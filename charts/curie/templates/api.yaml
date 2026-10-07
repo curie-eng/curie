@@ -408,6 +408,14 @@ spec:
             # Per-thread conversation transcript cap in bytes (#3301).
             - name: TRANSCRIPT_MAX_THREAD_BYTES
               value: {{ .Values.api.transcriptMaxThreadBytes | int64 | quote }}
+            {{- if .Values.api.githubStubCaConfigMap }}
+            - name: SSL_CERT_FILE
+              value: /etc/curie/github-stub/ca.pem
+            - name: GIT_SSL_CAINFO
+              value: /etc/curie/github-stub/ca.pem
+            - name: REQUESTS_CA_BUNDLE
+              value: /etc/curie/github-stub/ca.pem
+            {{- end }}
             {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) | nindent 12 }}
           ports:
             - name: http
@@ -424,4 +432,16 @@ spec:
             {{- toYaml .Values.api.livenessProbe | nindent 12 }}
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
+          {{- if .Values.api.githubStubCaConfigMap }}
+          volumeMounts:
+            - name: github-stub-ca
+              mountPath: /etc/curie/github-stub
+              readOnly: true
+          {{- end }}
+      {{- if .Values.api.githubStubCaConfigMap }}
+      volumes:
+        - name: github-stub-ca
+          configMap:
+            name: {{ .Values.api.githubStubCaConfigMap }}
+      {{- end }}
 {{- end }}

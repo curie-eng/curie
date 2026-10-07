@@ -1814,7 +1814,7 @@ export const commandManifest = {
           "name": "versions"
         },
         {
-          "about": "Manage an agent's hook configuration and signing secret",
+          "about": "Manage an agent's webhook partitions and source bindings. Not cron triggers: see `schedules` and `hook fire`",
           "hidden": false,
           "name": "hooks",
           "subcommands": [
@@ -2477,6 +2477,26 @@ export const commandManifest = {
               "help": "Clear the model override back to the platform default",
               "id": "clear_model",
               "long": "clear-model",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pin the reviewer model used at boot",
+              "id": "reviewer_model",
+              "long": "reviewer-model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the reviewer model override",
+              "id": "clear_reviewer_model",
+              "long": "clear-reviewer-model",
               "positional": false,
               "possible_values": [
                 "true",
@@ -3190,7 +3210,7 @@ export const commandManifest = {
           "name": "schedules"
         },
         {
-          "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "about": "Fire a declared cron hook now or read a durable run record",
           "hidden": false,
           "name": "hook",
           "subcommands": [
@@ -3256,6 +3276,65 @@ export const commandManifest = {
               ],
               "hidden": false,
               "name": "fire"
+            },
+            {
+              "about": "Read one durable hook run, including a run that is still in flight",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Hook run id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Print what would be requested and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "record"
             }
           ]
         },
@@ -3626,7 +3705,7 @@ export const commandManifest = {
           "name": "up"
         },
         {
-          "about": "Uninstall the release and sweep its runtime namespaces, running helm uninstall followed by kubectl delete namespace. The namespace delete is scoped to namespaces this release created, matched by both its release name and install namespace, so another release's namespaces on the same cluster are never touched. Pre-existing namespaces and the agents.x-k8s.io CRDs are left in place",
+          "about": "Uninstall the release and sweep its runtime namespaces, running helm uninstall followed by kubectl delete namespace. The namespace delete is scoped to namespaces this release created, matched by both its release name and install namespace, so another release's namespaces on the same cluster are never touched. Pre-existing namespaces and the agents.x-k8s.io CRDs are left in place. The sweep waits at most 300s. If owned namespaces remain, the command exits 3 and does not remove finalizers",
           "args": [
             {
               "default_values": [
@@ -5321,6 +5400,26 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Pin the reviewer model used at boot",
+              "id": "reviewer_model",
+              "long": "reviewer-model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the reviewer model override",
+              "id": "clear_reviewer_model",
+              "long": "clear-reviewer-model",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`)",
               "id": "thinking",
               "long": "thinking",
@@ -6293,7 +6392,7 @@ export const commandManifest = {
           "name": "schedules"
         },
         {
-          "about": "Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`)",
+          "about": "Fire a declared cron hook now or read a durable run record",
           "args": [
             {
               "env": "CURIE_API_URL",
@@ -6383,6 +6482,46 @@ export const commandManifest = {
               ],
               "hidden": false,
               "name": "fire"
+            },
+            {
+              "about": "Read one durable hook run, including a run that is still in flight",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Trigger name on the in-force bundle",
+                  "id": "name",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Hook run id",
+                  "id": "id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Print what would be requested and exit without making a request",
+                  "id": "dry_run",
+                  "long": "dry-run",
+                  "positional": false,
+                  "possible_values": [
+                    "true",
+                    "false"
+                  ],
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "record"
             }
           ]
         },
@@ -6453,7 +6592,7 @@ export const commandManifest = {
           "name": "versions"
         },
         {
-          "about": "Manage an agent's hook configuration and signing secret",
+          "about": "Manage an agent's webhook partitions and source bindings. Not cron triggers: see `schedules` and `hook fire`",
           "hidden": false,
           "name": "hooks",
           "subcommands": [
@@ -7097,11 +7236,8 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "z-ai/glm-5.3-flash"
-              ],
               "global": false,
-              "help": "Model id installed by cluster up",
+              "help": "Model id installed by cluster up. Defaults to Claude Sonnet for Anthropic credentials, or GLM Flash for OpenRouter credentials",
               "id": "model",
               "long": "model",
               "positional": false,
@@ -7740,6 +7876,64 @@ export const commandManifest = {
       "name": "dev",
       "subcommands": [
         {
+          "about": "Check the committed change before opening or updating a pull request",
+          "args": [
+            {
+              "global": false,
+              "help": "Run only the fast tier; the full tier is the default",
+              "id": "fast",
+              "long": "fast",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "main"
+              ],
+              "global": false,
+              "help": "Origin branch to compare against (for example, main or next)",
+              "id": "base",
+              "long": "base",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Print the selected checks without running them",
+              "id": "dry_run",
+              "long": "dry-run",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File containing the proposed pull request body",
+              "id": "pr_body",
+              "long": "pr-body",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Proposed pull request title used by the body guard",
+              "id": "title",
+              "long": "title",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "preflight"
+        },
+        {
           "about": "Manage hooks for this source checkout",
           "hidden": false,
           "name": "hooks",
@@ -7814,6 +8008,29 @@ export const commandManifest = {
           ],
           "hidden": false,
           "name": "factory-e2e"
+        },
+        {
+          "about": "Serve or record a scripted Anthropic Messages endpoint (#3814). `serve` replays a transcript and fails on an unexpected request. `record` proxies to a provider and writes the transcript",
+          "args": [
+            {
+              "global": false,
+              "help": "`serve` or `record`, followed by endpoint flags",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709552000,
+                "min": 1
+              },
+              "positional": true,
+              "required": true
+            }
+          ],
+          "hidden": false,
+          "name": "model-script"
+        },
+        {
+          "about": "Check the OpenRouter credit on CURIE_CREDENTIALS before a graded ladder spends a build",
+          "hidden": false,
+          "name": "model-credit"
         },
         {
           "about": "Serve a TLS GitHub fixture or capture public check lifecycle recordings",

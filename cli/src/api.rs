@@ -311,6 +311,10 @@ pub struct Agent {
     /// the one-entry-point rule this field now satisfies.
     #[serde(default)]
     pub model: Option<String>,
+    /// Per-agent reviewer model override, forwarded as CURIE_REVIEWER_MODEL
+    /// at sandbox boot. None delegates to the credential's reviewer default.
+    #[serde(default)]
+    pub reviewer_model: Option<String>,
     /// Per-agent thinking-depth override, forwarded as `CURIE_THINKING` at
     /// sandbox boot (#1182, ADR-0098). `None` means the platform default
     /// applies. Same three-way PATCH semantics as `model`: omitted leaves it,
@@ -726,6 +730,11 @@ pub struct ScheduleHook {
     pub zone: String,
     pub last_fire_at: Option<String>,
     pub last_outcome: Option<String>,
+    #[serde(default)]
+    pub last_reason: Option<String>,
+    pub last_manual_fire_at: Option<String>,
+    pub last_manual_outcome: Option<String>,
+    pub last_manual_reason: Option<String>,
     pub paused: bool,
 }
 
@@ -751,7 +760,7 @@ pub struct ScheduleList {
     pub schedules: Vec<AgentSchedules>,
 }
 
-/// One test-fire run record (`HookFireOut`, #2932).
+/// One durable hook run record (`HookFireOut`, #2932).
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct HookFireRecord {
     pub id: String,
@@ -760,7 +769,10 @@ pub struct HookFireRecord {
     pub name: String,
     pub trigger: String,
     pub slot_utc: String,
+    pub source: String,
     pub outcome: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
 }

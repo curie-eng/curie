@@ -91,10 +91,13 @@ through Bash). Its evidence lines share one `seq` counter per run:
 `report_progress` call with the hook's last observed phase and `late: true`
 when the report trails it, and `curie_gate` lines record refusals.
 
-Both reviewers default to `anthropic/claude-opus-5.5`, served through the same
-OpenRouter key as the main loop. The Agent tool's own `model` argument only
-takes Claude aliases, so the per-deployment override is the `model:` line in
-each file under `agents/`: change it in the bundle you deploy. Opus 5.5 needs
+Both reviewers declare the `opus` alias. The runner resolves it to
+`claude-opus-5-5` for a direct Anthropic credential or
+`anthropic/claude-opus-5.5` for an OpenRouter credential, using the same
+credential as the main loop. Pin a reviewer model with
+`curie cluster overrides dark-factory --reviewer-model <provider-model-id>`;
+`--clear-reviewer-model` restores the credential default without changing the
+bundle. The local overrides command accepts the same flags. Opus 5.5 needs
 the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
 0.2.158 or later).
 

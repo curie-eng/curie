@@ -26,6 +26,26 @@ pub(crate) enum LocalHookAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read one durable hook run, including a run that is still in flight.
+    Record {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+        /// Hook run id.
+        id: String,
+        #[arg(
+            long,
+            default_value = message::DEFAULT_LOCAL_API_URL,
+            env = "CURIE_API_URL"
+        )]
+        api_url: String,
+        #[arg(long, default_value = message::DEFAULT_API_KEY, env = "CURIE_API_KEY", hide_env_values = true, value_parser = message::api_key_or_default)]
+        api_key: String,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -452,7 +472,8 @@ pub(crate) enum LocalAction {
         #[command(flatten)]
         target: AgentTarget<LocalTier>,
     },
-    /// Manage an agent's hook configuration and signing secret.
+    /// Manage an agent's webhook partitions and source bindings. Not cron triggers: see
+    /// `schedules` and `hook fire`.
     Hooks {
         #[command(subcommand)]
         action: LocalHooksAction,
@@ -564,6 +585,12 @@ pub(crate) enum LocalAction {
         /// Clear the model override back to the platform default.
         #[arg(long)]
         clear_model: bool,
+        /// Pin the reviewer model used at boot.
+        #[arg(long)]
+        reviewer_model: Option<String>,
+        /// Clear the reviewer model override.
+        #[arg(long)]
+        clear_reviewer_model: bool,
         /// Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`).
         #[arg(long)]
         thinking: Option<String>,
@@ -802,7 +829,7 @@ pub(crate) enum LocalAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`).
+    /// Fire a declared cron hook now or read a durable run record.
     Hook {
         #[command(subcommand)]
         action: LocalHookAction,

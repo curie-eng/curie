@@ -79,8 +79,10 @@ def _uncollected_python_tests(repo: Path, testpaths: list[str]) -> list[Path]:
     return [
         test_file.relative_to(repo)
         for test_file in sorted(repo.rglob("test_*.py"))
-        if not any(part.startswith(".") or part in {"node_modules", "target"}
-                   for part in test_file.relative_to(repo).parts)
+        if not any(
+            part.startswith(".") or part in {"node_modules", "target", "fixtures"}
+            for part in test_file.relative_to(repo).parts
+        )
         and not test_file.is_relative_to(local_tier)
         and not _is_collected(test_file, testpaths, repo)
     ]
@@ -106,6 +108,13 @@ def test_the_reference_connector_fixture_tests_are_collected() -> None:
             f"'{test_file.relative_to(REPO)}' falls under none of pyproject.toml's "
             f"testpaths, so `uv run pytest -q` never collects it."
         )
+
+
+def test_collection_audit_ignores_a_fixture_repository(tmp_path: Path) -> None:
+    planted = tmp_path / "tools/factory-e2e/fixtures/unitconv/unitconv/tests/test_convert.py"
+    planted.parent.mkdir(parents=True)
+    planted.write_text("def test_convert(): pass\n", encoding="utf-8")
+    assert _uncollected_python_tests(tmp_path, ["examples/tests"]) == []
 
 
 def test_collection_audit_rejects_a_planted_test(tmp_path: Path) -> None:

@@ -1038,6 +1038,10 @@ fn assert_automatic_gvisor_recovery_narration(shown: &str) {
             && shown.contains("--set security.gvisor.mode=off"),
         "recovery must announce the gVisor admission retry with the inferred override:\n{shown}"
     );
+    assert!(
+        !shown.contains(GVISOR_LOOKUP_INFERENCE),
+        "admission recovery must not announce the RuntimeClass lookup inference:\n{shown}"
+    );
 }
 
 #[test]
@@ -1699,6 +1703,15 @@ fn rendered_workload_admission_still_rejects_beside_stale_preflight() {
 
 const GVISOR_INFERENCE: &str =
     "inferred that the cluster has no `gvisor` RuntimeClass from admission";
+const GVISOR_LOOKUP_INFERENCE: &str =
+    "inferred that the cluster has no `gvisor` RuntimeClass from the RuntimeClass lookup (NotFound)";
+
+fn assert_neither_gvisor_inference(shown: &str) {
+    assert!(
+        !shown.contains(GVISOR_INFERENCE) && !shown.contains(GVISOR_LOOKUP_INFERENCE),
+        "neither gVisor inference sentence may be announced:\n{shown}"
+    );
+}
 
 #[test]
 fn absent_runtimeclass_applies_gvisor_off_before_install() {
@@ -1728,12 +1741,38 @@ fn absent_runtimeclass_applies_gvisor_off_before_install() {
         "the single upgrade must carry mode off:\n{upgrades}"
     );
     assert!(
-        shown.contains(GVISOR_INFERENCE) && shown.contains("--set security.gvisor.mode=off"),
-        "the existing inference line must be announced:\n{shown}"
+        shown.contains(GVISOR_LOOKUP_INFERENCE)
+            && shown.contains("--set security.gvisor.mode=off")
+            && !shown.contains(GVISOR_INFERENCE),
+        "the lookup inference line must be announced without the admission sentence:\n{shown}"
     );
     assert!(
         !shown.contains(&format!("installing release {TARGET_RELEASE}: retrying")),
         "an absent RuntimeClass must not retry from admission:\n{shown}"
+    );
+}
+
+#[test]
+fn absent_runtimeclass_announces_lookup_inference_not_admission() {
+    let fixture = Fixture::new("matching", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("absent");
+    let (output, _) = fixture.run(&[]);
+    let shown = stderr(&output);
+    let lookup = "inferred that the cluster has no `gvisor` RuntimeClass from the RuntimeClass lookup (NotFound); applying `--set security.gvisor.mode=off`";
+    let admission = "inferred that the cluster has no `gvisor` RuntimeClass from admission; applying `--set security.gvisor.mode=off`";
+
+    assert!(
+        output.status.success(),
+        "an absent RuntimeClass must install once with gVisor off\nstdout:\n{}\nstderr:\n{shown}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        shown.contains(lookup),
+        "the RuntimeClass lookup path must announce the NotFound inference:\n{shown}"
+    );
+    assert!(
+        !shown.contains(admission),
+        "the RuntimeClass lookup path must not announce the admission inference:\n{shown}"
     );
 }
 
@@ -1759,10 +1798,7 @@ fn present_runtimeclass_does_not_infer_gvisor_off() {
         !upgrades.contains("security.gvisor.mode=off"),
         "a present RuntimeClass must not force mode off:\n{upgrades}"
     );
-    assert!(
-        !shown.contains(GVISOR_INFERENCE),
-        "a present RuntimeClass must not announce the inference:\n{shown}"
-    );
+    assert_neither_gvisor_inference(&shown);
     fixture.assert_children_stopped();
 }
 
@@ -1813,10 +1849,10 @@ fn present_runtimeclass_admission_rejection_does_not_retry() {
         "a present RuntimeClass must not force mode off after admission:\n{upgrades}"
     );
     assert!(
-        !shown.contains(&format!("installing release {TARGET_RELEASE}: retrying"))
-            && !shown.contains(GVISOR_INFERENCE),
-        "a present RuntimeClass must not retry or announce the inference:\n{shown}"
+        !shown.contains(&format!("installing release {TARGET_RELEASE}: retrying")),
+        "a present RuntimeClass must not retry:\n{shown}"
     );
+    assert_neither_gvisor_inference(&shown);
 }
 
 #[test]
@@ -1859,10 +1895,7 @@ fn present_runtimeclass_accepts_explicit_require() {
         "explicit require must still look up the RuntimeClass"
     );
     assert_eq!(fixture.upgrade_count(), 1);
-    assert!(
-        !shown.contains(GVISOR_INFERENCE),
-        "explicit require on a present class must not infer off:\n{shown}"
-    );
+    assert_neither_gvisor_inference(&shown);
     let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
     assert!(
         !upgrades.contains("security.gvisor.mode=off"),
@@ -1924,10 +1957,7 @@ fn fake_model_default_does_not_lookup_or_infer_gvisor_off() {
         !upgrades.contains("security.gvisor.mode=off"),
         "the fake model default must not infer mode off:\n{upgrades}"
     );
-    assert!(
-        !shown.contains(GVISOR_INFERENCE),
-        "the fake model default must not announce the inference:\n{shown}"
-    );
+    assert_neither_gvisor_inference(&shown);
 }
 
 #[test]

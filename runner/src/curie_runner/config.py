@@ -159,6 +159,9 @@ class RunnerConfig:
     # Whether this turn is bound to a channel, as the worker sent it (#3336).
     # Absent or false keeps the catalogue unchanged.
     channel_bound: bool = False
+    # Per-agent reviewer override. None lets the adapter choose the credential's
+    # provider default for the SDK's Opus alias (#4120).
+    reviewer_model: str | None = None
 
     @property
     def memory_writes_on(self) -> bool:
@@ -238,6 +241,7 @@ class RunnerConfig:
         return cls(
             session=boot.session,
             model=boot.model,
+            reviewer_model=boot.reviewer_model,
             thinking=parse_thinking(boot.thinking),
             harness=harness,
             max_turns=boot.max_turns if boot.max_turns is not None else 20,

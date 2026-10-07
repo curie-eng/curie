@@ -258,11 +258,13 @@ testpaths = [
     # @spec ACTION-EXECUTOR-9: the reference reversible connector is a hosted
     # fixture the e2e ladder builds into a bundle; its tests ship beside it.
     "cli/scripts/fixtures/reversible-reference",
+    "tools/preflight/tests",
     "tools/doclint/tests",
     # @spec PROTECTED-HOOK-LANE-2
     "packages/protected-hooks/tests",
     "tools/wire-tolerance-gate/tests",
     "tools/ci-retry-gate/tests",
+    "tools/dependency-audit-paths/tests",
     "tools/ci-workflow-paths/tests",
     "tools/e2e-ci-selection/tests",
     "tools/helm-ci-gate/tests",
@@ -275,6 +277,7 @@ testpaths = [
     "tools/sre-contract/tests",
     "tools/factory-e2e/tests",
     "tools/github-stub/tests",
+    "tools/model-script/tests",
     "tools/runtime-assertion-gate/tests",
     # Repo-level tests that pin a seam between two apps which may not import
     # each other, such as the runner/API default memory guidance (#1461).

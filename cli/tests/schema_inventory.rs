@@ -511,3 +511,61 @@ fn a_schema_may_not_change_shape_while_keeping_its_id() {
         problems.join("\n")
     );
 }
+
+#[test]
+fn schedules_history_split_is_v3_and_hook_source_is_v1_2() {
+    let schedules: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_path("cli/schema/schedules.schema.json"))
+            .expect("read schedules schema"),
+    )
+    .expect("schedules schema is JSON");
+    assert_eq!(
+        schedules["$id"],
+        "https://schemas.curietech.ai/cli/schedules/v3.json"
+    );
+    let hook = &schedules["$defs"]["hook"];
+    let required = hook["required"].as_array().expect("hook required fields");
+    for field in [
+        "last_manual_fire_at",
+        "last_manual_outcome",
+        "last_manual_reason",
+    ] {
+        assert!(hook["properties"].get(field).is_some(), "missing {field}");
+        assert!(
+            required.contains(&Value::String(field.to_string())),
+            "{field} must be required"
+        );
+    }
+
+    let fire: Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_path("cli/schema/hook-fire.schema.json"))
+            .expect("read hook-fire schema"),
+    )
+    .expect("hook-fire schema is JSON");
+    assert_eq!(
+        fire["$id"],
+        "https://schemas.curietech.ai/cli/hook-fire/v1.2.json"
+    );
+    assert!(fire["$defs"]["record"]["properties"]
+        .get("source")
+        .is_some());
+    // The producer always emits source. It remains optional in the minor-version
+    // schema so adding the field does not narrow existing v1 record validity.
+    let required = fire["$defs"]["record"]["required"].as_array().unwrap();
+    assert!(!required.contains(&Value::String("source".to_string())));
+
+    let index = index_json();
+    let results = index["results"]
+        .as_array()
+        .expect("schema result inventory");
+    for (schema, version) in [
+        ("schedules.schema.json", "3.0"),
+        ("hook-fire.schema.json", "1.2"),
+    ] {
+        let entry = results
+            .iter()
+            .find(|entry| entry["schema"] == schema)
+            .unwrap_or_else(|| panic!("missing inventory entry for {schema}"));
+        assert_eq!(entry["version"], version, "{schema} inventory version");
+    }
+}
