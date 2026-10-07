@@ -198,6 +198,7 @@ api:
   VALKEY_PORT: valkey.port
   VALKEY_TLS: valkey.tls
 dispatcher:
+  CURIE_TEST_INSTALLATION_THREAD_TURN_LIMIT: testInstallation.threadTurnLimit
   CURIE_API_KEY: api.apiKey
   CURIE_API_PREFLIGHT_TIMEOUT_SECONDS: dispatcher.apiPreflightTimeoutSeconds
   CURIE_API_URL: dispatcher.apiBaseUrl
