@@ -658,3 +658,16 @@ def test_gate_commands_that_exit_nonzero_by_design_do_not_read_as_failures():
     skill = (BUNDLE / "skills/mean-tester/SKILL.md").read_text()
     assert 'echo "exit=$?"' in skill
     assert re.search(r"exit 1 .*NO-GO|NO-GO.*exit 1", " ".join(skill.split()))
+
+
+def test_a_spec_source_that_cannot_be_read_still_gets_a_report():
+    spec = _section("Where the spec comes from")
+    assert re.search(r"never end (the turn |your turn )?with an empty", spec, re.I)
+    assert "MISSING" in spec
+    # Evals stay recorded exchanges (no network), so this is a skill rule only.
+    assert "spec MISSING" in spec
+
+
+def test_the_readme_names_the_models_the_tester_was_graded_on():
+    readme = (BUNDLE / "README.md").read_text()
+    assert "Models" in readme and "Claude" in readme
