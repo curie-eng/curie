@@ -29,6 +29,15 @@ class SafeParser(argparse.ArgumentParser):
         raise Invalid() from None
 
 
+class RejectRedirect(urllib.request.HTTPRedirectHandler):
+    """Keep the ServiceAccount token on the API endpoint. @spec SRE-CREDS-8"""
+
+    def redirect_request(
+        self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str
+    ) -> None:
+        return None
+
+
 def unique_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """Refuse ambiguous JSON object keys. @spec SRE-CREDS-1 SRE-CREDS-4"""
     result: dict[str, Any] = {}
@@ -196,6 +205,9 @@ class ServiceAccountRequest:
             raise Invalid()
         self.token = token
         self.context = ssl.create_default_context(cafile=str(sa_dir / "ca.crt"))
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(context=self.context), RejectRedirect()
+        )
 
     def __call__(self, method: str, path: str, body: Any = None) -> dict[str, Any]:
         """Send one GET or conditional merge PATCH. @spec SRE-CREDS-5 SRE-CREDS-8"""
@@ -208,7 +220,7 @@ class ServiceAccountRequest:
         request = urllib.request.Request(
             "https://kubernetes.default.svc" + path, data=payload, headers=headers, method=method
         )
-        with urllib.request.urlopen(request, context=self.context, timeout=10) as response:
+        with self.opener.open(request, timeout=10) as response:
             result = json.load(response)
         if not isinstance(result, dict):
             raise Invalid()
