@@ -152,3 +152,7 @@ a6ad6a14d49962754a56754da7c216469acd3bb6:runner/tests/test_redact.py:generic-api
 # Invented migration-preservation fixture repository and issue number, not a
 # downstream reference. Exact historical finding only; future references remain gated.
 9044947acf8d50fe58cf087f42fd627e0212271d:apps/api/tests/test_migration_0074_deploy_notifications.py:cross-repo-issue-ref:39
+
+# A settings attribute passed as the HMAC key to verify an operator principal
+# (`get_settings().api_key`), not a credential value: the remediation policy routes.
+174651d715a0afa6355aadf91707df28adbdc027:apps/api/src/curie_api/routers/remediation_policy.py:generic-api-key:94
