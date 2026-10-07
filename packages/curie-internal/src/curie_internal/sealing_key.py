@@ -14,7 +14,9 @@ One definition for every Python seam that enforces custody:
   (``curie_api.schemas.agents``) refuse the names with ``custody_reason``;
 * the API's ``undoable`` derivation (``curie_api.action_undoable``) reads
   ``SEALING_KEY_NAME``;
-* the worker's ``inject_connector_secrets`` withholds ``SEALING_KEY_NAMES``.
+* the worker's ``inject_connector_secrets`` withholds ``SEALING_KEY_NAMES``;
+* API bundle intake finds references in the fields the MCP client expands
+  from the sandbox environment with ``sealing_key_references``.
 
 The Helm guard in ``charts/curie/templates/agent-connector-secrets.yaml`` lists
 the same two names. ``SEALING_KEY_CUSTODY_REASON`` is the single wording of
@@ -22,6 +24,8 @@ the refusal so the CLI bundle check can mirror it verbatim.
 """
 
 from __future__ import annotations
+
+import re
 
 SEALING_KEY_NAME = "SNAPSHOT_SEALING_KEY"
 SEALING_KEYS_RETAINED_NAME = "SNAPSHOT_SEALING_KEYS_RETAINED"
@@ -48,3 +52,22 @@ def custody_reason(name: str) -> str:
     """The refusal message for ``name`` declared in a form other than a SecretRef."""
 
     return SEALING_KEY_CUSTODY_REASON.format(name=name)
+
+
+# A reference the sandbox could expand: `$` then an optional `{` and optional
+# whitespace, then the name, ending at a word boundary. Covers `$NAME`,
+# `${NAME}`, `${ NAME }`, `${NAME:-x}`, `${NAME-x}` and a reference nested in
+# another's default (`${OTHER:-${NAME}}`), since each name is searched on its
+# own rather than parsed out of an outer match. The trailing boundary keeps a
+# longer name that merely starts with a reserved one (`SNAPSHOT_SEALING_KEYRING`)
+# a different variable, as the environment treats it.
+_REFERENCE_RES = {
+    name: re.compile(r"\$\{?\s*" + re.escape(name) + r"(?![A-Za-z0-9_])")
+    for name in sorted(SEALING_KEY_NAMES)
+}
+
+
+def sealing_key_references(text: str) -> list[str]:
+    """The reserved names ``text`` references for expansion, in sorted order."""
+
+    return [name for name, pattern in _REFERENCE_RES.items() if pattern.search(text)]

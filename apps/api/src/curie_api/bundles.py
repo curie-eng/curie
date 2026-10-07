@@ -8,7 +8,6 @@ router; this module is pure intake logic.
 
 import io
 import json
-import re
 import tarfile
 import tempfile
 import zipfile
@@ -17,7 +16,11 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
-from curie_internal.sealing_key import custody_reason, is_sealing_key_name
+from curie_internal.sealing_key import (
+    custody_reason,
+    is_sealing_key_name,
+    sealing_key_references,
+)
 from plugin_format import (
     DEFAULT_MAX_COMPRESSION_RATIO,
     DEFAULT_MAX_MEMBERS,
@@ -140,10 +143,6 @@ def extract_and_validate(
 
 SEALING_KEY_CODE = "secrets.sealing_key_custody"
 
-# A `${NAME}` (or `${NAME:-default}`) reference the MCP client expands from the
-# sandbox environment, as `.mcp.json` has always expanded it.
-_SANDBOX_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
-
 
 def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
     """Every declaration of a reserved sealing key name other than a SecretRef.
@@ -157,9 +156,11 @@ def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
     ``secrets`` name (a sandbox secret) are each refused, naming the key. So
     is naming the key for the sandbox to expand without declaring it: a
     ``bearer_secret`` (the derived ``Authorization: Bearer ${NAME}`` header), or
-    a ``${NAME}`` reference in a remote connector's ``url`` or ``headers``, or
-    in a hosted connector's ``unhosted_url``. Each is expanded from the sandbox environment
-    by the MCP client, so each declares that the sandbox holds the key.
+    a reference to it (``$NAME``, ``${NAME}`` and their variants, see
+    ``sealing_key_references``) in a remote connector's ``url`` or
+    ``headers``, or in a hosted connector's ``unhosted_url``. Each is expanded
+    from the sandbox environment by the MCP client, so each declares that the
+    sandbox holds the key.
 
     Applied at API intake on top of the frozen ``validate_bundle``, so the
     package's contract is unchanged. Reads the raw files leniently: a file that
@@ -207,8 +208,11 @@ def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
             for name in names:
                 if is_sealing_key_name(name):
                     refuse(name, f"{where}.{form})")
-        if spec.bearer_secret is not None and is_sealing_key_name(spec.bearer_secret):
-            refuse(spec.bearer_secret, f"{where}.bearer_secret)")
+        if spec.bearer_secret is not None:
+            bearer = spec.bearer_secret
+            named = [bearer] if is_sealing_key_name(bearer) else sealing_key_references(bearer)
+            for name in named:
+                refuse(name, f"{where}.bearer_secret)")
         expanded = [(f"headers.{key}", value) for key, value in spec.headers.items()]
         if spec.url is not None:
             # `connector_render` writes it verbatim into `.mcp.json`, and the
@@ -217,9 +221,8 @@ def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
         if spec.unhosted_url is not None:
             expanded.append(("unhosted_url", spec.unhosted_url))
         for field, text in expanded:
-            for name in _SANDBOX_ENV_REF_RE.findall(text):
-                if is_sealing_key_name(name):
-                    refuse(name, f"{where}.{field})")
+            for name in sealing_key_references(text):
+                refuse(name, f"{where}.{field})")
     return issues
 
 
