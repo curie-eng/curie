@@ -95,6 +95,11 @@ names its target clearly ("pause acme-bot's nightly-cleanup", "stop acme-bot"):
    - **Approved:** the call ran. Read the result back and report it: `Stopped acme-bot. get_controls now shows it killed; resume_agent undoes it.`
    - **Rejected or expired:** say that nothing changed, and who decided, as a mention.
 
+When asked to resume a schedule, say before calling the tool that resuming can
+run the newest slot it missed straight away: Curie catches up one missed slot if
+it is under a day old (and under the schedule's own interval). So resuming a
+weekday 09:00 check at 16:00 runs that day's check at once.
+
 Never try to reach the same result another way after a rejection. Never chain
 changes nobody asked for. One request, one change, one report.
 
