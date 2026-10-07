@@ -45,10 +45,11 @@ KNOWN LIMITS, stated rather than papered over
   over `apps/deployments` (including its `scale` subresource). Any other shape of
   grant is not compared, and a bundle relying on one is not covered here.
 - A bundle with no connector source, or no write-annotated tool, passes trivially.
-- A write tool also passes when the bundle's `toolPolicy` names it literally
-  (`allow`, `approvalRequired` or `deny`). The runner enforces that policy and
-  denies anything it does not match, so a literal entry is a deliberate choice; a
-  glob entry is not counted, because it classifies tools nobody looked at.
+- A write tool also passes when the bundle's `toolPolicy` gates or denies it by
+  literal name (`approvalRequired` or `deny`). The runner enforces that policy, so
+  either still keeps a human in front of the write. An `allow` entry does not
+  count, since it lets the write run with nobody deciding, and a glob entry does
+  not count, because it classifies tools nobody looked at.
 """
 
 import argparse
@@ -89,18 +90,18 @@ def declared_gates(bundle: pathlib.Path) -> set[str]:
 
 
 def classified_tools(bundle: pathlib.Path) -> set[str]:
-    """`<server>/<tool>` names the bundle's `toolPolicy` classifies by literal name.
+    """`<server>/<tool>` names the bundle's `toolPolicy` gates or denies by literal name.
 
-    The runner enforces `toolPolicy` at call time and denies any tool it does not
-    match, so a write tool the owner names in `allow`, `approvalRequired` or `deny`
-    was classified on purpose rather than forgotten. Only literal entries count: a
-    glob such as `platform/*` would classify a write tool nobody looked at, which
-    is the incident this guard exists for.
+    The runner enforces `toolPolicy` at call time, so a write tool the owner names
+    in `approvalRequired` waits for a person and one named in `deny` never runs.
+    `allow` is not counted: it lets the write run with nobody deciding, which is
+    what this guard exists to stop. Only literal entries count: a glob such as
+    `platform/*` would classify a write tool nobody looked at.
     """
     manifest = json.loads((bundle / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     policy = manifest.get("toolPolicy") or {}
     names: set[str] = set()
-    for key in ("allow", "approvalRequired", "deny"):
+    for key in ("approvalRequired", "deny"):
         for entry in policy.get(key) or []:
             entry = str(entry).strip()
             if not any(ch in entry for ch in "*?["):

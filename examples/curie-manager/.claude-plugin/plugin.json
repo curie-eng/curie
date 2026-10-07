@@ -1,9 +1,18 @@
 {
   "name": "curie-manager",
   "version": "0.1.0",
-  "description": "Example bundle: an agent that manages the Curie install it runs on. Through one connector that holds the platform key, it reads agents, deployments, schedules, budgets, approvals, traces and metrics, and runs routine operations without asking: fire a hook, pause or resume a schedule, kill or resume an agent, set a budget, add memory, redeploy an existing version. Every delete waits for a human approval. A weekday check posts the platform's health to its channel.",
-  "author": { "name": "CurieTech" },
-  "keywords": ["example", "operations", "platform", "admin", "scheduled", "approval-gated"],
+  "description": "Example bundle: an agent that manages the Curie install it runs on. Through one connector that holds the platform key, it reads agents, deployments, schedules, budgets, approvals, traces and metrics, and it can pause or resume a schedule and kill or resume an agent, each only after a person approves. Deletes and other operator actions are deliberately absent until Curie can undo them. A weekday check posts the platform's health to its channel.",
+  "author": {
+    "name": "CurieTech"
+  },
+  "keywords": [
+    "example",
+    "operations",
+    "platform",
+    "admin",
+    "scheduled",
+    "approval-gated"
+  ],
   "toolPolicy": {
     "enforcement": "curie/mcp-tool-policy@1",
     "allow": [
@@ -19,20 +28,13 @@
       "platform/list_approvals",
       "platform/metrics_summary",
       "platform/list_traces",
-      "platform/get_trace",
-      "platform/fire_hook",
+      "platform/get_trace"
+    ],
+    "approvalRequired": [
       "platform/pause_schedule",
       "platform/resume_schedule",
       "platform/kill_agent",
-      "platform/resume_agent",
-      "platform/set_budget",
-      "platform/add_memory",
-      "platform/deploy_version"
-    ],
-    "approvalRequired": [
-      "platform/delete_agent",
-      "platform/end_deployment",
-      "platform/delete_memory"
+      "platform/resume_agent"
     ]
   },
   "triggers": [
@@ -49,6 +51,6 @@
     "Is the platform healthy?",
     "Which schedules failed their last run?",
     "Pause acme-bot's nightly-cleanup hook.",
-    "Roll acme-bot back to its previous version."
+    "Stop acme-bot now."
   ]
 }

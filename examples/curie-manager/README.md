@@ -1,15 +1,14 @@
 # curie-manager — an agent that manages Curie
 
-An example bundle for an agent that operates the Curie install it runs on. Ask
-it in Slack what the platform is doing, and ask it to change things:
+An example bundle for an agent that manages the Curie install it runs on, from
+Slack. Ask it what the platform is doing, and use it for the two emergency
+controls that otherwise need the CLI:
 
 ```
-@curie-manager is the platform healthy?
-@curie-manager which schedules failed their last run?
-@curie-manager pause acme-bot's nightly-cleanup hook
-@curie-manager raise acme-bot's budget to $20 a day
-@curie-manager roll acme-bot back to its previous version
-@curie-manager delete acme-old-bot
+@Curie Manager is the platform healthy?
+@Curie Manager which schedules failed their last run?
+@Curie Manager pause acme-bot's nightly-cleanup hook
+@Curie Manager stop acme-bot now
 ```
 
 Every weekday at 09:00 Eastern it also checks the platform and posts the
@@ -20,33 +19,37 @@ error rate. So the install tests itself.
 
 ## What it is allowed to do
 
-The agent has elevated permissions by default. Routine operations run without
-asking anyone. Deletes wait for a person.
+It reads freely, and it can make exactly two kinds of change, each only after
+a person approves it. Both are undone by their opposite.
 
 | Kind | Tools | Approval |
 | --- | --- | --- |
 | Read | `platform_health`, `list_agents`, `get_agent`, `list_versions`, `list_deployments`, `list_schedules`, `get_hook_run`, `get_controls`, `list_memory`, `list_approvals`, `metrics_summary`, `list_traces`, `get_trace` | none |
-| Operate | `fire_hook`, `pause_schedule`, `resume_schedule`, `kill_agent`, `resume_agent`, `set_budget`, `add_memory`, `deploy_version` | none |
-| Delete | `delete_agent`, `end_deployment`, `delete_memory` | one person approves each call |
+| Pause or resume a schedule | `pause_schedule`, `resume_schedule` | a person approves each call |
+| Stop or restart an agent | `kill_agent`, `resume_agent` | a person approves each call |
 
 The bundle's `toolPolicy` enforces this table. A tool the policy does not name
 is refused, so a tool added to the connector does nothing until it is classified
-there. `test_server.py` fails if any destructive tool is not gated.
+there. `test_server.py` fails if any write is not gated.
 
-Some things it cannot do at all, because no tool calls them:
+**Not yet.** Deleting anything, changing a budget, rolling back or redeploying
+a version, firing a hook, and writing another agent's memory are absent from
+the connector, not merely gated. Deletes wait until Curie can undo or restore
+them; the rest come later, one at a time.
 
-- read a secret value or the webhook secret;
-- mint a console login or an approval principal;
-- resolve an approval, including its own;
-- change an agent's secrets, channels or caller allowlist;
-- create an agent or upload a bundle.
+**Never.** It cannot read a secret value or the webhook secret, mint a console
+login or an approval principal, resolve an approval (including its own), change
+an agent's secrets, channels or caller allowlist, or create an agent or upload a
+bundle. Those stay with an operator and the `curie` CLI, and the agent names
+the exact command. It also will not stop itself, since nothing would be left to
+restart it.
 
-Those stay with an operator and the `curie` CLI. It also will not kill or
-delete itself, since nothing would be left to undo that.
-
-**Anyone who can post in its channel can ask it to operate the platform.** Put
-it in a channel whose members you would trust with `curie local` or `curie
-cluster` themselves.
+**Who can use it.** By default anyone who can post in its channel can ask, and
+any member of that channel can approve. Narrow either with the install's own
+controls: `curie <tier> callers` for who may talk to it, and approvers on its
+approval route for who may approve (see
+[`docs/approvals.md`](../../docs/approvals.md)). The full list of writes and
+their undo is in [`docs/PERMISSION-MAP.md`](docs/PERMISSION-MAP.md).
 
 ## Where the platform key lives
 
@@ -130,3 +133,4 @@ curie skill eval
 | an agent that does not exist is not invented | reporting health for an agent that is not there |
 | it will not kill itself | an agent that takes itself offline with nothing left to resume it |
 | a channel change is handed to the CLI | claiming to do something it has no tool for, instead of naming `curie local surfaces` |
+| a delete is not yet available | requesting approval for, or claiming, a delete it deliberately cannot do |

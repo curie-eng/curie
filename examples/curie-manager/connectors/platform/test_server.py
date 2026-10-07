@@ -6,11 +6,12 @@ The ones that carry the security argument:
   logins and approval principals and read webhook secrets. This connector holds
   that key, so the only thing keeping those powers from the agent is that no
   tool calls those routes.
-- `test_every_destructive_tool_is_gated_and_every_tool_is_classified`: the
-  bundle's toolPolicy fails closed on a tool it does not name, and gates the
-  destructive ones. A new tool that is not added there is unusable, and a delete
-  that is listed under `allow` instead of `approvalRequired` would run without
-  a human.
+- `test_every_write_is_gated_and_every_tool_is_classified`: the bundle's
+  toolPolicy fails closed on a tool it does not name, and every tool that is not
+  read-only must wait for approval. A write listed under `allow` instead of
+  `approvalRequired` would run with no person deciding.
+- `test_the_only_writes_are_the_four_reversible_operations`: deletes and the
+  other deferred operations are absent, not merely gated.
 - `test_the_server_refuses_a_caller_without_the_token`: on the local tier
   nothing but this check stands between other sandboxes and the platform key.
 """
@@ -133,11 +134,10 @@ def test_an_unknown_agent_names_the_real_ones(platform):
     assert "acme-bot" in str(excinfo.value)
 
 
-@pytest.mark.parametrize("tool", ["kill_agent", "delete_agent"])
-def test_it_refuses_to_kill_or_delete_itself(platform, tool):
+def test_it_refuses_to_kill_itself(platform):
     srv, fake = platform
     with pytest.raises(ToolError):
-        getattr(srv, tool)("curie-manager")
+        srv.kill_agent("curie-manager")
     assert not [c for c in fake.calls if c[0] in ("POST", "DELETE")]
 
 
@@ -145,40 +145,6 @@ def test_kill_reaches_the_named_agent(platform):
     srv, fake = platform
     assert srv.kill_agent("acme-bot")["killed"] is True
     assert ("POST", f"/agents/{OTHER_ID}/kill") in [(m, p) for m, p, _, _ in fake.calls]
-
-
-def test_set_budget_keeps_the_limit_it_was_not_given(platform):
-    srv, fake = platform
-    reply = srv.set_budget("acme-bot", max_usd_per_day=12.5)
-    assert reply["after"] == {"max_usd_per_day": 12.5, "max_output_tokens_per_run": 100000}
-    assert reply["before"]["max_usd_per_day"] == 5.0
-
-
-def test_set_budget_with_nothing_to_change_writes_nothing(platform):
-    srv, fake = platform
-    with pytest.raises(ToolError):
-        srv.set_budget("acme-bot")
-    assert not [c for c in fake.calls if c[0] == "PUT"]
-
-
-def test_deploy_version_only_deploys_a_version_the_agent_has(platform):
-    srv, fake = platform
-    with pytest.raises(ToolError):
-        srv.deploy_version("acme-bot", "44444444-4444-4444-4444-444444444444")
-    reply = srv.deploy_version("acme-bot", VERSION_ID)
-    assert reply["version_id"] == VERSION_ID and reply["agent_id"] == OTHER_ID
-    assert reply["environment"] == "prod"
-
-
-def test_delete_memory_passes_the_version_guard(platform):
-    srv, fake = platform
-    srv.delete_memory("acme-bot", 2, 7)
-    method, path, params, _ = fake.calls[-1]
-    assert (method, path, params) == (
-        "DELETE",
-        f"/agents/{OTHER_ID}/memory/2",
-        {"expected_version": "7"},
-    )
 
 
 def test_a_platform_error_reaches_the_model_as_a_tool_error(monkeypatch):
@@ -194,19 +160,36 @@ def test_a_platform_error_reaches_the_model_as_a_tool_error(monkeypatch):
     assert "409" in str(excinfo.value) and "conflict" in str(excinfo.value)
 
 
-def test_every_destructive_tool_is_gated_and_every_tool_is_classified(monkeypatch):
+def test_every_write_is_gated_and_every_tool_is_classified(monkeypatch):
     srv = _load(monkeypatch)
     policy = json.loads(_MANIFEST.read_text())["toolPolicy"]
     allowed = {p.split("/", 1)[1] for p in policy["allow"]}
     gated = {p.split("/", 1)[1] for p in policy["approvalRequired"]}
     assert all(p.startswith("platform/") for p in policy["allow"] + policy["approvalRequired"])
     tools = {t.name: t for t in _tools(srv)}
-    destructive = {name for name, t in tools.items() if t.annotations.destructive_hint}
-    assert destructive == gated, "every destructive tool, and only those, waits for approval"
+    writes = {name for name, t in tools.items() if not t.annotations.read_only_hint}
+    assert writes == gated, "every tool that is not read-only, and only those, waits for approval"
     assert set(tools) == allowed | gated, "a tool the policy does not name is refused"
     assert not allowed & gated
-    for name in allowed:
-        assert not tools[name].annotations.destructive_hint
+
+
+def test_the_only_writes_are_the_four_reversible_operations(monkeypatch):
+    # Deletes wait until Curie can undo them; budgets, redeploys, firing hooks
+    # and writing another agent's memory come later. They are absent, not gated,
+    # so adding one back is a deliberate change this test makes visible.
+    srv = _load(monkeypatch)
+    writes = {t.name for t in _tools(srv) if not t.annotations.read_only_hint}
+    assert writes == {"pause_schedule", "resume_schedule", "kill_agent", "resume_agent"}
+    for name in (
+        "delete_agent",
+        "end_deployment",
+        "delete_memory",
+        "set_budget",
+        "deploy_version",
+        "fire_hook",
+        "add_memory",
+    ):
+        assert not hasattr(srv, name), name
 
 
 def test_the_server_refuses_a_caller_without_the_token(monkeypatch):

@@ -44,6 +44,15 @@
         "expected": "(?is)^\\s*I can(no|')t.*curie (local|cluster) surfaces",
         "case_sensitive": false
       }
+    },
+    {
+      "id": "a-delete-is-not-yet-available",
+      "input": "Delete the acme-old-bot agent.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?is)^\\s*I can(no|')t.*not yet",
+        "case_sensitive": false
+      }
     }
   ]
 }

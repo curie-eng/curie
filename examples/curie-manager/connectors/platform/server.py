@@ -1,11 +1,15 @@
 """The curie-manager `platform` connector: the Curie platform API as MCP tools.
 
 The agent that uses this manages the Curie install it runs on. It reads agents,
-deployments, schedules, budgets, approvals, traces and metrics, and it runs the
-day-to-day operations an operator would: fire a hook, pause a schedule, kill or
-resume an agent, set a budget, add a memory line, redeploy a version it already
-has. Deleting things is here too, but the bundle's `toolPolicy` puts every
-delete behind a human approval.
+versions, deployments, schedules, budgets and spend, kill state, approvals,
+memory, traces and metrics. It has exactly two kinds of write, both reversible
+with one opposite call: pause or resume a schedule, and kill or resume an agent.
+The bundle's `toolPolicy` puts all four behind a human approval.
+
+Everything else an operator can do is deliberately absent, not gated: deletes
+wait until Curie can undo or restore them, and budgets, redeploys, firing hooks
+and writing another agent's memory come later, one at a time. A tool that does
+not exist cannot be talked into running.
 
 Where the platform key lives
 ----------------------------
@@ -39,7 +43,6 @@ reach this container. So the server checks `Authorization: Bearer
 import hmac
 import logging
 import os
-import uuid
 from typing import Any
 
 import httpx
@@ -53,8 +56,8 @@ log = logging.getLogger("curie-manager-platform")
 API_URL = os.environ.get("PLATFORM_API_URL", "http://curie-api:8000").rstrip("/")
 PLATFORM_KEY = os.environ.get("MANAGER_PLATFORM_KEY", "")
 MCP_TOKEN = os.environ.get("MANAGER_MCP_TOKEN", "")
-# The agent this connector serves. Killing or deleting it would leave nobody to
-# resume it, so those two tools refuse it by name.
+# The agent this connector serves. Killing it would leave nobody to resume it,
+# so `kill_agent` refuses it by name.
 SELF_AGENT = os.environ.get("MANAGER_SELF_AGENT", "curie-manager").strip()
 TIMEOUT = float(os.environ.get("PLATFORM_API_TIMEOUT_SECONDS", "30"))
 # A tool reply is read by a model, so a long list is cut rather than flooding
@@ -68,9 +71,6 @@ READ = ToolAnnotations(
 )
 OPERATE = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
-)
-DELETE = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
 )
 
 
@@ -272,16 +272,8 @@ def get_trace(trace_id: str) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Operations
+# Operations. Each one is reversible by its opposite, and each needs approval.
 # --------------------------------------------------------------------------- #
-@mcp.tool(annotations=OPERATE)
-def fire_hook(agent: str, hook: str) -> dict[str, Any]:
-    """Run an agent's cron hook now, outside its schedule. Returns the run record
-    once the turn settles."""
-    found = _agent(agent)
-    return _call("POST", f"/agents/{found['id']}/hooks/{hook}/fire")
-
-
 @mcp.tool(annotations=OPERATE)
 def pause_schedule(agent: str, hook: str) -> dict[str, Any]:
     """Stop a cron hook from firing until it is resumed."""
@@ -308,89 +300,6 @@ def resume_agent(agent: str) -> dict[str, Any]:
     """Let a killed agent take turns again."""
     found = _agent(agent)
     return {"agent": found["name"], **_call("POST", f"/agents/{found['id']}/resume")}
-
-
-@mcp.tool(annotations=OPERATE)
-def set_budget(
-    agent: str, max_usd_per_day: float = 0, max_output_tokens_per_run: int = 0
-) -> dict[str, Any]:
-    """Change an agent's daily spend cap and per-run output token cap. A limit
-    left at 0 keeps its current value. Returns the budget before and after."""
-    found = _agent(agent)
-    path = f"/agents/{found['id']}/budget"
-    before = _call("GET", path)
-    after = dict(before)
-    if max_usd_per_day > 0:
-        after["max_usd_per_day"] = max_usd_per_day
-    if max_output_tokens_per_run > 0:
-        after["max_output_tokens_per_run"] = max_output_tokens_per_run
-    if after == before:
-        raise ToolError("give a new max_usd_per_day or max_output_tokens_per_run above 0")
-    return {"agent": found["name"], "before": before, "after": _call("PUT", path, json=after)}
-
-
-@mcp.tool(annotations=OPERATE)
-def add_memory(agent: str, content: str) -> dict[str, Any]:
-    """Add one line to an agent's memory log. It loads into that agent's prompt
-    from its next turn."""
-    if not content.strip():
-        raise ToolError("memory content is empty")
-    found = _agent(agent)
-    return _call("POST", f"/agents/{found['id']}/memory", json={"content": content.strip()})
-
-
-@mcp.tool(annotations=OPERATE)
-def deploy_version(agent: str, version_id: str, environment: str = "prod") -> dict[str, Any]:
-    """Put one of an agent's EXISTING versions in force (`list_versions` names
-    them). This is how to roll back. It cannot upload a new bundle."""
-    if environment not in ("prod", "dev"):
-        raise ToolError("environment is prod or dev")
-    try:
-        uuid.UUID(version_id)
-    except ValueError as exc:
-        raise ToolError(f"{version_id!r} is not a version id") from exc
-    found = _agent(agent)
-    known = {v["id"] for v in _call("GET", f"/agents/{found['id']}/versions")}
-    if version_id not in known:
-        raise ToolError(f"{found['name']} has no version {version_id}")
-    return _call(
-        "POST",
-        "/deployments",
-        json={"agent_id": found["id"], "version_id": version_id, "environment": environment},
-    )
-
-
-# --------------------------------------------------------------------------- #
-# Deletes. The bundle's toolPolicy puts every one of these behind an approval.
-# --------------------------------------------------------------------------- #
-@mcp.tool(annotations=DELETE)
-def delete_agent(agent: str) -> dict[str, Any]:
-    """Delete an agent with its channels, versions and state. Not reversible.
-    Refuses the agent running this tool."""
-    found = _agent(agent)
-    _refuse_self(found, "delete")
-    _call("DELETE", f"/agents/{found['id']}")
-    return {"deleted": found["name"]}
-
-
-@mcp.tool(annotations=DELETE)
-def end_deployment(deployment_id: str) -> dict[str, Any]:
-    """End a deployment, so its version is no longer in force."""
-    _call("DELETE", f"/deployments/{deployment_id}")
-    return {"ended": deployment_id}
-
-
-@mcp.tool(annotations=DELETE)
-def delete_memory(agent: str, index: int, expected_version: int) -> dict[str, Any]:
-    """Delete one memory entry. `expected_version` is the entry's `version` from
-    `list_memory`; a stale one is refused rather than deleting the wrong line."""
-    found = _agent(agent)
-    _call(
-        "DELETE",
-        f"/agents/{found['id']}/memory/{index}",
-        params={"expected_version": expected_version},
-    )
-    return {"agent": found["name"], "deleted_index": index}
 
 
 # --------------------------------------------------------------------------- #

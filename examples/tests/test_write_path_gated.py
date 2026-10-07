@@ -140,8 +140,24 @@ def test_declared_gate_passes(tmp_path: Path) -> None:
     assert run(examples).returncode == 0
 
 
-def test_literal_tool_policy_entry_classifies_the_write_tool(tmp_path: Path) -> None:
-    """A tool the owner names in toolPolicy was classified on purpose, not forgotten."""
+def test_a_literal_approval_required_entry_gates_the_write_tool(tmp_path: Path) -> None:
+    """A write tool the owner names in approvalRequired still waits for a person."""
+    examples = bundle(
+        tmp_path,
+        gates=[],
+        connectors={"k8s-write": {"image": "x", "env": {}}},
+        servers={"k8s-write": WRITE_SERVER},
+        tool_policy={
+            "enforcement": "curie/mcp-tool-policy@1",
+            "approvalRequired": ["k8s-write/restart_deployment"],
+        },
+    )
+    r = run(examples)
+    assert r.returncode == 0, r.stderr
+
+
+def test_an_allow_entry_does_not_excuse_an_ungated_write_tool(tmp_path: Path) -> None:
+    """Allowing a write lets it run with nobody deciding; that is what this guard stops."""
     examples = bundle(
         tmp_path,
         gates=[],
@@ -153,7 +169,8 @@ def test_literal_tool_policy_entry_classifies_the_write_tool(tmp_path: Path) -> 
         },
     )
     r = run(examples)
-    assert r.returncode == 0, r.stderr
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert GATE in r.stderr, r.stderr
 
 
 def test_glob_tool_policy_entry_does_not_classify_the_write_tool(tmp_path: Path) -> None:
@@ -163,7 +180,10 @@ def test_glob_tool_policy_entry_does_not_classify_the_write_tool(tmp_path: Path)
         gates=[],
         connectors={"k8s-write": {"image": "x", "env": {}}},
         servers={"k8s-write": WRITE_SERVER},
-        tool_policy={"enforcement": "curie/mcp-tool-policy@1", "allow": ["k8s-write/*"]},
+        tool_policy={
+            "enforcement": "curie/mcp-tool-policy@1",
+            "approvalRequired": ["k8s-write/*"],
+        },
     )
     r = run(examples)
     assert r.returncode == 1, r.stdout + r.stderr

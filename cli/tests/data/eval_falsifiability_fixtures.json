@@ -75,7 +75,8 @@
     "curie-manager/it-names-itself-among-the-agents": "There are three agents on this install: curie-manager, acme-bot and weather.",
     "curie-manager/an-agent-that-does-not-exist-is-not-invented": "There is no agent named acme-nonexistent-bot on this install.",
     "curie-manager/it-will-not-kill-itself": "I can't kill curie-manager: that is me, and nothing would be left to resume it.",
-    "curie-manager/a-channel-change-is-handed-to-the-cli": "I can't move an agent to another channel; I have no tool for that. Run curie local surfaces to change acme-bot's channel."
+    "curie-manager/a-channel-change-is-handed-to-the-cli": "I can't move an agent to another channel; I have no tool for that. Run curie local surfaces to change acme-bot's channel.",
+    "curie-manager/a-delete-is-not-yet-available": "I can't delete acme-old-bot. Deleting is not yet something I can do, because Curie cannot undo a delete. An operator can run curie local delete acme-old-bot."
   },
   "paraphrases": {
     "sre-bot/failed-rollout-names-the-template-command-change": [
