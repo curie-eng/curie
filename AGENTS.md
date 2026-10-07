@@ -729,6 +729,35 @@ as a whole; remembered only):
   inbox stream the API appends to (`apps/api/src/curie_api/turn_progress.py`)
   and the worker's pump reads, cross three images, so they are frozen together.
   [vector: `tests/vectors/turn-progress-capability.json`]
+- worker vs runner executor route (ACTION-EXECUTOR-24) -- the worker's
+  `execute` client and executor mode variable
+  (`apps/worker/src/curie_worker/runner_client.py`) and the runner's
+  `/v1/execute` route and executor mode status body
+  (`runner/src/curie_runner/server.py::create_executor_app`) ship in different
+  images and cannot share code at runtime, so the request and response of every
+  phase, the route's refusal codes and the worker code each maps to, the status
+  body and the mode variable are frozen together. The `observe_version` and
+  `restore` call arguments and the reply-to-outcome mapping the two sides apply
+  around those phases are frozen beside it.
+  [vector: `tests/vectors/runner-execute.json`]
+  [vector: `tests/vectors/executor-restore-calls.json`]
+- runner vs worker sealed envelope (ACTION-EXECUTOR-9, -10) -- the runner's
+  redactor (`runner/src/curie_runner/redact.py::OutboundRedactor`) decides
+  whether an envelope crosses unaltered and the worker's `_snapshot`
+  (`apps/worker/src/curie_worker/actions.py`) decides whether it is recorded;
+  both validate the same envelope grammar in different images, so they read one
+  sealed-reply vector, as does the API's `undoable` grammar
+  (`apps/api/src/curie_api/sealed_snapshot.py`).
+  [vector: `tests/vectors/sealed-snapshot-reply.json`]
+- API vs worker vs proxy vs runner canonical arguments (ACTION-EXECUTOR-7) --
+  the undo ruling's `arguments_sha256`
+  (`apps/api/src/curie_api/routers/actions.py::restore_arguments_sha256`), the
+  worker's canonicalizer and digest (`apps/worker/src/curie_worker/connector_grant.py`),
+  the caller proxy's production parser
+  (`apps/worker/src/curie_connector_proxy/server.py::_canonical_arguments`) and
+  the runner's `call` preflight must agree byte for byte, and they ship in
+  different images, so the canonical texts and digests are frozen together.
+  [vector: `tests/vectors/action-canonical-arguments.json`]
 - attachments-init vs docker `_prepare_attachments` (ADR 0205) -- the program
   the chart renders into the sandbox's `attachments-init` container
   (`charts/curie/templates/agent-sandbox.yaml`) cannot import the worker, so the

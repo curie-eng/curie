@@ -40,9 +40,7 @@ async def test_recording_a_call_sends_its_arguments_and_a_dedupe_key() -> None:
     client, seen = _client(lambda _r: httpx.Response(201, json={"id": "a1", "status": "pending"}))
 
     async with client:
-        recorded = await ActionClient(
-            api_base_url="http://api", api_key="k", client=client
-        ).record(
+        recorded = await ActionClient(api_base_url="http://api", api_key="k", client=client).record(
             SideEffectFlag(
                 tool="scale_deployment",
                 call_id="toolu_01",
@@ -70,9 +68,7 @@ async def test_a_redelivered_record_is_not_an_error() -> None:
     client, _ = _client(lambda _r: httpx.Response(200, json={"id": "a1", "status": "pending"}))
 
     async with client:
-        recorded = await ActionClient(
-            api_base_url="http://api", api_key="k", client=client
-        ).record(
+        recorded = await ActionClient(api_base_url="http://api", api_key="k", client=client).record(
             SideEffectFlag(tool="t", call_id="c", arguments={}),
             event_id="e",
             conversation_id="C1",
@@ -82,11 +78,20 @@ async def test_a_redelivered_record_is_not_an_error() -> None:
     assert recorded.id == "a1"
 
 
-async def test_completing_a_call_forwards_the_prior_state_a_restore_replays() -> None:
-    """`prior` and `target` come out of the CONNECTOR's reply, not the arguments.
+_ENVELOPE = {
+    "sealed": "curie.snapshot.v1",
+    "kid": "example-key-2026-10",
+    "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=",
+}
+
+
+async def test_completing_a_call_forwards_the_sealed_prior_state_a_restore_replays() -> None:
+    """`prior`, `version` and `target` come out of the CONNECTOR's reply, not the arguments.
 
     No function of `replicas=10` can produce the replica count from before the
     call. That is why the reply is the declaration (ADR-0117 decision 1).
+    @spec ACTION-EXECUTOR-9: the restorable prior is a sealed envelope, and the
+    version the call left is recorded as ``post_version``.
     """
 
     client, seen = _client(lambda _r: httpx.Response(200, json={"id": "a1", "status": "succeeded"}))
@@ -100,7 +105,8 @@ async def test_completing_a_call_forwards_the_prior_state_a_restore_replays() ->
                 failed=False,
                 result={
                     "ok": True,
-                    "prior": {"spec": {"replicas": 3}},
+                    "prior": _ENVELOPE,
+                    "version": "rv-1041",
                     "post": {"spec": {"replicas": 10}},
                     "target": {"kind": "Deployment", "name": "api"},
                 },
@@ -109,13 +115,51 @@ async def test_completing_a_call_forwards_the_prior_state_a_restore_replays() ->
         )
 
     assert seen[0]["path"] == "/actions/a1/complete"
-    assert seen[0]["body"]["prior_state"] == {"spec": {"replicas": 3}}
-    # What the call LEFT, which is what a conflict check compares the live
-    # resource against. It cannot be derived from `replicas=10`: a PATCH's
-    # result is not its request body.
+    assert seen[0]["body"]["prior_state"] == _ENVELOPE
+    assert seen[0]["body"]["post_version"] == "rv-1041"
+    # What the call LEFT, readable beside the opaque version. It cannot be
+    # derived from `replicas=10`: a PATCH's result is not its request body.
     assert seen[0]["body"]["post_state"] == {"spec": {"replicas": 10}}
     assert seen[0]["body"]["target"] == {"kind": "Deployment", "name": "api"}
     assert seen[0]["body"]["failed"] is False
+
+
+async def test_a_cleartext_prior_state_is_history_not_a_restorable_snapshot() -> None:
+    """@spec ACTION-EXECUTOR-9: a cleartext ``prior`` stays in ``result`` only.
+
+    The reply is still forwarded whole, so the record keeps the history of the
+    call, and ``target`` and ``post`` still come from the reply, not the
+    arguments; but nothing restorable is recorded.
+    """
+
+    client, seen = _client(lambda _r: httpx.Response(200, json={"id": "a1", "status": "succeeded"}))
+    result = {
+        "ok": True,
+        "prior": {"spec": {"replicas": 3}},
+        "version": "rv-1041",
+        "post": {"spec": {"replicas": 10}},
+        "target": {"kind": "Deployment", "name": "api"},
+    }
+
+    async with client:
+        await ActionClient(api_base_url="http://api", api_key="k", client=client).complete(
+            "a1",
+            SideEffectFlag(
+                tool="scale_deployment",
+                call_id="toolu_01",
+                failed=False,
+                result=result,
+                detail="non-idempotent tool completed",
+            ),
+        )
+
+    body = seen[0]["body"]
+    assert body["result"] == result
+    assert body["prior_state"] is None
+    assert body["post_version"] is None
+    assert body["post_state"] == {"spec": {"replicas": 10}}
+    assert body["target"] == {"kind": "Deployment", "name": "api"}
+    assert body["failed"] is False
 
 
 async def test_a_prose_reply_completes_with_nothing_to_restore() -> None:
@@ -171,9 +215,7 @@ async def test_a_redacted_snapshot_never_produces_an_undoable_action() -> None:
     async with client:
         await ActionClient(api_base_url="http://api", api_key="k", client=client).complete(
             "a1",
-            SideEffectFlag(
-                tool="set_env", call_id="c", failed=False, result=result, redacted=True
-            ),
+            SideEffectFlag(tool="set_env", call_id="c", failed=False, result=result, redacted=True),
         )
 
     body = seen[0]["body"]

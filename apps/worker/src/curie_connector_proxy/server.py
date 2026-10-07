@@ -30,6 +30,7 @@ from nacl.signing import VerifyKey
 from yarl import URL
 
 from . import caller
+from .canonical import canonical_arguments
 
 LISTEN_PORT_ENV = "CURIE_CALLER_PROXY_PORT"
 UPSTREAM_PORT_ENV = "CURIE_CALLER_PROXY_UPSTREAM_PORT"
@@ -349,10 +350,10 @@ def _is_gated(config: ProxyConfig, name: str) -> bool:
 
 
 def _canonical_arguments(arguments: object) -> str | None:
-    if not isinstance(arguments, dict):
-        return None
+    """The shared canonical text, or None when it has none. @spec ACTION-EXECUTOR-7."""
+
     try:
-        return json.dumps(arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return canonical_arguments(arguments)
     except (TypeError, ValueError):
         return None
 

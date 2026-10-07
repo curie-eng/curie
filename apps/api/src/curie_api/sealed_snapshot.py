@@ -27,6 +27,8 @@ MAX_CIPHERTEXT_BYTES: Final = 65536
 # carried it would fail the alphabet below.
 REDACTION_PLACEHOLDER_PREFIX: Final = "[REDACTED:"
 
+MAX_VERSION_LENGTH: Final = 256
+_PRINTABLE_ASCII = re.compile(r"[\x20-\x7e]+")
 _ENVELOPE_KEYS: Final = frozenset({"sealed", "kid", "ciphertext"})
 _KID = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # Standard alphabet only: the URL-safe ``-`` and ``_`` are refused, as are
@@ -60,3 +62,19 @@ def is_sealed_envelope(value: Any) -> bool:
     except (binascii.Error, ValueError):
         return False
     return 0 < len(decoded) <= MAX_CIPHERTEXT_BYTES
+
+
+def is_post_version(value: Any) -> bool:
+    """1 to 256 printable ASCII characters, no placeholder. @spec ACTION-EXECUTOR-9.
+
+    Refused rather than truncated: the observation comparison trusts the stored
+    version, so a malformed one must never be stored at all. The worker's
+    ``_snapshot`` applies the same rule before it reports one.
+    """
+
+    return (
+        isinstance(value, str)
+        and len(value) <= MAX_VERSION_LENGTH
+        and _PRINTABLE_ASCII.fullmatch(value) is not None
+        and REDACTION_PLACEHOLDER_PREFIX not in value
+    )

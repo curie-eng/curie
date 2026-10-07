@@ -136,6 +136,20 @@
             ],
             "title": "Post State"
           },
+          "post_version": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "^[\\x20-\\x7e]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post Version"
+          },
           "prior_state": {
             "anyOf": [
               {

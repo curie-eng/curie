@@ -85,15 +85,15 @@ def test_a_recorded_call_survives_the_worker_to_api_hop(client: Any, anyio_backe
     assert row["call_id"] == "toolu_01"
     assert row["arguments"] == {"name": "api", "replicas": 10}
     assert row["dedupe_key"] == "event-1:toolu_01"
-    # The half a rename would silently break: the connector reported `prior` and
-    # `target` inside its reply, and the row has to hold them as the columns a
-    # restore replays.
-    assert row["prior_state"] == {"spec": {"replicas": 3}}
+    # The half a rename would silently break: the connector reported `target`
+    # and `post` inside its reply, and the row holds them under those names.
+    # @spec ACTION-EXECUTOR-9: a cleartext `prior` is not a sealed envelope, so
+    # the worker no longer records it as prior_state at all.
+    assert row["prior_state"] is None
     assert row["post_state"] == {"spec": {"replicas": 10}}
     assert row["target"] == {"kind": "Deployment", "name": "api"}
     assert row["status"] == "succeeded"
-    # @spec ACTION-EXECUTOR-11: a cleartext ``prior`` crosses and is stored as
-    # history, but it is not a sealed envelope, so the row is not undoable.
+    # @spec ACTION-EXECUTOR-11: without a sealed envelope the row is not undoable.
     # Field survival, not reversibility, is what this seam test pins.
     assert row["undoable"] is False
 
@@ -113,7 +113,7 @@ def test_a_call_that_never_reported_what_it_left_is_not_offered_as_undoable(
     reply = {key: value for key, value in _SNAPSHOT.items() if key != "post"}
     row = anyio.run(_round_trip, client.app, reply)
 
-    assert row["prior_state"] == {"spec": {"replicas": 3}}
+    assert row["prior_state"] is None  # @spec ACTION-EXECUTOR-9: cleartext prior not recorded
     assert row["target"] == {"kind": "Deployment", "name": "api"}
     assert row["post_state"] is None
     assert row["undoable"] is False

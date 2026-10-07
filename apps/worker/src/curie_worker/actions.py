@@ -22,6 +22,8 @@ from typing import Any, Protocol
 import httpx
 from aci_protocol import SideEffectFlag
 
+from .sealed_snapshot import carries_placeholder, is_post_version, is_sealed_envelope
+
 logger = logging.getLogger(__name__)
 
 # The keys a reporting connector answers with. Named here rather than inline
@@ -31,6 +33,8 @@ logger = logging.getLogger(__name__)
 PRIOR_KEY = "prior"
 POST_KEY = "post"
 TARGET_KEY = "target"
+# The version the call left (ACTION-EXECUTOR-9), recorded as ``post_version``.
+VERSION_KEY = "version"
 
 
 class ActionBackendError(RuntimeError):
@@ -59,38 +63,61 @@ class ActionRecorder(Protocol):
     async def complete(self, action_id: str, frame: SideEffectFlag) -> dict[str, Any]: ...
 
 
-def _snapshot(
-    frame: SideEffectFlag,
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
-    """What the call read, what it left, and what it acted on -- from its reply.
+@dataclass(frozen=True)
+class Snapshot:
+    """What the completion records out of one connector reply."""
 
-    ``prior`` is what a restore puts back and ``post`` is what a restore is
-    checked against, so the two are not interchangeable: comparing the live
-    resource to ``prior`` would refuse every undo that is actually safe and
-    permit exactly the one that is not.
+    prior_state: dict[str, Any] | None
+    post_state: dict[str, Any] | None
+    target: dict[str, Any] | None
+    post_version: str | None
 
-    A connector that answered in prose carries no structured result and lands
-    here as all-None, which downstream means not undoable. So does one that
-    returned JSON without reporting these. Neither is an error and neither is
-    inferred: an inferred state is a guess a restore would act on.
+
+_NOTHING = Snapshot(None, None, None, None)
+
+
+def _snapshot(frame: SideEffectFlag) -> Snapshot:
+    """What a restore needs, from the connector's reply. @spec ACTION-EXECUTOR-9.
+
+    ``prior_state`` is recorded exactly when the frame is not ``redacted``,
+    ``prior`` validates as a sealed envelope, ``version`` is a valid version and
+    neither ``target`` nor ``version`` carries the redaction placeholder; then
+    ``version`` is recorded as ``post_version``. Anything else records neither,
+    so the row is not undoable (ACTION-EXECUTOR-11). A cleartext ``prior`` is
+    history: it stays in ``result`` and is never restorable state.
+
+    A ``redacted`` frame is the frozen consumer rule on ``SideEffectFlag``: the
+    runner replaced or withheld something in ``result``, so nothing in it is
+    replayed (#1873), even an envelope that crossed unaltered beside a scrubbed
+    field (ACTION-EXECUTOR-10). The placeholder check is defense in depth for
+    Curie's own scrubber.
+
+    ``target`` and ``post`` stay on the record whenever they are objects: they
+    are what a person reads, and neither alone makes a row undoable.
     """
 
     result = frame.result
     if not isinstance(result, dict):
-        return None, None, None
-    if frame.redacted:
-        # The runner replaced something inside this reply, so ``prior`` may hold
-        # a placeholder where a value was, and a restore would write it (#1873).
-        # Recording neither state keeps the row not undoable; ``target`` names
-        # what was acted on and is never replayed, so it stays.
-        target = result.get(TARGET_KEY)
-        return None, None, target if isinstance(target, dict) else None
+        return _NOTHING
 
     def _obj(key: str) -> dict[str, Any] | None:
         value = result.get(key)
         return value if isinstance(value, dict) else None
 
-    return _obj(PRIOR_KEY), _obj(POST_KEY), _obj(TARGET_KEY)
+    target = _obj(TARGET_KEY)
+    if frame.redacted:
+        return Snapshot(None, None, target, None)
+    prior = result.get(PRIOR_KEY)
+    version = result.get(VERSION_KEY)
+    sealed = (
+        is_sealed_envelope(prior)
+        and is_post_version(version)
+        and target is not None
+        and not carries_placeholder(target)
+    )
+    if not sealed:
+        return Snapshot(None, _obj(POST_KEY), target, None)
+    return Snapshot(prior, _obj(POST_KEY), target, version)
 
 
 class ActionClient:
@@ -147,15 +174,16 @@ class ActionClient:
         reversibility the row does not have.
         """
 
-        prior, post, target = _snapshot(frame)
+        snapshot = _snapshot(frame)
         return await self._post(
             f"{self._url}/{action_id}/complete",
             {
                 "failed": bool(frame.failed),
                 "result": frame.result,
-                "prior_state": prior,
-                "post_state": post,
-                "target": target,
+                "prior_state": snapshot.prior_state,
+                "post_state": snapshot.post_state,
+                "post_version": snapshot.post_version,
+                "target": snapshot.target,
                 "detail": frame.detail,
             },
             "action complete",
