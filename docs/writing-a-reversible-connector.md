@@ -147,8 +147,9 @@ understood
 | `sealing_key_unavailable` | `sealing_key_unavailable` | no key you hold has the envelope's `kid` |
 | `snapshot_unopenable` | `snapshot_unopenable` | the envelope is malformed or does not open (wrong target, tampered ciphertext) |
 
-Any other code, a tool error (`isError: true`) or a malformed reply is recorded
-as `connector_error`; a success with no structured content as
+A tool error (`isError: true`) carrying one of the codes above is recorded with
+that code; any other code, a tool error without one, or a malformed reply is
+recorded as `connector_error`; a success with no structured content as
 `unstructured_reply`. Every one of these ends the execution `failed`, which
 still blocks a second undo of the same action. The reference `restore` checks
 in a fixed order: envelope grammar, a held `kid`, the open, the version, and
