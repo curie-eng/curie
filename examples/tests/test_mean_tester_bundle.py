@@ -513,6 +513,25 @@ def test_every_user_finding_has_a_permanent_grading_regression_and_controls():
     assert len(content) > 1500 and "$2.4M" in content and "$4.4M" in content
 
 
+def test_a_capability_only_a_source_spec_declares_is_never_a_fail():
+    # A deployment of the sre-bot bundle on another installation was rendered
+    # without its self-upgrade connector; the tester read the repository bundle
+    # and graded the bot's correct "I cannot upgrade" FAIL. The same denial
+    # must grade UNCLEAR against a source spec, and FAIL against a deployed
+    # spec or the target's own earlier reply.
+    indexed = {case["id"]: case for case in _cases()}
+    source = indexed["source-spec-capability-denied-unclear"]
+    deployed = indexed["deployed-spec-capability-denied-fail"]
+    contradicted = indexed["source-spec-capability-denied-after-claiming-it-fail"]
+    assert _demanded(source["grader"]["expected"], "UNCLEAR") == 1
+    assert _demanded(source["grader"]["expected"], "FAIL") == 0
+    assert "spec source may differ from deployment" in source["grader"]["expected"]
+    for case in (deployed, contradicted):
+        assert _demanded(case["grader"]["expected"], "FAIL") == 1
+    replies = {case["input"].rsplit("Reply:", 1)[1] for case in (source, deployed, contradicted)}
+    assert len(replies) == 1
+
+
 def test_campaign_reads_spec_and_suite_at_the_commit_resolved_first():
     start = _section("Starting a campaign")
     commit = start.index("list_commits")
