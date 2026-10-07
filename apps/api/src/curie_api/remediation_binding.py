@@ -64,6 +64,9 @@ class ProtectedEvent:
     agent_id: uuid.UUID
     hook: str
     admitted_generation: int | None
+    # The envelope's ``logical_conversation_key``: the delivery's conversation,
+    # which an approval request names (AUTOMATED-REMEDIATION-15).
+    conversation_id: str | None = None
 
 
 def _read_binding(runtime: IngressRuntime, event_id: str) -> bytes | None:
@@ -113,9 +116,11 @@ async def resolve_protected_event(event_id: str) -> ProtectedEvent | None:
     # Absent from a binding written before the field: no admitted generation,
     # which sends the turn to approval and never refuses it.
     admitted = envelope.get(REMEDIATION_GENERATION)
+    conversation = envelope.get("logical_conversation_key")
     return ProtectedEvent(
         event_id=event_id,
         agent_id=uuid.UUID(shape["agent"]),
         hook=shape["hook"],
         admitted_generation=None if admitted is None else int(admitted),
+        conversation_id=conversation if isinstance(conversation, str) else None,
     )

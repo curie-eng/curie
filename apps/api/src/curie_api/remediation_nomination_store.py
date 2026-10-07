@@ -149,6 +149,7 @@ async def record_submission(
             agent_id=event.agent_id,
             hook=event.hook,
             block_sha256=digest,
+            conversation_id=event.conversation_id,
         )
         .on_conflict_do_nothing(index_elements=["event_id"])
         .returning(RemediationNominationSubmission.event_id)

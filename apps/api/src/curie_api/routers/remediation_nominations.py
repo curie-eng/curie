@@ -11,10 +11,14 @@ token never reach it. The body is exactly ``event_id`` and the block. In order:
    (404), an unreadable broker is ``503``;
 3. the event's first accepted submission wins: a byte-identical replay returns
    the same answer, different bytes are ``nomination_conflict`` (409);
-4. the block is parsed and one row per entry (or one malformed row) is written.
+4. the block is parsed and one row per entry (or one malformed row) is written;
+5. admission (``curie_api.remediation_admission``) decides each ``received``
+   row in the order of AUTOMATED-REMEDIATION-8: ``refused`` ``agent_stopped``,
+   ``approval_requested`` naming the failed check, or ``precondition_pending``
+   with its precondition read.
 
-The worker never reads the policy and never decides admission; nothing here
-creates an approval or an execution. Responses carry ``Cache-Control: no-store``.
+The worker never reads the policy and never decides admission. Responses carry
+``Cache-Control: no-store``.
 """
 
 from __future__ import annotations
@@ -26,7 +30,8 @@ from fastapi.responses import JSONResponse
 
 from ..auth import require_internal_worker_token
 from ..config import get_settings
-from ..deps import SessionDep
+from ..deps import KillSwitchDep, SessionDep, StoreDep
+from ..remediation_admission import admit_nominations
 from ..remediation_binding import BindingUnavailable, resolve_protected_event
 from ..remediation_nomination_store import (
     EventAgentMissing,
@@ -62,12 +67,16 @@ def _refused(status_code: int, code: str) -> JSONResponse:
     responses={404: _REFUSAL, 409: _REFUSAL, 503: {"description": "Broker unavailable"}},
 )
 async def submit_remediation_nominations(
-    body: RemediationNominationSubmit, session: SessionDep
+    body: RemediationNominationSubmit,
+    session: SessionDep,
+    store: StoreDep,
+    kill_switch: KillSwitchDep,
 ) -> JSONResponse:
     """Record one protected turn's nomination block.
 
     \f
-    @spec AUTOMATED-REMEDIATION-1 @spec AUTOMATED-REMEDIATION-6 @spec AUTOMATED-REMEDIATION-7.
+    @spec AUTOMATED-REMEDIATION-1 @spec AUTOMATED-REMEDIATION-6 @spec AUTOMATED-REMEDIATION-7
+    @spec AUTOMATED-REMEDIATION-8.
     """
     settings = get_settings()
     if not (settings.remediation_enabled and settings.action_executor_enabled):
@@ -87,5 +96,8 @@ async def submit_remediation_nominations(
         return _refused(404, "not_protected_event")
     except NominationConflict:
         return _refused(409, "nomination_conflict")
+    # @spec AUTOMATED-REMEDIATION-8: admission decides each received row; a
+    # replay finds them decided and changes nothing.
+    await admit_nominations(session, store, kill_switch, ids)
     accepted = RemediationNominationAccepted(event_id=event.event_id, nomination_ids=ids)
     return JSONResponse(content=accepted.model_dump(mode="json"), headers=_NO_STORE)
