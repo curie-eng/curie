@@ -450,14 +450,14 @@ def test_agent_resource_reads_return_the_stored_override_and_null_default() -> N
     async def go() -> None:
         async with _resource_binding() as (resolver, engine, schema, agent_id):
             assert await resolver.model_settings_for(agent_id) == (
-                "acme-model", "high", _OVERRIDE
+                "acme-model", None, "high", _OVERRIDE
             )
             assert await resolver.runner_resources_for(agent_id) == _OVERRIDE
-            assert await resolver.model_settings_for(uuid.uuid4()) == (None, None, None)
+            assert await resolver.model_settings_for(uuid.uuid4()) == (None, None, None, None)
             assert await resolver.runner_resources_for(uuid.uuid4()) is None
             async with engine.begin() as conn:
                 await conn.execute(text(f"UPDATE {schema}.agents SET runner_resources = NULL"))
-            assert await resolver.model_settings_for(agent_id) == ("acme-model", "high", None)
+            assert await resolver.model_settings_for(agent_id) == ("acme-model", None, "high", None)
             assert await resolver.runner_resources_for(agent_id) is None
 
     asyncio.run(go())

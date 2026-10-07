@@ -193,24 +193,33 @@ impl OverrideChange {
 ///
 /// Args:
 ///   model: the intent for the model override.
+///   reviewer_model: the intent for the reviewer model override.
 ///   thinking: the intent for the thinking override.
 ///
 /// Returns:
-///   The body to PATCH, or `None` when both intents are `Unchanged`.
+///   The body to PATCH, or `None` when every intent is `Unchanged`.
 pub fn overrides_patch_body(
     model: &OverrideChange,
+    reviewer_model: &OverrideChange,
     thinking: &OverrideChange,
     execution_deadline: &OverrideChange,
     runner_resources: &OverrideChange,
 ) -> Option<AgentUpdate> {
-    let all_unchanged = [model, thinking, execution_deadline, runner_resources]
-        .iter()
-        .all(|change| **change == OverrideChange::Unchanged);
+    let all_unchanged = [
+        model,
+        reviewer_model,
+        thinking,
+        execution_deadline,
+        runner_resources,
+    ]
+    .iter()
+    .all(|change| **change == OverrideChange::Unchanged);
     if all_unchanged {
         return None;
     }
     Some(AgentUpdate {
         model: model.patch_value(),
+        reviewer_model: reviewer_model.patch_value(),
         thinking: thinking.patch_value(),
         execution_deadline_seconds: execution_deadline.patch_value_as_seconds(),
         runner_resources: runner_resources.patch_value_as_object(),
@@ -239,6 +248,7 @@ fn patch_body_json(body: &AgentUpdate) -> Result<serde_json::Value> {
 /// Args:
 ///   agent: the agent's name.
 ///   model: the stored model override, `None` when the platform default applies.
+///   reviewer_model: the stored reviewer override, `None` when the credential default applies.
 ///   thinking: the stored thinking override, same convention.
 ///   execution_deadline_seconds: the stored deadline override, same convention.
 ///   runner_resources: the stored runner resources override, same convention.
@@ -247,9 +257,11 @@ fn patch_body_json(body: &AgentUpdate) -> Result<serde_json::Value> {
 ///
 /// Returns:
 ///   The summary line, with no trailing newline.
+#[allow(clippy::too_many_arguments)] // Mirrors every stored override and the inspect/write result.
 pub fn overrides_summary(
     agent: &str,
     model: &Option<String>,
+    reviewer_model: &Option<String>,
     thinking: &Option<String>,
     execution_deadline_seconds: &Option<u32>,
     runner_resources: &Option<serde_json::Value>,
@@ -257,6 +269,7 @@ pub fn overrides_summary(
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
+    let reviewer = reviewer_model.as_deref().unwrap_or("credential default");
     let deadline = execution_deadline_seconds
         .map(|s| format!("{s} s"))
         .unwrap_or_else(|| "platform default".to_string());
@@ -269,18 +282,18 @@ pub fn overrides_summary(
     let verb = if changed { " now" } else { "" };
     let writes = if memory_writes { "on" } else { "off" };
     format!(
-        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}",
+        "overrides for {agent}{verb}: model {}, reviewer model {reviewer}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}",
         show(model),
         show(thinking)
     )
 }
 
-/// Output of `<tier> overrides <agent>`: the dry-run plan, or the agent's two
+/// Output of `<tier> overrides <agent>`: the dry-run plan, or the agent's
 /// nullable overrides as the API stored them. Owns its data so it outlives the
 /// `ApiClient`.
 ///
-/// `model`/`thinking` are `None` when no override is pinned, which is the same
-/// fact the API returns as JSON null: the platform default applies. `changed`
+/// Nullable overrides are `None` when unpinned, matching the API's JSON null.
+/// The reviewer uses its credential default; other overrides use platform defaults. `changed`
 /// distinguishes an inspect from a write, so an agent consumer can tell "this
 /// is what it is" from "this is what it now is" without diffing.
 /// `memory_writes` is the agent's NOT NULL memory-tools switch (#1461), so it
@@ -291,6 +304,7 @@ pub enum OverridesOutput {
     Done {
         agent: String,
         model: Option<String>,
+        reviewer_model: Option<String>,
         thinking: Option<String>,
         execution_deadline_seconds: Option<u32>,
         runner_resources: Option<serde_json::Value>,
@@ -306,6 +320,7 @@ impl crate::ui::CliOutput for OverridesOutput {
             OverridesOutput::Done {
                 agent,
                 model,
+                reviewer_model,
                 thinking,
                 execution_deadline_seconds,
                 runner_resources,
@@ -314,6 +329,7 @@ impl crate::ui::CliOutput for OverridesOutput {
             } => serde_json::json!({
                 "agent": agent,
                 "model": model,
+                "reviewer_model": reviewer_model,
                 "thinking": thinking,
                 "execution_deadline_seconds": execution_deadline_seconds,
                 "runner_resources": runner_resources,
@@ -329,6 +345,7 @@ impl crate::ui::CliOutput for OverridesOutput {
             OverridesOutput::Done {
                 agent,
                 model,
+                reviewer_model,
                 thinking,
                 execution_deadline_seconds,
                 runner_resources,
@@ -338,6 +355,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 ui.payload(&overrides_summary(
                     agent,
                     model,
+                    reviewer_model,
                     thinking,
                     execution_deadline_seconds,
                     runner_resources,
@@ -349,7 +367,7 @@ impl crate::ui::CliOutput for OverridesOutput {
     }
 }
 
-/// `curie <tier> overrides <agent> [--model V|--clear-model] [--thinking V|--clear-thinking]`.
+/// `curie <tier> overrides <agent>` sets or clears model, reviewer and thinking overrides.
 ///
 /// With no change flags this INSPECTS: one `GET`-resolved agent, no write. With
 /// any change flag it PATCHes only the fields named, then reports the row as the
@@ -366,6 +384,7 @@ impl crate::ui::CliOutput for OverridesOutput {
 /// Args:
 ///   opts: api url/key, the agent name or id, and the dry-run flag.
 ///   model: the intent for the model override.
+///   reviewer_model: the intent for the reviewer model override.
 ///   thinking: the intent for the thinking override.
 ///
 /// Returns:
@@ -373,6 +392,7 @@ impl crate::ui::CliOutput for OverridesOutput {
 pub async fn overrides(
     opts: AgentActionOpts,
     model: OverrideChange,
+    reviewer_model: OverrideChange,
     thinking: OverrideChange,
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
@@ -380,6 +400,7 @@ pub async fn overrides(
     overrides_with_memory_writes(
         opts,
         model,
+        reviewer_model,
         thinking,
         execution_deadline,
         runner_resources,
@@ -404,6 +425,7 @@ pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
 /// Args:
 ///   opts: api url/key, the agent name or id, and the dry-run flag.
 ///   model: the intent for the model override.
+///   reviewer_model: the intent for the reviewer model override.
 ///   thinking: the intent for the thinking override.
 ///   execution_deadline: the intent for the execution deadline.
 ///   runner_resources: the intent for the runner resources override.
@@ -414,13 +436,20 @@ pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
 pub async fn overrides_with_memory_writes(
     opts: AgentActionOpts,
     model: OverrideChange,
+    reviewer_model: OverrideChange,
     thinking: OverrideChange,
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
     memory_writes: Option<bool>,
 ) -> Result<OverridesOutput> {
     let ui = crate::ui::ui();
-    let mut body = overrides_patch_body(&model, &thinking, &execution_deadline, &runner_resources);
+    let mut body = overrides_patch_body(
+        &model,
+        &reviewer_model,
+        &thinking,
+        &execution_deadline,
+        &runner_resources,
+    );
     if let Some(on) = memory_writes {
         body.get_or_insert_with(AgentUpdate::default).memory_writes = Some(on);
     }
@@ -444,11 +473,12 @@ pub async fn overrides_with_memory_writes(
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
     let Some(body) = body else {
-        // Inspect: find_agent already carries both fields, so there is nothing
+        // Inspect: find_agent already carries every override, so there is nothing
         // further to fetch and nothing to write.
         return Ok(OverridesOutput::Done {
             agent: agent.name,
             model: agent.model,
+            reviewer_model: agent.reviewer_model,
             thinking: agent.thinking,
             execution_deadline_seconds: agent.execution_deadline_seconds,
             runner_resources: agent.runner_resources,
@@ -471,6 +501,7 @@ pub async fn overrides_with_memory_writes(
     Ok(OverridesOutput::Done {
         agent: saved.name,
         model: saved.model,
+        reviewer_model: saved.reviewer_model,
         thinking: saved.thinking,
         execution_deadline_seconds: saved.execution_deadline_seconds,
         runner_resources: saved.runner_resources,
@@ -663,12 +694,19 @@ mod overrides_tests {
     /// The PATCH body as it goes on the wire, or `None` for the inspect path.
     fn wire(
         model: &OverrideChange,
+        reviewer_model: &OverrideChange,
         thinking: &OverrideChange,
         execution_deadline: &OverrideChange,
         runner_resources: &OverrideChange,
     ) -> Option<serde_json::Value> {
-        overrides_patch_body(model, thinking, execution_deadline, runner_resources)
-            .map(|body| super::patch_body_json(&body).expect("encodes"))
+        overrides_patch_body(
+            model,
+            reviewer_model,
+            thinking,
+            execution_deadline,
+            runner_resources,
+        )
+        .map(|body| super::patch_body_json(&body).expect("encodes"))
     }
 
     // The property the whole verb rests on (#1310, #1311): an UNCHANGED field is
@@ -678,6 +716,7 @@ mod overrides_tests {
     #[test]
     fn an_unchanged_field_is_absent_and_a_cleared_field_is_present_and_null() {
         let body = wire(
+            &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Clear,
             &OverrideChange::Unchanged,
@@ -699,6 +738,7 @@ mod overrides_tests {
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
         )
         .is_none());
     }
@@ -707,6 +747,7 @@ mod overrides_tests {
     fn a_set_field_carries_its_value() {
         let body = wire(
             &OverrideChange::Set("kimi-k2".into()),
+            &OverrideChange::Unchanged,
             &OverrideChange::Set("adaptive".into()),
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
@@ -752,12 +793,13 @@ mod overrides_tests {
             &None,
             &None,
             &None,
+            &None,
             false,
             false,
         );
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off"
+            "overrides for a: model kimi-k2, reviewer model credential default, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -768,13 +810,14 @@ mod overrides_tests {
             super::overrides_summary(
                 "a",
                 &None,
+                &None,
                 &Some("adaptive".into()),
                 &Some(90),
                 &None,
                 true,
                 true
             ),
-            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on"
+            "overrides for a now: model platform default, reviewer model credential default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on"
         );
     }
 
@@ -800,6 +843,7 @@ mod overrides_tests {
     fn the_dry_run_body_carries_the_trimmed_value() {
         let body = wire(
             &OverrideChange::resolve("model", Some(" kimi-k2 ".into()), false).unwrap(),
+            &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
@@ -836,6 +880,7 @@ mod overrides_tests {
         let body = wire(
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
             &OverrideChange::resolve_execution_deadline(Some("120".into()), false).unwrap(),
             &OverrideChange::Unchanged,
         )
@@ -850,6 +895,7 @@ mod overrides_tests {
         let body = wire(
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
             &OverrideChange::Clear,
             &OverrideChange::Unchanged,
         )
@@ -861,6 +907,7 @@ mod overrides_tests {
     fn an_unchanged_execution_deadline_is_absent_when_model_and_thinking_are_set() {
         let body = wire(
             &OverrideChange::Set("kimi-k2".into()),
+            &OverrideChange::Unchanged,
             &OverrideChange::Set("adaptive".into()),
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,

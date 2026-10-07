@@ -75,6 +75,8 @@ pub struct AgentUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_branch_prefix: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub publication_draft: Option<bool>,

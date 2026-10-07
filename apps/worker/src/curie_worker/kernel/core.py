@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from ..actions import ActionRecorder
@@ -116,6 +117,10 @@ class Kernel:
         )
         if revoker is not None and poster is not None:
             revoker(poster)
+        minter = getattr(self._substrate, "set_boot_credential_minter", None)
+        signer = getattr(binding, "fresh_boot_credential", None) if binding is not None else None
+        if minter is not None and signer is not None:
+            minter(signer)
         # The trusted repository preparation lane. It is optional for generic
         # and legacy deployments. A turn that requires a repository refuses when
         # this lane is unavailable instead of booting an empty directory.
@@ -128,6 +133,11 @@ class Kernel:
         # the claim env is how that capability is delivered -- and its sibling
         # retention ledger is swept from the same reap tick as the workspace's.
         self._attachments = attachments
+        # #4079: one carry lookup per concurrent turn, each on its own daemon
+        # thread, so a lookup a slow store keeps running past its bound holds
+        # one of these slots rather than a thread in the shared pool that
+        # claims and lookups need.
+        self._carry_slots = asyncio.Semaphore(config.max_concurrency)
         self._killswitch = killswitch
         # The approval-record backend (#244). When absent (unwired tests, a
         # deployment without the API), an awaiting-approval run degrades to an
@@ -233,6 +243,7 @@ class Kernel:
     _is_approval_resume = staticmethod(approval_key._is_approval_resume)
     _route_attachment_and_start = attachments._route_attachment_and_start
     _discard_prepared_attachments = attachments._discard_prepared_attachments
+    _carried_attachment_env = attachments._carried_attachment_env
     _resolve_attachments = attachments._resolve_attachments
     _attempt = attempt._attempt
     _attempt_turn = attempt._attempt_turn

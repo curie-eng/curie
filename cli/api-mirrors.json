@@ -488,6 +488,10 @@
           "why": "The model override is written by the overrides verb through PATCH, so a created agent starts on the platform default."
         },
         {
+          "field": "reviewer_model",
+          "why": "The reviewer model override is written by the overrides verb through PATCH, so a created agent uses its credential default."
+        },
+        {
           "field": "publication_branch_prefix",
           "why": "Publication policy is written by the publication-policy verb through PATCH, not at creation."
         },
@@ -783,6 +787,7 @@
         {"field": "approval_required_tools", "why": "Approval gates belong to the approvals command."},
         {"field": "approval_routes", "why": "Approval routes belong to the approvals command."},
         {"field": "model", "why": "Model selection belongs to the overrides command."},
+        {"field": "reviewer_model", "why": "Reviewer model selection belongs to the overrides command."},
         {"field": "thinking", "why": "Thinking depth belongs to the overrides command."},
         {"field": "execution_deadline_seconds", "why": "Execution deadline belongs to the overrides command."},
         {"field": "runner_resources", "why": "Runner resources belong to the overrides command."},

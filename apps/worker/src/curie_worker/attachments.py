@@ -31,10 +31,11 @@ Three properties are load-bearing and each has a reason it is not merely style:
   workspace ownership ledger is keyed by ``sha256(thread_key)`` under
   ``_ownership/``, decodes to a typed ``PreparedWorkspace``, and carries the
   ROUTE lease, refreshed on every affinity touch.  Attachment bytes answer a
-  different question ("may a retry of this turn still fetch them?") on a
-  different clock, so they get their own prefix and their own expiry field,
-  swept from the SAME ``reap_orphans`` tick rather than folded into a
-  thread-ownership authority.
+  different question ("may a retry of this turn, or a later turn in this
+  thread that boots another sandbox, still fetch them?") on a different
+  clock, so they get their own prefix and their own expiry field, swept from
+  the SAME ``reap_orphans`` tick rather than folded into a thread-ownership
+  authority.
 
 The object-store port is the worker's existing ``WorkspaceObjectPort``: a
 sandbox is handed a presigned URL for exactly one object, never an object-store
@@ -54,7 +55,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Callable, Container, Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from aci_protocol import Attachment, ReplyHandle
@@ -152,7 +153,8 @@ class AttachmentLimits:
     read_chunk_bytes: int = 1024 * 1024
     #: How long the minted one-object capability stays redeemable.
     reference_ttl_seconds: int = 300
-    #: How long the parked bytes are retained for a redelivery of the turn.
+    #: How long the parked bytes are retained for a redelivery of the turn,
+    #: and for a later text-only turn in the thread that boots a fresh sandbox.
     retention_ttl_seconds: int = 3600
     max_files: int = 10
 
@@ -955,6 +957,86 @@ class AttachmentCoordinator:
             best = max(live, key=lambda owned: (owned[1].expires_at_epoch, owned[0]), default=None)
             return None if best is None else best[1]
 
+    def carry(self, thread_key: str, *, agent_id: str) -> dict[str, str]:
+        """The claim-env contribution that hands a text-only turn its thread's files.
+
+        A file belongs to the turn that carried it, but ``/attachments`` belongs
+        to one sandbox, and a follow-up in the same thread often boots another
+        one (#3823 turn budget, idle reap, approval resume). Its history still
+        names ``/attachments/<name>``, so the bytes have to be there too (#4079).
+        This re-mints the newest live set's capabilities for the same parked
+        objects; it writes no record and extends no retention.
+
+        Every refusal below returns nothing rather than a capability, because a
+        capability the init container cannot redeem fails the boot instead of
+        merely arriving without the file:
+
+        * a set with less than one reference TTL of retention left, which the
+          reaper may delete before the URL is redeemed;
+        * a set parked for another agent, since a thread key names a
+          conversation and not the agent answering it;
+        * a set one of whose objects is already gone (a discard that deleted
+          some bytes and kept its record).
+
+        A record that does not decode, or whose refs and objects disagree, is
+        skipped rather than raised: this is a best-effort read, and the reap
+        path still reports it.
+
+        The listing is scoped to this thread's own owner keys, not the whole
+        ledger ``_scan_owners`` walks, because this runs on every text-only turn.
+        It takes no lock: it only reads, and it already has to tolerate another
+        worker's reap or discard, so serializing against this process's reap
+        would only make turns wait behind it.
+        """
+
+        now = int(self._clock())
+        agent_prefix = f"{ATTACHMENT_OBJECT_PREFIX}/{agent_id}/"
+        live: list[tuple[str, _AttachmentSet]] = []
+        for key in tuple(self.objects.list_keys(self._owner_prefix(thread_key))):
+            try:
+                record = self._load_key(key)
+            except AttachmentResolutionError:
+                continue
+            except Exception as exc:
+                if self._is_missing_object(exc):
+                    continue
+                raise
+            if (
+                record.thread_key == thread_key
+                and record.expires_at_epoch > now
+                and len(record.refs) == len(record.object_keys)
+                and all(object_key.startswith(agent_prefix) for object_key in record.object_keys)
+            ):
+                live.append((key, record))
+        best = max(live, key=lambda owned: (owned[1].expires_at_epoch, owned[0]), default=None)
+        if best is None:
+            return {}
+        record = best[1]
+        if record.expires_at_epoch - now < self.limits.reference_ttl_seconds:
+            return {}
+        if not self._all_present(record.object_keys):
+            return {}
+        refs = tuple(
+            replace(
+                ref,
+                url=self.objects.presign_get(
+                    object_key, expires_seconds=self.limits.reference_ttl_seconds
+                ),
+                expires_at_epoch=now + self.limits.reference_ttl_seconds,
+            )
+            for ref, object_key in zip(record.refs, record.object_keys, strict=True)
+        )
+        return {ATTACHMENTS_REF_ENV: encode_attachment_refs(refs)}
+
+    def _all_present(self, object_keys: Sequence[str]) -> bool:
+        """Whether every object is still in the store, by listing its generation."""
+
+        wanted = set(object_keys)
+        found: set[str] = set()
+        for parent in dict.fromkeys(key.rsplit("/", 1)[0] for key in object_keys):
+            found.update(key for key in self.objects.list_keys(parent) if key in wanted)
+        return found == wanted
+
     def enumerate_expired(self) -> list[str]:
         """Snapshot expired thread ids without mutating their durable ledgers.
 
@@ -1064,8 +1146,14 @@ class AttachmentCoordinator:
         the bucket; the token is what makes the key unique per resolve.
         """
 
+        return f"{AttachmentCoordinator._owner_prefix(thread_key)}/{owner_token}.json"
+
+    @staticmethod
+    def _owner_prefix(thread_key: str) -> str:
+        """Where every owner record of one thread lives, below the ledger prefix."""
+
         digest = hashlib.sha256(thread_key.encode("utf-8")).hexdigest()
-        return f"{ATTACHMENT_LEDGER_PREFIX}/{digest}/{owner_token}.json"
+        return f"{ATTACHMENT_LEDGER_PREFIX}/{digest}"
 
     def _scan_owners(self) -> Iterator[tuple[str, _AttachmentSet]]:
         """THE owner discovery path: one listing of the whole ledger prefix.
@@ -1077,6 +1165,11 @@ class AttachmentCoordinator:
         and strand its objects forever. One scan and one decoder means an old
         record and a new one are the same thing to every caller, with no
         migration step and no second code path to keep honest.
+
+        ``carry`` is the one deliberate exception. It only reads, it runs on
+        every text-only turn, and a pre-upgrade record it misses costs a
+        follow-up its file rather than stranding bytes, so it lists the thread's
+        own subprefix instead.
 
         A key can be deleted by another worker's discard or reap between the
         listing and the read, which is ordinary rather than exceptional, so a

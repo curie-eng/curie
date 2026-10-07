@@ -27,7 +27,10 @@ def test_notice_migration_appends_to_released_head() -> None:
     assert "0074" not in revisions
     assert revisions["0075"] == ("0073", "0075_hook_source_policies.py")
     assert revisions["0076"][0] == "0075"
-    assert revisions["0077"] == ("0076", "0077_agent_deploy_notifications.py")
+    assert revisions["0079"][0] == "0076"
+    assert revisions["0080"][0] == "0079"
+    assert revisions["0081"][0] == "0080"
+    assert revisions["0082"] == ("0081", "0082_agent_deploy_notifications.py")
 
 
 def test_candidate_does_not_rewrite_released_windows() -> None:
@@ -35,16 +38,16 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     catalog = json.loads((ROOT / "cli/src/application_schema_windows.json").read_text())
     released = {"schema_min": "0070", "schema_head": "0073"}
     stable = {"schema_min": "0076", "schema_head": "0076"}
-    # The candidate keeps moving as later migrations land (#2909 added 0078, #3819 added 0079,
-    # #4067 added 0081, #4079 added 0082);
-    # the point of this test is that `released`/`stable` above never do.
-    candidate = {"schema_min": "0077", "schema_head": "0082"}
+    # Feature migrations append after the published v0.12.2 head; published
+    # application windows remain fixed while the candidate advances.
+    candidate = {"schema_min": "0082", "schema_head": "0086"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
+    assert catalog["windows"]["0.12.2"] == {"schema_min": "0076", "schema_head": "0081"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == candidate
-    assert catalog["revisions"][-4:] == ["0078", "0079", "0081", "0082"]
+    assert catalog["revisions"][-5:] == ["0082", "0083", "0084", "0085", "0086"]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(
         (Path(__file__).parent / "fixtures/source_schema_prior_windows.json").read_text()

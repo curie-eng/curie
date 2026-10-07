@@ -18,6 +18,18 @@ pub(crate) enum ClusterHookAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Read one durable hook run, including a run that is still in flight.
+    Record {
+        /// Agent name or id.
+        agent: String,
+        /// Trigger name on the in-force bundle.
+        name: String,
+        /// Hook run id.
+        id: String,
+        /// Print what would be requested and exit without making a request.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -191,7 +203,9 @@ pub(crate) enum ClusterAction {
     /// is scoped to namespaces this release created, matched by both its
     /// release name and install namespace, so another release's namespaces
     /// on the same cluster are never touched. Pre-existing namespaces and
-    /// the agents.x-k8s.io CRDs are left in place.
+    /// the agents.x-k8s.io CRDs are left in place. The sweep waits at most
+    /// 300s. If owned namespaces remain, the command exits 3 and does not
+    /// remove finalizers.
     Down {
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
@@ -832,6 +846,12 @@ pub(crate) enum ClusterAction {
         /// Clear the model override back to the platform default.
         #[arg(long)]
         clear_model: bool,
+        /// Pin the reviewer model used at boot.
+        #[arg(long)]
+        reviewer_model: Option<String>,
+        /// Clear the reviewer model override.
+        #[arg(long)]
+        clear_reviewer_model: bool,
         /// Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`).
         #[arg(long)]
         thinking: Option<String>,
@@ -1081,7 +1101,7 @@ pub(crate) enum ClusterAction {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Fire a declared cron hook now (`POST /agents/{agent}/hooks/{name}/fire`).
+    /// Fire a declared cron hook now or read a durable run record.
     Hook {
         #[command(subcommand)]
         action: ClusterHookAction,
@@ -1093,7 +1113,8 @@ pub(crate) enum ClusterAction {
         #[command(flatten)]
         target: ClusterAgentTarget,
     },
-    /// Manage an agent's hook configuration and signing secret.
+    /// Manage an agent's webhook partitions and source bindings. Not cron triggers: see
+    /// `schedules` and `hook fire`.
     Hooks {
         #[command(subcommand)]
         action: ClusterHooksAction,

@@ -975,6 +975,7 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
     )
     .await
     .unwrap();
@@ -983,6 +984,7 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
         commands::OverridesOutput::Done {
             agent,
             model,
+            reviewer_model: _,
             thinking,
             execution_deadline_seconds: _,
             runner_resources: _,
@@ -1023,6 +1025,7 @@ async fn overrides_set_patches_only_the_field_named() {
 
     let out = commands::overrides(
         opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Set("enabled:2000".to_string()),
         commands::OverrideChange::Unchanged,
@@ -1074,6 +1077,7 @@ async fn overrides_clear_sends_explicit_null_not_an_empty_string() {
     let out = commands::overrides(
         opts(&server.base_url, "deal-desk", false),
         commands::OverrideChange::Clear,
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Clear,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
@@ -1128,6 +1132,7 @@ async fn overrides_dry_run_makes_no_request_on_either_path() {
         let out = commands::overrides(
             opts(&server.base_url, "deal-desk", true),
             model,
+            commands::OverrideChange::Unchanged,
             thinking,
             commands::OverrideChange::Unchanged,
             commands::OverrideChange::Unchanged,
@@ -1161,6 +1166,7 @@ async fn overrides_set_execution_deadline_patches_only_that_field() {
 
     let out = commands::overrides(
         opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Set("120".to_string()),
@@ -1202,6 +1208,7 @@ async fn overrides_clear_execution_deadline_sends_explicit_null_not_an_empty_str
 
     let out = commands::overrides(
         opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Clear,
@@ -1272,6 +1279,7 @@ async fn overrides_set_runner_resources_patches_only_that_field() {
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
         runner_resources,
     )
     .await
@@ -1312,6 +1320,7 @@ async fn overrides_clear_runner_resources_sends_explicit_null_not_an_empty_strin
 
     let out = commands::overrides(
         opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
@@ -1364,6 +1373,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
     )
     .await
     .unwrap();
@@ -1371,6 +1381,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
     let curie::commands::OverridesOutput::Done {
         agent,
         model,
+        reviewer_model,
         thinking,
         execution_deadline_seconds,
         runner_resources,
@@ -1412,6 +1423,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
     let line = commands::overrides_summary(
         agent,
         model,
+        reviewer_model,
         thinking,
         execution_deadline_seconds,
         runner_resources,
@@ -1420,7 +1432,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
     );
     assert_eq!(
         line,
-        "overrides for deal-desk: model kimi-k2, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off"
+        "overrides for deal-desk: model kimi-k2, reviewer model credential default, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off"
     );
 
     let rec = server.recorded();
@@ -1451,6 +1463,7 @@ async fn overrides_error_includes_the_api_quota_refusal_detail() {
 
     let err = commands::overrides(
         opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,

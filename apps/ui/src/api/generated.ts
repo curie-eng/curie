@@ -2055,7 +2055,7 @@ export interface paths {
         };
         /**
          * List Schedules
-         * @description Cron hooks on each in-force deployment, newest slot first in the record.
+         * @description Cron hooks on each in-force deployment, with separate latest run histories.
          */
         get: operations["list_schedules_schedules_get"];
         put?: never;
@@ -3205,6 +3205,8 @@ export interface components {
             publication_policy?: "approve" | "auto";
             /** Repo Full Name */
             repo_full_name?: string | null;
+            /** Reviewer Model */
+            reviewer_model?: string | null;
             /** Secrets */
             secrets?: {
                 [key: string]: string;
@@ -3279,6 +3281,8 @@ export interface components {
             publication_policy_version?: number;
             /** Repo Full Name */
             repo_full_name: string | null;
+            /** Reviewer Model */
+            reviewer_model: string | null;
             /** Runner Resources */
             runner_resources?: {
                 [key: string]: unknown;
@@ -3352,6 +3356,8 @@ export interface components {
             publication_policy?: ("approve" | "auto") | null;
             /** Repo Full Name */
             repo_full_name?: string | null;
+            /** Reviewer Model */
+            reviewer_model?: string | null;
             /** Runner Resources */
             runner_resources?: {
                 [key: string]: unknown;
@@ -5297,11 +5303,18 @@ export interface components {
             name: string;
             /** Outcome */
             outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
+            /** Reason */
+            reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
             /**
              * Slot Utc
              * Format: date-time
              */
             slot_utc: string;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "schedule" | "manual";
             /**
              * Started At
              * Format: date-time
@@ -6773,13 +6786,21 @@ export interface components {
         };
         /**
          * ScheduleHookOut
-         * @description One cron hook on the in-force bundle, with its newest slot.
+         * @description One cron hook with its newest scheduled and manual run histories.
          */
         ScheduleHookOut: {
             /** Last Fire At */
             last_fire_at: string | null;
+            /** Last Manual Fire At */
+            last_manual_fire_at: string | null;
+            /** Last Manual Outcome */
+            last_manual_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
+            /** Last Manual Reason */
+            last_manual_reason: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
             /** Last Outcome */
             last_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
+            /** Last Reason */
+            last_reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
             /** Name */
             name: string;
             /** Paused */

@@ -112,7 +112,7 @@ pub(crate) struct ClusterConn {
 }
 
 /// Same connection as [`ClusterConn`], but the flags are global so they parse
-/// after `cluster hook fire` as well as on `cluster hook`.
+/// after `cluster hook fire` or `cluster hook record` as well as on `cluster hook`.
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ClusterHookConn {
     /// Platform API base URL. Omit to self-plumb a loopback tunnel to the release API.
@@ -951,9 +951,10 @@ pub(crate) enum FactoryAction {
         /// Kind cluster name used only when no kube context is targeted.
         #[arg(long, default_value = curie::factory_quickstart::DEFAULT_KIND_NAME)]
         kind_name: String,
-        /// Model id installed by cluster up.
-        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_MODEL)]
-        model: String,
+        /// Model id installed by cluster up. Defaults to Claude Sonnet for
+        /// Anthropic credentials, or GLM Flash for OpenRouter credentials.
+        #[arg(long)]
+        model: Option<String>,
         /// Per run execution deadline in seconds for the deployed agent.
         #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_DEADLINE_SECONDS)]
         execution_deadline: u32,

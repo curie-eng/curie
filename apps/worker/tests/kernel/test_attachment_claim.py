@@ -5,9 +5,12 @@ and the model are faked, as everywhere in this suite):
 
 1. **Claim.** A turn carrying ``QueuedTurn.attachments`` must have them resolved
    into a signed reference BEFORE the sandbox is claimed, and that reference must
-   arrive in the claim env. A turn carrying none must produce the claim it
-   produces today, without the lane being consulted at all -- that is the
-   common case and the regression this file guards hardest.
+   arrive in the claim env. A turn carrying none never resolves anything. It may
+   ask the lane to ``carry`` the thread's retained set (#4079), so a follow-up
+   that boots a fresh runner still finds the files an earlier message attached.
+   When the lane has nothing to carry, or carrying fails, that turn must produce
+   exactly the claim it produced before carry existed: no attachment key at all.
+   That is the common case and the regression this file guards hardest.
 
 2. **Reap.** The attachment retention ledger is a SIBLING of the workspace one
    and is swept from the SAME ``reap_orphans`` tick, reusing the per-thread lock
@@ -52,6 +55,8 @@ from aci_protocol import (
 )
 from curie_worker.attachments import AttachmentResolutionError
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.binding import MAX_TURNS_ENV
+from curie_worker.kernel import constants as kernel_module
 from curie_worker.kernel.core import Kernel
 from curie_worker.sandbox import SuspendedThreadError
 from curie_worker.workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
@@ -83,6 +88,7 @@ def _qevent(
 DONE = SessionStatus.DONE
 ATTACHMENTS_REF_ENV = "CURIE_ATTACHMENTS_REF"
 REF_VALUE = "opaque-presigned-attachment-reference"
+CARRIED_VALUE = "opaque-re-minted-retained-attachment-reference"
 WORKSPACE_REF_VALUE = "opaque-presigned-workspace-reference"
 ACTIVE_FILE_REPLY = (
     "I cannot add a file while the current reply is still running. "
@@ -137,9 +143,19 @@ class _FakeAttachmentLane:
         error: AttachmentResolutionError | None = None,
         resolve_entered: threading.Event | None = None,
         resolve_gate: threading.Event | None = None,
+        carry_value: dict[str, str] | None = None,
+        carry_error: Exception | None = None,
+        carry_gate: threading.Event | None = None,
     ) -> None:
         self.resolve_calls: list[dict[str, Any]] = []
         self.discard_calls: list[dict[str, Any]] = []
+        #: Every (thread key, agent id) a text-only turn asked to carry, in order.
+        self.carry_calls: list[tuple[str, str | None]] = []
+        #: The name of the thread each carry call ran on, in order.
+        self.carry_threads: list[str] = []
+        self._carry_value = dict(carry_value or {})
+        self._carry_error = carry_error
+        self._carry_gate = carry_gate
         self._ref_value = ref_value
         self._error = error
         self._resolve_entered = resolve_entered
@@ -178,6 +194,23 @@ class _FakeAttachmentLane:
         """Record exact prepared cleanup through the production signature."""
 
         self.discard_calls.append({"thread_key": thread_key, "prepared": prepared})
+
+    def carry(self, thread_key: str, *, agent_id: str | None = None) -> dict[str, str]:
+        """The thread's retained set as claim env, or ``{}`` (#4079).
+
+        Returns a copy so a kernel that mutates what it was handed cannot make a
+        later call look different from the value configured here. With a gate,
+        the call parks (up to two seconds) the way a blackholed object store
+        would, then answers normally.
+        """
+
+        self.carry_calls.append((thread_key, agent_id))
+        self.carry_threads.append(threading.current_thread().name)
+        if self._carry_gate is not None:
+            self._carry_gate.wait(timeout=2.0)
+        if self._carry_error is not None:
+            raise self._carry_error
+        return dict(self._carry_value)
 
     # The reap half. Unused by the claim tests; present because the kernel holds
     # ONE optional collaborator for this lane, exactly as it holds one for the
@@ -351,12 +384,15 @@ def _authenticate_route(h: Any, thread: str) -> None:
 def test_a_turn_with_no_attachments_claims_exactly_the_env_it_claims_today(
     make_harness,
 ) -> None:
-    """The common case, untouched: the lane is not even consulted.
+    """The common case, untouched: nothing is resolved and nothing is carried.
 
-    Asserted two ways so the guard cannot be satisfied by an empty-valued entry:
-    the lane records no ``resolve`` call, and the claim env carries no
-    attachment key at all -- not the key with an empty value, which an init
-    container would read as "there is work here".
+    Since #4079 a text-only turn may ask the lane to ``carry`` the thread's
+    retained set, but this thread has none (the fake's carry returns ``{}``), so
+    the claim must be the one it was before carry existed. Asserted two ways so
+    the guard cannot be satisfied by an empty-valued entry: the lane records no
+    ``resolve`` call, and the claim env carries no attachment key at all. Not
+    even the key with an empty value, which an init container would read as
+    "there is work here".
 
     The signature check ahead of it pins the wiring shape: the lane is an
     OPTIONAL injected collaborator named ``attachments``, exactly as the
@@ -379,8 +415,9 @@ def test_a_turn_with_no_attachments_claims_exactly_the_env_it_claims_today(
             await h.kernel.process_event(_qevent("plain question", thread="tNoFiles"))
 
             assert lane.resolve_calls == [], (
-                "a turn with no attachments must not touch the attachment lane"
+                "a turn with no attachments must never resolve anything"
             )
+            assert lane.discard_calls == []
             env = _claim_env(h)
             assert ATTACHMENTS_REF_ENV not in env
             assert h.sink.last_text == "ok"
@@ -1563,6 +1600,499 @@ def test_enabled_lane_does_not_replace_a_retained_claim_without_files(
             first_envs = list(h.fake_k8s.claim_envs)
 
             await h.kernel.process_event(_qevent("second", thread="tNoFilesRetained"))
+
+            assert lane.resolve_calls == []
+            assert lane.discard_calls == []
+            assert set(h.fake_k8s.claims) == {first_claim}
+            assert h.fake_k8s.claim_envs == first_envs
+            assert h.runners[first_port].opened == ["first", "second"]
+            assert sum(len(runner.opened) for runner in h.runners.values()) == 2
+
+    asyncio.run(go())
+
+
+class _BudgetBumpingBinding(_HistoryBinding):
+    """A binding whose turn budget changes after the first boot.
+
+    ``CURIE_MAX_TURNS`` binds at boot, so a different value on the next turn is
+    the #3071 turn-budget fence: the warm runner is replaced through a handoff
+    rather than adopted. That is the same replace-on-follow-up shape #3823's
+    token expiry produces on nearly every follow-up in production, which is how
+    a text-only follow-up lands on a fresh runner with an empty ``/attachments``.
+    """
+
+    def __init__(self, deployment_id: uuid.UUID) -> None:
+        super().__init__(deployment_id, workspace_enabled=False)
+        self.boots = 0
+
+    def boot_env(self, resolved: object, thread_key: str, **kwargs: Any) -> dict[str, str]:
+        self.boots += 1
+        return {
+            **super().boot_env(resolved, thread_key, **kwargs),
+            MAX_TURNS_ENV: "5" if self.boots == 1 else "6",
+        }
+
+
+def _agent_binding() -> _WorkspaceBinding:
+    """A binding that resolves the channel to a real agent with no workspace.
+
+    Carry is agent-scoped (an object key is ``attachments/<agent_id>/...``), so
+    a turn only carries when the binding names the agent it runs for.
+    """
+
+    return _WorkspaceBinding(uuid.uuid4(), workspace_enabled=False)
+
+
+def _agent_of(binding: _WorkspaceBinding) -> str:
+    return str(binding.resolved.agent_id)
+
+
+def _carry_warnings(caplog: Any) -> list[Any]:
+    return [
+        record
+        for record in caplog.records
+        if record.name == "curie_worker.kernel"
+        and record.levelname == "WARNING"
+        and "attach" in record.getMessage().lower()
+    ]
+
+
+def test_a_text_followup_on_a_fresh_claim_carries_the_threads_retained_files(
+    make_harness,
+) -> None:
+    """#4079 AC1 at the kernel seam: the follow-up's NEW runner gets the files.
+
+    Turn one attaches a file. The route is then released (idle reap, operator
+    reset), so turn two, which is text only, boots a fresh sandbox whose
+    ``/attachments`` starts empty. The lane's carry value must reach that claim,
+    asked for the agent the turn runs as. The file turn itself never carries:
+    its own resolve is the whole story (AC5).
+    """
+
+    async def go() -> None:
+        binding = _agent_binding()
+        async with make_harness(binding=binding) as h:
+            lane = _FakeAttachmentLane(carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="ok", status=DONE)]
+            thread_key = _thread_key("tCarryFresh")
+
+            await h.kernel.process_event(
+                _qevent(
+                    "file this asset",
+                    thread="tCarryFresh",
+                    attachments=[Attachment(id="F1", name="asset.pdf")],
+                )
+            )
+            assert _claim_env(h)[ATTACHMENTS_REF_ENV] == REF_VALUE
+            assert lane.carry_calls == [], "a turn with its own files must not carry"
+
+            await asyncio.to_thread(h.substrate.release, thread_key)
+            claims_before = len(h.fake_k8s.claim_envs)
+
+            await h.kernel.process_event(_qevent("file it into category X", thread="tCarryFresh"))
+
+            assert len(h.fake_k8s.claim_envs) == claims_before + 1, (
+                "the follow-up did not claim a fresh sandbox"
+            )
+            assert _claim_env(h)[ATTACHMENTS_REF_ENV] == CARRIED_VALUE
+            assert lane.carry_calls == [(thread_key, _agent_of(binding))]
+            assert len(lane.resolve_calls) == 1, "a text-only turn must never resolve"
+            assert lane.discard_calls == []
+            assert h.runner.opened == ["file this asset", "file it into category X"]
+            assert h.sink.last_text == "ok"
+
+    asyncio.run(go())
+
+
+def test_a_text_followup_handed_off_for_its_turn_budget_carries_the_retained_files(
+    make_harness,
+) -> None:
+    """The live defect's path: a warm runner REPLACED on a text-only follow-up.
+
+    The replacement boots from the claim env alone, so unless the carried set is
+    on that env the new runner has no ``/attachments/<name>`` for the file the
+    replayed history still names.
+    """
+
+    async def go() -> None:
+        binding = _BudgetBumpingBinding(uuid.uuid4())
+        async with make_harness(binding=binding, per_sandbox_runners=2) as h:
+            lane = _FakeAttachmentLane(carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            for runner in h.runners.values():
+                runner.default_script = [Final(text="ok", status=DONE)]
+            thread_key = _thread_key("tCarryHandoff")
+
+            await h.kernel.process_event(
+                _qevent(
+                    "file this asset",
+                    thread="tCarryHandoff",
+                    attachments=[Attachment(id="F1", name="asset.pdf")],
+                )
+            )
+            first_claim = next(iter(h.fake_k8s.claims))
+            first_port = h.fake_k8s.assigned_ports[h.fake_k8s.claims[first_claim].sandbox_name]
+
+            await h.kernel.process_event(_qevent("file it into category X", thread="tCarryHandoff"))
+
+            assert len(h.fake_k8s.claim_envs) == 2, "the turn-budget fence did not hand off"
+            assert first_claim not in h.fake_k8s.claims
+            second_claim = next(iter(h.fake_k8s.claims))
+            second_port = h.fake_k8s.assigned_ports[h.fake_k8s.claims[second_claim].sandbox_name]
+            assert second_port != first_port
+            handed_off = h.fake_k8s.claim_envs[1]
+            assert handed_off is not None
+            assert handed_off[ATTACHMENTS_REF_ENV] == CARRIED_VALUE
+            assert handed_off[MAX_TURNS_ENV] == "6"
+            assert lane.carry_calls == [(thread_key, _agent_of(binding))]
+            assert h.runners[second_port].opened == ["file it into category X"]
+
+    asyncio.run(go())
+
+
+def test_a_suspended_thread_resumed_by_a_text_turn_carries_the_retained_files(
+    make_harness,
+) -> None:
+    """Suspend deletes the pod, so the resumed runner starts with no files either."""
+
+    async def go() -> None:
+        binding = _agent_binding()
+        async with make_harness(binding=binding, per_sandbox_runners=2) as h:
+            lane = _FakeAttachmentLane(carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            for runner in h.runners.values():
+                runner.default_script = [Final(text="continued", status=DONE)]
+            thread_key = _thread_key("tCarrySuspended")
+            old = await asyncio.to_thread(h.substrate.claim, thread_key)
+            await asyncio.to_thread(h.substrate.suspend, thread_key, history_ref="history:carry")
+
+            await h.kernel.process_event(_qevent("now file it", thread="tCarrySuspended"))
+
+            assert old.claim_name not in h.fake_k8s.claims
+            resumed_env = h.fake_k8s.claim_envs[-1]
+            assert resumed_env is not None
+            assert resumed_env[ATTACHMENTS_REF_ENV] == CARRIED_VALUE
+            assert lane.carry_calls == [(thread_key, _agent_of(binding))]
+            assert lane.resolve_calls == []
+            assert h.sink.last_text == "continued"
+
+    asyncio.run(go())
+
+
+def test_a_text_turn_with_nothing_to_carry_claims_no_attachment_key(make_harness) -> None:
+    """#4079 AC2: no live retained set, so the boot env is byte-identical to today's.
+
+    The lane IS asked, because that is how the kernel learns there is nothing,
+    and its empty answer must leave no key behind, empty-valued or otherwise.
+    """
+
+    async def go() -> None:
+        binding = _agent_binding()
+        async with make_harness(binding=binding) as h:
+            lane = _FakeAttachmentLane(carry_value={})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="ok", status=DONE)]
+
+            await h.kernel.process_event(_qevent("plain question", thread="tCarryEmpty"))
+
+            assert lane.carry_calls == [(_thread_key("tCarryEmpty"), _agent_of(binding))]
+            assert lane.resolve_calls == []
+            env = _claim_env(h)
+            assert ATTACHMENTS_REF_ENV not in env
+            assert h.sink.last_text == "ok"
+
+    asyncio.run(go())
+
+
+def test_a_text_turn_with_no_bound_agent_never_asks_to_carry(make_harness) -> None:
+    """Carry is agent-scoped, so a turn with no agent has nothing it may carry.
+
+    The lane is not asked at all (it would have no agent prefix to check the
+    objects against), and the claim carries no attachment key even though the
+    lane would have answered with one.
+    """
+
+    async def go() -> None:
+        async with make_harness() as h:
+            lane = _FakeAttachmentLane(carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="ok", status=DONE)]
+
+            await h.kernel.process_event(_qevent("plain question", thread="tCarryNoAgent"))
+
+            assert lane.carry_calls == []
+            assert lane.resolve_calls == []
+            assert ATTACHMENTS_REF_ENV not in _claim_env(h)
+            assert h.sink.last_text == "ok"
+
+    asyncio.run(go())
+
+
+def test_a_failing_carry_does_not_fail_the_text_turn(make_harness, caplog) -> None:
+    """#4079 AC4: carry is best effort; a ledger or presign fault boots without files.
+
+    The turn is answered exactly as it would be without the feature, and a
+    WARNING says the carry was skipped. The fault's text is not copied into the
+    log, because for a presign failure it can include a signed URL.
+    """
+
+    signed_query = "X-Amz-Signature=carry-marker"
+
+    async def go() -> None:
+        binding = _agent_binding()
+        async with make_harness(binding=binding) as h:
+            lane = _FakeAttachmentLane(
+                carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE},
+                carry_error=RuntimeError(
+                    f"presign failed for https://objects.example.com/k?{signed_query}"
+                ),
+            )
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="answered anyway", status=DONE)]
+
+            with caplog.at_level("WARNING", logger="curie_worker.kernel"):
+                await h.kernel.process_event(
+                    _qevent("file it into category X", thread="tCarryFails")
+                )
+
+            assert lane.carry_calls == [(_thread_key("tCarryFails"), _agent_of(binding))]
+            assert h.sink.last_text == "answered anyway"
+            assert h.runner.opened == ["file it into category X"]
+            assert ATTACHMENTS_REF_ENV not in _claim_env(h)
+            assert _carry_warnings(caplog), "a skipped carry must be visible at WARNING"
+            assert signed_query not in caplog.text
+
+    asyncio.run(go())
+
+
+def test_a_hanging_carry_is_bounded_and_does_not_fail_the_text_turn(
+    make_harness, caplog, monkeypatch
+) -> None:
+    """A blackholed object store must not hold a text-only turn hostage.
+
+    Before #4079 a text-only turn made no object-store call at all. Carry is
+    bounded by ``_ATTACHMENT_CARRY_TIMEOUT_S``: past it the turn boots without
+    the carried files and says so at WARNING. The fake answers WITH a value
+    once its gate times out, so a kernel that waited the call out would put the
+    key on the claim and fail here.
+    """
+
+    monkeypatch.setattr(kernel_module, "_ATTACHMENT_CARRY_TIMEOUT_S", 0.2)
+    gate = threading.Event()
+
+    async def go() -> None:
+        binding = _agent_binding()
+        async with make_harness(binding=binding) as h:
+            lane = _FakeAttachmentLane(
+                carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE}, carry_gate=gate
+            )
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="answered anyway", status=DONE)]
+
+            try:
+                with caplog.at_level("WARNING", logger="curie_worker.kernel"):
+                    await h.kernel.process_event(
+                        _qevent("file it into category X", thread="tCarryHangs")
+                    )
+                assert not gate.is_set()
+                assert lane.carry_calls == [(_thread_key("tCarryHangs"), _agent_of(binding))]
+                assert h.sink.last_text == "answered anyway"
+                assert ATTACHMENTS_REF_ENV not in _claim_env(h), (
+                    "the kernel waited out a hung carry instead of bounding it"
+                )
+                assert _carry_warnings(caplog), "a timed-out carry must be visible at WARNING"
+            finally:
+                # Let the abandoned worker thread finish so nothing leaks.
+                gate.set()
+
+    asyncio.run(go())
+
+
+def _busy_warnings(caplog: Any) -> list[Any]:
+    return [record for record in _carry_warnings(caplog) if "busy" in record.getMessage()]
+
+
+def test_carry_runs_on_its_own_named_thread_not_the_default_executor(make_harness) -> None:
+    """A hung carry is abandoned, not cancelled, so it must not sit in the shared pool.
+
+    The asyncio default executor also runs ``substrate.lookup``, claims and
+    workspace prepare. A carry parked there by a blackholed store would hold one
+    of its few threads for as long as the store takes to answer.
+    """
+
+    async def go() -> None:
+        binding = _agent_binding()
+        async with make_harness(binding=binding) as h:
+            lane = _FakeAttachmentLane(carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="ok", status=DONE)]
+
+            await h.kernel.process_event(_qevent("plain question", thread="tCarryThread"))
+
+            assert lane.carry_threads == ["attachment-carry"]
+            assert _claim_env(h)[ATTACHMENTS_REF_ENV] == CARRIED_VALUE
+
+    asyncio.run(go())
+
+
+def test_a_text_turn_skips_carry_when_no_slot_frees_within_its_budget(
+    make_harness, caplog, monkeypatch
+) -> None:
+    """With every slot held past the carry budget, the turn stops waiting for one.
+
+    Each abandoned lookup keeps a daemon thread until the store answers, so the
+    slots are what bound the threads a blackholed store can pin. The wait for a
+    slot counts against the same budget as the lookup, so a turn that finds
+    none free in time skips carry, boots without the files, and says so.
+    """
+
+    monkeypatch.setattr(kernel_module, "_ATTACHMENT_CARRY_TIMEOUT_S", 0.3)
+
+    async def go() -> None:
+        binding = _agent_binding()
+        async with make_harness(binding=binding) as h:
+            lane = _FakeAttachmentLane(carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            slots = asyncio.Semaphore(1)
+            h.kernel._carry_slots = slots  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="answered anyway", status=DONE)]
+
+            await slots.acquire()
+            try:
+                with caplog.at_level("WARNING", logger="curie_worker.kernel"):
+                    await h.kernel.process_event(
+                        _qevent("file it into category X", thread="tCarryBusy")
+                    )
+            finally:
+                slots.release()
+
+            assert lane.carry_calls == [], "a turn with no free slot still ran a carry"
+            assert h.sink.last_text == "answered anyway"
+            assert ATTACHMENTS_REF_ENV not in _claim_env(h)
+            assert _busy_warnings(caplog), "a skipped carry must say the lookups were busy"
+
+    asyncio.run(go())
+
+
+def test_a_text_turn_waits_for_a_slot_that_frees_within_its_budget(
+    make_harness, monkeypatch
+) -> None:
+    """A briefly busy worker still carries: the turn waits, it does not skip.
+
+    Skipping the moment every slot is taken would drop the files from a
+    follow-up whenever a few other text turns happen to be mid-lookup, which
+    is ordinary load rather than a hung store. The slot frees after 0.1s here,
+    well inside the 2s budget, so the lookup must run and its key must land.
+    """
+
+    monkeypatch.setattr(kernel_module, "_ATTACHMENT_CARRY_TIMEOUT_S", 2.0)
+
+    async def go() -> None:
+        binding = _agent_binding()
+        async with make_harness(binding=binding) as h:
+            lane = _FakeAttachmentLane(carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            slots = asyncio.Semaphore(1)
+            h.kernel._carry_slots = slots  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="ok", status=DONE)]
+
+            await slots.acquire()
+            turn = asyncio.create_task(
+                h.kernel.process_event(_qevent("file it into category X", thread="tCarryWait"))
+            )
+            try:
+                await asyncio.sleep(0.1)
+                assert lane.carry_calls == [], "the turn ran a carry without a slot"
+            finally:
+                slots.release()
+            await asyncio.wait_for(turn, timeout=10.0)
+
+            assert lane.carry_calls == [(_thread_key("tCarryWait"), _agent_of(binding))], (
+                "the turn skipped carry instead of waiting for the slot"
+            )
+            assert _claim_env(h)[ATTACHMENTS_REF_ENV] == CARRIED_VALUE
+            assert h.sink.last_text == "ok"
+
+    asyncio.run(go())
+
+
+def test_a_timed_out_carry_holds_its_slot_until_it_returns_then_frees_it(
+    make_harness, caplog, monkeypatch
+) -> None:
+    """The slot follows the THREAD, not the turn that gave up on it.
+
+    Turn A's lookup outlives the time bound, so turn A boots without the files
+    while the lookup keeps running and keeps its slot. Once the store answers,
+    the slot comes back, and turn B on another thread carries normally. A slot
+    leaked on timeout would leave every later turn on the worker skipping carry.
+    """
+
+    monkeypatch.setattr(kernel_module, "_ATTACHMENT_CARRY_TIMEOUT_S", 0.2)
+    gate = threading.Event()
+
+    async def go() -> None:
+        binding = _agent_binding()
+        async with make_harness(binding=binding) as h:
+            lane = _FakeAttachmentLane(
+                carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE}, carry_gate=gate
+            )
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            slots = asyncio.Semaphore(1)
+            h.kernel._carry_slots = slots  # type: ignore[attr-defined]
+            h.runner.default_script = [Final(text="ok", status=DONE)]
+
+            try:
+                await h.kernel.process_event(_qevent("first", thread="tCarrySlotA"))
+                assert lane.carry_calls == [(_thread_key("tCarrySlotA"), _agent_of(binding))]
+                assert ATTACHMENTS_REF_ENV not in _claim_env(h)
+                # Turn A gave up, but its lookup is still parked on the gate.
+                assert slots.locked(), "a timed-out carry gave up its slot while still running"
+            finally:
+                gate.set()
+
+            deadline = asyncio.get_running_loop().time() + 5.0
+            while slots.locked():
+                assert asyncio.get_running_loop().time() < deadline, (
+                    "the late lookup never returned its slot"
+                )
+                await asyncio.sleep(0.02)
+
+            await h.kernel.process_event(_qevent("second", thread="tCarrySlotB"))
+
+            assert lane.carry_calls[-1] == (_thread_key("tCarrySlotB"), _agent_of(binding))
+            assert _claim_env(h)[ATTACHMENTS_REF_ENV] == CARRIED_VALUE
+            assert h.sink.last_text == "ok"
+
+    asyncio.run(go())
+
+
+def test_a_carried_set_never_forces_replacement_of_a_warm_retained_claim(
+    make_harness,
+) -> None:
+    """Carry rides on boots that happen anyway; it never causes one.
+
+    A warm runner adopted for a follow-up either already holds the files or is
+    the runner that saw them, so a non-empty carry value must not by itself
+    trip a replacement. Otherwise every follow-up in a thread that once had a
+    file would cold-boot a sandbox.
+    """
+
+    async def go() -> None:
+        binding = _agent_binding()
+        async with make_harness(binding=binding, per_sandbox_runners=2) as h:
+            lane = _FakeAttachmentLane(carry_value={ATTACHMENTS_REF_ENV: CARRIED_VALUE})
+            h.kernel._attachments = lane  # type: ignore[attr-defined]
+            for runner in h.runners.values():
+                runner.default_script = [Final(text="plain", status=DONE)]
+
+            await h.kernel.process_event(_qevent("first", thread="tCarryWarm"))
+            first_claim = next(iter(h.fake_k8s.claims))
+            first_sandbox = h.fake_k8s.claims[first_claim].sandbox_name
+            first_port = h.fake_k8s.assigned_ports[first_sandbox]
+            first_envs = list(h.fake_k8s.claim_envs)
+
+            await h.kernel.process_event(_qevent("second", thread="tCarryWarm"))
 
             assert lane.resolve_calls == []
             assert lane.discard_calls == []

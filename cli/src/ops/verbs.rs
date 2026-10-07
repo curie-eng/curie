@@ -165,6 +165,8 @@ pub(crate) fn nodes_cmd() -> OpsCommand {
 /// retention rather than deleting a namespace whose owner cannot be
 /// established; there is no fallback selector, since a fallback is exactly the
 /// cross-release delete #1654 reports.
+const OWNED_NAMESPACE_SWEEP_TIMEOUT: &str = "300s";
+
 pub fn down_commands(o: &CommonOpts) -> Vec<OpsCommand> {
     vec![
         OpsCommand::new(
@@ -187,6 +189,7 @@ pub fn down_commands(o: &CommonOpts) -> Vec<OpsCommand> {
                     o.release, o.namespace
                 )),
                 plain("--ignore-not-found"),
+                plain(format!("--timeout={OWNED_NAMESPACE_SWEEP_TIMEOUT}")),
             ],
         ),
     ]
@@ -535,6 +538,290 @@ fn teardown_result(
         crate::exit::CliError::failure(message).with_fix(cmd)
     };
     Err(err.into())
+}
+
+/// True only when the namespace sweep itself failed and at least one owned
+/// namespace is still present. A successful sweep, including a zero-match
+/// sweep, is not a wait expiry.
+pub(super) fn owned_namespace_wait_expired(sweep_ok: bool, remaining: usize) -> bool {
+    !sweep_ok && remaining > 0
+}
+
+/// kubectl's own delete wait expired. This is not an immediate RBAC or
+/// validation failure, and it is not the connectivity marker `i/o timeout`.
+pub(super) fn sweep_wait_expired(stderr: &str) -> bool {
+    stderr.to_ascii_lowercase().contains("timed out waiting")
+}
+
+fn step_is_permanent(outcome_failed: bool, stderr: &str) -> bool {
+    outcome_failed && !is_connectivity_failure(stderr)
+}
+
+/// One owned namespace still present after the bounded sweep wait.
+pub(super) struct OwnedNamespaceWait {
+    pub name: String,
+    pub phase: String,
+    pub conditions: String,
+    pub objects: String,
+}
+
+/// Operator text for a sweep wait that expired. Names each remaining namespace.
+/// It does not say that any finalizer was cleared.
+pub(super) fn format_owned_namespace_wait(rows: &[OwnedNamespaceWait], resume: &str) -> String {
+    let listed = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "namespace {} phase {} conditions {}; remaining objects: {}",
+                row.name, row.phase, row.conditions, row.objects
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "owned namespace sweep waited {OWNED_NAMESPACE_SWEEP_TIMEOUT} and these namespaces are still present: {listed}. Resume with: {resume}"
+    )
+}
+
+fn owned_namespace_list_cmd(o: &CommonOpts) -> OpsCommand {
+    OpsCommand::new(
+        "kubectl",
+        vec![
+            plain("get"),
+            plain("namespace"),
+            plain("-l"),
+            plain(format!(
+                "curietech.ai/created-by={},curietech.ai/created-in={}",
+                o.release, o.namespace
+            )),
+            plain("-o"),
+            plain("json"),
+        ],
+    )
+}
+
+fn format_namespace_conditions(item: &serde_json::Value) -> String {
+    let Some(conditions) = item.pointer("/status/conditions") else {
+        return "none".to_string();
+    };
+    if conditions.is_null() {
+        return "none".to_string();
+    }
+    let Some(conditions) = conditions.as_array() else {
+        return "none".to_string();
+    };
+    let parts: Vec<String> = conditions
+        .iter()
+        .filter_map(|condition| {
+            let type_name = condition.get("type")?.as_str()?;
+            let status = condition.get("status")?.as_str()?;
+            if type_name.is_empty() || status.is_empty() {
+                None
+            } else {
+                Some(format!("{type_name}={status}"))
+            }
+        })
+        .collect();
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+struct OwnedNamespaceSnapshot {
+    name: String,
+    phase: String,
+    conditions: String,
+}
+
+/// A kind List whose items are Namespaces. Any other shape is an error so a
+/// diagnosis failure falls through to the existing sweep failure.
+fn parse_owned_namespace_list(output: &str) -> Result<Vec<OwnedNamespaceSnapshot>> {
+    let document: serde_json::Value =
+        serde_json::from_str(output).context("parsing the owned namespace list")?;
+    if document.get("kind").and_then(serde_json::Value::as_str) != Some("List") {
+        bail!("owned namespace list is not a kind List");
+    }
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("owned namespace list has no items array")?;
+    let mut rows = Vec::new();
+    for item in items {
+        if item.get("kind").and_then(serde_json::Value::as_str) != Some("Namespace") {
+            bail!("owned namespace list contains an item that is not a Namespace");
+        }
+        let name = item
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+            .context("owned namespace list contains a Namespace without a name")?
+            .to_string();
+        let phase = item
+            .pointer("/status/phase")
+            .and_then(serde_json::Value::as_str)
+            .filter(|phase| !phase.is_empty())
+            .unwrap_or("Unknown")
+            .to_string();
+        rows.push(OwnedNamespaceSnapshot {
+            name,
+            phase,
+            conditions: format_namespace_conditions(item),
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_remaining_objects(output: &str) -> Result<Vec<(String, String)>> {
+    let document: serde_json::Value =
+        serde_json::from_str(output).context("parsing a namespace object inventory")?;
+    let items = document
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .context("namespace object inventory has no items array")?;
+    let mut found = Vec::new();
+    for item in items {
+        let Some(name) = item
+            .pointer("/metadata/name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.is_empty())
+        else {
+            continue;
+        };
+        let kind = item
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .filter(|kind| !kind.is_empty())
+            .unwrap_or("Unknown");
+        found.push((kind.to_string(), name.to_string()));
+    }
+    Ok(found)
+}
+
+fn format_remaining_objects(grouped: std::collections::BTreeMap<String, Vec<String>>) -> String {
+    if grouped.is_empty() {
+        return "none".to_string();
+    }
+    grouped
+        .into_iter()
+        .map(|(kind, mut names)| {
+            names.sort();
+            format!("{kind} ({}): {}", names.len(), names.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+const OWNED_NAMESPACE_LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const OWNED_NAMESPACE_INVENTORY_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Namespaces still selected by this release's ownership pair, plus the objects
+/// left in each. One failed object list is recorded and does not abort the
+/// rest. The list and the inventory share a bounded budget so a stalled API
+/// cannot hold `cluster down` open after the sweep wait. Never finalizes,
+/// patches, or force-deletes.
+async fn diagnose_owned_namespace_wait(o: &CommonOpts) -> Result<Vec<OwnedNamespaceWait>> {
+    let listed = match tokio::time::timeout(
+        OWNED_NAMESPACE_LIST_TIMEOUT,
+        run_capture(&owned_namespace_list_cmd(o)),
+    )
+    .await
+    {
+        Ok(captured) => captured?,
+        Err(_) => bail!("timed out listing owned namespaces after the sweep wait"),
+    };
+    let (ok, output, err) = listed;
+    if !ok {
+        bail!(
+            "could not list owned namespaces after the sweep wait: {}",
+            failure_reason(&err)
+        );
+    }
+    let namespaces = parse_owned_namespace_list(&output)?;
+    if namespaces.is_empty() {
+        return Ok(Vec::new());
+    }
+    let discovered = match tokio::time::timeout(
+        OWNED_NAMESPACE_LIST_TIMEOUT,
+        run_capture(&super::namespaced_resources_cmd()),
+    )
+    .await
+    {
+        Ok(Ok((true, discovered, _err))) => discovered,
+        _ => {
+            return Ok(namespaces
+                .into_iter()
+                .map(|namespace| OwnedNamespaceWait {
+                    name: namespace.name,
+                    phase: namespace.phase,
+                    conditions: namespace.conditions,
+                    objects: "inventory timed out".to_string(),
+                })
+                .collect());
+        }
+    };
+    let resources: Vec<String> = discovered
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    let inventory_deadline = std::time::Instant::now() + OWNED_NAMESPACE_INVENTORY_BUDGET;
+    let mut rows = Vec::with_capacity(namespaces.len());
+    for namespace in namespaces {
+        let mut grouped: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        let mut failures = Vec::new();
+        for resource in &resources {
+            let remaining = inventory_deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                failures.push("inventory timed out".to_string());
+                break;
+            }
+            let captured = match tokio::time::timeout(
+                remaining,
+                run_capture(&super::namespace_inventory_cmd(&namespace.name, resource)),
+            )
+            .await
+            {
+                Ok(Ok(captured)) => captured,
+                Ok(Err(_)) | Err(_) => {
+                    failures.push(format!("{resource}: list failed"));
+                    continue;
+                }
+            };
+            let (listed, inventory, _err) = captured;
+            if !listed {
+                failures.push(format!("{resource}: list failed"));
+                continue;
+            }
+            match parse_remaining_objects(&inventory) {
+                Ok(items) => {
+                    for (kind, name) in items {
+                        grouped.entry(kind).or_default().push(name);
+                    }
+                }
+                Err(_) => failures.push(format!("{resource}: list failed")),
+            }
+        }
+        let mut objects = format_remaining_objects(grouped);
+        if !failures.is_empty() {
+            if objects == "none" {
+                objects = failures.join("; ");
+            } else {
+                objects.push_str("; ");
+                objects.push_str(&failures.join("; "));
+            }
+        }
+        rows.push(OwnedNamespaceWait {
+            name: namespace.name,
+            phase: namespace.phase,
+            conditions: namespace.conditions,
+            objects,
+        });
+    }
+    Ok(rows)
 }
 
 /// #707 ownership stamp. Returns the single `kubectl label namespace` step that
@@ -1182,6 +1469,7 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
     // to do" apart from "removed it"; only the stdout content can. Distinguish
     // them into their own outcome so `teardown_result` never claims compute was
     // stopped when the sweep matched nothing.
+    let mut sweep_report = sweep_err.clone();
     let sweep_outcome = if ok {
         if out.trim().is_empty() {
             step.done("no matching namespaces");
@@ -1190,11 +1478,59 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
             step.done("removed");
             SweepOutcome::Removed
         }
+    } else if sweep_wait_expired(&sweep_err) {
+        // An immediate RBAC or validation failure is not a wait expiry, so it
+        // keeps the permanent exit class from #767. Only kubectl's own
+        // "timed out waiting" wording opens this path.
+        match diagnose_owned_namespace_wait(&opts.common).await {
+            Ok(rows) if !owned_namespace_wait_expired(false, rows.len()) => {
+                // The namespace finished deleting between the sweep error and
+                // the follow-up list. That is a completed sweep, not a failure.
+                step.done("removed");
+                SweepOutcome::Removed
+            }
+            Ok(rows)
+                if !step_is_permanent(matches!(helm_outcome, HelmOutcome::Failed), &helm_err)
+                    && !step_is_permanent(
+                        matches!(hook_outcome, HookOutcome::Failed),
+                        &hook_err,
+                    ) =>
+            {
+                step.fail("still present");
+                for line in out.lines().chain(sweep_err.lines()) {
+                    ui.plumbing(line);
+                }
+                let resume = resume_command(
+                    &outstanding_steps(helm_outcome, hook_outcome, SweepOutcome::Failed),
+                    &opts.common,
+                );
+                return Err(
+                    crate::exit::CliError::transient(format_owned_namespace_wait(&rows, &resume))
+                        .with_fix(resume)
+                        .into(),
+                );
+            }
+            Ok(rows) => {
+                // A permanent helm or hook failure still decides the exit
+                // class. The sweep report carries the objects that remain.
+                step.fail("still present");
+                let resume = resume_command(
+                    &outstanding_steps(helm_outcome, hook_outcome, SweepOutcome::Failed),
+                    &opts.common,
+                );
+                sweep_report = format_owned_namespace_wait(&rows, &resume);
+                SweepOutcome::Failed
+            }
+            Err(_) => {
+                step.fail("failed");
+                SweepOutcome::Failed
+            }
+        }
     } else {
         step.fail("failed");
         SweepOutcome::Failed
     };
-    for line in out.lines().chain(sweep_err.lines()) {
+    for line in out.lines().chain(sweep_report.lines()) {
         ui.plumbing(line);
     }
 
@@ -1206,7 +1542,7 @@ pub async fn down(opts: DownOpts) -> Result<ClusterDownOutput> {
         sweep_outcome,
         &helm_err,
         &hook_err,
-        &sweep_err,
+        &sweep_report,
         &opts.common,
     )
 }
@@ -4733,13 +5069,72 @@ mod tests {
         // namespace, so it cannot reach another release's namespaces.
         assert_eq!(
             sweep,
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s"
         );
         // Negative case: the pre-existing shared namespace is no longer an
         // unconditional delete target (that would strand pre-existing state).
         assert!(!sweep.contains("agent-sandbox-system"), "{sweep}");
         // ignore-not-found preserved so a partial teardown stays re-runnable.
         assert!(sweep.contains("--ignore-not-found"), "{sweep}");
+    }
+
+    // #4017: the owned-namespace sweep carries a bounded wait. A stuck
+    // finalizer must not hang `cluster down`, and the command must not clear
+    // finalizers or force the delete (#707, #767, #768).
+    #[test]
+    fn down_sweep_command_carries_a_300s_bound() {
+        let cmds = down_commands(&common_distinct_release());
+        let sweep = cmds[1].display();
+        assert!(sweep.contains("--timeout=300s"), "{sweep}");
+        assert!(sweep.contains("--ignore-not-found"), "{sweep}");
+        assert!(
+            sweep.contains("curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns"),
+            "{sweep}"
+        );
+        assert!(!sweep.contains("finalize"), "{sweep}");
+        assert!(!sweep.contains("--force"), "{sweep}");
+    }
+
+    // #4017: a successful sweep is not a wait expiry, and an empty remainder
+    // is not either. Only a failed sweep that left namespaces behind expires.
+    // The message names what is still there; it must not claim a finalizer
+    // was removed (#707, #767, #768).
+    #[test]
+    fn owned_namespace_wait_expires_only_for_a_failed_sweep_with_namespaces_left() {
+        assert!(
+            !owned_namespace_wait_expired(true, 3),
+            "a successful sweep is not a wait expiry"
+        );
+        assert!(!owned_namespace_wait_expired(false, 0));
+        assert!(owned_namespace_wait_expired(false, 1));
+        assert!(sweep_wait_expired(
+            "error: timed out waiting for the condition on namespaces/agent-ns"
+        ));
+        assert!(!sweep_wait_expired(
+            "Error: namespaces is forbidden: User \"x\" cannot delete resource \"namespaces\""
+        ));
+        // `i/o timeout` is a connectivity failure, not kubectl's delete wait.
+        assert!(!sweep_wait_expired("dial tcp: i/o timeout"));
+        let resume = "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s";
+        let message = format_owned_namespace_wait(
+            &[OwnedNamespaceWait {
+                name: "agent-ns".into(),
+                phase: "Terminating".into(),
+                conditions: "NamespaceFinalizersRemaining=True".into(),
+                objects: "ConfigMap (1): hold".into(),
+            }],
+            resume,
+        );
+        assert!(message.contains("agent-ns"), "{message}");
+        assert!(message.contains("Terminating"), "{message}");
+        assert!(
+            message.contains("NamespaceFinalizersRemaining=True"),
+            "{message}"
+        );
+        assert!(message.contains("ConfigMap"), "{message}");
+        assert!(message.contains("hold"), "{message}");
+        assert!(message.contains("--timeout=300s"), "{message}");
+        assert!(!message.contains("finalizer removed"), "{message}");
     }
 
     // #1654 cross-release teardown scope. Two independent Curie installs on one
@@ -4882,7 +5277,7 @@ mod tests {
         let cmd = resume_command(&[TeardownStep::NamespaceSweep], &o);
         assert_eq!(
             cmd,
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found"
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s"
         );
         // #707 ownership-scope invariant: the sweep stays keyed on THIS release's
         // label and is never widened to an unconditional namespace delete.
@@ -4922,7 +5317,7 @@ mod tests {
         );
         let helm_cmd = "helm uninstall prod-release -n agent-ns";
         let sweep_cmd =
-            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found";
+            "kubectl delete namespace -l curietech.ai/created-by=prod-release,curietech.ai/created-in=agent-ns --ignore-not-found --timeout=300s";
         assert_eq!(
             cmd,
             format!(

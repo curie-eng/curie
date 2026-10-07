@@ -122,8 +122,11 @@ def validate_snapshot_against_base(
             "publication-validation", "snapshot repository does not match sanitized base"
         )
     if snapshot.base_sha != prepared.base_sha:
+        # #4121: name both commits so the factory run's details line is actionable.
         raise WorkspacePreparationError(
-            "publication-validation", "snapshot commit does not match sanitized base"
+            "publication-validation",
+            f"snapshot commit {snapshot.base_sha[:12]} does not match "
+            f"sanitized base {prepared.base_sha[:12]}",
         )
     if len(snapshot.patch) > max_patch_bytes:
         raise WorkspacePreparationError(

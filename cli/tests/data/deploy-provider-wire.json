@@ -20,5 +20,7 @@
     "id": "dep_1",
     "environment": "dev",
     "status": "active"
-  }
+  },
+  "cron_triggers": [],
+  "warnings": []
 }
