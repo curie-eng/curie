@@ -56,7 +56,7 @@ pub fn custody_reason(name: &str) -> String {
 
 /// The reserved names `text` references for expansion, in sorted order.
 ///
-/// A reference is `$`, an optional `{`, optional whitespace, then the name,
+/// A reference is `$`, an optional `{`, optional whitespace (Python's `\s`), then the name,
 /// ending where a variable name would (not before `[A-Za-z0-9_]`). That covers
 /// `$NAME`, `${NAME}`, `${ NAME }`, `${NAME:-x}`, `${NAME-x}` and a reference
 /// nested in another's default, and keeps a longer name that merely starts with
@@ -75,7 +75,7 @@ fn references(text: &str, name: &str) -> bool {
     text.match_indices('$').any(|(at, _)| {
         let rest = &text[at + 1..];
         let rest = rest.strip_prefix('{').unwrap_or(rest);
-        let rest = rest.trim_start();
+        let rest = rest.trim_start_matches(is_python_whitespace);
         rest.strip_prefix(name).is_some_and(|after| {
             !after
                 .chars()
@@ -83,6 +83,26 @@ fn references(text: &str, name: &str) -> bool {
                 .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
         })
     })
+}
+
+/// Python's `\s` in a `str` pattern (`str.isspace`), exactly. Rust's
+/// `char::is_whitespace` (Unicode `White_Space`) lacks U+001C..=U+001F, which
+/// Python counts, so the set is spelled out rather than borrowed.
+fn is_python_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{09}'..='\u{0D}'
+            | '\u{1C}'..='\u{20}'
+            | '\u{85}'
+            | '\u{A0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200A}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202F}'
+            | '\u{205F}'
+            | '\u{3000}'
+    )
 }
 
 /// One refused declaration: the reserved name, where the bundle declares it,
