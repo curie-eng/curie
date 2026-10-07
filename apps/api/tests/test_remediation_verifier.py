@@ -1602,6 +1602,12 @@ def _operator() -> dict[str, str]:
 def _put_policy(
     client: Any, headers: dict[str, str], agent_id: str, document: dict[str, Any]
 ) -> Any:
+    # Bound with ``automatic`` false: an automatic action needs a qualification
+    # record at write (AUTOMATED-REMEDIATION-23), and independence is checked
+    # for every action, automatic or not.
+    document = copy.deepcopy(document)
+    for action in document["actions"]:
+        action["automatic"] = False
     return client.put(
         f"/agents/{agent_id}/hooks/{HOOK}/remediation-policy",
         json={
