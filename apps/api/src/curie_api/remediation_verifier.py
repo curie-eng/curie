@@ -16,8 +16,12 @@ acting connector's digest is recorded ``restore_capable`` (it advertises
 ``observe_version``) and the ledger record carries its target and
 ``post_version``, an observe-only execution of the acting connector is due
 beside each sample (E3). The nomination is ``verifying``. A forward that ends
-``failed`` or ``indeterminate`` gets no verifier and is ``not-recovered`` at
-once. A verifier that cannot be scheduled (none declared, no in-force digest
+``failed``, ``indeterminate`` or ``refused`` after admission
+(``finish_unverified``) gets no verifier: its nomination finishes
+``not-recovered`` at once with the execution's code in ``execution_code``, and
+a ledger record, when one exists, carries the outcome too. A refusal that
+returns the nomination to approval (``not_reversible_now``, ``policy_changed``)
+is not an outcome. A verifier that cannot be scheduled (none declared, no in-force digest
 for its connector, not independent now) is ``verifier-unavailable``.
 
 Evaluation (``reads_ended``, called after every transition that ends a read):
@@ -66,6 +70,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from . import bundles
+from .action_execution_codes import NOT_REVERSIBLE_NOW_CODE
 from .action_undoable import in_force_bundle_refs
 from .config import get_settings
 from .models import (
@@ -100,6 +105,13 @@ FINISHED: Final = "finished"
 
 # @spec AUTOMATED-REMEDIATION-12: a verification is at most 60 samples.
 MAX_SAMPLES: Final = 60
+# @spec AUTOMATED-REMEDIATION-11 @spec AUTOMATED-REMEDIATION-13: refusals that send
+# the nomination back to approval instead of finishing it.
+_BACK_TO_APPROVAL: Final = frozenset({NOT_REVERSIBLE_NOW_CODE, "policy_changed"})
+_UNVERIFIED: Final = frozenset(
+    {ExecutionState.failed, ExecutionState.indeterminate, ExecutionState.refused}
+)
+
 # The code the rest of a decided verification's reads end with: the authority
 # that scheduled them is spent, and no read under it runs.
 SPENT_CODE: Final = "authority_unavailable"
@@ -376,6 +388,56 @@ async def _observable(
     return bool(capable)
 
 
+async def finish_unverified(
+    session: AsyncSession, execution: ActionExecution, now: datetime
+) -> bool:
+    """Finish a remediation whose forward execution ended without confirming.
+
+    @spec AUTOMATED-REMEDIATION-18: "An execution that ends ``failed``,
+    ``indeterminate`` or ``refused`` after admission gets no verifier and
+    finishes ``not-recovered`` for reporting, with the execution code". The
+    nomination is ``finished`` ``not-recovered`` with ``execution_code``; a
+    ledger record (``failed`` and ``indeterminate`` have one, a refusal never
+    does) carries the outcome too. Written once. A refusal that returns the
+    nomination to approval is left alone. Returns whether ``execution`` was such
+    an ending of a remediation's forward execution. Commits nothing.
+    """
+
+    if execution.kind != ExecutionKind.forward or execution.state not in _UNVERIFIED:
+        return False
+    code = execution.refusal_code or execution.failure_code
+    if execution.state == ExecutionState.refused and code in _BACK_TO_APPROVAL:
+        return True
+    nomination = await nomination_for_execution(session, execution)
+    if nomination is None:
+        return True
+    if execution.subject_action_id is not None:
+        await session.execute(
+            update(AgentAction)
+            .where(
+                AgentAction.id == execution.subject_action_id,
+                AgentAction.verification_outcome.is_(None),
+            )
+            .values(verification_outcome=NOT_RECOVERED, verified_at=now)
+            .execution_options(synchronize_session=False)
+        )
+    finished = await session.scalar(
+        update(RemediationNomination)
+        .where(
+            RemediationNomination.id == nomination.id,
+            RemediationNomination.verification_outcome.is_(None),
+        )
+        .values(verification_outcome=NOT_RECOVERED, state=FINISHED, execution_code=code)
+        .returning(RemediationNomination.id)
+        .execution_options(synchronize_session=False)
+    )
+    if finished is not None:
+        logger.info(
+            "remediation verification ended nomination=%s outcome=%s", nomination.id, NOT_RECOVERED
+        )
+    return True
+
+
 async def schedule_verification(
     session: AsyncSession,
     store: ObjectStore,
@@ -389,6 +451,8 @@ async def schedule_verification(
     Commits nothing.
     """
 
+    if await finish_unverified(session, execution, now):
+        return
     if execution.kind != ExecutionKind.forward or execution.subject_action_id is None:
         return
     nomination = await nomination_for_execution(session, execution)
@@ -413,10 +477,6 @@ async def schedule_verification(
             now=now,
         )
 
-    if execution.state in (ExecutionState.failed, ExecutionState.indeterminate):
-        # "gets no verifier and finishes not-recovered for reporting".
-        await decide(NOT_RECOVERED)
-        return
     if execution.state != ExecutionState.confirmed:
         return
 
@@ -698,6 +758,7 @@ __all__ = [
     "SUPERSEDED",
     "UNAVAILABLE",
     "VERIFIED",
+    "finish_unverified",
     "header_secret_names",
     "independence_refusal",
     "is_observe_only",
