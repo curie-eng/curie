@@ -223,27 +223,47 @@ fn undo_principal_token() -> Result<String> {
 }
 
 // @spec ACTION-EXECUTOR-23
+/// An `actions` verb whose inputs passed [`ActionsVerb::validate`]: every id
+/// is a UUID and an undo carries its principal. Only this type reaches
+/// [`actions`], so no request is made for a malformed invocation.
+pub struct ValidatedActions {
+    verb: ActionsVerb,
+    principal: Option<String>,
+}
+
+impl ActionsVerb {
+    // @spec ACTION-EXECUTOR-23
+    /// Check the invocation's own inputs. Pure: no network, no cluster, no
+    /// key discovery, so a dispatcher runs it BEFORE resolving the connection
+    /// (at the cluster tier that resolution reads Helm state and the release's
+    /// key Secret and opens a port-forward, none of which a malformed id or a
+    /// missing principal should trigger).
+    pub fn validate(self) -> Result<ValidatedActions> {
+        let verb = match self {
+            ActionsVerb::List { agent } => ActionsVerb::List { agent },
+            ActionsVerb::Show { id } => ActionsVerb::Show {
+                id: validated_id("action", &id)?,
+            },
+            ActionsVerb::Undo { id } => ActionsVerb::Undo {
+                id: validated_id("action", &id)?,
+            },
+            ActionsVerb::Execution { id } => ActionsVerb::Execution {
+                id: validated_id("execution", &id)?,
+            },
+        };
+        let principal = match &verb {
+            ActionsVerb::Undo { .. } => Some(undo_principal_token()?),
+            _ => None,
+        };
+        Ok(ValidatedActions { verb, principal })
+    }
+}
+
+// @spec ACTION-EXECUTOR-23
 /// `<tier> actions <verb>`: list or read ledger actions, ask for an undo, or
 /// read an execution's receipt.
-pub async fn actions(opts: ActionsOpts, verb: ActionsVerb) -> Result<ActionsOutput> {
-    // Inputs are validated before the client exists, so a malformed request
-    // makes no network call at all.
-    let verb = match verb {
-        ActionsVerb::List { agent } => ActionsVerb::List { agent },
-        ActionsVerb::Show { id } => ActionsVerb::Show {
-            id: validated_id("action", &id)?,
-        },
-        ActionsVerb::Undo { id } => ActionsVerb::Undo {
-            id: validated_id("action", &id)?,
-        },
-        ActionsVerb::Execution { id } => ActionsVerb::Execution {
-            id: validated_id("execution", &id)?,
-        },
-    };
-    let principal = match &verb {
-        ActionsVerb::Undo { .. } => Some(undo_principal_token()?),
-        _ => None,
-    };
+pub async fn actions(opts: ActionsOpts, validated: ValidatedActions) -> Result<ActionsOutput> {
+    let ValidatedActions { verb, principal } = validated;
     // A cluster tunnel is loopback too; its key is already the release's, so
     // it must not trigger local key discovery.
     let client = if opts.tier == "cluster" {

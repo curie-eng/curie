@@ -431,6 +431,9 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
         // @spec ACTION-EXECUTOR-23
         LocalAction::Actions { verb } => {
             let (verb, conn) = verb.into_parts();
+            // Validated before the connection is resolved, so a malformed id
+            // or a missing principal never reaches discovery or the API.
+            let verb = verb.validate()?;
             emit(
                 commands::actions(
                     commands::ActionsOpts {
