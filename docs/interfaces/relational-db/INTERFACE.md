@@ -187,6 +187,22 @@ Rows are written by `apps/api/src/curie_api/remediation_admission.py` and
 deletes nominations refused `reply_surface_unavailable` and restores the refusal
 check.
 
+Migration `0094_remediation_qualifications.py` (automated remediation,
+AUTOMATED-REMEDIATION-22) is additive. `remediation_qualifications`
+(`apps/api/src/curie_api/models.py::RemediationQualification`) holds one
+immutable record per qualification id for one agent, connector, tool, connector
+digest and verifier declaration digest: the reversibility, the operator
+principal that recorded it, the worst case statement (at most 2000 characters,
+a check), the evidence references checked by state and digest at write, and the
+hook, action and policy generation it was evaluated against.
+`remediation_qualification_verifier_runs` (`RemediationQualificationVerifierRun`)
+holds each qualification verifier run (hook, action, generation, verifier
+digest, literal target, operator principal, `started_at`, outcome); its samples
+are `read` executions with `authority_kind` `qualification`. Both cascade with
+the agent. Rows are written by
+`apps/api/src/curie_api/remediation_qualifications.py`; the downgrade drops both
+tables.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.
