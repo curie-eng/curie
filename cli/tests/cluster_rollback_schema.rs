@@ -914,3 +914,148 @@ fn json_refusal_is_nonzero_actionable_and_redacted() {
         "json refusal must not invoke helm rollback: {helm_log}"
     );
 }
+
+/// Unlabeled retained manifest: no schema-compat ConfigMap is declared.
+const UNLABELED_MANIFEST: &str = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: byo-config\n  labels:\n    app.kubernetes.io/component: api\ndata:\n  note: no schema metadata\n";
+
+/// A refused rollback whose target's catalog window is not ambiguous must
+/// return the plain catalog refusal: the original message, the fail forward
+/// fix with no retained-manifest guidance, and no mutation.
+fn assert_original_catalog_refusal(
+    fixture: &RollbackFixture,
+    output: &Output,
+    target: &str,
+    live: &str,
+    catalog_head: &str,
+    expected_fix: &str,
+) {
+    assert!(
+        !output.status.success(),
+        "rollback to {target} with live {live} must be refused: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload = json_payload(output);
+    let error = payload["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(&format!(
+            "refusing rollback to application {target}: live database revision {live} is outside its declared schema range (head {catalog_head})"
+        )),
+        "refusal must be the original catalog message: {payload}"
+    );
+    let fix = payload["fix"].as_str().unwrap_or_default();
+    assert_eq!(
+        fix, expected_fix,
+        "refusal fix must be the plain catalog fail forward fix: {payload}"
+    );
+    assert!(
+        !fix.contains("helm get manifest"),
+        "a catalog refusal must not carry retained-manifest guidance: {payload}"
+    );
+    fixture.assert_no_mutation();
+}
+
+/// #4230 AC7(a): a main-built 0.12.1 revision whose own schema-compat metadata
+/// declares 0076..0081 can start against live 0081, so rollback proceeds even
+/// though the released 0.12.1 catalog window ends at 0076.
+#[test]
+fn main_built_v0121_ahead_of_its_release_rolls_back_by_declared_window() {
+    let history = two_revision_history("0.12.1", "0.12.2");
+    let manifest = compatibility_manifest("prod-release-schema-compat", "0.12.1", "0076", "0081");
+    let fixture = RollbackFixture::new(&history, "0081", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert!(
+        output.status.success(),
+        "declared 0076..0081 window admits live 0081: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(json_payload(&output)["rolled_back"], true);
+    let log = fixture.helm_log();
+    assert!(
+        log.lines()
+            .any(|line| line == "get manifest prod-release -n agent-ns --revision 1"),
+        "the refused catalog window must trigger a retained manifest read: {log}"
+    );
+    assert!(
+        log.lines()
+            .any(|line| line == "rollback prod-release 1 -n agent-ns"),
+        "the admitted target must be rolled back: {log}"
+    );
+}
+
+/// #4230 AC7(b): without a labeled schema-compat ConfigMap the release build
+/// is judged by its catalog window and refused.
+#[test]
+fn v0121_without_labeled_metadata_keeps_the_catalog_refusal() {
+    let history = two_revision_history("0.12.1", "0.12.2");
+    let fixture = RollbackFixture::new(&history, "0081", Ok(UNLABELED_MANIFEST));
+    let output = fixture.run(&[]);
+    assert_original_catalog_refusal(
+        &fixture,
+        &output,
+        "0.12.1",
+        "0081",
+        "0076",
+        "fail forward to application 0.12.2, which can start against revision 0081",
+    );
+}
+
+/// #4230 AC7(c): the published v0.10.2 chart declares head 0061, earlier than
+/// its catalog head 0062, so the declared window never replaces the catalog
+/// window and the original refusal stands.
+#[test]
+fn published_v0102_declared_head_earlier_than_catalog_keeps_the_catalog_refusal() {
+    let history = two_revision_history("0.10.2", "0.10.3");
+    let manifest = compatibility_manifest("prod-release-schema-compat", "0.10.2", "0060", "0061");
+    let fixture = RollbackFixture::new(&history, "0063", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert_original_catalog_refusal(
+        &fixture,
+        &output,
+        "0.10.2",
+        "0063",
+        "0062",
+        "fail forward to application 0.10.3, which can start against revision 0063",
+    );
+}
+
+/// #4230 AC7(d): a failed retained manifest read returns the original catalog
+/// refusal, not a manifest read error.
+#[test]
+fn v0121_manifest_read_failure_keeps_the_catalog_refusal() {
+    let history = two_revision_history("0.12.1", "0.12.2");
+    let fixture = RollbackFixture::new(&history, "0081", Err("boom"));
+    let output = fixture.run(&[]);
+    assert_original_catalog_refusal(
+        &fixture,
+        &output,
+        "0.12.1",
+        "0081",
+        "0076",
+        "fail forward to application 0.12.2, which can start against revision 0081",
+    );
+    let payload = json_payload(&output);
+    assert!(
+        !payload["error"].as_str().unwrap_or_default().contains("boom"),
+        "the manifest read error must not replace the catalog refusal: {payload}"
+    );
+}
+
+/// #4230 Decision 12: a later declared head that still excludes the live
+/// revision returns the original catalog refusal.
+#[test]
+fn v0121_declared_window_that_still_excludes_live_keeps_the_catalog_refusal() {
+    let history = two_revision_history("0.12.1", "0.12.2");
+    let manifest = compatibility_manifest("prod-release-schema-compat", "0.12.1", "0076", "0080");
+    let fixture = RollbackFixture::new(&history, "0081", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert_original_catalog_refusal(
+        &fixture,
+        &output,
+        "0.12.1",
+        "0081",
+        "0076",
+        "fail forward to application 0.12.2, which can start against revision 0081",
+    );
+}
