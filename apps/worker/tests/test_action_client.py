@@ -324,3 +324,106 @@ async def test_an_attributed_completion_carries_the_worker_token() -> None:
     assert seen[0]["body"]["connector_digest"] == _DIGEST
     assert seen[0]["worker_token"] == "wt"
     assert seen[0]["api_key"] == "k"
+
+
+# -- ACTION-EXECUTOR-12: a refused attribution costs only the digest -----------
+#
+# Attribution is optional metadata. If the API refuses it (403: worker token
+# mismatch, unset or mid-rotation; 422: tool-prefix mismatch or a tightened
+# validator), the refusal stored nothing, so the client re-posts the same
+# completion once without the pair. The action completes with a null digest and
+# the turn does not fail. A refusal of a plain completion is the ledger failing
+# and still raises, exactly as before.
+
+
+def _refusing_attribution(status: int, *, plain_status: int = 200) -> tuple[Any, list[Any]]:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(
+            {
+                "path": request.url.path,
+                "body": body,
+                "worker_token": request.headers.get("X-Curie-Worker-Token"),
+            }
+        )
+        if "connector" in body or "connector_digest" in body:
+            return httpx.Response(status, json={"detail": "refused"})
+        if plain_status != 200:
+            return httpx.Response(plain_status, json={"detail": "refused"})
+        return httpx.Response(200, json={"id": "a1", "status": "succeeded", **body})
+
+    return handler, seen
+
+
+async def _attributed_complete(handler: Any) -> dict[str, Any]:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        return await ActionClient(
+            api_base_url="http://api", api_key="k", client=http, worker_token="wt"
+        ).complete(
+            "a1",
+            SideEffectFlag(tool="mcp__grafana__scale", call_id="c", result={"ok": True}),
+            connector="grafana",
+            connector_digest=_DIGEST,
+        )
+
+
+@pytest.mark.parametrize("status", [403, 422])
+async def test_a_refused_attribution_reposts_once_without_the_pair(status: int) -> None:
+    handler, seen = _refusing_attribution(status)
+
+    row = await _attributed_complete(handler)
+
+    assert [s["path"] for s in seen] == ["/actions/a1/complete"] * 2
+    first, second = seen[0]["body"], seen[1]["body"]
+    assert (first["connector"], first["connector_digest"]) == ("grafana", _DIGEST)
+    assert second.get("connector") is None
+    assert second.get("connector_digest") is None
+    # Everything else is the same completion.
+    rest = {k: v for k, v in first.items() if k not in ("connector", "connector_digest")}
+    assert {k: v for k, v in second.items() if v is not None} == {
+        k: v for k, v in rest.items() if v is not None
+    }
+    # The ledger's row comes back: completed, with no attribution.
+    assert row["id"] == "a1"
+    assert row["status"] == "succeeded"
+    assert row.get("connector") is None and row.get("connector_digest") is None
+
+
+@pytest.mark.parametrize("status", [403, 422])
+async def test_a_repost_that_is_refused_too_surfaces_and_is_not_retried_again(
+    status: int,
+) -> None:
+    """The fallback is the plain completion; its refusal is the ledger failing."""
+
+    handler, seen = _refusing_attribution(status, plain_status=status)
+
+    with pytest.raises(ActionBackendError):
+        await _attributed_complete(handler)
+
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize("status", [403, 422, 503])
+async def test_a_refused_plain_completion_still_raises_without_a_retry(status: int) -> None:
+    handler, seen = _refusing_attribution(200, plain_status=status)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(ActionBackendError):
+            await ActionClient(
+                api_base_url="http://api", api_key="k", client=http, worker_token="wt"
+            ).complete("a1", SideEffectFlag(tool="t", call_id="c", result={"ok": True}))
+
+    assert len(seen) == 1
+
+
+async def test_a_server_error_on_an_attributed_completion_is_not_a_refusal() -> None:
+    """Only 403 and 422 mean 'refused, nothing stored'; a 5xx still surfaces."""
+
+    handler, seen = _refusing_attribution(503)
+
+    with pytest.raises(ActionBackendError):
+        await _attributed_complete(handler)
+
+    assert len(seen) == 1

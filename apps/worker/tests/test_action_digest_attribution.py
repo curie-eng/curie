@@ -738,3 +738,49 @@ async def test_with_both_gates_the_composed_recorder_attributes_through_config(
     assert asked and asked[0] == (AGENT_ID, CONNECTOR)
     assert [r["namespace"] for r in apps.reads] == [NAMESPACE, NAMESPACE]
     assert _attributed(ledger.completion()) == (CONNECTOR, DIGEST)
+
+
+# -- the API refusing the attribution never fails the turn ----------------------
+
+
+class _RefusingLedger(Ledger):
+    """A ledger whose completion refuses any attribution with ``status``."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__()
+        self._status = status
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else None
+        if request.url.path.endswith("/complete") and body and "connector" in body:
+            self.posts.append({"path": request.url.path, "body": body})
+            return httpx.Response(self._status, json={"detail": "refused"})
+        return super().__call__(request)
+
+
+@pytest.mark.parametrize("status", [403, 422])
+async def test_an_api_refusal_of_the_attribution_completes_the_action_with_null(
+    status: int,
+) -> None:
+    apps = FakeAppsV1Api(deployment(), deployment())
+    ledger = _RefusingLedger(status)
+    opening, closing = _frames()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(ledger)) as http:
+        recorder = DigestAttributingRecorder(
+            ActionClient(api_base_url="http://api", api_key="k", client=http, worker_token="wt"),
+            deployments=apps,
+            namespace=NAMESPACE,
+            deployment_name=_resolver()[0],
+        )
+        recorded = await recorder.record(
+            opening, event_id="event-1", conversation_id="C1", agent_id=AGENT_ID
+        )
+        row = await recorder.complete(recorded.id, closing)
+
+    completes = [p["body"] for p in ledger.posts if p["path"].endswith("/complete")]
+    assert len(completes) == 2
+    assert _attributed(completes[0]) == (CONNECTOR, DIGEST)
+    assert _attributed(completes[1]) == NULL
+    assert row["id"] == "a1"
+    assert row.get("connector") is None
