@@ -1371,3 +1371,42 @@ def test_a_card_post_retried_after_a_failure_posts_one_card(
     assert len(keys) == 1 and None not in keys
     assert [entry[0] for entry in memory.remembered] == [approval_id]
     assert memory.remembered[0][1]["ts"] == next(iter(messages.values()))
+
+
+def test_an_approved_raiser_whose_rerun_is_refused_finishes_and_is_not_retried(
+    client: Any,
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+    runs_stream: str,
+    stream: Any,
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-16 (review round 2, N1): the approve claim
+    committed and the raiser is ``approved`` with no execution (the execution's
+    insert failed); a policy write then withdraws the action's tool. The
+    sweeper's rerun is refused ``policy_changed``: the raiser finishes with that
+    code in ``execution_code``, nothing executes, and the next pass owes nothing.
+    """
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    raising_id = _nominate(agent_id, n=1)
+    requested = _request(agent_id, raising_id, n=1)
+    with _fault("execution"):
+        _settle_under_fault(client, requested.approval_id, "approved", runs_stream)
+    assert _nomination(raising_id)["state"] == "approved"
+    assert _nomination(raising_id)["execution_id"] is None
+    _advance_policy(agent_id, {**DOCUMENT, "actions": [{**ACTION, "tool": "patch_deployment"}]})
+
+    _sweep(runs_stream)
+
+    raising = _nomination(raising_id)
+    assert raising["state"] == "finished"
+    assert raising["execution_code"] == "policy_changed"
+    assert raising["execution_id"] is None
+    assert raising["decided_at"] is not None
+    assert _executions() == []
+
+    again = _run(lambda session: _approvals_module().reconcile_remediation_approvals(session))
+    assert again == 0
+    assert _nomination(raising_id)["state"] == "finished"
+    assert _executions() == []
+    assert stream() == []
