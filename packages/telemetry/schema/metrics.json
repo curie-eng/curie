@@ -1,5 +1,68 @@
 {
   "metrics": {
+    "curie.action_executor.execution": {
+      "attributes": {
+        "code": [
+          "agent_stopped",
+          "authority_unavailable",
+          "reserved_verb_via_forward",
+          "arguments_mismatch",
+          "tool_not_grant_bound",
+          "connector_not_hosted",
+          "connector_digest_unavailable",
+          "restore_not_advertised",
+          "restore_schema_mismatch",
+          "tool_not_advertised",
+          "version_conflict",
+          "sandbox_unavailable",
+          "runner_unavailable",
+          "connector_unreachable",
+          "version_conflict_at_write",
+          "sealing_key_unavailable",
+          "snapshot_unopenable",
+          "connector_error",
+          "unstructured_reply",
+          "response_lost",
+          "deadline_exceeded",
+          "none"
+        ],
+        "connector": {
+          "ceiling": 16,
+          "kind": "bounded",
+          "overflow": "other",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+          "reserved": [
+            "other"
+          ]
+        },
+        "kind": [
+          "restore",
+          "probe",
+          "other"
+        ],
+        "service.name": [
+          "curie-worker"
+        ],
+        "stage": [
+          "pre_dispatch",
+          "connector_refusal",
+          "post_dispatch",
+          "none"
+        ],
+        "state": [
+          "confirmed",
+          "failed",
+          "indeterminate",
+          "refused",
+          "unreported"
+        ]
+      },
+      "cardinality_bound": 22440,
+      "description": "Connector action executions by kind, terminal state, stage, code and connector.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{execution}"
+    },
     "curie.agent.turn.completed": {
       "attributes": {
         "agent": {

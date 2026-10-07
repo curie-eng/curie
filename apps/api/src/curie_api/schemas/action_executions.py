@@ -83,9 +83,15 @@ class ExecutionOutcome(ExecutionFence):
 class ExecutionOut(BaseModel):
     """One execution as the worker and the receipt read it.
 
-    @spec ACTION-EXECUTOR-18. Deliberately without ``outcome``,
-    ``arguments_sha256`` or ``forward_arguments``: the read names what ran and
-    how it ended, never a version, an argument or a state.
+    @spec ACTION-EXECUTOR-18. Deliberately without ``outcome`` or
+    ``forward_arguments``: the read names what ran and how it ended, never a
+    version, an argument or a state.
+
+    @spec ACTION-EXECUTOR-14 @spec ACTION-EXECUTOR-7. Two non-secret digests
+    the worker checks before dispatch: ``connector_digest``, the image the
+    call must run against, and ``arguments_sha256``, the ruling's digest over
+    the restore's canonical ``{target, prior_state}`` (null on a probe). A
+    digest names neither the arguments nor the state it covers.
     """
 
     model_config = ConfigDict(from_attributes=True)
@@ -106,3 +112,5 @@ class ExecutionOut(BaseModel):
     dispatched_at: datetime | None
     finished_at: datetime | None
     created_at: datetime
+    connector_digest: str
+    arguments_sha256: str | None
