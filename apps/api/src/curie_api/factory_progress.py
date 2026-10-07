@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import ExecutionRequest, ExecutionRequestPhaseReport, FactoryStatusComment
@@ -289,25 +290,31 @@ async def record_report(
     # Read before any rollback below expires the instance.
     active_id = active.id
 
-    row: FactoryStatusComment | None = await session.scalar(
-        select(FactoryStatusComment)
-        .where(FactoryStatusComment.execution_request_id == active.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if row is None:
-        # Admitted before 0055 and still active: give it its status row now.
-        row = FactoryStatusComment(
-            execution_request_id=active.id,
+    # Admitted before 0055 and still active: give it its status row now.
+    await session.execute(
+        insert(FactoryStatusComment)
+        .values(
+            execution_request_id=active_id,
             work_item_id=active.work_item_id,
             applied_label=None,
         )
-        session.add(row)
-
+        .on_conflict_do_nothing(index_elements=["execution_request_id"])
+    )
     declaration = body.declaration.model_dump(exclude_none=True)
-    if row.declaration is None:
-        row.declaration = declaration
-    elif row.declaration != declaration:
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(
+            FactoryStatusComment.execution_request_id == active_id,
+            FactoryStatusComment.declaration.is_(None),
+        )
+        .values(declaration=declaration)
+    )
+    stored = await session.scalar(
+        select(FactoryStatusComment.declaration).where(
+            FactoryStatusComment.execution_request_id == active_id
+        )
+    )
+    if stored != declaration:
         await session.rollback()
         return RecordResult("declaration_changed", active_id)
 
@@ -329,7 +336,11 @@ async def record_report(
         )
     )
     if body.activity is not None:
-        row.activity = body.activity.model_dump(exclude_none=True)
+        await session.execute(
+            update(FactoryStatusComment)
+            .where(FactoryStatusComment.execution_request_id == active_id)
+            .values(activity=body.activity.model_dump(exclude_none=True))
+        )
     await session.commit()
     return RecordResult("recorded", active.id)
 

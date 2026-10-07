@@ -939,6 +939,7 @@ def _racing_pass(count: int) -> None:
         reconcilers = [WorkItemReconciler(maker, c, get_settings()) for c in clients]
         try:
             await asyncio.gather(*(r.run_once() for r in reconcilers))
+            await asyncio.gather(*(r._sync_status_comments() for r in reconcilers))
         finally:
             for c in clients:
                 await c.aclose()
@@ -1348,6 +1349,7 @@ def _passes_on_one_reconciler(count: int) -> None:
         try:
             for _ in range(count):
                 await reconciler.run_once()
+                await reconciler._sync_status_comments()
         finally:
             await valkey.aclose()
             await engine.dispose()

@@ -23,6 +23,7 @@ from aci_protocol import (
 )
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
 from curie_api.config import get_settings
+from curie_api.main import create_app
 from curie_api.workitem_dispatch import acquire, admit, defer, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_telemetry import build_resource, configure_meter_provider
@@ -43,6 +44,12 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from test_factory_terminus import (  # noqa: F401 (fixtures)
+    _label,
+    _request,
+    admitted,
+    comments,
+)
 
 REPO = "acme-corp/acme-bot"
 ADDRESS = "C0EXAMPLE1"
@@ -58,7 +65,6 @@ RECONCILER_STEPS = (
     "_settle_overdue_cancellations",
     "_readmit_pending",
     "_reconcile_missed_labels",
-    "_sync_status_comments",
     "_redispatch_lapsed_acquisitions",
     "_publish_execute_wakes",
 )
@@ -471,7 +477,7 @@ def test_run_once_creates_the_group_then_publishes_a_readable_execute_wake(
     assert payload["author"] == REQUESTER
 
 
-def test_status_comment_failure_still_publishes_a_readable_execute_wake(
+def test_run_once_never_calls_status_comments_and_publishes_a_readable_execute_wake(
     clean_db: None,
     allowlisted: None,
     valkey: redis.Redis,
@@ -479,7 +485,11 @@ def test_status_comment_failure_still_publishes_a_readable_execute_wake(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    attempted = False
+
     async def fail_status_comments(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal attempted
+        attempted = True
         raise RuntimeError("injected status comment failure")
 
     monkeypatch.setattr(
@@ -515,12 +525,126 @@ def test_status_comment_failure_still_publishes_a_readable_execute_wake(
     assert payload["conversation_id"] == WIRE_CONVERSATION
     assert payload["text"] == OBJECTIVE
     assert payload["author"] == REQUESTER
-    assert any(
-        "sync_status_comments" in record.getMessage()
-        and record.exc_info is not None
-        and str(record.exc_info[1]) == "injected status comment failure"
+    assert not attempted
+    assert not any("sync_status_comments" in record.getMessage() for record in caplog.records)
+
+
+def test_status_comment_loop_recovers_after_failure_and_cancels_cleanly(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    attempts = 0
+
+    async def steps(
+        _maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> None:
+        recovered = asyncio.Event()
+        original = reconciler._sync_status_comments
+
+        async def fail_once() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("injected status comment loop failure")
+            await original()
+            recovered.set()
+
+        monkeypatch.setattr(reconciler, "_sync_status_comments", fail_once)
+        loop = asyncio.create_task(reconciler.run_status_comments_forever())
+        try:
+            await asyncio.wait_for(recovered.wait(), 5)
+            assert attempts >= 2
+            assert not loop.done()
+        finally:
+            loop.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(loop, 2)
+
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_INTERVAL_SECONDS", "1")
+    get_settings.cache_clear()
+    try:
+        _run(steps, runs_stream)
+    finally:
+        get_settings.cache_clear()
+    failures = [
+        record
         for record in caplog.records
-    )
+        if record.exc_info is not None
+        and str(record.exc_info[1]) == "injected status comment loop failure"
+    ]
+    assert len(failures) == 1
+
+
+def test_lifespan_runs_status_sync_on_a_separate_task_and_cancels_both_loops(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 9958
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "true")
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_INTERVAL_SECONDS", "1")
+    get_settings.cache_clear()
+    app = create_app()
+
+    async def go() -> None:
+        entered, released = asyncio.Event(), asyncio.Event()
+        sink.get_barrier = (
+            f"/repos/{REPO}/issues/{number}",
+            asyncio.get_running_loop(),
+            entered,
+            released,
+        )
+        try:
+            async with app.router.lifespan_context(app):
+                await asyncio.wait_for(entered.wait(), 5)
+                dispatch = app.state.work_item_reconciler_task
+                status = app.state.work_item_status_comments_task
+                assert dispatch is not None and status is not None
+                assert dispatch is not status
+                assert not dispatch.done() and not status.done()
+
+                # The background dispatch loop may be the pass that publishes.
+                async def published_generation() -> Any:
+                    while True:
+                        async with app.state.sessionmaker() as session:
+                            published = await session.scalar(
+                                text(
+                                    "SELECT published_generation "
+                                    "FROM curie.execution_requests WHERE id = :id"
+                                ),
+                                {"id": request_id},
+                            )
+                        if published == 1:
+                            return published
+                        await asyncio.sleep(0.05)
+
+                # One shared 2 s deadline: dispatch must publish within 2 s
+                # while its sibling status sync is still awaiting GitHub.
+                async with asyncio.timeout(2):
+                    # The real dispatch pass must finish while its sibling awaits GitHub.
+                    await app.state.work_item_reconciler.run_once()
+                    published = await published_generation()
+                assert published == 1
+                assert not status.done()
+            assert dispatch.cancelled()
+            assert status.cancelled()
+            assert app.state.engine.pool.checkedout() == 0
+            assert app.state.liveness_engine.pool.checkedout() == 0
+        finally:
+            released.set()
+            sink.get_barrier = None
+
+    try:
+        client.portal.call(go)
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.mark.parametrize("failed_step", RECONCILER_STEPS)

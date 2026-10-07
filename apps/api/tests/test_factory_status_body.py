@@ -20,7 +20,7 @@ from curie_api.factory_notices import (
 )
 from curie_api.factory_progress import PhaseSlot, PhaseView, StageSlot
 from curie_api.factory_reply_target import ReplyTarget
-from curie_api.models import FactoryStatusComment, WorkItem
+from curie_api.models import FactoryStatusComment
 
 REQUEST = uuid.UUID("00000000-0000-0000-0000-000000003125")
 CARD = "https://curie.example.com/v1/factory/cards/abc.svg"
@@ -375,7 +375,7 @@ def test_every_factory_comment_creation_redacts_at_the_http_boundary(target_kind
         async with httpx.AsyncClient(transport=httpx.MockTransport(github)) as client:
             outcome = await _deliver(
                 _GitHub(client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}),
-                WorkItem(github_issue_number=3936),
+                3936,
                 FactoryStatusComment(execution_request_id=REQUEST, scan_page=1),
                 target,
                 f"{_PROVIDER_DETAIL}\n{_PR_URL}\n{marker_for(REQUEST)}\n",

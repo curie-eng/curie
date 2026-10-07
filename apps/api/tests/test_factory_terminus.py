@@ -298,13 +298,19 @@ class _GitHubComments(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
-    def _send(self, status: int, payload: object) -> None:
+    def _send(self, status: int, payload: object, *, headers: dict[str, str] | None = None) -> None:
         body = payload.encode() if isinstance(payload, str) else json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Cancelling a lifespan task can abandon an in-flight HTTP read.
+            return
 
     def _payload(self) -> Any:
         length = int(self.headers.get("Content-Length", "0"))
@@ -318,6 +324,42 @@ class _GitHubComments(BaseHTTPRequestHandler):
         if self._ci_get(server, path):
             return
         server.requests.append(("GET", path, None))
+        barrier = server.get_barrier
+        if barrier is not None and path == barrier[0]:
+            # The HTTP fake waits on the test's event loop, keeping real HTTP
+            # and database operations in flight until the test releases it.
+            server.get_barrier = None
+            _, loop, entered, released = barrier
+            loop.call_soon_threadsafe(entered.set)
+            asyncio.run_coroutine_threadsafe(released.wait(), loop).result(timeout=15)
+        label = _LABELS.match(path)
+        if label is not None and label.group(2) is None:
+            # List labels for an issue:
+            # https://docs.github.com/en/rest/issues/labels#list-labels-for-an-issue
+            # Pagination uses the provider's Link relation:
+            # https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
+            number = int(label.group(1))
+            params = parse_qs(parsed.query)
+            page = int(params.get("page", ["1"])[0])
+            per_page = int(params.get("per_page", ["30"])[0])
+            server.label_pages.append((number, page))
+            status = server.label_page_statuses.get((number, page), 200)
+            if status != 200:
+                self._send(status, {"message": "injected label list refusal"})
+                return
+            names = sorted(server.issue_labels.get(number, set()))
+            start = (page - 1) * per_page
+            headers = {}
+            if start + per_page < len(names):
+                host, port = server.server_address
+                next_page = f"http://{host}:{port}{path}?per_page={per_page}&page={page + 1}"
+                headers["Link"] = f'<{next_page}>; rel="next"'
+            self._send(
+                200,
+                [{"name": value} for value in names[start : start + per_page]],
+                headers=headers,
+            )
+            return
         subject = _ISSUE_OR_PR.match(path)
         if subject is not None:
             number = int(subject.group(1))
@@ -443,9 +485,7 @@ class _GitHubComments(BaseHTTPRequestHandler):
                 server.lost_response_paths.discard(path)
                 self.close_connection = True
                 return
-            status = (
-                server.rerun_statuses.pop(0) if server.rerun_statuses else server.rerun_status
-            )
+            status = server.rerun_statuses.pop(0) if server.rerun_statuses else server.rerun_status
             self._send(status, {} if status == 201 else {"message": "refused"})
             return
         server.requests.append(("POST", path, payload.get("body", "")))
@@ -511,8 +551,13 @@ class _CommentServer(ThreadingHTTPServer):
         self.patch_statuses: list[int] = []
         # Issue number -> label names currently on it.
         self.issue_labels: dict[int, set[str]] = {}
+        self.label_pages: list[tuple[int, int]] = []
+        self.label_page_statuses: dict[tuple[int, int], int] = {}
         # Issue or pull request number -> title the subject read returns.
         self.titles: dict[int, str] = {}
+        self.get_barrier: (
+            tuple[str, asyncio.AbstractEventLoop, asyncio.Event, asyncio.Event] | None
+        ) = None
 
     def find(self, comment_id: int) -> dict[str, Any] | None:
         for comment in self.comments:
@@ -688,6 +733,7 @@ def _reconcile() -> None:
         reconciler = WorkItemReconciler(maker, client, get_settings())
         try:
             await reconciler.run_once()
+            await reconciler._sync_status_comments()
         finally:
             await client.aclose()
             await engine.dispose()
@@ -954,9 +1000,7 @@ def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
 
 
 @pytest.mark.parametrize("cause", ["early_stop", "approval_create_failed"])
-def test_an_early_stop_finish_defers_to_an_in_flight_publication(
-    admitted: Any, cause: str
-) -> None:
+def test_an_early_stop_finish_defers_to_an_in_flight_publication(admitted: Any, cause: str) -> None:
     """#3128: like ``no_pull_request``, publication owns the terminus."""
 
     client, github, sink = admitted
@@ -1951,7 +1995,6 @@ def test_an_issue_originated_notice_still_comments_on_the_issue(admitted: Any) -
     assert marker_for(row["id"]) in (posts[0][1] or "")
 
 
-
 def test_factory_notices_usage_limited_finish_posts_the_reset_remedy_once(
     admitted: Any,
 ) -> None:
@@ -1964,7 +2007,9 @@ def test_factory_notices_usage_limited_finish_posts_the_reset_remedy_once(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
         json={
-            "runtime_epoch": epoch, "outcome": "failed", "cause": "model_usage_limited",
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "model_usage_limited",
             "detail": "You've hit your session limit · resets 3pm (UTC)",
         },
     )

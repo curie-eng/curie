@@ -1086,6 +1086,12 @@ class FactoryStatusComment(Base):
     detail: Mapped[str | None] = mapped_column(Text, default=None)
     attempts: Mapped[int] = mapped_column(default=0, server_default="0")
     scan_page: Mapped[int] = mapped_column(default=1, server_default="1")
+    sync_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    sync_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Set when the comment is invalidated while a sync holds the lease.
+    sync_invalidated: Mapped[bool] = mapped_column(default=False, server_default="false")
     posted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )

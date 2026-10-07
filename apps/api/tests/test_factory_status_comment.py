@@ -15,29 +15,37 @@ Admission is a signed issues webhook; progress arrives through the real
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
+import socket
 import sys
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from curie_api.factory_notices import FINAL_MARKER, marker_for, result_section
+from curie_api.factory_notices import FINAL_MARKER, marker_for, result_section, sync_status_comments
+from curie_api.github_app import GitHubAppError
 from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-from test_factory_progress import DECLARATION, STAGED_DECLARATION, report
+from sqlalchemy import make_url, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from test_factory_progress import ACTIVITY, DECLARATION, STAGED_DECLARATION, progress_token, report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     _LABELS,
     HEAD_A,
     REPO,
     _attach_publication,
     _attach_revision_publication,
+    _Credentials,
     _insert_revision,
     _notices,
     _patches,
@@ -120,6 +128,548 @@ def _finish_failed(
     assert finished.status_code == 200, finished.text
 
 
+@asynccontextmanager
+async def _blocked_status_sync(
+    client: Any, sink: Any, number: int, *, path: str | None = None
+) -> AsyncIterator[tuple[asyncio.Task[None], asyncio.Event]]:
+    """Hold the pass on its GET of ``path``, by default the issue read."""
+
+    entered, released = asyncio.Event(), asyncio.Event()
+    sink.get_barrier = (
+        path or f"/repos/{REPO}/issues/{number}",
+        asyncio.get_running_loop(),
+        entered,
+        released,
+    )
+    task = asyncio.create_task(client.app.state.work_item_reconciler._sync_status_comments())
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        yield task, released
+    finally:
+        released.set()
+        sink.get_barrier = None
+        await asyncio.wait_for(task, 10)
+
+
+def test_blocked_github_has_no_idle_transaction_and_progress_completes(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9951
+    request_id = _admit(client, github, sink, number)
+    _start_running(request_id)
+
+    async def go() -> None:
+        inspector = create_async_engine(get_settings().database_url)
+        try:
+            async with _blocked_status_sync(client, sink, number) as (sync, _released):
+                assert client.app.state.engine.pool.checkedout() == 0
+                async with inspector.connect() as connection:
+                    idle = (
+                        await connection.execute(
+                            text(
+                                "SELECT pid, query FROM pg_stat_activity "
+                                "WHERE datname = current_database() "
+                                "AND state = 'idle in transaction' AND pid <> pg_backend_pid()"
+                            )
+                        )
+                    ).all()
+                assert idle == [], idle
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+                ) as api:
+                    response = await asyncio.wait_for(
+                        api.post(
+                            f"/v1/work-item-progress/{request_id}",
+                            headers={"X-API-Key": progress_token(request_id)},
+                            json={
+                                "phase": "read_issue",
+                                "declaration": DECLARATION,
+                                "activity": ACTIVITY,
+                            },
+                        ),
+                        2,
+                    )
+                    assert response.status_code == 201, response.text
+                    changed = {
+                        **DECLARATION,
+                        "phases": [*DECLARATION["phases"], {"id": "extra", "label": "Extra"}],
+                    }
+                    rejected = await asyncio.wait_for(
+                        api.post(
+                            f"/v1/work-item-progress/{request_id}",
+                            headers={"X-API-Key": progress_token(request_id)},
+                            json={
+                                "phase": "read_issue",
+                                "declaration": changed,
+                                "activity": ACTIVITY,
+                            },
+                        ),
+                        2,
+                    )
+                    assert rejected.status_code == 409, rejected.text
+                    assert "declaration_changed" in rejected.text
+                assert not sync.done(), "GitHub must still be blocked when progress returns"
+        finally:
+            await inspector.dispose()
+
+    client.portal.call(go)
+    row = _rows(
+        "SELECT declaration, activity FROM curie.factory_terminal_notices "
+        "WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]
+    assert row["declaration"] == DECLARATION
+    assert row["activity"] == ACTIVITY
+
+
+def test_blocked_github_does_not_delay_heartbeat_or_relax_epoch_fencing(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9952
+    request_id = _admit(client, github, sink, number)
+    epoch = _start_running(request_id)
+
+    async def go() -> None:
+        async with _blocked_status_sync(client, sink, number) as (sync, _released):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+            ) as api:
+                path = f"/v1/internal/work-items/requests/{request_id}/heartbeat"
+                heartbeat = await asyncio.wait_for(
+                    api.post(path, headers=WORKER, json={"runtime_epoch": epoch}), 2
+                )
+                assert heartbeat.status_code == 200, heartbeat.text
+                assert heartbeat.json()["status"] == "running"
+                stale = await asyncio.wait_for(
+                    api.post(path, headers=WORKER, json={"runtime_epoch": epoch + 1}), 2
+                )
+                assert stale.status_code == 409, stale.text
+                assert "stale_owner" in stale.text
+            assert not sync.done(), "GitHub must still be blocked when the heartbeat returns"
+
+    client.portal.call(go)
+
+
+def test_concurrent_status_passes_claim_one_row_and_post_one_comment(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9953
+    request_id = _admit(client, github, sink, number)
+
+    async def go() -> None:
+        async with _blocked_status_sync(client, sink, number) as (first, released):
+            second = await asyncio.wait_for(
+                sync_status_comments(
+                    client.app.state.sessionmaker, get_settings(), owner="status-owner-b", limit=1
+                ),
+                2,
+            )
+            assert second == 0
+            assert _posts(sink) == []
+            assert not first.done()
+            released.set()
+            await asyncio.wait_for(first, 5)
+
+    client.portal.call(go)
+    assert len(_posts(sink)) == 1
+    assert len(_marked(sink, request_id)) == 1
+    row = _rows(
+        "SELECT sync_owner, sync_lease_expires_at, attempts "
+        "FROM curie.factory_terminal_notices WHERE execution_request_id = :id",
+        {"id": request_id},
+    )[0]
+    assert row == {"sync_owner": None, "sync_lease_expires_at": None, "attempts": 1}
+
+
+def test_expired_status_claim_is_taken_over_and_old_writeback_is_dropped(
+    admitted: Any,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 9954
+    request_id = _admit(client, github, sink, number)
+    _start_running(request_id)
+    caplog.set_level(logging.INFO, logger="curie_api.factory_notices")
+
+    async def go() -> None:
+        maker = client.app.state.sessionmaker
+        async with _blocked_status_sync(client, sink, number) as (first, released):
+            async with maker() as session:
+                owner = await session.scalar(
+                    text(
+                        "SELECT sync_owner FROM curie.factory_terminal_notices "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"id": request_id},
+                )
+                assert owner.startswith("work-item-reconciler:")
+                await session.execute(
+                    text(
+                        "UPDATE curie.factory_terminal_notices "
+                        "SET sync_lease_expires_at = clock_timestamp() - interval '1 second' "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"id": request_id},
+                )
+                await session.commit()
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+            ) as api:
+                response = await api.post(
+                    f"/v1/work-item-progress/{request_id}",
+                    headers={"X-API-Key": progress_token(request_id)},
+                    json={"phase": "read_issue", "declaration": DECLARATION, "activity": ACTIVITY},
+                )
+                assert response.status_code == 201, response.text
+            assert (
+                await asyncio.wait_for(
+                    sync_status_comments(maker, get_settings(), owner="status-owner-b", limit=1), 5
+                )
+                > 0
+            )
+            async with maker() as session:
+                before = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT * FROM curie.factory_terminal_notices "
+                                "WHERE execution_request_id = :id"
+                            ),
+                            {"id": request_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                before = dict(before)
+            assert before["sync_owner"] is None
+            assert before["sync_lease_expires_at"] is None
+            assert before["declaration"] == DECLARATION
+            assert before["activity"] == ACTIVITY
+            assert not first.done()
+            released.set()
+            await asyncio.wait_for(first, 5)
+            async with maker() as session:
+                after = (
+                    (
+                        await session.execute(
+                            text(
+                                "SELECT * FROM curie.factory_terminal_notices "
+                                "WHERE execution_request_id = :id"
+                            ),
+                            {"id": request_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+            assert dict(after) == before
+
+    client.portal.call(go)
+    assert any(
+        record.levelno == logging.INFO
+        and re.search(r"(?:stale|lost|drop|skip)", record.getMessage(), re.IGNORECASE)
+        for record in caplog.records
+        if record.name == "curie_api.factory_notices"
+    )
+
+
+def test_state_label_change_reads_once_adds_once_and_removes_only_old_label(admitted: Any) -> None:  # noqa: F811
+    client, github, sink = admitted
+    number = 9955
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    sink.requests.clear()
+    _start_running(request_id)
+    _reconcile()
+    path = f"/repos/{REPO}/issues/{number}/labels"
+    label_calls = [
+        (method, called) for method, called, _body in sink.requests if _LABELS.match(called)
+    ]
+    assert label_calls == [
+        ("GET", path),
+        ("POST", path),
+        ("DELETE", f"{path}/curie-factory:queued"),
+    ]
+    assert sink.issue_labels[number] == {LABEL, "bug", "curie-factory:running"}
+    sink.requests.clear()
+    _reconcile()
+    assert _label_writes(sink) == []
+
+
+def test_state_labels_on_later_pages_are_removed_and_human_labels_are_preserved(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 9962
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    human_labels = {f"aaa-example-label-{index:03d}" for index in range(100)} | {LABEL, "bug"}
+    sink.issue_labels[number] = human_labels | {"curie-factory:queued"}
+    sink.requests.clear()
+    sink.label_pages.clear()
+    _start_running(request_id)
+
+    _reconcile()
+
+    pages = [page for issue, page in sink.label_pages if issue == number]
+    assert len(pages) >= 2
+    assert pages == list(range(1, len(pages) + 1))
+    path = f"/repos/{REPO}/issues/{number}/labels"
+    assert _label_writes(sink) == [
+        ("POST", path, '["curie-factory:running"]'),
+        ("DELETE", f"{path}/curie-factory:queued", None),
+    ]
+    assert sink.issue_labels[number] == human_labels | {"curie-factory:running"}
+    assert _notices(request_id)[0]["applied_label"] == "curie-factory:running"
+
+
+@pytest.mark.parametrize("status", [403, 500])
+def test_failed_second_label_page_does_not_write_or_settle_and_next_pass_recovers(
+    admitted: Any,  # noqa: F811
+    status: int,
+) -> None:
+    client, github, sink = admitted
+    number = 9963
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    human_labels = {f"aaa-example-label-{index:03d}" for index in range(100)} | {LABEL, "bug"}
+    original = human_labels | {"curie-factory:queued"}
+    sink.issue_labels[number] = original.copy()
+    sink.label_page_statuses[(number, 2)] = status
+    sink.requests.clear()
+    sink.label_pages.clear()
+    _start_running(request_id)
+
+    _reconcile()
+
+    assert sink.label_pages == [(number, 1), (number, 2)]
+    assert _label_writes(sink) == []
+    assert sink.issue_labels[number] == original
+    assert _notices(request_id)[0]["applied_label"] == "curie-factory:queued"
+
+    sink.label_page_statuses.clear()
+    sink.requests.clear()
+    sink.label_pages.clear()
+    _reconcile()
+
+    pages = [page for issue, page in sink.label_pages if issue == number]
+    assert len(pages) >= 2
+    assert pages == list(range(1, len(pages) + 1))
+    assert sink.issue_labels[number] == human_labels | {"curie-factory:running"}
+    assert _notices(request_id)[0]["applied_label"] == "curie-factory:running"
+    assert len(_label_writes(sink)) == 2
+
+
+def test_ready_and_heartbeat_use_liveness_pool_when_all_main_connections_are_busy(
+    admitted: Any,  # noqa: F811
+) -> None:  # noqa: F811
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 9956)
+    epoch = _start_running(request_id)
+
+    async def go() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=client.app), base_url="http://testserver"
+        ) as api:
+            path = f"/v1/internal/work-items/requests/{request_id}/heartbeat"
+            async with AsyncExitStack() as checked_out:
+                for _ in range(15):
+                    session = await checked_out.enter_async_context(client.app.state.sessionmaker())
+                    await session.execute(text("SELECT 1"))
+                assert client.app.state.engine.pool.checkedout() == 15
+                ready, heartbeat = await asyncio.wait_for(
+                    asyncio.gather(
+                        api.get("/ready"),
+                        api.post(path, headers=WORKER, json={"runtime_epoch": epoch}),
+                    ),
+                    2,
+                )
+                assert ready.status_code == 200, ready.text
+                assert heartbeat.status_code == 200, heartbeat.text
+                unauthorized = await asyncio.wait_for(
+                    api.post(
+                        path,
+                        headers={"X-Curie-Worker-Token": "wrong-worker"},
+                        json={"runtime_epoch": epoch},
+                    ),
+                    2,
+                )
+                assert unauthorized.status_code == 401, unauthorized.text
+                stale = await asyncio.wait_for(
+                    api.post(path, headers=WORKER, json={"runtime_epoch": epoch + 1}), 2
+                )
+                assert stale.status_code == 409, stale.text
+                assert "stale_owner" in stale.text
+                assert client.app.state.engine.pool.checkedout() == 15
+            assert client.app.state.engine.pool.checkedout() == 0
+            # Readiness still requires its own database pool to be available.
+            async with AsyncExitStack() as checked_out:
+                for _ in range(4):
+                    session = await checked_out.enter_async_context(
+                        client.app.state.liveness_sessionmaker()
+                    )
+                    await session.execute(text("SELECT 1"))
+                unavailable = await asyncio.wait_for(api.get("/ready"), 3)
+                assert unavailable.status_code == 503, unavailable.text
+            assert (await asyncio.wait_for(api.get("/ready"), 2)).status_code == 200
+
+    client.portal.call(go)
+
+
+def test_liveness_database_failure_rejects_ready_and_does_not_renew_heartbeat(
+    admitted: Any,  # noqa: F811
+) -> None:  # noqa: F811
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 9960)
+    epoch = _start_running(request_id)
+
+    async def go() -> None:
+        async with client.app.state.sessionmaker() as session:
+            before = await session.scalar(
+                text(
+                    "SELECT runtime_heartbeat_expires_at FROM curie.execution_requests "
+                    "WHERE id = :id"
+                ),
+                {"id": request_id},
+            )
+        # A bound TCP socket without listen reserves a port that refuses
+        # connections. This exercises the real database driver failure path.
+        with socket.socket() as unavailable_port:
+            unavailable_port.bind(("127.0.0.1", 0))
+            database = make_url(get_settings().database_url).set(
+                host="127.0.0.1", port=unavailable_port.getsockname()[1]
+            )
+            unavailable = create_async_engine(database, connect_args={"timeout": 0.25})
+            original = client.app.state.liveness_sessionmaker
+            client.app.state.liveness_sessionmaker = async_sessionmaker(unavailable)
+            try:
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=client.app, raise_app_exceptions=False),
+                    base_url="http://testserver",
+                ) as api:
+                    ready = await asyncio.wait_for(api.get("/ready"), 2)
+                    assert ready.status_code == 503, ready.text
+                    heartbeat = await asyncio.wait_for(
+                        api.post(
+                            f"/v1/internal/work-items/requests/{request_id}/heartbeat",
+                            headers=WORKER,
+                            json={"runtime_epoch": epoch},
+                        ),
+                        2,
+                    )
+                    assert heartbeat.status_code == 500, heartbeat.text
+            finally:
+                client.app.state.liveness_sessionmaker = original
+                await unavailable.dispose()
+        async with client.app.state.sessionmaker() as session:
+            after = await session.scalar(
+                text(
+                    "SELECT runtime_heartbeat_expires_at FROM curie.execution_requests "
+                    "WHERE id = :id"
+                ),
+                {"id": request_id},
+            )
+        assert after == before
+
+    client.portal.call(go)
+
+
+def test_credential_mint_failure_releases_status_claim_and_next_pass_retries(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 9961)
+
+    class RefusedCredentials(_Credentials):
+        def token_for_verified_installation(self, repo: str, installation_id: int) -> str:
+            raise GitHubAppError("fixture installation token mint refused")
+
+    async def go() -> None:
+        monkeypatch.setattr(
+            "curie_api.factory_notices.credentials_for", lambda _settings: RefusedCredentials()
+        )
+        assert (
+            await sync_status_comments(
+                client.app.state.sessionmaker, get_settings(), owner="retry-owner", limit=1
+            )
+            == 0
+        )
+        async with client.app.state.sessionmaker() as session:
+            row = (
+                (
+                    await session.execute(
+                        text(
+                            "SELECT attempts, sync_owner, sync_lease_expires_at, refused_at "
+                            "FROM curie.factory_terminal_notices WHERE execution_request_id = :id"
+                        ),
+                        {"id": request_id},
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        assert dict(row) == {
+            "attempts": 1,
+            "sync_owner": None,
+            "sync_lease_expires_at": None,
+            "refused_at": None,
+        }
+        assert sink.requests == []
+        monkeypatch.setattr(
+            "curie_api.factory_notices.credentials_for", lambda _settings: _Credentials()
+        )
+        assert (
+            await sync_status_comments(
+                client.app.state.sessionmaker, get_settings(), owner="retry-owner", limit=1
+            )
+            > 0
+        )
+
+    client.portal.call(go)
+    assert len(_posts(sink)) == 1
+    assert _notices(request_id)[0]["attempts"] == 2
+
+
+def test_slow_github_call_logs_one_sanitized_warning_and_row_summary(
+    admitted: Any,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 9957
+    _admit(client, github, sink, number)
+    caplog.set_level(logging.INFO, logger="curie_api.factory_notices")
+
+    async def go() -> None:
+        async with _blocked_status_sync(client, sink, number) as (sync, released):
+            await asyncio.sleep(2.05)
+            released.set()
+            await asyncio.wait_for(sync, 5)
+
+    client.portal.call(go)
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "curie_api.factory_notices" and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "GET" in message
+    assert "200" in message
+    assert "elapsed" in message
+    assert "{" in message and "}" in message
+    assert str(number) not in message
+    assert REPO not in message
+    assert "ghs_factory_terminus_fixture" not in caplog.text
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "curie_api.factory_notices"
+        and record.levelno == logging.INFO
+        and "elapsed" in record.getMessage()
+        and "call" in record.getMessage()
+    ]
+    assert len(summaries) == 1
+
+
 def _reconcile_later(seconds: int) -> None:
     """Advance only the reconciler clock. Stored deadlines stay write-once."""
 
@@ -183,7 +733,8 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
 
 
 def test_the_card_image_is_linked_when_a_base_url_is_set(
-    admitted: Any, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,  # noqa: F811
 ) -> None:
     client, github, sink = admitted
     monkeypatch.setenv("GITHUB_FACTORY_CARD_BASE_URL", CARD_BASE)
@@ -202,7 +753,8 @@ def test_the_card_image_is_linked_when_a_base_url_is_set(
 
 
 def test_a_card_url_replaces_the_checklist_as_phases_advance(
-    admitted: Any, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,  # noqa: F811
 ) -> None:
     client, github, sink = admitted
     monkeypatch.setenv("GITHUB_FACTORY_CARD_BASE_URL", CARD_BASE)
@@ -315,9 +867,7 @@ def test_diff_review_failure_keeps_completed_phases_after_renewed_plan_review(
     _reconcile()
 
     assert _posts(sink) == []
-    assert [path for path, _ in _patches(sink)] == [
-        f"/repos/{REPO}/issues/comments/{comment_id}"
-    ]
+    assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
     for label in ("Plan", "Plan review", "Failing test", "Implement"):
@@ -489,9 +1039,7 @@ def test_sandbox_termination_comment_shows_kubernetes_reason(admitted: Any) -> N
     _reconcile()
 
     assert _posts(sink) == []
-    assert [path for path, _ in _patches(sink)] == [
-        f"/repos/{REPO}/issues/comments/{comment_id}"
-    ]
+    assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
     assert body.startswith("Could not complete: the sandbox terminated")
@@ -519,7 +1067,9 @@ def test_sandbox_termination_comment_shows_kubernetes_reason(admitted: Any) -> N
     ],
 )
 def test_every_terminal_failure_cause_shows_needs_human_status(
-    admitted: Any, number: int, cause: str  # noqa: F811
+    admitted: Any,  # noqa: F811
+    number: int,
+    cause: str,
 ) -> None:
     client, github, sink = admitted
     request_id = _admit(client, github, sink, number)
@@ -703,9 +1253,7 @@ def test_budget_failure_comment_identifies_the_limit_or_admits_it_is_unknown(
     _reconcile()
 
     assert _posts(sink) == []
-    assert [path for path, _ in _patches(sink)] == [
-        f"/repos/{REPO}/issues/comments/{comment_id}"
-    ]
+    assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
     (comment,) = _marked(sink, request_id)
     body = comment["body"]
     headline = body.splitlines()[0]
@@ -1067,8 +1615,7 @@ def test_queued_review_revision_replies_that_it_waits_for_the_current_run(
         },
     )
     _execute(
-        "UPDATE curie.work_items SET next_sequence = 4, version = version + 1 "
-        "WHERE id = :id",
+        "UPDATE curie.work_items SET next_sequence = 4, version = version + 1 WHERE id = :id",
         {"id": first["work_item_id"]},
     )
     _execute(
@@ -1091,9 +1638,7 @@ def test_queued_review_revision_replies_that_it_waits_for_the_current_run(
     assert _curie_labels(sink, number) == {"curie-factory:running"}
 
     github.labels = []
-    cancelled = _post(
-        client, "issues", _issue_event("unlabeled", number, label={"name": LABEL})
-    )
+    cancelled = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
     assert cancelled.json()["status"] == "factory_cancellation_requested", cancelled.text
     _reconcile()
     queued_row = _rows(
@@ -1127,8 +1672,7 @@ def test_closed_lineage_queue_keeps_the_completed_runs_pr_open_label(
         },
     )
     _execute(
-        "UPDATE curie.work_items SET next_sequence = 3, version = version + 1 "
-        "WHERE id = :id",
+        "UPDATE curie.work_items SET next_sequence = 3, version = version + 1 WHERE id = :id",
         {"id": first["work_item_id"]},
     )
     _execute(
