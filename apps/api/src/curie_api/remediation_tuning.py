@@ -26,8 +26,8 @@ the current-value read, the evidence from the evidence reads. The model's
 reason is shown only as unverified model text.
 
 Approving the request records the decision and ends every nomination of it
-``finished``, the raising one with ``execution_code``
-``tune_execution_not_automated``; no forward execution is created
+``refused`` with ``tune_execution_not_automated``; no forward execution is
+created
 (``remediation_approvals.execute_approved``, and ``create_remediation_forward``
 refuses a tune action as a second guard).
 """
