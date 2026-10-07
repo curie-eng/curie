@@ -71,7 +71,9 @@ if "STARTABILITY_TEST_SNAPSHOT" in os.environ:
 
         def read_namespaced_secret(self, name: str, namespace: str, **_: Any) -> Any:
             record("secret", [name, namespace])
-            assert namespace in {"acme-dispatchers", "acme-workers"}, "Secret namespace was not scoped"
+            assert namespace in {"acme-dispatchers", "acme-workers"}, (
+                "Secret namespace was not scoped"
+            )
             if DATA.get("secret_error") == name:
                 raise PermissionError("credential response " + SENTINEL)
             secrets = (

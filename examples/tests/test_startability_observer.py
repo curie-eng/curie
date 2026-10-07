@@ -141,7 +141,9 @@ def test_missing_slack_lane_does_not_fail_email(lane: str) -> None:
     }
     rows, total = split(judge(observer, [binding(), binding(kind="email")], lanes=states))
     assert [row["ready"] for row in rows] == [0, 1]
-    assert lane in rows[0]["reason"] and total["not_ready"] == 1
+    role = "app" if lane == "SLACK_APP_TOKEN" else "bot"
+    assert f"{role} credential" in rows[0]["reason"] and total["not_ready"] == 1
+    assert lane not in rows[0]["reason"]
 
 
 def test_declaration_names_actual_indexed_lanes() -> None:
@@ -281,7 +283,10 @@ def test_secret_claim_uses_current_worker_marker_and_pool_policy() -> None:
 
 @pytest.mark.parametrize(
     "pools, templates, fragment",
-    [({}, {}, "SandboxWarmPool is absent"), ({"acme-runner-pool": "acme-runner"}, {}, "SandboxTemplate is absent")],
+    [
+        ({}, {}, "SandboxWarmPool is absent"),
+        ({"acme-runner-pool": "acme-runner"}, {}, "SandboxTemplate is absent"),
+    ],
 )
 def test_missing_pool_or_template_fails(pools: dict, templates: dict, fragment: str) -> None:
     """@spec STARTABILITY-2."""

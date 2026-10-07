@@ -146,14 +146,15 @@ def judge(
                 credentials = identity_lanes.get(identity)
             if credentials is None:
                 return f"Slack identity {identity} has no declaration"
-            for lane in credentials:
+            for position, lane in enumerate(credentials):
                 state = (
                     (lane in lanes, "variable is absent")
                     if isinstance(lanes, set)
                     else (lanes.get(lane, (False, "variable is absent")))
                 )
                 if not state[0]:
-                    return f"Slack identity {identity}: {lane}: {state[1]}"
+                    role = "app" if position == 0 else "bot"
+                    return f"Slack identity {identity}: {role} credential: {state[1]}"
         if not binding["deployed"]:
             return "the agent has no active deployment"
         secret_env: dict[str, str] = {}
@@ -178,16 +179,19 @@ def judge(
             if derived != base_pool and derived in pools:
                 pool = derived
         if pool not in pools:
-            return f"selected SandboxWarmPool {pool} is absent"
+            return "selected SandboxWarmPool is absent"
         template = pools[pool]
         if template not in templates:
-            return f"selected SandboxTemplate {template} is absent"
+            return "selected SandboxTemplate is absent"
         references = templates[template]
         if references is None:
-            return f"selected SandboxTemplate {template} has no unique runner container"
+            return "selected SandboxTemplate has no unique runner container"
         for name in names:
             if name not in references:
-                return f"SandboxTemplate {template} has no runner secretKeyRef for {name}"
+                return (
+                    "selected SandboxTemplate has no runner secretKeyRef "
+                    "for required connector key"
+                )
         return None
 
     lines = []
