@@ -51,7 +51,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -866,3 +868,85 @@ def test_the_structural_check_rejects_a_ruling_called_without_a_principal() -> N
     assert any("without a required principal" in v for v in rulings), rulings
     assert any("not requested by the principal" in v for v in rulings), rulings
     assert any("SQL inserts a restore" in v for v in rulings), rulings
+
+
+# --------------------------------------------------------------------------- #
+# Recovery: an approved undo whose restore never committed
+# --------------------------------------------------------------------------- #
+
+
+@contextlib.contextmanager
+def _restore_insert_fault() -> Iterator[None]:
+    """A real Postgres error on inserting a ``restore`` execution, removed on exit."""
+
+    sql_rows(
+        "CREATE OR REPLACE FUNCTION curie.remesc_test_fault() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected fault'; END $$"
+    )
+    sql_rows(
+        "CREATE TRIGGER remesc_test_fault BEFORE INSERT ON curie.action_executions "
+        "FOR EACH ROW WHEN (NEW.kind = 'restore') EXECUTE FUNCTION curie.remesc_test_fault()"
+    )
+    try:
+        yield
+    finally:
+        sql_rows("DROP TRIGGER IF EXISTS remesc_test_fault ON curie.action_executions")
+        sql_rows("DROP FUNCTION IF EXISTS curie.remesc_test_fault()")
+
+
+def _sweep(runs_stream: str) -> None:
+    """One pass of the API's periodic approval sweeper, as the API runs it."""
+
+    from curie_api.resumequeue import ResumeQueue
+    from curie_api.sweeper import sweep_expired_approvals
+    from redis import asyncio as aioredis
+
+    async def sweep() -> None:
+        settings = get_settings()
+        engine = create_async_engine(settings.database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        valkey = aioredis.from_url(settings.valkey_dsn())
+        try:
+            async with sessions() as session:
+                await sweep_expired_approvals(session, ResumeQueue(valkey, stream=runs_stream))
+        finally:
+            await valkey.aclose()
+            await engine.dispose()
+
+    asyncio.run(sweep())
+
+
+def test_an_approved_undo_whose_restore_did_not_commit_is_completed_once_by_recovery(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, runs_stream: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-19 @spec AUTOMATED-REMEDIATION-16: "approving it
+    produces one restore execution under the approving principal" holds across a
+    failure after the approval's claim: the restore's insert fails, and what the
+    platform retries (the API's sweeper passes; a still-pending approval resolved
+    again by its person) ends with exactly one restore requested by the approving
+    principal and one granted ruling row. Further passes add nothing.
+    """
+
+    _, nomination_id, _, action_id = _undoable_scenario(client, auth_headers, tmp_path)
+    _drive(client, nomination_id, "not-recovered")
+    approval_id = _one_escalation(nomination_id)["undo_approval_id"]
+    assert approval_id is not None
+
+    with _restore_insert_fault(), contextlib.suppress(Exception):
+        _resolve(client, approval_id, "approved")
+    assert _restores() == []
+    claimed = _approval(approval_id)["status"] == "approved"
+
+    _sweep(runs_stream)
+    if _approval(approval_id)["status"] == "pending":
+        assert not claimed
+        assert _resolve(client, approval_id, "approved").status_code == 200
+    _sweep(runs_stream)
+
+    assert _approval(approval_id)["status"] == "approved"
+    _assert_one_restore_under(action_id, OPERATOR)
+
+    _sweep(runs_stream)
+    _sweep(runs_stream)
+
+    _assert_one_restore_under(action_id, OPERATOR)
