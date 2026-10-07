@@ -116,7 +116,7 @@ def judge(
     worker_env: Mapping[str, str | None],
     lanes: Mapping[str, tuple[bool, str]] | set[str],
     pools: Mapping[str, str],
-    templates: Mapping[str, set[str]],
+    templates: Mapping[str, set[str] | None],
     *,
     identity_lanes: Mapping[str, tuple[str, str]] | None = None,
     claim: Callable[[str, Mapping[str, str], str, frozenset[str], frozenset[str]], str],
@@ -182,8 +182,11 @@ def judge(
         template = pools[pool]
         if template not in templates:
             return f"selected SandboxTemplate {template} is absent"
+        references = templates[template]
+        if references is None:
+            return f"selected SandboxTemplate {template} has no unique runner container"
         for name in names:
-            if name not in templates[template]:
+            if name not in references:
                 return f"SandboxTemplate {template} has no runner secretKeyRef for {name}"
         return None
 
@@ -344,14 +347,16 @@ def gather(args: argparse.Namespace, dsn: str) -> list[dict[str, Any]]:
         p["metadata"]["name"]: p["spec"]["sandboxTemplateRef"]["name"]
         for p in items("sandboxwarmpools")
     }
-    templates = {}
+    templates: dict[str, set[str] | None] = {}
     for template in items("sandboxtemplates"):
         containers = template["spec"]["podTemplate"]["spec"]["containers"]
+        runners = [c for c in containers if c["name"] == args.runner_container]
+        if len(runners) != 1:
+            templates[template["metadata"]["name"]] = None
+            continue
         templates[template["metadata"]["name"]] = {
             e["name"]
-            for c in containers
-            if c["name"] == args.runner_container
-            for e in c.get("env") or []
+            for e in runners[0].get("env") or []
             if (e.get("valueFrom") or {}).get("secretKeyRef")
         }
 
