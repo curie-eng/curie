@@ -14,7 +14,8 @@ The readers here:
   returns ``satisfied``, ``unsatisfied`` or ``unsuccessful`` for a declared
   ``{"comparator", "value"}`` (no ``value`` for ``absent``) against a reported
   ``{"sample", "value"}``; ``SAMPLE_KINDS``, ``SUCCESSFUL_SAMPLES`` and
-  ``RESULTS`` are the closed sets;
+  ``RESULTS`` are the closed sets, and ``ORDERING_COMPARATORS`` read a JSON number
+  or a string matching ``NUMERIC_STRING_GRAMMAR`` as numeric;
 * ``curie_api.schemas.action_executions.ExecutionSample``: the closed body of
   ``POST /action-executions/{id}/samples``;
 * ``curie_api.remediation_policy_document`` (the policy store): the comparator
@@ -37,6 +38,7 @@ _KEYS = {
     "comment",
     "comparators",
     "ordering_comparators",
+    "numeric_string_grammar",
     "in_list_max",
     "value_max_chars",
     "sample_kinds",
@@ -72,6 +74,8 @@ def test_the_evaluator_closes_the_frozen_sets() -> None:
     assert set(module.SAMPLE_KINDS) == set(_VECTOR["sample_kinds"])
     assert set(module.SUCCESSFUL_SAMPLES) == set(_VECTOR["successful"])
     assert set(module.RESULTS) == set(_VECTOR["results"])
+    assert set(module.ORDERING_COMPARATORS) == set(_VECTOR["ordering_comparators"])
+    assert module.NUMERIC_STRING_GRAMMAR == _VECTOR["numeric_string_grammar"]
 
 
 @pytest.mark.parametrize("case", _VECTOR["evaluations"], ids=lambda case: case["name"])

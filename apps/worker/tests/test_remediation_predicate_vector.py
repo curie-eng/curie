@@ -33,6 +33,7 @@ _KEYS = {
     "comment",
     "comparators",
     "ordering_comparators",
+    "numeric_string_grammar",
     "in_list_max",
     "value_max_chars",
     "sample_kinds",

@@ -1,5 +1,5 @@
 {
-  "comment": "@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-17 @spec AUTOMATED-REMEDIATION-26. The declared-read predicate (maintainer ruling 2026-10-07: one RFC 6901 JSON pointer and a closed comparator set, not an expression language), frozen across three images: the runner's pointer extraction (the `read` phase answers only the sample, never the result), the worker's sample report to the API, and the API's evaluator. `extractions`: given a read tool's `structured` content (null when the tool returned none) and `is_error`, the runner yields `sample`, one of `sample_kinds`, with `value` the pointed JSON scalar for `value` and null otherwise. A scalar whose compact JSON text (ensure_ascii false) exceeds `value_max_chars` code points is `value_too_long`. `successful` names the kinds a verifier counts as a sample taken (AUTOMATED-REMEDIATION-18); the others are unsuccessful samples, never refusals. `invalid_pointers` are refused at policy write (policy_document_invalid) and by the runner (invalid_request, without dialing). `sample_report` is the worker's body for `POST /action-executions/{id}/samples`: the fence, the zero-based sample `index`, and the sample and value exactly as the runner answered. `evaluations`: the API evaluator's `result` (one of `results`) for a declared `comparator` and `value` (no `value` for `absent`) against a reported sample. Ordering comparators apply only when both sides are JSON numbers (booleans are not numbers); otherwise eq, ne and in compare type and value exactly, and an ordering comparator is unsatisfied. Read by runner/tests/test_runner_execute_vector.py (the extraction cases and invalid pointers, through the real `read` phase), apps/worker/tests/test_remediation_predicate_vector.py and apps/api/tests/test_remediation_predicate_vector.py, each of which rejects an unknown key.",
+  "comment": "@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-17 @spec AUTOMATED-REMEDIATION-26. The declared-read predicate (maintainer ruling 2026-10-07: one RFC 6901 JSON pointer and a closed comparator set, not an expression language), frozen across three images: the runner's pointer extraction (the `read` phase answers only the sample, never the result), the worker's sample report to the API, and the API's evaluator. `extractions`: given a read tool's `structured` content (null when the tool returned none) and `is_error`, the runner yields `sample`, one of `sample_kinds`, with `value` the pointed JSON scalar for `value` and null otherwise. A scalar whose compact JSON text (ensure_ascii false) exceeds `value_max_chars` code points is `value_too_long`. `successful` names the kinds a verifier counts as a sample taken (AUTOMATED-REMEDIATION-18); the others are unsuccessful samples, never refusals. `invalid_pointers` are refused at policy write (policy_document_invalid) and by the runner (invalid_request, without dialing). `sample_report` is the worker's body for `POST /action-executions/{id}/samples`: the fence, the zero-based sample `index`, and the sample and value exactly as the runner answered. `evaluations`: the API evaluator's `result` (one of `results`) for a declared `comparator` and `value` (no `value` for `absent`) against a reported sample. Ordering comparators apply only when both sides are numeric (a JSON number, or a string matching `numeric_string_grammar`: optional sign, ASCII digits, optional fraction, optional exponent, nothing else; booleans are never numeric), compared by numeric value; otherwise an ordering comparator is unsatisfied. eq, ne and in never coerce: they compare JSON numbers numerically and everything else by type and value exactly. Read by runner/tests/test_runner_execute_vector.py (the extraction cases and invalid pointers, through the real `read` phase), apps/worker/tests/test_remediation_predicate_vector.py and apps/api/tests/test_remediation_predicate_vector.py, each of which rejects an unknown key.",
   "comparators": [
     "eq",
     "ne",
@@ -16,6 +16,7 @@
     "gt",
     "ge"
   ],
+  "numeric_string_grammar": "^[+-]?[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?$",
   "in_list_max": 16,
   "value_max_chars": 256,
   "sample_kinds": [
@@ -533,25 +534,270 @@
       "result": "unsatisfied"
     },
     {
-      "name": "gt_against_a_numeric_string_is_not_numeric",
+      "name": "gt_against_a_prometheus_numeric_string",
       "comparator": "gt",
       "value": 0.5,
       "sample": {
         "sample": "value",
         "value": "0.75"
       },
-      "result": "unsatisfied",
-      "note": "No coercion: an ordering comparator applies only when both sides are JSON numbers."
+      "result": "satisfied",
+      "note": "An ordering comparator reads a string in the strict decimal grammar as its number."
     },
     {
-      "name": "lt_against_a_string",
+      "name": "gt_numeric_string_equal",
+      "comparator": "gt",
+      "value": 0.5,
+      "sample": {
+        "sample": "value",
+        "value": "0.5"
+      },
+      "result": "unsatisfied"
+    },
+    {
+      "name": "ge_numeric_string_equal",
+      "comparator": "ge",
+      "value": 0.5,
+      "sample": {
+        "sample": "value",
+        "value": "0.5"
+      },
+      "result": "satisfied"
+    },
+    {
+      "name": "lt_against_a_numeric_string",
       "comparator": "lt",
       "value": 10,
       "sample": {
         "sample": "value",
         "value": "5"
       },
+      "result": "satisfied"
+    },
+    {
+      "name": "lt_numeric_string_fails",
+      "comparator": "lt",
+      "value": 0.05,
+      "sample": {
+        "sample": "value",
+        "value": "0.42"
+      },
       "result": "unsatisfied"
+    },
+    {
+      "name": "gt_signed_exponent_string",
+      "comparator": "gt",
+      "value": 100,
+      "sample": {
+        "sample": "value",
+        "value": "+1.5e2"
+      },
+      "result": "satisfied"
+    },
+    {
+      "name": "lt_negative_string",
+      "comparator": "lt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "-3"
+      },
+      "result": "satisfied"
+    },
+    {
+      "name": "ge_leading_zero_digits",
+      "comparator": "ge",
+      "value": 7,
+      "sample": {
+        "sample": "value",
+        "value": "007"
+      },
+      "result": "satisfied"
+    },
+    {
+      "name": "lt_uppercase_exponent",
+      "comparator": "lt",
+      "value": 0.01,
+      "sample": {
+        "sample": "value",
+        "value": "1E-3"
+      },
+      "result": "satisfied"
+    },
+    {
+      "name": "le_declared_numeric_string",
+      "comparator": "le",
+      "value": "0.05",
+      "sample": {
+        "sample": "value",
+        "value": 0.02
+      },
+      "result": "satisfied",
+      "note": "The rule applies to both sides."
+    },
+    {
+      "name": "gt_both_numeric_strings",
+      "comparator": "gt",
+      "value": "1",
+      "sample": {
+        "sample": "value",
+        "value": "2"
+      },
+      "result": "satisfied"
+    },
+    {
+      "name": "gt_rejects_leading_space_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": " 0.75"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_trailing_newline_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "0.75\n"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_hex_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "0x1A"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_nan_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "NaN"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_infinity_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "Infinity"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_inf_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "inf"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_thousands_separator_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "1,000"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_no_integer_digits_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": ".5"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_no_fraction_digits_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "1."
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_double_sign_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "+-1"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_empty_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": ""
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_bare_exponent_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "1e"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_non_ascii_digit_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "١"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
+    },
+    {
+      "name": "gt_rejects_underscore_digits_string",
+      "comparator": "gt",
+      "value": 0,
+      "sample": {
+        "sample": "value",
+        "value": "1_000"
+      },
+      "result": "unsatisfied",
+      "note": "Outside the strict decimal grammar: not a number."
     },
     {
       "name": "ge_against_null",

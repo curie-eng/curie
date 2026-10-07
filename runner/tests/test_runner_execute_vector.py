@@ -19,7 +19,8 @@ replies from ``tests/vectors/executor-restore-calls.json``.
 
 @spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-17
 @spec AUTOMATED-REMEDIATION-18 @spec AUTOMATED-REMEDIATION-26. The remediation
-``read`` phase (executor amendments E3, E4 and E6): the request's ``pointer``,
+``read`` phase (executor amendments E3, E4 and E6): the ``read`` request's
+``pointer`` (no other phase carries one),
 the read and observe-only sequences, ``tool_not_read_only`` without dialing,
 and the pointer extraction cases of ``tests/vectors/remediation-predicate.json``
 driven through the real route, which answers only the sample.

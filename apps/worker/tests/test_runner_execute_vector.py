@@ -17,8 +17,8 @@ Each test serves the frozen runner answer from a real aiohttp server, so the
 client's real HTTP path is what is read.
 
 @spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-26. The remediation
-``read`` phase (executor amendments E3, E4 and E6): every request carries
-``pointer``, the client posts and reads the ``read`` phase, maps
+``read`` phase (executor amendments E3, E4 and E6): the ``read`` request alone
+adds ``pointer`` to the frozen keys, the client posts and reads the ``read`` phase, maps
 ``tool_not_read_only`` to its pre-dispatch code, and never reports a read as
 ``response_lost``, because a read cannot write.
 """
@@ -67,6 +67,15 @@ _KEYS = {
 }
 
 
+def _request_keys(phase: str) -> set[str]:
+    """@spec AUTOMATED-REMEDIATION-12: only the ``read`` request adds ``pointer``."""
+
+    keys = set(_VECTOR["request_keys"])
+    if phase == "read":
+        keys |= set(_VECTOR["read"]["request_keys_added"])
+    return keys
+
+
 def test_the_vector_has_only_known_keys() -> None:
     unknown = set(_VECTOR) - _KEYS
     assert not unknown, (
@@ -75,7 +84,7 @@ def test_the_vector_has_only_known_keys() -> None:
     )
     assert set(_VECTOR) == _KEYS
     for phase, spec in _VECTOR["phases"].items():
-        assert set(spec["request"]) == set(_VECTOR["request_keys"]), phase
+        assert set(spec["request"]) == _request_keys(phase), phase
         assert spec["request"]["phase"] == phase
 
 
@@ -137,7 +146,7 @@ def test_each_phase_posts_the_frozen_request_and_reads_the_frozen_response(phase
     assert sent["path"] == route["path"]
     assert sent["authorization"] == f"{route['auth_scheme']} {_TOKEN}"
     assert sent["body"] == spec["request"]
-    assert set(sent["body"]) == set(_VECTOR["request_keys"])
+    assert set(sent["body"]) == _request_keys(phase)
     assert response == spec["response"]
     assert set(response) == set(spec["response_keys"])
 
@@ -200,8 +209,12 @@ def test_an_oversized_call_result_fails_the_execution() -> None:
     assert (state, code) == (over["worker_state"], over["worker_code"])
 
 
-def test_the_client_sends_exactly_the_frozen_request_keys() -> None:
-    """@spec AUTOMATED-REMEDIATION-12: ``pointer`` joins the one request shape."""
+def test_the_client_knows_the_read_phase() -> None:
+    """@spec AUTOMATED-REMEDIATION-12: the existing request shape is unchanged.
+
+    ``pointer`` rides the ``read`` request only; every other phase keeps
+    exactly ``request_keys``.
+    """
 
     assert set(runner_client.EXECUTE_REQUEST_KEYS) == set(_VECTOR["request_keys"])
     assert set(runner_client.EXECUTE_PHASES) == set(_VECTOR["phases"])
