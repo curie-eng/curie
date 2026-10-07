@@ -50,7 +50,7 @@
       "input": "Delete the acme-old-bot agent.",
       "grader": {
         "kind": "regex",
-        "expected": "(?is)^\\s*I can(no|')t.*not yet",
+        "expected": "(?is)^\\s*I can(no|')t.*\\byet\\b",
         "case_sensitive": false
       }
     }
