@@ -72,6 +72,12 @@ from ..remediation_forward import (
     policy_generation,
 )
 from ..remediation_reads import missed_samples
+from ..remediation_verifier import (
+    finish_unverified,
+    is_observe_only,
+    reads_ended,
+    schedule_verification,
+)
 from ..schemas.action_executions import (
     ExecutionArguments,
     ExecutionClaim,
@@ -363,6 +369,8 @@ async def _expire_dispatched(session: AsyncSession, now: datetime) -> None:
     """@spec ACTION-EXECUTOR-17: a ``dispatched`` lease that expired is ``indeterminate``.
 
     The call may have reached the connector, so it is never repeated.
+    @spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending so
+    finishes its nomination ``not-recovered`` with the code.
     """
 
     expired = (
@@ -377,6 +385,10 @@ async def _expire_dispatched(session: AsyncSession, now: datetime) -> None:
     ).all()
     for execution in expired:
         _finish(session, execution, ExecutionState.indeterminate, EXPIRED_DISPATCH_CODE, now)
+    if expired:
+        await session.flush()
+    for execution in expired:
+        await finish_unverified(session, execution, now)
 
 
 # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): one transaction-scoped
@@ -388,7 +400,7 @@ _CLAIM_LOCK = text(
 _LIVE = (ExecutionState.claimed, ExecutionState.dispatched)
 
 
-async def _expire_claimed_reads(session: AsyncSession, now: datetime) -> None:
+async def _expire_claimed_reads(session: AsyncSession, now: datetime) -> list[str]:
     """@spec AUTOMATED-REMEDIATION-12: a read whose lease expired is never re-queued.
 
     It ends ``refused`` with ``runner_unavailable``, an unsuccessful sample,
@@ -408,17 +420,18 @@ async def _expire_claimed_reads(session: AsyncSession, now: datetime) -> None:
     ).all()
     for execution in expired:
         _finish(session, execution, ExecutionState.refused, EXHAUSTED_CLAIM_CODE, now)
+    return [execution.idempotency_key for execution in expired]
 
 
-async def _skip_missed_samples(session: AsyncSession, now: datetime) -> None:
+async def _skip_missed_samples(session: AsyncSession, now: datetime) -> list[str]:
     """@spec AUTOMATED-REMEDIATION-12: a sample whose successor is due is ``skipped``.
 
     It never claims a sandbox. It ends ``confirmed`` with the sample
     ``{"sample": "skipped", "value": null}``, an unsuccessful sample and never a
-    refusal code.
+    refusal code. Returns the skipped reads' keys for the verifier.
     """
 
-    await session.execute(
+    skipped = await session.scalars(
         update(ActionExecution)
         .where(missed_samples(now))
         .values(
@@ -426,8 +439,10 @@ async def _skip_missed_samples(session: AsyncSession, now: datetime) -> None:
             sample={"sample": SKIPPED_SAMPLE, "value": None},
             finished_at=now,
         )
+        .returning(ActionExecution.idempotency_key)
         .execution_options(synchronize_session=False)
     )
+    return list(skipped.all())
 
 
 def _due(now: datetime) -> Any:
@@ -468,8 +483,12 @@ async def claim_execution(data: ExecutionClaim, session: SessionDep) -> Any:
     await session.execute(_CLAIM_LOCK)
     now = await _now(session)
     await _expire_dispatched(session, now)
-    await _expire_claimed_reads(session, now)
-    await _skip_missed_samples(session, now)
+    ended = await _expire_claimed_reads(session, now)
+    ended += await _skip_missed_samples(session, now)
+    await session.flush()
+    # @spec AUTOMATED-REMEDIATION-18: a read the claim route ended may decide
+    # its verification, which ends the rest of that series before any is handed out.
+    await reads_ended(session, ended, now)
     await session.flush()
 
     cap = settings.action_executor_max_concurrent_sandboxes
@@ -516,6 +535,7 @@ async def claim_execution(data: ExecutionClaim, session: SessionDep) -> Any:
         if execution.state == ExecutionState.claimed and execution.attempt >= MAX_ATTEMPTS:
             _finish(session, execution, ExecutionState.refused, EXHAUSTED_CLAIM_CODE, now)
             await session.flush()
+            await finish_unverified(session, execution, now)
             continue
         execution.state = ExecutionState.claimed
         execution.attempt = execution.attempt + 1
@@ -562,6 +582,8 @@ async def record_observation(
     execution = await _locked(session, execution_id)
     now = await _now(session)
     _check_fence(execution, data, now)
+    if is_observe_only(execution):
+        return await _record_observe_only(session, execution, data, now)
     if execution.kind != ExecutionKind.restore:
         raise _conflict("only a restore observes a version")
     seen, version = _observed(execution)
@@ -588,6 +610,37 @@ async def record_observation(
         _finish(
             session, execution, ExecutionState.refused, "version_conflict", now, versions=versions
         )
+    await session.commit()
+    await session.refresh(execution)
+    return _out(execution)
+
+
+async def _record_observe_only(
+    session: AsyncSession,
+    execution: ActionExecution,
+    data: ExecutionObservation,
+    now: datetime,
+) -> ExecutionOut:
+    """@spec AUTOMATED-REMEDIATION-18 (executor amendment E3): an observe-only read.
+
+    The version is recorded unjudged and the execution ends ``confirmed``; the
+    verifier compares it with the action's ``post_version`` (``superseded``).
+    Attribution, never success. A replay of the same version answers the row
+    unchanged; another version is a conflicting report.
+    """
+
+    observed = data.version[:_MAX_VERSION] if data.version is not None else None
+    seen, version = _observed(execution)
+    if seen:
+        if version != observed:
+            raise _conflict("a different version was already observed")
+        return _out(execution)
+    if execution.state != ExecutionState.claimed:
+        raise _conflict(f"an execution in state {execution.state} observes nothing")
+    execution.outcome = {"observed_version": observed}
+    _finish(session, execution, ExecutionState.confirmed, None, now)
+    await session.flush()
+    await reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
     return _out(execution)
@@ -793,7 +846,9 @@ async def read_arguments(
     ``409``, and only a ``claimed`` forward execution answers. Nothing moves.
 
     @spec AUTOMATED-REMEDIATION-12: a ``claimed`` read execution answers its
-    bound tool, arguments and pointer the same way.
+    bound tool, arguments and pointer the same way; an observe-only execution
+    (AUTOMATED-REMEDIATION-18) answers ``observe_version``, the recorded target
+    and a null pointer.
     """
 
     execution = await _locked(session, execution_id)
@@ -807,7 +862,9 @@ async def read_arguments(
         raise _conflict(f"this {execution.kind} execution has no bound call")
     answer: ExecutionArguments | ReadArguments
     if execution.kind == ExecutionKind.read:
-        if execution.pointer is None:
+        # @spec AUTOMATED-REMEDIATION-18 (E3): only an observe-only execution
+        # carries no pointer.
+        if execution.pointer is None and not is_observe_only(execution):
             raise _conflict("this read execution has no bound pointer")
         answer = ReadArguments(
             tool=execution.tool,
@@ -828,7 +885,7 @@ def _reported(execution: ActionExecution) -> tuple[str, str | None, bool | None]
 
 @router.post("/{execution_id}/outcome", response_model=ExecutionOut)
 async def report_outcome(
-    execution_id: uuid.UUID, data: ExecutionOutcome, session: SessionDep
+    execution_id: uuid.UUID, data: ExecutionOutcome, session: SessionDep, store: StoreDep
 ) -> ExecutionOut:
     """Record how an execution ended.
 
@@ -840,6 +897,12 @@ async def report_outcome(
     the verbs it observed. An unknown post-dispatch code is normalized by stage.
     A replay of the stored outcome returns the row unchanged; a different one
     is refused and the first stands.
+
+    @spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending
+    schedules its verifier (``confirmed``) or finishes it ``not-recovered``
+    with the execution's code (``failed``, ``indeterminate``, ``refused``) in
+    the same transaction; a refused read
+    is evaluated by its verification.
     """
 
     try:
@@ -903,6 +966,12 @@ async def report_outcome(
         )
     elif state == ExecutionState.confirmed and execution.kind == ExecutionKind.restore:
         await _confirm_restore(session, execution, now)
+    elif execution.kind == ExecutionKind.forward:
+        await session.flush()
+        await schedule_verification(session, store, execution, now)
+    elif execution.kind == ExecutionKind.read:
+        await session.flush()
+        await reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
     return _out(execution)
@@ -930,7 +999,7 @@ async def report_sample(
 
     @spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and
     ``value`` (remediation-predicate.json ``sample_report``); the API evaluates
-    the predicate from the stored sample (plan task 11). Only a ``claimed`` read
+    the predicate from the stored sample (AUTOMATED-REMEDIATION-18). Only a ``claimed`` read
     reports one; a replay of the stored sample answers the row unchanged and a
     different one is refused (``409``). The answer is the receipt, which never
     carries the value or the pointer.
@@ -939,7 +1008,7 @@ async def report_sample(
     execution = await _locked(session, execution_id)
     now = await _now(session)
     _check_fence(execution, data, now)
-    if execution.kind != ExecutionKind.read:
+    if execution.kind != ExecutionKind.read or is_observe_only(execution):
         raise _conflict(f"a {execution.kind} execution takes no sample")
     reported = {"sample": data.sample, "value": data.value}
     if execution.state in _TERMINAL:
@@ -952,6 +1021,9 @@ async def report_sample(
         raise _conflict(f"a read execution in state {execution.state} takes no sample")
     execution.sample = reported
     _finish(session, execution, ExecutionState.confirmed, None, now)
+    await session.flush()
+    # @spec AUTOMATED-REMEDIATION-18: the API evaluates the predicate.
+    await reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
     return _out(execution)

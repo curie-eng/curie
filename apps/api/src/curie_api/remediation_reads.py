@@ -46,6 +46,10 @@ from .schemas.action_executions import CONNECTOR_MAX_LENGTH, CONNECTOR_PATTERN, 
 
 # @spec AUTOMATED-REMEDIATION-12: the authorities a read runs under.
 READ_AUTHORITY_KINDS: Final = frozenset({"policy", "approval", "qualification"})
+# @spec AUTOMATED-REMEDIATION-18 (executor amendment E3): an observe-only
+# execution is a read of the acting connector's ``observe_version`` with no
+# pointer; it is the only read that carries none.
+OBSERVE_TOOL: Final = "observe_version"
 
 _CONNECTOR = re.compile(CONNECTOR_PATTERN)
 _DIGEST = re.compile(DIGEST_PATTERN)
@@ -101,6 +105,68 @@ def _well_formed(
     )
 
 
+def _pointer_allowed(tool: str, pointer: str | None) -> bool:
+    """A valid RFC 6901 pointer, or none for an observe-only execution (E3)."""
+
+    if pointer is None:
+        return tool == OBSERVE_TOOL
+    return valid_pointer(pointer)
+
+
+def scheduled_read(
+    *,
+    agent_id: uuid.UUID,
+    connector: str,
+    connector_digest: str,
+    tool: str,
+    arguments: Mapping[str, Any],
+    pointer: str | None,
+    authority_kind: str,
+    authority_ref: str,
+    idempotency_key: str,
+    not_before: datetime,
+) -> dict[str, Any]:
+    """The insert values of one ``requested`` read, checked like ``create_read_execution``.
+
+    @spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-18. For a producer
+    that schedules a whole series inside its own transaction (the verifier):
+    nothing is written or committed here. Raises ``ReadRefused``.
+    """
+
+    if not _well_formed(
+        connector=connector,
+        connector_digest=connector_digest,
+        tool=tool,
+        authority_kind=authority_kind,
+        authority_ref=authority_ref,
+        idempotency_key=idempotency_key,
+        not_before=not_before,
+    ) or not _pointer_allowed(tool, pointer):
+        raise ReadRefused("authority_unavailable", "no remediation authority names this read")
+    try:
+        text = canonical_arguments(arguments)
+    except (TypeError, ValueError):
+        raise ReadRefused("arguments_mismatch", "the arguments have no canonical form") from None
+    return {
+        "id": uuid.uuid4(),
+        "kind": ExecutionKind.read.value,
+        "agent_id": agent_id,
+        "connector": connector,
+        "tool": tool,
+        "subject_action_id": None,
+        "connector_digest": connector_digest,
+        "arguments_sha256": arguments_sha256(arguments),
+        "forward_arguments": json.loads(text),
+        "pointer": pointer,
+        "authority_kind": authority_kind,
+        "authority_ref": authority_ref,
+        "idempotency_key": idempotency_key,
+        "not_before": not_before,
+        "state": ExecutionState.requested.value,
+        "attempt": 0,
+    }
+
+
 def _same_read(
     execution: ActionExecution,
     *,
@@ -108,7 +174,7 @@ def _same_read(
     connector_digest: str,
     tool: str,
     sha256: str,
-    pointer: str,
+    pointer: str | None,
     authority_kind: str,
     authority_ref: str,
 ) -> bool:
@@ -132,7 +198,7 @@ async def create_read_execution(
     connector_digest: str,
     tool: str,
     arguments: Mapping[str, Any],
-    pointer: str,
+    pointer: str | None,
     authority_kind: str,
     authority_ref: str,
     idempotency_key: str,
@@ -152,7 +218,7 @@ async def create_read_execution(
         authority_ref=authority_ref,
         idempotency_key=idempotency_key,
         not_before=not_before,
-    ) or not valid_pointer(pointer):
+    ) or not _pointer_allowed(tool, pointer):
         await session.rollback()
         raise ReadRefused("authority_unavailable", "no remediation authority names this read")
     try:
@@ -165,7 +231,7 @@ async def create_read_execution(
         await session.rollback()
         raise ReadRefused("authority_unavailable", "no agent names this read")
 
-    same = {
+    same: dict[str, Any] = {
         "connector": connector,
         "connector_digest": connector_digest,
         "tool": tool,
@@ -242,7 +308,8 @@ def series_successor_due(now: datetime) -> ColumnElement[bool]:
             later.connector == ActionExecution.connector,
             later.tool == ActionExecution.tool,
             later.arguments_sha256 == ActionExecution.arguments_sha256,
-            later.pointer == ActionExecution.pointer,
+            # An observe-only series has no pointer: NULL matches NULL here.
+            later.pointer.is_not_distinct_from(ActionExecution.pointer),
             later.not_before > ActionExecution.not_before,
             later.not_before <= now,
         )
@@ -262,10 +329,12 @@ def missed_samples(now: datetime) -> ColumnElement[bool]:
 
 
 __all__ = [
+    "OBSERVE_TOOL",
     "READ_AUTHORITY_KINDS",
     "ReadCreated",
     "ReadRefused",
     "create_read_execution",
     "missed_samples",
+    "scheduled_read",
     "series_successor_due",
 ]

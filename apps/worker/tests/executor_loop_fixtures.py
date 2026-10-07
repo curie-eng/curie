@@ -96,6 +96,14 @@ READ_SECRET = "EXAMPLE_METRICS_TOKEN"
 READ_SHA256: str = connector_grant.arguments_sha256(READ_TEXT)
 
 
+# @spec AUTOMATED-REMEDIATION-18 (executor amendment E3): an observe-only
+# execution of the acting connector, bound to the action's recorded target.
+OBSERVE_ARGUMENTS: dict[str, Any] = {"target": copy.deepcopy(TARGET)}
+OBSERVE_SHA256: str = connector_grant.arguments_sha256(
+    connector_grant.canonical_arguments(OBSERVE_ARGUMENTS)
+)
+
+
 def read_list_tools() -> list[dict[str, Any]]:
     return copy.deepcopy(RUNNER_VECTOR["read"]["list_response"]["tools"])
 
@@ -291,6 +299,20 @@ class FakeApi:
         self.order.append(execution.id)
         return execution
 
+    def add_observe(self, **fields: Any) -> Execution:
+        """An observe-only execution (AUTOMATED-REMEDIATION-18, E3) as the verifier
+        schedules it: kind ``read``, the acting connector's ``observe_version``,
+        bound to the recorded target, no pointer.
+        """
+
+        fields.setdefault("tool", "observe_version")
+        fields.setdefault("arguments_sha256", OBSERVE_SHA256)
+        fields.setdefault("requested_by", None)
+        execution = Execution(id=str(uuid.uuid4()), kind="read", **fields)
+        self.executions[execution.id] = execution
+        self.order.append(execution.id)
+        return execution
+
     def fail(self, route: str, *modes: str) -> None:
         """Script ``route`` (claim, observation, dispatch, outcome, ledger)."""
 
@@ -375,7 +397,7 @@ class FakeApi:
             return _conflict("the lease on this execution has expired")
         if (
             execution.kind == "read"
-            and route in {"samples", "outcome"}
+            and route in {"samples", "outcome", "observation"}
             and execution.state not in _TERMINAL
             and self.live_claims is not None
         ):
@@ -446,6 +468,22 @@ class FakeApi:
         return httpx.Response(204)
 
     def _observation(self, execution: Execution, body: dict[str, Any]) -> httpx.Response:
+        if execution.kind == "read" and execution.tool == "observe_version":
+            # @spec AUTOMATED-REMEDIATION-18 (E3): an observe-only execution ends
+            # ``confirmed`` with the version it saw; the verifier compares it.
+            if set(body) != {"lease_owner", "attempt", "version"}:
+                return httpx.Response(422, json={"detail": "the fence and the version"})
+            version = body.get("version")
+            if execution.observed:
+                if execution.observed_version != version:
+                    return _conflict("a different version was already observed")
+                return httpx.Response(200, json=execution.out())
+            if execution.state != "claimed":
+                return _conflict(f"an execution in state {execution.state} observes nothing")
+            execution.observed = True
+            execution.observed_version = version
+            execution.state = "confirmed"
+            return httpx.Response(200, json=execution.out())
         if execution.kind != "restore":
             return _conflict("only a restore observes a version")
         version = body.get("version")
@@ -504,6 +542,15 @@ class FakeApi:
         if execution.kind == "read":
             if execution.state != "claimed":
                 return _conflict(f"an execution in state {execution.state} reads no arguments")
+            if execution.tool == "observe_version":
+                return httpx.Response(
+                    200,
+                    json={
+                        "tool": execution.tool,
+                        "arguments": copy.deepcopy(OBSERVE_ARGUMENTS),
+                        "pointer": None,
+                    },
+                )
             return httpx.Response(
                 200,
                 json={

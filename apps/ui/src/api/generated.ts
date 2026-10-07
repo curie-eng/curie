@@ -78,7 +78,9 @@ export interface paths {
          *     ``409``, and only a ``claimed`` forward execution answers. Nothing moves.
          *
          *     @spec AUTOMATED-REMEDIATION-12: a ``claimed`` read execution answers its
-         *     bound tool, arguments and pointer the same way.
+         *     bound tool, arguments and pointer the same way; an observe-only execution
+         *     (AUTOMATED-REMEDIATION-18) answers ``observe_version``, the recorded target
+         *     and a null pointer.
          */
         post: operations["read_arguments_action_executions__execution_id__arguments_post"];
         delete?: never;
@@ -163,6 +165,12 @@ export interface paths {
          *     the verbs it observed. An unknown post-dispatch code is normalized by stage.
          *     A replay of the stored outcome returns the row unchanged; a different one
          *     is refused and the first stands.
+         *
+         *     @spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending
+         *     schedules its verifier (``confirmed``) or finishes it ``not-recovered``
+         *     with the execution's code (``failed``, ``indeterminate``, ``refused``) in
+         *     the same transaction; a refused read
+         *     is evaluated by its verification.
          */
         post: operations["report_outcome_action_executions__execution_id__outcome_post"];
         delete?: never;
@@ -186,7 +194,7 @@ export interface paths {
          *
          *     @spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and
          *     ``value`` (remediation-predicate.json ``sample_report``); the API evaluates
-         *     the predicate from the stored sample (plan task 11). Only a ``claimed`` read
+         *     the predicate from the stored sample (AUTOMATED-REMEDIATION-18). Only a ``claimed`` read
          *     reports one; a replay of the stored sample answers the row unchanged and a
          *     different one is refused (``409``). The answer is the receipt, which never
          *     carries the value or the pointer.
@@ -6702,6 +6710,8 @@ export interface components {
          *
          *     @spec AUTOMATED-REMEDIATION-12: the read is the declaration's, never a
          *     caller's. Answered only by ``POST /action-executions/{id}/arguments``.
+         *     @spec AUTOMATED-REMEDIATION-18 (executor amendment E3): ``pointer`` is null
+         *     only for an observe-only execution (``observe_version`` of the target).
          */
         ReadArguments: {
             /** Arguments */
@@ -6709,7 +6719,7 @@ export interface components {
                 [key: string]: unknown;
             };
             /** Pointer */
-            pointer: string;
+            pointer: string | null;
             /** Tool */
             tool: string;
         };

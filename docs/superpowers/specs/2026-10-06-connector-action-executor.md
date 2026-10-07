@@ -359,7 +359,12 @@ and opens each session through the standalone client, promoted from the
 private `_server_streams` to a public helper in the same module. Within one
 sandbox the only accepted sequences are `list`, or `list` then `observe` then
 `call` for a restore, or `list` then `call` for a forward action, or `list`
-then one `read` (amendment E3); anything else, including a second `call` or a
+then one `read` (amendment E3), or `list` then one `observe` with no `call` in
+an observe-only execution (amendment E3, AUTOMATED-REMEDIATION-18: a `read`
+kind execution of the acting connector's `observe_version`, bound to the
+action's recorded target with no pointer, whose version the worker posts
+unjudged to `POST /action-executions/{id}/observation` for the verifier's
+`superseded` check); anything else, including a second `call` or a
 second `read`, returns `409` without dialing. Preflight before
 `call`: the tool is advertised; for `restore`, ACTION-EXECUTOR-13's capability
 rule holds; the argument text parses to an object whose canonical form is
