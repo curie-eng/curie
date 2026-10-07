@@ -410,6 +410,8 @@ _HTTP_OPERATIONS = [
     # The thread attachment ledger (ADR 0205).
     "/v1/internal/thread-attachments/query",
     "/v1/internal/thread-attachments/append",
+    # Automated remediation nominations (AUTOMATED-REMEDIATION-6).
+    "/v1/internal/remediation/nominations",
     "/v1/work-item-progress/{request_id}",
     "/v1/work-item-progress/{request_id}/usage",
     "/v1/work-item-progress/{request_id}/verification",

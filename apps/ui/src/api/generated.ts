@@ -2416,6 +2416,26 @@ export interface paths {
         patch: operations["advance_publication_lineage_v1_internal_publications__publication_id__lineage_patch"];
         trace?: never;
     };
+    "/v1/internal/remediation/nominations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Remediation Nominations
+         * @description Record one protected turn's nomination block.
+         */
+        post: operations["submit_remediation_nominations_v1_internal_remediation_nominations_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/state/released-credentials": {
         parameters: {
             query?: never;
@@ -6530,6 +6550,49 @@ export interface components {
             /** Text */
             text: string;
             tool_access?: components["schemas"]["ToolAccess"] | null;
+        };
+        /**
+         * RemediationNominationAccepted
+         * @description The event's accepted submission: its nominations in block order.
+         *
+         *     @spec AUTOMATED-REMEDIATION-6 @spec AUTOMATED-REMEDIATION-7.
+         */
+        RemediationNominationAccepted: {
+            /** Event Id */
+            event_id: string;
+            /** Nomination Ids */
+            nomination_ids: string[];
+        };
+        /**
+         * RemediationNominationRefusal
+         * @description @spec AUTOMATED-REMEDIATION-6.
+         */
+        RemediationNominationRefusal: {
+            detail: components["schemas"]["RemediationNominationRefusalDetail"];
+        };
+        /**
+         * RemediationNominationRefusalDetail
+         * @description @spec AUTOMATED-REMEDIATION-6.
+         */
+        RemediationNominationRefusalDetail: {
+            /** Code */
+            code: string;
+        };
+        /**
+         * RemediationNominationSubmit
+         * @description One protected turn's nomination block. @spec AUTOMATED-REMEDIATION-6.
+         */
+        RemediationNominationSubmit: {
+            /**
+             * Block
+             * @description The withheld block text, fences included, exactly as extracted.
+             */
+            block: string;
+            /**
+             * Event Id
+             * @description The protected event whose turn produced the block.
+             */
+            event_id: string;
         };
         /**
          * RemediationPolicyMutation
@@ -13205,6 +13268,66 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
                 };
+            };
+        };
+    };
+    submit_remediation_nominations_v1_internal_remediation_nominations_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationNominationSubmit"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationNominationAccepted"];
+                };
+            };
+            /** @description Refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationNominationRefusal"];
+                };
+            };
+            /** @description Refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationNominationRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Broker unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
