@@ -46,6 +46,11 @@ adapter is connected.
   leaves this intent in place; a fresh invocation refuses another enqueue until
   an operator has confirmed the old route's release. The intent clears only
   after the matching reset is confirmed, never merely after a reset request.
+  State updates use a separate stable process lock and an atomic replacement
+  of a synced temporary file, followed by syncing the containing directory.
+  An existing empty or corrupt state file fails closed; only a genuinely absent
+  state file is a first-run empty state. An interrupted write cannot turn a
+  recorded cleanup intent into a healthy empty state.
   It submits that key to `POST /agents/{agent_id}/threads/{thread_key}/reset`
   and polls the matching reset status endpoint until `requested` is false and
   `route_existed` is true. It never resets an unowned or guessed conversation.
