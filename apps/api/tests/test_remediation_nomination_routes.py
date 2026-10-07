@@ -770,10 +770,11 @@ def test_one_block_mixing_entries_writes_one_row_per_entry_with_its_own_outcome(
 
             assert response.status_code == 200, response.text
             found = await rows(event)
-            outcomes = sorted(
+            outcomes = [
                 (row["action"], arguments_text(row["arguments"]), row["refusal_code"])
                 for row in found
-            )
+            ]
+            assert len(outcomes) == 4, found
             expected = sorted(
                 [
                     ("scale-out-api", canonical(items[0]["arguments"]), None),
