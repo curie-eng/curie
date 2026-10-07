@@ -328,6 +328,7 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/hooks/{hook}/remediation-policy",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
     "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
@@ -431,6 +432,8 @@ _HTTP_OPERATIONS = [
     # Deliberate progress from a running turn (ADR 0130).
     "/v1/turn-progress/{progress_id}",
     "/v1/factory/cards/{token}.svg",
+    "/remediation-nominations",
+    "/remediation-nominations/{nomination_id}",
     "/schedules",
     "/schedules/{agent}/{name}/pause",
     "/schedules/{agent}/{name}/resume",
@@ -578,6 +581,71 @@ _TOOL_RESULT_ATTRIBUTES = {
     "source": ["runner"],
     "origin": ["connector", "platform", "builtin"],
     "outcome": ["success", "error", "awaiting_approval", "cancelled", "refused", "unavailable"],
+}
+
+# AUTOMATED-REMEDIATION-21: closed lists from tests/vectors/remediation-codes.json.
+_REMEDIATION_STAGES = [
+    "nominated",
+    "refused",
+    "approval_requested",
+    "executed",
+    "verified",
+    "not-recovered",
+    "verifier-unavailable",
+    "superseded",
+    "undo_requested",
+    "undone",
+    "escalated",
+]
+_REMEDIATION_KINDS = [
+    "remediate",
+    "prevent",
+    "tune",
+]
+_REMEDIATION_AUTHORITIES = [
+    "policy",
+    "approval",
+    "none",
+]
+_REMEDIATION_CODES = [
+    "nomination_malformed",
+    "unknown_action",
+    "nomination_duplicate",
+    "arguments_schema_mismatch",
+    "agent_stopped",
+    "reply_surface_unavailable",
+    "tune_execution_not_automated",
+    "generation_not_current",
+    "policy_disarmed",
+    "not_automatic",
+    "qualification_missing",
+    "qualification_stale",
+    "verifier_not_independent",
+    "out_of_bounds",
+    "not_reversible_now",
+    "breaker_open",
+    "policy_rate_limit",
+    "action_rate_limit",
+    "incident_limit",
+    "turn_limit",
+    "target_live",
+    "precondition_not_met",
+    "precondition_unavailable",
+    "admission_unreadable",
+    "policy_changed",
+    "arguments_mismatch",
+    "verified",
+    "not-recovered",
+    "verifier-unavailable",
+    "superseded",
+    "none",
+]
+_REMEDIATION_LIFECYCLE_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "stage": _REMEDIATION_STAGES,
+    "kind": _REMEDIATION_KINDS,
+    "authority": _REMEDIATION_AUTHORITIES,
+    "code": _REMEDIATION_CODES,
 }
 
 
@@ -857,6 +925,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "In-process supervised worker task restarts.",
         True,
         _SUPERVISED_RESTART_ATTRIBUTES,
+    ),
+    "curie.remediation.lifecycle": _definition(
+        "counter",
+        "{receipt}",
+        "Remediation lifecycle receipts posted, by stage, kind, authority and code.",
+        True,
+        _REMEDIATION_LIFECYCLE_ATTRIBUTES,
     ),
     "curie.tool.result": _definition(
         "counter",
