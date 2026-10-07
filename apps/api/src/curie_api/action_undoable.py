@@ -34,6 +34,12 @@ import uuid
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
+# @spec ACTION-EXECUTOR-16: the reserved name the first release recognizes as
+# the sealing key, defined once in ``curie_internal.sealing_key``. Custody holds
+# only when the in-force version declares it as a ``SecretRef`` on the
+# connector that recorded the action; a plain named secret, another name, or
+# ``SNAPSHOT_SEALING_KEYS_RETAINED`` alone does not.
+from curie_internal.sealing_key import SEALING_KEY_NAME
 from plugin_format.connectors import SecretRef
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -52,12 +58,6 @@ from .models import (
 from .storage import ObjectStore
 
 logger = logging.getLogger(__name__)
-
-# @spec ACTION-EXECUTOR-16: the reserved name the first release recognizes as
-# the sealing key. Custody holds only when the in-force version declares it as
-# a ``SecretRef`` on the connector that recorded the action; a plain named
-# secret, another name, or ``SNAPSHOT_SEALING_KEYS_RETAINED`` alone does not.
-SEALING_KEY_NAME = "SNAPSHOT_SEALING_KEY"
 
 # The platform's in-force rule, as hook_fire's ``_IN_FORCE_SQL`` and the
 # worker's binding ``_RESOLVE_SQL`` apply it: an active deployment, prod

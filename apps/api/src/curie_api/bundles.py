@@ -16,6 +16,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
+from curie_internal.sealing_key import custody_reason, is_sealing_key_name
 from plugin_format import (
     DEFAULT_MAX_COMPRESSION_RATIO,
     DEFAULT_MAX_MEMBERS,
@@ -26,6 +27,7 @@ from plugin_format import (
     ApprovalPolicy,
     PluginManifest,
     UnsupportedArchive,
+    ValidationIssue,
     ValidationResult,
     bundle_root,
     connector_render,
@@ -125,10 +127,77 @@ def extract_and_validate(
     # classification code passes no enforcement id to its own `validate_bundle`,
     # so it refuses to BOOT a policy-bearing bundle. The failure mode of an old
     # runner meeting a new bundle is "will not start", never "starts unfenced".
-    result = validate_bundle(
-        bundle_root(dest), enforces_tool_policy=TOOL_POLICY_ENFORCEMENT
-    )
+    root = bundle_root(dest)
+    result = validate_bundle(root, enforces_tool_policy=TOOL_POLICY_ENFORCEMENT)
+    custody = sealing_key_custody_issues(root)
+    if custody:
+        result = ValidationResult(
+            valid=False, errors=[*result.errors, *custody], warnings=result.warnings
+        )
     return extension, content_type, result
+
+
+SEALING_KEY_CODE = "secrets.sealing_key_custody"
+
+
+def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
+    """Every declaration of a reserved sealing key name other than a SecretRef.
+
+    @spec ACTION-EXECUTOR-16. ``SNAPSHOT_SEALING_KEY`` and
+    ``SNAPSHOT_SEALING_KEYS_RETAINED`` may reach only the hosted connector, so
+    the one accepted form is a ``SecretRef`` in ``connectors.yaml``. A plain
+    ``secrets`` name (Curie resolves and owns the value), a literal ``env``
+    value, a ``secret_files`` entry (the same per-agent Secret, as a file), a
+    ``sealed_secrets`` blob (the bundle carries the value) and a ``plugin.json``
+    ``secrets`` name (a sandbox secret) are each refused, naming the key.
+
+    Applied at API intake on top of the frozen ``validate_bundle``, so the
+    package's contract is unchanged. Reads the raw files leniently: a file that
+    does not parse is ``validate_bundle``'s to report, and this adds nothing.
+    """
+
+    issues: list[ValidationIssue] = []
+
+    def refuse(name: str, location: str) -> None:
+        issues.append(
+            ValidationIssue(code=SEALING_KEY_CODE, message=custody_reason(name), location=location)
+        )
+
+    manifest_path = resolve_manifest(root)
+    if manifest_path is not None:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+            manifest = None
+        declared = manifest.get("secrets") if isinstance(manifest, dict) else None
+        if isinstance(declared, list):
+            for i, name in enumerate(declared):
+                if isinstance(name, str) and is_sealing_key_name(name):
+                    refuse(name, f"plugin.json (secrets[{i}])")
+
+    path = root / CONNECTORS_FILE
+    if not path.is_file():
+        return issues
+    try:
+        parsed = ConnectorsFile.model_validate(
+            safe_load_unique(path.read_text(encoding="utf-8")) or {}
+        )
+    except Exception:  # noqa: BLE001 - validate_bundle reports a malformed file
+        return issues
+    for connector, spec in parsed.connectors.items():
+        where = f"{CONNECTORS_FILE} (connectors.{connector}"
+        for declared_secret in spec.secrets:
+            if isinstance(declared_secret, str) and is_sealing_key_name(declared_secret):
+                refuse(declared_secret, f"{where}.secrets)")
+        for form, names in (
+            ("env", spec.env),
+            ("secret_files", spec.secret_files),
+            ("sealed_secrets", spec.sealed_secrets),
+        ):
+            for name in names:
+                if is_sealing_key_name(name):
+                    refuse(name, f"{where}.{form})")
+    return issues
 
 
 def extract_stored_bundle(
