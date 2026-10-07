@@ -25,6 +25,12 @@ declared key missing, or a value of the wrong type). Values of the right type
 outside the allowed set, range or target list are not refused here; admission
 sends them to approval. ``target_key`` is the AUTOMATED-REMEDIATION-10 target
 key: the action's connector and the canonical JSON of the target argument.
+
+A ``tune`` entry (AUTOMATED-REMEDIATION-25) is checked against the action's own
+shape instead: its rule one the action declares, its field one the change
+schema declares, its value of that field's type, and for ``retire`` exactly
+``{"duplicate_of": <rule>}`` naming a rule the action lists as a duplicate
+target. Its target key is the rule owner connector and the canonical rule.
 """
 
 from __future__ import annotations
@@ -54,6 +60,10 @@ _TOP_KEYS: Final = frozenset({"version", "nominations"})
 _ARGUMENTS_REQUIRED: Final = frozenset({"action", "arguments"})
 _CHANGE_REQUIRED: Final = frozenset({"action", "rule", "field", "value"})
 _OPTIONAL: Final = frozenset({"reason"})
+# @spec AUTOMATED-REMEDIATION-25
+TUNE_KIND: Final = "tune"
+TUNE_RETIRE: Final = "retire"
+_TUNE_ARGUMENTS: Final = frozenset({"field", "rule", "value"})
 
 
 class NominationMalformed(Exception):
@@ -247,16 +257,52 @@ def find_action(document: Mapping[str, Any] | None, name: str) -> Mapping[str, A
     return None
 
 
+def _tune_refusal(action: Mapping[str, Any], arguments: Mapping[str, Any]) -> str | None:
+    """A tune entry's shape against its action. @spec AUTOMATED-REMEDIATION-25."""
+    if set(arguments) != _TUNE_ARGUMENTS:
+        return SCHEMA_MISMATCH_CODE
+    rules, change = action.get("rules"), action.get("change")
+    rule, field, value = arguments["rule"], arguments["field"], arguments["value"]
+    if not isinstance(rules, Mapping) or not isinstance(change, Mapping):
+        return SCHEMA_MISMATCH_CODE
+    if type(rule) is not str or rule not in rules:
+        return SCHEMA_MISMATCH_CODE
+    if type(field) is not str or field not in change:
+        return SCHEMA_MISMATCH_CODE
+    spec = change[field]
+    if not isinstance(spec, Mapping):
+        return SCHEMA_MISMATCH_CODE
+    if field == TUNE_RETIRE:
+        duplicates = spec.get("duplicate_of")
+        if (
+            type(value) is not dict
+            or set(value) != {"duplicate_of"}
+            or type(value["duplicate_of"]) is not str
+            or value["duplicate_of"] == rule
+            or not isinstance(duplicates, list)
+            or value["duplicate_of"] not in duplicates
+        ):
+            return SCHEMA_MISMATCH_CODE
+        return None
+    if not _typed(spec.get("type"), value):
+        return SCHEMA_MISMATCH_CODE
+    return None
+
+
 def validate_entry(action: Mapping[str, Any] | None, arguments: Mapping[str, Any]) -> str | None:
     """The entry's parse refusal against its policy action, or None.
 
     Only shape is refused: an unknown action, a key outside the action's
     argument schema, a declared key missing, or a value of the wrong type.
-    Bounds are admission's (AUTOMATED-REMEDIATION-8 check 8).
-    @spec AUTOMATED-REMEDIATION-7.
+    Bounds are admission's (AUTOMATED-REMEDIATION-8 check 8). A ``tune``
+    action's entry is ``{rule, field, value}`` against its declared rules and
+    change schema (``_tune_refusal``).
+    @spec AUTOMATED-REMEDIATION-7 @spec AUTOMATED-REMEDIATION-25.
     """
     if action is None:
         return UNKNOWN_ACTION_CODE
+    if action.get("kind") == TUNE_KIND:
+        return _tune_refusal(action, arguments)
     schema = action.get("arguments")
     if not isinstance(schema, Mapping) or set(arguments) != set(schema):
         return SCHEMA_MISMATCH_CODE
@@ -270,10 +316,17 @@ def validate_entry(action: Mapping[str, Any] | None, arguments: Mapping[str, Any
 def target_key(action: Mapping[str, Any], arguments: Mapping[str, Any]) -> str | None:
     """The AUTOMATED-REMEDIATION-10 target key: connector and canonical target value.
 
-    @spec AUTOMATED-REMEDIATION-7 @spec AUTOMATED-REMEDIATION-10.
+    For a ``tune`` action it is the rule owner connector and the canonical rule
+    identifier (AUTOMATED-REMEDIATION-25).
+    @spec AUTOMATED-REMEDIATION-7 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-25.
     """
     target = action.get("target")
     connector = action.get("connector")
+    if action.get("kind") == TUNE_KIND:
+        rule = arguments.get("rule")
+        if type(connector) is not str or type(rule) is not str:
+            return None
+        return f"{connector}:{canonical_text(rule)}"
     if not isinstance(target, Mapping) or type(connector) is not str:
         return None
     argument = target.get("argument")

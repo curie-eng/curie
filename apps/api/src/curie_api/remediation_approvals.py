@@ -23,6 +23,10 @@ equals the nomination's. After an approving claim, ``execute_approved`` moves
 the raising nomination to ``approved`` and every attached one to ``finished``
 and creates the one forward execution through
 ``remediation_forward.create_remediation_forward`` (AUTOMATED-REMEDIATION-13).
+A ``tune`` request (AUTOMATED-REMEDIATION-25, maintainer ruling 2026-10-07)
+executes nothing: raising it schedules the nominated rule's declared reads for
+the card (``remediation_tuning``), and approving it ends every nomination
+``refused`` with ``tune_execution_not_automated`` and creates no execution.
 Attached nominations never execute: only the raising nomination holds the
 ``approved`` state the approval authority requires, so an approval yields at
 most one execution. ``settle_remediation_approval`` ends every nomination of a
@@ -45,6 +49,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .action_forward import ForwardCreated, ForwardRefused, arguments_sha256
+from .config import get_settings
 from .models import (
     Agent,
     Approval,
@@ -63,6 +68,13 @@ from .remediation_forward import (
     policy_ref,
 )
 from .remediation_policy_document import APPROVAL_TTL_SECONDS_DEFAULT
+from .remediation_tuning import (
+    TUNE_EXECUTION_NOT_AUTOMATED,
+    insert_tune_reads,
+    is_tune,
+    tune_read_rows,
+)
+from .storage import BundleStore, ObjectStore
 
 logger = logging.getLogger(__name__)
 
@@ -199,13 +211,17 @@ async def request_remediation_approval(
     turn: QueuedTurn,
     check: str,
     observed: Any = None,
+    store: ObjectStore | None = None,
 ) -> RemediationApprovalRequested:
     """Raise, attach to, or replay the approval of a not-admitted nomination.
 
     @spec AUTOMATED-REMEDIATION-15. ``turn`` is the protected delivery's queued
     turn: only its conversation and reply handle are copied, never its text.
     ``check`` is the admission code that failed and ``observed`` the
-    precondition read's value when one was taken; the card names both. Commits.
+    precondition read's value when one was taken; the card names both. A new
+    ``tune`` approval schedules its nominated rule's declared reads in the same
+    transaction (@spec AUTOMATED-REMEDIATION-25); an attached one schedules
+    nothing. ``store`` reads the in-force bundle for those reads. Commits.
     Raises ``RemediationApprovalUnavailable`` having written nothing when the
     nomination names no call, no generation declares its action, or it was
     already decided.
@@ -241,9 +257,10 @@ async def request_remediation_approval(
         else None
     )
     document = generation.document if generation is not None else None
-    bound = _connector_tool(
+    declared = (
         declared_action(document, nomination.action) if isinstance(document, Mapping) else None
     )
+    bound = _connector_tool(declared)
     if generation_number is None or not isinstance(document, Mapping) or bound is None:
         await session.rollback()
         raise RemediationApprovalUnavailable("no policy generation declares the action")
@@ -280,6 +297,18 @@ async def request_remediation_approval(
         await session.commit()
         return RemediationApprovalRequested(approval_id=approval_id, created=False)
 
+    tune_reads = (
+        await tune_read_rows(
+            session,
+            store or BundleStore(get_settings()),
+            nomination,
+            generation_number,
+            declared,
+            arguments,
+        )
+        if declared is not None and is_tune(declared)
+        else []
+    )
     connector, tool = bound
     route = document.get("route") if isinstance(document.get("route"), str) else None
     agent = await session.get(Agent, nomination.agent_id)
@@ -335,6 +364,8 @@ async def request_remediation_approval(
             observed=observed,
         )
     )
+    # The card waits for these reads (AUTOMATED-REMEDIATION-25).
+    await insert_tune_reads(session, tune_reads)
     nomination.state = _APPROVAL_REQUESTED
     nomination.approval_id = approval_id
     await session.commit()
@@ -352,9 +383,7 @@ class _Judged:
 async def _judge(session: AsyncSession, approval: Approval) -> _Judged | ForwardRefused:
     """The AUTOMATED-REMEDIATION-16 checks against the rows as they are now."""
 
-    request = await session.get(
-        RemediationApprovalRequest, approval.id, populate_existing=True
-    )
+    request = await session.get(RemediationApprovalRequest, approval.id, populate_existing=True)
     nomination = (
         await session.get(RemediationNomination, request.nomination_id, populate_existing=True)
         if request is not None
@@ -402,9 +431,7 @@ async def _judge(session: AsyncSession, approval: Approval) -> _Judged | Forward
         or approval.granted_arguments is None
         or digest != nomination.arguments_sha256
     ):
-        return ForwardRefused(
-            ARGUMENTS_MISMATCH, "the approval no longer binds the nominated call"
-        )
+        return ForwardRefused(ARGUMENTS_MISMATCH, "the approval no longer binds the nominated call")
     return _Judged(nomination=nomination, live_generation=live_number)
 
 
@@ -488,6 +515,62 @@ async def _finish_unexecuted(session: AsyncSession, raising_id: uuid.UUID, code:
     )
 
 
+async def _tunes(session: AsyncSession, judged: _Judged) -> bool:
+    """Whether the action is ``tune`` in the generation the approval was raised
+    under or the one it would execute under: either is enough to write nothing.
+    """
+
+    nomination = judged.nomination
+    numbers = {
+        judged.live_generation,
+        await authority_generation(session, nomination, APPROVAL_AUTHORITY),
+    }
+    for number in numbers:
+        generation = (
+            await session.get(
+                RemediationPolicyGeneration, (nomination.agent_id, nomination.hook, number)
+            )
+            if number is not None
+            else None
+        )
+        if (
+            generation is not None
+            and nomination.action is not None
+            and is_tune(declared_action(generation.document, nomination.action))
+        ):
+            return True
+    return False
+
+
+async def _refuse_tune(
+    session: AsyncSession, approval_id: uuid.UUID, raising_id: uuid.UUID
+) -> None:
+    """End every nomination of an approved tune request ``refused``.
+
+    @spec AUTOMATED-REMEDIATION-25: ``tune_execution_not_automated``, with no
+    execution. The raiser may already be ``approved`` on a rerun after the
+    claim. The caller holds the identity lock (``_lock_request``).
+    """
+
+    await session.execute(
+        update(RemediationNomination)
+        .where(
+            RemediationNomination.approval_id == approval_id,
+            RemediationNomination.execution_id.is_(None),
+            or_(
+                RemediationNomination.state == _APPROVAL_REQUESTED,
+                (RemediationNomination.state == "approved")
+                & (RemediationNomination.id == raising_id),
+            ),
+        )
+        .values(
+            state="refused",
+            refusal_code=TUNE_EXECUTION_NOT_AUTOMATED,
+            decided_at=func.now(),
+        )
+    )
+
+
 async def execute_approved(session: AsyncSession, approval_id: uuid.UUID) -> ForwardCreated:
     """Create the one forward execution of an approved remediation approval.
 
@@ -496,7 +579,9 @@ async def execute_approved(session: AsyncSession, approval_id: uuid.UUID) -> For
     attached nomination ``finished``; then the execution is built from the
     raising nomination's row. The checks of ``resolution_refusal`` are repeated
     under the nomination's lock; a refusal then finishes every nomination and
-    raises ``ForwardRefused``. Replays adopt the same execution.
+    raises ``ForwardRefused``. Replays adopt the same execution. A ``tune``
+    action creates nothing: every nomination ends ``refused``
+    ``tune_execution_not_automated`` and that code is raised (@spec AUTOMATED-REMEDIATION-25).
     """
 
     request = await _lock_request(session, approval_id)
@@ -519,6 +604,19 @@ async def execute_approved(session: AsyncSession, approval_id: uuid.UUID) -> For
         await _finish_unexecuted(session, raising_id, judged.code)
         await session.commit()
         raise judged
+    if await _tunes(session, judged):
+        # AUTOMATED-REMEDIATION-25 (maintainer ruling, 2026-10-07): the decision
+        # is recorded and nothing is written. Every nomination of the request
+        # ends refused naming the code; no forward execution is created.
+        await _refuse_tune(session, approval_id, raising_id)
+        await session.commit()
+        logger.info(
+            "remediation approval %s approved a tuning request; nothing executes", approval_id
+        )
+        raise ForwardRefused(
+            TUNE_EXECUTION_NOT_AUTOMATED,
+            "an approved alert rule tuning request is recorded and applies no change",
+        )
     await _finish_nominations(
         session,
         approval_id,

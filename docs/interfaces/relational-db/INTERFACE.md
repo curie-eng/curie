@@ -216,6 +216,13 @@ no `remediation_approval_requests` row. Rows are written by
 writes the outcome; the downgrade deletes the undo approvals the table names,
 then drops it.
 
+Migration `0096_remediation_tune_refusal.py` (automated remediation,
+AUTOMATED-REMEDIATION-25) widens `remediation_nominations_refusal_ck` to accept
+`tune_execution_not_automated`, the refusal every nomination of an approved
+alert rule tuning request ends with (it executes nothing). The downgrade moves
+such rows to `finished` with the code in `execution_code`, then restores the
+narrower check.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.

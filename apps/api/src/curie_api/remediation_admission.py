@@ -18,7 +18,8 @@ route's own ``remediation_disabled``):
 3. the admitted generation is present and is the hook's current generation
    (AUTOMATED-REMEDIATION-4): ``generation_not_current``;
 4. the current generation is armed: ``policy_disarmed``;
-5. the action is a ``remediate`` action declared ``automatic``: ``not_automatic``;
+5. the action is a ``remediate`` action declared ``automatic``: ``not_automatic``
+   (a ``prevent`` or ``tune`` action always asks, AUTOMATED-REMEDIATION-24);
 6. its qualification record (``qualification_refusal``);
 7. verifier independence against the in-force version
    (``remediation_verifier.independence_refusal``);
@@ -673,7 +674,11 @@ async def _delivery_turn(
 
 
 async def raise_approval(
-    session: AsyncSession, nomination_id: uuid.UUID, *, observed: Any = None
+    session: AsyncSession,
+    nomination_id: uuid.UUID,
+    *,
+    observed: Any = None,
+    store: ObjectStore | None = None,
 ) -> uuid.UUID | None:
     """Raise (or attach to) the approval of a nomination already sent to approval.
 
@@ -711,6 +716,7 @@ async def raise_approval(
             turn=turn,
             check=nomination.approval_reason,
             observed=observed,
+            store=store,
         )
     except (RemediationApprovalUnavailable, SQLAlchemyError, ValueError) as error:
         await session.rollback()
@@ -767,6 +773,7 @@ async def _to_approval(
     *,
     from_state: str,
     observed: Any = None,
+    store: ObjectStore | None = None,
 ) -> None:
     await session.rollback()
     moved = await return_to_approval(
@@ -783,7 +790,7 @@ async def _to_approval(
             nomination_id,
             failed.reason,
         )
-        await raise_approval(session, nomination_id, observed=observed)
+        await raise_approval(session, nomination_id, observed=observed, store=store)
 
 
 async def _stop(session: AsyncSession, nomination_id: uuid.UUID, *, from_state: str) -> None:
@@ -845,7 +852,7 @@ async def _admit_one(
             return
     except SQLAlchemyError:
         failed = _Failed(ADMISSION_UNREADABLE)
-    await _to_approval(session, nomination_id, failed, from_state=RECEIVED)
+    await _to_approval(session, nomination_id, failed, from_state=RECEIVED, store=store)
 
 
 async def admit_nominations(
@@ -953,6 +960,7 @@ async def precondition_ended(
             nomination_id,
             _Failed(PRECONDITION_UNAVAILABLE),
             from_state=PRECONDITION_PENDING,
+            store=store,
         )
         return
     try:
@@ -961,7 +969,12 @@ async def precondition_ended(
         failed = _Failed(ADMISSION_UNREADABLE)
     if failed is not None:
         await _to_approval(
-            session, nomination_id, failed, from_state=PRECONDITION_PENDING, observed=observed
+            session,
+            nomination_id,
+            failed,
+            from_state=PRECONDITION_PENDING,
+            observed=observed,
+            store=store,
         )
 
 
@@ -1200,7 +1213,7 @@ async def reconcile_admissions(
                 elif step == "precondition":
                     await precondition_ended(session, store, kill_switch, item)
                 else:
-                    await raise_approval(session, item)
+                    await raise_approval(session, item, store=store)
                 handled += 1
             except Exception:  # noqa: BLE001 - one nomination must not stop the pass
                 await session.rollback()
