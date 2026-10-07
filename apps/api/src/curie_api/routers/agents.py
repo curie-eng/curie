@@ -56,12 +56,14 @@ def _carries_secret_input(error: dict[str, Any]) -> bool:
     """Whether a validation error's ``input`` can hold connector secret values.
 
     The ``secrets`` field's own errors carry the whole submitted map; an error
-    on the body itself (a missing field, a non-object body) carries the whole
-    body, which may include that map.
+    on the body itself carries the whole body, which may include that map. A
+    body FastAPI cannot read as an object (``text/plain``, a JSON list or
+    string, a form, no content type) arrives as raw text or a list, so every
+    error located at the body itself is redacted, whatever its ``input`` is.
     """
 
     loc = tuple(error.get("loc", ()))
-    if loc[:2] == ("body", "secrets"):
+    if loc[:2] == ("body", "secrets") or loc == ("body",):
         return True
     value = error.get("input")
     return isinstance(value, dict) and "secrets" in value
