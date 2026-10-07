@@ -38,9 +38,12 @@ import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-from aci_protocol import Final, QueuedTurn, SessionStatus, TextDelta
+import pytest
+import redis.exceptions
+from aci_protocol import Final, QueuedTurn, SessionStatus, SideEffectFlag, TextDelta
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker import kernel as kernel_module
 from curie_worker.consumer import Consumer
@@ -73,6 +76,155 @@ _LEASE_KNOBS: dict[str, object] = {
     "delivery_lease_heartbeat_s": _HEARTBEAT_S,
     "runner_total_timeout_s": 30.0,
 }
+
+
+def test_twenty_nine_second_ownership_outage_preserves_the_whole_live_turn(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ADR 0207: one live turn survives faults in all three ownership writes.
+
+    Production TTL/heartbeat/outage clocks are configured at scale 0.1.
+    Wrappers only raise transport errors; every successful write still reaches
+    real Valkey. This pin reaches the old raising-renewal and marker paths
+    without depending on any new implementation field.
+    """
+
+    async def go() -> None:
+        async with make_harness(
+            delivery_budget_s=60.0,
+            delivery_lease_ttl_s=4.5,
+            delivery_lease_heartbeat_s=1.0,
+            consumer_heartbeat_ttl_ms=4500,
+            consumer_capability_ttl_ms=9000,
+            runner_total_timeout_s=30.0,
+            read_block_ms=10,
+        ) as h:
+            leases = DeliveryLeaseStore(h.async_redis, h.config)
+            consumer = Consumer(
+                redis=h.async_redis, kernel=h.kernel, config=h.config, leases=leases
+            )
+            liveness = consumer._liveness_store
+            assert liveness is not None
+            spy = _ProcessEventSpy(h.kernel)
+            hold = asyncio.Event()
+            h.runner.hold = hold
+            h.runner.default_script = [TextDelta(text="working")]
+            h.runner.tail = [SideEffectFlag(tool="deploy"), Final(text="completed", status=DONE)]
+            until: float | None = None
+            outage_started: float | None = None
+            attempts = {"delivery": 0, "liveness": 0, "marker": 0}
+            failures = {"delivery": 0, "liveness": 0, "marker": 0}
+            recovered = {lane: asyncio.Event() for lane in attempts}
+            ready = {lane: asyncio.Event() for lane in ("delivery", "liveness")}
+            renewals: dict[str, list[float]] = {lane: [] for lane in ready}
+            marker_entered = asyncio.Event()
+            actions = 0
+            real_heartbeat = leases.heartbeat
+            real_renew = liveness.renew
+            real_marker = h.kernel._markers.mark_side_effect
+            real_action = h.kernel._record_action
+
+            def unavailable(lane: str) -> None:
+                attempts[lane] += 1
+                if lane in renewals:
+                    renewals[lane].append(time.monotonic())
+                if until is not None and time.monotonic() < until:
+                    failures[lane] += 1
+                    raise redis.exceptions.ConnectionError("injected 29s ownership outage")
+
+            async def delivery(*args: Any, **kwargs: Any) -> Any:
+                unavailable("delivery")
+                result = await real_heartbeat(*args, **kwargs)
+                if until is not None:
+                    recovered["delivery"].set()
+                else:
+                    ready["delivery"].set()
+                return result
+
+            async def alive(**kwargs: Any) -> bool:
+                unavailable("liveness")
+                result = await real_renew(**kwargs)
+                if until is not None:
+                    recovered["liveness"].set()
+                else:
+                    ready["liveness"].set()
+                return result
+
+            async def marker(event_id: str) -> None:
+                marker_entered.set()
+                assert actions == 0, "the frame applied while its marker was unavailable"
+                unavailable("marker")
+                await real_marker(event_id)
+                recovered["marker"].set()
+
+            async def action(*args: Any, **kwargs: Any) -> None:
+                nonlocal actions
+                assert await h.kernel._markers.saw_side_effect(event.event_id)
+                actions += 1
+                await real_action(*args, **kwargs)
+
+            async def scaled_marker_sleep(delay: float) -> None:
+                await asyncio.sleep(delay * 0.1)
+
+            monkeypatch.setattr(leases, "heartbeat", delivery)
+            monkeypatch.setattr(liveness, "renew", alive)
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", marker)
+            monkeypatch.setattr(h.kernel, "_record_action", action)
+            monkeypatch.setattr(
+                kernel_module,
+                "asyncio",
+                SimpleNamespace(**{**vars(asyncio), "sleep": scaled_marker_sleep}),
+            )
+            await consumer.ensure_group()
+            event = _qevent("ride through", thread="outage-ride-through", event_id=uuid.uuid4().hex)
+            entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(event))
+            task = asyncio.create_task(consumer.run())
+            try:
+                await _wait_until(lambda: h.runner.turn_active)
+                await asyncio.wait_for(
+                    asyncio.gather(*(flag.wait() for flag in ready.values())), timeout=2.0
+                )
+                outage_started = time.monotonic()
+                until = outage_started + 2.9
+                # The side-effect frame arrives five seconds into the outage.
+                await asyncio.sleep(0.5)
+                hold.set()
+                await asyncio.wait_for(marker_entered.wait(), timeout=0.2)
+                assert actions == 0
+                await _wait_until(lambda: h.sink.last_text == "completed", timeout=8.0)
+                await _wait_until(lambda: not consumer._inflight_ids)
+                assert not task.done(), "the consumer canceled a healthy in-flight turn"
+                assert all(count >= 1 for count in failures.values())
+                assert failures["delivery"] == failures["liveness"] == 2
+                for lane in renewals:
+                    during = [
+                        instant - outage_started
+                        for instant in renewals[lane]
+                        if instant >= outage_started
+                    ]
+                    assert during[:3] == pytest.approx([1.0, 2.0, 3.0], abs=0.07)
+                assert all(flag.is_set() for flag in recovered.values())
+                assert actions == 1
+                held = spy.leases_for(event.event_id)
+                assert len(held) == 1 and held[0] is not None
+                assert not held[0].lost.is_set()
+                assert h.runner.opened == [event.text]
+                assert h.runner.interrupts == 0
+                assert await h.kernel._markers.saw_side_effect(event.event_id)
+                assert await h.async_redis.exists(h.config.done_key(event.event_id))
+                assert entry_id not in await _pending_rows(h)
+                completions = [c for c in h.sink.completions if c.event_id == event.event_id]
+                assert len(completions) == 1 and completions[0].outcome == "delivered"
+                assert not any(
+                    "ConsumerLivenessExpired" in message or "owner_lost" in message
+                    for message in caplog.messages
+                )
+            finally:
+                hold.set()
+                consumer.request_stop()
+                await asyncio.wait_for(task, timeout=5.0)
+
+    asyncio.run(go())
 
 
 async def _read_one(h: Any, consumer_name: str) -> tuple[str, dict[str, str]]:
