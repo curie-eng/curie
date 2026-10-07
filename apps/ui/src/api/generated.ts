@@ -902,6 +902,73 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Put Remediation Qualification
+         * @description Record a qualification of one action declaration, recorded by the operator principal.
+         *
+         *     The evidence references are checked by state and digest; any refusal writes
+         *     nothing. A replay answers the record; another body under the same id is
+         *     ``qualification_conflict``.
+         */
+        put: operations["put_remediation_qualification_agents__agent_id__remediation_qualifications__qualification_id__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start Remediation Verifier Run
+         * @description Start a verifier evaluation of the declared verifier for a qualification.
+         *
+         *     Only ``read`` executions of the declared verifier are created, against a
+         *     target that is a literal member of the action's allowed list.
+         */
+        post: operations["start_remediation_verifier_run_agents__agent_id__remediation_qualifications__qualification_id__verifier_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Remediation Verifier Run
+         * @description A qualification verifier run and its outcome.
+         */
+        get: operations["get_remediation_verifier_run_agents__agent_id__remediation_qualifications__qualification_id__verifier_runs__run_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/resume": {
         parameters: {
             query?: never;
@@ -6937,6 +7004,135 @@ export interface components {
             };
         };
         /**
+         * RemediationQualificationOut
+         * @description One qualification record. @spec AUTOMATED-REMEDIATION-22.
+         */
+        RemediationQualificationOut: {
+            /** Action */
+            action: string | null;
+            /** Agent Id */
+            agent_id: string;
+            /** Connector */
+            connector: string;
+            /**
+             * Connector Digest
+             * @description The acting connector's in-force digest at write.
+             */
+            connector_digest: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Evidence */
+            evidence: {
+                [key: string]: unknown;
+            };
+            /** Generation */
+            generation: string | null;
+            /** Hook */
+            hook: string | null;
+            /** Id */
+            id: string;
+            /**
+             * Recorded By
+             * @description The operator principal that recorded it.
+             */
+            recorded_by: string;
+            /** Reversibility */
+            reversibility: string;
+            /** Tool */
+            tool: string;
+            /**
+             * Verifier Sha256
+             * @description SHA-256 of the canonical verifier declaration.
+             */
+            verifier_sha256: string;
+            /** Worst Case */
+            worst_case: string;
+        };
+        /**
+         * RemediationQualificationWrite
+         * @description One qualification record: the declaration it qualifies and its evidence.
+         *
+         *     @spec AUTOMATED-REMEDIATION-22.
+         */
+        RemediationQualificationWrite: {
+            /** Action */
+            action: string;
+            /**
+             * Evidence
+             * @description References to rows of this installation: restore_execution_id and conflict_execution_id (reversible) or forward_execution_ids (idempotent), and verified_run_id and not_recovered_run_id.
+             */
+            evidence: {
+                [key: string]: unknown;
+            };
+            /**
+             * Generation
+             * @description The policy generation whose action declaration and bounds were qualified.
+             */
+            generation: string;
+            /** Hook */
+            hook: string;
+            /**
+             * Worst Case
+             * @description The worst case statement, 1 to 2000 characters.
+             */
+            worst_case: string;
+        };
+        /**
+         * RemediationVerifierRunOut
+         * @description One qualification verifier run. @spec AUTOMATED-REMEDIATION-22.
+         */
+        RemediationVerifierRunOut: {
+            /** Action */
+            action: string;
+            /** Decided At */
+            decided_at: string | null;
+            /** Generation */
+            generation: string;
+            /** Hook */
+            hook: string;
+            /** Id */
+            id: string;
+            /**
+             * Outcome
+             * @description verified, not-recovered or verifier-unavailable once decided.
+             */
+            outcome: string | null;
+            /** Qualification Id */
+            qualification_id: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /**
+             * Started By
+             * @description The operator principal that started it.
+             */
+            started_by: string;
+            /** Target */
+            target: string | number | boolean;
+        };
+        /**
+         * RemediationVerifierRunStart
+         * @description Start a qualification verifier run; exactly ``{"hook", "action", "target"}``.
+         *
+         *     @spec AUTOMATED-REMEDIATION-22.
+         */
+        RemediationVerifierRunStart: {
+            /** Action */
+            action: string;
+            /** Hook */
+            hook: string;
+            /**
+             * Target
+             * @description A literal member of the action's target.allowed list.
+             */
+            target: string | number | boolean;
+        };
+        /**
          * ReplyHandle
          * @description Channel-neutral coordinates for where a turn's reply is delivered.
          *
@@ -10275,6 +10471,162 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["MemoryTraceBackOut"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_remediation_qualification_agents__agent_id__remediation_qualifications__qualification_id__put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                qualification_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationQualificationWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationQualificationOut"];
+                };
+            };
+            /** @description Named refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Named refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    start_remediation_verifier_run_agents__agent_id__remediation_qualifications__qualification_id__verifier_runs_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                qualification_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationVerifierRunStart"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationVerifierRunOut"];
+                };
+            };
+            /** @description Named refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Named refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    get_remediation_verifier_run_agents__agent_id__remediation_qualifications__qualification_id__verifier_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                qualification_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationVerifierRunOut"];
+                };
+            };
+            /** @description No such verifier run */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {

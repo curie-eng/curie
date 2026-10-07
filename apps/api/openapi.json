@@ -8974,6 +8974,285 @@
         "title": "RemediationPolicyWrite",
         "type": "object"
       },
+      "RemediationQualificationOut": {
+        "additionalProperties": false,
+        "description": "One qualification record. @spec AUTOMATED-REMEDIATION-22.",
+        "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action"
+          },
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "connector": {
+            "title": "Connector",
+            "type": "string"
+          },
+          "connector_digest": {
+            "description": "The acting connector's in-force digest at write.",
+            "title": "Connector Digest",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "evidence": {
+            "additionalProperties": true,
+            "title": "Evidence",
+            "type": "object"
+          },
+          "generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Generation"
+          },
+          "hook": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Hook"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "recorded_by": {
+            "description": "The operator principal that recorded it.",
+            "title": "Recorded By",
+            "type": "string"
+          },
+          "reversibility": {
+            "title": "Reversibility",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          },
+          "verifier_sha256": {
+            "description": "SHA-256 of the canonical verifier declaration.",
+            "title": "Verifier Sha256",
+            "type": "string"
+          },
+          "worst_case": {
+            "title": "Worst Case",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "hook",
+          "action",
+          "generation",
+          "connector",
+          "tool",
+          "connector_digest",
+          "verifier_sha256",
+          "reversibility",
+          "recorded_by",
+          "worst_case",
+          "evidence",
+          "created_at"
+        ],
+        "title": "RemediationQualificationOut",
+        "type": "object"
+      },
+      "RemediationQualificationWrite": {
+        "additionalProperties": false,
+        "description": "One qualification record: the declaration it qualifies and its evidence.\n\n@spec AUTOMATED-REMEDIATION-22.",
+        "properties": {
+          "action": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Action",
+            "type": "string"
+          },
+          "evidence": {
+            "additionalProperties": true,
+            "description": "References to rows of this installation: restore_execution_id and conflict_execution_id (reversible) or forward_execution_ids (idempotent), and verified_run_id and not_recovered_run_id.",
+            "title": "Evidence",
+            "type": "object"
+          },
+          "generation": {
+            "description": "The policy generation whose action declaration and bounds were qualified.",
+            "title": "Generation",
+            "type": "string"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "worst_case": {
+            "description": "The worst case statement, 1 to 2000 characters.",
+            "title": "Worst Case",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hook",
+          "action",
+          "generation",
+          "evidence",
+          "worst_case"
+        ],
+        "title": "RemediationQualificationWrite",
+        "type": "object"
+      },
+      "RemediationVerifierRunOut": {
+        "additionalProperties": false,
+        "description": "One qualification verifier run. @spec AUTOMATED-REMEDIATION-22.",
+        "properties": {
+          "action": {
+            "title": "Action",
+            "type": "string"
+          },
+          "decided_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided At"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "string"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "verified, not-recovered or verifier-unavailable once decided.",
+            "title": "Outcome"
+          },
+          "qualification_id": {
+            "title": "Qualification Id",
+            "type": "string"
+          },
+          "started_at": {
+            "format": "date-time",
+            "title": "Started At",
+            "type": "string"
+          },
+          "started_by": {
+            "description": "The operator principal that started it.",
+            "title": "Started By",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "title": "Target"
+          }
+        },
+        "required": [
+          "id",
+          "qualification_id",
+          "hook",
+          "action",
+          "target",
+          "generation",
+          "started_by",
+          "started_at",
+          "outcome",
+          "decided_at"
+        ],
+        "title": "RemediationVerifierRunOut",
+        "type": "object"
+      },
+      "RemediationVerifierRunStart": {
+        "additionalProperties": false,
+        "description": "Start a qualification verifier run; exactly ``{\"hook\", \"action\", \"target\"}``.\n\n@spec AUTOMATED-REMEDIATION-22.",
+        "properties": {
+          "action": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Action",
+            "type": "string"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "description": "A literal member of the action's target.allowed list.",
+            "title": "Target"
+          }
+        },
+        "required": [
+          "hook",
+          "action",
+          "target"
+        ],
+        "title": "RemediationVerifierRunStart",
+        "type": "object"
+      },
       "ReplyHandle": {
         "description": "Channel-neutral coordinates for where a turn's reply is delivered.\n\n``kind`` and ``channel`` are the **routing pair** (ADR-0096): the channel kind\n(``slack``, ``email``, ...) plus the address within that kind. Both halves are\nneeded to resolve the binding, because one address can legitimately exist under\ntwo kinds. ``kind`` is REQUIRED and deliberately has no default: an optional\nkind forces the resolver to invent one, and every honest answer there is an\naddress-only fallback or a ``\"slack\"`` guess -- the silent misroute this field\nexists to close.\n\nThe reply model supports editing an existing reply or carrying no existing\nreply reference. ``placeholder`` is a required, nullable, opaque correlation\nhandle minted by the adapter. The worker never parses it and only ever hands\nit back to the adapter that minted it. For the Slack adapter it happens to be\nthe ts of the preposted placeholder message. For another kind it is whatever\nthat adapter needs to find the same message again. ``None`` means this turn\nhas no existing reply to edit.\n\n``endpoint`` is the per-turn reply target: the base URL of the channel API the\nworker delivers this turn's reply through. It routes the reply back to the\ningress that enqueued the turn instead of a worker-global setting, so two\ningress paths (a real Slack workspace and a no-Slack CLI stub) can coexist on\none worker (issue #19). ``None`` means \"use the worker's configured default\"\n(its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set\nit keeps the pre-#19 behavior.\n\n``adapter`` names the egress adapter identity whose credential authenticates\nthe reply, so a sink call made *before* binding resolution can still select the\nright credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both\n**platform-set from the binding row** (never accepted from an ingress request\nbody); ``slack`` carries no endpoint, because its route is the worker's\nconfigured Slack origin, and names its identity in ``adapter`` (ADR-0168\ndecision 3); a NULL there means ``DEFAULT_IDENTITY`` (see ``route_identity``).\n``adapter`` is optional at the schema so a third-party or pre-upgrade\nproducer is not rejected outright, but every first-party mint site sets it\nexplicitly.\n\n``identity`` is an optional Slack binding selector for a disconnected\ncluster message whose reserved ``adapter`` selects reply delivery. An absent\nvalue retains the default identity. Ordinary Slack turns continue to name\ntheir identity in ``adapter`` (INGRESS-CANARY-1).",
         "properties": {
@@ -15960,6 +16239,332 @@
         "summary": "Memory Trace Back",
         "tags": [
           "memory"
+        ]
+      }
+    },
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}": {
+      "put": {
+        "description": "Record a qualification of one action declaration, recorded by the operator principal.\n\nThe evidence references are checked by state and digest; any refusal writes\nnothing. A replay answers the record; another body under the same id is\n``qualification_conflict``.",
+        "operationId": "put_remediation_qualification_agents__agent_id__remediation_qualifications__qualification_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "qualification_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Qualification Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Principal"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemediationQualificationWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationQualificationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Named refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Named refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Validation error or named refusal"
+          }
+        },
+        "summary": "Put Remediation Qualification",
+        "tags": [
+          "remediation-qualifications"
+        ]
+      }
+    },
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs": {
+      "post": {
+        "description": "Start a verifier evaluation of the declared verifier for a qualification.\n\nOnly ``read`` executions of the declared verifier are created, against a\ntarget that is a literal member of the action's allowed list.",
+        "operationId": "start_remediation_verifier_run_agents__agent_id__remediation_qualifications__qualification_id__verifier_runs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "qualification_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Qualification Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Principal"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemediationVerifierRunStart"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationVerifierRunOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Named refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Named refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Validation error or named refusal"
+          }
+        },
+        "summary": "Start Remediation Verifier Run",
+        "tags": [
+          "remediation-qualifications"
+        ]
+      }
+    },
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}": {
+      "get": {
+        "description": "A qualification verifier run and its outcome.",
+        "operationId": "get_remediation_verifier_run_agents__agent_id__remediation_qualifications__qualification_id__verifier_runs__run_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "qualification_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Qualification Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationVerifierRunOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "No such verifier run"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Remediation Verifier Run",
+        "tags": [
+          "remediation-qualifications"
         ]
       }
     },
