@@ -165,6 +165,7 @@ PRECONDITION_UNAVAILABLE: Final = "precondition_unavailable"
 ADMISSION_UNREADABLE: Final = "admission_unreadable"
 POLICY_CHANGED: Final = "policy_changed"
 REPLY_SURFACE_UNAVAILABLE: Final = "reply_surface_unavailable"
+UNKNOWN_ACTION: Final = "unknown_action"
 
 # The precondition read's idempotency key: ``remediation:<nomination id>:precondition``.
 _PRECONDITION: Final = "precondition"
@@ -679,7 +680,8 @@ async def raise_approval(
     @spec AUTOMATED-REMEDIATION-15. The nomination is ``approval_requested``
     with its ``approval_reason``; this names the approval on it, on the reply
     surface its delivery recorded. A nomination whose delivery recorded none,
-    and any other failure, is left for ``reconcile_admissions``. Commits;
+    and any other failure, is left for ``reconcile_admissions``, which ends an
+    unraisable one ``refused`` (``reply_surface_unavailable``). Commits;
     returns the approval id.
     """
 
@@ -698,7 +700,8 @@ async def raise_approval(
             return approval_id
         turn = await _delivery_turn(session, nomination)
         if turn is None:
-            # Nowhere to ask: nothing is guessed.
+            # Nowhere to ask: the reconciler's next pass ends it
+            # ``reply_surface_unavailable`` (``_end_unraisable``).
             await session.rollback()
             logger.warning("remediation approval has no reply surface nomination=%s", nomination_id)
             return None
@@ -1047,6 +1050,67 @@ async def refuse_changed_authority(
 # --------------------------------------------------------------------------- #
 
 
+def _owed_approval() -> Any:
+    """``approval_requested`` with its reason and no approval yet."""
+
+    return and_(
+        RemediationNomination.state == APPROVAL_REQUESTED,
+        RemediationNomination.approval_id.is_(None),
+        RemediationNomination.approval_reason.is_not(None),
+    )
+
+
+async def _end_unraisable(session: AsyncSession) -> None:
+    """End every owed approval request that no pass could ever raise. Commits nothing."""
+
+    surface = (
+        select(RemediationNominationSubmission.event_id)
+        .where(
+            RemediationNominationSubmission.event_id == RemediationNomination.event_id,
+            RemediationNominationSubmission.reply_kind.is_not(None),
+            RemediationNominationSubmission.reply_channel.is_not(None),
+        )
+        .exists()
+    )
+    live = (
+        select(RemediationPolicy.generation)
+        .where(
+            RemediationPolicy.agent_id == RemediationNomination.agent_id,
+            RemediationPolicy.hook == RemediationNomination.hook,
+        )
+        .scalar_subquery()
+    )
+    declared = (
+        select(RemediationPolicyGeneration.generation)
+        .where(
+            RemediationPolicyGeneration.agent_id == RemediationNomination.agent_id,
+            RemediationPolicyGeneration.hook == RemediationNomination.hook,
+            RemediationPolicyGeneration.generation
+            == func.coalesce(RemediationNomination.current_generation, live),
+            RemediationPolicyGeneration.document["actions"].contains(
+                func.jsonb_build_array(
+                    func.jsonb_build_object("name", RemediationNomination.action)
+                )
+            ),
+        )
+        .exists()
+    )
+    for condition, code in ((~surface, REPLY_SURFACE_UNAVAILABLE), (~declared, UNKNOWN_ACTION)):
+        ended = (
+            await session.scalars(
+                update(RemediationNomination)
+                .where(_owed_approval(), condition)
+                .values(state=REFUSED, refusal_code=code, decided_at=func.now())
+                .returning(RemediationNomination.id)
+                .execution_options(synchronize_session=False)
+            )
+        ).all()
+        for nomination_id in ended:
+            await release_reservation(session, nomination_id)
+        if ended:
+            logger.warning("remediation nominations refused count=%d code=%s", len(ended), code)
+
+
 async def reconcile_admissions(
     session: AsyncSession, store: ObjectStore, kill_switch: KillSwitch, *, limit: int = 100
 ) -> int:
@@ -1059,8 +1123,15 @@ async def reconcile_admissions(
     Each step is the same idempotent step the routes run. Returns how many it
     handled; failures are logged and retried on the next pass.
 
+    An owed approval that can never be raised is ended first, in one statement
+    for every such row, so it is never selected again and cannot starve a
+    raisable one: no reply surface recorded is ``reply_surface_unavailable``,
+    and an action the generation the approval would bind no longer declares is
+    ``unknown_action`` (AUTOMATED-REMEDIATION-7, -15).
     """
 
+    await _end_unraisable(session)
+    await session.commit()
     stranded = (
         await session.scalars(
             select(RemediationNomination.id)
@@ -1100,11 +1171,7 @@ async def reconcile_admissions(
     owed = (
         await session.scalars(
             select(RemediationNomination.id)
-            .where(
-                RemediationNomination.state == APPROVAL_REQUESTED,
-                RemediationNomination.approval_id.is_(None),
-                RemediationNomination.approval_reason.is_not(None),
-            )
+            .where(_owed_approval())
             .order_by(RemediationNomination.decided_at)
             .limit(limit)
         )
