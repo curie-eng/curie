@@ -5,9 +5,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 from pathlib import Path
-import asyncio
 
 import pytest
 from aci_protocol.turn import QueuedTurn
@@ -49,16 +49,20 @@ def test_selection_requires_exact_live_active_binding() -> None:
     with pytest.raises(ValueError, match="selected"):
         canary.select_targets(rows, [("slack", "C-ABSENT", "blue")])
     with pytest.raises(ValueError, match="selected"):
-        canary.select_targets([{**_binding(), "deployment_status": "inactive"}],
-                              [("slack", "C-EXAMPLE-1", "blue")])
+        canary.select_targets(
+            [{**_binding(), "deployment_status": "inactive"}], [("slack", "C-EXAMPLE-1", "blue")]
+        )
 
 
 def test_named_binding_turn_is_read_only_and_relayed_internally() -> None:
     """@spec TURN-CANARY-2"""
     canary = _canary()
     turn = canary.build_turn(
-        _binding(), nonce="n-unique-1", conversation_id="eval:probe-1",
-        reply_ref=REPLY_REF, event_id="EvSIM-example-1",
+        _binding(),
+        nonce="n-unique-1",
+        conversation_id="eval:probe-1",
+        reply_ref=REPLY_REF,
+        event_id="EvSIM-example-1",
         received_at="2026-01-01T00:00:00Z",
     )
     wire = QueuedTurn.model_validate_json(turn.model_dump_json())
@@ -80,17 +84,42 @@ def test_named_binding_turn_is_read_only_and_relayed_internally() -> None:
 @pytest.mark.parametrize(
     ("events", "expected"),
     [
-        ([{"event": "reply.update", "text": "nonce-1"},
-          {"event": "turn.completed", "outcome": "delivered"}], True),
+        (
+            [
+                {"event": "reply.update", "text": "nonce-1"},
+                {"event": "turn.completed", "outcome": "delivered"},
+            ],
+            True,
+        ),
         ([{"event": "reply.update", "text": "nonce-1"}], False),
-        ([{"event": "reply.update", "text": "nonce-1"},
-          {"event": "turn.completed", "outcome": "awaiting-approval"}], False),
-        ([{"event": "reply.update", "text": "nonce-1"},
-          {"event": "turn.completed", "outcome": "dropped"}], False),
-        ([{"event": "reply.update", "text": "wrong"},
-          {"event": "turn.completed", "outcome": "delivered"}], False),
-        ([{"event": "reply.update", "text": "nonce-1 extra"},
-          {"event": "turn.completed", "outcome": "delivered"}], False),
+        (
+            [
+                {"event": "reply.update", "text": "nonce-1"},
+                {"event": "turn.completed", "outcome": "awaiting-approval"},
+            ],
+            False,
+        ),
+        (
+            [
+                {"event": "reply.update", "text": "nonce-1"},
+                {"event": "turn.completed", "outcome": "dropped"},
+            ],
+            False,
+        ),
+        (
+            [
+                {"event": "reply.update", "text": "wrong"},
+                {"event": "turn.completed", "outcome": "delivered"},
+            ],
+            False,
+        ),
+        (
+            [
+                {"event": "reply.update", "text": "nonce-1 extra"},
+                {"event": "turn.completed", "outcome": "delivered"},
+            ],
+            False,
+        ),
     ],
 )
 def test_success_requires_delivered_completion_and_exact_nonce(events, expected) -> None:
@@ -104,9 +133,7 @@ def test_owned_reset_key_matches_named_worker_route() -> None:
 
     canary = _canary()
     key = canary.scoped_reset_key(_binding(), "eval:probe-1")
-    assert key == scoped_conversation_id(
-        "slack", "C-EXAMPLE-1", "eval:probe-1", identity="blue"
-    )
+    assert key == scoped_conversation_id("slack", "C-EXAMPLE-1", "eval:probe-1", identity="blue")
     assert key != scoped_conversation_id("slack", "C-EXAMPLE-1", "eval:probe-1")
 
 
@@ -146,7 +173,9 @@ class CyclePlatform:
         return self.headroom
 
     async def enqueue(self, turn):
-        assert QueuedTurn.model_validate_json(turn.model_dump_json()).tool_access.value == "read-only"
+        assert (
+            QueuedTurn.model_validate_json(turn.model_dump_json()).tool_access.value == "read-only"
+        )
         self.calls.append(("enqueue", turn.conversation_id))
         self.active += 1
         self.peak = max(self.peak, self.active)
@@ -155,7 +184,11 @@ class CyclePlatform:
         self.calls.append(("replies", after))
         if self.reply_events is None:
             return {"events": [], "next_cursor": after, "terminal": False}
-        return {"events": self.reply_events, "next_cursor": after + len(self.reply_events), "terminal": True}
+        return {
+            "events": self.reply_events,
+            "next_cursor": after + len(self.reply_events),
+            "terminal": True,
+        }
 
     async def reset(self, agent_id, thread_key):
         self.calls.append(("reset", thread_key))
@@ -175,10 +208,19 @@ def test_timeout_resets_owned_route_and_stops_when_cleanup_unconfirmed():
     """@spec TURN-CANARY-3 TURN-CANARY-4"""
     canary = _canary()
     platform = CyclePlatform(reset_state={"requested": True, "route_existed": None})
-    result = asyncio.run(canary.run_cycle(platform, _routes(), turn_deadline=0.02,
-                                    cleanup_deadline=0.02, poll_period=0.005))
-    assert len([call for call in platform.calls if isinstance(call, tuple) and call[0] == "enqueue"]) == 1
-    assert len([call for call in platform.calls if isinstance(call, tuple) and call[0] == "reset"]) == 1
+    result = asyncio.run(
+        canary.run_cycle(
+            platform, _routes(), turn_deadline=0.02, cleanup_deadline=0.02, poll_period=0.005
+        )
+    )
+    assert (
+        len([call for call in platform.calls if isinstance(call, tuple) and call[0] == "enqueue"])
+        == 1
+    )
+    assert (
+        len([call for call in platform.calls if isinstance(call, tuple) and call[0] == "reset"])
+        == 1
+    )
     assert result.cleanup_degraded is True
     assert result.success is False
 
@@ -186,8 +228,11 @@ def test_timeout_resets_owned_route_and_stops_when_cleanup_unconfirmed():
 def test_false_reset_result_stops_before_second_probe():
     """@spec TURN-CANARY-4"""
     platform = CyclePlatform(reset_state={"requested": False, "route_existed": False})
-    result = asyncio.run(_canary().run_cycle(platform, _routes(), turn_deadline=0.02,
-                                       cleanup_deadline=0.02, poll_period=0.005))
+    result = asyncio.run(
+        _canary().run_cycle(
+            platform, _routes(), turn_deadline=0.02, cleanup_deadline=0.02, poll_period=0.005
+        )
+    )
     assert result.cleanup_degraded is True
     assert sum(call[0] == "enqueue" for call in platform.calls if isinstance(call, tuple)) == 1
 
@@ -195,8 +240,11 @@ def test_false_reset_result_stops_before_second_probe():
 def test_successful_cycle_runs_probes_serially():
     """@spec TURN-CANARY-3 TURN-CANARY-5"""
     platform = CyclePlatform(reply_events=[{"event": "turn.completed", "outcome": "dropped"}])
-    result = asyncio.run(_canary().run_cycle(platform, _routes(), turn_deadline=0.02,
-                                       cleanup_deadline=0.02, poll_period=0.005))
+    result = asyncio.run(
+        _canary().run_cycle(
+            platform, _routes(), turn_deadline=0.02, cleanup_deadline=0.02, poll_period=0.005
+        )
+    )
     assert result.cleanup_degraded is False
     assert platform.peak == 1
     assert sum(call[0] == "enqueue" for call in platform.calls if isinstance(call, tuple)) == 2
@@ -206,21 +254,28 @@ def test_successful_cycle_runs_probes_serially():
 def test_quota_headroom_refuses_enqueue(headroom):
     """@spec TURN-CANARY-5"""
     platform = CyclePlatform(headroom=headroom)
-    result = asyncio.run(_canary().run_cycle(platform, _routes()[:1], turn_deadline=0.02,
-                                       cleanup_deadline=0.02, poll_period=0.005))
+    result = asyncio.run(
+        _canary().run_cycle(
+            platform, _routes()[:1], turn_deadline=0.02, cleanup_deadline=0.02, poll_period=0.005
+        )
+    )
     assert result.capacity_skips == 1
     assert not any(call[0] == "enqueue" for call in platform.calls if isinstance(call, tuple))
 
 
 def test_network_error_diagnostic_omits_raw_secret_and_reply():
     """@spec TURN-CANARY-6"""
+
     class Broken(CyclePlatform):
         async def replies(self, reply_ref, after):
             raise RuntimeError("token=private-secret reply=private-content")
 
     platform = Broken()
-    result = asyncio.run(_canary().run_cycle(platform, _routes()[:1], turn_deadline=0.02,
-                                       cleanup_deadline=0.02, poll_period=0.005))
+    result = asyncio.run(
+        _canary().run_cycle(
+            platform, _routes()[:1], turn_deadline=0.02, cleanup_deadline=0.02, poll_period=0.005
+        )
+    )
     rendered = repr(result) + str(result.logs)
     assert "private-secret" not in rendered
     assert "private-content" not in rendered
