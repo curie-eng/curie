@@ -111,7 +111,9 @@ READ_TOOL = "query_value"
 READ_DIGEST = "sha256:" + "ef" * 32
 
 USERS_ROUTE = "sre-oncall"
-CHANNEL = "C0EXAMPLE7"
+# One route binds one channel to one agent, so each agent of a test takes its
+# own example channel (the gitleaks allowlist covers C0EXAMPLE0 to C0EXAMPLE9).
+CHANNELS = [f"C0EXAMPLE{digit}" for digit in range(10)]
 OPERATOR = "U0EXAMPLE7"
 PRINCIPAL_HEADER = "X-Curie-Approval-Principal"
 
@@ -240,16 +242,22 @@ def _deploy(
 
 
 def _agent(client: Any, headers: dict[str, str], tmp_path: Path) -> str:
-    """An agent with an explicit approval route, a protected hook and both connectors."""
+    """An agent with an explicit approval route, a protected hook and both connectors.
 
+    Each agent of a test gets its own channel (the database is clean per test).
+    """
+
+    count = int(sql_dicts("SELECT count(*) AS n FROM curie.agents")[0]["n"])
+    assert count < len(CHANNELS), "a test needs more agents than example channels"
+    channel = CHANNELS[count]
     created = client.post(
         "/agents",
         json={
             "name": f"qual-bot-{uuid.uuid4().hex[:6]}",
-            "channel": {"kind": "slack", "address": CHANNEL},
+            "channel": {"kind": "slack", "address": channel},
             "approval_routes": {
                 USERS_ROUTE: {
-                    "resolution": {"kind": "slack", "address": CHANNEL},
+                    "resolution": {"kind": "slack", "address": channel},
                     "approvers": {"users": [OPERATOR]},
                 }
             },
@@ -1283,12 +1291,15 @@ def test_no_route_lets_an_administrator_request_a_write(client: Any) -> None:
     """
 
     prefix = "/agents/{agent_id}/remediation-qualifications"
+    paths = client.app.openapi()["paths"]
+    # The walk must see the app's routes, so an empty surface cannot pass.
+    assert "/agents/{agent_id}/hooks/{hook}/remediation-policy" in paths, sorted(paths)
     surface = {
-        (method, route.path)
-        for route in client.app.routes
-        if getattr(route, "path", "").startswith(prefix)
-        for method in (getattr(route, "methods", None) or set())
-        if method not in {"HEAD", "OPTIONS"}
+        (method.upper(), path)
+        for path, operations in paths.items()
+        if path.startswith(prefix)
+        for method in operations
+        if method.upper() in {"GET", "PUT", "POST", "PATCH", "DELETE"}
     }
 
     assert surface == {
