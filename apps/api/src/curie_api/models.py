@@ -2976,6 +2976,9 @@ class RemediationDeliverySurface(Base):
     reply_channel: Mapped[str] = mapped_column(Text, nullable=False)
     reply_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
     reply_adapter: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The thread the receipts post into (AUTOMATED-REMEDIATION-20), recorded by
+    # the ingress with the surface; NULL for a surface recorded before 0097.
+    reply_conversation: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -3181,6 +3184,47 @@ class RemediationEscalation(Base):
         UUID(as_uuid=True),
         ForeignKey(f"{SCHEMA}.approvals.id", ondelete="SET NULL"),
         nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationReceiptPost(Base):
+    """One remediation receipt the worker loop has claimed: its lease and whether it posted.
+
+    @spec AUTOMATED-REMEDIATION-20. Keyed by nomination and stage, so a stage
+    posts once across passes, leases and worker replicas. It holds no message
+    text, argument or reason; the message is rendered from the nomination row
+    when it is posted.
+    """
+
+    __tablename__ = "remediation_receipt_posts"
+    __table_args__ = (
+        CheckConstraint(
+            "stage IN ('nominated', 'refused', 'approval_requested', 'executed', 'verified', "
+            "'not-recovered', 'verifier-unavailable', 'superseded', 'undo_requested', "
+            "'undone', 'escalated')",
+            name="remediation_receipt_posts_stage_ck",
+        ),
+        CheckConstraint("attempts >= 0", name="remediation_receipt_posts_attempts_ck"),
+    )
+
+    nomination_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.remediation_nominations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    stage: Mapped[str] = mapped_column(Text, primary_key=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(Text, nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

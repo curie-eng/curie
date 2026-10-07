@@ -710,7 +710,14 @@ async def _ingest_protected(
                 # nomination finds it; a failed write admits nothing (the
                 # sender's retry records it and admits once).
                 try:
-                    await record_delivery_surface(session, agent.id, hook, event_id, binding)
+                    await record_delivery_surface(
+                        session,
+                        agent.id,
+                        hook,
+                        event_id,
+                        binding,
+                        conversation=hook_conversation_id(agent.id, hook, partition),
+                    )
                 except SQLAlchemyError:
                     raise HTTPException(
                         status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
