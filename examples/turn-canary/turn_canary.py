@@ -3,6 +3,7 @@
 import asyncio
 import fcntl
 import json
+import math
 import os
 import secrets
 import tempfile
@@ -104,11 +105,24 @@ class StateJournal:
             else:
                 data = {}
             pending = data.get("pending") if isinstance(data, dict) else None
+
+            def valid_timestamp(value: Any) -> bool:
+                return type(value) in (int, float) and math.isfinite(value) and value > 0
+
             if (
                 not isinstance(data, dict)
-                or not isinstance(data.get("capacity_skips_total", 0), int)
+                or type(data.get("capacity_skips_total", 0)) is not int
+                or data.get("capacity_skips_total", 0) < 0
                 or not isinstance(data.get("target_last_success", {}), dict)
-                or data.get("cleanup_blocked", False) not in (True, False)
+                or not all(
+                    isinstance(route, str) and valid_timestamp(timestamp)
+                    for route, timestamp in data.get("target_last_success", {}).items()
+                )
+                or (
+                    data.get("last_success") is not None
+                    and not valid_timestamp(data["last_success"])
+                )
+                or type(data.get("cleanup_blocked", False)) is not bool
                 or (
                     pending is not None
                     and (
@@ -336,7 +350,10 @@ async def run_cycle(
         max_targets=max_targets,
     )
     result = CycleResult()
-    if getattr(platform, "cleanup_blocked", False) or (journal is not None and journal.pending):
+    if getattr(platform, "cleanup_blocked", False) or (
+        journal is not None
+        and (journal.pending is not None or journal.data.get("cleanup_blocked") is True)
+    ):
         result.cleanup_degraded = True
         result.record("cleanup", "previous_unconfirmed")
         return result
