@@ -257,7 +257,8 @@ def read_document(result: CallToolResult) -> object:
     """The document a pointer applies to, or ``_ABSENT`` (maintainer ruling M3).
 
     The structured content when present; otherwise the strict JSON of the one
-    and only content block when it is text within ``CALL_RESULT_MAX_BYTES``.
+    and only content block when it is text within ``CALL_RESULT_MAX_BYTES``
+    (``sample_of`` already refused a whole result past that bound).
     """
 
     structured = result.structured_content
@@ -277,6 +278,11 @@ def sample_of(result: CallToolResult, pointer: str) -> dict[str, Any]:
 
     if result.is_error:
         return {"sample": "tool_error", "value": None}
+    size = len(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+    if size > CALL_RESULT_MAX_BYTES:
+        # The call phase's bound holds for the whole result, structured
+        # content included; past it nothing is parsed.
+        return {"sample": "result_unstructured", "value": None}
     document = read_document(result)
     if document is _ABSENT:
         return {"sample": "result_unstructured", "value": None}
