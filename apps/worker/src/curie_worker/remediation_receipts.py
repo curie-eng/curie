@@ -30,8 +30,11 @@ retried. A later stage never posts before an earlier one of its nomination has
 settled (posted or dead-lettered).
 
 A message is rendered from the stage, the action name, the target key, the
-authority and a code from the frozen vocabulary, and from nothing else
-(``render_receipt``): no other argument, read result, envelope, reason or alert
+authority and a code from the frozen vocabulary, and from nothing else. The
+action and target are named only when the action is one a policy generation of
+the hook declares; model text the platform never matched (an ``unknown_action``
+or ``nomination_duplicate`` refusal) renders as ``-``.
+No other argument, read result, envelope, reason or alert
 body is ever read by this module. A code outside the vocabulary (an execution
 code such as a connector error) is never named. One counter point and one span
 record each posted receipt, with the closed attributes only.
@@ -147,6 +150,12 @@ def _code_span(value: str) -> str:
     return f"`{_escaped(bounded.replace('`', chr(39)))}`"
 
 
+def _named(value: str) -> str:
+    """A declared name as a code span; the absent marker as itself."""
+
+    return value if value == _ABSENT else _code_span(value)
+
+
 def render_receipt(
     stage: str, *, action: str, target_key: str, authority: str, code: str | None
 ) -> str:
@@ -167,8 +176,7 @@ def render_receipt(
     lines = [
         f"Remediation {stage}",
         _HEADLINES[stage],
-        f"Action: {_code_span(action)}",
-        f"Target: {_code_span(target_key)}",
+        f"Action: {_named(action)} on {_named(target_key)}",
         f"Authority: {authority}",
     ]
     if code is not None:
@@ -215,6 +223,7 @@ class PostgresRemediationReceiptStore:
         self._surfaces = f'"{schema}".remediation_delivery_surfaces'
         self._escalations = f'"{schema}".remediation_escalations'
         self._executions = f'"{schema}".action_executions'
+        self._generations = f'"{schema}".remediation_policy_generations'
         self._requests = f'"{schema}".remediation_approval_requests'
         self._posts = f'"{schema}".remediation_receipt_posts'
         self._lease_owner = lease_owner
@@ -284,7 +293,9 @@ class PostgresRemediationReceiptStore:
                  WHERE n.created_at > now() - CAST(:window AS interval)
             )
             SELECT f.nomination_id, f.stage, f.authority, f.code,
-                   n.kind, n.action, n.target,
+                   n.kind,
+                   CASE WHEN declared.is_declared THEN n.action END AS action,
+                   CASE WHEN declared.is_declared THEN n.target END AS target,
                    COALESCE(s.reply_kind, sub.reply_kind) AS reply_kind,
                    COALESCE(s.reply_channel, sub.reply_channel) AS reply_channel,
                    COALESCE(s.reply_endpoint, sub.reply_endpoint) AS reply_endpoint,
@@ -295,6 +306,19 @@ class PostgresRemediationReceiptStore:
               LEFT JOIN {self._surfaces} s
                 ON s.event_id = n.event_id AND s.agent_id = n.agent_id
               LEFT JOIN {self._submissions} sub ON sub.event_id = n.event_id
+              CROSS JOIN LATERAL (
+                  SELECT EXISTS (
+                      SELECT 1
+                        FROM {self._generations} g
+                       WHERE g.agent_id = n.agent_id
+                         AND g.hook = n.hook
+                         AND jsonb_path_exists(
+                             CAST(g.document AS jsonb),
+                             '$.actions[*] ? (@.name == $name)',
+                             jsonb_build_object('name', n.action)
+                         )
+                  ) AS is_declared
+              ) declared
               LEFT JOIN {self._posts} p
                 ON p.nomination_id = f.nomination_id AND p.stage = f.stage
              WHERE COALESCE(s.reply_channel, sub.reply_channel) IS NOT NULL
