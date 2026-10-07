@@ -38,6 +38,7 @@ from curie_worker.sandbox import (
     AffinityStore,
     CapacityExhaustedError,
     RouteRecord,
+    RouteState,
     SandboxHandle,
     SandboxSubstrate,
     SubstrateConfig,
@@ -491,3 +492,196 @@ def test_pressure_candidates_exclude_executor_routes(
             await pressure_client.aclose()
 
     asyncio.run(go())
+
+
+# -- Review round 1 -------------------------------------------------------------
+
+# The model credential an operator puts on the runner through
+# ``agentSandbox.runner.extraEnv`` (rendered after the chart's own entries), in
+# both shapes extraEnv allows. ``CURIE_MODEL_ENV_KEY`` declares a JSON array, so
+# both names it resolves to are model credentials too.
+_DECLARED_KEYS = ("OPENROUTER_API_KEY", "ACME_MODEL_KEY")
+_EXTRA_ENV: tuple[dict[str, Any], ...] = (
+    {"name": "CURIE_MODEL_ENV_KEY", "value": json.dumps(list(_DECLARED_KEYS))},
+    {"name": "ANTHROPIC_API_KEY", "value": "sk-ant-placeholder"},
+    {
+        "name": "CLAUDE_CODE_OAUTH_TOKEN",
+        "valueFrom": {"secretKeyRef": {"name": "acme-model", "key": "oauth"}},
+    },
+    {"name": "ANTHROPIC_AUTH_TOKEN", "value": "auth-placeholder"},
+    {
+        "name": "ANTHROPIC_FOUNDRY_API_KEY",
+        "valueFrom": {"secretKeyRef": {"name": "acme-model", "key": "foundry"}},
+    },
+    {"name": "ANTHROPIC_CUSTOM_HEADERS", "value": "x-placeholder: 1"},
+    {
+        "name": "OPENROUTER_API_KEY",
+        "valueFrom": {"secretKeyRef": {"name": "acme-model", "key": "openrouter"}},
+    },
+    {"name": "ACME_MODEL_KEY", "value": "acme-model-placeholder"},
+    # Not a model credential: must survive the executor copy.
+    {"name": "ACME_FEATURE_FLAG", "value": "on"},
+)
+
+
+def _extra_env_template_spec() -> dict[str, Any]:
+    spec = _agent_template_spec()
+    runner = _runner_container(spec)
+    # The chart's CURIE_MODEL_ENV_KEY entry is replaced by the extraEnv one.
+    runner["env"] = [e for e in runner["env"] if e["name"] != "CURIE_MODEL_ENV_KEY"]
+    runner["env"] += [copy.deepcopy(e) for e in _EXTRA_ENV]
+    return spec
+
+
+def _runner_boot_env(spec: dict[str, Any]) -> dict[str, str]:
+    """The runner's env as the kubelet would set it: every entry non-empty.
+
+    A ``valueFrom`` entry resolves to a placeholder; a ``value`` entry keeps its
+    literal, so a surviving declaration still names what it names.
+    """
+
+    env: dict[str, str] = {}
+    for entry in _runner_container(spec)["env"]:
+        env[entry["name"]] = entry.get("value") or f"resolved-{entry['name']}"
+    return env
+
+
+def _model_credential_names() -> frozenset[str]:
+    """Every name the runner's executor mode refuses, read from the runner itself.
+
+    ``executor_model_credentials`` is the runner's own refusal (no vector lists
+    the names), so the worker cannot drift from it. The CLI parent model keys
+    are the runner's other model credential inventory.
+    """
+
+    from curie_runner.__main__ import executor_model_credentials
+    from curie_runner.subprocess_env import CLI_PARENT_MODEL_KEYS
+
+    probe = {e["name"]: e.get("value") or "x" for e in _EXTRA_ENV}
+    probe["CURIE_CREDENTIALS"] = "x"
+    refused = frozenset(executor_model_credentials(probe))
+    # The probe must have exercised the declaration, or the oracle is vacuous.
+    assert set(_DECLARED_KEYS) <= refused
+    assert {"CURIE_CREDENTIALS", "CURIE_MODEL_ENV_KEY", "ANTHROPIC_API_KEY"} <= refused
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in refused
+    return refused | CLI_PARENT_MODEL_KEYS
+
+
+def test_executor_template_drops_every_model_credential_the_runner_refuses() -> None:
+    """@spec ACTION-EXECUTOR-5 @spec ACTION-EXECUTOR-4: the executor runner would boot."""
+
+    from curie_runner.__main__ import executor_model_credentials
+
+    api = _FakeApi()
+    source = _seed_chart(api, spec=_extra_env_template_spec())
+    pristine = copy.deepcopy(source)
+    claim = "curie-thread-0123456789-e3e3e3"
+
+    _client(api).create_claim(
+        claim,
+        pool=_AGENT_POOL,
+        env=_executor_env(),
+        labels={"curietech.ai/agent": _AGENT},
+        agent_name=_AGENT,
+        executor_secret_names=frozenset({_TARGET_SECRET}),
+    )
+
+    (template,) = _posted(api, "SandboxTemplate")
+    spec = template["spec"]
+    names = {e["name"] for e in _runner_container(spec)["env"]}
+    leaked = names & _model_credential_names()
+    assert not leaked, sorted(leaked)
+    # The runner's own boot check finds nothing, so executor mode boots.
+    assert executor_model_credentials(_runner_boot_env(spec)) == ()
+    spec_json = json.dumps(spec)
+    for value in ("sk-ant-placeholder", "acme-model", "auth-placeholder", "acme-model-placeholder"):
+        assert value not in spec_json, value
+    # Liveness: an unrelated extraEnv entry and the target secret survive.
+    runner_env = _runner_container(spec)["env"]
+    assert {"name": "ACME_FEATURE_FLAG", "value": "on"} in runner_env
+    assert _CONNECTOR_SECRET_REF in runner_env
+    assert _without_runner_env(spec) == _without_runner_env(pristine)
+
+
+def test_an_ordinary_claim_keeps_extra_env_model_credentials() -> None:
+    """@spec ACTION-EXECUTOR-5: only the executor copy is stripped."""
+
+    api = _FakeApi()
+    source = _seed_chart(api, spec=_extra_env_template_spec())
+    pristine = copy.deepcopy(source)
+    claim = "curie-thread-0123456789-0b0b0b"
+
+    _client(api).create_claim(
+        claim,
+        pool=_AGENT_POOL,
+        env=_ordinary_env(),
+        labels={"curietech.ai/agent": _AGENT},
+        agent_name=_AGENT,
+    )
+
+    (template,) = _posted(api, "SandboxTemplate")
+    runner_env = _runner_container(template["spec"])["env"]
+    tokens = sorted(("CURIE_CONNECTOR_CALLER_TOKEN", "CURIE_RUNNER_TOKEN", "CURIE_STATE_TOKEN"))
+    assert runner_env == _runner_container(pristine)["env"] + [
+        _token_ref(claim, key) for key in tokens
+    ]
+
+
+def _seed_route(affinity: AffinityStore, thread_key: str, state: RouteState) -> RouteRecord:
+    record = RouteRecord(handle=_route(thread_key, "claim-exec-old").handle, state=state)
+    assert affinity.put_if_absent(thread_key, record, 60)
+    return record
+
+
+def test_resume_refuses_an_executor_route(affinity: AffinityStore, key_prefix: str) -> None:
+    """@spec ACTION-EXECUTOR-5: resume never builds an unstripped executor claim."""
+
+    api = _BindingApi()
+    _seed_chart(api, spec=_agent_template_spec())
+    substrate = _substrate(api, affinity, key_prefix)
+    record = _seed_route(affinity, _EXEC_KEY, RouteState.SUSPENDED)
+
+    with pytest.raises(ValueError):
+        substrate.resume(_EXEC_KEY, env=_executor_env(), agent_name=_AGENT)
+
+    assert _posted(api, "SandboxClaim") == []
+    assert _posted(api, "SandboxTemplate") == []
+    assert not any(plural == "sandboxclaims" for plural, _ in api.deletes)
+    still = affinity.get(_EXEC_KEY)
+    assert still is not None and still.handle == record.handle
+
+
+def test_handoff_refuses_an_executor_route(affinity: AffinityStore, key_prefix: str) -> None:
+    """@spec ACTION-EXECUTOR-5: handoff never builds an unstripped executor claim."""
+
+    api = _BindingApi()
+    _seed_chart(api, spec=_agent_template_spec())
+    substrate = _substrate(api, affinity, key_prefix)
+    record = _seed_route(affinity, _EXEC_KEY, RouteState.LIVE)
+
+    with pytest.raises(ValueError):
+        substrate.handoff(
+            _EXEC_KEY,
+            expected=record.handle,
+            env=_executor_env(),
+            workspace_repo=None,
+            agent_name=_AGENT,
+        )
+
+    assert _posted(api, "SandboxClaim") == []
+    assert _posted(api, "SandboxTemplate") == []
+    assert not any(plural == "sandboxclaims" for plural, _ in api.deletes)
+    still = affinity.get(_EXEC_KEY)
+    assert still is not None and still.handle == record.handle
+
+
+def test_fake_sandbox_client_matches_the_protocol_keyword() -> None:
+    """The substrate test double accepts and records ``executor_secret_names``."""
+
+    from .conftest import FakeSandboxClient
+
+    fake = FakeSandboxClient()
+    fake.create_claim("c-exec", pool="p", executor_secret_names=frozenset({_TARGET_SECRET}))
+    fake.create_claim("c-turn", pool="p")
+    assert fake.claims["c-exec"].executor_secret_names == frozenset({_TARGET_SECRET})
+    assert fake.claims["c-turn"].executor_secret_names is None
