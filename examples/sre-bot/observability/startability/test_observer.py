@@ -621,3 +621,107 @@ def test_cli_missing_selected_container_is_a_collection_error(tmp_path: Path, fl
     """@spec STARTABILITY-5 STARTABILITY-6."""
     result, _ = run_cli(tmp_path, snapshot(), args=[*ARGS, flag, "acme-missing"])
     assert_error(result)
+
+
+def test_cli_empty_identity_list_keeps_dispatcher_default(tmp_path: Path) -> None:
+    """@spec STARTABILITY-3 STARTABILITY-7; [] is the dispatcher's legacy default."""
+    data = snapshot()
+    data["secrets"]["acme-declaration"]["identities"] = "[]"
+    result, _ = run_cli(tmp_path, data)
+    assert result.returncode == 0
+    rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
+    assert [row["ready"] for row in rows] == [1, 1, 0]
+    assert total["not_ready"] == 1
+
+
+@pytest.mark.parametrize(
+    "violation",
+    ["default_lanes", "missing_default", "shared_lanes", "reserved_identity",
+     "long_identity", "invalid_identity", "extra_field"],
+)
+def test_cli_rejects_dispatcher_invalid_declarations(tmp_path: Path, violation: str) -> None:
+    """@spec STARTABILITY-3 STARTABILITY-6 STARTABILITY-7."""
+    data = snapshot()
+    declaration = json.loads(data["secrets"]["acme-declaration"]["identities"])
+    if violation == "default_lanes":
+        declaration[0]["app_token_env"] = "CURIE_SLACK_APP_TOKEN__3"
+    elif violation == "missing_default":
+        declaration = declaration[1:]
+    elif violation == "shared_lanes":
+        declaration.append({**declaration[1], "name": "other"})
+    elif violation == "reserved_identity":
+        declaration[1]["name"] = "cluster-message"
+    elif violation == "long_identity":
+        declaration[1]["name"] = "a" * 41
+    elif violation == "invalid_identity":
+        declaration[1]["name"] = "help_desk"
+    else:
+        declaration[0]["unexpected"] = SENTINEL
+    data["secrets"]["acme-declaration"]["identities"] = json.dumps(declaration)
+    result, _ = run_cli(tmp_path, data)
+    assert_error(result)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["E2E_CLUSTER_KUBECONFIG", "E2E_REGISTRY_PUSH_CONFIG", "E2E_BUILD_CACHE_CONFIG",
+     "SNAPSHOT_SEALING_KEY", "SNAPSHOT_SEALING_KEYS_RETAINED"],
+)
+def test_cli_withheld_secret_names_do_not_require_sandbox_pool(tmp_path: Path, name: str) -> None:
+    """@spec STARTABILITY-2 STARTABILITY-7; worker withholds these before marking."""
+    data = snapshot()
+    data["bindings"] = [binding(kind="email", secret_names=(name,))]
+    data["worker_env"] = [{"name": "CURIE_WARM_POOL", "value": "acme-runner-pool"}]
+    data["pools"] = data["pools"][:1]
+    data["templates"] = data["templates"][:1]
+    result, _ = run_cli(tmp_path, data)
+    assert result.returncode == 0
+    rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
+    assert rows[0]["ready"] == 1 and total["not_ready"] == 0
+    assert name not in result.stdout + result.stderr
+
+
+def test_cli_blank_worker_pool_is_not_replaced_with_default(tmp_path: Path) -> None:
+    """@spec STARTABILITY-2 STARTABILITY-7; explicit empty config stays empty."""
+    data = snapshot()
+    data["bindings"] = [binding(kind="email")]
+    data["worker_env"] = [{"name": "CURIE_WARM_POOL", "value": ""}]
+    data["pools"] = data["pools"][:1]
+    data["pools"][0]["metadata"]["name"] = "curie-runner-pool"
+    result, _ = run_cli(tmp_path, data)
+    assert result.returncode == 0
+    rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
+    assert rows[0]["ready"] == 0 and total["not_ready"] == 1
+
+
+@pytest.mark.parametrize("generic_present", [False, True])
+def test_cli_unlisted_existing_agent_pool_is_selected(
+    tmp_path: Path, generic_present: bool
+) -> None:
+    """@spec STARTABILITY-2 STARTABILITY-7; discovered pool overrides generic choice."""
+    data = snapshot()
+    data["bindings"] = [binding(kind="email")]
+    data["worker_env"] = [{"name": "CURIE_WARM_POOL", "value": "acme-runner-pool"}]
+    if generic_present:
+        data["templates"] = data["templates"][:1]
+    else:
+        data["pools"] = data["pools"][1:]
+    result, _ = run_cli(tmp_path, data)
+    assert result.returncode == 0
+    rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
+    expected = 0 if generic_present else 1
+    assert rows[0]["ready"] == expected and total["not_ready"] == 1 - expected
+    if generic_present:
+        assert "acme-agent-runner" in rows[0]["reason"]
+
+
+def test_cli_discovered_pool_does_not_bypass_connector_secret_refusal(tmp_path: Path) -> None:
+    """@spec STARTABILITY-2 STARTABILITY-7; only a generic choice can be overridden."""
+    data = snapshot()
+    data["bindings"] = [binding(kind="email", secret_names=("CONNECTOR_ROOT",))]
+    data["worker_env"] = [{"name": "CURIE_WARM_POOL", "value": "acme-runner-pool"}]
+    result, _ = run_cli(tmp_path, data)
+    assert result.returncode == 0
+    rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
+    assert rows[0]["ready"] == 0 and total["not_ready"] == 1
+    assert "worker refuses" in rows[0]["reason"]
