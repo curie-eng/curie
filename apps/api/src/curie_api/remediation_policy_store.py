@@ -8,8 +8,8 @@ Every write (bind, arm, disarm, removal) runs in one transaction that
    ``policy_operation_conflict`` when the intent differs;
 3. compares ``expected_generation`` with the current generation (``0`` when the
    hook has none), else ``stale_policy_generation``;
-4. runs the verb's own checks (a protected source policy for bind and arm, the
-   approval route for bind, a bound policy for arm, disarm and removal);
+4. runs the verb's own checks (a protected source policy and the explicit
+   approval route for bind and arm, a bound policy for arm, disarm and removal);
 5. writes generation ``max + 1`` as an immutable row naming the operator
    principal, and moves the current row to it.
 
@@ -200,6 +200,9 @@ async def write_policy(
                         status_code=409,
                     )
                 await _protected(session, agent_id, hook)
+                # The route must still satisfy the bind rule: the agent's routes
+                # may have changed since the bind (AUTOMATED-REMEDIATION-2).
+                _explicit_route(agent, str(previous.document.get("route", "")))
                 armed, active, stored = True, True, dict(previous.document)
             elif verb == "disarm":
                 armed, active, stored = False, current.active, dict(previous.document)
