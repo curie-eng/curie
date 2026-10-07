@@ -523,16 +523,10 @@ def test_the_outcome_and_completion_finish_the_forward_ledger_row(
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("kind", ["policy", "approval"])
-def test_undo_of_a_forward_executed_record_is_refused_authority_unresolved(
+def _undoable_forward_record(
     client: Any, auth_headers: dict[str, str], tmp_path: Path, kind: str
-) -> None:
-    """@spec ACTION-EXECUTOR-19: "Until #4068 delivers authority-aware undo
-    authorization, undo of a forward-executed record is refused
-    ``refused_authority_unresolved``"; ADR 0117 decision 3's ungated default must
-    not apply. The record holds every other undo ingredient, so the authority is
-    the only reason; one audit row, no restore execution.
-    """
+) -> tuple[str, str]:
+    """A seam-created forward record holding every undo ingredient: (execution, action)."""
 
     agent_id = _agent(client, auth_headers, tmp_path)
     ref = str(uuid.uuid4()) if kind == "approval" else "policy:ref"
@@ -562,17 +556,85 @@ def test_undo_of_a_forward_executed_record_is_refused_authority_unresolved(
         ]
         == "confirmed"
     )
+    return str(created.execution_id), action_id
+
+
+@pytest.mark.parametrize("kind", ["policy", "approval"])
+def test_undo_of_a_forward_record_whose_authority_names_no_route_is_refused_unauthorized(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, kind: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-19 @spec ACTION-EXECUTOR-19: AR-19 replaces
+    AE-19's interim ``refused_authority_unresolved``: a ``policy`` record needs a
+    principal in the policy route's approver set and an ``approval`` record one
+    in the gating approval route's set. This record's authority resolves to no
+    route (no bound policy generation, no readable gating approval), so no
+    principal is in its set: ``403`` ``refused_unauthorized``, never ADR 0117
+    decision 3's ungated default and never the interim ``409``. One audit row,
+    no restore execution. The granted path (``202`` under a route member, through
+    the escalation's undo approval or the ruling route) is in
+    ``test_remediation_escalation.py``.
+    """
+
+    _, action_id = _undoable_forward_record(client, auth_headers, tmp_path, kind)
 
     undo = client.post(f"/actions/{action_id}/undo", json={}, headers=operator_headers())
 
-    assert undo.status_code == 409, undo.text
+    assert undo.status_code == 403, undo.text
     audit = client.get(f"/actions/{action_id}/audit", headers=auth_headers)
     assert audit.status_code == 200, audit.text
-    assert [(e["action"], e["authorized"]) for e in audit.json()] == [
-        ("refused_authority_unresolved", False)
-    ]
+    refusals = [e for e in audit.json() if e["actor_kind"] == "undo_ruling"]
+    assert [(e["action"], e["authorized"]) for e in refusals] == [("refused_unauthorized", False)]
+    assert refusals[0]["authorizer"] != "ungated"
     assert [row["kind"] for row in _executions()] == ["forward"]
     assert _ledger()[0]["undone_at"] is None
+
+
+@pytest.mark.parametrize("kind", ["policy", "approval"])
+def test_undo_of_a_forward_record_is_never_ruled_without_a_principal(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, kind: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-19: "No code path calls the undo ruling for a
+    policy-executed record without an approving principal." The platform key or
+    the worker token is no principal: ``401``, no ruling row, no restore.
+    """
+
+    _, action_id = _undoable_forward_record(client, auth_headers, tmp_path, kind)
+
+    for headers in (auth_headers, worker_headers(), {}):
+        undo = client.post(f"/actions/{action_id}/undo", json={}, headers=headers)
+        assert undo.status_code == 401, undo.text
+
+    audit = client.get(f"/actions/{action_id}/audit", headers=auth_headers)
+    assert audit.status_code == 200, audit.text
+    assert [e for e in audit.json() if e["actor_kind"] == "undo_ruling"] == []
+    assert [row["kind"] for row in _executions()] == ["forward"]
+
+
+def test_undo_of_a_policy_record_is_granted_through_its_undo_approval_under_a_member(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-19: the granted path that replaces the interim
+    refusal. A policy record whose verification ends ``not-recovered`` is undone
+    only by approving its escalation's undo approval as a member of the policy
+    route (one ``restore`` requested by that member); an outsider's approval is
+    ``403`` and restores nothing.
+    """
+
+    escalation = importlib.import_module("test_remediation_escalation")
+    _, nomination_id, _, action_id = escalation._undoable_scenario(client, auth_headers, tmp_path)
+    escalation._drive(client, nomination_id, "not-recovered")
+    approval_id = escalation._one_escalation(nomination_id)["undo_approval_id"]
+    assert approval_id is not None
+
+    outsider = escalation._resolve(client, approval_id, "approved", subject=escalation.OUTSIDER)
+
+    assert outsider.status_code == 403, outsider.text
+    assert escalation._restores() == []
+
+    member = escalation._resolve(client, approval_id, "approved")
+
+    assert member.status_code == 200, member.text
+    escalation._assert_one_restore_under(action_id, escalation.OPERATOR)
 
 
 # --------------------------------------------------------------------------- #

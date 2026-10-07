@@ -571,7 +571,8 @@ class Approval(Base):
         JSONB(none_as_null=True), default=None
     )
     # Server-owned purpose. ``publication`` and ``remediation`` (an argument-bound
-    # remediation call, AUTOMATED-REMEDIATION-15) suppress the ordinary model
+    # remediation call, AUTOMATED-REMEDIATION-15, or the undo offered for an
+    # unverified one, AUTOMATED-REMEDIATION-19) suppress the ordinary model
     # wake; requester equality follows the same approver-set rule for every purpose.
     purpose: Mapped[str] = mapped_column(server_default="session", default="session")
     # Set only when the platform resolved this row under ADR 0147. Human
@@ -3049,3 +3050,138 @@ class RemediationReservation(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RemediationQualification(Base):
+    """One qualification record of an agent's action (AUTOMATED-REMEDIATION-22).
+
+    @spec AUTOMATED-REMEDIATION-22. For one ``(agent_id, connector, tool,
+    connector_digest, verifier_sha256)``: the evidence references the API checked
+    by state and digest when the record was written, the worst case statement and
+    the operator principal that recorded it. Never updated; valid only while the
+    acting connector's in-force digest is ``connector_digest``.
+    """
+
+    __tablename__ = "remediation_qualifications"
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(worst_case) BETWEEN 1 AND 2000",
+            name="remediation_qualifications_worst_case_ck",
+        ),
+        CheckConstraint(
+            "verifier_sha256 ~ '^[0-9a-f]{64}$'",
+            name="remediation_qualifications_verifier_ck",
+        ),
+        CheckConstraint(
+            "reversibility IN ('reversible', 'idempotent')",
+            name="remediation_qualifications_reversibility_ck",
+        ),
+        Index("ix_remediation_qualifications_agent", "agent_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    connector: Mapped[str] = mapped_column(Text, nullable=False)
+    tool: Mapped[str] = mapped_column(Text, nullable=False)
+    connector_digest: Mapped[str] = mapped_column(Text, nullable=False)
+    verifier_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    reversibility: Mapped[str] = mapped_column(Text, nullable=False)
+    recorded_by: Mapped[str] = mapped_column(Text, nullable=False)
+    worst_case: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    # The hook, action and generation whose bounds the record was evaluated against.
+    hook: Mapped[str | None] = mapped_column(String(63), nullable=True)
+    action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationQualificationVerifierRun(Base):
+    """One verifier evaluation an operator started for a qualification.
+
+    @spec AUTOMATED-REMEDIATION-22. Its samples are ``read`` executions of the
+    declared verifier with ``authority_kind`` ``qualification`` and this run's
+    id as ``authority_ref``, anchored on ``started_at``; the outcome is written
+    once.
+    """
+
+    __tablename__ = "remediation_qualification_verifier_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IS NULL OR outcome IN ('verified', 'not-recovered', 'verifier-unavailable')",
+            name="remediation_qualification_verifier_runs_outcome_ck",
+        ),
+        CheckConstraint(
+            "(outcome IS NULL) = (decided_at IS NULL)",
+            name="remediation_qualification_verifier_runs_decided_ck",
+        ),
+        Index(
+            "ix_remediation_qualification_verifier_runs_qualification",
+            "agent_id",
+            "qualification_id",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    qualification_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    generation: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    verifier_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    target: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    started_by: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RemediationEscalation(Base):
+    """The failure report of one remediation whose outcome is not ``verified``.
+
+    @spec AUTOMATED-REMEDIATION-19. Written in the transaction that writes the
+    outcome (``remediation_escalation.escalate``), once per nomination. It is
+    what the worker remediation loop delivers to the policy's route and the
+    delivery's thread. ``undo_approval_id`` is the undo approval (purpose
+    ``remediation``, dedupe key ``remediation-undo:<nomination id>``) offered
+    for a ``reversible`` action whose record was undoable, else null.
+    """
+
+    __tablename__ = "remediation_escalations"
+    __table_args__ = (
+        UniqueConstraint("nomination_id", name="uq_remediation_escalations_nomination"),
+        UniqueConstraint("undo_approval_id", name="uq_remediation_escalations_undo_approval"),
+        CheckConstraint(
+            "outcome IN ('not-recovered', 'verifier-unavailable', 'superseded')",
+            name="remediation_escalations_outcome_ck",
+        ),
+        CheckConstraint(
+            "undo_approval_id IS NULL OR action_id IS NOT NULL",
+            name="remediation_escalations_undo_ck",
+        ),
+        Index("ix_remediation_escalations_agent", "agent_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    nomination_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    action_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    outcome: Mapped[str] = mapped_column(Text, nullable=False)
+    undo_approval_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.approvals.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

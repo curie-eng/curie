@@ -57,7 +57,7 @@ from ..approvers import card_on_requesting_surface
 from ..auth import require_api_key, require_platform_key
 from ..authorizer import authorize_approval
 from ..config import get_settings
-from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep
+from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
 from ..models import Approval, ApprovalStatus
 from ..remediation_approvals import (
     REMEDIATION_PURPOSE,
@@ -65,12 +65,15 @@ from ..remediation_approvals import (
     resolution_refusal,
     settle_remediation_approval,
 )
+from ..remediation_escalation import is_undo_approval, undo_subject
 from ..resumequeue import (
     approval_trace_context,
     build_expiry_resume_turn,
     build_resume_turn,
 )
+from ..storage import ObjectStore
 from ..wirebody import ApprovalRequestBody
+from .actions import rule_undo
 
 logger = logging.getLogger(__name__)
 
@@ -464,6 +467,7 @@ async def resolve_approval(
     resume_queue: ResumeQueueDep,
     approver_sets: ApproverSetSelectorDep,
     principal: ApprovalPrincipalDep,
+    store: Annotated[ObjectStore | None, Depends(get_store)] = None,
 ) -> ApprovalOut:
     """Claim the resolution (resolve-once) and wake the suspended session.
 
@@ -637,7 +641,11 @@ async def resolve_approval(
                 f"approval expired at {expires_at} and can no longer be resolved",
             )
 
-    if approval.purpose == REMEDIATION_PURPOSE and data.decision == ApprovalStatus.approved:
+    if (
+        approval.purpose == REMEDIATION_PURPOSE
+        and not is_undo_approval(approval)
+        and data.decision == ApprovalStatus.approved
+    ):
         # AUTOMATED-REMEDIATION-16: judged before the claim, so a refused
         # approval executes nothing and stays undecided.
         refused = await resolution_refusal(session, approval)
@@ -689,6 +697,31 @@ async def resolve_approval(
         },
     )
     await _audit("resolved", authorized=True, reason=decision.reason or None)
+
+    if is_undo_approval(claimed):
+        # AUTOMATED-REMEDIATION-19: no model wake (purpose ``remediation``),
+        # and no forward execution or nomination to settle. Approval drives the undo
+        # ruling under the approving principal: exactly one restore, because
+        # only the winner of the claim above reaches here. Rejection creates
+        # nothing. A ruling refusal is returned as the ruling route returns it,
+        # with its audit row on the record; a ruling that never committed is
+        # rerun by the sweeper (``remediation_undo_recovery``).
+        out = ApprovalOut.model_validate(claimed)
+        if claimed.status == ApprovalStatus.approved:
+            subject = await undo_subject(session, claimed)
+            if subject is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "no undoable record is bound to this approval"
+                )
+            await rule_undo(
+                session,
+                subject,
+                principal=principal,
+                approver_sets=approver_sets,
+                store=store,
+                approval_id=claimed.id,
+            )
+        return out
 
     if claimed.purpose == REMEDIATION_PURPOSE:
         # AUTOMATED-REMEDIATION-16: no model wake (the claim marked it owed

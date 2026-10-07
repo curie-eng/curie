@@ -47,8 +47,10 @@ is written once, on the ledger record (``verification_outcome`` with
 the rest of the verification's reads are then ended ``refused``
 ``authority_unavailable`` (the authority that scheduled them is spent) and are
 never claimed. No outcome creates a restore execution or calls the undo
-ruling (AUTOMATED-REMEDIATION-19). Nothing here logs or returns a sampled
-value, a version or a target.
+ruling (AUTOMATED-REMEDIATION-19); an outcome other than ``verified`` is
+escalated in its transaction (``remediation_escalation.escalate``): one report
+row and, for an undoable ``reversible`` record, one undo approval. Nothing
+here logs or returns a sampled value, a version or a target.
 
 Independence (``independence_refusal``): the verifier's connector differs from
 the acting connector and, in the agent's in-force version, the secret names
@@ -87,6 +89,7 @@ from .models import (
     ExecutionState,
     RemediationNomination,
 )
+from .remediation_escalation import escalate
 from .remediation_forward import (
     IDEMPOTENCY_PREFIX,
     declared_action,
@@ -320,6 +323,7 @@ async def _write_outcome(
     now: datetime,
     connector: str | None,
     tool: str | None,
+    store: ObjectStore | None = None,
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-18: the one outcome, on the record and the nomination.
 
@@ -327,6 +331,8 @@ async def _write_outcome(
     changes nothing. No restore and no undo follow (AUTOMATED-REMEDIATION-19).
     @spec AUTOMATED-REMEDIATION-11: an outcome other than ``verified`` opens the
     breaker of the forward execution's connector, tool and target key.
+    @spec AUTOMATED-REMEDIATION-19: and is escalated in the same transaction:
+    the report row and, for an undoable ``reversible`` record, its undo approval.
     """
 
     written = await session.scalar(
@@ -349,6 +355,9 @@ async def _write_outcome(
     )
     await _end_the_rest(session, nomination_id, forward_id, now)
     await outcome_written(session, nomination_id, outcome, connector=connector, tool=tool)
+    await escalate(
+        session, nomination_id=nomination_id, outcome=outcome, action_id=action_id, store=store
+    )
     logger.info("remediation verification ended nomination=%s outcome=%s", nomination_id, outcome)
 
 
@@ -455,6 +464,14 @@ async def finish_unverified(
             connector=execution.connector,
             tool=execution.tool,
         )
+        # @spec AUTOMATED-REMEDIATION-19: reported; a record that did not
+        # succeed is not undoable, so no undo is offered.
+        await escalate(
+            session,
+            nomination_id=nomination.id,
+            outcome=NOT_RECOVERED,
+            action_id=execution.subject_action_id,
+        )
         logger.info(
             "remediation verification ended nomination=%s outcome=%s", nomination.id, NOT_RECOVERED
         )
@@ -500,6 +517,7 @@ async def schedule_verification(
             now=now,
             connector=execution.connector,
             tool=execution.tool,
+            store=store,
         )
 
     if execution.state != ExecutionState.confirmed:
