@@ -89,6 +89,7 @@
 {{- define "curie.testInstallation.check" -}}
 {{- $root := .root -}}
 {{- $_ := include "curie.testInstallation.drivers" $root -}}
+{{- $_ := include "curie.testInstallation.threadTurnLimit" $root -}}
 {{- if eq (include "curie.testInstallation.enabled" $root) "true" -}}
 {{- if eq (lower (trim (toString $root.Values.api.environment))) "prod" -}}
 {{- fail "testInstallation.enabled=true but api.environment is prod. A test installation admits a listed bot's actions and approval replies, so the chart refuses it on an installation that says it is production (ADR 0202). Turn testInstallation.enabled off, or deploy the test installation separately." -}}
@@ -105,4 +106,18 @@
 {{- fail (printf "testInstallation.enabled=true but these secrets are still the published default: %s. A test installation admits bot-driven actions, so it may not run on a secret anyone reading this repository holds (ADR 0202). Set real values, or leave them unset without security.allowDevDefaults so the chart generates them." (join ", " $offenders)) -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+
+{{/* The driver-turn budget. Missing old-release values use the default; types
+     and bounds are checked here too, when the JSON schema is unavailable. */}}
+{{- define "curie.testInstallation.threadTurnLimit" -}}
+{{- $block := .Values.testInstallation | default dict -}}
+{{- $limit := 10 -}}
+{{- if and (kindIs "map" $block) (hasKey $block "threadTurnLimit") -}}
+{{- $limit = index $block "threadTurnLimit" -}}
+{{- end -}}
+{{- if or (not (or (kindIs "int" $limit) (kindIs "int64" $limit) (kindIs "float64" $limit))) (not (regexMatch "^([1-9][0-9]?|100)$" (toString $limit))) -}}
+{{- fail "testInstallation.threadTurnLimit must be an integer from 1 to 100." -}}
+{{- end -}}
+{{- $limit -}}
 {{- end -}}
