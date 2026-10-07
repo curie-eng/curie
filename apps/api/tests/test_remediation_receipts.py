@@ -108,12 +108,14 @@ def _check_surface(posts: list[dict[str, Any]]) -> None:
         assert TARGET_KEY in text
 
 
-def _refused_row(agent_id: str, code: str = "unknown_action") -> uuid.UUID:
+def _refused_row(
+    agent_id: str, code: str = "unknown_action", action: str = ACTION_NAME, n: int = 1
+) -> uuid.UUID:
     sql_rows(
         "INSERT INTO curie.remediation_nomination_submissions "
         "(event_id, agent_id, hook, block_sha256) VALUES (:e, :agent_id, :hook, :sha) "
         "ON CONFLICT DO NOTHING",
-        {"e": EVENT_ID, "agent_id": uuid.UUID(agent_id), "hook": HOOK, "sha": "cd" * 32},
+        {"e": f"{EVENT_ID}-{n}", "agent_id": uuid.UUID(agent_id), "hook": HOOK, "sha": "cd" * 32},
     )
     nomination_id = uuid.uuid4()
     arguments = {"namespace": "example-ns", "deployment": "example-api", "replicas": 4}
@@ -127,8 +129,8 @@ def _refused_row(agent_id: str, code: str = "unknown_action") -> uuid.UUID:
             "id": nomination_id,
             "agent_id": uuid.UUID(agent_id),
             "hook": HOOK,
-            "e": EVENT_ID,
-            "action": ACTION_NAME,
+            "e": f"{EVENT_ID}-{n}",
+            "action": action,
             "arguments": json.dumps(arguments, sort_keys=True, separators=(",", ":")),
             "sha": "ab" * 32,
             "target": TARGET_KEY,
@@ -290,6 +292,38 @@ def test_a_refusal_posts_one_refused_message_and_never_a_change(
     assert "unknown_action" in text
     assert "changed" not in text.lower()
     assert deliver_receipts() == []
+
+
+def test_a_hostile_model_supplied_action_never_reaches_a_refusal_receipt(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-20: an ``unknown_action`` or ``nomination_duplicate``
+    refusal's ``action`` is model text the platform never matched to a declaration,
+    so its receipt renders ``-`` and carries none of it (no mention, link, newline
+    or 16 KB of text), through the worker's real sender.
+    """
+
+    hostile = "<!channel> <https://example.invalid/x|click>\nline two\n" + "A" * 16384
+    agent_id = _agent(client, auth_headers, tmp_path)
+    _bind_policy(agent_id, _document())
+    _refused_row(agent_id, "unknown_action", hostile, 1)
+    _refused_row(agent_id, "nomination_duplicate", hostile, 2)
+    set_threads()
+
+    posts = deliver_receipts()
+
+    assert _stages(posts) == ["refused", "refused"]
+    codes = sorted(
+        code for post in posts for code in ("unknown_action", "nomination_duplicate")
+        if code in whole(post)
+    )
+    assert codes == ["nomination_duplicate", "unknown_action"]
+    for post in posts:
+        text = whole(post)
+        for fragment in ("<!channel>", "example.invalid", "line two", "AAAA", "click"):
+            assert fragment not in text
+        assert len(text) < 2000
+        assert " - " in text or text.rstrip().endswith("-")
 
 
 def test_a_forward_that_failed_posts_not_recovered_and_the_report_but_no_executed(
