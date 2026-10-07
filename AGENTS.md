@@ -749,6 +749,17 @@ as a whole; remembered only):
   around those phases are frozen beside it.
   [vector: `tests/vectors/runner-execute.json`]
   [vector: `tests/vectors/executor-restore-calls.json`]
+- API vs CLI remediation policy validation, and API vs worker vs CLI
+  remediation codes (AUTOMATED-REMEDIATION-3, -20) -- the API validator
+  (`apps/api/src/curie_api/remediation_policy_document.py`) and the CLI's
+  mirrored validation (`cli/src/remediation_policy.rs`) cannot share code
+  across Python/Rust, and the closed nomination states, refusal codes,
+  approval reasons and verification outcomes the API stores
+  (`apps/api/src/curie_api/remediation_codes.py`) are rendered by the worker's
+  receipts (`apps/worker/src/curie_worker/remediation_receipts.py`) and the CLI
+  (`cli/src/remediation.rs`) in other images.
+  [vector: `tests/vectors/remediation-policy.json`]
+  [vector: `tests/vectors/remediation-codes.json`]
 - runner vs worker sealed envelope (ACTION-EXECUTOR-9, -10) -- the runner's
   redactor (`runner/src/curie_runner/redact.py::OutboundRedactor`) decides
   whether an envelope crosses unaltered and the worker's `_snapshot`

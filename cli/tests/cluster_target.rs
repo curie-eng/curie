@@ -190,6 +190,17 @@ fn cluster_cases() -> Vec<ClusterCase> {
             name: "actions",
             args: &["actions", "show", "11111111-1111-4111-8111-111111111111"],
         },
+        // @spec AUTOMATED-REMEDIATION-3: the policy read has no dry run; the
+        // target must still be refused before connection discovery.
+        ClusterCase {
+            name: "remediation-policy",
+            args: &["remediation-policy", "show", "acme-bot", "alerts"],
+        },
+        // @spec AUTOMATED-REMEDIATION-20: the operator receipt read.
+        ClusterCase {
+            name: "remediation",
+            args: &["remediation", "list"],
+        },
     ]
 }
 
@@ -293,7 +304,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 33);
+    assert_eq!(covered_names.len(), 35);
 }
 
 #[test]
