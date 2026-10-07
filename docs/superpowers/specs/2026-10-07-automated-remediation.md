@@ -31,8 +31,13 @@ on any outcome other than `verified`, whatever authorized the action
 (AUTOMATED-REMEDIATION-11); recurrence prevention and alert rule tuning are never
 automatic in the first release (AUTOMATED-REMEDIATION-24); and qualification
 evidence must be observed in the installation that binds the action
-(AUTOMATED-REMEDIATION-23). Each is a tightening the ADR permits ("a policy may
-tighten these, never loosen them").
+(AUTOMATED-REMEDIATION-23); and a nomination with no bounded action for a person
+to approve (malformed, an unknown action, a duplicate, or arguments outside the
+action's schema) or one from a stopped agent ends refused instead of becoming an
+approval request (AUTOMATED-REMEDIATION-7, -8), because ADR 0203 lets an injected
+alert reach no tool the policy omits and a stopped agent asks nobody. The ADR does
+not forbid any of these stricter readings; each narrows what runs without a
+person and none widens it.
 
 **Maintainer rulings, 2026-10-07.** The maintainer ruled on the four questions
 this specification raised as open, and the affected criteria carry the rulings
@@ -45,6 +50,8 @@ as decided text:
 * **Administrative principal.** Policy writes and breaker closes require an
   ADR 0106 operator principal in addition to the administrative credential, and
   that principal is recorded as the actor (AUTOMATED-REMEDIATION-3, -11, -14).
+  Qualification writes and verifier runs follow the same rule, because a
+  qualification record enables automatic execution (AUTOMATED-REMEDIATION-22).
 * **Alert rule tuning (#4144).** Tuning stops at the nomination and the approval
   card; an approved tuning request ends refused with no write. Automated
   rule-owner change requests need a separate Draft ADR later
@@ -52,8 +59,10 @@ as decided text:
 * **Predicate grammar.** One JSON pointer and a closed comparator set is not an
   expression language under ADR 0007 or ADR 0117 (AUTOMATED-REMEDIATION-17).
 
-Where realizing a decision meets an existing invariant,
-the conflict is stated, not designed around.
+This contract also amends the executor contract in seven places, listed under
+"Amendments to the executor contract", and records under "Needs an ADR" what it
+does not decide. Where realizing a decision meets an existing invariant, the
+conflict is stated, not designed around.
 
 ## Evidence labels
 
@@ -99,7 +108,8 @@ admits it to the protected broker. The source generation active at admission is
 recorded only in Valkey (the admission intent and receipt, and `source_revision`
 in the envelope built by `packages/protected-hooks/src/curie_protected_hooks/atomic_admission.py::AtomicAdmission._envelope`)
 and in the HTTP receipt `apps/api/src/curie_api/routers/hooks.py::HookAccepted`.
-No Postgres row records a webhook delivery, and `QueuedTurn` carries no
+No Postgres row records a `/hooks` delivery (other webhook receivers, such as
+the review webhook, keep their own rows), and `QueuedTurn` carries no
 generation. (Inspected.)
 
 **No incident identity.** No platform record ties a delivery to an incident, an
@@ -114,17 +124,22 @@ identity rule is bundle policy (`examples/sre-bot/docs/ALERT-IDENTITY.md`).
 **No protected worker yet.** The protected lane's worker modules (plan task 4 of
 the [protected hooks plan](../plans/2026-10-02-protected-hooks.md)) do not exist
 on `next`: nothing in the worker consumes `protected_envelope`. A protected turn
-is admitted but not yet executed. (Inspected; the planned runner client wrapper
-is Documented in PROTECTED-HOOK-LANE-7.)
+is admitted but not yet executed. PROTECTED-HOOK-LANE-7 plans a guarded kernel
+facade and protected binding and substrate wrappers around an unchanged kernel;
+it plans no runner client wrapper, which AUTOMATED-REMEDIATION-6 adds.
+(Inspected; the planned modules are Documented.)
 
 **Where a turn's final text is visible.** `packages/aci-protocol/src/aci_protocol/events.py::Final`
 carries `text` and `status`. The kernel stores and renders it
 (`apps/worker/src/curie_worker/kernel/attempt.py::_apply_frame`); the kernel is
-off-limits to this work. Outside the kernel, the raw `Final` is visible only in
+off-limits to this work. The same function streams each `TextDelta` to the reply
+before the `Final` arrives, and on a protected turn (no placeholder) the first
+stream emit posts a message. Outside the kernel, the raw frames are visible only in
 the frame stream returned by `apps/worker/src/curie_worker/runner_client.py::RunnerClient.start_turn`
 (a `TurnStream`); a `apps/worker/src/curie_worker/reply_sink.py::ReplySink`
 sees only rendered text with the receipt appended. No post-turn callback carries
-the final text. The one precedent for a structured block in model output is the
+the final text. The runner, not the worker, appends the conversation transcript
+(`runner/src/curie_runner/history.py`, addressed by `CURIE_HISTORY_REF`). The one precedent for a structured block in model output is the
 `curie-reply` fence parsed by `apps/worker/src/curie_worker/blocks.py::parse_reply`.
 (Inspected.)
 
@@ -135,10 +150,14 @@ refuses any tool outside the read-only set and any approval request on a
 
 **Approvals.** `apps/api/src/curie_api/models.py::Approval` has `granted_tool`
 and `granted_arguments` (canonical arguments of a permission-gated call), a
-`route`, `expires_at`, NOT NULL thread and reply handle columns and a `purpose`
+`route`, a nullable `expires_at`, NOT NULL `conversation_id`, `reply_kind` and
+`reply_channel` (the other reply columns are nullable), a `dedupe_key` unique
+across all statuses, and a `purpose`
 constrained by `approvals_purpose_ck` to `session` or `publication`.
 `apps/api/src/curie_api/routers/approvals.py::create_approval` creates `session`
-approvals under the platform key; `apps/api/src/curie_api/routers/approvals.py::resolve_approval`
+approvals under `require_api_key` (the platform key or a console session), and
+`apps/api/src/curie_api/crud/approvals.py::create_approval` sets `expires_at` only
+when an expiry is given, so there is no default expiry; `apps/api/src/curie_api/routers/approvals.py::resolve_approval`
 authenticates an ADR 0106 principal, selects the route's approver set
 (`apps/api/src/curie_api/slack_approvers.py::SlackApproverSetSelector`),
 authorizes (`apps/api/src/curie_api/authorizer.py::authorize_approval`), claims
@@ -147,8 +166,9 @@ the decision by compare and set, and then enqueues a model wake
 is `publication`. A publication approval wakes no model: the worker's
 `apps/worker/src/curie_worker/publication_loop.py::PublicationReconciler.deliver_pending_card`
 posts its card through an injected reply sink and records it in
-`apps/worker/src/curie_worker/approval_cards.py::ApprovalCardStore`. No approval
-kind exists that a model turn did not raise. (Inspected.)
+`apps/worker/src/curie_worker/approval_cards.py::ApprovalCardStore`. Every approval
+today follows a model turn: a session gate the model raised, or a publication the
+platform raised from a turn's request to publish. (Inspected.)
 
 **The ledger and executor on `next`.** `apps/api/src/curie_api/models.py::AgentAction`
 carries `authority_kind`, `authority_ref`, `connector`, `connector_digest` and
@@ -169,6 +189,16 @@ helpers only; the worker executor loop (AE task 11) does not exist and
 reads only `gate_approval_id`: none means ungated, otherwise the principal must
 belong to that approval route's approver set. It never reads `authority_kind`.
 (Inspected.)
+
+**Approver sets.** `apps/api/src/curie_api/approvers.py::ExplicitUsers` accepts
+operator, console and chat principals;
+`apps/api/src/curie_api/slack_approvers.py::SlackUserGroupMembers` accepts chat and
+console principals and not an operator principal. (Inspected.)
+
+**The executor's runner side.** The `/v1/execute` phases live in
+`runner/src/curie_runner/executor.py`; executor mode loads no harness, so the
+read-only tool set a turn builds is absent there and only a tool's
+`readOnlyHint` from `list` is available. (Inspected.)
 
 **Stops.** `apps/worker/src/curie_worker/killswitch.py::KillSwitch.is_killed`
 reads the per-agent kill key. (Inspected.)
@@ -232,47 +262,58 @@ time, checked against `main`) adds:
 
 * `remediation_policies`: primary key `(agent_id, hook)`, foreign key to the
   agent with cascade; `generation BIGINT > 0`; `operation_id UUID`; `armed
-  BOOLEAN`; `updated_at`. One row per bound hook; a removal leaves a tombstone row
-  with no active generation, as the source policy does.
+  BOOLEAN`; `active BOOLEAN`; `updated_at`. One row per bound hook. A removal
+  writes a new generation with `active` false, `armed` false and no actions; the
+  row keeps a positive generation, as the source policy's ordinary tombstone does.
 * `remediation_policy_generations`: primary key `(agent_id, hook, generation)`;
   `operation_id`, `intent_sha256`, `document JSONB` (the whole policy below),
-  `armed`, `bound_by` (the operator principal, AUTOMATED-REMEDIATION-3), `created_at`. Rows
-  are immutable and never deleted while the agent exists, enforced by a trigger
-  like the one on `hook_source_operations`, so an earlier generation can always
-  be read back.
+  `armed`, `active`, `bound_by` (the operator principal, AUTOMATED-REMEDIATION-3),
+  `created_at`. Rows are immutable and never deleted while the agent exists,
+  enforced by a trigger like the one on `hook_source_operations`, so an earlier
+  generation can always be read back.
 
 The policy document is closed (unknown keys refused) and holds:
 
 * `route`: the approval route name, which must exist in the agent's
-  `approval_routes` with an approver set an operator or console principal can
-  satisfy (`apps/api/src/curie_api/approvers.py::ExplicitUsers` or a user group);
+  `approval_routes` with an explicit approver set (`approvers.users`, an
+  `apps/api/src/curie_api/approvers.py::ExplicitUsers` set, or `approvers.group`,
+  an `apps/api/src/curie_api/slack_approvers.py::SlackUserGroupMembers` set). The
+  channel-members fallback is refused, because anyone in an alert channel would
+  approve. A user group set accepts chat and console principals but not an
+  operator principal, so a route driven from the CLI needs `approvers.users`;
 * `limits`: `per_policy_per_hour` (default and ceiling 3),
   `per_incident_per_target` (default and ceiling 1), optional
-  `per_action_per_hour` and `per_target_per_hour` (at most the policy ceiling),
-  and `incident_window_seconds` (AUTOMATED-REMEDIATION-10);
+  `per_action_per_hour` (at most the policy ceiling; the policy limit already
+  bounds every action), `incident_window_seconds` (AUTOMATED-REMEDIATION-10) and
+  `approval_ttl_seconds` (default 14400, at most 86400; AUTOMATED-REMEDIATION-15);
 * `actions`: a non-empty list, each with `name` (`[a-z0-9][a-z0-9_-]{0,62}`,
   unique), `kind` (`remediate`, `prevent` or `tune`, AUTOMATED-REMEDIATION-24),
   `connector` and `tool` (the forward verb), `arguments` (a closed argument
-  schema: each key with a type and an allowed set, range or maximum delta),
-  `target` (the argument that names the target and its allowed namespaces, label
-  selectors or resource list), `reversibility` (`reversible` or `idempotent`,
-  REMEDIATION-4 and REMEDIATION-11), `precondition` and `verifier` (each a
-  declared read, AUTOMATED-REMEDIATION-17), `automatic` (boolean), and
-  `qualification` (a reference, AUTOMATED-REMEDIATION-22).
+  schema: each key with a type and an allowed set or an absolute range),
+  `target` (AUTOMATED-REMEDIATION-7), `reversibility` (`reversible` or
+  `idempotent`, REMEDIATION-4 and REMEDIATION-11), `precondition` and `verifier`
+  (each a declared read, AUTOMATED-REMEDIATION-17), `automatic` (boolean), and
+  `qualification` (a reference, AUTOMATED-REMEDIATION-22). A `remediate` or
+  `prevent` action must declare both a precondition and a verifier whether or
+  not it is automatic, so every executed action has a verdict (REMEDIATION-8).
+  A `tune` action declares evidence reads instead (AUTOMATED-REMEDIATION-25).
+  Magnitude is bounded by absolute ranges only: a delta bound would need a
+  trusted baseline, and the first release offers none (see "Out of scope").
 
 Generations follow the source policy rule: a write advances the generation
 above every recorded attempt, compares and swaps on `expected_generation`, is
 idempotent on `operation_id` (a different intent under the same id is
 `policy_operation_conflict`), and never reuses a number. Arming, disarming,
-binding, tightening and widening each create a generation.
+binding, tightening, widening and removal each create a generation.
 
 Acceptance: real Postgres upgrade, downgrade and upgrade round trip; a write
 with a stale `expected_generation` is refused `stale_policy_generation` and
 changes nothing; a replayed operation returns the committed generation; deleting
 a generation row while the agent exists fails; a limit above its ceiling, an
-unknown key, an action without a precondition or verifier when `automatic` is
-true, and a route without an operator-eligible approver set are each refused
-with a named code and create no generation.
+unknown key, a `remediate` or `prevent` action without a precondition or
+verifier, a delta bound, and a route bound to the channel-members fallback are
+each refused with a named code and create no generation; a removal leaves a
+positive generation with `active` false.
 
 <!-- @spec AUTOMATED-REMEDIATION-3 -->
 **AUTOMATED-REMEDIATION-3. Administration, and the source cannot write it.**
@@ -355,34 +396,63 @@ API's production parser and the worker's extractor.
 
 <!-- @spec AUTOMATED-REMEDIATION-6 -->
 **AUTOMATED-REMEDIATION-6. Capture after the turn, outside the kernel.** The
-protected worker's runner client wrapper (planned by PROTECTED-HOOK-LANE-7)
-observes the stream from `RunnerClient.start_turn`. When the stream ends with a
-`Final` whose `status` is `done`, it extracts the block and submits it, with the
-turn's `event_id`, to `POST /v1/internal/remediation/nominations`; it then yields
-a `Final` whose `text` has the block removed, so the reply posted to the channel
-and the stored transcript never show it. A turn ending in any other status, or
-with no block, submits nothing. A turn whose output contains a block that cannot
-be extracted submits the raw block text so the API records it as malformed. No
-kernel, consumer, thread lock or markers file changes, and no ACI frame or field
-is added.
+kernel streams each `TextDelta` to the reply before the `Final` arrives
+(`apps/worker/src/curie_worker/kernel/attempt.py::_apply_frame`), so removing
+the block from `Final` alone would still post it. The capture seam is therefore
+the frame stream itself: a runner client wrapper (a subclass of
+`apps/worker/src/curie_worker/runner_client.py::RunnerClient`, whose
+`start_turn` returns the `TurnStream` the kernel iterates) that the protected
+lane's composition passes to `apps/worker/src/curie_worker/kernel/core.py::Kernel`
+as its `runner`, exactly as `apps/worker/src/curie_worker/run.py::build` passes
+`RunnerClient` today. PROTECTED-HOOK-LANE-7 plans a kernel facade and binding and
+substrate wrappers, not this wrapper; this work adds it to the protected lane's
+composition, reviewed by the #3603 owner. The wrapper:
 
-The route requires the internal worker token, accepts only an `event_id` that has
-a protected envelope binding, and is idempotent per `event_id`: the first
-accepted submission wins, a byte-identical replay returns it, and a different one
-is refused `nomination_conflict`. A retried turn that produces a different block
-therefore cannot add nominations. The worker never reads the policy and never
-decides admission.
+* passes `TextDelta` text through a line filter that withholds everything from a
+  line that is exactly the opening fence to the closing fence line, holding back
+  a trailing partial line until it is complete so a fence split across deltas is
+  still caught; a block that never closes is withheld to the end of the stream;
+* when the stream ends with a `Final` whose `status` is `done`, extracts the block
+  from `Final.text`, submits it with the turn's `event_id` to
+  `POST /v1/internal/remediation/nominations`, and yields a `Final` whose `text`
+  has the block removed;
+* submits nothing for any other status or when no block is present, and submits
+  the raw text of a block it cannot extract so the API records it as malformed.
+
+The stored transcript is written by the runner, not the worker
+(`runner/src/curie_runner/history.py`, addressed by `CURIE_HISTORY_REF`), so the
+wrapper cannot keep the block out of it. The first release does not try: the
+block stays in the protected conversation's own history segment, which
+PROTECTED-HOOK-LANE-7 keeps separate from any human session and which is
+rehydrated only into later protected turns. A later turn that repeats an old
+block produces a new submission under its own `event_id`, evaluated afresh
+(duplicates dedupe as in AUTOMATED-REMEDIATION-15). Keeping it out would need a
+runner change in a qualified protected artifact, which is out of scope.
+
+The route requires the internal worker token and accepts only `event_id` and the
+block. The API resolves `agent_id`, `hook`, the admitted generation, the thread
+and the reply handle from the protected binding keyed by that `event_id`, never
+from the request, and refuses an event with no binding `not_protected_event`.
+The binding must therefore be retained until the turn's submission window closes
+(the protected lane's binding retention, reviewed with task 5 of the plan). The
+route is idempotent per `event_id`: the first accepted submission wins, a
+byte-identical replay returns it, and a different one is refused
+`nomination_conflict`, so a retried turn cannot add nominations. The worker never
+reads the policy and never decides admission. No kernel, consumer, thread lock
+or markers file changes, and no ACI frame or field is added.
 
 Residual trust, named: any holder of the internal worker token can submit
 nominations for a protected event. A nomination carries no authority beyond what
 an injected alert already has (REMEDIATION-3), and admission is unchanged.
 
 Acceptance (protected worker, real runner): a `done` turn with a block submits
-it once and the posted reply has no block; an `awaiting` or failed turn submits
-nothing; a second submission with different bytes for the same event is refused;
-a submission for an ordinary event id is refused `not_protected_event`; the
-kernel package, `consumer.py`, `threadlock.py` and `markers.py` are unchanged in
-the diff.
+it once; no streamed reply edit and not the final reply contains the fence,
+including when the fence line is split across two deltas; an awaiting or failed
+turn submits nothing; a second submission with different bytes for the same
+event is refused; a submission for an ordinary event id is refused
+`not_protected_event`; a request carrying an `agent_id` or `hook` field is
+refused as malformed; the kernel package, `consumer.py`, `threadlock.py` and
+`markers.py` are unchanged in the diff.
 
 <!-- @spec AUTOMATED-REMEDIATION-7 -->
 **AUTOMATED-REMEDIATION-7. Parsing and validation.** The API parses the
@@ -396,8 +466,10 @@ used as evidence), `state` (AUTOMATED-REMEDIATION-8), `refusal_code`,
 there is no bounded action for a person to approve: `nomination_malformed`,
 `unknown_action`, `nomination_duplicate`, `arguments_schema_mismatch` (a key
 outside the action's schema or a wrong type). An entry whose values are of the
-right type but outside the policy's allowed values, ranges, deltas or target
-selectors is not refused: it becomes an approval request (REMEDIATION-7).
+right type but outside the policy's allowed values, ranges or target list is not
+refused: it becomes an approval request (REMEDIATION-7). The action's `target`
+names the argument that identifies the target and lists its allowed values
+literally; the row's `target` is the target key of AUTOMATED-REMEDIATION-10.
 
 Acceptance: each refusal code is produced through the real route and writes a
 row with that code and no approval or execution; an out-of-bounds value of the
@@ -418,26 +490,35 @@ evaluated in this order; the first failing check decides:
 5. the action's `kind` is `remediate` and `automatic` is true;
 6. the action's qualification record is present and valid for the connector
    digest now in force (AUTOMATED-REMEDIATION-22);
-7. the arguments and target are within bounds;
-8. reversibility: `reversible` requires the connector's capability row to record
+7. verifier independence against the in-force version (AUTOMATED-REMEDIATION-17),
+   otherwise `verifier_not_independent`;
+8. the arguments and target are within bounds;
+9. reversibility: `reversible` requires the connector's capability row to record
    the `restore` and `observe_version` pair at that digest (AE-13) and key custody
    (AE-16); `idempotent` is admitted under REMEDIATION-11 only;
-9. no open breaker for the action and target (AUTOMATED-REMEDIATION-11);
-10. the limits and the one-automatic-action-per-turn rule
+10. no open breaker for the action's connector, tool and target
+    (AUTOMATED-REMEDIATION-11);
+11. the limits and the one-automatic-action-per-turn rule
     (AUTOMATED-REMEDIATION-10), reserved transactionally;
-11. the precondition read holds (AUTOMATED-REMEDIATION-9).
+12. the precondition read holds (AUTOMATED-REMEDIATION-9).
 
-A nomination failing any of checks 3 to 11 becomes an approval request
-(AUTOMATED-REMEDIATION-15) whose card names the failed check. States:
-`received`, `refused`, `precondition_pending`, `admitted`, `approval_requested`,
-`approved`, `rejected`, `expired`, `executing`, `verifying`, `finished`. An
-unreadable policy, breaker, limit or capability row fails closed to the approval
-path, never to execution.
+A nomination failing any of checks 3 to 12 becomes an approval request
+(AUTOMATED-REMEDIATION-15) whose card names the failed check. Because check 12
+is asynchronous, the transition from `precondition_pending` to `admitted`
+re-runs checks 2 to 11 under the AUTOMATED-REMEDIATION-10 lock, in the same
+transaction that creates the execution; any check failing then sends the
+nomination to approval (or ends it `agent_stopped`) and releases the
+reservation. States: `received`, `refused`, `precondition_pending`, `admitted`,
+`approval_requested`, `approved`, `rejected`, `expired`, `executing`,
+`verifying`, `finished`. An unreadable policy, breaker, limit or capability row
+fails closed to the approval path, never to execution.
 
 Acceptance: a table-driven test drives each check through its real producer and
 asserts the resulting state and code; with every check passing, one execution is
 created; injecting a database error at each read yields an approval request or
-`agent_stopped`, never an execution.
+`agent_stopped`, never an execution; disarming, opening a breaker or killing the
+agent while a nomination is `precondition_pending` makes the transition create
+no execution.
 
 <!-- @spec AUTOMATED-REMEDIATION-9 -->
 **AUTOMATED-REMEDIATION-9. The precondition read.** The condition an action
@@ -446,10 +527,11 @@ the alert body or the nomination's `reason`. The read is a `read` execution
 (AUTOMATED-REMEDIATION-12) of the declared connector, read tool and arguments,
 whose arguments may reference the nomination's target and nothing else of it,
 evaluated by the declared predicate (AUTOMATED-REMEDIATION-17) with one sample.
-The predicate holding admits the nomination; not holding sends it to approval
-with `precondition_not_met`; a read that fails or times out sends it to approval
-with `precondition_unavailable`. The limit reservation of check 10 is released
-when the nomination does not execute.
+The predicate holding moves the nomination to the re-check of
+AUTOMATED-REMEDIATION-8; not holding sends it to approval with
+`precondition_not_met`; a read that fails or times out sends it to approval with
+`precondition_unavailable`. The limit reservation of check 11 is released when
+the nomination does not execute.
 
 Acceptance: with the reference fixtures, a precondition read that observes the
 condition admits; one that observes it absent produces an approval request and
@@ -465,88 +547,119 @@ policy per rolling hour; a policy may only tighten them. Further:
   of the same turn becomes an approval request (ADR 0203 option D: "once per
   turn");
 * at most one automatic action per target is live (not finished verifying) at a
-  time, across policies of the same agent;
-* per-action and per-target hourly limits apply when declared.
+  time, across every hook and policy of the agent;
+* per-action hourly limits apply when declared; the policy limit bounds every
+  action otherwise, and the incident window bounds every target.
 
-Counts are taken over `remediation_nominations` rows whose execution was
-authorized by the policy, under a transaction-scoped advisory lock keyed by the
-agent and hook, and the reservation is written in the same transaction, so two
-concurrent admissions cannot both take the last slot.
+The target key is the action's connector plus the canonical JSON of the target
+argument's value, which must be a literal member of the action's allowed target
+list (a namespace, a label selector string or a resource name exactly as the
+policy lists it); a value that is not a literal member is out of bounds and goes
+to approval. The incident window, the one-live rule and the breaker are looked up
+per agent and target key, never per policy or hook, so a second hook cannot act
+on a target inside another hook's incident window. Counts and reservations are
+taken under one transaction-scoped advisory lock keyed by the agent, and the
+reservation is written in the same transaction, so two concurrent admissions
+cannot both take the last slot, whichever hook they came from.
 
 Incident (maintainer ruling, 2026-10-07): an incident on a target opens with the
-first automatic action on it and stays open for `incident_window_seconds`
-(default 3600; a policy may only lengthen it) after that action's verification
-finished. While it is open, a further automatic action on the target goes to the
-approval path with `incident_limit`. The incident is never derived from the alert
-body, a source fingerprint or the nomination; a policy declaring a window below
-the default is refused at write.
+first action executed on it under this contract, automatic or approved, and stays
+open for `incident_window_seconds` (default 3600; a policy may only lengthen it)
+after that action's verification finished; a later executed action on the target
+extends it. While it is open, a further automatic action on the target goes to
+the approval path with `incident_limit`. The incident is never derived from the
+alert body, a source fingerprint or the nomination; a policy declaring a window
+below the default is refused at write.
 
 Acceptance: a fourth admissible nomination within an hour becomes an approval
 request with `policy_rate_limit`; a second automatic action on one target within
-the incident window becomes an approval request with `incident_limit`; two
-nominations in one turn yield one execution and one approval request; two
-concurrent admissions racing for the last slot yield exactly one execution
-(real Postgres); a policy that declares a looser limit is refused at write.
+the incident window becomes an approval request with `incident_limit`, also when
+the second nomination comes from another hook of the same agent; two nominations
+in one turn yield one execution and one approval request; two concurrent
+admissions from two hooks racing for one target yield exactly one execution (real
+Postgres); a target value equivalent to but not literally in the allowed list
+goes to approval; a policy that declares a looser limit is refused at write.
 
 <!-- @spec AUTOMATED-REMEDIATION-11 -->
 **AUTOMATED-REMEDIATION-11. Breaker, disarm and kill switch fail closed.** A
-`remediation_breakers` row keyed by `(agent_id, hook, action, target)` opens on
-any verification outcome other than `verified` (AUTOMATED-REMEDIATION-18),
-whether the action ran under the policy or under an approval, and on an
-execution that ended `failed` or `indeterminate`. An open breaker sends every
-later nomination for that action and target to approval. Only the policy's
-administrative routes close it (`POST .../breakers/{breaker_id}/close`), which
-requires an operator principal and records it as the closing actor with a reason; no nomination, delivery,
+`remediation_breakers` row keyed by `(agent_id, connector, tool, target key)`
+opens on any verification outcome other than `verified`
+(AUTOMATED-REMEDIATION-18), whether the action ran under the policy or under an
+approval, and on an execution that ended `failed` or `indeterminate`. An open
+breaker sends every later nomination for that action and target, from any hook
+of the agent, to approval. Only the policy's administrative route closes it
+(`POST .../breakers/{breaker_id}/close`), which requires an operator principal
+and records it as the closing actor with a reason; no nomination, delivery,
 verifier or approval closes it. Disarm writes a new generation with `armed`
 false and takes effect for every nomination evaluated after it, including those
-from deliveries admitted earlier (AUTOMATED-REMEDIATION-4). The kill switch is
-read at admission (check 2) and again by the executor at claim and before
-dispatch (AE-21), so a kill between admission and dispatch refuses
-`agent_stopped` with no write call.
+from deliveries admitted earlier (AUTOMATED-REMEDIATION-4).
+
+Between admission and dispatch, the API's executor claim route re-validates a
+policy-authorized forward execution: the nomination's generation is still current
+and armed and no breaker is open for its target key; otherwise it refuses the
+execution `policy_changed` before any sandbox claim and sends the nomination to
+approval. The kill switch is read at admission (check 2) and again by the
+executor at claim and before dispatch (AE-21), so a kill between admission and
+dispatch refuses `agent_stopped` with no write call.
 
 Acceptance: a `not-recovered` outcome opens a breaker and the next nomination for
 that action and target becomes an approval request; closing the breaker through
 the hook source key, the worker token or an approval is refused; closing it with
 the platform key and an operator principal re-allows automatic admission, while
-the platform key alone is refused `operator_principal_required`; disarming while a nomination is
-`precondition_pending` sends it to approval; killing the agent after admission
-yields `agent_stopped` with no write observed at the connector.
+the platform key alone is refused `operator_principal_required`; disarming after
+an execution is created and before it is claimed yields `policy_changed` and no
+write; killing the agent after admission yields `agent_stopped` with no write
+observed at the connector.
 
 ## Execution and the ledger (#4067 task 12, #4068, #4073)
 
 <!-- @spec AUTOMATED-REMEDIATION-12 -->
 **AUTOMATED-REMEDIATION-12. Read executions.** Precondition and verifier reads
 run through the executor, in a sandbox under the read connector's own binding,
-never as a direct client in the worker or the API (ADR 0121 decision 2). This
-extends the executor contract additively:
+never as a direct client in the worker or the API (ADR 0121 decision 2's
+reachability argument applied to reads; see "Amendments to the executor
+contract"). Concretely:
 
 * `action_executions.kind` gains `read` (the check constraint is replaced in the
   same migration), with `authority_kind` `policy`, `approval` or
-  `qualification` and `authority_ref` naming the nomination or qualification run;
-* the runner's `/v1/execute` gains a `read` phase: after `list`, one or more
-  `read` requests of the same tool with the same canonical arguments, each
-  calling `tools/call` once; the tool must be advertised with
-  `readOnlyHint: true` at that digest and be in the runner's read-only set, or
-  the phase refuses `tool_not_read_only` without dialing; no grant is sent;
+  `qualification` and `authority_ref` naming the nomination or qualification
+  verifier run;
+* the runner's `/v1/execute` (phases in `runner/src/curie_runner/executor.py`)
+  gains a `read` phase: after `list`, one or more `read` requests of the same tool
+  with the same canonical arguments, each calling `tools/call` once. Executor mode
+  loads no harness, so the runner's read-only set does not exist there; the tool
+  must instead be advertised with `readOnlyHint: true` in that sandbox's own
+  `list`, and be the read the policy declares, or the phase refuses
+  `tool_not_read_only` without dialing. No grant is sent. Residual trust, named
+  as ADR 0191 names it: `readOnlyHint` is not proof of no effects, so the
+  qualification's worst case statement covers the read tools
+  (AUTOMATED-REMEDIATION-22);
 * the request carries the predicate's JSON pointer; the runner returns only the
   value at that pointer in the result's structured content (a JSON scalar of at
   most 256 characters) or `pointer_absent`, never the whole result;
 * the worker reports each sample's scalar to
   `POST /action-executions/{id}/samples` (worker token, fenced like the other
   transitions); the API evaluates the predicate;
+* lifecycle: a read execution never enters `dispatched`, because no sample can
+  write. It runs in `claimed`, renewing its lease at each sample; it ends
+  `confirmed` when sampling ends, or `refused` with `runner_unavailable` on lease
+  expiry or any refusal, which the verifier treats as unsuccessful samples. It is
+  never re-queued;
 * a read execution holds its sandbox for at most its deadline and at most 60
-  samples, then releases it on every path.
-
-These change the `runner-execute` vector, the worker client, the runner route and
-the executor codes together (AE-24's seam); no ACI frame, `BootEnv` field or
-plugin-format member changes.
+  samples (AUTOMATED-REMEDIATION-17 refuses a declaration whose deadline divided
+  by its interval exceeds 60), then releases it on every path;
+* the sandbox carries only the read connector's credentials, which requires the
+  executor's per-claim stripped template ([#4204](https://github.com/curie-eng/curie/issues/4204),
+  unmerged); without it the pool template would put the acting connector's
+  credential in the verifier's sandbox and defeat REMEDIATION-15.
 
 Acceptance: against a read fixture, one `read` returns the pointed scalar and the
 API records it; a tool without `readOnlyHint`, an unadvertised tool and a write
 tool are refused `tool_not_read_only` with no call observed; the API never
 receives more than the scalar (log and payload capture); the sandbox is released
-after the last sample and after a worker crash (sweeper); the vector fails on a
-one-sided field change.
+after the last sample and after a worker crash (sweeper); a cluster exec check
+finds no acting connector credential in a verifier read sandbox; the vector fails
+on a one-sided field change.
 
 <!-- @spec AUTOMATED-REMEDIATION-13 -->
 **AUTOMATED-REMEDIATION-13. Forward execution with an authority.** An admitted
@@ -598,44 +711,64 @@ check; a policy-executed record exposes every field above through
 is well formed but not admitted creates one `Approval` with `purpose`
 `remediation` (the `approvals_purpose_ck` constraint gains the value), `route`
 the policy's route, `granted_tool` `mcp__<connector>__<tool>`,
-`granted_arguments` the canonical arguments, `dedupe_key`
-`remediation:<agent_id>:<hook>:<action>:<arguments_sha256>`, thread and reply
-handle copied from the protected delivery's `QueuedTurn`, `author` the policy
-reference, and `expires_at` from the existing approval default. While a pending
-remediation approval exists for that dedupe key, a further identical nomination
-attaches to it (a count and the newest `event_id`) and raises no new card, so a
-recurring alert produces one decision, not one per fire. The card is posted by a
-worker remediation loop through an injected reply sink and recorded in
-`ApprovalCardStore`, as `PublicationReconciler.deliver_pending_card` does; it
-uses the existing approval action ids, so the dispatcher is unchanged. The card
-shows the platform-rendered call (action, target and arguments), the admission
-check that failed, the precondition read's observed value when one was taken,
-and the model's `reason` labeled as unverified model text. It never shows the
-alert body.
+`granted_arguments` the nomination's canonical arguments, `dedupe_key`
+`remediation:<nomination id>`, `conversation_id`, `reply_kind` and
+`reply_channel` (and the nullable reply columns, null for a protected turn)
+copied from the protected delivery's `QueuedTurn`, `author` the policy reference,
+and an explicit expiry of the policy's `approval_ttl_seconds` (default 14400).
+The create path sets no expiry by itself (it is null unless given), so the
+expiry is always passed. Deduplication is done on the nomination rows, not on
+`Approval.dedupe_key`, which is unique across all statuses: while an approval
+raised for the same agent, hook, action and `arguments_sha256` is pending, a
+further identical nomination attaches to it (a count and the newest `event_id`),
+raises no new card, and finishes with that approval's outcome without ever
+executing separately; once that approval is resolved or expired, the next
+identical nomination raises a new one. A recurring alert therefore produces one
+open decision at a time.
+
+The card is posted by a worker remediation loop through an injected reply sink
+and recorded in `ApprovalCardStore`, as `PublicationReconciler.deliver_pending_card`
+does; it uses the existing approval action ids, so the dispatcher is unchanged.
+It is rendered from the nomination row and the policy generation, never from the
+approval row: the platform-rendered call (action, target and arguments), the
+admission check that failed, the precondition read's observed value when one was
+taken, and the model's `reason` as escaped plain text (no mentions, links or
+markup) labeled as unverified model text. It never shows the alert body.
 
 Acceptance: an out-of-bounds nomination produces one pending approval whose
-`granted_arguments` equal the canonical arguments; a second identical nomination
-from a later delivery produces no second approval and increments the count; the
-card renders on the route with the bound arguments; a `session` approval keeps
-today's behavior.
+`granted_arguments` equal the canonical arguments and whose `expires_at` is set;
+a second identical nomination from a later delivery produces no second approval
+and increments the count, and finishes with the first approval's outcome; after
+that approval is rejected, a third identical nomination raises a new approval; a
+`reason` containing a mention, a link and markup renders inert; a card built from
+a delivery whose body contains a marker string never contains that string; a
+`session` approval keeps today's behavior.
 
 <!-- @spec AUTOMATED-REMEDIATION-16 -->
 **AUTOMATED-REMEDIATION-16. Approval executes exactly the bound call, without a
 model.** Resolution keeps `resolve_approval`'s authentication, approver set
 selection and compare and set. For `purpose` `remediation` it enqueues no model
-wake; on `approved` it creates the forward execution of
-AUTOMATED-REMEDIATION-13 from the approval's `granted_tool` and
-`granted_arguments`, and nothing else; on `rejected` or `expired` it creates
-nothing and finishes the nomination. Resume reconciliation excludes this purpose
-as it excludes `publication`. The approved call is verified like an automatic
-one (AUTOMATED-REMEDIATION-18). ADR 0035's tool-name grant is not used.
+wake. On `approved` it builds the forward execution of AUTOMATED-REMEDIATION-13
+from the nomination row (connector, tool and canonical arguments), and first
+requires that the approval's `granted_tool` equals `mcp__<connector>__<tool>` of
+that action and that the SHA-256 of the approval's canonical `granted_arguments`
+equals the nomination's `arguments_sha256`; any difference refuses
+`arguments_mismatch` and creates nothing. It also refuses `policy_changed` when
+the current policy generation no longer has the action with the same connector
+and tool, so a withdrawn action is not executed on an old card. On `rejected` or
+`expired` it creates nothing and finishes the nomination and any nominations
+attached to it. Resume reconciliation excludes this purpose as it excludes
+`publication`. The approved call is verified like an automatic one
+(AUTOMATED-REMEDIATION-18), and every such action has a verifier
+(AUTOMATED-REMEDIATION-2). ADR 0035's tool-name grant is not used.
 
 Acceptance: approving yields one execution whose arguments hash equals the
-approval's; no resume turn is enqueued (queue observed); rejecting or letting
+nomination's; no resume turn is enqueued (queue observed); rejecting or letting
 the approval expire yields no execution and no write call; a principal outside
-the route's approver set is refused `403` and nothing executes; a tampered
-`granted_arguments` (direct database edit after creation) is refused
-`arguments_mismatch` because the execution hash is bound at creation.
+the route's approver set is refused `403` and nothing executes; editing the
+approval row's `granted_arguments` in the database after the card is posted and
+then approving is refused `arguments_mismatch` with no execution; approving after
+a generation that removed the action is refused `policy_changed`.
 
 ## Verification (#4070)
 
@@ -645,8 +778,10 @@ precondition) declares: `connector`, `tool`, `arguments` (canonical, may
 reference the target), `pointer` (an RFC 6901 JSON pointer), `comparator` (one
 of `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `in`, `absent`), `value` (a JSON scalar or,
 for `in`, a list of at most 16 scalars), and for a verifier `settle_seconds`,
-`deadline_seconds` (greater than settle, at most 3600), `interval_seconds` (at
-least 10) and `consecutive` (at least 1, default 1). Numeric comparison applies
+`settle_seconds` (at least `interval_seconds`, ADR 0203's minimum settle
+interval), `deadline_seconds` (greater than settle, at most 3600, and at most 60
+times the interval, matching the sample cap of AUTOMATED-REMEDIATION-12),
+`interval_seconds` (at least 10) and `consecutive` (at least 1, default 1). Numeric comparison applies
 only when both sides are JSON numbers; otherwise only `eq`, `ne` and `in` apply,
 by exact string comparison. There are no functions, arithmetic, variables or
 nesting; the maintainer ruled on 2026-10-07 that this closed form is not an
@@ -655,14 +790,19 @@ decision. Independence
 (REMEDIATION-15) is checked at policy write and again at admission against the
 in-force version: the verifier's connector differs from the acting connector,
 and the set of secret names the verifier connector's MCP headers expand is
-disjoint from the acting connector's. No model output, alert body or connector
+disjoint from the acting connector's. Residual trust, named: disjoint names do not
+prove distinct credentials (two names can hold one token, and a connector with no
+credential is trivially disjoint), so the qualification's worst case statement
+covers it (AUTOMATED-REMEDIATION-22). No model output, alert body or connector
 write reply is an input.
 
 Acceptance: a shared predicate vector of pointer, comparator and value cases is
 evaluated identically by the API evaluator and the runner's pointer extraction;
 a verifier naming the acting connector, or a connector sharing a credential name
 with it, is refused `verifier_not_independent` at write and, after a bundle
-version introduces the overlap, at admission.
+version introduces the overlap, at admission; an unknown comparator, a nested
+value, an `in` list of 17 entries, a settle below the interval and a deadline over
+60 intervals are each refused at write.
 
 <!-- @spec AUTOMATED-REMEDIATION-18 -->
 **AUTOMATED-REMEDIATION-18. Running the verifier.** When a forward execution of a
@@ -673,19 +813,21 @@ outcome is:
 
 * `verified`: `consecutive` samples at or after settle satisfy the predicate
   before the deadline;
-* `superseded`: before `verified`, the acting connector's `observe_version` on
-  the target differs from the action's recorded `post_version`, or another
-  ledger record on the same target is created; checked at each sample (a
-  `superseded` outcome is attribution, not a recovery verdict, so the acting
-  connector may report it);
+* `superseded`: before `verified`, another ledger record on the same target key
+  is created, or, for an action whose connector advertises `observe_version`, a
+  separate `observe` execution against the acting connector at each sample
+  reports a version different from the action's recorded `post_version`. This is
+  attribution, not a recovery verdict, so the acting connector may report it; it
+  is never read as success;
 * `not-recovered`: the deadline passes with at least one successful sample after
   settle and no `verified`;
 * `verifier-unavailable`: the deadline passes with no successful sample after
   settle, or the read execution is refused.
 
-An execution that ends `failed` or `indeterminate` gets no verifier and finishes
-`not-recovered` for reporting, with the execution code. The outcome is written on
-the nomination and the ledger record once; a second outcome is refused.
+An execution that ends `failed`, `indeterminate` or `refused` after admission
+gets no verifier and finishes `not-recovered` for reporting, with the execution
+code. The outcome is written on the nomination and the ledger record once; a
+second outcome is refused.
 
 Acceptance (cluster, reference connector and read fixture): a recovered target
 is `verified` only after settle; a target healthy before settle and unhealthy
@@ -707,7 +849,9 @@ without an approving principal (REMEDIATION-14). `_authorize_undo` gains
 authority awareness: a record with `authority_kind` `policy` requires a principal
 in the policy route's approver set, and a record with `authority_kind` `approval`
 requires one in the approval route's set (through `gate_approval_id`), replacing
-AE-19's interim `refused_authority_unresolved`. A REMEDIATION-11 action escalates
+AE-19's interim `refused_authority_unresolved`. This authority-aware undo
+authorization is the part AE-19 assigns to
+[#4068](https://github.com/curie-eng/curie/issues/4068). A REMEDIATION-11 action escalates
 immediately on any outcome other than `verified` and offers no undo.
 
 Acceptance: a `not-recovered` outcome produces a report and an undo approval and
@@ -725,13 +869,15 @@ outcome, as separate messages after the investigation's reply (ADR 0203 option
 D's stated cost). Each names the stage (`nominated`, `refused`,
 `approval_requested`, `executed`, `verified`, `not-recovered`,
 `verifier-unavailable`, `superseded`, `undo_requested`, `undone`, `escalated`),
-the action, target, authority and code, never arguments the policy marks
-sensitive, an envelope, a result or the alert body. The CLI (`curie local|cluster
+the action, target key, authority and code, and never any other argument value,
+an envelope, a read result, the model's `reason` or the alert body. The CLI (`curie local|cluster
 remediation list` and `show <nomination id>`) is the operator receipt with the
 same fields under `--json`. The turn receipt of ADR 0117 is unchanged.
 
 Acceptance: each stage, driven through its real producer, produces exactly one
-thread message naming it; a refusal never produces a "changed" line; the CLI
+thread message naming it; a refusal never produces a "changed" line; a capture of
+every thread message over the campaign contains none of the fixture's non-target
+argument values, sampled values or alert body marker; the CLI
 `show` output matches the API row for every terminal state.
 
 <!-- @spec AUTOMATED-REMEDIATION-21 -->
@@ -767,22 +913,32 @@ is written:
 * every action: one verifier evaluation ending `verified` and one ending
   `not-recovered` under the same verifier declaration;
 * every action: a worst case statement (text, at most 2000 characters) and the
-  policy bounds it was evaluated against.
+  policy bounds it was evaluated against, covering the read tools' residual trust
+  (AUTOMATED-REMEDIATION-12) and the credential distinctness that secret names
+  cannot prove (AUTOMATED-REMEDIATION-17).
 
-Evidence writes are produced only through existing authorities: forward runs are
-approval-authorized (a qualification run raises an ordinary remediation approval
-on the policy route), and verifier evaluations are `read` executions with
-`authority_kind` `qualification` started by `POST
-/agents/{agent_id}/remediation-qualifications/{id}/verifier-runs` under the
-administrative dependency, which can only run the declared reads. A record is
-valid only for its digest: a connector upgrade invalidates it and admission
-check 6 sends the action to approval until it is requalified.
+The record is written by `PUT /agents/{agent_id}/remediation-qualifications/{id}`
+and verifier evaluations are started by
+`POST /agents/{agent_id}/remediation-qualifications/{id}/verifier-runs`; both use
+the administrative dependency and require an operator principal recorded as the
+actor (the 2026-10-07 principal ruling applies, because a record enables
+automatic execution). The verifier-run route accepts no tool or argument fields
+and can only start `read` executions of the declared verifier with
+`authority_kind` `qualification`, against a target that is a literal member of
+the action's allowed list. Forward evidence is produced only through ordinary
+remediation approvals: a drill is a protected delivery to the bound hook (in the
+binding installation, against a disposable target inside the policy's bounds)
+whose turn nominates the action with `automatic` false, and whose approval
+executes it. No route lets an administrator request a write directly. A record is
+valid only for its digest: a connector upgrade invalidates it and admission check
+6 sends the action to approval until it is requalified.
 
 Acceptance: writing a record with a missing, wrong-state or other-digest evidence
-reference is refused with a named code; a complete record makes check 6 pass;
-deploying a new connector digest makes the same nomination an approval request
-with `qualification_stale`; the verifier-run route accepts no tool or argument
-fields.
+reference is refused with a named code; a write or verifier run without an
+operator principal is refused `operator_principal_required`; a complete record
+makes check 6 pass; deploying a new connector digest makes the same nomination an
+approval request with `qualification_stale`; the verifier-run route refuses a body
+with tool or argument fields and a target outside the allowed list.
 
 <!-- @spec AUTOMATED-REMEDIATION-23 -->
 **AUTOMATED-REMEDIATION-23. Evidence is local and observed.** Qualification
@@ -791,10 +947,13 @@ a static review does not satisfy AUTOMATED-REMEDIATION-22. The process document
 for adding an action (plan task 17) states the drill order: bind the action with
 `automatic` false, run the qualification drills through approvals on a disposable
 target within the policy's bounds, record the qualification, then write a
-generation with `automatic` true.
+generation with `automatic` true. The `qualification_required` check runs at
+policy write (plan task 3 owns the validator, task 15 adds the check); until it
+lands, admission check 6 is what blocks automatic execution.
 
 Acceptance: a policy write setting `automatic` true for an action without a valid
-qualification record is refused `qualification_required`.
+qualification record is refused `qualification_required`; the same write with a
+valid record is accepted and the next in-bounds nomination is admitted.
 
 ## Nomination kinds (#4144)
 
@@ -804,15 +963,17 @@ declares each action's `kind`; the model names only the action, so it cannot
 choose a kind. `remediate` follows the whole admission order. `prevent`
 (recurrence prevention: an action whose purpose is that the alert does not fire
 again, such as a capacity or configuration change) carries a precondition and a
-verifier like any action and is never automatic in the first release: a policy
-write with `automatic` true on it is refused `kind_not_automatic`, and its
+verifier like any action and is never automatic in the first release; its
 nominations always become approval requests that are executed and verified as in
-AUTOMATED-REMEDIATION-16 and -18. `tune` is AUTOMATED-REMEDIATION-25. This is
-within ADR 0203: the ADR never requires an action to be automatic.
+AUTOMATED-REMEDIATION-16 and -18. `tune` is AUTOMATED-REMEDIATION-25. A policy
+write with `automatic` true on a `prevent` or `tune` action is refused
+`kind_not_automatic`. This is within ADR 0203: the ADR never requires an action
+to be automatic.
 
 Acceptance: a `prevent` nomination that passes every bound produces an approval
 request, never an execution, and its approved execution is verified; a policy
-write with `automatic` true on `prevent` or `tune` is refused.
+write with `automatic` true on `prevent` and on `tune` is each refused
+`kind_not_automatic`.
 
 <!-- @spec AUTOMATED-REMEDIATION-25 -->
 **AUTOMATED-REMEDIATION-25. Alert rule tuning requests.** A `tune` action
@@ -883,6 +1044,59 @@ a frozen contract change that lands as its own reviewed PR first.
 Acceptance: the wire lock, the ACI schema compatibility test and the
 plugin-format schema export are unchanged by every realizing PR.
 
+## Amendments to the executor contract
+
+This contract amends the [executor contract](2026-10-06-connector-action-executor.md)
+as follows; each amendment lands with the task that needs it and updates the
+executor spec text in the same change.
+
+* **E1, AE-1 and AE-2 (producers and authority).** The closed producer set gains
+  the remediation creation functions (forward executions from admission and
+  approval, read executions from admission, verification and the qualification
+  verifier-run route). `authority_kind` gains `policy`, `approval` (already named
+  by AE-2) and `qualification`, closed by a check constraint
+  (AUTOMATED-REMEDIATION-14). The rule that no route accepts a tool name or
+  arguments for execution stands: every remediation tool and argument comes from a
+  policy generation or a nomination row.
+* **E2, AE-2 (kind).** `kind` gains `read` (AUTOMATED-REMEDIATION-12).
+* **E3, AE-6 (phases and sequences).** A `read` phase is added, with the sequence
+  `list` then one or more `read`s of one tool and arguments. `observe` is also
+  accepted, repeatedly and with no `call`, in an execution that only observes a
+  forward action's target for the `superseded` check (AUTOMATED-REMEDIATION-18);
+  AE-6's "observe only before a restore" otherwise stands, and the one-`call` rule
+  is unchanged.
+* **E4, AE-4 and AE-6 (read-only evidence).** In executor mode the read-only set is
+  absent, so a `read` requires `readOnlyHint` in the sandbox's own `list`, with
+  the residual trust stated in AUTOMATED-REMEDIATION-12.
+* **E5, AE-17 (lifecycle).** Read executions never enter `dispatched`, renew their
+  lease per sample, and end `confirmed` or `refused` without re-queueing.
+* **E6, AE-20 and AE-24 (codes).** Pre-dispatch codes gain `tool_not_read_only`,
+  `not_reversible_now` and `policy_changed`; `pointer_absent` is a sample result,
+  not a refusal. The `runner-execute` vector carries all of them.
+* **E7, AE-5 (sandbox credentials).** Read executions require the per-claim
+  stripped template proposed by #4204 (unmerged); this contract does not ship
+  verification on the pool template.
+
+## Needs an ADR
+
+Judged against ADR 0121, ADR 0124 and ADR 0203, none of E1 to E7 is a new
+architectural decision. Routing reads through executor sandboxes applies ADR 0121
+decision 2's reachability argument to reads and adds no reach: a sandbox under the
+read connector's binding reaches only what a model turn of the same agent already
+reaches through that connector. Observing the target through the acting
+connector for `superseded` is attribution, which REMEDIATION-15 does not govern,
+and uses an existing read-only verb. The remaining items are contract mechanics
+inside decisions already made.
+
+Two things would need an ADR, and this contract does not decide them:
+
+* **Automated execution of an alert rule change** through the rules' owner, which
+  the 2026-10-07 ruling sends to a later Draft ADR (AUTOMATED-REMEDIATION-25).
+* **Any platform read of a tenant connector outside an executor sandbox**, for
+  example a direct client in the worker or the API to make verification cheaper.
+  ADR 0121 rejected that reach for restores; adopting it for reads is a boundary
+  change.
+
 ## Out of scope for the first release
 
 * Composite or multi-step actions; one nomination is one write call.
@@ -899,6 +1113,9 @@ plugin-format schema export are unchanged by every realizing PR.
 * A console surface for policies or nominations; the CLI is the operator surface
   and no console action is added, so the console parity map gains no entry.
 * Importing qualification evidence from another installation.
+* Delta bounds on magnitude (for example a maximum replica change), which need a
+  trusted baseline read; absolute ranges bound magnitude in the first release.
+* Keeping a nomination block out of the runner-written protected transcript.
 * Executing an approved alert rule tuning change, including automated change
   requests to the rules' owner; a separate Draft ADR decides it later.
 
