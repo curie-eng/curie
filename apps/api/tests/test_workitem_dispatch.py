@@ -1385,6 +1385,53 @@ def test_thread_busy_between_start_deferrals_neither_resets_nor_advances_the_cap
     with_session(body)
 
 
+def test_only_non_capacity_not_started_reasons_count_toward_the_start_cap(
+    clean_db: None, allowlisted: None
+) -> None:
+    prefix = workitem_dispatch.START_DEFERRAL_REASON_PREFIX
+    assert prefix == "not_started:"
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        for _ in range(6):
+            result, before, after = await _acquire_and_defer(
+                session, facts.request_id, reason="runtime_unavailable", capacity=False
+            )
+            row = await _start_row(session, facts.request_id)
+            assert row.status == "waiting"
+            assert row.start_deferrals == 0
+            assert row.capacity_deferrals == 0
+            assert row.terminal_cause is None
+            assert row.terminal_at is None
+            assert row.last_deferral_reason == "runtime_unavailable"
+            _assert_delay(row.dispatch_not_before, before, after, 10)
+            assert result.terminal_cause is None
+
+        counted = _facts(agent_id, github_issue_number=4171)
+        await admit(session, counted)
+        for reason in START_REASONS[:4]:
+            assert reason.startswith(prefix)
+            await _acquire_and_defer(session, counted.request_id, reason=reason, capacity=False)
+        other, _, _ = await _acquire_and_defer(
+            session, counted.request_id, reason="runtime_unavailable", capacity=False
+        )
+        assert other.terminal_cause is None
+        row = await _start_row(session, counted.request_id)
+        assert (row.status, row.start_deferrals) == ("waiting", 4)
+
+        final, _, _ = await _acquire_and_defer(
+            session, counted.request_id, reason="not_started:classified_failure", capacity=False
+        )
+        assert final.terminal_cause == "start_failed"
+        row = await _start_row(session, counted.request_id)
+        assert (row.status, row.terminal_cause) == ("failed", "start_failed")
+        assert row.start_deferrals == 5
+
+    with_session(body)
+
+
 def test_start_deferral_limit_is_read_from_settings(
     clean_db: None, allowlisted: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
