@@ -33,8 +33,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from curie_api.factory_notices import FINAL_MARKER, marker_for, sync_status_comments
+from curie_api.factory_notices import FINAL_MARKER, marker_for, result_section, sync_status_comments
 from curie_api.github_app import GitHubAppError
+from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
 from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from test_factory_progress import ACTIVITY, DECLARATION, STAGED_DECLARATION, progress_token, report
@@ -1303,6 +1304,85 @@ def test_history_capacity_failure_notice_explains_retry(admitted: Any) -> None: 
     assert "status: needs human" in body
     assert "status: failed" not in body
     assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+
+
+START_FAILED_SENTENCE = (
+    "Could not complete: the sandbox did not start after 5 attempts. "
+    "Last reason: not_started:classified_failure."
+)
+
+
+def _defer_start(request_id: uuid.UUID, times: int) -> None:
+    """Drive the real worker defer path: each attempt is acquired, then deferred."""
+
+    async def go() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                for _ in range(times):
+                    generation = await session.scalar(
+                        text(
+                            "SELECT dispatch_generation FROM curie.execution_requests "
+                            "WHERE id = :id"
+                        ),
+                        {"id": request_id},
+                    )
+                    acquired = await acquire(
+                        session, request_id, owner="factory-owner", generation=generation
+                    )
+                    assert not isinstance(acquired, DispatchConflict), acquired
+                    deferred = await defer(
+                        session,
+                        request_id,
+                        owner="factory-owner",
+                        generation=generation,
+                        reason="not_started:classified_failure",
+                        capacity=False,
+                    )
+                    assert not isinstance(deferred, DispatchConflict), deferred
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_start_failed_comment_names_the_attempts_and_last_reason(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 9936
+    request_id = _admit(client, github, sink, number)
+    _reconcile()
+    comment_id = _notices(request_id)[0]["comment_id"]
+    sink.requests.clear()
+
+    _defer_start(request_id, 5)
+    row = _request(number)
+    assert (row["status"], row["terminal_cause"]) == ("failed", "start_failed")
+    _reconcile()
+
+    assert _posts(sink) == []
+    assert [path for path, _ in _patches(sink)] == [f"/repos/{REPO}/issues/comments/{comment_id}"]
+    (comment,) = _marked(sink, request_id)
+    body = comment["body"]
+    assert body.splitlines()[0] == START_FAILED_SENTENCE
+    assert "Cause: start_failed" in body
+    assert "Provider message:" not in body
+    assert "Status: NEEDS HUMAN" in body
+    assert FINAL_MARKER in body
+    assert _curie_labels(sink, number) == {"curie-factory:needs-human"}
+    assert sink.posts == 1
+
+
+def test_start_failed_result_section_uses_the_detail_as_the_sentence() -> None:
+    detail = (
+        "the sandbox did not start after 5 attempts. Last reason: not_started:classified_failure."
+    )
+    body = result_section("start_failed", pr_url=None, detail=detail)
+    assert body.startswith(f"{START_FAILED_SENTENCE}\n")
+    assert "Cause: start_failed" in body
+    assert "Provider message:" not in body
+    assert body.count("did not start") == 1
 
 
 def test_unlabel_while_waiting_stops_and_clears_every_state_label(

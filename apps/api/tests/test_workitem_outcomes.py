@@ -660,6 +660,46 @@ def test_failed_names_terminal_cause_and_delivery_budget(
     _assert_common(body)
 
 
+def test_failed_start_failed_names_the_attempts_and_last_reason(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """#4170: the sandbox never started, so the fifth start deferral failed it."""
+
+    agent = _agent(stack, auth_headers)
+    facts = _facts(agent["agent_id"])
+    seeded = _admit(facts)
+
+    async def never_starts(session: AsyncSession) -> None:
+        for _ in range(5):
+            generation = await session.scalar(
+                text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
+                {"id": facts.request_id},
+            )
+            granted = await acquire(session, facts.request_id, owner=OWNER, generation=generation)
+            assert getattr(granted, "code", None) is None, granted
+            deferred = await defer(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=generation,
+                reason="not_started:classified_failure",
+                capacity=False,
+            )
+            assert getattr(deferred, "code", None) is None, deferred
+
+    with_session(never_starts)
+
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+
+    assert body["state"] == "failed"
+    assert body["actionable_cause"] == (
+        "failed: start_failed, the sandbox did not start after 5 attempts. "
+        "Last reason: not_started:classified_failure."
+    )
+    assert body["requests"][-1]["terminal_cause"] == "start_failed"
+    _assert_common(body)
+
+
 def test_completion_without_a_pull_request_stays_running(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:

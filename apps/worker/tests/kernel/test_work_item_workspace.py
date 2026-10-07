@@ -31,7 +31,6 @@ from aci_protocol import (
 )
 from channel_protocol.reply import ReplyAck, ReplyEvent
 from curie_worker.approvals import (
-    DEFAULT_BUDGET_S,
     ApprovalClient,
     ApprovalRequest,
     CreatedApproval,
@@ -759,7 +758,7 @@ class _HttpPublicationApi(_NoExistingPublication):
         )
 
     async def create_publication(
-        self, request: PublicationCreateRequest, *, budget_s: float = DEFAULT_BUDGET_S
+        self, request: PublicationCreateRequest, *, budget_s: float = 120
     ) -> object:
         self.creates += 1
         return await self._client.create_publication(request, budget_s=budget_s)

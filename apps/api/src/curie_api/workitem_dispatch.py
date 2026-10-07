@@ -14,7 +14,8 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from . import crud, workitems
-from .config import get_settings
+from .config import Settings, get_settings
+from .factory_notices import start_failed_sentence
 from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
 from .threadkeys import (
     legacy_route_adapter_of,
@@ -42,6 +43,15 @@ from .workitems import (
 from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
+
+# Only a non-capacity defer whose reason carries this prefix is a failed
+# sandbox start: the worker's kernel defers with
+# ``run.defer(f"not_started:{telemetry_outcome}", capacity=False)`` when the
+# sandbox never started. Those count toward the start deferral limit and can
+# end the request (#4170). Every other non-capacity reason is a wait, for
+# example the kernel's ``thread_busy`` while another turn holds the thread: it
+# keeps the flat base backoff, is not counted, and never ends the request.
+START_DEFERRAL_REASON_PREFIX = "not_started:"
 
 RefusalCode = Literal[
     "not_found",
@@ -82,7 +92,8 @@ class AcquireGrant:
 @dataclass(frozen=True)
 class DeferResult:
     dispatch_generation: int
-    not_before: datetime
+    not_before: datetime | None
+    terminal_cause: str | None = None
 
 
 @dataclass(frozen=True)
@@ -682,6 +693,13 @@ async def acquire(
     return grant
 
 
+def _backoff_seconds(settings: Settings, count: int) -> int:
+    return min(
+        settings.work_item_backoff_base_seconds * int(2**count),
+        settings.work_item_backoff_max_seconds,
+    )
+
+
 async def defer(
     session: AsyncSession,
     request_id: uuid.UUID,
@@ -691,9 +709,21 @@ async def defer(
     reason: str,
     capacity: bool,
 ) -> DeferResult | DispatchConflict:
-    request = await _lock_request_by_id(session, request_id)
-    if request is None:
-        return await _refuse(session, "not_found", request_id=request_id)
+    counts_as_start = not capacity and reason.startswith(START_DEFERRAL_REASON_PREFIX)
+    if not counts_as_start:
+        # Capacity defers and other waits never settle the request, so the
+        # request lock alone suffices.
+        request = await _lock_request_by_id(session, request_id)
+        if request is None:
+            return await _refuse(session, "not_found", request_id=request_id)
+        work_item = None
+    else:
+        # A start deferral may settle the request, so it takes the locks in
+        # the order every settling path does: work item, then request.
+        locked = await _lock_pair(session, request_id)
+        if isinstance(locked, DispatchConflict):
+            return locked
+        work_item, request = locked
     if request.status != "waiting":
         return await _refuse(
             session,
@@ -718,19 +748,30 @@ async def defer(
             session, "not_dispatchable", request_id=request.id
         )
     settings = get_settings()
+    values: dict[str, Any] = {}
     if capacity:
-        delay = min(
-            settings.work_item_backoff_base_seconds
-            * (2 ** request.capacity_deferrals),
-            settings.work_item_backoff_max_seconds,
-        )
-        deferral_values: dict[str, Any] = {
-            "capacity_deferrals": ExecutionRequest.capacity_deferrals + 1
-        }
-    else:
+        delay = _backoff_seconds(settings, request.capacity_deferrals)
+        values["capacity_deferrals"] = ExecutionRequest.capacity_deferrals + 1
+    elif not counts_as_start:
         delay = settings.work_item_backoff_base_seconds
-        deferral_values = {}
-    not_before = now + timedelta(seconds=delay)
+    else:
+        delay = _backoff_seconds(settings, request.start_deferrals)
+        values["start_deferrals"] = ExecutionRequest.start_deferrals + 1
+    fails_start = (
+        counts_as_start
+        and request.start_deferrals + 1 >= settings.work_item_start_deferral_limit
+    )
+    if fails_start:
+        # #4170: the sandbox never started within the limit, so the request
+        # ends here. dispatch_not_before is left untouched.
+        values.update(
+            status="failed",
+            terminal_at=now,
+            terminal_cause="start_failed",
+            version=ExecutionRequest.version + 1,
+        )
+    else:
+        values["dispatch_not_before"] = now + timedelta(seconds=delay)
     changed_id = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -744,21 +785,42 @@ async def defer(
             acquired_generation=None,
             acquire_owner=None,
             acquire_expires_at=None,
-            dispatch_not_before=not_before,
             last_deferral_reason=reason,
             updated_at=func.clock_timestamp(),
-            **deferral_values,
+            **values,
         )
         .returning(ExecutionRequest.id)
     )
     if changed_id is None:
         return await _refuse(session, "not_dispatchable", request_id=request.id)
     request = await _reload_request(session, request.id)
+    if not fails_start:
+        result = DeferResult(
+            dispatch_generation=request.dispatch_generation,
+            not_before=request.dispatch_not_before,
+        )
+        await session.commit()
+        return result
+    assert work_item is not None
+    attempts = request.start_deferrals
+    await workitems._settle_terminal(
+        session,
+        work_item,
+        request,
+        detail=start_failed_sentence(attempts, reason),
+    )
     result = DeferResult(
         dispatch_generation=request.dispatch_generation,
-        not_before=request.dispatch_not_before,
+        not_before=None,
+        terminal_cause="start_failed",
     )
     await session.commit()
+    logger.warning(
+        "work item request %s failed to start after %d start deferrals; last reason %s",
+        changed_id,
+        attempts,
+        reason,
+    )
     return result
 
 

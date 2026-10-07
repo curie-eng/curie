@@ -247,3 +247,83 @@ def test_run_finish_clamps_retry_budget_to_execution_deadline(monkeypatch) -> No
         assert 2.9 <= sum(sleeps) <= 3
 
     asyncio.run(go())
+
+
+# --- #4170 a start deferral can end the request ------------------------------
+
+# Response shape: apps/api/src/curie_api/routers/work_items.py defer route.
+_TERMINAL_DEFER = {"dispatch_generation": 6, "not_before": None, "terminal_cause": "start_failed"}
+_NONTERMINAL_DEFER = {
+    "dispatch_generation": 2,
+    "not_before": "2026-10-07T12:00:30+00:00",
+    "terminal_cause": None,
+}
+
+
+def _deferring_run(body: object) -> tuple[str | None, WorkItemRun]:
+    async def go() -> tuple[str | None, WorkItemRun]:
+        def handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=body)
+
+        async def stop(_thread: str, _run: WorkItemRun) -> None:
+            raise AssertionError("No heartbeat was started")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = WorkItemDispatchClient(
+                api_base_url="http://api.example", worker_token="example-token", client=http
+            )
+            cause = await client.defer(
+                REQUEST_ID, owner="worker-1", generation=1, reason="thread_busy", capacity=False
+            )
+            run = WorkItemRun(
+                client=client,
+                request_id=REQUEST_ID,
+                owner="worker-1",
+                grant=WorkItemAcquireGrant(1, WORK_ITEM_ID, "thread", "2099-01-01T00:00:00Z", None),
+                event_id="event",
+                thread_key="slack:C1:thread",
+                on_stop=stop,
+                on_stale=stop,
+            )
+            await run.defer("not_started:classified_failure", capacity=False)
+            return cause, run
+
+    return asyncio.run(go())
+
+
+def test_a_terminal_start_deferral_finishes_the_run() -> None:
+    # The fifth non-capacity deferral ends the request start_failed; the run
+    # must count as settled so the kernel releases the claim this delivery made.
+    cause, run = _deferring_run(_TERMINAL_DEFER)
+    assert cause == "start_failed"
+    assert run.finished is True
+    assert run.started is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [_NONTERMINAL_DEFER, {"dispatch_generation": 2, "not_before": None}],
+    ids=["terminal_cause_null", "terminal_cause_absent"],
+)
+def test_a_nonterminal_deferral_keeps_the_run_open(body: dict[str, object]) -> None:
+    # The request stays waiting and the next acquire adopts this thread's
+    # route, so the claim must stay standing.
+    cause, run = _deferring_run(body)
+    assert cause is None
+    assert run.finished is False
+
+
+@pytest.mark.parametrize("terminal_cause", [5, "", ["start_failed"]])
+def test_a_deferral_with_an_unusable_terminal_cause_is_a_transport_error(
+    terminal_cause: object,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={**_TERMINAL_DEFER, "terminal_cause": terminal_cause})
+
+    with pytest.raises(WorkItemTransportError):
+        _run(
+            handler,
+            lambda c: c.defer(
+                REQUEST_ID, owner="worker-1", generation=1, reason="thread_busy", capacity=False
+            ),
+        )

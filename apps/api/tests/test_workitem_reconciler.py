@@ -24,7 +24,7 @@ from aci_protocol import (
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
 from curie_api.config import get_settings
 from curie_api.main import create_app
-from curie_api.workitem_dispatch import admit, fence_published
+from curie_api.workitem_dispatch import acquire, admit, defer, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
@@ -1114,6 +1114,86 @@ def test_terminate_wake_uses_the_sql_snapshot_without_an_agent_channel(
     assert handle.get("placeholder") is None
     assert handle.get("endpoint") is None
     assert handle.get("adapter") is None
+
+
+def test_start_failed_request_gets_no_execute_wake_while_a_waiting_sibling_does(
+    clean_db: None,
+    allowlisted: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#4170: the fifth start deferral fails the request, so it is never re-woken."""
+
+    monkeypatch.setenv("CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS", "1")
+    monkeypatch.setenv("CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS", "1")
+    get_settings.cache_clear()
+
+    async def acquire_and_defer(
+        session: AsyncSession, request_id: uuid.UUID, *, reason: str, capacity: bool
+    ) -> None:
+        generation = await session.scalar(
+            text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
+            {"id": request_id},
+        )
+        granted = await acquire(session, request_id, owner="worker-a", generation=generation)
+        assert getattr(granted, "code", None) is None, granted
+        deferred = await defer(
+            session,
+            request_id,
+            owner="worker-a",
+            generation=generation,
+            reason=reason,
+            capacity=capacity,
+        )
+        assert getattr(deferred, "code", None) is None, deferred
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        async with maker() as session:
+            agent_id = await _agent_with_channel(session)
+            doomed = _facts(agent_id)
+            sibling = _facts(agent_id, github_issue_number=2574)
+            await admit(session, doomed)
+            await admit(session, sibling)
+            for _ in range(5):
+                await acquire_and_defer(
+                    session,
+                    doomed.request_id,
+                    reason="not_started:classified_failure",
+                    capacity=False,
+                )
+            await acquire_and_defer(session, sibling.request_id, reason="capacity", capacity=True)
+            row = await _request_row(session, doomed.request_id)
+            assert (row.status, row.terminal_cause) == ("failed", "start_failed")
+            due = await session.scalar(
+                text(
+                    "SELECT max(dispatch_not_before) FROM curie.execution_requests "
+                    "WHERE id IN (:doomed, :sibling)"
+                ),
+                {"doomed": doomed.request_id, "sibling": sibling.request_id},
+            )
+            assert due is not None
+            while await _now(session) < due:
+                await asyncio.sleep(0.05)
+            await session.commit()
+        await reconciler.run_once()
+        async with maker() as session:
+            row = await _request_row(session, doomed.request_id)
+            assert (row.status, row.terminal_cause) == ("failed", "start_failed")
+            assert row.published_generation is None
+            sibling_row = await _request_row(session, sibling.request_id)
+            assert sibling_row.status == "waiting"
+            assert sibling_row.published_generation == sibling_row.dispatch_generation == 2
+        return doomed.request_id, sibling.request_id
+
+    doomed_id, sibling_id = _run(steps, runs_stream)
+    event_ids = [payload["event_id"] for payload in _payloads(valkey, runs_stream)]
+    assert not [e for e in event_ids if e.startswith(f"work-item-{doomed_id}-execute")]
+    assert event_ids == [f"work-item-{sibling_id}-execute-2"]
 
 
 def test_suite_create_app_does_not_start_the_work_item_reconciler(client: Any) -> None:
