@@ -474,6 +474,20 @@ async def _finish_nominations(
     )
 
 
+async def _finish_unexecuted(session: AsyncSession, raising_id: uuid.UUID, code: str) -> None:
+    """End an ``approved`` raiser that has no execution, recording why in ``execution_code``."""
+
+    await session.execute(
+        update(RemediationNomination)
+        .where(
+            RemediationNomination.id == raising_id,
+            RemediationNomination.state == "approved",
+            RemediationNomination.execution_id.is_(None),
+        )
+        .values(state="finished", execution_code=code, decided_at=func.now())
+    )
+
+
 async def execute_approved(session: AsyncSession, approval_id: uuid.UUID) -> ForwardCreated:
     """Create the one forward execution of an approved remediation approval.
 
@@ -501,6 +515,8 @@ async def execute_approved(session: AsyncSession, approval_id: uuid.UUID) -> For
         await _finish_nominations(
             session, approval_id, raising="finished", attached="finished", raising_id=raising_id
         )
+        # A rerun after the claim may find the raiser already ``approved``.
+        await _finish_unexecuted(session, raising_id, judged.code)
         await session.commit()
         raise judged
     await _finish_nominations(
@@ -514,19 +530,11 @@ async def execute_approved(session: AsyncSession, approval_id: uuid.UUID) -> For
     await session.commit()
     try:
         return await create_remediation_forward(session, raising_id, approval_id=approval_id)
-    except ForwardRefused:
+    except ForwardRefused as refused:
         # A refusal is final for this authority: end the raising nomination, so
         # reconciliation does not retry it. Any other error leaves it ``approved``
         # with no execution, which ``reconcile_remediation_approvals`` completes.
-        await session.execute(
-            update(RemediationNomination)
-            .where(
-                RemediationNomination.id == raising_id,
-                RemediationNomination.state == "approved",
-                RemediationNomination.execution_id.is_(None),
-            )
-            .values(state="finished")
-        )
+        await _finish_unexecuted(session, raising_id, refused.code)
         await session.commit()
         raise
 
