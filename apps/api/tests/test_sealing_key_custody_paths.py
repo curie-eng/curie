@@ -299,6 +299,156 @@ def test_the_same_forms_with_an_unreserved_name_are_accepted(
 
 
 # --------------------------------------------------------------------------- #
+# Review round 2, R2-L2 and R2-L3: every field the MCP client expands, and every
+# reference shape. The contract: the reserved name appearing as a token in a
+# remote ``url``, a remote ``headers`` value or an ``unhosted_url`` is refused,
+# whatever surrounds it. A name that merely starts with the reserved one
+# (``SNAPSHOT_SEALING_KEYRING``) is a different variable and stays accepted.
+# --------------------------------------------------------------------------- #
+
+_REFERENCE_SHAPES = {
+    "braced": "${{{name}}}",
+    "bare_dollar": "${name}",
+    "braced_spaces": "${{ {name} }}",
+    "default_colon_dash": "${{{name}:-x}}",
+    "default_dash": "${{{name}-x}}",
+    "nested_default": "${{OTHER_VAR:-${{{name}}}}}",
+}
+
+
+def _reference(shape: str, name: str) -> str:
+    return _REFERENCE_SHAPES[shape].format(name=name)
+
+
+def _expanded_field(field: str, ref: str) -> str:
+    if field == "remote_url":
+        return f'connectors:\n  k8s:\n    url: "{REMOTE_URL}?token={ref}"\n'
+    if field == "remote_header":
+        return (
+            f"connectors:\n  k8s:\n    url: {REMOTE_URL}\n"
+            f'    headers:\n      Authorization: "Bearer {ref}"\n'
+        )
+    if field == "unhosted_url":
+        return (
+            f"connectors:\n  k8s:\n    image: {IMAGE}\n"
+            f'    unhosted_url: "http://localhost:8765/mcp?key={ref}"\n'
+        )
+    raise AssertionError(field)
+
+
+_EXPANDED_FIELDS = ["remote_url", "remote_header", "unhosted_url"]
+
+
+@pytest.mark.parametrize("name", RESERVED)
+@pytest.mark.parametrize("shape", list(_REFERENCE_SHAPES))
+@pytest.mark.parametrize("field", _EXPANDED_FIELDS)
+def test_any_reference_to_the_key_in_an_expanded_field_is_refused(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, field: str, shape: str, name: str
+) -> None:
+    """@spec ACTION-EXECUTOR-16: intake refuses either name in any form but a SecretRef.
+
+    ``connector_render`` writes the remote ``url`` verbatim into ``.mcp.json``
+    and the MCP client expands it like ``headers`` and ``unhosted_url``. A
+    lenient expander may accept ``$NAME``, padded braces or a ``-`` default, so
+    the refusal keys on the name as a token rather than on one placeholder
+    syntax.
+    """
+
+    connectors = _expanded_field(field, _reference(shape, name))
+    response = _upload(client, auth_headers, _archive(tmp_path, connectors))
+    _assert_custody_refusal(response, name)
+
+
+@pytest.mark.parametrize("control", ["MY_SEAL_KEY", "SNAPSHOT_SEALING_KEYRING"])
+@pytest.mark.parametrize("shape", list(_REFERENCE_SHAPES))
+@pytest.mark.parametrize("field", _EXPANDED_FIELDS)
+def test_a_reference_to_another_name_in_an_expanded_field_is_accepted(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, field: str, shape: str, control: str
+) -> None:
+    """@spec ACTION-EXECUTOR-16: the paired control.
+
+    ``SNAPSHOT_SEALING_KEYRING`` contains the reserved name as a prefix but is
+    a different variable, so a substring match that refuses it is too broad.
+    """
+
+    connectors = _expanded_field(field, _reference(shape, control))
+    response = _upload(client, auth_headers, _archive(tmp_path, connectors))
+    assert response.status_code == 201, response.text
+
+
+# --------------------------------------------------------------------------- #
+# Review round 2, R2-L1: a body that is not a JSON object still echoes nothing
+# --------------------------------------------------------------------------- #
+
+_SECRETS_PAYLOAD = {
+    "secrets": {"SNAPSHOT_SEALING_KEY": SEAL_VALUE, "GITHUB_PERSONAL_ACCESS_TOKEN": SIBLING_VALUE}
+}
+
+
+def _malformed_body(shape: str, payload: dict[str, Any]) -> tuple[str, str]:
+    """(content type, raw body) for a request body FastAPI cannot read as the model."""
+
+    if shape == "text_plain":
+        return "text/plain", json.dumps(payload)
+    if shape == "json_list":
+        return "application/json", json.dumps([payload])
+    if shape == "json_string":
+        return "application/json", json.dumps(json.dumps(payload))
+    if shape == "form_urlencoded":
+        return "application/x-www-form-urlencoded", json.dumps(payload)
+    if shape == "no_content_type":
+        return "", json.dumps(payload)
+    raise AssertionError(shape)
+
+
+_MALFORMED_SHAPES = ["text_plain", "json_list", "json_string", "form_urlencoded", "no_content_type"]
+
+
+def _send(
+    client: Any, method: str, url: str, headers: dict[str, str], shape: str, payload: Any
+) -> Any:
+    content_type, body = _malformed_body(shape, payload)
+    sent = dict(headers)
+    if content_type:
+        sent["Content-Type"] = content_type
+    return client.request(method, url, content=body.encode(), headers=sent)
+
+
+def _assert_no_secret_echo(response: Any) -> None:
+    assert response.status_code == 422, (
+        f"a malformed body was not refused ({response.status_code}): {response.text}"
+    )
+    assert SEAL_VALUE not in response.text, "the 422 body echoes the sealing key value"
+    assert SIBLING_VALUE not in response.text, "the 422 body echoes another secret value"
+
+
+@pytest.mark.parametrize("shape", _MALFORMED_SHAPES)
+def test_a_malformed_agent_patch_body_does_not_echo_secret_values(
+    client: Any, auth_headers: dict[str, str], shape: str
+) -> None:
+    """@spec ACTION-EXECUTOR-16: no refusal echoes a submitted secret value, whatever the shape."""
+
+    agent_id, _ = _new_version(client, auth_headers)
+    response = _send(client, "PATCH", f"/agents/{agent_id}", auth_headers, shape, _SECRETS_PAYLOAD)
+    _assert_no_secret_echo(response)
+
+
+@pytest.mark.parametrize("shape", _MALFORMED_SHAPES)
+def test_a_malformed_agent_create_body_does_not_echo_secret_values(
+    client: Any, auth_headers: dict[str, str], shape: str
+) -> None:
+    """@spec ACTION-EXECUTOR-16"""
+
+    payload = {
+        "name": f"seal-{uuid.uuid4().hex[:8]}",
+        "channel": {"kind": "slack", "address": _address()},
+        **_SECRETS_PAYLOAD,
+    }
+    response = _send(client, "POST", "/agents", auth_headers, shape, payload)
+    _assert_no_secret_echo(response)
+
+
+# --------------------------------------------------------------------------- #
 # L2: a SecretRef on a remote connector is not custody
 # --------------------------------------------------------------------------- #
 

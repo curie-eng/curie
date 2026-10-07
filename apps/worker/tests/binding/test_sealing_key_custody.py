@@ -109,5 +109,5 @@ def test_eval_boot_env_withholds_the_sealing_key(reserved: str) -> None:
         model=None,
         requested_at="2026-10-06T00:00:00+00:00",
     )
-    env = consumer._boot_env(item, _secrets(reserved), None, model=None)
+    env = consumer._boot_env(item, _secrets(reserved), None, model=None, reviewer_model=None)
     _assert_withheld(env, reserved)
