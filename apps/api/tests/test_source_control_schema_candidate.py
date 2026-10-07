@@ -36,14 +36,14 @@ def test_candidate_requires_exact_ledger_schema(resource: str) -> None:
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
-def test_new_candidate_release_fields_are_0122(field: str) -> None:
+def test_new_candidate_release_fields_are_0123(field: str) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     if field == "cargo":
         value = tomllib.loads((ROOT / "cli/Cargo.toml").read_text())["package"]["version"]
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
-    assert value == "0.12.2"
+    assert value == "0.12.3"
 
 
 def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
@@ -68,7 +68,7 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     actual = catalog()["windows"]
     assert {name: actual[name] for name in expected} == expected
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
-    assert set(actual) - set(expected) <= {"0.12.1", "0.12.2"}
+    assert set(actual) - set(expected) <= {"0.12.1", "0.12.2", "0.12.3"}
 
 
 def test_0075_startup_refuses_without_migrating_then_0076_starts(
