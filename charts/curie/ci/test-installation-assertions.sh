@@ -141,9 +141,25 @@ def on(drivers=(DRIVER,), **extra):
 default = pair(ok())
 assert default == {ENABLED: "false", DRIVERS: "[]"}, f"(a) default renders {default!r}"
 
+# The driver budget is chart-owned and bounded, including a schemaless backstop.
+limit_name = "CURIE_TEST_INSTALLATION_THREAD_TURN_LIMIT"
+def dispatcher_limit(output):
+    docs = yaml.safe_load_all((output / "curie/templates/dispatcher.yaml").read_text())
+    for doc in docs:
+        if doc and doc.get("kind") == "Deployment":
+            return next(e["value"] for c in doc["spec"]["template"]["spec"]["containers"]
+                        for e in c["env"] if e["name"] == limit_name)
+assert dispatcher_limit(ok()) == "10"
+assert dispatcher_limit(ok({"testInstallation": {"threadTurnLimit": 3}})) == "3"
+for bad in (0, -1, 101, True, 1.5, "three"):
+    refuse("invalid driver budget", {"testInstallation": {"threadTurnLimit": bad}},
+           expected=["threadTurnLimit"])
+refuse("reserved driver budget", {"dispatcher": {"extraEnv": [{"name": limit_name, "value": "99"}]}},
+       expected=["chart-owned", limit_name])
+
 # (b) Declared defaults, typed boolean, quoted refused, nil coalesced away.
 values = yaml.safe_load((chart / "values.yaml").read_text())
-assert values.get("testInstallation") == {"enabled": False, "drivers": []}, (
+assert values.get("testInstallation") == {"enabled": False, "drivers": [], "threadTurnLimit": 10}, (
     f"(b) values.yaml declares testInstallation as {values.get('testInstallation')!r}"
 )
 schema = json.loads((chart / "values.schema.json").read_text())
@@ -201,6 +217,9 @@ refuse("(f) off, no channel", {"testInstallation": {"drivers": [no_channel]}}, e
 schemaless = work / "schemaless"
 shutil.copytree(chart, schemaless / "curie")
 (schemaless / "curie" / "values.schema.json").unlink()
+for bad in (0, -1, 101, True, 1.5, "three"):
+    refuse("schemaless driver budget", {"testInstallation": {"threadTurnLimit": bad}},
+           source=schemaless / "curie", expected=["threadTurnLimit"])
 refuse("(f) schemaless no channel", REAL_SECRETS, on((no_channel,)), source=schemaless / "curie",
        expected=["testInstallation.drivers[0]", "channel"])
 for key, overlay in (
@@ -290,6 +309,7 @@ def entries(drivers):
 
 api = Settings(_env_file=None)
 dispatcher = DispatcherConfig()
+assert dispatcher.test_installation_thread_turn_limit == 10
 for name, config in (("API", api), ("dispatcher", dispatcher)):
     assert config.test_installation_enabled is True, f"{name} did not read the declaration on"
     assert entries(config.test_installation_drivers) == expected, (
