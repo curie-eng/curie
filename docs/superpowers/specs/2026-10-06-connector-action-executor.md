@@ -521,8 +521,14 @@ connector's owned Deployment by name (a new single-object `get`, never
 seconds, so the wrapper adds at most four seconds per action, and a timeout or
 error records null. It records `connector` and `connector_digest` only when both
 reads show the same generation, a completed rollout and an image reference
-pinned by `@sha256:`. A failed read never fails the record or the turn. The
-local tier has no reconciled Deployment and records null.
+pinned by `@sha256:`. A read shows a completed rollout only when all four
+hold: `status.observedGeneration` is at least `metadata.generation`, and
+`status.updatedReplicas`, `status.availableReplicas` and `status.replicas` each
+equal `spec.replicas`. The last condition is not redundant: during a surge
+rollout the first three can hold while an old pod still serves, which leaves
+`status.replicas` above `spec.replicas` (measurement M5). A failed read never
+fails the record or the turn. The local tier has no reconciled Deployment and
+records null.
 
 Acceptance (cluster): a call during a completed rollout records the digest; a
 call that straddles a rollout, a tag-referenced `image:` connector, a plugin
@@ -533,7 +539,9 @@ The worker's `get` on Deployments is granted only when the executor is enabled
 and the connector reconciler that already manages those Deployments is
 enabled; with the executor off, the worker Role is unchanged and actions record
 no digest, so they are not undoable. Least privilege outweighs recording digests
-for an executor that is not running.
+for an executor that is not running. The gate narrows the single-object read
+path rather than creating a read capability: the reconciler's existing `list`
+grant already returns the same Deployment objects (measurement M5).
 
 <!-- @spec ACTION-EXECUTOR-13 -->
 **ACTION-EXECUTOR-13. Restore capability from the advertised list.** When the

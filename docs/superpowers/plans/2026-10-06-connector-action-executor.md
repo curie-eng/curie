@@ -61,6 +61,14 @@ identifiers.
 * **M5.** Read a connector Deployment by name with the new `get` grant across a
   rollout and confirm the AE-12 bracket rule distinguishes a completed rollout
   from one in progress, and measure read latency against the two second bound.
+  Observed 2026-10-06 on a disposable single-node cluster at `346e21ba3`:
+  generation and availability alone called every one of 214 in-progress reads
+  completed, and updated plus available replicas still called 69 of them
+  completed while an old pod served; adding `status.replicas == spec.replicas`
+  misclassified none, so ACTION-EXECUTOR-12 now names all four conditions.
+  Over 727 reads p50 was 9.8 ms, p95 12.4 ms and max 20.0 ms against the two
+  second bound. Enabling the executor added only `get` on Deployments in the
+  release namespace; the reconciler's `list` already returns the same objects.
 * **M6.** Confirm that filtering `action-exec:` routes out of
   `SandboxSubstrate.pressure_candidates` keeps them out of
   `apps/worker/src/curie_worker/kernel/capacity.py::_reclaim_idle_route`, and
