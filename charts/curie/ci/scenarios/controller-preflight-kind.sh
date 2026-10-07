@@ -226,7 +226,7 @@ for ((attempt=0; attempt<150; attempt++)); do
 import sys
 from datetime import datetime
 
-a, b = (datetime.strptime(t, "%Y-%m-%dT%H:%M:%S.%fZ") for t in sys.argv[1:3])
+a, b = (datetime.fromisoformat(t) for t in sys.argv[1:3])
 print(int((b - a).total_seconds()))
 PY
 )"

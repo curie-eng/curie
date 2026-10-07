@@ -264,6 +264,8 @@ spec:
                 set -- ${lease_fields}
                 [ "$#" -eq 3 ] && [ "$1" = "${holder}" ] && [ "$2" = "${acquired}" ] \
                   && [ "$3" != "${renewed}" ] || return 1
+                renewal_advance=$(seconds_between "${renewed}" "$3")
+                [ "${renewal_advance}" -gt 0 ] 2>/dev/null || return 1
                 held=$(seconds_between "${acquired}" "$3")
                 [ "${held}" -ge "${STABLE_LEADER_SECONDS}" ] 2>/dev/null || return 1
 

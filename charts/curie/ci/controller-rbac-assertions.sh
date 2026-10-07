@@ -667,6 +667,12 @@ assert_leader_refused "a leader younger than stableLeaderSeconds" \
   "$ROLLED_OUT" "$SERVING" "$YOUNG_LEASE" "$YOUNG_LEASE_RENEWED"
 assert_leader_refused "a Lease that is not renewed while the hook watches" \
   "$ROLLED_OUT" "$SERVING" "$HELD_LEASE" "$HELD_LEASE"
+assert_leader_refused "a Lease renewal timestamp that moves backwards" \
+  "$ROLLED_OUT" "$SERVING" "$HELD_LEASE" \
+  "$HOLDER 2026-10-01T08:00:00.000000Z 2026-10-06T11:59:58.000000Z"
+assert_leader_refused "a Lease renewal timestamp rewritten without advancing" \
+  "$ROLLED_OUT" "$SERVING" "$HELD_LEASE" \
+  "$HOLDER 2026-10-01T08:00:00.000000Z 2026-10-06T12:00:00Z"
 assert_leader_refused "a Lease reacquired by a new process between reads" \
   "$ROLLED_OUT" "$SERVING" "$HELD_LEASE" \
   "${LEADER_POD}_7d1f0c2e-0000-4000-8000-000000000002 2026-10-06T12:00:01.000000Z 2026-10-06T12:00:02.000000Z"
