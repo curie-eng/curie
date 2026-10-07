@@ -8,6 +8,7 @@ router; this module is pure intake logic.
 
 import io
 import json
+import re
 import tarfile
 import tempfile
 import zipfile
@@ -139,6 +140,10 @@ def extract_and_validate(
 
 SEALING_KEY_CODE = "secrets.sealing_key_custody"
 
+# A `${NAME}` (or `${NAME:-default}`) reference the MCP client expands from the
+# sandbox environment, as `.mcp.json` has always expanded it.
+_SANDBOX_ENV_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-[^}]*)?\}")
+
 
 def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
     """Every declaration of a reserved sealing key name other than a SecretRef.
@@ -149,7 +154,12 @@ def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
     ``secrets`` name (Curie resolves and owns the value), a literal ``env``
     value, a ``secret_files`` entry (the same per-agent Secret, as a file), a
     ``sealed_secrets`` blob (the bundle carries the value) and a ``plugin.json``
-    ``secrets`` name (a sandbox secret) are each refused, naming the key.
+    ``secrets`` name (a sandbox secret) are each refused, naming the key. So
+    is naming the key for the sandbox to expand without declaring it: a
+    ``bearer_secret`` (the derived ``Authorization: Bearer ${NAME}`` header), or
+    a ``${NAME}`` reference in a remote connector's ``headers`` or a hosted
+    connector's ``unhosted_url``. Each is expanded from the sandbox environment
+    by the MCP client, so each declares that the sandbox holds the key.
 
     Applied at API intake on top of the frozen ``validate_bundle``, so the
     package's contract is unchanged. Reads the raw files leniently: a file that
@@ -197,6 +207,15 @@ def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
             for name in names:
                 if is_sealing_key_name(name):
                     refuse(name, f"{where}.{form})")
+        if spec.bearer_secret is not None and is_sealing_key_name(spec.bearer_secret):
+            refuse(spec.bearer_secret, f"{where}.bearer_secret)")
+        expanded = [(f"headers.{key}", value) for key, value in spec.headers.items()]
+        if spec.unhosted_url is not None:
+            expanded.append(("unhosted_url", spec.unhosted_url))
+        for field, text in expanded:
+            for name in _SANDBOX_ENV_REF_RE.findall(text):
+                if is_sealing_key_name(name):
+                    refuse(name, f"{where}.{field})")
     return issues
 
 
