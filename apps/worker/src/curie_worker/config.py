@@ -1321,6 +1321,13 @@ class WorkerConfig(BaseSettings):
     action_executor_enabled: bool = Field(
         default=False, validation_alias="CURIE_ACTION_EXECUTOR_ENABLED"
     )
+    # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+    # executor amendment E9), rendered from the same chart or compose value as
+    # the API's. The executor loop runs up to this many executions at once; the
+    # API's claim route, not this loop, is the authority over the count.
+    action_executor_max_concurrent_sandboxes: int = Field(
+        default=2, ge=1, validation_alias="CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES"
+    )
     # The automated remediation switch (AUTOMATED-REMEDIATION-1), rendered from
     # the same chart or compose value as the API's. It requires the executor.
     remediation_enabled: bool = Field(

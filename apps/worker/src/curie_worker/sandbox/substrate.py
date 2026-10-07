@@ -834,6 +834,16 @@ class SandboxSubstrate:
             raise error
         return released
 
+    def executor_routes(self) -> dict[str, SandboxHandle]:
+        """The handle of every executor route (``action-exec:<id>``), by thread key.
+
+        @spec AUTOMATED-REMEDIATION-12: read by the executor loop to release a
+        crashed holder's sandbox once the API has ended its execution; the
+        release itself is ``release_claim`` of exactly the handle read here.
+        """
+
+        return {key: record.handle for key, record in self._affinity.executor_routes().items()}
+
     def release_claim(self, thread_key: str, handle: SandboxHandle) -> bool:
         """Release exactly the claim ``handle`` names (@spec ACTION-EXECUTOR-5).
 

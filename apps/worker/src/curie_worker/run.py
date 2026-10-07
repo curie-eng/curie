@@ -1141,6 +1141,8 @@ def _build_action_executor(
         lease_seconds=lease_seconds,
         dispatch_deadline_s=_ACTION_EXECUTOR_DISPATCH_DEADLINE_S,
         interval_seconds=_ACTION_EXECUTOR_INTERVAL_S,
+        # @spec AUTOMATED-REMEDIATION-12 (E9): the chart's cap, also the API's.
+        max_concurrent_sandboxes=config.action_executor_max_concurrent_sandboxes,
     )
 
 
