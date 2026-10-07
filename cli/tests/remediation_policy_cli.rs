@@ -287,32 +287,28 @@ fn local_and_cluster_expose_the_remediation_policy_group() {
             .output()
             .unwrap_or_else(|err| panic!("run {tier} --help: {err}"));
         let parent_help = text(&parent);
-        for group in ["remediation-policy"] {
+        assert!(
+            parent_help
+                .lines()
+                .any(|line| line.trim_start().starts_with("remediation-policy ")),
+            "{tier} --help must list the remediation-policy group:\n{parent_help}"
+        );
+        let output = Command::new(bin())
+            .args([tier, "remediation-policy", "--help"])
+            .output()
+            .unwrap_or_else(|err| panic!("run {tier} remediation-policy --help: {err}"));
+        let help = text(&output);
+        assert!(
+            output.status.success(),
+            "{tier} remediation-policy --help must render:\n{help}"
+        );
+        for verb in POLICY_VERBS {
             assert!(
-                parent_help
-                    .lines()
-                    .any(|line| line.trim_start().starts_with(&format!("{group} "))),
-                "{tier} --help must list the {group} group:\n{parent_help}"
+                help.lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{verb} "))
+                        || line.trim() == verb),
+                "{tier} remediation-policy must expose `{verb}`; help:\n{help}"
             );
-        }
-        for (group, verbs) in [("remediation-policy", &POLICY_VERBS[..])] {
-            let output = Command::new(bin())
-                .args([tier, group, "--help"])
-                .output()
-                .unwrap_or_else(|err| panic!("run {tier} {group} --help: {err}"));
-            let help = text(&output);
-            assert!(
-                output.status.success(),
-                "{tier} {group} --help must render:\n{help}"
-            );
-            for verb in verbs {
-                assert!(
-                    help.lines()
-                        .any(|line| line.trim_start().starts_with(&format!("{verb} "))
-                            || line.trim() == *verb),
-                    "{tier} {group} must expose `{verb}`; help:\n{help}"
-                );
-            }
         }
     }
 }
@@ -332,15 +328,13 @@ fn committed_manifest_records_the_remediation_policy_group_under_both_tiers() {
     };
     for tier in ["local", "cluster"] {
         let tier_node = child(&manifest, tier).unwrap_or_else(|| panic!("manifest has {tier}"));
-        for (group, verbs) in [("remediation-policy", &POLICY_VERBS[..])] {
-            let node = child(&tier_node, group)
-                .unwrap_or_else(|| panic!("manifest must record `{tier} {group}`"));
-            for verb in verbs {
-                assert!(
-                    child(&node, verb).is_some(),
-                    "manifest must record `{tier} {group} {verb}`: {node}"
-                );
-            }
+        let node = child(&tier_node, "remediation-policy")
+            .unwrap_or_else(|| panic!("manifest must record `{tier} remediation-policy`"));
+        for verb in POLICY_VERBS {
+            assert!(
+                child(&node, verb).is_some(),
+                "manifest must record `{tier} remediation-policy {verb}`: {node}"
+            );
         }
     }
 }
