@@ -6,14 +6,19 @@ lifecycle in recordings/curie-pr-3400.json. Git runs the installed client.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import importlib.util
 import json
 import os
 import ssl
 import subprocess
 import sys
+import threading
+import time
 from collections.abc import Iterator
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +54,122 @@ def _app_key() -> str:
         )
         .decode()
     )
+
+
+def test_seed_tree_uses_the_factory_fixture_layout(
+    tmp_path: Path, recording: dict[str, Any]
+) -> None:
+    fixture = STUB_ROOT.parent / "factory-e2e" / "fixtures" / "unitconv"
+    server = _stub_type()(tmp_path / "state", recording, seed_tree=fixture)
+    try:
+        server.start()
+        clone = tmp_path / "clone"
+        env = dict(os.environ, GIT_SSL_CAINFO=str(server.ca_file))
+        subprocess.run(["git", "clone", server.clone_url, str(clone)], env=env, check=True)
+        assert (clone / "unitconv" / "convert.py").read_bytes() == (
+            fixture / "unitconv" / "convert.py"
+        ).read_bytes()
+        check = subprocess.run(
+            [sys.executable, "-m", "unittest", "discover", "-s", "unitconv/tests", "-v"],
+            cwd=clone,
+            capture_output=True,
+        )
+        assert check.returncode == 0, check.stderr.decode()
+    finally:
+        server.close()
+
+
+def test_dedicated_actor_creates_human_issue_and_label_event(
+    tmp_path: Path, recording: dict[str, Any]
+) -> None:
+    server = _stub_type()(tmp_path / "state", recording, actor_token="example-actor-token")
+    try:
+        server.start()
+        with httpx.Client(
+            base_url=server.base_url,
+            verify=ssl.create_default_context(cafile=str(server.ca_file)),
+            trust_env=False,
+            headers={"Authorization": "Bearer example-actor-token"},
+        ) as client:
+            assert _ok(client.get("/user"))["login"] == "octocat"
+            assert _ok(client.get("/app/installations/5501"))["permissions"]["checks"] == "read"
+            assert _ok(client.get(f"/repos/{REPO}"))["permissions"]["push"] is True
+            issue = _ok(
+                client.post(
+                    f"/repos/{REPO}/issues",
+                    json={"title": "Add Kelvin conversion", "labels": ["factory"]},
+                ),
+                201,
+            )
+            assert issue["user"]["type"] == "User"
+            assert "performed_via_github_app" not in issue
+            event = _ok(client.get(f"/repos/{REPO}/issues/{issue['number']}/events"))[-1]
+            assert event["actor"]["login"] == "octocat"
+            assert "performed_via_github_app" not in event
+    finally:
+        server.close()
+
+
+def test_human_label_delivers_signed_webhook_and_retains_actual_response(
+    tmp_path: Path, recording: dict[str, Any]
+) -> None:
+    received: list[dict[str, Any]] = []
+    secret = "example-webhook-secret"
+
+    class Receiver(BaseHTTPRequestHandler):
+        def log_message(self, *_args: Any) -> None:
+            pass
+
+        def do_POST(self) -> None:  # noqa: N802
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            signature = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+            assert self.headers["X-Hub-Signature-256"] == signature
+            assert self.headers["X-GitHub-Event"] == "issues"
+            received.append(json.loads(body))
+            payload = b'{"status":"example-receiver-accepted"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    receiver = ThreadingHTTPServer(("127.0.0.1", 0), Receiver)
+    thread = threading.Thread(target=receiver.serve_forever, daemon=True)
+    thread.start()
+    server = _stub_type()(
+        tmp_path / "state",
+        recording,
+        actor_token="example-actor-token",
+        webhook_secret=secret,
+    )
+    try:
+        server.start()
+        with httpx.Client(
+            base_url=server.base_url,
+            verify=ssl.create_default_context(cafile=str(server.ca_file)),
+            trust_env=False,
+            headers={"Authorization": "Bearer example-actor-token"},
+        ) as client:
+            target = f"http://127.0.0.1:{receiver.server_port}/github/webhook"
+            _ok(client.patch("/app/hook/config", json={"url": target}))
+            issue = _ok(
+                client.post(
+                    f"/repos/{REPO}/issues",
+                    json={"title": "Add Kelvin conversion", "labels": ["factory"]},
+                ),
+                201,
+            )
+            listing = _ok(client.get("/app/hook/deliveries"))
+            detail = _ok(client.get(f"/app/hook/deliveries/{listing[-1]['id']}"))
+            assert received[0]["issue"]["number"] == issue["number"]
+            assert received[0]["sender"]["login"] == "octocat"
+            assert detail["status_code"] == 200
+            assert detail["response"]["payload"]["status"] == "example-receiver-accepted"
+            assert "headers" not in detail["request"]
+    finally:
+        server.close()
+        receiver.shutdown()
+        receiver.server_close()
+        thread.join(timeout=5)
 
 
 @pytest.fixture
@@ -170,6 +291,31 @@ def test_app_discovery_and_token_scope_use_real_credentials(
     assert stub.unknown_requests == []
 
 
+def test_installation_tokens_preserve_requested_read_only_scope(github: httpx.Client) -> None:
+    # GitHub allows narrowing a token to a subset of the installation permissions:
+    # https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+    path = "/app/installations/5501/access_tokens"
+    read = _ok(
+        github.post(path, json={"repositories": ["acme-bot"], "permissions": {"issues": "read"}}),
+        201,
+    )
+    assert read["permissions"] == {"issues": "read", "metadata": "read"}
+    write = _ok(
+        github.post(
+            path, json={"repositories": ["acme-bot"], "permissions": {"contents": "write"}}
+        ),
+        201,
+    )
+    assert write["permissions"] == {"contents": "write", "metadata": "read"}
+    assert read["token"] != write["token"]
+    assert (
+        github.post(
+            path, json={"repositories": ["acme-bot"], "permissions": {"checks": "write"}}
+        ).status_code
+        == 422
+    )
+
+
 def test_issues_labels_comments_and_polling_round_trip(github: httpx.Client, stub: Any) -> None:
     issue = _ok(
         github.post(
@@ -252,6 +398,18 @@ def test_unknown_calls_fail_loudly_and_remain_observable(github: httpx.Client, s
         stub.close()
 
 
+def test_fixture_clock_scales_recorded_ci_time_without_changing_product_deadlines(
+    tmp_path: Path, recording: dict[str, Any]
+) -> None:
+    server = _stub_type()(tmp_path, recording, clock_scale=20)
+    try:
+        server.start()
+        server._real_start = time.monotonic() - 3
+        assert server._seconds() >= 60
+    finally:
+        server.close()
+
+
 def test_git_smart_http_clones_pushes_and_exposes_the_pushed_ref(
     github: httpx.Client, stub: Any, tmp_path: Path
 ) -> None:
@@ -292,6 +450,10 @@ def test_git_smart_http_clones_pushes_and_exposes_the_pushed_ref(
     assert git("ls-remote", stub.clone_url, "refs/heads/factory/example").split()[0] == pushed_sha
     branch = _ok(github.get(f"/repos/{REPO}/branches/factory%2Fexample"))
     assert branch["commit"]["sha"] == pushed_sha
+    assert {row["name"] for row in _ok(github.get(f"/repos/{REPO}/branches"))} == {
+        "main",
+        "factory/example",
+    }
     pull = _ok(
         github.post(
             f"/repos/{REPO}/pulls",
@@ -307,6 +469,7 @@ def test_git_smart_http_clones_pushes_and_exposes_the_pushed_ref(
     assert pull["head"]["ref"] == "factory/example"
     assert pull["head"]["sha"] == pushed_sha
     assert pull["base"]["ref"] == "main"
+    assert datetime.fromisoformat(pull["created_at"].replace("Z", "+00:00"))
     assert _ok(github.get(f"/repos/{REPO}/pulls/{pull['number']}"))["html_url"] == pull["html_url"]
     listed = _ok(
         github.get(

@@ -9,12 +9,21 @@ this repository. The process deletes only the namespace it creates.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import hashlib
+import importlib.util
 import json
 import os
-import subprocess
+import shutil
+import signal
+import ssl
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 import factory_e2e as fe
 import scripted_scenario as scenario
@@ -22,17 +31,32 @@ import scripted_scenario as scenario
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = REPO_ROOT / "tools" / "factory-e2e" / "fixtures" / "unitconv"
 TRANSCRIPT = REPO_ROOT / "tools" / "model-script" / "transcripts" / "unitconv-issue.json"
-FORBIDDEN = ("k8", "ProdCurietechAi", "StagingCurietechAi")
 
 
 class ScriptedScenarioError(RuntimeError):
     """The kind scenario could not prove the fixture run."""
 
 
+def fixture_bundle(workdir: Path) -> Path:
+    """Keep factory behavior, using platform Python for this stdlib fixture.
+
+    The original layer adds repository-specific uv/Rust/pnpm toolchains. This
+    fixture does not claim qualification of that default release artifact.
+    """
+    target = workdir / "fixture-bundle"
+    shutil.copytree(
+        REPO_ROOT / "examples" / "dark-factory",
+        target,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    (target / "connectors.yaml").write_text("connectors: {}\n")
+    return target
+
+
 def refuse_context(context: str) -> None:
     """Production and the shared k8 context are never this scenario's cluster."""
 
-    if context == "k8" or any(marker in context for marker in FORBIDDEN if marker != "k8"):
+    if not context.startswith("kind-"):
         raise ScriptedScenarioError(
             f"refusing kube context {context!r}; create a disposable kind cluster"
         )
@@ -85,74 +109,344 @@ def assert_observed(preflight_outcome: str, publication_paths: list[str]) -> Non
     scenario.assert_publication_paths(publication_paths)
 
 
-def main(args: argparse.Namespace) -> int:
-    context = args.context
-    try:
-        refuse_context(context)
-    except ScriptedScenarioError as exc:
-        print(f"factory-e2e: {exc}", file=sys.stderr)
-        return fe.EXIT_CONFIG
-    transcript = Path(args.transcript)
-    if not transcript.is_file():
-        print(
-            f"factory-e2e: transcript {transcript} is missing; record one with "
-            "curie dev model-script record during a factory-e2e issue-to-pr run",
-            file=sys.stderr,
+def fixture_module(name: str, path: Path) -> Any:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class ScriptedPreflight(fe.Preflight):
+    """The existing driver, with only its external fixture endpoints adapted."""
+
+    def __init__(self, *args: Any, github_stub: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.github_stub = github_stub
+        self.github_html_base = github_stub.base_url
+        self.ci_observations: list[dict[str, Any]] = []
+
+    def work_item_detail(self, work_item_id: str) -> dict[str, Any] | None:
+        detail = super().work_item_detail(work_item_id)
+        if detail is not None and isinstance(detail.get("ci"), dict):
+            self.ci_observations.append(dict(detail["ci"]))
+        return detail
+
+    def github(self, method: str, path: str, *, token: str, body: Any = None) -> tuple[int, Any]:
+        request = Request(
+            self.github_stub.base_url + "/api/v3" + path,
+            data=None if body is None else json.dumps(body).encode(),
+            method=method,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         )
-        return fe.EXIT_CONFIG
-    model_base_url = args.model_base_url or os.environ.get("CURIE_FACTORY_MODEL_BASE_URL")
-    if not model_base_url:
-        print(
-            "factory-e2e: scripted needs --model-base-url set to the proxy pod IP",
-            file=sys.stderr,
-        )
-        return fe.EXIT_CONFIG
-    try:
-        values = scripted_values(
-            model_base_url=model_base_url,
-            github_api=os.environ.get("CURIE_FACTORY_GITHUB_API", "https://127.0.0.1:9/api/v3"),
-            clone_base=os.environ.get("CURIE_FACTORY_GITHUB_CLONE_BASE", "https://127.0.0.1:9"),
-            ca_configmap="github-stub-ca",
-        )
-    except fe.ConfigError as exc:
-        print(f"factory-e2e: {exc}", file=sys.stderr)
-        return fe.EXIT_CONFIG
-    plan = {
-        "context": context,
-        "namespace": args.namespace,
-        "transcript": str(transcript),
-        "model_base_url": model_base_url,
-        "worker_env": values["worker"].get("extraEnv"),
-        "egress": values["security"]["networkPolicy"]["allowedEgress"],
-        "fixture_check": scenario.FIXTURE_CHECK,
-        "fixture_paths": scenario.FIXTURE_CHANGED_PATHS,
-    }
-    if os.environ.get("CURIE_FACTORY_SCRIPTED_PLAN") == "1":
-        print(json.dumps(plan))
-        return 0
-    print(json.dumps(plan), file=sys.stderr)
-    completed = subprocess.run(
-        [
-            "helm",
-            "--kube-context",
-            context,
-            "status",
-            "curie",
+        context = ssl.create_default_context(cafile=str(self.github_stub.ca_file))
+        try:
+            with urlopen(request, context=context, timeout=30) as response:
+                status, raw = response.status, response.read()
+        except HTTPError as exc:
+            status, raw = exc.code, exc.read()
+        return status, json.loads(raw) if raw else None
+
+    def github_diff(self, number: int) -> tuple[int, str]:
+        # The fixture's bare repository is the actual received Git push.
+        pull = self.github_stub._get("pull", number)
+        if pull is None:
+            return 404, ""
+        fresh = self.github_stub._fresh_pull(pull)
+        return 200, self.github_stub._run(
+            "git",
+            "--git-dir",
+            str(self.github_stub._repository),
+            "diff",
+            fresh["base"]["sha"],
+            fresh["head"]["sha"],
+        ).decode()
+
+    def check_images(self) -> None:
+        nodes = json.loads(self.kubectl("get", "nodes", "-o", "json"))["items"]
+        identities: dict[str, dict[str, str]] = {}
+        for node in nodes:
+            name = node["metadata"]["name"]
+            identities[name] = {}
+            for image in (
+                "curie-api:local",
+                "curie-worker:local",
+                "curie-ui:local",
+                "curie-runner:latest",
+            ):
+                inspected = json.loads(
+                    fe.run(["docker", "exec", name, "crictl", "inspecti", image])
+                )
+                identities[name][image] = inspected["status"]["id"]
+        if not identities:
+            raise fe.PreflightFailed("kind has no nodes with candidate images")
+        self.evidence["loaded_images"] = identities
+
+    def extract_chart(self) -> Path:
+        return self.repo_root / "charts" / "curie"
+
+    def sweep_stale_namespaces(self) -> None:
+        # This execution never acquires cleanup ownership of previous runs.
+        self.step("existing namespaces preserved")
+
+    def egress_cidrs(self) -> list[str]:
+        return []
+
+    def model_usage(self) -> float | None:
+        # Provider authentication and billing remain outside the product box.
+        return None
+
+    def install(self) -> None:
+        self.kubectl(
             "-n",
-            args.namespace,
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
+            self.namespace,
+            "create",
+            "configmap",
+            "github-stub-ca",
+            f"--from-file=ca.pem={self.github_stub.ca_file}",
+        )
+        super().install()
+
+    def installation_values(self, config: fe.FactoryConfig, **kwargs: Any) -> dict[str, Any]:
+        values = fe.install_values(config, **kwargs, local_images=True)
+        values["api"].update(
+            {
+                "githubApiUrl": self.github_stub.base_url + "/api/v3",
+                "githubCloneBase": self.github_stub.base_url,
+                "githubStubCaConfigMap": "github-stub-ca",
+            }
+        )
+        values["dispatcher"]["deploy"] = False
+        values["security"]["networkPolicy"]["allowedEgress"].append(
+            fe.model_proxy_egress(self.github_stub.base_url)
+        )
+        return values
+
+    def tunnel(self) -> None:
+        # Both external fixtures are on this CI host; the real API remains in kind.
+        self.ensure_api()
+        self.tunnel_url = self.api_url
+        self.step("external fixture reaches owned API port-forward")
+
+    def ensure_tunnel(self) -> None:
+        self.ensure_api()
+        if self.tunnel_url != self.api_url:
+            self.tunnel()
+            self.point_card_at_tunnel()
+            self._patch_webhook(self.tunnel_url + "/github/webhook")
+
+
+def run_scenario(preflight: ScriptedPreflight) -> dict[str, Any]:
+    result = fe.issue_to_pr(preflight)
+    request = str(uuid.UUID(preflight.evidence["execution_request_id"]))
+    work_item = str(uuid.UUID(preflight.evidence["work_item_id"]))
+    lineage = preflight.sql(
+        "SELECT l.head_sha FROM thread_publication_lineages l "
+        "JOIN work_items w ON w.publication_lineage_id = l.id "
+        f"WHERE w.id = '{work_item}'"
     )
-    if completed.returncode != 0:
+    if len(lineage) != 1 or not lineage[0][0]:
+        raise ScriptedScenarioError("no actual published lineage head")
+    scenario.assert_ci_completion(result, preflight.ci_observations, lineage[0][0])
+    result["ci_observations"] = preflight.ci_observations
+    observations = preflight.sql(
+        "SELECT note FROM execution_request_phase_reports "
+        f"WHERE execution_request_id = '{request}' AND phase = 'verification_preflight' ORDER BY id"
+    )
+    records = [json.loads(row[0]) for row in observations]
+    matching = [r for r in records if r.get("command") == " ".join(scenario.FIXTURE_CHECK)]
+    if not matching:
+        raise ScriptedScenarioError("no actual declared fixture preflight observation")
+    paths = preflight.sql(
+        "SELECT changed_paths::text FROM publications "
+        f"WHERE execution_request_id = '{request}' ORDER BY created_at"
+    )
+    changed = [path for row in paths for path in json.loads(row[0])]
+    for record in matching:
+        assert_observed(record["outcome"], changed)
+    result["fixture_preflight"] = matching
+    result["publication_paths"] = changed
+    return result
+
+
+def finish_run(
+    preflight: ScriptedPreflight | None,
+    fixtures: fe.Teardown,
+    model: Any,
+    *,
+    code: int,
+    record: bool,
+) -> tuple[int, list[dict[str, Any]]]:
+    cleanup = preflight.teardown.run() if preflight is not None else []
+    cleanup += fixtures.run()
+    if not all(result["ok"] for result in cleanup) or (model is not None and not model._exchanges):
+        code = fe.EXIT_FAILED
+    if preflight is not None:
+        preflight.evidence.update(
+            result="passed" if code == 0 else "failed",
+            teardown=cleanup,
+            teardown_clean=all(r["ok"] for r in cleanup),
+            finished_at=dt.datetime.now(dt.UTC).isoformat(),
+            model_mode="provider recording" if record else "strict replay",
+            model_exchanges=len(model._exchanges),
+        )
+        preflight.write_evidence()
+        shutil.rmtree(preflight.workdir, ignore_errors=True)
+    for result in cleanup:
         print(
-            "factory-e2e: scripted install is not ready in "
-            f"{args.namespace}; helm status failed",
+            f"factory-e2e: cleanup {result['step']}: {'ok' if result['ok'] else 'FAILED'}",
             file=sys.stderr,
         )
-        return fe.EXIT_FAILED
-    return 0
+    return code, cleanup
+
+
+def main(args: argparse.Namespace) -> int:
+    record = getattr(args, "record", False)
+    transcript = Path(args.transcript).resolve()
+    try:
+        refuse_context(args.context)
+        namespace = fe.validate_namespace(args.namespace)
+        if args.model_base_url:
+            raise fe.ConfigError(
+                "scripted owns its model proxy; use --listen-host for pod reachability"
+            )
+        if not record:
+            recorded = json.loads(transcript.read_text())
+            if recorded.get("version") != 1 or not recorded.get("exchanges"):
+                raise fe.ConfigError("the factory transcript contains no recorded exchanges")
+        credential = os.environ.get("CURIE_FACTORY_MODEL_API_KEY") if record else None
+        if record and not credential:
+            raise fe.ConfigError("recording needs CURIE_FACTORY_MODEL_API_KEY on the fixture host")
+        if record and transcript.exists():
+            raise fe.ConfigError("recording refuses to overwrite an existing transcript")
+        host = getattr(args, "listen_host", None) or os.environ.get("CURIE_E2E_LISTEN_HOST")
+        if not host:
+            raise fe.ConfigError("--listen-host must name the kind-reachable fixture host IP")
+        # Validate the actual network-policy endpoint before any fixture or namespace starts.
+        fe.model_proxy_egress(f"http://{host}:1")
+    except (fe.ConfigError, ScriptedScenarioError, OSError, ValueError, AttributeError) as exc:
+        print(f"factory-e2e: {exc}", file=sys.stderr)
+        return fe.EXIT_CONFIG
+    stub_module = fixture_module(
+        "factory_github_stub", REPO_ROOT / "tools/github-stub/github_stub.py"
+    )
+    model_module = fixture_module(
+        "factory_model_script", REPO_ROOT / "tools/model-script/model_script.py"
+    )
+    stage = REPO_ROOT / ".projects" / "factory-scripted"
+    stage.mkdir(parents=True, exist_ok=True)
+    evidence = getattr(args, "evidence", None) or stage / f"{namespace}.json"
+    code = fe.EXIT_FAILED
+    preflight: ScriptedPreflight | None = None
+    model: Any = None
+    fixtures = fe.Teardown()
+    previous_signals = {}
+
+    def terminate(signum: int, _frame: Any) -> None:
+        raise SystemExit(128 + signum)
+
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        previous_signals[sig] = signal.signal(sig, terminate)
+    with tempfile.TemporaryDirectory(prefix="fixture-", dir=stage) as temporary:
+        workdir = Path(temporary)
+        try:
+            bundle = fixture_bundle(workdir)
+            key = workdir / "app.pem"
+            fe.run(["openssl", "genrsa", "-out", str(key), "2048"])
+            os.chmod(key, 0o600)
+            github_recording = json.loads(
+                (REPO_ROOT / "tools/github-stub/recordings/curie-pr-3400.json").read_text()
+            )
+            stub = stub_module.GithubStub(
+                workdir / "github",
+                github_recording,
+                host=host,
+                bind="0.0.0.0",
+                seed_tree=FIXTURE,
+                actor_token="example-actor-token",
+                webhook_secret="example-webhook-secret",
+                clock_scale=20,
+            )
+            fixtures.push("close GitHub fixture", lambda: stub.close() or {"closed": True})
+            stub.start()
+            # Preserve recorded timing relative to the first actual pull request.
+            model = model_module.ModelScript(
+                transcript,
+                record=record,
+                require_consumed=True,
+                upstream=getattr(args, "upstream", "https://openrouter.ai/api"),
+                upstream_api_key=credential,
+                host="0.0.0.0",
+            )
+            fixtures.push("close model fixture", lambda: model.close() or {"closed": True})
+            model.start()
+            config = fe.FactoryConfig(
+                kube_context=args.context,
+                app_id="51",
+                installation_id=5501,
+                private_key_file=key,
+                repo="acme-corp/acme-bot",
+                label="factory",
+                mention="example-app",
+                cloudflared="kubectl",
+                priority_classes=("curie-platform", "curie-sandbox"),
+                restore_webhook_url=None,
+                webhook_secret="example-webhook-secret",
+                actor_token="example-actor-token",
+                operator_login="example-operator",
+                model_api_key="example-proxy-token",
+                model=getattr(args, "model", None) or fe.DEFAULT_MODEL,
+                model_context_tokens=None,
+                model_base_url=f"http://{host}:{model.port}",
+                curie_bin=os.environ.get("CURIE_BIN", "curie"),
+                bundle_dir=bundle,
+            )
+            candidate = fe.run(["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"]).strip()
+            preflight = ScriptedPreflight(
+                config,
+                github_stub=stub,
+                repo_root=REPO_ROOT,
+                candidate=candidate,
+                namespace=namespace,
+                evidence_path=Path(evidence),
+                admission_timeout=120,
+                issue_spec=(
+                    "Add Kelvin temperature conversion",
+                    "Support k alongside c and f in unitconv/convert.py. "
+                    "Add tests in unitconv/tests/test_convert.py for 0 c = 273.15 k, "
+                    "32 f = 273.15 k, and Kelvin round trips. Keep length conversions "
+                    "and category rejection unchanged. Run the repository's declared "
+                    "unittest command and publish both changed Python files.",
+                ),
+                expect="pr",
+                scenario_name="issue-to-pr",
+            )
+            preflight.evidence["mode"] = "scripted:record" if record else "scripted:replay"
+            preflight.evidence["image_tag"] = "kind-loaded-candidate"
+            preflight.evidence["github_fixture_clock_scale"] = stub.clock_scale
+            preflight.evidence["fixture_bundle_difference"] = (
+                "connectors.yaml: repository toolchain runner declaration removed"
+            )
+            digest = hashlib.sha256()
+            for path in sorted(bundle.rglob("*")):
+                if path.is_file():
+                    digest.update(
+                        str(path.relative_to(bundle)).encode() + b"\0" + path.read_bytes()
+                    )
+            preflight.evidence["fixture_bundle_sha256"] = digest.hexdigest()
+            preflight.run(run_scenario)
+            preflight.evidence["result"] = "passed"
+            code = 0
+        except BaseException as exc:  # noqa: BLE001 - owned cleanup runs on interrupts too
+            print(f"factory-e2e: scripted failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            if preflight is not None:
+                preflight.evidence.update(result="failed", error=f"{type(exc).__name__}: {exc}")
+        finally:
+            code, _ = finish_run(preflight, fixtures, model, code=code, record=record)
+            for sig, handler in previous_signals.items():
+                signal.signal(sig, handler)
+    return code
 
 
 if __name__ == "__main__":

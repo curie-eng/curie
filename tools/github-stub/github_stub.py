@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import sqlite3
@@ -14,11 +17,14 @@ import ssl
 import subprocess
 import threading
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.request import Request, urlopen
 
 REPOSITORY = "acme-corp/acme-bot"
 HUMAN = {"id": 6601, "login": "octocat", "type": "User"}
@@ -53,9 +59,15 @@ class GithubStub:
         port: int = 0,
         *,
         bind: str | None = None,
+        seed_tree: Path | None = None,
+        actor_token: str | None = None,
+        webhook_secret: str | None = None,
+        clock_scale: float = 1,
     ) -> None:
         if recording.get("version") != 1:
             raise ValueError("unsupported GitHub recording version")
+        if not 0 < clock_scale <= 100:
+            raise ValueError("fixture clock scale must be positive and at most 100")
         try:
             advertised_ip = ipaddress.ip_address(host)
         except ValueError:
@@ -82,6 +94,11 @@ class GithubStub:
         self.host = host
         self.bind = bind_address
         self.port = port
+        self.seed_tree = seed_tree
+        self.actor_token = actor_token
+        self.webhook_secret = webhook_secret
+        self.clock_scale = clock_scale
+        self._hook_config: dict[str, Any] = {"url": "", "content_type": "json"}
         self.ca_file = self.root / "ca.pem"
         self._database = self.root / "state.sqlite3"
         self._server: ThreadingHTTPServer | None = None
@@ -207,6 +224,16 @@ class GithubStub:
             .strip()
             .decode()
         )
+        if self.seed_tree is not None:
+            seed = self.root / "seed"
+            shutil.copytree(
+                self.seed_tree,
+                seed,
+                ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+            )
+            git = ["git", "--git-dir", str(self._repository), "--work-tree", str(seed)]
+            self._run(*git, "add", ".")
+            tree = self._run(*git, "write-tree").strip().decode()
         commit = (
             self._run(
                 "git",
@@ -289,7 +316,9 @@ class GithubStub:
     def _seconds(self) -> float:
         with sqlite3.connect(self._database) as connection:
             elapsed = float(connection.execute("SELECT seconds FROM clock").fetchone()[0])
-        return elapsed + (time.monotonic() - self._real_start if self._real_start else 0)
+        return elapsed + (
+            (time.monotonic() - self._real_start) * self.clock_scale if self._real_start else 0
+        )
 
     def _put(self, kind: str, identifier: int, body: dict[str, Any]) -> None:
         with sqlite3.connect(self._database) as connection:
@@ -346,6 +375,64 @@ class GithubStub:
             .strip()
         )
 
+    def _deliver_label(self, issue: dict[str, Any], label: str, actor: dict[str, Any]) -> None:
+        """Send an external fixture event; retain the receiver's actual response.
+
+        HMAC shape: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries.
+        Request headers, including the signature, are deliberately not recorded.
+        """
+        target = self._hook_config["url"]
+        if not target or not self.webhook_secret:
+            return
+        payload = {
+            "action": "labeled",
+            "issue": issue,
+            "label": {"name": label},
+            "sender": actor,
+            "repository": self._repository_row(),
+            "installation": {"id": 5501},
+        }
+        raw = json.dumps(payload).encode()
+        guid = str(uuid.uuid4())
+        signature = (
+            "sha256=" + hmac.new(self.webhook_secret.encode(), raw, hashlib.sha256).hexdigest()
+        )
+        request = Request(
+            target,
+            data=raw,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-GitHub-Event": "issues",
+                "X-GitHub-Delivery": guid,
+                "X-Hub-Signature-256": signature,
+            },
+        )
+        try:
+            with urlopen(request, timeout=30) as response:
+                status, response_raw = response.status, response.read()
+        except HTTPError as exc:
+            status, response_raw = exc.code, exc.read()
+        try:
+            response_payload = json.loads(response_raw)
+        except ValueError:
+            response_payload = response_raw.decode(errors="replace")
+        identifier = max((row["id"] for row in self._rows("delivery")), default=0) + 1
+        self._put(
+            "delivery",
+            identifier,
+            {
+                "id": identifier,
+                "guid": guid,
+                "delivered_at": _utc(),
+                "event": "issues",
+                "action": "labeled",
+                "status_code": status,
+                "request": {"payload": payload},
+                "response": {"payload": response_payload},
+            },
+        )
+
     def _repository_row(self) -> dict[str, Any]:
         return {
             "id": 4401,
@@ -355,6 +442,7 @@ class GithubStub:
             "default_branch": "main",
             "html_url": f"{self.base_url}/{REPOSITORY}",
             "clone_url": self.clone_url,
+            "permissions": {"push": True, "admin": False},
         }
 
     def _checks(self) -> list[dict[str, Any]]:
@@ -398,7 +486,13 @@ class GithubStub:
             return
         try:
             payload = json.loads(body) if body else {}
-            result = self._rest(handler.command, path, parse_qs(parsed.query), payload)
+            actor = (
+                HUMAN
+                if self.actor_token
+                and handler.headers.get("Authorization") == f"Bearer {self.actor_token}"
+                else BOT
+            )
+            result = self._rest(handler.command, path, parse_qs(parsed.query), payload, actor=actor)
         except (ValueError, KeyError, subprocess.CalledProcessError) as exc:
             self._json(handler, 422, {"message": str(exc)})
             return
@@ -448,20 +542,52 @@ class GithubStub:
         handler.wfile.write(content)
 
     def _rest(
-        self, method: str, path: str, query: dict[str, list[str]], body: Any
+        self,
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        body: Any,
+        *,
+        actor: dict[str, Any] = BOT,
     ) -> tuple[int, Any] | None:
+        if method == "GET" and path == "/user":
+            return 200, actor
+        if method == "GET" and path == "/app/installations/5501":
+            return 200, {
+                "id": 5501,
+                "app_id": 51,
+                "permissions": PERMISSIONS,
+                "account": {"login": "acme-corp"},
+            }
+        if path == "/app/hook/config" and method in {"GET", "PATCH"}:
+            if method == "PATCH":
+                self._hook_config.update({k: body[k] for k in ("url", "content_type") if k in body})
+            return 200, self._hook_config
+        if method == "GET" and path == "/app/hook/deliveries":
+            return 200, self._page(self._rows("delivery"), query)
+        if method == "GET" and path.startswith("/app/hook/deliveries/"):
+            delivery = self._get("delivery", int(path.rsplit("/", 1)[-1]))
+            return (200, delivery) if delivery else (404, {"message": "Not Found"})
         if method == "POST" and path == "/app/installations/5501/access_tokens":
             if body.get("repositories") != ["acme-bot"]:
                 return 422, {"message": "token must be scoped to acme-bot"}
-            token = "example-installation-token"
+            permissions = body.get("permissions", PERMISSIONS)
+            if not isinstance(permissions, dict) or any(
+                name not in PERMISSIONS or level not in {"read", "write"}
+                or (level == "write" and PERMISSIONS[name] != "write")
+                for name, level in permissions.items()
+            ):
+                return 422, {"message": "requested permission exceeds the installation grant"}
+            granted = {**permissions, "metadata": "read"}
+            token = "example-installation-token-" + uuid.uuid4().hex
             with sqlite3.connect(self._database) as connection:
                 connection.execute(
-                    "INSERT OR REPLACE INTO tokens VALUES(?,?)", (token, json.dumps(PERMISSIONS))
+                    "INSERT INTO tokens VALUES(?,?)", (token, json.dumps(granted))
                 )
             return 201, {
                 "token": token,
                 "expires_at": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-                "permissions": PERMISSIONS,
+                "permissions": granted,
             }
         prefix = f"/repos/{REPOSITORY}"
         if path != prefix and not path.startswith(prefix + "/"):
@@ -478,6 +604,37 @@ class GithubStub:
             }
         if method == "GET" and tail == "collaborators/octocat/permission":
             return 200, {"permission": "write", "user": HUMAN}
+        if method == "GET" and tail == "branches":
+            refs = (
+                self._run(
+                    "git",
+                    "--git-dir",
+                    str(self._repository),
+                    "for-each-ref",
+                    "--format=%(refname:short)",
+                    "refs/heads/",
+                )
+                .decode()
+                .splitlines()
+            )
+            return 200, self._page(
+                [{"name": ref, "commit": {"sha": self._ref(ref)}} for ref in refs], query
+            )
+        if method == "DELETE" and tail.startswith("git/refs/heads/"):
+            branch = tail.removeprefix("git/refs/heads/")
+            if branch == "main":
+                return 422, {"message": "cannot delete fixture default branch"}
+            self._run(
+                "git",
+                "--git-dir",
+                str(self._repository),
+                "update-ref",
+                "-d",
+                f"refs/heads/{branch}",
+            )
+            return 204, None
+        if method == "GET" and tail.startswith("labels/"):
+            return 200, {"name": tail.removeprefix("labels/"), "color": "5319e7"}
         if method == "GET" and tail.startswith("branches/"):
             branch = tail.removeprefix("branches/")
             return 200, {"name": branch, "commit": {"sha": self._ref(branch)}}
@@ -539,10 +696,13 @@ class GithubStub:
                 issue = self._issue(
                     number, body["title"], body.get("body", ""), body.get("labels", [])
                 )
-                issue.update(user=BOT, performed_via_github_app={"id": 51})
+                issue["user"] = actor
+                if actor == BOT:
+                    issue["performed_via_github_app"] = {"id": 51}
                 self._put("issue", number, issue)
                 for label in issue["labels"]:
-                    self._label_event(number, label["name"], "labeled", BOT)
+                    self._label_event(number, label["name"], "labeled", actor)
+                    self._deliver_label(issue, label["name"], actor)
                 return 201, issue
         if tail.startswith("issues/"):
             parts = tail.split("/")
@@ -640,6 +800,8 @@ class GithubStub:
                     "id": number,
                     "number": number,
                     "state": "open",
+                    "created_at": _utc(),
+                    "updated_at": _utc(),
                     "merged": False,
                     "title": body["title"],
                     "body": body.get("body", ""),
@@ -650,6 +812,8 @@ class GithubStub:
                 }
                 pull = self._fresh_pull(pull)
                 self._put("pull", number, pull)
+                if self._real_start is None:
+                    self._real_start = time.monotonic()
                 return 201, pull
         if tail.startswith("pulls/"):
             parts = tail.split("/")

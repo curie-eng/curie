@@ -12,6 +12,15 @@ on:
   # main dispatches this against next. Scheduled workflows only run from
   # the default branch, so the schedule itself cannot live here.
   workflow_dispatch:
+    inputs:
+      factory_record:
+        description: Record the actual scripted factory fixture through the model provider
+        type: boolean
+        default: false
+      factory_recording_recipient:
+        description: Public PEM certificate for encrypting the recording before artifact upload
+        type: string
+        default: ''
 
 # Supersede an in-flight run of the same event on the same ref. The event
 # name is part of the group so a dispatch is not cancelled by a push to
@@ -2404,11 +2413,39 @@ jobs:
         if: needs.changes.outputs.factory == 'true'
         env:
           CURIE_BIN: cli/target/release/curie
+          FACTORY_RECORD: ${{ github.event_name == 'workflow_dispatch' && inputs.factory_record }}
+          FACTORY_RECORDING_RECIPIENT: ${{ inputs.factory_recording_recipient }}
+          CURIE_FACTORY_MODEL_API_KEY: ${{ github.event_name == 'workflow_dispatch' && inputs.factory_record && secrets.OPENROUTER_API_KEY || '' }}
         run: |
           set -euo pipefail
-          CURIE_FACTORY_SCRIPTED_PLAN=1 python3 tools/factory-e2e/factory_e2e.py scripted \
-            --context kind-curie-e2e \
-            --model-base-url http://10.1.2.3:8080
+          args=(--context kind-curie-e2e --namespace test-factory-scripted)
+          if [[ "$FACTORY_RECORD" == true ]]; then
+            test -n "$FACTORY_RECORDING_RECIPIENT"
+            mkdir -m 700 "$RUNNER_TEMP/factory-recording"
+            printf '%s\n' "$FACTORY_RECORDING_RECIPIENT" > "$RUNNER_TEMP/factory-recording/recipient.pem"
+            openssl x509 -in "$RUNNER_TEMP/factory-recording/recipient.pem" -noout -checkend 0
+            args+=(--record --transcript "$RUNNER_TEMP/factory-recording/unitconv-issue.json")
+          fi
+          python3 tools/factory-e2e/factory_e2e.py scripted "${args[@]}"
+      - name: Encrypt recorded factory exchanges
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.factory_record }}
+        env:
+          CURIE_FACTORY_MODEL_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          python3 tools/factory-e2e/encrypt_recording.py \
+            "$RUNNER_TEMP/factory-recording/unitconv-issue.json" \
+            "$RUNNER_TEMP/factory-recording/recipient.pem" \
+            "$RUNNER_TEMP/factory-recording/encrypted.bin"
+          rm -f "$RUNNER_TEMP/factory-recording/unitconv-issue.json"
+      - name: Upload encrypted factory recording for private review
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.factory_record }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: encrypted-factory-recording
+          path: ${{ runner.temp }}/factory-recording/encrypted.bin
+          if-no-files-found: error
+          retention-days: 3
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       - name: Dump cluster diagnostics on failure

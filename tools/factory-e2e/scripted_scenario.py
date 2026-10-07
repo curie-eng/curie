@@ -9,6 +9,8 @@ can show the failure. They are not the product path.
 
 from __future__ import annotations
 
+from typing import Any
+
 FIXTURE_CHECK = ["python", "-m", "unittest", "discover", "-s", "unitconv/tests", "-v"]
 FIXTURE_CHANGED_PATHS = [
     "unitconv/convert.py",
@@ -28,6 +30,29 @@ def assert_preflight_outcome(outcome: str) -> None:
     if outcome not in {"passed", "failed"}:
         raise ScenarioAssertionError(
             f"preflight reported {outcome!r}; expected passed or failed"
+        )
+
+
+def assert_ci_completion(
+    result: dict[str, Any],
+    observations: list[dict[str, Any]],
+    head_sha: str,
+) -> None:
+    """A PR and comment alone cannot stand in for completed product CI waiting."""
+    if (
+        result.get("terminal") is not True
+        or result.get("request_status") != "completed"
+        or result.get("terminal_cause") != "completed"
+        or result.get("ending_cause") != "completed"
+        or result.get("work_item_state") != "published"
+        or (result.get("ci") or {}).get("state") != "passing"
+        or (result.get("ci") or {}).get("head_sha") != head_sha
+    ):
+        raise ScenarioAssertionError("published request did not complete with passing head CI")
+    states = [row.get("state") for row in observations if row.get("head_sha") == head_sha]
+    if "pending" not in states or "passing" not in states[states.index("pending") + 1 :]:
+        raise ScenarioAssertionError(
+            "no product pending-to-passing CI observations on published head"
         )
 
 

@@ -86,6 +86,15 @@ def _post(base: str, payload: dict[str, Any]) -> tuple[int, bytes, str]:
         return int(exc.code), exc.read(), exc.headers.get("Content-Type", "")
 
 
+def test_required_replay_rejects_unconsumed_exchanges(tmp_path: Path) -> None:
+    transcript = tmp_path / "transcript.json"
+    ms.dump_transcript(transcript, [_exchange("implementer", "plan")])
+    server = ms.ModelScript(transcript, require_consumed=True)
+    server.start()
+    with pytest.raises(ms.UnexpectedRequest, match="unconsumed"):
+        server.close()
+
+
 def test_normalize_ignores_stream_ids_and_urls() -> None:
     left = {
         "system": "plan reviewer https://github.com/acme/fixture/issues/4",
@@ -165,6 +174,7 @@ def test_record_proxies_and_replays(tmp_path: Path) -> None:
             output,
             record=True,
             upstream=f"http://127.0.0.1:{server.server_address[1]}",
+            upstream_api_key="example-provider-key",
         )
         recorder.start()
         status, body, _ = _post(
@@ -187,7 +197,8 @@ def test_record_proxies_and_replays(tmp_path: Path) -> None:
     finally:
         server.shutdown()
         server.server_close()
-    assert seen["key"] == "sk-or-test-secret"
+    assert seen["key"] == "example-provider-key"
+    assert "example-provider-key" not in output.read_text()
     saved = json.loads(output.read_text())
     assert len(saved["exchanges"]) == 2
     replay = ms.ModelScript(output)

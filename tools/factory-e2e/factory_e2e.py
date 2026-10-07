@@ -1047,6 +1047,7 @@ def judge_outcome(
     expect_causes: frozenset[str] | set[str] | None = None,
     expect_reasons: Sequence[str] = (),
     secrets: Sequence[str | None] = (),
+    github_html_base: str = "https://github.com",
 ) -> list[str]:
     """Every way an issue-to-pr ending falls short. Empty means it passed.
 
@@ -1086,7 +1087,11 @@ def judge_outcome(
     final_body = comment_bodies[0] if len(comment_bodies) == 1 else None
     if prs and final_body is not None:
         pr_url = str(prs[0].get("url") or "")
-        if not pr_url or pr_url not in _PULL_REQUEST_URL.findall(final_body):
+        pattern = _PULL_REQUEST_URL if github_html_base == "https://github.com" else re.compile(
+            re.escape(github_html_base.rstrip("/"))
+            + r"/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*"
+        )
+        if not pr_url or pr_url not in pattern.findall(final_body):
             failures.append(f"the final comment does not name the opened pull request {pr_url!r}")
     if comments and not prs:
         if expect != "pr":
@@ -1588,6 +1593,8 @@ def _stop(process: subprocess.Popen[Any]) -> bool:
 
 
 class Preflight:
+    github_html_base = "https://github.com"
+
     def __init__(
         self,
         config: FactoryConfig,
@@ -1708,6 +1715,16 @@ class Preflight:
 
     def as_actor(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
         return self.github(method, path, token=self.config.actor_token, body=body)
+
+    def github_diff(self, number: int) -> tuple[int, str]:
+        return http_text(
+            f"{GITHUB_API}/repos/{self.config.repo}/pulls/{number}",
+            headers={
+                "Authorization": f"Bearer {self.config.actor_token}",
+                "Accept": "application/vnd.github.diff",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
 
     def as_app(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
         token = app_jwt(self.config.app_id, self.config.private_key_file)
@@ -1996,6 +2013,10 @@ class Preflight:
             "verified_absent": True,
         }
 
+    def installation_values(self, config: FactoryConfig, **kwargs: Any) -> dict[str, Any]:
+        """Use the same install contract for setup and later owned upgrades."""
+        return install_values(config, **kwargs)
+
     def install(self) -> None:
         chart = self.extract_chart()
         consumer = bool(
@@ -2043,7 +2064,7 @@ class Preflight:
         self._consumer_controller = consumer
         self._egress_cidrs = list(egress_cidrs)
         self._sandbox_quota = quota
-        values = install_values(
+        values = self.installation_values(
             self.config,
             candidate=self.candidate,
             app_key_secret=APP_KEY_REF,
@@ -2621,7 +2642,7 @@ class Preflight:
 
         assert self.chart_dir is not None, "install() extracts the chart first"
         config = self.config if model is None else dataclasses.replace(self.config, model=model)
-        values = install_values(
+        values = self.installation_values(
             config,
             candidate=self.candidate,
             app_key_secret=APP_KEY_REF,
@@ -3357,14 +3378,7 @@ def _scenario_pull_requests(p: Preflight) -> list[dict[str, Any]]:
         files, previous = pr_file_names(p._paged(f"{repo}/pulls/{number}/files"))
         status, detail = p.as_actor("GET", f"{repo}/pulls/{number}")
         detail = detail if status == 200 and isinstance(detail, dict) else {}
-        status, diff = http_text(
-            f"{GITHUB_API}{repo}/pulls/{number}",
-            headers={
-                "Authorization": f"Bearer {p.config.actor_token}",
-                "Accept": "application/vnd.github.diff",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
+        status, diff = p.github_diff(number)
         if status != 200:
             raise PreflightFailed(f"reading the diff of pull request #{number} failed")
         prs.append(
@@ -3642,6 +3656,7 @@ def issue_to_pr(p: Preflight) -> dict[str, Any]:
         expect_causes=p.expect_causes,
         expect_reasons=p.expect_reasons,
         secrets=known,
+        github_html_base=p.github_html_base,
     )
     link = _work_item_link(p, str(work_item_id)) if len(prs) == 1 else None
     failures += judge_lineage(link, prs)
@@ -5158,6 +5173,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=Path("tools/model-script/transcripts/unitconv-issue.json"),
     )
     scripted.add_argument("--model-base-url")
+    scripted.add_argument("--listen-host")
+    scripted.add_argument("--model")
+    scripted.add_argument("--record", action="store_true")
+    scripted.add_argument("--upstream", default="https://openrouter.ai/api")
+    scripted.add_argument("--evidence", type=Path)
     return parser.parse_args(argv)
 
 

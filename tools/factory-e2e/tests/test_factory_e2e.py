@@ -593,6 +593,19 @@ def test_clean_single_pr_passes() -> None:
     assert fe.judge_outcome(_outcome(), "pr") == []
 
 
+def test_fixture_comment_must_name_exact_pr_on_its_owned_html_base() -> None:
+    base = "https://127.0.0.1:8443"
+    url = base + "/acme/fixture/pull/5"
+    outcome = _outcome(
+        pull_requests=[_pr(url=url)], terminus_comment_bodies=["Completed: " + url]
+    )
+    assert fe.judge_outcome(outcome, "pr")
+    assert fe.judge_outcome(outcome, "pr", github_html_base=base) == []
+    for wrong in ("https://127.0.0.2:8443/acme/fixture/pull/5", base + "/acme/fixture/pull/6"):
+        outcome["terminus_comment_bodies"] = ["Completed: " + wrong]
+        assert fe.judge_outcome(outcome, "pr", github_html_base=base)
+
+
 def test_non_terminal_run_fails() -> None:
     assert fe.judge_outcome(_outcome(terminal=False), "any")
 

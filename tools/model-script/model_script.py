@@ -249,11 +249,15 @@ class ModelScript:
         upstream: str = "https://openrouter.ai/api",
         host: str = "127.0.0.1",
         port: int = 0,
+        require_consumed: bool = False,
+        upstream_api_key: str | None = None,
     ) -> None:
         self.transcript = transcript
         self.record = record
         self.upstream = upstream.rstrip("/")
         self.host = host
+        self.require_consumed = require_consumed
+        self.upstream_api_key = upstream_api_key
         self._exchanges = [] if record else load_transcript(transcript)
         self._used: set[int] = set()
         self.unexpected: list[dict[str, Any]] = []
@@ -310,6 +314,10 @@ class ModelScript:
             raise UnexpectedRequest(
                 f"{len(self.unexpected)} request(s) were not in the transcript"
             )
+        if self.require_consumed and not self.record:
+            remaining = len(self._exchanges) - len(self._used)
+            if remaining:
+                raise UnexpectedRequest(f"{remaining} unconsumed transcript exchange(s)")
 
     def _match(self, method: str, path: str, body: bytes) -> dict[str, Any] | None:
         try:
@@ -386,6 +394,8 @@ class ModelScript:
             value = handler.headers.get(name)
             if value:
                 headers[name] = value
+        if self.upstream_api_key:
+            headers["x-api-key"] = self.upstream_api_key
         request = Request(
             self.upstream + path,
             data=body,
