@@ -217,7 +217,7 @@ def _frames(tool: str = TOOL) -> tuple[SideEffectFlag, SideEffectFlag]:
 
 
 async def _round_trip(
-    apps: FakeAppsV1Api | None,
+    apps: Any,
     *,
     tool: str = TOOL,
     resolver: Resolver | None = None,
@@ -246,7 +246,7 @@ async def _round_trip(
         opened = time.monotonic()
         assert isinstance(recorded, RecordedAction)
         assert recorded.id == "a1"
-        if apps is not None:
+        if isinstance(apps, FakeAppsV1Api):
             # The opening read is taken on the opening frame, not deferred.
             assert len(apps.reads) <= 1
         row = await recorder.complete(recorded.id, closing)
@@ -549,9 +549,15 @@ async def test_a_read_past_the_bound_records_null_within_the_bound(
     assert record_seconds + complete_seconds <= READ_TIMEOUT_SECONDS + 2 * SLACK_SECONDS
 
 
-async def test_two_reads_past_the_bound_add_at_most_four_seconds(
+async def test_hung_reads_keep_the_whole_action_within_four_seconds(
     released: list[FakeAppsV1Api],
 ) -> None:
+    """Whatever reads a hung API server causes, the action adds at most two bounds.
+
+    (Whether a hung opening read is followed by a closing read is the wrapper's
+    choice; the closing-read hang is pinned on its own above.)
+    """
+
     apps = FakeAppsV1Api(Hang, Hang)
     released.append(apps)
 
@@ -565,3 +571,170 @@ async def test_two_reads_past_the_bound_add_at_most_four_seconds(
     assert total <= 2 * READ_TIMEOUT_SECONDS + 2 * SLACK_SECONDS
     # The turn's record and completion both still landed.
     assert [p["path"] for p in ledger.posts] == ["/actions", "/actions/a1/complete"]
+
+
+# -- a timed-out read does not keep its thread past the bound -------------------
+#
+# ``asyncio.wait_for`` frees the turn at the bound, but the sync client keeps
+# running in its thread. The kubernetes client turns a float ``_request_timeout``
+# into a per-attempt urllib3 timeout and, by default, retries a read timeout, so
+# one stalled read would hold a shared executor thread for several bounds. The
+# client the worker builds must make one attempt only.
+
+
+class _SilentApiServer:
+    """A TCP listener that accepts connections and never answers; counts attempts."""
+
+    def __init__(self) -> None:
+        import socket
+
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.bind(("127.0.0.1", 0))
+        self._sock.listen(16)
+        self._sock.settimeout(0.2)
+        self.port = self._sock.getsockname()[1]
+        self.connections = 0
+        self._held: list[Any] = []
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._sock.accept()
+            except OSError:
+                continue
+            self.connections += 1
+            self._held.append(conn)
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        for conn in self._held:
+            conn.close()
+        self._sock.close()
+
+
+@pytest.fixture
+def silent_api_server() -> Iterator[_SilentApiServer]:
+    server = _SilentApiServer()
+    yield server
+    server.close()
+
+
+@pytest.fixture
+def local_cluster_config(
+    monkeypatch: pytest.MonkeyPatch, silent_api_server: _SilentApiServer
+) -> None:
+    """Point the worker's cluster config at the silent server; never at a kubeconfig."""
+
+    from kubernetes import config as k8s_config
+
+    monkeypatch.setattr(k8s_client.Configuration, "_default", None)
+
+    def in_cluster() -> None:
+        configuration = k8s_client.Configuration()
+        configuration.host = f"http://127.0.0.1:{silent_api_server.port}"
+        k8s_client.Configuration.set_default(configuration)
+
+    def no_kubeconfig(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("the test must never load a real kubeconfig")
+
+    monkeypatch.setattr(k8s_config, "load_incluster_config", in_cluster)
+    monkeypatch.setattr(k8s_config, "load_kube_config", no_kubeconfig)
+
+
+@pytest.mark.usefixtures("local_cluster_config")
+async def test_a_timed_out_read_makes_one_attempt_and_releases_its_thread(
+    silent_api_server: _SilentApiServer,
+) -> None:
+    import asyncio
+
+    from curie_worker.connector_k8s import connector_deployments_api
+
+    api = connector_deployments_api()
+
+    body, _, (record_seconds, _) = await _round_trip(api)
+    assert _attributed(body) == NULL
+    assert record_seconds <= READ_TIMEOUT_SECONDS + SLACK_SECONDS
+
+    # Long enough for a retried attempt (one more bound) to have connected.
+    await asyncio.sleep(READ_TIMEOUT_SECONDS + 1.5)
+    assert silent_api_server.connections == 1
+
+
+# -- composition: the wrapper exists only where the Role grants the get ---------
+
+
+class _GateConfig:
+    def __init__(self, *, reconcile: bool, executor: bool) -> None:
+        self.connector_reconcile_enabled = reconcile
+        self.action_executor_enabled = executor
+        self.connector_namespace = NAMESPACE
+        self.connector_release = "rel"
+        self.db_schema = "curie"
+        self.internal_worker_token = "wt"
+
+
+@pytest.mark.parametrize(
+    ("reconcile", "executor"),
+    [(False, False), (True, False), (False, True)],
+    ids=["neither", "reconciler_only", "executor_only"],
+)
+def test_without_both_gates_the_ledger_client_is_not_wrapped(
+    monkeypatch: pytest.MonkeyPatch, reconcile: bool, executor: bool
+) -> None:
+    from curie_worker import connector_k8s, run
+
+    built: list[str] = []
+    monkeypatch.setattr(
+        connector_k8s, "connector_deployments_api", lambda **_k: built.append("apps")
+    )
+    inner = ActionClient(api_base_url="http://api", api_key="k", client=httpx.AsyncClient())
+
+    composed = run._build_action_recorder(
+        _GateConfig(reconcile=reconcile, executor=executor),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        inner,
+    )
+
+    assert composed is inner
+    # No cluster client is even built: the Role has no get to use.
+    assert built == []
+
+
+async def test_with_both_gates_the_composed_recorder_attributes_through_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_worker import action_digest, connector_k8s, run
+
+    apps = FakeAppsV1Api(deployment(), deployment())
+    monkeypatch.setattr(connector_k8s, "connector_deployments_api", lambda **_k: apps)
+    engine = object()
+    factory_calls: list[Any] = []
+    resolve, asked = _resolver()
+
+    def factory(eng: Any, *, db_schema: str, release: str) -> Resolver:
+        factory_calls.append((eng, db_schema, release))
+        return resolve
+
+    monkeypatch.setattr(action_digest, "agent_deployment_resolver", factory)
+
+    ledger = Ledger()
+    opening, closing = _frames()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(ledger)) as http:
+        composed = run._build_action_recorder(
+            _GateConfig(reconcile=True, executor=True),  # type: ignore[arg-type]
+            engine,  # type: ignore[arg-type]
+            ActionClient(api_base_url="http://api", api_key="k", client=http),
+        )
+        recorded = await composed.record(
+            opening, event_id="event-1", conversation_id="C1", agent_id=AGENT_ID
+        )
+        await composed.complete(recorded.id, closing)
+
+    assert factory_calls == [(engine, "curie", "rel")]
+    assert asked and asked[0] == (AGENT_ID, CONNECTOR)
+    assert [r["namespace"] for r in apps.reads] == [NAMESPACE, NAMESPACE]
+    assert _attributed(ledger.completion()) == (CONNECTOR, DIGEST)

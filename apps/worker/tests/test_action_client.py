@@ -288,3 +288,39 @@ async def test_completion_without_attribution_sends_none() -> None:
     ):
         assert body.get("connector") is None
         assert body.get("connector_digest") is None
+
+
+async def test_an_attributed_completion_carries_the_worker_token() -> None:
+    """@spec ACTION-EXECUTOR-12: the API takes attribution only under the worker token.
+
+    The platform key still rides along; the token is what lets the completion
+    carry ``connector``/``connector_digest`` at all.
+    """
+
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            {
+                "path": request.url.path,
+                "api_key": request.headers.get("X-API-Key"),
+                "worker_token": request.headers.get("X-Curie-Worker-Token"),
+                "body": json.loads(request.content),
+            }
+        )
+        return httpx.Response(200, json={"id": "a1"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        await ActionClient(
+            api_base_url="http://api", api_key="k", client=http, worker_token="wt"
+        ).complete(
+            "a1",
+            SideEffectFlag(tool="mcp__grafana__scale", call_id="c", result={"ok": True}),
+            connector="grafana",
+            connector_digest=_DIGEST,
+        )
+
+    assert seen[0]["path"] == "/actions/a1/complete"
+    assert seen[0]["body"]["connector_digest"] == _DIGEST
+    assert seen[0]["worker_token"] == "wt"
+    assert seen[0]["api_key"] == "k"
