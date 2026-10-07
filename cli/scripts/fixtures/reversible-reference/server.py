@@ -289,10 +289,12 @@ def build(store: Store, keys: Keyring, variant: str) -> MCPServer:
 
         @spec ACTION-EXECUTOR-15 @spec ACTION-EXECUTOR-16. ``expected_version``,
         when given, must equal the live version or the call refuses
-        ``version_conflict`` and writes nothing.
+        ``version_conflict`` and writes nothing. The target is not checked on
+        its own: it is the associated data of the open, so a malformed or
+        foreign target fails there as ``snapshot_unopenable`` (``scale`` never
+        seals for a malformed target).
         """
 
-        key = _record_key(target)
         sealed = _envelope_ciphertext(prior_state)
         if sealed is None:
             log.info("restore refused: %s", SNAPSHOT_UNOPENABLE)
@@ -311,6 +313,7 @@ def build(store: Store, keys: Keyring, variant: str) -> MCPServer:
         if not isinstance(replicas, int) or isinstance(replicas, bool) or replicas < 0:
             log.info("restore refused: %s", SNAPSHOT_UNOPENABLE)
             return _refused(SNAPSHOT_UNOPENABLE)
+        key = _record_key(target)
         with store.lock:
             records = store.load()
             record = _record(records, key)
