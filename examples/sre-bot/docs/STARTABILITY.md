@@ -41,8 +41,9 @@ of an existing per-agent pool in the snapshot, using the actual
 `agent_warm_pool_name` helper. An absent derived pool preserves the generic
 choice; a connector-secret refusal remains a refusal. Never copy the helpers'
 routing, derivation, or secret-name policy into the observer. A worker refusal,
-missing selected pool, missing selected template, or missing connector secret
-reference fails only affected bindings. Check reference presence only;
+missing selected pool, missing selected template, missing or ambiguous named
+runner container in the selected template, or missing connector secret reference
+fails only affected bindings. Check reference presence only;
 do not claim that referenced sandbox Secrets exist or are usable.
 
 ### STARTABILITY-3: Dispatcher identity declarations
@@ -91,8 +92,10 @@ An equal string is a necessary comparison, not proof that a mutable tag points
 to identical bytes; operators should supply the same immutable worker image.
 
 Read SandboxWarmPools and SandboxTemplates only in the supplied sandbox
-namespace, using `extensions.agents.x-k8s.io/v1beta1`, and read template env
-references only from the named runner container. Resolve relevant explicit
+namespace, using `extensions.agents.x-k8s.io/v1beta1`. Record whether each
+template has exactly one named runner container and read secret references only
+from that container. A malformed unselected template does not fail collection.
+Resolve relevant explicit
 environment `value` and `valueFrom.secretKeyRef` / `configMapKeyRef` entries
 in the owning Deployment namespace: worker pool-selection variables and the
 dispatcher declaration plus its credential variables. A failure reading
@@ -126,6 +129,8 @@ command in subprocesses against fixture-backed Kubernetes and database clients.
 Cover positive and negative collection, declaration values held in external
 references, credential absence/blankness/read failure, scoped resource reads,
 image incompatibility, deployment absence, missing pool/template/reference,
+missing and duplicate named runner containers for an agent with no connector
+secrets,
 reserved and connector-only withheld names, empty-list and dispatcher-invalid
 declarations, blank worker pool configuration, discovery of an existing
 unlisted per-agent pool and its selected template, multiple bindings, and zero
