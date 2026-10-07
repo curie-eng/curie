@@ -46,6 +46,7 @@ from curie_api.schemas.approvals import (
 )
 
 from .. import adapter_principal, approval_principal
+from ..action_forward import ForwardRefused
 from ..admission import admit
 from ..approval_auth import (
     ApprovalPrincipalDep,
@@ -58,6 +59,12 @@ from ..authorizer import authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep
 from ..models import Approval, ApprovalStatus
+from ..remediation_approvals import (
+    REMEDIATION_PURPOSE,
+    execute_approved,
+    resolution_refusal,
+    settle_remediation_approval,
+)
 from ..resumequeue import (
     approval_trace_context,
     build_expiry_resume_turn,
@@ -88,6 +95,14 @@ router = APIRouter(prefix="/approvals", tags=["approvals"])
 
 def _approval_not_found() -> HTTPException:
     return HTTPException(status.HTTP_404_NOT_FOUND, APPROVAL_NOT_FOUND_DETAIL)
+
+
+def _remediation_refused(refused: ForwardRefused) -> HTTPException:
+    """The 409 naming why an approved remediation executes nothing (AUTOMATED-REMEDIATION-16)."""
+
+    return HTTPException(
+        status.HTTP_409_CONFLICT, {"code": refused.code, "message": refused.reason}
+    )
 
 
 @router.post(
@@ -554,7 +569,11 @@ async def resolve_approval(
                 authorized=True,
                 reason=f"approval expired at {expires_at}",
             )
-            if expired.purpose == "publication":
+            if expired.purpose == REMEDIATION_PURPOSE:
+                # AUTOMATED-REMEDIATION-16: an expired remediation creates
+                # nothing and ends its nominations; no model wake is owed.
+                await settle_remediation_approval(session, approval_id, ApprovalStatus.expired)
+            if expired.purpose in crud_approvals.NO_WAKE_PURPOSES:
                 raise HTTPException(
                     status.HTTP_410_GONE,
                     f"approval expired at {expires_at} and can no longer be resolved",
@@ -618,6 +637,14 @@ async def resolve_approval(
                 f"approval expired at {expires_at} and can no longer be resolved",
             )
 
+    if approval.purpose == REMEDIATION_PURPOSE and data.decision == ApprovalStatus.approved:
+        # AUTOMATED-REMEDIATION-16: judged before the claim, so a refused
+        # approval executes nothing and stays undecided.
+        refused = await resolution_refusal(session, approval)
+        if refused is not None:
+            await _audit("remediation_refused", authorized=True, reason=refused.code)
+            raise _remediation_refused(refused)
+
     with operation_span(
         "curie.approval.resolve",
         kind=SpanKind.INTERNAL,
@@ -662,6 +689,23 @@ async def resolve_approval(
         },
     )
     await _audit("resolved", authorized=True, reason=decision.reason or None)
+
+    if claimed.purpose == REMEDIATION_PURPOSE:
+        # AUTOMATED-REMEDIATION-16: no model wake (the claim marked it owed
+        # nothing). Approval builds the one forward execution from the
+        # nomination row; rejection ends the nominations.
+        out = ApprovalOut.model_validate(claimed)
+        if claimed.status == ApprovalStatus.approved:
+            try:
+                await execute_approved(session, approval_id)
+            except ForwardRefused as exc:
+                logger.warning(
+                    "remediation approval %s approved but refused %s", approval_id, exc.code
+                )
+                raise _remediation_refused(exc) from None
+        else:
+            await settle_remediation_approval(session, approval_id, ApprovalStatus.rejected)
+        return out
 
     if claimed.purpose == "publication":
         # Publication outcomes are consumed by the trusted worker and emitted

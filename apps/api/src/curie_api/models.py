@@ -570,8 +570,9 @@ class Approval(Base):
     granted_arguments: Mapped[dict[str, Any] | None] = mapped_column(
         JSONB(none_as_null=True), default=None
     )
-    # Server-owned purpose. ``publication`` suppresses the ordinary model wake;
-    # requester equality follows the same approver-set rule for every purpose.
+    # Server-owned purpose. ``publication`` and ``remediation`` (an argument-bound
+    # remediation call, AUTOMATED-REMEDIATION-15) suppress the ordinary model
+    # wake; requester equality follows the same approver-set rule for every purpose.
     purpose: Mapped[str] = mapped_column(server_default="session", default="session")
     # Set only when the platform resolved this row under ADR 0147. Human
     # resolutions leave both NULL so they stay distinguishable in the audit.

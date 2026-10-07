@@ -55,6 +55,8 @@ from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import publications as crud_publications
 
 from .config import get_settings
+from .models import ApprovalStatus
+from .remediation_approvals import REMEDIATION_PURPOSE, settle_remediation_approval
 from .resumequeue import (
     ResumeQueue,
     approval_trace_context,
@@ -148,7 +150,11 @@ async def sweep_expired_approvals(
                 authorized=True,
                 reason=f"approval expired at {expired.expires_at}",
             )
-            if expired.purpose == "publication":
+            if expired.purpose == REMEDIATION_PURPOSE:
+                # AUTOMATED-REMEDIATION-16: no execution and no model wake; the
+                # nominations end expired.
+                await settle_remediation_approval(session, expired.id, ApprovalStatus.expired)
+            if expired.purpose in crud_approvals.NO_WAKE_PURPOSES:
                 flipped += 1
                 continue
             stream_id = await resume_queue.enqueue(
