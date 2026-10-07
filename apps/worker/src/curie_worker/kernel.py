@@ -3571,6 +3571,8 @@ class Kernel:
                 )
             termination_detail: str | None = None
             attempt = 0
+            capacity_refusals = 0
+            capacity_wait_run: WorkItemRun | None = None
             while True:
                 attempt += 1
                 hook_carry = _HOOK_RUN_CARRY.get()
@@ -3578,8 +3580,8 @@ class Kernel:
                     hook_carry.this_attempt_started = False
                 # The delivery's overall deadline gates every attempt, and the
                 # attempts CONSUME it: a retry never restarts it.
-                if lease is not None:
-                    if lease.lost.is_set():
+                if lease is not None or capacity_wait_run is not None:
+                    if lease is not None and lease.lost.is_set():
                         # Fenced out between attempts. Start nothing: a
                         # replacement holds this delivery and is entitled to run
                         # it. Returning without completing leaves the entry
@@ -3592,8 +3594,10 @@ class Kernel:
                             event_id,
                         )
                         return
-                    remaining = lease.remaining_s()
-                    if remaining <= _MIN_ATTEMPT_BUDGET_S:
+                    remaining = _remaining_budget(lease)
+                    if capacity_wait_run is not None:
+                        remaining = capacity_wait_run.bound_remaining_s(remaining)
+                    if remaining is not None and remaining <= _MIN_ATTEMPT_BUDGET_S:
                         # DISTINCT from the model-spend ``budget-exceeded``
                         # classification: this is the wall-clock delivery
                         # deadline, and conflating the two would make both
@@ -3854,6 +3858,19 @@ class Kernel:
                     return
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
+                capacity_continuation = None
+                if outcome.classification == "sandbox-capacity" and (
+                    (parsed_work_item is not None and parsed_work_item.is_ci_fix)
+                    or self._is_approval_resume(event_id)
+                ):
+                    capacity_continuation = self._run_for_event(event_id)
+                if capacity_continuation is not None:
+                    # The execution already started, so SQL defer cannot hold
+                    # this continuation. Waiting for quota consumes its delivery
+                    # and execution deadlines, never a runner attempt (#4275).
+                    capacity_wait_run = capacity_continuation
+                    capacity_refusals += 1
+                    attempt -= 1
                 if outcome.classification == "sandbox-terminated":
                     termination_detail = outcome.error_message
                 if (
@@ -3937,13 +3954,25 @@ class Kernel:
                         "retry_class": cast("str", outcome.classification),
                     },
                 )
-                backoff_s = self._backoff(attempt)
-                if lease is not None:
+                backoff_s = self._backoff(
+                    capacity_refusals if capacity_continuation is not None else attempt
+                )
+                remaining = _remaining_budget(lease)
+                if capacity_continuation is not None:
+                    remaining = capacity_continuation.bound_remaining_s(remaining)
+                if remaining is not None:
                     # The backoff CONSUMES the delivery budget; it never extends
                     # it. Clamped, because an unclamped backoff longer than the
                     # remaining deadline burns the whole thing asleep and then
                     # escalates without ever having retried -- the worst of both.
-                    backoff_s = min(backoff_s, max(0.0, lease.remaining_s()))
+                    backoff_s = min(backoff_s, max(0.0, remaining))
+                if capacity_continuation is not None:
+                    logger.info(
+                        "sandbox capacity retry for event %s: refusal=%d backoff=%.3fs",
+                        event_id,
+                        capacity_refusals,
+                        backoff_s,
+                    )
                 await asyncio.sleep(backoff_s)
         finally:
             if owned_work_item_id is not None:
@@ -4776,7 +4805,11 @@ class Kernel:
                 elif outcome == "delivered":
                     ci_fix = parsed is not None and parsed.is_ci_fix
                     if ci_fix:
-                        cause = "ci_fix_unpublished"
+                        cause = (
+                            "runner_escalated"
+                            if turn is not None and turn.start_failed
+                            else "ci_fix_unpublished"
+                        )
                     elif turn is None or self._is_approval_resume(qevent.event_id):
                         cause = "no_pull_request"
                     else:
@@ -5574,10 +5607,14 @@ class Kernel:
                     raise _WorkItemDeferred() from None
 
             async def capacity_refusal() -> TurnOutcome:
-                # An approval resume has no capacity reply to send or queue to
-                # wait in: it fails as sandbox-capacity and the driving loop
-                # retries it (#3693). Every other turn answers the person.
-                if self._is_approval_resume(qevent.event_id):
+                # Started factory continuations wait in the driving loop:
+                # their running request cannot use SQL defer (#4275). An
+                # interactive approval keeps its bounded retry policy (#3693).
+                if (
+                    parsed_execute is not None
+                    and parsed_execute.is_ci_fix
+                    and self._run_for_event(qevent.event_id) is not None
+                ) or self._is_approval_resume(qevent.event_id):
                     release_order()
                     return TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
                 return await capacity_response()
