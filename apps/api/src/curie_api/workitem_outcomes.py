@@ -34,6 +34,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import Settings
+from .factory_notices import start_failed_sentence
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import (
     Approval,
@@ -182,10 +183,8 @@ def _cause(
         )
     if state == "failed":
         if cause == "start_failed":
-            return (
-                f"failed: start_failed, the sandbox did not start after "
-                f"{req.start_deferrals} attempts. "
-                f"Last reason: {req.last_deferral_reason or 'unknown'}."
+            return "failed: start_failed, " + start_failed_sentence(
+                req.start_deferrals, req.last_deferral_reason or "unknown"
             )
         text = f"failed: {cause}"
         if cause == "deadline_halted":
