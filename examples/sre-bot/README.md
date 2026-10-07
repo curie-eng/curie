@@ -10,6 +10,10 @@ per-message, source-thread intake described in
 not part of the default bundle because its Slack source identity, subject
 prefixes, channel, and signed hook are installation-specific.
 
+Installations can also opt into [scheduled job health alerts](docs/SCHEDULED-JOB-ALERTS.md).
+The renderer requires an explicit namespace and impact description; it does not
+change the default installation or treat intentionally suspended templates as healthy.
+
 ## Kubernetes authority
 
 The bundle's `toolPolicy` classifies the pinned server's complete 19-tool core

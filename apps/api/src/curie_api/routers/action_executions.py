@@ -22,9 +22,11 @@ version, ends the execution ``refused`` with ``version_conflict`` and writes the
 ``refused_conflict`` audit row naming both versions, in the same transaction,
 so no ``dispatched`` commit (and so no write call) can follow it.
 
-Every route uses the platform key the worker already holds
-(``require_platform_key``), never a console session. No response, audit row or
-refusal body carries an envelope, a state, an argument or a result.
+The probe and every claim, observation, arguments, dispatch and outcome route
+require the internal worker token (``require_internal_worker_token``), never
+the platform or operator key or a console session; only the receipt,
+``GET /action-executions/{id}``, takes the platform key for the operator CLI.
+No response, audit row or refusal body carries an envelope, a state, an argument or a result.
 """
 
 from __future__ import annotations

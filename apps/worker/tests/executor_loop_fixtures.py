@@ -675,7 +675,10 @@ class FakeRunner:
     ``call_mode``: ``reply`` (answer ``call_reply``), ``crash`` (the write
     reaches the connector, then the connection drops), ``unknown`` (the write
     reaches the connector, then the vector's ``call_transport_failure``), or
-    ``refuse:<code>`` (a pre-dial route refusal: no write).
+    ``refuse:<code>`` (a pre-dial route refusal: no write), or ``preflight``
+    (the real runner's ``call`` checks, ``curie_runner.executor``, applied to
+    this sandbox's own ``list`` and phase order: a refusal answers its code
+    with no write, anything else answers ``call_reply`` after one write).
     """
 
     def __init__(self, timeline: Timeline) -> None:
@@ -727,6 +730,13 @@ class FakeRunner:
             return web.json_response({"refused": "invalid_request"}, status=400)
         if self.call_mode.startswith("refuse:"):
             return web.json_response({"refused": self.call_mode.split(":", 1)[1]}, status=409)
+        if self.call_mode == "preflight":
+            refused = self._runner_preflight(body)
+            if refused is not None:
+                return web.json_response({"refused": refused}, status=409)
+            self.writes.append(body)
+            self.timeline.add("connector:write")
+            return web.json_response(self.call_reply)
         self.writes.append(body)
         self.timeline.add("connector:write")
         if self.call_mode == "crash":
@@ -737,6 +747,42 @@ class FakeRunner:
             failure = RUNNER_VECTOR["call_transport_failure"]
             return web.json_response(failure["body"], status=failure["status"])
         return web.json_response(self.call_reply)
+
+    def _runner_preflight(self, body: dict[str, Any]) -> str | None:
+        """The code the executor-mode runner answers this ``call`` with, or None.
+
+        The runner's own rules over what this sandbox already served: the
+        phase order (``Executor._check_order``), then ``restore_refusal`` for
+        ``restore`` or the advertised check for any other tool, then the
+        canonical-object check (``canonical_arguments``). Reusing the runner's
+        functions keeps the double from drifting from the route it stands for.
+        """
+
+        from curie_runner import executor as runner_executor
+
+        done = [r["body"]["phase"] for r in self.requests[:-1]]
+        tool = body.get("tool")
+        expected = ["list", "observe"] if tool == runner_executor.RESTORE_TOOL else ["list"]
+        if done != expected:
+            return "phase_out_of_order"
+        served = {
+            entry["name"]: runner_executor._Tool(
+                entry["name"],
+                dict(entry.get("annotations") or {}),
+                dict(entry.get("input_schema") or {}),
+            )
+            for entry in self.tools
+            if isinstance(entry, dict) and isinstance(entry.get("name"), str)
+        }
+        if tool == runner_executor.RESTORE_TOOL:
+            refusal = runner_executor.restore_refusal(served)
+            if refusal is not None:
+                return refusal
+        elif tool not in served:
+            return "tool_not_advertised"
+        if runner_executor.canonical_arguments(str(body.get("arguments"))) is None:
+            return "arguments_mismatch"
+        return None
 
 
 # --------------------------------------------------------------------------- #

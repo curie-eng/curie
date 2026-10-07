@@ -165,14 +165,15 @@ class PostgresRemediationCardStore:
         if lease_seconds <= 0 or max_attempts <= 0:
             raise ValueError("remediation card lease and attempts must be positive")
         self._engine = engine
-        self._schema = schema
+        self._requests = f'"{schema}".remediation_approval_requests'
+        self._approvals = f'"{schema}".approvals'
+        self._nominations = f'"{schema}".remediation_nominations'
+        self._policies = f'"{schema}".remediation_policies'
+        self._generations = f'"{schema}".remediation_policy_generations'
         self._lease_owner = lease_owner
         self._lease_seconds = lease_seconds
         self._max_attempts = max_attempts
         self._versions: dict[uuid.UUID, int] = {}
-
-    def _table(self, name: str) -> str:
-        return f'"{self._schema}".{name}'
 
     async def claim_pending_card(self) -> RemediationCardWork | None:
         """Lease the oldest undelivered card of a pending remediation approval."""
@@ -184,12 +185,12 @@ class PostgresRemediationCardStore:
                    g.document,
                    a.card_channel, a.reply_kind, a.reply_channel, a.reply_endpoint,
                    a.reply_adapter, a.conversation_id
-              FROM {self._table("remediation_approval_requests")} r
-              JOIN {self._table("approvals")} a ON a.id = r.approval_id
-              JOIN {self._table("remediation_nominations")} n ON n.id = r.nomination_id
-              LEFT JOIN {self._table("remediation_policies")} p
+              FROM {self._requests} r
+              JOIN {self._approvals} a ON a.id = r.approval_id
+              JOIN {self._nominations} n ON n.id = r.nomination_id
+              LEFT JOIN {self._policies} p
                 ON p.agent_id = n.agent_id AND p.hook = n.hook
-              LEFT JOIN {self._table("remediation_policy_generations")} g
+              LEFT JOIN {self._generations} g
                 ON g.agent_id = n.agent_id AND g.hook = n.hook
                AND g.generation = COALESCE(n.current_generation, p.generation)
              WHERE a.status = 'pending'
@@ -215,7 +216,7 @@ class PostgresRemediationCardStore:
                 await connection.execute(
                     text(
                         f"""
-                        UPDATE {self._table("remediation_approval_requests")}
+                        UPDATE {self._requests}
                            SET card_version = card_version + 1,
                                card_lease_owner = :owner,
                                card_lease_expires_at = now() + :lease
@@ -275,7 +276,7 @@ class PostgresRemediationCardStore:
                 await connection.execute(
                     text(
                         f"""
-                        UPDATE {self._table("remediation_approval_requests")}
+                        UPDATE {self._requests}
                            SET card_posted_at = now(),
                                card_error = NULL,
                                card_version = card_version + 1,
@@ -310,7 +311,7 @@ class PostgresRemediationCardStore:
             await connection.execute(
                 text(
                     f"""
-                    UPDATE {self._table("remediation_approval_requests")}
+                    UPDATE {self._requests}
                        SET card_attempts = card_attempts + 1,
                            card_error = :error,
                            card_dead_lettered_at = CASE
