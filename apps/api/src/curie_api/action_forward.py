@@ -219,11 +219,15 @@ async def create_forward_execution(
         raise ForwardRefused(
             "authority_unavailable", "no verified forward authority names this call"
         )
+    # Every refusal ends the caller's transaction, as the others do: the agent
+    # read above opened it, and a refusal writes nothing.
     try:
         sha256 = arguments_sha256(authority.arguments)
     except (TypeError, ValueError):
+        await session.rollback()
         raise ForwardRefused("arguments_mismatch", "the arguments have no canonical form") from None
     if sha256 != authority.arguments_sha256:
+        await session.rollback()
         raise ForwardRefused(
             "arguments_mismatch", "the arguments differ from the ones the authority bound"
         )
