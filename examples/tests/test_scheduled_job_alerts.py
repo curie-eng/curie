@@ -1,6 +1,6 @@
 """Contract tests for the opt-in scheduled job Prometheus alerts.
 
-Run with ``python3 examples/sre-bot/observability/test_scheduled_job_alerts.py``.
+Run with ``python3 examples/tests/test_scheduled_job_alerts.py``.
 The evaluator cases use the generated rule groups and Prometheus 3.5.0's
 promtool in a disposable container; they do not contact a Kubernetes cluster.
 """
@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 
 # @spec SRE-SCHEDULED-JOBS c1 c2 c3 c4 c5
-REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CLI = REPOSITORY_ROOT / "examples/sre-bot/observability/scheduled_job_alerts.py"
 NAMESPACE = "acme-system"
 DESCRIPTION = "Maintenance credentials and inventory depend on these jobs."

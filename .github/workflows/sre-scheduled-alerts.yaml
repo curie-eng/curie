@@ -5,12 +5,14 @@ on:
     branches: [main, next]
     paths:
       - 'examples/sre-bot/observability/*scheduled_job_alerts.py'
+      - 'examples/tests/test_scheduled_job_alerts.py'
       - 'examples/sre-bot/docs/SCHEDULED-JOB-ALERTS.md'
       - '.github/workflows/sre-scheduled-alerts.yaml'
   push:
     branches: [main, next]
     paths:
       - 'examples/sre-bot/observability/*scheduled_job_alerts.py'
+      - 'examples/tests/test_scheduled_job_alerts.py'
       - 'examples/sre-bot/docs/SCHEDULED-JOB-ALERTS.md'
       - '.github/workflows/sre-scheduled-alerts.yaml'
 
@@ -18,7 +20,8 @@ permissions:
   contents: read
 
 jobs:
-  evaluate:
+  scheduled-alert-consumer:
+    name: SRE scheduled job rule verification
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -26,7 +29,7 @@ jobs:
           persist-credentials: false
       # @spec SRE-SCHEDULED-JOBS c1, c2, c3, c4, c5
       - name: Evaluate generated rules and refusal cases
-        run: python3 examples/sre-bot/observability/test_scheduled_job_alerts.py
+        run: python3 examples/tests/test_scheduled_job_alerts.py
       # @spec SRE-SCHEDULED-JOBS c1, c2, c3, c5
       - name: Load and evaluate the exact rules in running Prometheus
         run: python3 examples/sre-bot/observability/verify_scheduled_job_alerts.py
