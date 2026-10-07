@@ -74,7 +74,10 @@ def test_one_hand_written_revision_on_the_assumed_parent() -> None:
 
     revision, down = _revision()
     assert (revision, down) == (HEAD, BELOW)
-    assert ScriptDirectory.from_config(alembic_config()).get_heads() == [HEAD]
+    script = ScriptDirectory.from_config(alembic_config())
+    # The admission revision (task 9, 0093) follows this one; the head pin lives
+    # in test_migration_remediation_admission.py.
+    assert HEAD in {rev.revision for rev in script.iterate_revisions(script.get_heads()[0], BELOW)}
 
 
 def test_after_the_upgrade_the_remediation_purpose_is_accepted_and_an_unknown_one_is_not(

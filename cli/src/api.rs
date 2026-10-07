@@ -12,8 +12,8 @@ use crate::api_requests::{
     ActionUndo, AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
     ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
     DeploymentCreate, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
-    RemediationPolicyMutation, RemediationPolicyWrite, ResolveTargetRequest, RoutingCheckRequest,
-    VersionCreate,
+    RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
+    ResolveTargetRequest, RoutingCheckRequest, VersionCreate,
 };
 
 pub struct ApiClient {
@@ -1207,6 +1207,23 @@ pub struct ActionExecution {
     pub dispatched_at: Option<String>,
     pub finished_at: Option<String>,
     pub created_at: String,
+}
+
+// @spec AUTOMATED-REMEDIATION-11
+/// One circuit breaker as the close route answers it (`RemediationBreakerOut`):
+/// the action and target it holds open, and, once closed, when, by whom (the
+/// operator principal's subject, never its token) and why.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationBreaker {
+    pub id: String,
+    pub agent_id: String,
+    pub connector: String,
+    pub tool: String,
+    pub target: String,
+    pub opened_at: String,
+    pub closed_at: Option<String>,
+    pub closed_by: Option<String>,
+    pub close_reason: Option<String>,
 }
 
 // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
@@ -4116,6 +4133,38 @@ impl ApiClient {
             .json()
             .await
             .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-11
+    /// Close an open circuit breaker:
+    /// `POST .../remediation-policy/breakers/{breaker_id}/close` with the
+    /// operator's reason, on the platform key and the operator principal.
+    pub async fn close_remediation_breaker(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        breaker_id: &str,
+        body: &RemediationBreakerClose,
+        principal_token: &str,
+    ) -> Result<RemediationBreaker> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationBreakerClose>(body),
+                "POST /agents/{id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "closing the circuit breaker was refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the circuit breaker")
     }
 
     // @spec AUTOMATED-REMEDIATION-3

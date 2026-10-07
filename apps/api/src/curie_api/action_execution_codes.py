@@ -55,6 +55,12 @@ _ACCEPTED: Final = {
 # no longer holds at dispatch. Decided by the API, never reported by a worker,
 # so it is not in ``PRE_DISPATCH_CODES``.
 NOT_REVERSIBLE_NOW_CODE: Final = "not_reversible_now"
+# @spec AUTOMATED-REMEDIATION-11 (executor amendment E8): the pre-dispatch code
+# the claim route ends a policy-authorized forward execution with when its
+# remediation authority no longer holds (generation no longer current and armed,
+# or a breaker open on its target key). Decided by the API before any sandbox
+# claim, never reported by a worker.
+POLICY_CHANGED_CODE: Final = "policy_changed"
 
 # @spec AUTOMATED-REMEDIATION-12: the sample kinds a read execution stores
 # (remediation-predicate.json ``sample_kinds``), and the one the API records

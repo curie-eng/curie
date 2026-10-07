@@ -8644,6 +8644,105 @@
         "title": "ReadArguments",
         "type": "object"
       },
+      "RemediationBreakerClose": {
+        "additionalProperties": false,
+        "description": "Why an operator closes a breaker; exactly ``{\"reason\"}``.\n\n@spec AUTOMATED-REMEDIATION-11.",
+        "properties": {
+          "reason": {
+            "description": "Why the breaker is closed, recorded with the operator principal.",
+            "maxLength": 1000,
+            "minLength": 1,
+            "pattern": "\\S",
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "RemediationBreakerClose",
+        "type": "object"
+      },
+      "RemediationBreakerOut": {
+        "additionalProperties": false,
+        "description": "One breaker on an agent's connector, tool and target key.\n\n@spec AUTOMATED-REMEDIATION-11.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "close_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Close Reason"
+          },
+          "closed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Closed At"
+          },
+          "closed_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The operator principal that closed it.",
+            "title": "Closed By"
+          },
+          "connector": {
+            "title": "Connector",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "opened_at": {
+            "format": "date-time",
+            "title": "Opened At",
+            "type": "string"
+          },
+          "target": {
+            "description": "The target key: the connector and the canonical target.",
+            "title": "Target",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "connector",
+          "tool",
+          "target",
+          "opened_at",
+          "closed_at",
+          "closed_by",
+          "close_reason"
+        ],
+        "title": "RemediationBreakerOut",
+        "type": "object"
+      },
       "RemediationNominationAccepted": {
         "additionalProperties": false,
         "description": "The event's accepted submission: its nominations in block order.\n\n@spec AUTOMATED-REMEDIATION-6 @spec AUTOMATED-REMEDIATION-7.",
@@ -11801,7 +11900,7 @@
   "paths": {
     "/action-executions/claim": {
       "post": {
-        "description": "Claim the oldest due execution under a lease, or ``204``.\n\n@spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a\n``requested`` row is claimable, and so is a ``claimed`` row whose lease\nexpired, which is reclaimed with the next attempt so the earlier holder's\nfence is stale. A reclaim forgets the earlier attempt's observation, so the\nnew holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.\n@spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.\n\n@spec AUTOMATED-REMEDIATION-12 (executor amendments E5 and E9): only due\nexecutions (``not_before`` NULL or past) are handed out, oldest\n``not_before`` first (an unscheduled row by its creation time); never more\nthan ``action_executor_max_concurrent_sandboxes`` are live (claimed or\ndispatched) across the installation, and while two or more slots exist at\nmost all but one are reads. An expired read is refused ``runner_unavailable``\nand never reclaimed; a due read whose series successor is due is skipped.",
+        "description": "Claim the oldest due execution under a lease, or ``204``.\n\n@spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a\n``requested`` row is claimable, and so is a ``claimed`` row whose lease\nexpired, which is reclaimed with the next attempt so the earlier holder's\nfence is stale. A reclaim forgets the earlier attempt's observation, so the\nnew holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.\n@spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.\n\n@spec AUTOMATED-REMEDIATION-12 (executor amendments E5 and E9): only due\nexecutions (``not_before`` NULL or past) are handed out, oldest\n``not_before`` first (an unscheduled row by its creation time); never more\nthan ``action_executor_max_concurrent_sandboxes`` are live (claimed or\ndispatched) across the installation, and while two or more slots exist at\nmost all but one are reads. An expired read is refused ``runner_unavailable``\nand never reclaimed; a due read whose series successor is due is skipped.\n\n@spec AUTOMATED-REMEDIATION-11 (executor amendment E8): a ``policy`` forward\nexecution is handed out only while its remediation authority holds\n(``remediation_admission.authority_refusal``); otherwise it ends ``refused``\n``policy_changed`` before any sandbox claim, its nomination goes back to\napproval, and the next due execution is considered. An expired precondition\nread decides its nomination's check 12 (AUTOMATED-REMEDIATION-9).",
         "operationId": "claim_execution_action_executions_claim_post",
         "parameters": [
           {
@@ -12142,7 +12241,7 @@
     },
     "/action-executions/{execution_id}/outcome": {
       "post": {
-        "description": "Record how an execution ended.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20.\n``refused`` lands only on a ``claimed`` row, with a pre-dispatch code:\npast ``dispatched`` the call may have reached the connector. ``confirmed``,\n``failed`` and ``indeterminate`` land only on a ``dispatched`` row, except\na probe, which never dispatches and is ``confirmed`` from ``claimed`` with\nthe verbs it observed. An unknown post-dispatch code is normalized by stage.\nA replay of the stored outcome returns the row unchanged; a different one\nis refused and the first stands.\n\n@spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending\nschedules its verifier (``confirmed``) or finishes it ``not-recovered``\nwith the execution's code (``failed``, ``indeterminate``, ``refused``) in\nthe same transaction; a refused read\nis evaluated by its verification.",
+        "description": "Record how an execution ended.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20.\n``refused`` lands only on a ``claimed`` row, with a pre-dispatch code:\npast ``dispatched`` the call may have reached the connector. ``confirmed``,\n``failed`` and ``indeterminate`` land only on a ``dispatched`` row, except\na probe, which never dispatches and is ``confirmed`` from ``claimed`` with\nthe verbs it observed. An unknown post-dispatch code is normalized by stage.\nA replay of the stored outcome returns the row unchanged; a different one\nis refused and the first stands.\n\n@spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending\nschedules its verifier (``confirmed``) or finishes it ``not-recovered``\nwith the execution's code (``failed``, ``indeterminate``, ``refused``) in\nthe same transaction; a refused read\nis evaluated by its verification.\n\n@spec AUTOMATED-REMEDIATION-9: a refused precondition read sends its\nnomination to approval ``precondition_unavailable`` once this commits.",
         "operationId": "report_outcome_action_executions__execution_id__outcome_post",
         "parameters": [
           {
@@ -12212,7 +12311,7 @@
     },
     "/action-executions/{execution_id}/samples": {
       "post": {
-        "description": "Record the one sample a claimed read execution took, ending it ``confirmed``.\n\n@spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and\n``value`` (remediation-predicate.json ``sample_report``); the API evaluates\nthe predicate from the stored sample (AUTOMATED-REMEDIATION-18). Only a ``claimed`` read\nreports one; a replay of the stored sample answers the row unchanged and a\ndifferent one is refused (``409``). The answer is the receipt, which never\ncarries the value or the pointer.",
+        "description": "Record the one sample a claimed read execution took, ending it ``confirmed``.\n\n@spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and\n``value`` (remediation-predicate.json ``sample_report``); the API evaluates\nthe predicate from the stored sample (AUTOMATED-REMEDIATION-18). Only a ``claimed`` read\nreports one; a replay of the stored sample answers the row unchanged and a\ndifferent one is refused (``409``). The answer is the receipt, which never\ncarries the value or the pointer.\n\n@spec AUTOMATED-REMEDIATION-9: a precondition read's sample decides its\nnomination's check 12 once this commits (``remediation_admission``).",
         "operationId": "report_sample_action_executions__execution_id__samples_post",
         "parameters": [
           {
@@ -14297,6 +14396,123 @@
           }
         },
         "summary": "Arm Remediation Policy",
+        "tags": [
+          "remediation-policy"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close": {
+      "post": {
+        "description": "Close an open breaker, recording the operator principal and the reason.\n\nOnly this route closes a breaker: no nomination, delivery, verifier or\napproval does. The breaker must hold an action this hook's policy\ndeclares; any other id is ``404``. Closing an already closed breaker\nanswers it unchanged.",
+        "operationId": "close_remediation_breaker_agents__agent_id__hooks__hook__remediation_policy_breakers__breaker_id__close_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "breaker_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Breaker Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Principal"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemediationBreakerClose"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationBreakerOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "404": {
+            "description": "No such breaker under this policy"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Close Remediation Breaker",
         "tags": [
           "remediation-policy"
         ]

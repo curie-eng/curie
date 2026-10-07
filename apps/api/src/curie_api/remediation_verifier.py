@@ -21,8 +21,11 @@ beside each sample (E3). The nomination is ``verifying``. A forward that ends
 ``not-recovered`` at once with the execution's code in ``execution_code``, and
 a ledger record, when one exists, carries the outcome too. A refusal that
 returns the nomination to approval (``not_reversible_now``, ``policy_changed``)
-is not an outcome. A verifier that cannot be scheduled (none declared, no in-force digest
-for its connector, not independent now) is ``verifier-unavailable``.
+is not an outcome. Any outcome other than ``verified`` opens the breaker of the
+action's connector, tool and target key (AUTOMATED-REMEDIATION-11,
+``remediation_limits.outcome_written``). A verifier that cannot be scheduled
+(none declared, no in-force digest for its connector, not independent now) is
+``verifier-unavailable``.
 
 Evaluation (``reads_ended``, called after every transition that ends a read):
 
@@ -91,6 +94,7 @@ from .remediation_forward import (
     nomination_for_execution,
     policy_generation,
 )
+from .remediation_limits import outcome_written, release_reservation
 from .remediation_predicate import SATISFIED, SUCCESSFUL_SAMPLES, evaluate_sample
 from .remediation_reads import OBSERVE_TOOL, ReadRefused, scheduled_read
 from .storage import BundleStore, ObjectStore
@@ -314,11 +318,15 @@ async def _write_outcome(
     forward_id: uuid.UUID,
     outcome: str,
     now: datetime,
+    connector: str | None,
+    tool: str | None,
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-18: the one outcome, on the record and the nomination.
 
     Each update holds only while no outcome is written, so a second outcome
     changes nothing. No restore and no undo follow (AUTOMATED-REMEDIATION-19).
+    @spec AUTOMATED-REMEDIATION-11: an outcome other than ``verified`` opens the
+    breaker of the forward execution's connector, tool and target key.
     """
 
     written = await session.scalar(
@@ -340,6 +348,7 @@ async def _write_outcome(
         .execution_options(synchronize_session=False)
     )
     await _end_the_rest(session, nomination_id, forward_id, now)
+    await outcome_written(session, nomination_id, outcome, connector=connector, tool=tool)
     logger.info("remediation verification ended nomination=%s outcome=%s", nomination_id, outcome)
 
 
@@ -434,7 +443,18 @@ async def finish_unverified(
         .returning(RemediationNomination.id)
         .execution_options(synchronize_session=False)
     )
+    if execution.state == ExecutionState.refused:
+        # @spec AUTOMATED-REMEDIATION-10: refused before any write, it did not
+        # execute, so its reservation no longer counts.
+        await release_reservation(session, nomination.id)
     if finished is not None:
+        await outcome_written(
+            session,
+            nomination.id,
+            NOT_RECOVERED,
+            connector=execution.connector,
+            tool=execution.tool,
+        )
         logger.info(
             "remediation verification ended nomination=%s outcome=%s", nomination.id, NOT_RECOVERED
         )
@@ -478,6 +498,8 @@ async def schedule_verification(
             forward_id=execution.id,
             outcome=outcome,
             now=now,
+            connector=execution.connector,
+            tool=execution.tool,
         )
 
     if execution.state != ExecutionState.confirmed:
@@ -728,6 +750,8 @@ async def _evaluate(
             forward_id=forward_id,
             outcome=outcome,
             now=now,
+            connector=forward.connector,
+            tool=forward.tool,
         )
 
     if await _superseded(session, action, nomination, declared, observes):

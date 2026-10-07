@@ -461,6 +461,7 @@
           "/agents/{agent_id}/hooks/{hook}/remediation-policy",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
           "/agents/{agent_id}/hooks/{name}/fire",
           "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
@@ -581,7 +582,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1144,
+      "cardinality_bound": 1152,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -631,6 +632,7 @@
           "/agents/{agent_id}/hooks/{hook}/remediation-policy",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
           "/agents/{agent_id}/hooks/{name}/fire",
           "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
@@ -758,7 +760,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5720,
+      "cardinality_bound": 5760,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -808,6 +810,7 @@
           "/agents/{agent_id}/hooks/{hook}/remediation-policy",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
           "/agents/{agent_id}/hooks/{name}/fire",
           "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
           "/agents/{agent_id}/versions",
@@ -935,7 +938,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5720,
+      "cardinality_bound": 5760,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

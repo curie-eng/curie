@@ -133,6 +133,7 @@ from ..protected_support import (
     SupportAuthorityUnavailable,
     evaluate_protected_support,
 )
+from ..remediation_nomination_store import record_delivery_surface
 from ..source_binding import MappingOutcome, resolve_source_binding
 from ..wirebody import read_bounded_body
 
@@ -619,8 +620,13 @@ async def _ingest_protected(
     ``configuration_unsupported``, the runtime and enqueue files 503
     ``runtime_unavailable``, a full ingress executor 503 ``broker_unavailable``,
     the ordinary claim lookup, turn construction and its bound (413), then one
-    atomic admission. No ordinary claim, backlog slot, workspace row or SQL
-    write is made. @spec PROTECTED-HOOK-SOURCE-2/8 @spec PROTECTED-HOOK-LANE-4.
+    atomic admission. No ordinary claim, backlog slot or workspace row is made.
+    The one SQL write: with remediation on, the delivery's chosen reply surface
+    is committed by event id (``remediation_delivery_surfaces``) just before
+    the admission, and a failed write is 503 ``authority_unavailable`` with
+    nothing admitted; a remediation approval for its nominations is raised on
+    it. It never decides admission. @spec PROTECTED-HOOK-SOURCE-2/8 @spec PROTECTED-HOOK-LANE-4
+    @spec AUTOMATED-REMEDIATION-15.
     """
     agent = source.agent
     if explicit_target:
@@ -698,6 +704,17 @@ async def _ingest_protected(
                     status.HTTP_400_BAD_REQUEST,
                     "the delivery id or turn cannot be admitted to a protected source",
                 ) from None
+            if settings.remediation_enabled:
+                # AUTOMATED-REMEDIATION-15: the surface this turn names is
+                # committed before the broker admits it, so a fast turn's
+                # nomination finds it; a failed write admits nothing (the
+                # sender's retry records it and admits once).
+                try:
+                    await record_delivery_surface(session, agent.id, hook, event_id, binding)
+                except SQLAlchemyError:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
+                    ) from None
             await source.ensure_live()
             result = await admit(slot, runtime, admission)
     except IngressBrokerUnavailable:

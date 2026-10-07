@@ -83,3 +83,34 @@ class RemediationPolicyRefusal(_RemediationModel):
     """@spec AUTOMATED-REMEDIATION-2."""
 
     detail: RemediationPolicyRefusalDetail
+
+
+class RemediationBreakerClose(_RemediationModel):
+    """Why an operator closes a breaker; exactly ``{"reason"}``.
+
+    @spec AUTOMATED-REMEDIATION-11.
+    """
+
+    reason: str = Field(
+        min_length=1,
+        max_length=1000,
+        pattern=r"\S",
+        description="Why the breaker is closed, recorded with the operator principal.",
+    )
+
+
+class RemediationBreakerOut(_RemediationModel):
+    """One breaker on an agent's connector, tool and target key.
+
+    @spec AUTOMATED-REMEDIATION-11.
+    """
+
+    id: SourceUuid
+    agent_id: SourceUuid
+    connector: str
+    tool: str
+    target: str = Field(description="The target key: the connector and the canonical target.")
+    opened_at: datetime
+    closed_at: datetime | None
+    closed_by: str | None = Field(description="The operator principal that closed it.")
+    close_reason: str | None
