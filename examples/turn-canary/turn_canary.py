@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import secrets
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -90,12 +91,18 @@ class StateJournal:
         self.data: dict[str, Any] = {}
 
     def __enter__(self) -> "StateJournal":
-        state = self.path.open("a+", encoding="utf-8")
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        state = os.fdopen(descriptor, "r+", encoding="utf-8")
         try:
             fcntl.flock(state, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            state.seek(0)
-            raw = state.read().strip()
-            data = json.loads(raw) if raw else {}
+            if self.path.exists():
+                raw = self.path.read_text(encoding="utf-8")
+                if not raw.strip():
+                    raise ValueError("existing canary state is empty")
+                data = json.loads(raw)
+            else:
+                data = {}
             pending = data.get("pending") if isinstance(data, dict) else None
             if (
                 not isinstance(data, dict)
@@ -131,11 +138,21 @@ class StateJournal:
     def _write(self) -> None:
         if self._file is None:
             raise RuntimeError("state journal is not locked")
-        self._file.seek(0)
-        self._file.truncate()
-        self._file.write(json.dumps(self.data, sort_keys=True) + "\n")
-        self._file.flush()
-        os.fsync(self._file.fileno())
+        descriptor, temporary = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write(json.dumps(self.data, sort_keys=True) + "\n")
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, self.path)
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def record_intent(self, agent_id: str, thread_key: str) -> None:
         if self.pending is not None:

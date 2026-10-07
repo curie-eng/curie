@@ -29,7 +29,9 @@ qualification. Use a disposable route and verify a real delivered nonce, the
 protected runner trace, and reset completion before enabling periodic use.
 
 The state file must be on persistent storage shared by repeated invocations.
-A process lock prevents overlapping cycles on that file. Before enqueue, the
+A separate `.lock` file holds the process lock while atomic state replacement
+keeps the previous complete state readable through an interrupted write. An
+existing empty or corrupt state file refuses all probes. Before enqueue, the
 checker fsyncs a `pending` record with the exact agent ID and scoped thread key.
 It removes that record only after the matching reset is confirmed. A crash or
 unconfirmed reset leaves it in place, and later invocations refuse to enqueue.
