@@ -131,6 +131,7 @@ from .remediation_policy_document import (
     PER_POLICY_PER_HOUR_CEILING,
 )
 from .remediation_predicate import SATISFIED, UNSUCCESSFUL, evaluate_sample
+from .remediation_qualifications import qualification_refusal as record_refusal
 from .remediation_reads import ReadRefused, scheduled_read
 from .remediation_verifier import independence_refusal
 from .storage import ObjectStore
@@ -194,18 +195,14 @@ async def qualification_refusal(
 ) -> str | None:
     """``qualification_missing``, ``qualification_stale`` or None (check 6).
 
-    @spec AUTOMATED-REMEDIATION-8 (check 6) @spec AUTOMATED-REMEDIATION-22. An
-    action with no ``qualification`` reference has no record. Qualification
-    records are plan task 15 and no record store exists before it, so a
-    reference names no record admission can find: every action is
-    ``qualification_missing`` until task 15 replaces this lookup with the
-    record's state and digest. Fails closed; never None today.
+    @spec AUTOMATED-REMEDIATION-8 (check 6) @spec AUTOMATED-REMEDIATION-22. The
+    record lookup of ``remediation_qualifications``: a record of this agent for
+    the action's connector, tool, reversibility and verifier declaration whose
+    connector digest is still the acting connector's in-force digest. Fails
+    closed.
     """
 
-    del session, agent_id, store  # read by task 15's record lookup
-    if not action.get("qualification"):
-        return QUALIFICATION_MISSING
-    return QUALIFICATION_MISSING
+    return await record_refusal(session, agent_id, action, store=store)
 
 
 # --------------------------------------------------------------------------- #

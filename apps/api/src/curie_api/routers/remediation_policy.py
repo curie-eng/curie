@@ -38,6 +38,7 @@ from ..models import RemediationPolicyGeneration
 from ..remediation_limits import close_breaker
 from ..remediation_policy_document import PolicyRefused, validate_document
 from ..remediation_policy_store import PolicyGeneration, Verb, read_policy, write_policy
+from ..remediation_qualifications import QUALIFICATION_REQUIRED, automatic_unqualified
 from ..remediation_verifier import NOT_INDEPENDENT, independence_refusal
 from ..schemas.remediation_policy import (
     RemediationBreakerClose,
@@ -204,6 +205,10 @@ async def put_remediation_policy(
     @spec AUTOMATED-REMEDIATION-17: every verifier is independent of its acting
     connector in the agent's in-force version, or the write is refused
     ``verifier_not_independent`` and creates no generation.
+    @spec AUTOMATED-REMEDIATION-23: an ``automatic`` action without a valid
+    qualification record (this agent, its connector, tool, reversibility and
+    verifier declaration, at the acting connector's in-force digest) is refused
+    ``qualification_required`` and creates no generation.
     """
     try:
         document = validate_document(body.policy)
@@ -223,7 +228,19 @@ async def put_remediation_policy(
                     ),
                 )
             )
-    # The check only read; the store opens its own transaction for the write.
+    unqualified = await automatic_unqualified(session, uuid.UUID(agent_id), document, store=store)
+    if unqualified is not None:
+        return _refusal(
+            PolicyRefused(
+                QUALIFICATION_REQUIRED,
+                path=f"/actions/{unqualified}/qualification",
+                message=(
+                    "an automatic action needs a qualification record of this agent for its "
+                    "connector, tool, verifier and the connector digest now in force"
+                ),
+            )
+        )
+    # The checks only read; the store opens its own transaction for the write.
     await session.rollback()
     return await _write(session, agent_id, hook, "bind", body, principal, document)
 

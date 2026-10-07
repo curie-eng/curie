@@ -79,6 +79,7 @@ from ..remediation_forward import (
     not_reversible_now,
     policy_generation,
 )
+from ..remediation_qualifications import qualification_reads_ended
 from ..remediation_reads import missed_samples
 from ..remediation_verifier import (
     finish_unverified,
@@ -525,6 +526,7 @@ async def _claim(
     # @spec AUTOMATED-REMEDIATION-18: a read the claim route ended may decide
     # its verification, which ends the rest of that series before any is handed out.
     await reads_ended(session, ended, now)
+    await qualification_reads_ended(session, ended, now)
     await session.flush()
 
     cap = settings.action_executor_max_concurrent_sandboxes
@@ -685,6 +687,7 @@ async def _record_observe_only(
     _finish(session, execution, ExecutionState.confirmed, None, now)
     await session.flush()
     await reads_ended(session, [execution.idempotency_key], now)
+    await qualification_reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
     return _out(execution)
@@ -1023,6 +1026,7 @@ async def report_outcome(
     elif execution.kind == ExecutionKind.read:
         await session.flush()
         await reads_ended(session, [execution.idempotency_key], now)
+        await qualification_reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
     answer = _out(execution)
@@ -1085,6 +1089,7 @@ async def report_sample(
     await session.flush()
     # @spec AUTOMATED-REMEDIATION-18: the API evaluates the predicate.
     await reads_ended(session, [execution.idempotency_key], now)
+    await qualification_reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
     answer = _out(execution)
