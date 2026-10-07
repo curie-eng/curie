@@ -60,9 +60,7 @@ async def delivered(stage: Stage) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """One protected delivery: its event id, binding envelope and intent."""
 
     event = await stage.protected_event()
-    intent = record(
-        stage.broker, admission_key("intent", stage.agent, f"delivery-{stage._deliveries}")
-    )
+    intent = record(stage.broker, admission_key("intent", stage.agent, stage.delivery_of[event]))
     assert intent is not None
     return event, binding(stage.broker, event), intent
 

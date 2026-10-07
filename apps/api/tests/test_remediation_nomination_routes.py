@@ -226,6 +226,9 @@ class Stage:
         self.broker = broker
         self.generation: int | None = None
         self._deliveries = 0
+        # Each event's delivery id, recorded when it is minted so concurrent
+        # deliveries never read one another's counter after awaiting.
+        self.delivery_of: dict[str, str] = {}
 
     async def protected_event(self) -> str:
         """A signed protected delivery admitted onto the broker; its event id."""
@@ -239,6 +242,7 @@ class Stage:
         body = response.json()
         assert body["acceptance_status"] == "accepted", body
         assert body["event_id"] == event_id(self.agent, delivery)
+        self.delivery_of[str(body["event_id"])] = delivery
         assert self.broker.command("EXISTS", "protected:admission:binding:" + body["event_id"])
         return str(body["event_id"])
 
