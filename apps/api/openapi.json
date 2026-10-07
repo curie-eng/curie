@@ -893,6 +893,17 @@
             ],
             "title": "Repo Full Name"
           },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
+          },
           "secrets": {
             "anyOf": [
               {
@@ -1093,6 +1104,17 @@
             ],
             "title": "Repo Full Name"
           },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
+          },
           "runner_resources": {
             "anyOf": [
               {
@@ -1153,6 +1175,7 @@
           "deploy_notifications",
           "behavior_packs",
           "model",
+          "reviewer_model",
           "thinking",
           "approval_required_tools",
           "approval_routes",
@@ -1357,6 +1380,17 @@
               }
             ],
             "title": "Repo Full Name"
+          },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
           },
           "runner_resources": {
             "anyOf": [
@@ -5672,9 +5706,45 @@
             ],
             "title": "Outcome"
           },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
           "slot_utc": {
             "format": "date-time",
             "title": "Slot Utc",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "schedule",
+              "manual"
+            ],
+            "title": "Source",
             "type": "string"
           },
           "started_at": {
@@ -5693,6 +5763,7 @@
           "agent",
           "name",
           "trigger",
+          "source",
           "slot_utc",
           "outcome",
           "started_at",
@@ -8988,7 +9059,7 @@
         "type": "object"
       },
       "ScheduleHookOut": {
-        "description": "One cron hook on the in-force bundle, with its newest slot.",
+        "description": "One cron hook with its newest scheduled and manual run histories.",
         "properties": {
           "last_fire_at": {
             "anyOf": [
@@ -9001,6 +9072,65 @@
               }
             ],
             "title": "Last Fire At"
+          },
+          "last_manual_fire_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Fire At"
+          },
+          "last_manual_outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ran",
+                  "deferred",
+                  "skipped",
+                  "blocked",
+                  "reclaimed",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Outcome"
+          },
+          "last_manual_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Reason"
           },
           "last_outcome": {
             "anyOf": [
@@ -9020,6 +9150,34 @@
               }
             ],
             "title": "Last Outcome"
+          },
+          "last_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Reason"
           },
           "name": {
             "title": "Name",
@@ -9049,6 +9207,9 @@
           "zone",
           "last_fire_at",
           "last_outcome",
+          "last_manual_fire_at",
+          "last_manual_outcome",
+          "last_manual_reason",
           "paused"
         ],
         "title": "ScheduleHookOut",
@@ -9404,6 +9565,286 @@
           "owner"
         ],
         "title": "TerminationClaimBody",
+        "type": "object"
+      },
+      "ThreadAttachmentAppend": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/ThreadAttachmentRefBody"
+            },
+            "maxItems": 1000,
+            "title": "Refs",
+            "type": "array"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "refs"
+        ],
+        "title": "ThreadAttachmentAppend",
+        "type": "object"
+      },
+      "ThreadAttachmentAppendOut": {
+        "properties": {
+          "appended": {
+            "title": "Appended",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "appended"
+        ],
+        "title": "ThreadAttachmentAppendOut",
+        "type": "object"
+      },
+      "ThreadAttachmentQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key"
+        ],
+        "title": "ThreadAttachmentQuery",
+        "type": "object"
+      },
+      "ThreadAttachmentRefBody": {
+        "additionalProperties": false,
+        "description": "One recorded file. Exactly these fields: never an endpoint, URL or bytes.",
+        "properties": {
+          "disk_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Disk Name",
+            "type": "string"
+          },
+          "file_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "File Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ordinal": {
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "route_adapter": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Adapter"
+          },
+          "route_identity": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Route Identity",
+            "type": "string"
+          },
+          "route_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Route Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9A-Fa-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "file_id",
+          "ordinal",
+          "name",
+          "disk_name",
+          "sha256",
+          "route_kind",
+          "route_identity"
+        ],
+        "title": "ThreadAttachmentRefBody",
+        "type": "object"
+      },
+      "ThreadAttachmentRefRow": {
+        "additionalProperties": false,
+        "description": "A query row: the appended ref plus the event it was recorded under, so a\nredelivered turn's worker recognises its own rows by (event_id, file_id).",
+        "properties": {
+          "disk_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Disk Name",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "file_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "File Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ordinal": {
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "route_adapter": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Adapter"
+          },
+          "route_identity": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Route Identity",
+            "type": "string"
+          },
+          "route_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Route Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9A-Fa-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "file_id",
+          "ordinal",
+          "name",
+          "disk_name",
+          "sha256",
+          "route_kind",
+          "route_identity",
+          "event_id"
+        ],
+        "title": "ThreadAttachmentRefRow",
+        "type": "object"
+      },
+      "ThreadAttachmentRefsOut": {
+        "properties": {
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/ThreadAttachmentRefRow"
+            },
+            "title": "Refs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "refs"
+        ],
+        "title": "ThreadAttachmentRefsOut",
         "type": "object"
       },
       "ThreadResetState": {
@@ -19727,7 +20168,7 @@
     },
     "/schedules": {
       "get": {
-        "description": "Cron hooks on each in-force deployment, newest slot first in the record.",
+        "description": "Cron hooks on each in-force deployment, with separate latest run histories.",
         "operationId": "list_schedules_schedules_get",
         "parameters": [
           {
@@ -20793,6 +21234,124 @@
         "summary": "Release Sandbox Credential",
         "tags": [
           "internal-state"
+        ]
+      }
+    },
+    "/v1/internal/thread-attachments/append": {
+      "post": {
+        "operationId": "append_thread_attachments_v1_internal_thread_attachments_append_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadAttachmentAppend"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadAttachmentAppendOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Thread Attachments",
+        "tags": [
+          "internal-thread-attachments"
+        ]
+      }
+    },
+    "/v1/internal/thread-attachments/query": {
+      "post": {
+        "operationId": "query_thread_attachments_v1_internal_thread_attachments_query_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadAttachmentQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadAttachmentRefsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Query Thread Attachments",
+        "tags": [
+          "internal-thread-attachments"
         ]
       }
     },

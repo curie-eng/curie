@@ -640,3 +640,21 @@ def test_a_sibling_tester_paces_under_the_platforms_sibling_limits():
     assert "SIBLING_TURN_LIMIT: Final = 5" in worker
     assert "SIBLING_OPEN_LIMIT: Final = 5" in worker
     assert "5 or less" in skill and "4 or less" in skill
+
+
+def test_the_report_starts_with_its_first_line_and_says_nothing_about_itself():
+    report = _section("Reporting")
+    assert "first line" in report
+    assert re.search(r"never describe the report", report, re.I)
+
+
+def test_continue_finds_a_report_inside_the_request_threads():
+    cont = _section('"continue"')
+    assert "slack_get_thread_replies" in cont
+    assert re.search(r"root messages? that mention(s)? you", cont)
+
+
+def test_gate_commands_that_exit_nonzero_by_design_do_not_read_as_failures():
+    skill = (BUNDLE / "skills/mean-tester/SKILL.md").read_text()
+    assert 'echo "exit=$?"' in skill
+    assert re.search(r"exit 1 .*NO-GO|NO-GO.*exit 1", " ".join(skill.split()))

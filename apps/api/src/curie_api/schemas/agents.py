@@ -20,6 +20,7 @@ from ..workspace_policy import valid_repository_name
 from .approvals import ApprovalRouteBinding, ApprovalRouteBindingOut
 from .channels import ChannelBindingOut, ChannelBindingWrite
 from .common import (
+    nullable_override_validator,
     validate_model_override,
     validate_runner_resource_value,
     validate_thinking_override,
@@ -483,6 +484,7 @@ class AgentCreate(BaseModel):
     # Per-agent model id, forwarded as CURIE_MODEL at boot (#254). None uses the
     # platform default model.
     model: str | None = None
+    reviewer_model: str | None = None
     # Per-agent thinking depth, forwarded as CURIE_THINKING at boot (#1182,
     # ADR-0098). None uses the platform default.
     thinking: str | None = None
@@ -514,6 +516,9 @@ class AgentCreate(BaseModel):
     publication_branch_prefix: str | None = None
 
     _check_name = field_validator("name")(_validate_agent_name)
+    _check_reviewer_model = field_validator("reviewer_model")(
+        nullable_override_validator("reviewer_model", "a reviewer model id like 'claude-opus-5-5'")
+    )
     _check_model = field_validator("model")(validate_model_override)
     _check_thinking = field_validator("thinking")(validate_thinking_override)
     _check_approval_tools = field_validator("approval_required_tools")(_validate_tool_names)
@@ -549,6 +554,7 @@ class AgentUpdate(BaseModel):
     # New per-agent model id (#254). OMITTED leaves the current model unchanged;
     # explicit null clears it back to the platform default (#1310).
     model: str | None = None
+    reviewer_model: str | None = None
     # New per-agent thinking depth (#1182, ADR-0098). Same three-way semantics as
     # `model` above: omitted is unchanged, explicit null clears to the platform
     # default.
@@ -605,6 +611,9 @@ class AgentUpdate(BaseModel):
     publication_draft: bool | None = None
     publication_branch_prefix: str | None = None
 
+    _check_reviewer_model = field_validator("reviewer_model")(
+        nullable_override_validator("reviewer_model", "a reviewer model id like 'claude-opus-5-5'")
+    )
     _check_model = field_validator("model")(validate_model_override)
     _check_thinking = field_validator("thinking")(validate_thinking_override)
     _check_runner_resources = field_validator("runner_resources")(validate_runner_resource_value)
@@ -642,6 +651,7 @@ class AgentOut(BaseModel):
     deploy_notifications: bool
     behavior_packs: dict[str, Any] | None
     model: str | None
+    reviewer_model: str | None
     thinking: str | None
     # Null means the platform default execution deadline (1800 s) (#3071).
     execution_deadline_seconds: int | None = None

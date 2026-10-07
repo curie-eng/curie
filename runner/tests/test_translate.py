@@ -16,7 +16,12 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk.types import RateLimitInfo
 from curie_runner import SideEffectClassifier
-from curie_runner.translate import RESULT_MAX_BYTES, TurnState, translate_message
+from curie_runner.translate import (
+    RESULT_MAX_BYTES,
+    TurnState,
+    _is_credit_exhausted,
+    translate_message,
+)
 
 
 def _translate(message: object, state: TurnState | None = None) -> list:
@@ -337,7 +342,7 @@ def test_assistant_error_field_emits_error_event() -> None:
     msg = AssistantMessage(content=[], model="m", error="rate_limit")
     events = _translate(msg)
     assert [e.type for e in events] == ["error"]
-    assert events[0].classification == "unclassified"
+    assert events[0].classification == "model-usage-limited"
     assert events[0].classification != "rate_limit"
     assert "rate_limit" in events[0].message
 
@@ -552,6 +557,24 @@ def test_sdk_billing_error_is_credit_exhausted() -> None:
     assert events[0].classification == "model-credit-exhausted"
 
 
+# Observed 2026-10-05 on a staging install (#4104): an OpenRouter key at its own
+# spend limit answers HTTP 403 with this body, and the SDK reports it as
+# error="authentication_failed". Workspace and key ids replaced with "example".
+_OPENROUTER_KEY_LIMIT_403 = (
+    'API Error: 403 {"error":{"message":"Key limit exceeded (total limit). Manage it '
+    'using https://openrouter.ai/workspaces/example/keys/example","code":403}}'
+)
+
+
+def test_openrouter_key_limit_text_is_credit_exhausted() -> None:
+    assert _is_credit_exhausted("authentication_failed", _OPENROUTER_KEY_LIMIT_403)
+
+
+def test_rate_limit_text_is_not_credit_exhausted() -> None:
+    # A retryable rate limit must stay out of the terminal credit class.
+    assert not _is_credit_exhausted("rate_limit", "API Error: 429 Rate limit exceeded")
+
+
 def test_unknown_error_without_credit_text_stays_unclassified() -> None:
     msg = AssistantMessage(
         content=[TextBlock(text="API Error: 500 upstream exploded")], model="m", error="unknown"
@@ -648,7 +671,7 @@ def _tool_call_then_success(
     state = TurnState()
     tool_input = (
         {"description": "Diff review round 1", "subagent_type": "reviewer"}
-        if tool == "Agent"
+        if tool in {"Agent", "Task"}
         else {"command": "uv run pytest tests/test_billing.py -q"}
     )
     call = AssistantMessage(
@@ -924,3 +947,136 @@ def test_a_later_recoverable_error_does_not_mask_an_earlier_reviewer_402(
     assert events[-1] is finals[0]
     assert finals[0].status is SessionStatus.CLASSIFIED_FAILURE
     assert events.index(errors[-1]) < events.index(finals[0])
+
+
+# Source: uv.lock pins claude-agent-sdk 0.2.159, bundled Claude Code 2.1.281.
+# Its embedded nFn/oFn formatters call _h with the Ide session/weekly/Opus/
+# Sonnet/Fable names and optional " · resets <time>"/" · progress saved".
+# Generic rejected/fallback branches pass "limit"/"usage limit". These are
+# rendered producer strings, not an implementation-derived regex fixture.
+_SUBSCRIPTION_USAGE_LIMIT_MESSAGES = (
+    "You've hit your session limit · resets 3pm (UTC)",
+    "You've hit your weekly limit · resets Oct 8, 3pm (UTC)",
+    "You've hit your Opus limit · resets Oct 8, 3pm (UTC)",
+    "You've hit your Sonnet limit · resets Oct 8, 3pm (UTC)",
+    "You've hit your Fable limit · resets Oct 8, 3pm (UTC)",
+    "You've hit your usage limit · resets 3pm (UTC)",
+    "You've hit your limit · resets 3pm (UTC)",
+    "You've hit your session limit · resets 3pm (UTC) · progress saved",
+    "You've reached your Fable limit.",
+    "Usage limit reached",
+)
+
+
+@pytest.mark.parametrize("text", _SUBSCRIPTION_USAGE_LIMIT_MESSAGES)
+@pytest.mark.parametrize("error", ["unknown", "authentication_failed"])
+def test_subscription_usage_limit_messages_are_terminal_before_credit_matching(
+    text: str, error: str
+) -> None:
+    state = TurnState()
+    events = _translate(
+        AssistantMessage(content=[TextBlock(text=text)], model="m", error=error),
+        state,
+    )
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert [event.classification for event in errors] == ["model-usage-limited"]
+    assert state.error_classification == "model-usage-limited"
+    final = _translate(_success_result(), state)[-1]
+    assert isinstance(final, Final)
+    assert final.status is SessionStatus.CLASSIFIED_FAILURE
+
+
+@pytest.mark.parametrize("text", _SUBSCRIPTION_USAGE_LIMIT_MESSAGES)
+@pytest.mark.parametrize("tool", ["Agent", "Task"])
+def test_reviewer_usage_limit_is_terminal_when_the_parent_reports_success(
+    text: str, tool: str
+) -> None:
+    # The real bundled CLI shape is documented by test_reviewer_credit_real_cli:
+    # an Agent/Task provider refusal can arrive only as an errored tool result.
+    events = _tool_call_then_success(
+        "Agent terminated early due to an API error: " + text,
+        tool=tool,
+    )
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert [event.classification for event in errors] == ["model-usage-limited"]
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+@pytest.mark.parametrize("text", _SUBSCRIPTION_USAGE_LIMIT_MESSAGES)
+def test_usage_limit_in_a_successful_review_or_failing_workload_stays_live(
+    text: str,
+) -> None:
+    for tool, is_error in [("Agent", None), ("Bash", True)]:
+        events = _tool_call_then_success(text, tool=tool, is_error=is_error)
+        assert not [event for event in events if isinstance(event, ErrorEvent)]
+        assert events[-1].status is SessionStatus.DONE
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "You've used 50% of your session limit · resets 3pm (UTC)",
+        "You're close to your usage credit limit",
+        "Your usage limit has reset · press enter to continue",
+    ],
+)
+def test_subscription_warning_and_reset_text_is_not_a_terminal_refusal(text: str) -> None:
+    events = _translate(AssistantMessage(content=[TextBlock(text=text)], model="m"))
+    assert [event.type for event in events] == ["text_delta"]
+    assert events[0].text == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        _OPENROUTER_KEY_LIMIT_403,
+        _OPENROUTER_402,
+        "You've hit your monthly spend limit.",
+        "You've hit your usage credit limit",
+    ],
+)
+def test_spend_credit_and_openrouter_limits_keep_the_credit_remedy(text: str) -> None:
+    errors = [
+        event
+        for event in _translate(
+            AssistantMessage(content=[TextBlock(text=text)], model="m", error="unknown")
+        )
+        if isinstance(event, ErrorEvent)
+    ]
+    assert [event.classification for event in errors] == ["model-credit-exhausted"]
+
+
+def test_subscription_usage_refusal_is_sticky_after_later_recoverable_errors() -> None:
+    state = TurnState()
+    events = _translate(
+        AssistantMessage(content=[], model="m", error="rate_limit"), state
+    )
+    events += _translate(_later_rate_limit(), state)
+    events += _translate(_later_overloaded(), state)
+    events += _translate(_success_result(), state)
+    assert events[0].classification == "model-usage-limited"
+    assert state.error_classification == "model-usage-limited"
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+@pytest.mark.parametrize("text", _SUBSCRIPTION_USAGE_LIMIT_MESSAGES)
+def test_terminal_sdk_result_usage_limit_is_classified(text: str) -> None:
+    result = ResultMessage(
+        subtype="error_during_execution", duration_ms=1, duration_api_ms=1,
+        is_error=True, num_turns=1, session_id="s", result=text,
+    )
+    events = _translate(result)
+    assert events[0].classification == "model-usage-limited"
+    assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
+
+
+@pytest.mark.parametrize("text", ["You're out of usage credits", "You're out of extra usage"])
+def test_finance_text_without_existing_credit_match_is_not_a_subscription_limit(
+    text: str,
+) -> None:
+    errors = [
+        event for event in _translate(
+            AssistantMessage(content=[TextBlock(text=text)], model="m", error="unknown")
+        ) if isinstance(event, ErrorEvent)
+    ]
+    assert [event.classification for event in errors] == ["unclassified"]

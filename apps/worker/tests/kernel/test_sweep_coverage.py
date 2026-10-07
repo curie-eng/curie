@@ -520,14 +520,14 @@ def test_close_returns_true_only_when_it_closed_the_row(make_hook_run) -> None:
         async with make_hook_run() as run:
             recorder = HookRunRecorder(run.engine, "curie")
 
-            assert await recorder.close(run.ref, "failed") is True
+            assert await recorder.close(run.ref, "failed", "turn_error") is True
             assert await recorder.close(run.ref, "ran") is False
             state = await run.state()
             assert state is not None and state[0] == "failed"
 
             missing = run.ref.model_copy(update={"name": f"missing_{uuid.uuid4().hex}"})
             with pytest.raises(HookRunRecorderError) as raised:
-                await recorder.close(missing, "failed")
+                await recorder.close(missing, "failed", "turn_error")
             assert raised.value.code == "missing"
 
     asyncio.run(go())

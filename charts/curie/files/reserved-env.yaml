@@ -3,6 +3,7 @@
 # suppress the chart entry. The shared validator still refuses repeated extraEnv names.
 worker:
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
+  CURIE_ACTION_EXECUTOR_ENABLED: actionExecutor.enabled
   CURIE_ADAPTER_CREDENTIALS: worker.adapterCredentialsExistingSecret
   CURIE_AGENT_CONNECTOR_SECRET_POOLS: agentSandbox.connectorSecrets
   CURIE_AGENT_SANDBOX_POOLS: agentSandbox.connectorSecrets or agentSandbox.registryEgress
@@ -10,6 +11,8 @@ worker:
   CURIE_ATTACHMENT_MAX_FILE_BYTES: worker.attachments.maxFileBytes
   CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS: worker.attachments.referenceTtlSeconds
   CURIE_ATTACHMENT_RETENTION_TTL_SECONDS: worker.attachments.retentionTtlSeconds
+  CURIE_ATTACHMENT_THREAD_MAX_BYTES: worker.attachments.threadMaxBytes
+  CURIE_ATTACHMENT_THREAD_MAX_FILES: worker.attachments.threadMaxFiles
   CURIE_CLAIM_TIMEOUT_SECONDS: worker.claimTimeoutSeconds
   CURIE_CONNECTOR_APP_NAME: nameOverride
   CURIE_CONNECTOR_CALLER_SIGNING_KEY: connectorCaller.signingKey
@@ -110,6 +113,7 @@ api:
   APPROVAL_SWEEP_INTERVAL_S: api.approvalSweepIntervalSeconds
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
   COMMIT_POLL_INTERVAL_S: api.commitPollIntervalSeconds
+  CURIE_ACTION_EXECUTOR_ENABLED: actionExecutor.enabled
   CURIE_APPROVAL_CHAT_ATTESTER_SECRET: api.approvalChatAttesterSecret
   CURIE_APPROVAL_RECOVERY_ENABLED: api.approvalRecovery.enabled
   CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY: connectorCaller.previousVerifyKey
@@ -203,6 +207,7 @@ dispatcher:
   VALKEY_TLS: valkey.tls
 agentSandbox.runner:
   ANTHROPIC_BASE_URL: inference.service.port
+  CURIE_ATTACHMENTS_MANIFEST: the claim's attachment manifest, filled per boot (remove this override)
   CURIE_BUDGET: agentSandbox.runner.budget.maxOutputTokensPerRun
   CURIE_CREDENTIALS: agentSandbox.runner.credentialsExistingSecret
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel

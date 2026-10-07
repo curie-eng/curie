@@ -2570,3 +2570,73 @@ mod narrow_platforms_tests {
         assert_eq!(single.image_ref, full.image_ref);
     }
 }
+
+#[cfg(test)]
+mod dark_factory_runner_digest_tests {
+    use super::*;
+
+    /// Copy regular files and directories only; anything else (a symlink) is a
+    /// fixture surprise worth failing loudly on.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            let target = to.join(entry.file_name());
+            if kind.is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else if kind.is_file() {
+                std::fs::copy(entry.path(), &target).unwrap();
+            } else {
+                panic!("unexpected non-regular entry {}", entry.path().display());
+            }
+        }
+    }
+
+    fn append(path: &Path, text: &str) {
+        let mut body = std::fs::read_to_string(path).unwrap();
+        body.push_str(text);
+        std::fs::write(path, body).unwrap();
+    }
+
+    // #4109: the runner layer reads nothing from its context, so an agent edit
+    // must not invalidate the lock, while a Dockerfile edit still must.
+    #[test]
+    fn editing_an_agent_file_keeps_the_runner_digest_and_editing_the_dockerfile_moves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bundle = dir.path().join("dark-factory");
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/dark-factory"),
+            &bundle,
+        );
+        let runner = load(&bundle)
+            .unwrap()
+            .runner
+            .expect("the dark factory bundle declares a runner layer");
+        let digest = || {
+            let (context, _) = check_runner_source(&bundle, &runner).unwrap();
+            source_digest_of(&context, &runner.build).unwrap()
+        };
+
+        let original = digest();
+        append(
+            &bundle.join("agents/diff-reviewer.md"),
+            "\nmodel note: edited\n",
+        );
+        assert_eq!(
+            original,
+            digest(),
+            "editing an agent file must not move the runner source digest"
+        );
+
+        append(
+            &bundle.join("runner.Dockerfile"),
+            "LABEL org.opencontainers.image.description=\"edited\"\n",
+        );
+        assert_ne!(
+            original,
+            digest(),
+            "editing runner.Dockerfile must move the runner source digest"
+        );
+    }
+}

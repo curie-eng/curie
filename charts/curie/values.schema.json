@@ -272,6 +272,13 @@
             "bucket": {"type": "string", "minLength": 3}
           }
         },
+        "attachments": {
+          "type": "object",
+          "properties": {
+            "threadMaxFiles": {"type": "integer", "minimum": 1, "maximum": 1000},
+            "threadMaxBytes": {"type": "integer", "minimum": 1}
+          }
+        },
           "publication": {
             "type": "object",
             "properties": {
@@ -359,6 +366,13 @@
         "pushImage": {"type": "string"},
         "buildTimeoutSeconds": {"type": "integer", "minimum": 60, "maximum": 3600},
         "sourceHosts": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+      }
+    },
+    "actionExecutor": {
+      "type": "object",
+      "description": "The connector action executor switch (ACTION-EXECUTOR-1), rendered into both the API and the worker. A boolean, so a quoted \"false\" cannot turn it on.",
+      "properties": {
+        "enabled": {"type": "boolean"}
       }
     },
     "e2eConnectorIdentity": {

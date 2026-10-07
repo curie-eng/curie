@@ -65,6 +65,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         repo_full_name=data.repo_full_name,
         deploy_notifications=data.deploy_notifications,
         model=data.model,
+        reviewer_model=data.reviewer_model,
         thinking=data.thinking,
         behavior_packs=(
             data.behavior_packs.model_dump() if data.behavior_packs is not None else None
@@ -374,4 +375,13 @@ async def get_agents_by_repo_casefold(session: AsyncSession, repo_full_name: str
 
 async def get_agent_by_name(session: AsyncSession, name: str) -> Agent | None:
     agent: Agent | None = await session.scalar(select(Agent).where(Agent.name == name))
+    return agent
+
+
+async def update_agent_reviewer_model(
+    session: AsyncSession, agent: Agent, reviewer_model: str | None
+) -> Agent:
+    agent.reviewer_model = reviewer_model
+    await session.commit()
+    await session.refresh(agent)
     return agent

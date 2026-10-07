@@ -32,10 +32,9 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
         if resource == "api"
         else catalog()["candidate"]
     )
-    # The candidate keeps moving as later migrations land (#2909 added 0078, #3819 added 0079,
-    # #4067 added 0081);
-    # the point of this test is that the min side tracks the ledger schema.
-    assert window == {"schema_min": "0077", "schema_head": "0081"}
+    # The next-only migrations follow the immutable published 0.12.2 chain.
+    # The minimum tracks the deployment notification ledger schema.
+    assert window == {"schema_min": "0082", "schema_head": "0086"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -52,10 +51,10 @@ def test_new_candidate_release_fields_are_0130(field: str) -> None:
 def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     data = catalog()
-    assert data["windows"].get("0.13.0") == {"schema_min": "0077", "schema_head": "0081"}
-    assert data["revisions"][-3:] == ["0078", "0079", "0081"]
+    assert data["windows"].get("0.13.0") == {"schema_min": "0082", "schema_head": "0086"}
+    assert data["revisions"][-3:] == ["0084", "0085", "0086"]
     assert (
-        json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())["0077"]
+        json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())["0082"]
         == "expand"
     )
 
@@ -73,7 +72,7 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     assert set(actual) - set(expected) <= {"0.12.1", "0.12.2", "0.13.0"}
 
 
-def test_released_0076_startup_refuses_without_migrating_then_0077_starts(
+def test_released_0076_startup_refuses_without_migrating_then_0082_starts(
     isolated_migration_db: IsolatedMigrationDb, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
@@ -94,8 +93,8 @@ def test_released_0076_startup_refuses_without_migrating_then_0077_starts(
             with TestClient(create_app()):
                 pass
         assert current_revision() == "0076"
-        command.upgrade(alembic_config(), "0077")
-        assert current_revision() == "0077"
+        command.upgrade(alembic_config(), "0082")
+        assert current_revision() == "0082"
         with TestClient(create_app()) as client:
             response = client.get("/health")
             assert response.status_code == 200

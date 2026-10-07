@@ -580,7 +580,7 @@ def test_reviewers_default_to_opus_and_are_read_only(name: str) -> None:
     assert match
     front = yaml.safe_load(match.group(1))
     assert front["name"] == name
-    assert front["model"] == "anthropic/claude-opus-5.5"
+    assert front["model"] == "opus"
     tools = {t.strip() for t in front["tools"].split(",")}
     assert not tools & {"Edit", "Write", "NotebookEdit", "Agent", "Task"}
     assert f"REVIEWER: {name}" in match.group(2)

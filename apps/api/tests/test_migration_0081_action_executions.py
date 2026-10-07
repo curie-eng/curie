@@ -1,4 +1,4 @@
-"""Migration 0081: the execution record, the ledger columns and capabilities.
+"""Migration 0085: the execution record, the ledger columns and capabilities.
 
 Realizes the schema half of the connector action executor contract
 (docs/superpowers/specs/2026-10-06-connector-action-executor.md):
@@ -14,14 +14,8 @@ Realizes the schema half of the connector action executor contract
 * ACTION-EXECUTOR-13 adds ``connector_capabilities``, keyed on the agent,
   connector and image digest.
 
-The revision number is not named by the spec or the plan. ``0081`` sits on
-``next``'s head ``0079``: ``main`` already holds ``0080`` (hook run source), and
-both lines skip numbers, so ``0081`` collides with neither.
-
-Hand-written and tested against real Postgres in a database of its own
-(``isolated_migration_db``), never the shared compose database. Every revision
-is targeted by name rather than ``-1`` so a later migration moving head cannot
-turn a downgrade assertion into one that proves nothing (#1391).
+The next-only execution migration follows the canvas migration at 0084,
+after the immutable published stable chain through 0081.
 """
 
 from __future__ import annotations
@@ -42,8 +36,8 @@ from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy.exc import IntegrityError
 
-REVISION = "0081"
-BELOW = "0079"
+REVISION = "0085"
+BELOW = "0084"
 
 NEW_ACTION_COLUMNS = {
     "post_version",
@@ -110,7 +104,7 @@ LEGACY_ROW_COLUMNS = (
 
 
 def _require_revision() -> None:
-    """The migration this file tests exists and sits directly on 0079."""
+    """The migration this file tests exists and sits directly on 0084."""
 
     script = ScriptDirectory.from_config(alembic_config())
     known = {rev.revision for rev in script.walk_revisions()}
@@ -222,7 +216,7 @@ def _insert_capability(
     )
 
 
-def test_0081_revises_0079() -> None:
+def test_0085_revises_0084() -> None:
     """@spec ACTION-EXECUTOR-2: one additive, hand-written revision on the current head."""
 
     _require_revision()

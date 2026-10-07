@@ -35,6 +35,7 @@ _PUBLICATION_EXPIRES_IN_SECONDS = 24 * 60 * 60
 _SESSION_APPROVAL_EXPIRES_IN_SECONDS = 24 * 60 * 60
 
 _ATTACHMENT_HANDOFF_PROBE_TIMEOUT_S = 5.0
+_ATTACHMENT_CARRY_TIMEOUT_S = 5.0
 
 _ACTIVE_ATTACHMENT_REPLY = (
     "I cannot add a file while the current reply is still running. "
@@ -183,6 +184,7 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         "ledger-error",
         "model-credential-rejected",
         "model-credit-exhausted",
+        "model-usage-limited",
         "approval-not-acted",
         "false-completion",
         "publication-unrecorded",
@@ -219,6 +221,7 @@ _ESCALATION_DETAIL_MAX = 300
 # ``runner_escalated``.
 _ESCALATION_CAUSES = {
     "model-credit-exhausted": "model_credit_exhausted",
+    "model-usage-limited": "model_usage_limited",
     "model-credential-rejected": "model_credential_rejected",
     "rate-limit": "model_rate_limited",
     "server-error": "model_error",

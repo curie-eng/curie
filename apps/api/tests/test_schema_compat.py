@@ -43,7 +43,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 CONTRACT = "0041"
 # @spec PROTECTED-HOOK-SOURCE-2 and DEPLOY-NOTICE-RELEASE-1.
 # Agent reads require deploy notifications after the published source-control ledger.
-APP_SCHEMA_MIN = "0077"
+APP_SCHEMA_MIN = "0082"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -126,10 +126,20 @@ def test_the_route_identity_contract_raises_the_floor_and_needs_forward_only() -
 def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> None:
     """@spec DEPLOY-NOTICE-RELEASE-1."""
     window = load_window()
-    known = {"0070", "0071", "0072", "0073", "0075", "0076", "0077"}
-    for released in ("0070", "0071", "0072", "0073", "0075", "0076"):
+    known = set(load_kinds())
+    for released in (
+        "0070",
+        "0071",
+        "0072",
+        "0073",
+        "0075",
+        "0076",
+        "0079",
+        "0080",
+        "0081",
+    ):
         assert can_serve(released, window, known) is False
-    assert can_serve("0077", window, known) is True
+    assert can_serve("0082", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

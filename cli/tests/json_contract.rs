@@ -1304,6 +1304,8 @@ fn deploy_output_validates() {
         deployment_id: "dep_1".to_string(),
         deployment_environment: "prod".to_string(),
         deployment_status: "active".to_string(),
+        cron_triggers: Vec::new(),
+        warnings: Vec::new(),
     };
     assert_valid("deploy.schema.json", &out.to_json());
 }
@@ -1329,6 +1331,8 @@ fn deploy_result_for_target(target: &str) -> serde_json::Value {
         deployment_id: format!("deployment-{target}"),
         deployment_environment: environment.to_string(),
         deployment_status: "active".to_string(),
+        cron_triggers: Vec::new(),
+        warnings: Vec::new(),
     }
     .to_json()
 }
@@ -1375,6 +1379,109 @@ fn deploy_all_targets_failure_outputs_validate() {
         "fix": null
     });
     assert_valid("deploy.schema.json", &connector_failure);
+}
+
+#[test]
+fn deploy_v1_1_payload_without_cron_receipts_remains_valid() {
+    let schema = load_schema("deploy.schema.json");
+    assert_eq!(
+        schema["$id"],
+        serde_json::json!("https://schemas.curietech.ai/cli/deploy/v1.2.json")
+    );
+    let mut value = deploy_result_for_target("dev");
+    let object = value.as_object_mut().expect("deploy result object");
+    object.remove("cron_triggers");
+    object.remove("warnings");
+    assert!(
+        validator(&schema).is_valid(&value),
+        "v1.2 must continue accepting v1.1 receipts without the optional fields: {value}"
+    );
+}
+
+fn deploy_result_with_cron() -> serde_json::Value {
+    let mut value = deploy_result_for_target("dev");
+    value["cron_triggers"] = serde_json::json!([
+        {"name": "nightly", "schedule": "0 2 * * *", "zone": "Europe/London", "target": "C0NOTBOUND1"},
+        {"name": "maintenance", "schedule": "0 0 * * 0", "zone": "UTC", "target": null}
+    ]);
+    value["warnings"] = serde_json::json!([
+        "cron trigger `nightly` targets `C0NOTBOUND1`, which matches no single channel bound to `acme-dev`; every slot records failed until that address is bound."
+    ]);
+    value
+}
+
+#[test]
+fn deploy_cron_receipts_validate_in_single_aggregate_and_partial_failure_results() {
+    let result = deploy_result_with_cron();
+    assert_valid("deploy.schema.json", &result);
+    let aggregate = serde_json::json!({
+        "results": [{"target": "dev", "result": result.clone()}]
+    });
+    assert_valid("deploy.schema.json", &aggregate);
+    let partial = serde_json::json!({
+        "failed_target": "prod",
+        "stage": "deploy",
+        "completed": [{"target": "dev", "result": result.clone()}],
+        "error": "creating the deployment failed with 500",
+        "fix": null
+    });
+    assert_valid("deploy.schema.json", &partial);
+    let connector_failure = serde_json::json!({
+        "failed_target": "dev",
+        "stage": "connector_sync",
+        "completed": [],
+        "failed_result": result,
+        "error": "connector sync failed",
+        "fix": null
+    });
+    assert_valid("deploy.schema.json", &connector_failure);
+}
+
+#[test]
+fn deploy_schema_rejects_invalid_cron_receipt_fields_and_warning_types() {
+    let schema = load_schema("deploy.schema.json");
+    let validator = validator(&schema);
+    let valid = deploy_result_with_cron();
+    for (field, invalid) in [
+        ("name", serde_json::json!(1)),
+        ("schedule", serde_json::json!(["0 2 * * *"])),
+        ("zone", serde_json::json!(null)),
+        ("target", serde_json::json!(true)),
+    ] {
+        let mut value = valid.clone();
+        value["cron_triggers"][0][field] = invalid;
+        assert!(
+            !validator.is_valid(&value),
+            "cron receipt {field} must retain its declared type: {value}"
+        );
+        let mut missing = valid.clone();
+        missing["cron_triggers"][0]
+            .as_object_mut()
+            .expect("cron object")
+            .remove(field);
+        assert!(
+            !validator.is_valid(&missing),
+            "every cron receipt must require {field}: {missing}"
+        );
+    }
+    for invalid in [
+        serde_json::json!([1]),
+        serde_json::json!(null),
+        serde_json::json!("warning"),
+    ] {
+        let mut value = valid.clone();
+        value["warnings"] = invalid;
+        assert!(
+            !validator.is_valid(&value),
+            "warnings must be an array of strings: {value}"
+        );
+    }
+    let mut extra = valid;
+    extra["cron_triggers"][0]["unexpected"] = serde_json::json!("field");
+    assert!(
+        !validator.is_valid(&extra),
+        "cron objects must be closed: {extra}"
+    );
 }
 
 #[test]

@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Verify each pushed commit with that commit's own fast preflight."""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+
+def git(root: Path, *args: str, env: dict[str, str]) -> str:
+    result = subprocess.run(
+        ["git", *args], cwd=root, env=env, text=True, capture_output=True, check=False
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result.stdout.strip()
+
+
+def choose_base(root: Path, commit: str, env: dict[str, str]) -> str:
+    candidates: list[tuple[int, int, str]] = []
+    for index, base in enumerate(("main", "next")):
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", f"origin/{base}^{{commit}}"],
+            cwd=root,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            count = int(git(root, "rev-list", "--count", f"origin/{base}..{commit}", env=env))
+            candidates.append((count, index, base))
+    if not candidates:
+        raise RuntimeError("No origin/main or origin/next base is available; fetch the base first")
+    return min(candidates)[2]
+
+
+def check_commit(root: Path, commit: str, base: str, env: dict[str, str]) -> int:
+    # Always use committed content, including for HEAD. A dirty tracked tool or
+    # source file in the invoking checkout must not certify a different tree.
+    scratch = root / ".projects" / "preflight"
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="push-", dir=scratch) as directory:
+        checkout = Path(directory) / "checkout"
+        registered = False
+        result = 1
+        try:
+            git(root, "worktree", "add", "--quiet", "--detach", str(checkout), commit, env=env)
+            registered = True
+            tool = checkout / "tools/preflight/preflight.py"
+            if not tool.is_file():
+                raise RuntimeError("The pushed commit has no tools/preflight/preflight.py")
+            result = subprocess.run(
+                [
+                    "uv",
+                    "run",
+                    "--no-project",
+                    "--with",
+                    "pyyaml==6.0.3",
+                    "python3",
+                    "tools/preflight/preflight.py",
+                    "--fast",
+                    "--base",
+                    base,
+                ],
+                cwd=checkout,
+                env=env,
+                check=False,
+            ).returncode
+        finally:
+            if registered:
+                git(root, "worktree", "remove", "--force", str(checkout), env=env)
+                if checkout.exists():
+                    raise RuntimeError("The owned preflight worktree was not removed")
+        return result
+
+
+def main() -> int:
+    env = dict(os.environ)
+    try:
+        root = Path(git(Path.cwd(), "rev-parse", "--show-toplevel", env=env))
+        # Git exports repository-local variables to hooks. Children running in
+        # another worktree must resolve that checkout's own .git file instead.
+        for name in git(root, "rev-parse", "--local-env-vars", env=env).splitlines():
+            env.pop(name, None)
+        passed = True
+        for line in sys.stdin:
+            fields = line.split()
+            if len(fields) != 4:
+                raise RuntimeError("Invalid pre-push ref record")
+            local_sha = fields[1]
+            if not re.fullmatch(r"[0-9a-fA-F]{40,64}", local_sha):
+                raise RuntimeError("Invalid pre-push object id")
+            if set(local_sha) == {"0"}:
+                continue
+            commit = git(root, "rev-parse", "--verify", f"{local_sha}^{{commit}}", env=env)
+            base = choose_base(root, commit, env)
+            print(f"pre-push: fast preflight against origin/{base}", file=sys.stderr)
+            if check_commit(root, commit, base, env):
+                passed = False
+        return 0 if passed else 1
+    except (OSError, RuntimeError, ValueError) as error:
+        print(
+            f"pre-push: {error}\nFix: fix the named check and retry; "
+            "git push --no-verify bypasses this hook.",
+            file=sys.stderr,
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

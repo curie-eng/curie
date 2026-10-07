@@ -109,7 +109,8 @@ that does not exist yet is authorized as a create, so a Role with only `patch`
 lets the reconciler update existing connectors while failing to create any --
 the first-run path, and the one most likely to be exercised. Verified with
 `kubectl apply --server-side --as=<the worker SA>`, which is forbidden without
-it. No `get` (nothing reads a single object), no cluster scope, no other kinds.
+it. No `get` unless the action executor is enabled, when one separate rule adds
+only `get` on Deployments for digest attribution; no cluster scope, no other kinds.
 
 This is a genuine privilege increase over the CRD-only rules above -- it
 includes delete on Secrets -- which is why it renders only when the reconciler
@@ -118,6 +119,19 @@ is actually enabled.
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["create", "list", "patch", "delete"]
+{{- if eq (include "curie.actionExecutorEnabled" .) "true" }}
+{{/*
+ACTION-EXECUTOR-12/-14: the action executor reads the connector's owned
+Deployment by name to record the digest it ran at and to check a pinned digest.
+A single-object `get` on Deployments only, in its own rule so it cannot spill
+onto another kind; granted only with the executor and this reconciler both
+enabled. With the executor off this Role is unchanged and actions record no
+digest. No `watch`, no other kind.
+*/}}
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get"]
+{{- end }}
   - apiGroups: [""]
     resources: ["services", "secrets"]
     verbs: ["create", "list", "patch", "delete"]
@@ -285,6 +299,28 @@ spec:
               value: {{ .Values.worker.attachments.referenceTtlSeconds | quote }}
             - name: CURIE_ATTACHMENT_RETENTION_TTL_SECONDS
               value: {{ .Values.worker.attachments.retentionTtlSeconds | quote }}
+            {{- /*
+            ADR 0205 decision 7: the per-thread file count and byte budget one
+            boot materializes. The byte budget has to fit the attachments
+            emptyDir the init container writes into, or the thread's files
+            overflow it and the pod is evicted mid-boot; the chart refuses the
+            values instead. Defaulted here as well as in values.yaml: under
+            `helm upgrade --reuse-values` from a release that predates the keys
+            they are nil, and a nil budget would render "0".
+            */}}
+            {{- $threadMaxFiles := .Values.worker.attachments.threadMaxFiles | default 20 | int64 }}
+            {{- $threadMaxBytes := .Values.worker.attachments.threadMaxBytes | default 268435456 | int64 }}
+            {{- $runnerAttachments := .Values.agentSandbox.runner.attachments | default dict }}
+            {{- if and .Values.worker.attachments.enabled $runnerAttachments.enabled }}
+            {{- $volumeBytes := include "curie.capacity.memBytes" $runnerAttachments.sizeLimit | int64 }}
+            {{- if gt $threadMaxBytes $volumeBytes }}
+            {{- fail (printf "worker.attachments.threadMaxBytes (%d) exceeds agentSandbox.runner.attachments.sizeLimit (%s, %d bytes): one boot of a thread's files would overflow the sandbox's attachments volume. Lower threadMaxBytes or raise sizeLimit (ADR 0205 decision 7)." $threadMaxBytes (toString $runnerAttachments.sizeLimit) $volumeBytes) }}
+            {{- end }}
+            {{- end }}
+            - name: CURIE_ATTACHMENT_THREAD_MAX_FILES
+              value: {{ $threadMaxFiles | quote }}
+            - name: CURIE_ATTACHMENT_THREAD_MAX_BYTES
+              value: {{ $threadMaxBytes | quote }}
             - name: CURIE_PUBLICATION_ENABLED
               value: {{ .Values.worker.publication.enabled | quote }}
             - name: CURIE_PUBLICATION_NAMESPACE
@@ -358,6 +394,10 @@ spec:
               valueFrom:
                 secretKeyRef:
                   {{- include "curie.secretRef" (dict "root" . "existingSecret" (get (.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get (.Values.connectorCaller | default dict) "signingKeyKey") | default "signingKey") "defaultKey" "connectorCallerSigningKey") | nindent 18 }}
+            # The action executor switch (ACTION-EXECUTOR-1). The API renders
+            # the same value from the same helper; the two must never differ.
+            - name: CURIE_ACTION_EXECUTOR_ENABLED
+              value: {{ include "curie.actionExecutorEnabled" . | quote }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE
@@ -592,6 +632,14 @@ spec:
             {{- end }}
             - name: BUNDLE_BUCKET
               value: {{ .Values.agentSandbox.runner.bundleFetch.bucket | quote }}
+            {{- if .Values.api.githubStubCaConfigMap }}
+            - name: SSL_CERT_FILE
+              value: /etc/curie/github-stub/ca.pem
+            - name: GIT_SSL_CAINFO
+              value: /etc/curie/github-stub/ca.pem
+            - name: REQUESTS_CA_BUNDLE
+              value: /etc/curie/github-stub/ca.pem
+            {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
             {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "worker") | fromJson)) | nindent 12 }}
           # No HTTP port on the worker, so an exec probe checks a heartbeat file
@@ -603,8 +651,18 @@ spec:
           volumeMounts:
             - name: workspace-clone
               mountPath: {{ .Values.worker.workspace.mountPath | quote }}
+            {{- if .Values.api.githubStubCaConfigMap }}
+            - name: github-stub-ca
+              mountPath: /etc/curie/github-stub
+              readOnly: true
+            {{- end }}
       volumes:
         - name: workspace-clone
           emptyDir:
             sizeLimit: {{ .Values.worker.workspace.cloneVolumeSize | quote }}
+        {{- if .Values.api.githubStubCaConfigMap }}
+        - name: github-stub-ca
+          configMap:
+            name: {{ .Values.api.githubStubCaConfigMap }}
+        {{- end }}
 {{- end }}

@@ -160,6 +160,7 @@ def _recover_assistant_groups(
 # Claude or otherwise -- ever sees one.
 _SDK_ATTRIBUTION_OFF_SETTINGS = json.dumps({"attribution": {"commit": "", "pr": ""}})
 _SDK_TITLE_MODEL_ENV = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+_SDK_REVIEWER_MODEL_ENV = "ANTHROPIC_DEFAULT_OPUS_MODEL"
 # The settings the CLI loads, passed explicitly (#3766, ADR-0189). Today's
 # loading, kept on purpose: ``[]`` would also stop a workspace ``CLAUDE.md``.
 _SETTING_SOURCES: tuple[SettingSource, ...] = ("user", "project", "local")
@@ -503,6 +504,7 @@ def build_options(
     resume: str | None,
     session_id: str | None = None,
     session_store: SessionStore | None = None,
+    reviewer_model: str | None = None,
     thinking: dict[str, Any] | None = None,
     task_budget_hint: int | None = None,
     env: dict[str, str] | None = None,
@@ -565,6 +567,22 @@ def build_options(
             *(tool_name for tool_name in disallowed_tools if tool_name != "WebSearch"),
         ]
     sdk_env = dict(env or {})
+    # Auth has already been resolved at boot. An explicit SDK env value,
+    # including an empty value that fences inherited auth, wins over the
+    # process env. Reviewers use the Opus alias so install overrides do not
+    # require rebuilding the bundle (#4120).
+    credential = sdk_env.get(
+        "CLAUDE_CODE_OAUTH_TOKEN", os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    ) or sdk_env.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", ""))
+    sdk_env[_SDK_REVIEWER_MODEL_ENV] = (
+        reviewer_model
+        if reviewer_model is not None
+        else (
+            "claude-opus-5-5"
+            if credential.startswith("sk-ant-")
+            else "anthropic/claude-opus-5.5"
+        )
+    )
     title_model = sdk_env.get(_SDK_TITLE_MODEL_ENV, os.environ.get(_SDK_TITLE_MODEL_ENV, ""))
     if not title_model.strip():
         sdk_env[_SDK_DISABLE_TERMINAL_TITLE_ENV] = "1"

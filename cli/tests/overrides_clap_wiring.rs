@@ -39,6 +39,8 @@ fn bin() -> &'static str {
 
 /// A model value that could never be mistaken for a thinking depth.
 const MODEL_SENTINEL: &str = "curie-test-model-alpha";
+/// The reviewer must not accidentally reuse the implementer's model.
+const REVIEWER_MODEL_SENTINEL: &str = "curie-test-reviewer-model-beta";
 /// A thinking value that could never be mistaken for a model name.
 const THINKING_SENTINEL: &str = "enabled:31337";
 /// An execution-deadline value inside the accepted 60..10800 range (issue #3071).
@@ -217,6 +219,170 @@ fn cluster_overrides_set_model_and_clear_thinking_bind_to_their_own_patch_fields
         serde_json::json!({"model": MODEL_SENTINEL, "thinking": null}),
         "--clear-thinking must null `thinking` while --model sets `model`: {plan}"
     );
+}
+
+#[test]
+fn reviewer_model_set_clear_and_omission_use_distinct_patch_fields_at_both_tiers() {
+    for tier in ["local", "cluster"] {
+        let connection = [
+            tier,
+            "overrides",
+            "dark-factory",
+            "--api-url",
+            "http://127.0.0.1:9",
+            "--api-key",
+            "curie-test-key",
+        ];
+        for (flags, expected) in [
+            (
+                vec![
+                    "--model",
+                    MODEL_SENTINEL,
+                    "--reviewer-model",
+                    REVIEWER_MODEL_SENTINEL,
+                ],
+                serde_json::json!({
+                    "model": MODEL_SENTINEL,
+                    "reviewer_model": REVIEWER_MODEL_SENTINEL,
+                }),
+            ),
+            (
+                vec!["--model", MODEL_SENTINEL, "--clear-reviewer-model"],
+                serde_json::json!({"model": MODEL_SENTINEL, "reviewer_model": null}),
+            ),
+            (
+                vec!["--model", MODEL_SENTINEL],
+                serde_json::json!({"model": MODEL_SENTINEL}),
+            ),
+        ] {
+            let mut args = connection.to_vec();
+            args.extend(flags);
+            args.extend(["--dry-run", "--json"]);
+            let plan = dry_run_plan_line(&args);
+            assert_eq!(patch_body(&plan), expected, "{tier}: {plan}");
+        }
+    }
+}
+
+#[test]
+fn reviewer_model_and_clear_reviewer_model_conflict_at_both_tiers() {
+    for tier in ["local", "cluster"] {
+        let mut args = vec![
+            tier,
+            "overrides",
+            "dark-factory",
+            "--api-url",
+            "http://127.0.0.1:9",
+            "--api-key",
+            "curie-test-key",
+            "--reviewer-model",
+            REVIEWER_MODEL_SENTINEL,
+            "--dry-run",
+            "--json",
+        ];
+        // Establish that this is a valid flag before testing its refusal.
+        dry_run_plan_line(&args);
+        args.push("--clear-reviewer-model");
+        usage_refused(&args);
+    }
+}
+
+#[test]
+fn reviewer_model_set_inspect_clear_and_sibling_write_round_trip_at_both_tiers() {
+    for tier in ["local", "cluster"] {
+        let mut initial: serde_json::Value = serde_json::from_str(&mw_agent_json(true)).unwrap();
+        initial["name"] = serde_json::json!("dark-factory");
+        initial["reviewer_model"] = serde_json::Value::Null;
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(initial));
+        let state = std::sync::Arc::clone(&stored);
+        let server = serve(move |req| {
+            let mut state = state.lock().unwrap();
+            match (req.method.as_str(), req.path.as_str()) {
+                ("GET", "/agents") => {
+                    Response::json(200, &serde_json::json!([state.clone()]).to_string())
+                }
+                ("PATCH", p) if *p == format!("/agents/{MW_AGENT_ID}") => {
+                    let patch: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    state
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(patch.as_object().unwrap().clone());
+                    Response::json(200, &state.to_string())
+                }
+                _ => Response::json(404, r#"{"detail":"not found"}"#),
+            }
+        });
+        let run = |flags: &[&str]| {
+            let output = Command::new(bin())
+                .args([tier, "overrides", "dark-factory"])
+                .args(flags)
+                .args(["--api-url", &server.base_url, "--api-key", "k", "--json"])
+                .env_remove("CURIE_API_URL")
+                .env_remove("CURIE_API_KEY")
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("no_proxy", "127.0.0.1,localhost")
+                .output()
+                .expect("run reviewer model override");
+            assert!(
+                output.status.success(),
+                "{tier}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            json_of(&String::from_utf8_lossy(&output.stdout))
+        };
+
+        let changed = run(&["--reviewer-model", REVIEWER_MODEL_SENTINEL]);
+        assert_eq!(changed["reviewer_model"], REVIEWER_MODEL_SENTINEL);
+        assert_eq!(changed["model"], "kimi-k2");
+        assert_eq!(changed["changed"], true);
+        let patches: Vec<_> = server
+            .recorded()
+            .into_iter()
+            .filter(|request| request.method == "PATCH")
+            .collect();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&patches[0].body).unwrap(),
+            serde_json::json!({"reviewer_model": REVIEWER_MODEL_SENTINEL})
+        );
+
+        let inspected = run(&[]);
+        assert_eq!(inspected["reviewer_model"], REVIEWER_MODEL_SENTINEL);
+        assert_eq!(inspected["changed"], false);
+        assert_eq!(
+            server
+                .recorded()
+                .iter()
+                .filter(|r| r.method == "PATCH")
+                .count(),
+            1,
+            "inspection must not write"
+        );
+
+        let sibling = run(&["--model", MODEL_SENTINEL]);
+        assert_eq!(sibling["reviewer_model"], REVIEWER_MODEL_SENTINEL);
+        assert_eq!(sibling["model"], MODEL_SENTINEL);
+        let cleared = run(&["--clear-reviewer-model"]);
+        assert_eq!(cleared["reviewer_model"], serde_json::Value::Null);
+        assert_eq!(cleared["model"], MODEL_SENTINEL);
+        assert_eq!(cleared["changed"], true);
+        let patches: Vec<_> = server
+            .recorded()
+            .into_iter()
+            .filter(|request| request.method == "PATCH")
+            .collect();
+        assert_eq!(patches.len(), 3);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&patches[1].body).unwrap(),
+            serde_json::json!({"model": MODEL_SENTINEL})
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&patches[2].body).unwrap(),
+            serde_json::json!({"reviewer_model": null})
+        );
+        assert_eq!(run(&[])["reviewer_model"], serde_json::Value::Null);
+    }
 }
 
 // --- `--execution-deadline`/`--clear-execution-deadline` (issue #3071) ------

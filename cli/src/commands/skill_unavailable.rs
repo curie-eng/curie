@@ -79,11 +79,16 @@ pub const HOOK_RECORD_REASON: &str =
     "the skill tier runs one bundle against a local runner and has no platform API or hook run record";
 /// Where a durable hook record lives instead.
 pub const HOOK_RECORD_ALT: &str =
-    "use `curie local hook fire` or `curie cluster hook fire`, which print the run record";
+    "use `curie local hook record <agent> <name> <id>` or `curie cluster hook record <agent> <name> <id>` to read the run record";
 
 /// `skill hook schedule` and `skill hook record` (ADR-0099, #2932).
 pub fn skill_hook_record_unavailable(verb: &str) -> anyhow::Error {
-    crate::exit::unsupported(verb, HOOK_RECORD_REASON, HOOK_RECORD_ALT)
+    let alternative = if verb == "record" {
+        HOOK_RECORD_ALT
+    } else {
+        "use `curie local hook fire` or `curie cluster hook fire`, which print the run record"
+    };
+    crate::exit::unsupported(verb, HOOK_RECORD_REASON, alternative)
 }
 
 /// `skill observability runs|run|metrics`: understood, but unavailable here.

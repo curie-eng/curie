@@ -140,9 +140,10 @@ fn guide_prints_primer_to_stdout() {
         assert!(text.contains(needle), "primer missing `{needle}`\n{text}");
     }
     // "Roughly 100 lines": a real primer, neither a stub nor a sprawling manual.
+    // The ceiling grew with the Cron triggers section (#4012).
     let lines = text.lines().count();
     assert!(
-        (60..=170).contains(&lines),
+        (60..=200).contains(&lines),
         "primer is {lines} lines, expected roughly 100"
     );
 }
@@ -390,6 +391,65 @@ fn approval_card_channel_null_explanations_preserve_compatibility_meaning() {
         assert!(
             !text.contains("names no route"),
             "{surface} still claims null `card_channel` means the record names no route"
+        );
+    }
+}
+
+#[test]
+fn guide_documents_cron_triggers() {
+    // AC (#4012): nothing in the released CLI said cron triggers exist. Both
+    // renderings carry the manifest shape and the verbs that read the record,
+    // and the markdown keeps them inside one Cron triggers section.
+    let md = out_str(&run(&["guide"]));
+    let json_text = out_str(&run(&["guide", "--json"]));
+    for (label, text) in [("markdown", &md), ("json", &json_text)] {
+        for needle in [
+            "triggers",
+            "schedule",
+            "timezone",
+            "prompt",
+            "target",
+            "schedules",
+            "hook fire",
+            "failed",
+        ] {
+            assert!(
+                text.contains(needle),
+                "{label} primer missing the cron fact `{needle}`\n{text}"
+            );
+        }
+    }
+
+    let start = md
+        .find("## Cron triggers")
+        .unwrap_or_else(|| panic!("markdown primer has no Cron triggers section\n{md}"));
+    let rest = &md[start..];
+    let section = match rest[1..].find("\n## ") {
+        Some(end) => &rest[..end + 1],
+        None => rest,
+    };
+    for needle in ["triggers", "schedules", "hook fire"] {
+        assert!(
+            section.contains(needle),
+            "Cron triggers section missing `{needle}`\n{section}"
+        );
+    }
+
+    let surface = Surface::load();
+    let json: Value = serde_json::from_str(&json_text).expect("guide --json is json");
+    let commands = json["cron"]["commands"]
+        .as_array()
+        .expect("cron.commands is an array");
+    assert!(!commands.is_empty(), "cron.commands is empty");
+    for cmd in commands {
+        let cmd = cmd.as_str().expect("command is a string");
+        assert!(
+            matches!(surface.resolve(cmd), Ok(Some(_))),
+            "cron command `{cmd}` does not resolve to a real command"
+        );
+        assert!(
+            section.contains(cmd),
+            "cron command `{cmd}` is absent from the markdown Cron triggers section"
         );
     }
 }

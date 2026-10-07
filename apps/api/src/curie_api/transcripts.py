@@ -16,6 +16,11 @@ WorkItem terminal (``expire_for_work_item``). Every write also moves
 ``expires_at`` forward by ``transcript_idle_ttl_seconds``; an expired row reads
 as absent and is deleted by the next write for the same agent. That covers
 threads with no WorkItem, and is a backstop for a WorkItem thread.
+
+The thread's attachment ledger (``thread_attachments``, ADR 0205) has the same
+lifetime: every path here that ends a thread's history deletes its file
+references in the same transaction, and the sweep also removes references past
+their own expiry that no live transcript holds.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from . import thread_attachments
 from .config import get_settings
 from .models import ThreadTranscript, WorkItem
 from .threadkeys import pre_identity_thread_key_for
@@ -143,6 +149,8 @@ async def _sweep_expired(session: AsyncSession, agent_id: uuid.UUID) -> None:
         by_scope.setdefault(scope, []).append(key)
     for scope, keys in by_scope.items():
         await _delete_pre_identity(session, agent_id, scope, keys)
+        await thread_attachments.delete_for(session, agent_id, scope, keys)
+    await thread_attachments.sweep_orphans(session, agent_id)
 
 
 async def _adopt_pre_identity(
@@ -298,6 +306,8 @@ async def remove(
         if row is not None:
             await session.delete(row)
         await _delete_pre_identity(session, agent_id, scope, [key])
+        # The thread ends even when only its files exist yet (ADR 0205).
+        await thread_attachments.delete_for(session, agent_id, scope, [key])
         await session.commit()
         return row is not None
     stored = row.version if row is not None else None
@@ -310,6 +320,7 @@ async def remove(
         )
         if deleted is not None:
             await _delete_pre_identity(session, agent_id, scope, [key])
+            await thread_attachments.delete_for(session, agent_id, scope, [key])
         await session.commit()
     if deleted is None:
         if stored is None:
@@ -372,3 +383,6 @@ async def expire_for_work_item(session: AsyncSession, work_item: WorkItem) -> No
         )
     )
     await _delete_pre_identity(session, work_item.agent_id, None, [work_item.conversation_id])
+    await thread_attachments.delete_for(
+        session, work_item.agent_id, None, [work_item.conversation_id]
+    )

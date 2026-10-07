@@ -170,6 +170,9 @@ class Agent(Base):
     # the platform/worker default model applies. The value is passed straight
     # through to the runner, which resolves it against its configured provider.
     model: Mapped[str | None] = mapped_column(default=None)
+    # Per-agent reviewer model (#4120). NULL lets the runner choose the
+    # credential's default; a value becomes the SDK's Opus alias target.
+    reviewer_model: Mapped[str | None] = mapped_column(default=None)
     # Per-agent thinking depth (#1182, ADR-0098). Forwarded as CURIE_THINKING at
     # sandbox boot; NULL means the worker's CURIE_THINKING default applies, and
     # unset at both layers means the runner sends no thinking configuration and
@@ -2037,6 +2040,72 @@ class ThreadTranscript(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+class ThreadAttachmentRef(Base):
+    """One file a thread's agent was given (ADR 0205, #4079).
+
+    Keyed exactly like ``ThreadTranscript`` and removed with it
+    (``curie_api.thread_attachments``). Only the worker writes it, through the
+    internal routes. It records the channel's file id and the route it came
+    from, never an endpoint, a URL or bytes. ``seq`` is the arrival order;
+    ``disk_name`` is fixed when recorded and unique in the thread, so a path a
+    notice named is the path on every later boot.
+    """
+
+    __tablename__ = "thread_attachment_refs"
+    __table_args__ = (
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "event_id",
+            "file_id",
+            name="uq_thread_attachment_refs_event_file",
+            postgresql_nulls_not_distinct=True,
+        ),
+        UniqueConstraint(
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "disk_name",
+            name="uq_thread_attachment_refs_disk_name",
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index(
+            "ix_thread_attachment_refs_thread_seq",
+            "agent_id",
+            "binding_scope",
+            "thread_key",
+            "seq",
+        ),
+        Index("ix_thread_attachment_refs_expires_at", "expires_at"),
+        # The orphan sweep runs on every transcript write, scoped to one agent.
+        Index("ix_thread_attachment_refs_agent_expires_at", "agent_id", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    seq: Mapped[int] = mapped_column(BigInteger, Identity(always=True))
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE")
+    )
+    binding_scope: Mapped[str | None] = mapped_column(Text, default=None)
+    thread_key: Mapped[str] = mapped_column(Text)
+    event_id: Mapped[str] = mapped_column(Text)
+    file_id: Mapped[str] = mapped_column(Text)
+    ordinal: Mapped[int] = mapped_column(Integer)
+    name: Mapped[str] = mapped_column(Text)
+    disk_name: Mapped[str] = mapped_column(Text)
+    mime_type: Mapped[str | None] = mapped_column(Text, default=None)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, default=None)
+    sha256: Mapped[str] = mapped_column(Text)
+    route_kind: Mapped[str] = mapped_column(Text)
+    route_adapter: Mapped[str | None] = mapped_column(Text, default=None)
+    route_identity: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class ConsoleSession(Base):
     """One console login: the code that establishes it and the session it becomes.
 
@@ -2169,6 +2238,10 @@ class HookRun(Base):
             "('ran', 'deferred', 'skipped', 'blocked', 'reclaimed', 'failed')",
             name="hook_runs_outcome_ck",
         ),
+        CheckConstraint(
+            "source IN ('schedule', 'manual')",
+            name="hook_runs_source_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -2182,7 +2255,11 @@ class HookRun(Base):
     version_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey(f"{SCHEMA}.agent_versions.id", ondelete="CASCADE")
     )
+    source: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'schedule'")
+    )
     outcome: Mapped[str | None] = mapped_column(String, default=None)
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None

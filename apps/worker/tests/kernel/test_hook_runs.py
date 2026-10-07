@@ -424,7 +424,7 @@ def test_cron_retry_inside_its_catch_up_bound_runs(
         async with make_hook_run() as run, make_harness(
             hook_runs=run.recorder()
         ) as h:
-            await HookRunRecorder(run.engine, "curie").close(run.ref, "deferred")
+            await HookRunRecorder(run.engine, "curie").close(run.ref, "deferred", "live_session")
             deferred, ended_at = await run.state() or (None, None)
             assert deferred == "deferred"
             assert ended_at is not None
@@ -1248,5 +1248,28 @@ def test_recorder_reads_and_writes_the_configured_schema() -> None:
             async with engine.begin() as conn:
                 await conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
             await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_hook_run_reason_turn_error(
+    make_harness,
+    make_hook_run,
+) -> None:
+    async def go() -> None:
+        async with (
+            make_hook_run() as run,
+            make_harness(hook_runs=run.recorder(), max_attempts=3) as h,
+        ):
+            h.runner.turn_scripts = [
+                [
+                    ErrorEvent(message="retryable", classification="runner-error"),
+                    Final(text="failed", status=SessionStatus.CLASSIFIED_FAILURE),
+                ]
+            ]
+            await h.kernel.process_event(_event(hook_run=run.ref))
+            outcome, _ended = await run.state() or (None, None)
+            assert outcome == "failed"
+            assert await run.reason() == "turn_error"
 
     asyncio.run(go())

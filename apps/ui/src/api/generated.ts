@@ -2069,7 +2069,7 @@ export interface paths {
         };
         /**
          * List Schedules
-         * @description Cron hooks on each in-force deployment, newest slot first in the record.
+         * @description Cron hooks on each in-force deployment, with separate latest run histories.
          */
         get: operations["list_schedules_schedules_get"];
         put?: never;
@@ -2362,6 +2362,40 @@ export interface paths {
          *     (``SANDBOX_CREDENTIAL_RELEASED_TTL_S``).
          */
         post: operations["release_sandbox_credential_v1_internal_state_released_credentials_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/thread-attachments/append": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Append Thread Attachments */
+        post: operations["append_thread_attachments_v1_internal_thread_attachments_append_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/thread-attachments/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query Thread Attachments */
+        post: operations["query_thread_attachments_v1_internal_thread_attachments_query_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3185,6 +3219,8 @@ export interface components {
             publication_policy?: "approve" | "auto";
             /** Repo Full Name */
             repo_full_name?: string | null;
+            /** Reviewer Model */
+            reviewer_model?: string | null;
             /** Secrets */
             secrets?: {
                 [key: string]: string;
@@ -3259,6 +3295,8 @@ export interface components {
             publication_policy_version?: number;
             /** Repo Full Name */
             repo_full_name: string | null;
+            /** Reviewer Model */
+            reviewer_model: string | null;
             /** Runner Resources */
             runner_resources?: {
                 [key: string]: unknown;
@@ -3332,6 +3370,8 @@ export interface components {
             publication_policy?: ("approve" | "auto") | null;
             /** Repo Full Name */
             repo_full_name?: string | null;
+            /** Reviewer Model */
+            reviewer_model?: string | null;
             /** Runner Resources */
             runner_resources?: {
                 [key: string]: unknown;
@@ -5296,11 +5336,18 @@ export interface components {
             name: string;
             /** Outcome */
             outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
+            /** Reason */
+            reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
             /**
              * Slot Utc
              * Format: date-time
              */
             slot_utc: string;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "schedule" | "manual";
             /**
              * Started At
              * Format: date-time
@@ -6772,13 +6819,21 @@ export interface components {
         };
         /**
          * ScheduleHookOut
-         * @description One cron hook on the in-force bundle, with its newest slot.
+         * @description One cron hook with its newest scheduled and manual run histories.
          */
         ScheduleHookOut: {
             /** Last Fire At */
             last_fire_at: string | null;
+            /** Last Manual Fire At */
+            last_manual_fire_at: string | null;
+            /** Last Manual Outcome */
+            last_manual_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
+            /** Last Manual Reason */
+            last_manual_reason: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
             /** Last Outcome */
             last_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
+            /** Last Reason */
+            last_reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
             /** Name */
             name: string;
             /** Paused */
@@ -6982,6 +7037,95 @@ export interface components {
         TerminationClaimBody: {
             /** Owner */
             owner: string;
+        };
+        /** ThreadAttachmentAppend */
+        ThreadAttachmentAppend: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Event Id */
+            event_id: string;
+            /** Refs */
+            refs: components["schemas"]["ThreadAttachmentRefBody"][];
+            /** Thread Key */
+            thread_key: string;
+        };
+        /** ThreadAttachmentAppendOut */
+        ThreadAttachmentAppendOut: {
+            /** Appended */
+            appended: number;
+        };
+        /** ThreadAttachmentQuery */
+        ThreadAttachmentQuery: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Thread Key */
+            thread_key: string;
+        };
+        /**
+         * ThreadAttachmentRefBody
+         * @description One recorded file. Exactly these fields: never an endpoint, URL or bytes.
+         */
+        ThreadAttachmentRefBody: {
+            /** Disk Name */
+            disk_name: string;
+            /** File Id */
+            file_id: string;
+            /** Mime Type */
+            mime_type?: string | null;
+            /** Name */
+            name: string;
+            /** Ordinal */
+            ordinal: number;
+            /** Route Adapter */
+            route_adapter?: string | null;
+            /** Route Identity */
+            route_identity: string;
+            /** Route Kind */
+            route_kind: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes?: number | null;
+        };
+        /**
+         * ThreadAttachmentRefRow
+         * @description A query row: the appended ref plus the event it was recorded under, so a
+         *     redelivered turn's worker recognises its own rows by (event_id, file_id).
+         */
+        ThreadAttachmentRefRow: {
+            /** Disk Name */
+            disk_name: string;
+            /** Event Id */
+            event_id: string;
+            /** File Id */
+            file_id: string;
+            /** Mime Type */
+            mime_type?: string | null;
+            /** Name */
+            name: string;
+            /** Ordinal */
+            ordinal: number;
+            /** Route Adapter */
+            route_adapter?: string | null;
+            /** Route Identity */
+            route_identity: string;
+            /** Route Kind */
+            route_kind: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes?: number | null;
+        };
+        /** ThreadAttachmentRefsOut */
+        ThreadAttachmentRefsOut: {
+            /** Refs */
+            refs: components["schemas"]["ThreadAttachmentRefRow"][];
         };
         /**
          * ThreadResetState
@@ -12622,6 +12766,76 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    append_thread_attachments_v1_internal_thread_attachments_append_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ThreadAttachmentAppend"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadAttachmentAppendOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    query_thread_attachments_v1_internal_thread_attachments_query_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ThreadAttachmentQuery"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadAttachmentRefsOut"];
+                };
             };
             /** @description Validation Error */
             422: {
