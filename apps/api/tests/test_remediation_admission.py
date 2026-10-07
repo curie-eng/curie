@@ -97,7 +97,6 @@ from curie_internal.keyspace import kill_key
 from sqlalchemy import event as sa_event
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from test_hook_source_support import (  # noqa: F401  (support_db is a fixture)
     HOOK,
     scoped_secret,
@@ -475,6 +474,7 @@ def assert_approval(row: dict[str, Any], reason: str) -> None:
 
     assert row["state"] == "approval_requested", row
     assert row["approval_reason"] == reason, row
+    assert row["approval_id"] is not None, row
     assert row["refusal_code"] is None, row
     assert row["execution_id"] is None, row
     assert row["verification_outcome"] is None, row
@@ -664,43 +664,48 @@ async def age(seconds: int) -> None:
     await asyncio.to_thread(_age, seconds)
 
 
-async def _with_session(factory: Callable[[Any], Any]) -> Any:
-    engine = create_async_engine(get_settings().database_url)
-    sessions = async_sessionmaker(engine, expire_on_commit=False)
-    try:
-        async with sessions() as session:
-            return await factory(session)
-    finally:
-        await engine.dispose()
+def _approver() -> dict[str, str]:
+    """The route's approver (``approvers.users``) as an operator principal, no platform key."""
+
+    return {k: v for k, v in admin_headers().items() if k != "X-API-Key"}
 
 
-async def approved_forward(row: dict[str, Any]) -> dict[str, Any]:
-    """An approval-authority forward execution of a nomination sent to approval.
+async def assert_requested(row: dict[str, Any]) -> dict[str, Any]:
+    """The nomination's ``remediation`` approval (task 10's request), bound to its call."""
 
-    The approval's resolution is task 10's (sibling branch); its outcome is
-    recorded here as task 10 records it (``approved`` with the approval id), and
-    the forward execution is created by the real AUTOMATED-REMEDIATION-13
-    producer, ``create_remediation_forward`` with that approval.
+    assert row["approval_id"] is not None, row
+    (approval,) = await q(
+        "SELECT * FROM curie.approvals WHERE id = :id", {"id": row["approval_id"]}
+    )
+    assert approval["purpose"] == "remediation", approval
+    assert approval["route"] == ROUTE_NAME, approval
+    assert approval["granted_tool"] == f"mcp__{ACT_CONNECTOR}__{ACT_TOOL}", approval
+    assert approval["expires_at"] is not None, approval
+    return approval
+
+
+async def approved_forward(stage: Stage, row: dict[str, Any]) -> dict[str, Any]:
+    """Approve the nomination's approval through the real resolve route (task 10).
+
+    Admission raised the approval through ``request_remediation_approval``; the
+    route's approver approves it, and the resolution creates the one
+    approval-authority forward execution (AUTOMATED-REMEDIATION-16).
     """
 
-    assert row["state"] == "approval_requested", row
-    approval_id = uuid.uuid4()
-    await asyncio.to_thread(
-        sql_rows,
-        "UPDATE curie.remediation_nominations SET state = 'approved', approval_id = :a "
-        "WHERE id = :id",
-        {"a": approval_id, "id": row["id"]},
+    asked = await nomination(row["id"])
+    assert asked["state"] == "approval_requested", asked
+    await assert_requested(asked)
+    resolved = await stage.client.post(
+        f"/approvals/{asked['approval_id']}/resolve",
+        json={"decision": "approved"},
+        headers=_approver(),
     )
-    forward = importlib.import_module("curie_api.remediation_forward")
-    created = await _with_session(
-        lambda session: forward.create_remediation_forward(
-            session, row["id"], approval_id=approval_id
-        )
-    )
+    assert resolved.status_code == 200, resolved.text
     rows = await q(
-        "SELECT * FROM curie.action_executions WHERE id = :id", {"id": created.execution_id}
+        "SELECT * FROM curie.action_executions WHERE kind = 'forward' AND idempotency_key = :key",
+        {"key": f"remediation:{row['id']}:approval:{asked['approval_id']}"},
     )
-    assert rows and rows[0]["authority_kind"] == "approval", rows
+    assert len(rows) == 1 and rows[0]["authority_kind"] == "approval", rows
     return rows[0]
 
 
@@ -950,6 +955,7 @@ def test_each_admission_check_decides_through_its_real_producer(
                 assert_stopped(row)
             else:
                 assert_approval(row, code)
+                await assert_requested(row)
             await assert_nothing_executes(row)
 
     run(scenario)
@@ -1095,6 +1101,7 @@ def test_the_first_failing_check_decides(
                 assert_stopped(row)
             else:
                 assert_approval(row, code)
+                await assert_requested(row)
             await assert_nothing_executes(row)
 
     run(scenario)
@@ -1318,7 +1325,7 @@ def test_a_breaker_opened_while_precondition_pending_sends_the_transition_to_app
                 "WHERE id = :id",
                 {"id": read["id"]},
             )
-            approved = await approved_forward(asked)
+            approved = await approved_forward(w.stage, asked)
             await run_forward(w.stage, asked, approved, "not-recovered")
             assert [b["closed_at"] for b in await breakers(TARGETS[0])] == [None]
             await asyncio.to_thread(
@@ -1773,7 +1780,7 @@ def test_an_approved_action_opens_the_incident_too(
             await w.bind()
             asked = await w.one(entry(TARGETS[0], replicas=9))
             assert_approval(asked, "out_of_bounds")
-            approved = await approved_forward(asked)
+            approved = await approved_forward(w.stage, asked)
             await run_forward(w.stage, asked, approved, "verified")
 
             assert_approval(await w.one(entry(TARGETS[0])), "incident_limit")
@@ -1847,7 +1854,7 @@ def test_an_approved_action_that_does_not_recover_opens_the_breaker_too(
         async with world(ingress_broker, tmp_path, monkeypatch) as w:
             await w.bind()
             asked = await w.one(entry(TARGETS[0], replicas=9))
-            approved = await approved_forward(asked)
+            approved = await approved_forward(w.stage, asked)
             await run_forward(w.stage, asked, approved, "not-recovered")
             assert [b["closed_at"] for b in await breakers(TARGETS[0])] == [None]
             await age(3700)  # past the incident the approved action opened
@@ -1987,6 +1994,7 @@ async def assert_policy_changed(w: World, row: dict[str, Any], forward: dict[str
     nominated = await nomination(row["id"])
     assert nominated["state"] == "approval_requested", nominated
     assert nominated["approval_reason"] == "policy_changed", nominated
+    await assert_requested(nominated)
     assert nominated["verification_outcome"] is None, nominated
     assert nominated["execution_code"] is None, nominated
     assert [r for r in await executions_of(row["id"], "read") if r["state"] == "requested"] == []
@@ -2038,7 +2046,7 @@ def test_a_breaker_opened_after_creation_refuses_the_execution_policy_changed_at
                 "WHERE id = :id",
                 {"id": forward["id"]},
             )
-            approved = await approved_forward(asked)
+            approved = await approved_forward(w.stage, asked)
             await run_forward(w.stage, asked, approved, "not-recovered")
             await asyncio.to_thread(
                 sql_rows,
@@ -2062,7 +2070,7 @@ def test_an_approval_authority_execution_is_claimed_whatever_the_policy_state(
         async with world(ingress_broker, tmp_path, monkeypatch) as w:
             await w.bind()
             asked = await w.one(entry(TARGETS[0], replicas=9))
-            approved = await approved_forward(asked)
+            approved = await approved_forward(w.stage, asked)
             await set_armed(w.stage, w.hooks, False)
             claimed = await claim_one(w.stage, approved["id"])
             assert claimed["state"] == "claimed", claimed
