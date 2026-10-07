@@ -24,7 +24,7 @@ import pytest
 _VECTORS = Path(__file__).resolve().parents[3] / "tests" / "vectors"
 _VECTOR = json.loads((_VECTORS / "remediation-policy.json").read_text("utf-8"))
 _CODES = json.loads((_VECTORS / "remediation-codes.json").read_text("utf-8"))
-_KEYS = {"comment", "refusal_codes", "valid", "invalid", "invalid_texts"}
+_KEYS = {"comment", "refusal_codes", "valid", "invalid", "invalid_texts", "numeric_texts"}
 
 
 def _validator() -> Any:  # noqa: ANN401 - the production module under test
@@ -44,14 +44,15 @@ def test_the_vector_has_only_known_keys() -> None:
         assert set(case) == {"name", "document"}, case["name"]
     for case in _VECTOR["invalid"]:
         assert set(case) == {"name", "document", "code", "path"}, case["name"]
-    for case in _VECTOR["invalid_texts"]:
+    for case in _VECTOR["invalid_texts"] + _VECTOR["numeric_texts"]:
         assert set(case) == {"name", "text", "code", "path"}, case["name"]
 
 
 def test_the_document_codes_are_policy_refusals() -> None:
     """@spec AUTOMATED-REMEDIATION-26: the document codes sit in the closed code set."""
 
-    used = {case["code"] for case in _VECTOR["invalid"] + _VECTOR["invalid_texts"]}
+    cases = _VECTOR["invalid"] + _VECTOR["invalid_texts"] + _VECTOR["numeric_texts"]
+    used = {case["code"] for case in cases}
     assert used == set(_VECTOR["refusal_codes"])
     assert set(_VECTOR["refusal_codes"]) <= set(_CODES["policy_refusals"])
 
@@ -81,6 +82,21 @@ def test_each_invalid_document_is_refused_with_its_code_and_path(case: dict[str,
 @pytest.mark.parametrize("case", _VECTOR["invalid_texts"], ids=lambda case: case["name"])
 def test_a_non_finite_number_is_refused_before_any_check(case: dict[str, Any]) -> None:
     """@spec AUTOMATED-REMEDIATION-2: NaN and infinities never reach a digest."""
+
+    module = _validator()
+    with pytest.raises(module.PolicyRefused) as refused:
+        module.validate_document(json.loads(case["text"]))
+    assert (refused.value.code, refused.value.path) == (case["code"], case["path"])
+
+
+@pytest.mark.parametrize("case", _VECTOR["numeric_texts"], ids=lambda case: case["name"])
+def test_a_number_a_json_value_can_change_is_refused_at_its_path(case: dict[str, Any]) -> None:
+    """@spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
+
+    An integer outside the signed 64-bit range and an exponent beyond a double
+    are refused at the number's own path, so the CLI's mirror (which reads
+    numbers into a native JSON value) and the API agree on code and path.
+    """
 
     module = _validator()
     with pytest.raises(module.PolicyRefused) as refused:

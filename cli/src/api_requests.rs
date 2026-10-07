@@ -205,3 +205,24 @@ pub struct EvalTriggerRequest {
 /// serializes as `{}` rather than `null`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ActionUndo {}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// `POST .../remediation-policy/arm` and `.../disarm`
+/// (`RemediationPolicyMutation`): compare and swap on the generation, plus the
+/// idempotency key. `DELETE` carries the same pair in its query.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemediationPolicyMutation {
+    pub expected_generation: String,
+    pub operation_id: String,
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// `PUT .../remediation-policy` (`RemediationPolicyWrite`): the CAS pair and
+/// the policy document exactly as the operator's file holds it (always a
+/// JSON object: the validator refuses anything else before a send).
+#[derive(Debug, Clone, Serialize)]
+pub struct RemediationPolicyWrite {
+    pub expected_generation: String,
+    pub operation_id: String,
+    pub policy: serde_json::Map<String, serde_json::Value>,
+}

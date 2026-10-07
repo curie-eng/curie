@@ -95,6 +95,10 @@ _ALLOWED_MAXIMUM: Final = 256
 _VERIFIER_INTERVAL_MINIMUM: Final = 10
 _VERIFIER_DEADLINE_MAXIMUM: Final = 3600
 _VERIFIER_SAMPLE_CAP: Final = 60
+# A number a reader's native JSON value can change is refused at its path, so
+# the CLI's mirror (which reads integers as signed 64-bit) agrees with this one.
+_INT64_MINIMUM: Final = -(2**63)
+_INT64_MAXIMUM: Final = 2**63 - 1
 
 
 class PolicyRefused(Exception):
@@ -140,6 +144,14 @@ def _number(value: Any, path: str) -> int | float:
     if type(value) not in (int, float) or not math.isfinite(value):
         raise _refuse("policy_document_invalid", path, "must be a finite number")
     return value  # type: ignore[no-any-return]
+
+
+def _member(value: Any, allowed: frozenset[str]) -> bool:
+    """A closed-vocabulary value: a string in ``allowed``, never an unhashable value.
+
+    @spec AUTOMATED-REMEDIATION-2.
+    """
+    return type(value) is str and value in allowed
 
 
 def _identifier(value: Any, path: str) -> str:
@@ -228,7 +240,7 @@ def _validate_argument(spec: Any, path: str) -> None:
     spec = _closed(spec, path, _ARGUMENT_KEYS)
     _require(spec, path, frozenset({"type"}))
     kind = spec["type"]
-    if kind not in ARGUMENT_TYPES:
+    if not _member(kind, ARGUMENT_TYPES):
         raise _refuse("policy_document_invalid", f"{path}/type", "is not a known argument type")
     has_allowed = "allowed" in spec
     has_range = "minimum" in spec or "maximum" in spec
@@ -262,7 +274,7 @@ def _validate_read(read: Any, path: str, *, verifier: bool) -> None:
     if type(read["pointer"]) is not str or not _POINTER.fullmatch(read["pointer"]):
         raise _refuse("policy_document_invalid", f"{path}/pointer", "must be an RFC 6901 pointer")
     comparator = read["comparator"]
-    if comparator not in COMPARATORS:
+    if not _member(comparator, COMPARATORS):
         raise _refuse("policy_document_invalid", f"{path}/comparator", "is not a comparator")
     if comparator == "absent":
         if "value" in read:
@@ -330,11 +342,11 @@ def _validate_action(action: Any, path: str) -> str:
             "policy_document_invalid", f"{path}/name", "must match [a-z0-9][a-z0-9_-]{0,62}"
         )
     kind = action["kind"]
-    if kind not in KINDS:
+    if not _member(kind, KINDS):
         raise _refuse("policy_document_invalid", f"{path}/kind", "is not a known kind")
     _identifier(action["connector"], f"{path}/connector")
     _identifier(action["tool"], f"{path}/tool")
-    if action["reversibility"] not in REVERSIBILITIES:
+    if not _member(action["reversibility"], REVERSIBILITIES):
         raise _refuse(
             "policy_document_invalid", f"{path}/reversibility", "is not a known reversibility"
         )
@@ -390,21 +402,34 @@ def _validate_action(action: Any, path: str) -> str:
     return name
 
 
-def _refuse_non_finite(value: Any, path: str) -> None:
-    """Refuse NaN and Infinity anywhere in the document.
+def _refuse_unrepresentable(value: Any, path: str, *, limit_field: bool = False) -> None:
+    """Refuse a number a reader's native JSON value can change, at its path.
 
     Canonical JSON has no non-finite numbers, but the request parser accepts
-    the tokens; refusing them here, before any check or digest, keeps every
-    numeric field finite. @spec AUTOMATED-REMEDIATION-2.
+    ``NaN`` and ``Infinity`` and reads an exponent beyond a double as infinity;
+    each is ``policy_document_invalid``. An integer outside the signed 64-bit
+    range is ``policy_limit_out_of_bounds`` as a member of the top-level
+    ``limits`` object (a well-formed number outside the limit's bounds) and
+    ``policy_document_invalid`` anywhere else. Refusing these first, before any
+    check or digest, keeps every number one the CLI's mirror reads unchanged.
+    @spec AUTOMATED-REMEDIATION-2.
     """
     if isinstance(value, float) and not math.isfinite(value):
         raise _refuse("policy_document_invalid", path or "/", "must be a finite number")
+    if type(value) is int and not _INT64_MINIMUM <= value <= _INT64_MAXIMUM:
+        code = "policy_limit_out_of_bounds" if limit_field else "policy_document_invalid"
+        raise _refuse(code, path, "is outside the signed 64-bit range")
     if isinstance(value, dict):
+        limits = path == "" and isinstance(value.get("limits"), dict)
         for key, item in value.items():
-            _refuse_non_finite(item, f"{path}/{key}")
+            if limits and key == "limits":
+                for limit, member in item.items():
+                    _refuse_unrepresentable(member, f"/limits/{limit}", limit_field=True)
+            else:
+                _refuse_unrepresentable(item, f"{path}/{key}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
-            _refuse_non_finite(item, f"{path}/{index}")
+            _refuse_unrepresentable(item, f"{path}/{index}")
 
 
 def validate_document(document: Any) -> dict[str, Any]:
@@ -412,7 +437,7 @@ def validate_document(document: Any) -> dict[str, Any]:
 
     @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-24.
     """
-    _refuse_non_finite(document, "")
+    _refuse_unrepresentable(document, "")
     document = _closed(document, "", _TOP_KEYS)
     _require(document, "", _TOP_KEYS)
     route = document["route"]

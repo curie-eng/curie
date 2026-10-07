@@ -441,6 +441,11 @@
           "why": "The worker's pre-dispatch arguments check (ACTION-EXECUTOR-7); a refusal on it reaches the receipt as the code arguments_mismatch."
         }
       ]
+    },
+    {
+      "struct": "RemediationPolicyGeneration",
+      "schema": "RemediationPolicyOut",
+      "omissions": []
     }
   ],
   "non_mirrors": [
@@ -642,6 +647,16 @@
           "why": "ACTION-EXECUTOR-3: the actor is the authenticated principal from CURIE_APPROVAL_PRINCIPAL_TOKEN; the body's actor is only a cross-check, so actions undo never asserts one and sends {}."
         }
       ]
+    },
+    {
+      "struct": "RemediationPolicyMutation",
+      "schema": "RemediationPolicyMutation",
+      "omissions": []
+    },
+    {
+      "struct": "RemediationPolicyWrite",
+      "schema": "RemediationPolicyWrite",
+      "omissions": []
     }
   ],
   "requests": [
@@ -776,6 +791,24 @@
       "struct": "ActionUndo",
       "method": "post",
       "path": "/actions/{action_id}/undo"
+    },
+    {
+      "function": "put_remediation_policy",
+      "struct": "RemediationPolicyWrite",
+      "method": "put",
+      "path": "/agents/{agent_id}/hooks/{hook}/remediation-policy"
+    },
+    {
+      "function": "arm_remediation_policy",
+      "struct": "RemediationPolicyMutation",
+      "method": "post",
+      "path": "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm"
+    },
+    {
+      "function": "disarm_remediation_policy",
+      "struct": "RemediationPolicyMutation",
+      "method": "post",
+      "path": "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm"
     }
   ],
   "_emits_comment": "The second, emit-hop gate (#699): a CliOutput::to_json can hand-project one of the mirror structs above into a serde_json::json! literal and drop a field the struct-level gate already proved it carries (the named drift was VersionsOutput dropping Version.id, fixed in #691). Each entry below declares that a specific `output` type's to_json projects a specific mirror `struct`, and every allowlisted omission needs a consumer-derived justification just like the mirrors list above. Check with: curie dev emit-parity. This is a narrower gate than the struct-level one: it verifies every DECLARED (output, struct) pair stays honest, but (unlike mirrors' UndeclaredStruct check) it cannot discover a NEW projection on its own -- see cli/tests/support/emit_parity.rs's module doc for why that reach is out of scope for a syntax-only check.",

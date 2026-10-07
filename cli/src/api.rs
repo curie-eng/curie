@@ -12,7 +12,8 @@ use crate::api_requests::{
     ActionUndo, AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
     ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
     DeploymentCreate, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
-    ResolveTargetRequest, RoutingCheckRequest, VersionCreate,
+    RemediationPolicyMutation, RemediationPolicyWrite, ResolveTargetRequest, RoutingCheckRequest,
+    VersionCreate,
 };
 
 pub struct ApiClient {
@@ -1206,6 +1207,22 @@ pub struct ActionExecution {
     pub dispatched_at: Option<String>,
     pub finished_at: Option<String>,
     pub created_at: String,
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// One committed remediation policy generation as the policy routes serialize
+/// it (`RemediationPolicyOut`). The generation is a canonical decimal string;
+/// `bound_by` is the operator principal's subject, never its token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationPolicyGeneration {
+    pub agent_id: String,
+    pub hook: String,
+    pub generation: String,
+    pub armed: bool,
+    pub active: bool,
+    pub bound_by: String,
+    pub policy: serde_json::Value,
+    pub updated_at: String,
 }
 
 /// One factory work item outcome (`WorkItemOutcomeOut`, #2577). `state` and
@@ -3946,6 +3963,229 @@ impl ApiClient {
                 )
             }
             s if s.is_server_error() => CliError::transient(message),
+            _ => CliError::failure(message),
+        };
+        Err(anyhow::Error::from(error))
+    }
+
+    // @spec AUTOMATED-REMEDIATION-3
+    /// The current policy generation of a hook:
+    /// `GET /agents/{agent_id}/hooks/{hook}/remediation-policy`, on the
+    /// platform key. Reads need no principal.
+    pub async fn get_remediation_policy(
+        &self,
+        agent_id: &str,
+        hook: &str,
+    ) -> Result<RemediationPolicyGeneration> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/hooks/{hook}/remediation-policy",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "reading the remediation policy")
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+    /// Bind or replace a hook's policy: `PUT .../remediation-policy` with the
+    /// CAS pair and the document, on the platform key and the operator
+    /// principal.
+    pub async fn put_remediation_policy(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        body: &RemediationPolicyWrite,
+        principal_token: &str,
+    ) -> Result<RemediationPolicyGeneration> {
+        let resp = self
+            .send_request(
+                self.http
+                    .put(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationPolicyWrite>(body),
+                "PUT /agents/{id}/hooks/{hook}/remediation-policy",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "the remediation policy write was refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+    /// Arm the current policy: `POST .../remediation-policy/arm`.
+    pub async fn arm_remediation_policy(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        body: &RemediationPolicyMutation,
+        principal_token: &str,
+    ) -> Result<RemediationPolicyGeneration> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationPolicyMutation>(body),
+                "POST /agents/{id}/hooks/{hook}/remediation-policy/arm",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "arming the remediation policy was refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+    /// Disarm the current policy: `POST .../remediation-policy/disarm`.
+    pub async fn disarm_remediation_policy(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        body: &RemediationPolicyMutation,
+        principal_token: &str,
+    ) -> Result<RemediationPolicyGeneration> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationPolicyMutation>(body),
+                "POST /agents/{id}/hooks/{hook}/remediation-policy/disarm",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "disarming the remediation policy was refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+    /// Remove the policy: `DELETE .../remediation-policy` with the CAS pair in
+    /// the query, as the route reads it. The answer is the new, inactive
+    /// generation.
+    pub async fn remove_remediation_policy(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        cas: &RemediationPolicyMutation,
+        principal_token: &str,
+    ) -> Result<RemediationPolicyGeneration> {
+        let resp = self
+            .send_request(
+                self.http
+                    .delete(format!(
+                        "{}/agents/{agent_id}/hooks/{hook}/remediation-policy",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .query(&[
+                        ("expected_generation", cas.expected_generation.as_str()),
+                        ("operation_id", cas.operation_id.as_str()),
+                    ]),
+                "DELETE /agents/{id}/hooks/{hook}/remediation-policy",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "removing the remediation policy was refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation policy")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-3
+    /// ADR-0021 status classes for the remediation policy routes, whose every
+    /// refusal is `{"detail": {"code", "path"?, "message"?}}`. The code (and
+    /// path) is carried into the error so a script can match it: 401/403/404/409
+    /// are failures (exit 1), 400/422 usage (exit 2), 5xx transient (exit 3).
+    async fn expect_remediation_policy_ok(
+        resp: reqwest::Response,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        use crate::exit::CliError;
+        use reqwest::StatusCode;
+        let status = resp.status();
+        if status.is_success() || status.is_redirection() {
+            return Self::expect_ok(resp, what).await;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if is_unrouted(status, &body) {
+            bail!(
+                "{what}: this platform release does not have the remediation policy routes, so \
+                 it is older than this CLI. Upgrade the release, or use a CLI matching it."
+            );
+        }
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .map(|value| value["detail"].clone());
+        let code = detail
+            .as_ref()
+            .and_then(|detail| detail["code"].as_str())
+            .map(str::to_string);
+        let reason = match (&code, &detail) {
+            (Some(code), Some(detail)) => {
+                let mut reason = code.clone();
+                if let Some(path) = detail["path"].as_str() {
+                    reason.push_str(&format!(" at {path}"));
+                }
+                if let Some(message) = detail["message"].as_str() {
+                    reason.push_str(&format!(": {message}"));
+                }
+                reason
+            }
+            _ => api_detail_reason(&body).unwrap_or_else(|| status.to_string()),
+        };
+        let message = format!("{what}: {reason}");
+        let error = match (status, code.as_deref()) {
+            (StatusCode::CONFLICT, Some("stale_policy_generation")) => CliError::failure(message)
+                .with_fix(
+                    "read the current generation with `remediation-policy show <AGENT> <HOOK>` \
+                     and retry with it as --expected-generation",
+                ),
+            (StatusCode::NOT_FOUND, Some("remediation_policy_absent")) => {
+                CliError::failure(message).with_fix(
+                    "bind a policy with `remediation-policy apply <AGENT> <HOOK> --file <PATH> \
+                     --expected-generation 0`",
+                )
+            }
+            (StatusCode::NOT_FOUND, _) => CliError::failure(message)
+                .with_fix("check the agent and hook names; the hook must be a protected hook"),
+            (StatusCode::FORBIDDEN, _) => CliError::failure(message).with_fix(
+                "export an operator principal as CURIE_APPROVAL_PRINCIPAL_TOKEN (mint one with \
+                 `curie <local|cluster> approvals <AGENT> --mint-operator-principal <SUBJECT>`)",
+            ),
+            (StatusCode::UNAUTHORIZED, _) => CliError::failure(message)
+                .with_fix("verify --api-key or CURIE_API_KEY matches the selected platform API"),
+            (StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY, _) => {
+                CliError::usage(message)
+                    .with_fix("correct the policy document or arguments the refusal names")
+            }
+            (s, _) if s.is_server_error() => CliError::transient(message),
             _ => CliError::failure(message),
         };
         Err(anyhow::Error::from(error))

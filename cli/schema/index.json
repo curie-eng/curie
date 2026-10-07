@@ -340,6 +340,12 @@
       "version": "1.0"
     },
     {
+      "result": "RemediationPolicyOutput",
+      "kind": "CliOutput",
+      "schema": "remediation-policy.schema.json",
+      "version": "1.1"
+    },
+    {
       "result": "ResetThreadOutput",
       "kind": "CliOutput",
       "schema": "reset-thread.schema.json",

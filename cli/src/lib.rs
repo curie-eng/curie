@@ -53,6 +53,8 @@ pub mod ops;
 pub mod queue;
 pub mod recipes;
 pub mod release_accept;
+pub mod remediation;
+pub mod remediation_policy;
 pub mod render;
 pub mod retired;
 pub mod runner;

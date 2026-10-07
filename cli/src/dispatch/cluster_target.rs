@@ -17,7 +17,10 @@ impl ClusterTargetSources {
         let Some((action_name, action_matches)) = cluster_matches.subcommand() else {
             return Self::default();
         };
-        let action_matches = if matches!(action_name, "hooks" | "console" | "actions") {
+        let action_matches = if matches!(
+            action_name,
+            "hooks" | "console" | "actions" | "remediation-policy"
+        ) {
             let Some((_, leaf_matches)) = action_matches.subcommand() else {
                 return Self::default();
             };
@@ -133,6 +136,10 @@ pub(crate) fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Op
             Some(target.conn.release.as_str()),
         ),
         ClusterAction::Actions { verb } => {
+            let conn = verb.conn();
+            (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
+        }
+        ClusterAction::RemediationPolicy { verb } => {
             let conn = verb.conn();
             (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
         }
@@ -271,6 +278,11 @@ pub(crate) fn retarget_cluster_action(
             replace(&mut target.conn.release, &release);
         }
         ClusterAction::Actions { verb } => {
+            let conn = verb.conn_mut();
+            replace(&mut conn.namespace, &namespace);
+            replace(&mut conn.release, &release);
+        }
+        ClusterAction::RemediationPolicy { verb } => {
             let conn = verb.conn_mut();
             replace(&mut conn.namespace, &namespace);
             replace(&mut conn.release, &release);
