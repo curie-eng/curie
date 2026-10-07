@@ -168,7 +168,8 @@ export interface paths {
          *
          *     @spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending
          *     schedules its verifier (``confirmed``) or finishes it ``not-recovered``
-         *     (``failed``, ``indeterminate``) in the same transaction; a refused read
+         *     with the execution's code (``failed``, ``indeterminate``, ``refused``) in
+         *     the same transaction; a refused read
          *     is evaluated by its verification.
          */
         post: operations["report_outcome_action_executions__execution_id__outcome_post"];
