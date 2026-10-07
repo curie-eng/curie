@@ -12,12 +12,14 @@
 //! `apps/api/tests/test_remediation_policy_vector.py`). The checks run in the
 //! API's order, so the first refusal is the API's first refusal.
 //!
-//! Two deliberate differences, neither reachable by a document the API
-//! accepts: the CLI's JSON objects iterate keys in sorted order rather than
-//! document order, so when several keys of one `limits` or `arguments` object
-//! are each invalid the CLI may name a different one first; and a non-finite
-//! number is refused by [`parse_policy_text`], at parse time, because a parsed
-//! [`Value`] cannot hold one.
+//! Numbers are compared exactly, as Python compares them, and a number a
+//! native JSON value would change (an integer outside the signed 64-bit
+//! range, a non-finite number) is refused at its path by
+//! [`parse_policy_text`], as the API's pre-check refuses it. One deliberate
+//! difference, unreachable by a document the API accepts: the CLI's JSON
+//! objects iterate keys in sorted order rather than document order, so when
+//! several keys of one `limits` or `arguments` object are each invalid the
+//! CLI may name a different one first.
 
 use std::fmt;
 
@@ -186,13 +188,67 @@ fn integer(value: &Value, path: &str) -> Checked<i128> {
     number.ok_or_else(|| invalid(path, "must be an integer"))
 }
 
+/// A JSON number held exactly: an integer as an integer, never rounded
+/// through a double, as Python holds it.
+#[derive(Clone, Copy, Debug)]
+enum Num {
+    Int(i128),
+    Float(f64),
+}
+
+/// The exact number a value holds; a boolean is `1` or `0`, as in Python.
+fn num_of(value: &Value) -> Option<Num> {
+    match value {
+        Value::Bool(flag) => Some(Num::Int(i128::from(*flag))),
+        Value::Number(n) => match n.as_i64().map(i128::from).or(n.as_u64().map(i128::from)) {
+            Some(int) => Some(Num::Int(int)),
+            None => n.as_f64().map(Num::Float),
+        },
+        _ => None,
+    }
+}
+
+/// Python's exact ordering of two numbers: an integer and a float compare by
+/// their mathematical values, never through a rounded double.
+fn num_cmp(left: Num, right: Num) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    fn int_vs_float(int: i128, float: f64) -> Option<Ordering> {
+        if float.is_nan() {
+            return None;
+        }
+        // Past +-2^126 the float is beyond every integer a document can hold.
+        if float >= 2f64.powi(126) {
+            return Some(Ordering::Less);
+        }
+        if float <= -(2f64.powi(126)) {
+            return Some(Ordering::Greater);
+        }
+        let floor = float.floor();
+        // `floor` is integral and in range, so the cast is exact.
+        let whole = floor as i128;
+        if floor == float {
+            Some(int.cmp(&whole))
+        } else if int <= whole {
+            Some(Ordering::Less)
+        } else {
+            Some(Ordering::Greater)
+        }
+    }
+    match (left, right) {
+        (Num::Int(a), Num::Int(b)) => Some(a.cmp(&b)),
+        (Num::Float(a), Num::Float(b)) => a.partial_cmp(&b),
+        (Num::Int(a), Num::Float(b)) => int_vs_float(a, b),
+        (Num::Float(a), Num::Int(b)) => int_vs_float(b, a).map(Ordering::reverse),
+    }
+}
+
 /// A finite JSON number (integer or float, never a boolean).
-fn number(value: &Value, path: &str) -> Checked<f64> {
-    value
-        .as_number()
-        .and_then(serde_json::Number::as_f64)
-        .filter(|n| n.is_finite())
-        .ok_or_else(|| invalid(path, "must be a finite number"))
+fn number(value: &Value, path: &str) -> Checked<Num> {
+    match (value, num_of(value)) {
+        (Value::Number(_), Some(Num::Int(int))) => Ok(Num::Int(int)),
+        (Value::Number(_), Some(Num::Float(float))) if float.is_finite() => Ok(Num::Float(float)),
+        _ => Err(invalid(path, "must be a finite number")),
+    }
 }
 
 fn is_identifier(text: &str) -> bool {
@@ -249,23 +305,19 @@ fn scalar(value: &Value) -> bool {
 }
 
 /// Python's `==` over JSON scalars, which `value in list` uses: numbers
-/// compare by value across int and float, and a boolean equals `1` or `0`.
+/// compare exactly by value across int and float (never through a rounded
+/// double), and a boolean equals `1` or `0`.
 fn python_eq(left: &Value, right: &Value) -> bool {
-    fn numeric(value: &Value) -> Option<(Option<i128>, f64)> {
-        match value {
-            Value::Bool(flag) => Some((Some(i128::from(*flag)), f64::from(u8::from(*flag)))),
-            Value::Number(n) => Some((
-                n.as_i64().map(i128::from).or(n.as_u64().map(i128::from)),
-                n.as_f64()?,
-            )),
-            _ => None,
-        }
-    }
-    match (numeric(left), numeric(right)) {
-        (Some((Some(a), _)), Some((Some(b), _))) => a == b,
-        (Some((_, a)), Some((_, b))) => a == b,
+    match (num_of(left), num_of(right)) {
+        (Some(a), Some(b)) => num_cmp(a, b) == Some(std::cmp::Ordering::Equal),
         _ => left == right,
     }
+}
+
+/// Python's `str.strip()`: Unicode whitespace plus the information
+/// separators U+001C to U+001F, which `str.isspace` also counts.
+fn python_strip(text: &str) -> &str {
+    text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
 }
 
 fn bounded(value: i128, path: &str, minimum: i128, maximum: i128) -> Checked<i128> {
@@ -386,8 +438,9 @@ fn validate_argument(spec: &Value, path: &str) -> Checked<()> {
         integer(&spec["minimum"], &format!("{path}/minimum"))?
             > integer(&spec["maximum"], &format!("{path}/maximum"))?
     } else {
-        number(&spec["minimum"], &format!("{path}/minimum"))?
-            > number(&spec["maximum"], &format!("{path}/maximum"))?
+        let minimum = number(&spec["minimum"], &format!("{path}/minimum"))?;
+        let maximum = number(&spec["maximum"], &format!("{path}/maximum"))?;
+        num_cmp(minimum, maximum) == Some(std::cmp::Ordering::Greater)
     };
     if above {
         return Err(invalid(path, "minimum is above maximum"));
@@ -604,7 +657,7 @@ pub fn validate_policy_document(document: &Value) -> Result<(), PolicyRefusal> {
     require(document, "", TOP_KEYS)?;
     if !document["route"]
         .as_str()
-        .is_some_and(|route| !route.trim().is_empty())
+        .is_some_and(|route| !python_strip(route).is_empty())
     {
         return Err(invalid("/route", "must name an approval route"));
     }
@@ -625,18 +678,312 @@ pub fn validate_policy_document(document: &Value) -> Result<(), PolicyRefusal> {
     Ok(())
 }
 
-// @spec AUTOMATED-REMEDIATION-2
-/// Parse a policy file strictly. Standard JSON has no `NaN` or `Infinity`, so
-/// a document carrying one (which the API's parser would accept and then
-/// refuse) is refused here as `policy_document_invalid`, as is any other text
-/// that is not JSON.
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// Parse a policy file as the API reads it, refusing a number a native JSON
+/// value would change, at that number's path.
+///
+/// The API's parser keeps an integer of any size exact and reads `NaN`,
+/// `Infinity` and an exponent beyond a double (`1e400`) as non-finite floats;
+/// its validator then refuses each at its path before any other check. A
+/// `serde_json::Value` would instead round a large integer to a double and
+/// reject `1e400` with no path, so this reader parses the text itself and
+/// refuses, at the number's pointer:
+///
+/// * an integer outside the signed 64-bit range: `policy_limit_out_of_bounds`
+///   when it is a member of the top-level `limits` object (a well-formed number
+///   outside the limit's bounds), `policy_document_invalid` anywhere else;
+/// * a non-finite number (`NaN`, `Infinity`, `-Infinity`, or an exponent
+///   beyond a double): `policy_document_invalid`.
+///
+/// The first such number in document order is the refusal, as the API's
+/// pre-check walks the document. Any other text that is not JSON is
+/// `policy_document_invalid` at the document root.
 pub fn parse_policy_text(text: &str) -> Result<Value, PolicyRefusal> {
-    serde_json::from_str(text).map_err(|error| {
-        invalid(
-            "",
-            format!("is not JSON with finite numbers only ({error})"),
-        )
-    })
+    let mut parser = Parser {
+        bytes: text.as_bytes(),
+        at: 0,
+        first_number_refusal: None,
+    };
+    let parsed = parser
+        .value("", Place::Root, 0)
+        .and_then(|value| {
+            parser.skip_whitespace();
+            if parser.at == parser.bytes.len() {
+                Ok(value)
+            } else {
+                Err(parser.syntax("trailing characters after the document"))
+            }
+        })
+        .map_err(|message| invalid("", format!("is not a JSON document ({message})")))?;
+    match parser.first_number_refusal {
+        Some(refusal) => Err(refusal),
+        None => Ok(parsed),
+    }
+}
+
+/// Where a value sits, as far as the number checks care.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Root,
+    /// The top-level `limits` member.
+    Limits,
+    /// A direct member of the top-level `limits` object.
+    LimitField,
+    Other,
+}
+
+/// The deepest nesting accepted, as `serde_json` limits it.
+const MAX_DEPTH: usize = 128;
+
+struct Parser<'a> {
+    bytes: &'a [u8],
+    at: usize,
+    first_number_refusal: Option<PolicyRefusal>,
+}
+
+impl Parser<'_> {
+    fn syntax(&self, what: &str) -> String {
+        format!("{what} at byte {}", self.at)
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.bytes.get(self.at), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.at += 1;
+        }
+    }
+
+    fn eat(&mut self, literal: &str) -> bool {
+        if self.bytes[self.at..].starts_with(literal.as_bytes()) {
+            self.at += literal.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn refuse_number(&mut self, refusal: PolicyRefusal) {
+        if self.first_number_refusal.is_none() {
+            self.first_number_refusal = Some(refusal);
+        }
+    }
+
+    fn non_finite(&mut self, path: &str) -> Value {
+        self.refuse_number(invalid(
+            if path.is_empty() { "/" } else { path },
+            "must be a finite number",
+        ));
+        Value::Null
+    }
+
+    fn value(&mut self, path: &str, place: Place, depth: usize) -> Result<Value, String> {
+        if depth > MAX_DEPTH {
+            return Err(self.syntax("nesting too deep"));
+        }
+        self.skip_whitespace();
+        match self.bytes.get(self.at) {
+            None => Err(self.syntax("unexpected end of text")),
+            Some(b'{') => self.object(path, place, depth),
+            Some(b'[') => self.array(path, depth),
+            Some(b'"') => self.string().map(Value::String),
+            Some(b't') if self.eat("true") => Ok(Value::Bool(true)),
+            Some(b'f') if self.eat("false") => Ok(Value::Bool(false)),
+            Some(b'n') if self.eat("null") => Ok(Value::Null),
+            Some(b'N') if self.eat("NaN") => Ok(self.non_finite(path)),
+            Some(b'I') if self.eat("Infinity") => Ok(self.non_finite(path)),
+            Some(b'-') if self.eat("-Infinity") => Ok(self.non_finite(path)),
+            Some(b'-' | b'0'..=b'9') => self.number(path, place),
+            Some(_) => Err(self.syntax("unexpected character")),
+        }
+    }
+
+    fn object(&mut self, path: &str, place: Place, depth: usize) -> Result<Value, String> {
+        self.at += 1;
+        let mut map = Map::new();
+        self.skip_whitespace();
+        if self.eat("}") {
+            return Ok(Value::Object(map));
+        }
+        loop {
+            self.skip_whitespace();
+            if self.bytes.get(self.at) != Some(&b'"') {
+                return Err(self.syntax("expected a member name"));
+            }
+            let key = self.string()?;
+            self.skip_whitespace();
+            if !self.eat(":") {
+                return Err(self.syntax("expected ':'"));
+            }
+            let child = match (place, key.as_str()) {
+                (Place::Root, "limits") => Place::Limits,
+                (Place::Limits, _) => Place::LimitField,
+                _ => Place::Other,
+            };
+            let value = self.value(&format!("{path}/{key}"), child, depth + 1)?;
+            map.insert(key, value);
+            self.skip_whitespace();
+            if self.eat(",") {
+                continue;
+            }
+            if self.eat("}") {
+                return Ok(Value::Object(map));
+            }
+            return Err(self.syntax("expected ',' or '}'"));
+        }
+    }
+
+    fn array(&mut self, path: &str, depth: usize) -> Result<Value, String> {
+        self.at += 1;
+        let mut items = Vec::new();
+        self.skip_whitespace();
+        if self.eat("]") {
+            return Ok(Value::Array(items));
+        }
+        loop {
+            let item = self.value(&format!("{path}/{}", items.len()), Place::Other, depth + 1)?;
+            items.push(item);
+            self.skip_whitespace();
+            if self.eat(",") {
+                continue;
+            }
+            if self.eat("]") {
+                return Ok(Value::Array(items));
+            }
+            return Err(self.syntax("expected ',' or ']'"));
+        }
+    }
+
+    fn hex4(&mut self) -> Result<u32, String> {
+        let digits = self
+            .bytes
+            .get(self.at..self.at + 4)
+            .and_then(|digits| std::str::from_utf8(digits).ok())
+            .filter(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| self.syntax("bad \\u escape"))?;
+        let code = u32::from_str_radix(digits, 16).map_err(|_| self.syntax("bad \\u escape"))?;
+        self.at += 4;
+        Ok(code)
+    }
+
+    fn string(&mut self) -> Result<String, String> {
+        self.at += 1;
+        let mut out = String::new();
+        loop {
+            let start = self.at;
+            while let Some(&b) = self.bytes.get(self.at) {
+                if b == b'"' || b == b'\\' || b < 0x20 {
+                    break;
+                }
+                self.at += 1;
+            }
+            out.push_str(
+                std::str::from_utf8(&self.bytes[start..self.at])
+                    .map_err(|_| self.syntax("invalid UTF-8"))?,
+            );
+            match self.bytes.get(self.at) {
+                None => return Err(self.syntax("unterminated string")),
+                Some(b'"') => {
+                    self.at += 1;
+                    return Ok(out);
+                }
+                Some(b'\\') => {
+                    self.at += 1;
+                    let escaped = self.bytes.get(self.at).copied();
+                    self.at += 1;
+                    match escaped {
+                        Some(b'"') => out.push('"'),
+                        Some(b'\\') => out.push('\\'),
+                        Some(b'/') => out.push('/'),
+                        Some(b'b') => out.push('\u{8}'),
+                        Some(b'f') => out.push('\u{c}'),
+                        Some(b'n') => out.push('\n'),
+                        Some(b'r') => out.push('\r'),
+                        Some(b't') => out.push('\t'),
+                        Some(b'u') => {
+                            let high = self.hex4()?;
+                            let code = if (0xD800..0xDC00).contains(&high) {
+                                if !self.eat("\\u") {
+                                    return Err(self.syntax("unpaired surrogate"));
+                                }
+                                let low = self.hex4()?;
+                                if !(0xDC00..0xE000).contains(&low) {
+                                    return Err(self.syntax("unpaired surrogate"));
+                                }
+                                0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00)
+                            } else {
+                                high
+                            };
+                            out.push(
+                                char::from_u32(code)
+                                    .ok_or_else(|| self.syntax("unpaired surrogate"))?,
+                            );
+                        }
+                        _ => return Err(self.syntax("bad escape")),
+                    }
+                }
+                Some(_) => return Err(self.syntax("control character in a string")),
+            }
+        }
+    }
+
+    fn number(&mut self, path: &str, place: Place) -> Result<Value, String> {
+        let start = self.at;
+        self.eat("-");
+        let digits = |parser: &mut Self| {
+            let from = parser.at;
+            while parser.bytes.get(parser.at).is_some_and(u8::is_ascii_digit) {
+                parser.at += 1;
+            }
+            parser.at - from
+        };
+        match self.bytes.get(self.at) {
+            Some(b'0') => self.at += 1,
+            Some(b'1'..=b'9') => {
+                digits(self);
+            }
+            _ => return Err(self.syntax("bad number")),
+        }
+        let mut integral = true;
+        if self.eat(".") {
+            integral = false;
+            if digits(self) == 0 {
+                return Err(self.syntax("bad number"));
+            }
+        }
+        if matches!(self.bytes.get(self.at), Some(b'e' | b'E')) {
+            integral = false;
+            self.at += 1;
+            if matches!(self.bytes.get(self.at), Some(b'+' | b'-')) {
+                self.at += 1;
+            }
+            if digits(self) == 0 {
+                return Err(self.syntax("bad number"));
+            }
+        }
+        // ASCII digits and signs only, so this slice is valid UTF-8.
+        let literal = std::str::from_utf8(&self.bytes[start..self.at]).unwrap_or_default();
+        if integral {
+            return Ok(match literal.parse::<i64>() {
+                Ok(int) => Value::from(int),
+                Err(_) => {
+                    self.refuse_number(if place == Place::LimitField {
+                        refuse(
+                            "policy_limit_out_of_bounds",
+                            path,
+                            "is outside the signed 64-bit range",
+                        )
+                    } else {
+                        invalid(path, "is outside the signed 64-bit range")
+                    });
+                    Value::Null
+                }
+            });
+        }
+        let float: f64 = literal.parse().map_err(|_| self.syntax("bad number"))?;
+        Ok(match serde_json::Number::from_f64(float) {
+            Some(number) => Value::Number(number),
+            None => self.non_finite(path),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -659,6 +1006,56 @@ mod tests {
         assert!(python_eq(&json!(true), &json!(1)));
         assert!(!python_eq(&json!("1"), &json!(1)));
         assert!(python_eq(&json!("a"), &json!("a")));
+    }
+
+    #[test]
+    fn the_reader_matches_serde_on_ordinary_json() {
+        let text = r#"{"a": [1, -7, 2.5, 1e2, "x\u00e9\ud83d\ude00\n", true, null], "b": {}}"#;
+        assert_eq!(
+            parse_policy_text(text).expect("parses"),
+            serde_json::from_str::<Value>(text).expect("serde parses")
+        );
+        for bad in [
+            "",
+            "{",
+            "[1,]",
+            "01",
+            "1.",
+            "\"\u{1}\"",
+            "{} x",
+            r#""\ud800""#,
+        ] {
+            assert_eq!(
+                parse_policy_text(bad).expect_err(bad).code,
+                "policy_document_invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_zero_is_the_integer_python_reads() {
+        assert_eq!(parse_policy_text("-0").expect("parses"), json!(0));
+    }
+
+    #[test]
+    fn numbers_compare_exactly() {
+        let big = 9_007_199_254_740_993_i64; // 2^53 + 1
+        assert!(!python_eq(&json!(big), &json!(9_007_199_254_740_992.0)));
+        assert!(python_eq(&json!(big - 1), &json!(9_007_199_254_740_992.0)));
+        assert_eq!(
+            num_cmp(Num::Int(2), Num::Float(1.5)),
+            Some(std::cmp::Ordering::Greater)
+        );
+        assert_eq!(
+            num_cmp(Num::Float(-1.5), Num::Int(-1)),
+            Some(std::cmp::Ordering::Less)
+        );
+    }
+
+    #[test]
+    fn route_whitespace_is_pythons() {
+        assert_eq!(python_strip("\u{1c}\u{1d} \u{1e}\u{1f}"), "");
+        assert_eq!(python_strip(" oncall\t"), "oncall");
     }
 
     #[test]
