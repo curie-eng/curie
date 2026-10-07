@@ -1,0 +1,42 @@
+# @spec STARTABILITY-7; boundary replays are not the STARTABILITY-8 runtime gate.
+name: SRE startability observer
+
+on:
+  pull_request:
+    branches: [main, next]
+    paths:
+      - "examples/sre-bot/observability/startability/**"
+      - "examples/sre-bot/docs/STARTABILITY.md"
+      - "apps/worker/src/curie_worker/sandbox/types.py"
+      - "packages/aci-protocol/**"
+      - "packages/plugin-format/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/startability.yaml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  observer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - run: uv sync --locked
+      - name: Lint observer and tests
+        run: uv run ruff check examples/sre-bot/observability/startability
+      - name: Type check observer
+        run: uv run mypy examples/sre-bot/observability/startability/observer.py
+      - name: Exercise observer command and current worker policy
+        run: uv run pytest -q examples/sre-bot/observability/startability/test_observer.py

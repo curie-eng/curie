@@ -247,6 +247,8 @@ testpaths = [
     # @spec SRE-EMAIL-1: the intake's executable contract belongs to the root
     # suite; a shipped scanner with hand-run-only tests is not verified.
     "examples/sre-bot/observability/slack-email-intake",
+    # @spec STARTABILITY-7
+    "examples/sre-bot/observability/startability",
     # The two source-built SRE-bot connectors (tempo and self-upgrade) are built
     # by CI and published by release.yaml, but each
     # ships its own test_server.py outside every collection root above -- so
