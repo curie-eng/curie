@@ -2,7 +2,8 @@
 
 @spec ACTION-EXECUTOR-4 @spec ACTION-EXECUTOR-5 @spec ACTION-EXECUTOR-7
 @spec ACTION-EXECUTOR-13 @spec ACTION-EXECUTOR-14 @spec ACTION-EXECUTOR-15
-@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-21 @spec ACTION-EXECUTOR-22
+@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-19 @spec ACTION-EXECUTOR-21
+@spec ACTION-EXECUTOR-22
 
 The loop (``curie_worker.action_executor_loop``) runs beside the connector
 reconcile loop. It claims an execution from the API under a lease, checks the
@@ -26,6 +27,13 @@ Surface these tests fix (see ``.projects/plans/task-executor-loop.plan.md``):
 ``ExecutionApi(api_base_url, api_key, worker_token, client)``,
 ``ExecutorBoot(boot_env, header_secret_names, agent_name)``, and
 ``ActionExecutorLoop(...)`` with ``run_once() -> bool``.
+
+A forward execution (plan task 12, ``.projects/plans/task-executor-forward.tests.md``)
+runs claim, kill switch, ``POST /action-executions/{id}/arguments`` (the bound
+tool and arguments, digest recomputed), the pinned digest with the tool gated,
+sandbox, ``list`` (the tool advertised), the digest again, the kill switch, the
+dispatch commit (which creates its ledger row), one grant and one ``call``, the
+ledger completion under the worker token, then the outcome. It never observes.
 """
 
 from __future__ import annotations
@@ -69,6 +77,10 @@ from executor_loop_fixtures import (  # noqa: E402
     CONNECTOR,
     DEPLOYMENT,
     DIGEST,
+    FORWARD_ARGUMENTS,
+    FORWARD_SHA256,
+    FORWARD_TEXT,
+    FORWARD_TOOL,
     GRANT_SEED,
     MOVED_VERSION,
     NAMESPACE,
@@ -1425,22 +1437,24 @@ async def test_the_executor_boot_is_resolved_for_the_execution_thread_key(
 # --------------------------------------------------------------------------- #
 
 
-async def test_a_forward_execution_is_refused_authority_unavailable(
+async def test_a_forward_execution_without_bound_arguments_is_refused_authority_unavailable(
     valkey: tuple[redis.Redis, str],
 ) -> None:
-    """@spec ACTION-EXECUTOR-19: no authority source exists yet; nothing is claimed or called.
-
-    Pins existing behaviour.
+    """@spec ACTION-EXECUTOR-19: a forward execution whose bound arguments the API
+    will not produce has no verifiable authority; it is refused
+    ``authority_unavailable`` before any sandbox, dispatch or call.
     """
 
     async with _rig(valkey) as rig:
-        execution = rig.api.add_forward()
+        rig.deployments.current = _forward_deployment()
+        execution = rig.api.add_forward(bound=False)
 
         await rig.loop().run_once()
 
         assert _final(rig, execution) == ("refused", "authority_unavailable")
         assert rig.sandboxes.created == []
         assert rig.runner.requests == []
+        assert rig.api.calls_to("dispatch") == []
 
 
 async def test_an_empty_signing_key_refuses_before_any_sandbox(
@@ -1702,3 +1716,241 @@ async def test_a_stale_holders_late_cleanup_never_releases_the_reclaimers_sandbo
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# --------------------------------------------------------------------------- #
+# Forward executions (ACTION-EXECUTOR-19, plan task 12)
+# --------------------------------------------------------------------------- #
+
+
+def _forward_deployment(**kwargs: Any) -> dict[str, Any]:
+    """The connector Deployment with the forward tool in the caller proxy's gated set."""
+
+    kwargs.setdefault("gated", [f"mcp__{CONNECTOR}__restore", f"mcp__{CONNECTOR}__{FORWARD_TOOL}"])
+    return deployment(**kwargs)
+
+
+def _forward_reply() -> dict[str, Any]:
+    """A structured success of the forward tool, as the runner's ``call`` answers."""
+
+    return {
+        "phase": "call",
+        "is_error": False,
+        "structured": {"ok": True, "version": "rv-2001", "target": dict(TARGET)},
+    }
+
+
+async def test_a_forward_execution_lists_dispatches_calls_once_and_confirms(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-19 @spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-17.
+
+    ``list`` then one ``call``, never ``observe``: no version is posted, the
+    dispatch commit precedes the call, one grant binds the exact canonical text
+    the authority bound, and the outcome is reported confirmed.
+    """
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.runner.call_reply = _forward_reply()
+        execution = rig.api.add_forward()
+
+        assert await rig.loop().run_once() is True
+
+        assert _final(rig, execution) == ("confirmed", None)
+        assert _phases(rig) == ["list", "call"]
+        assert rig.api.calls_to("observation") == []
+        call = rig.runner.requests[-1]["body"]
+        assert call["tool"] == FORWARD_TOOL
+        assert call["arguments"] == FORWARD_TEXT
+        assert call["connector"] == CONNECTOR
+        assert call["execution_id"] == execution.id
+        assert call["target"] is None
+        events = rig.timeline.events
+        assert events.index("api:arguments") < events.index("runner:list")
+        assert events.index("api:dispatch") < events.index("runner:call")
+        assert _api_routes(rig).count("dispatch") == 1
+        assert len(rig.runner.writes) == 1
+        assert len(minted) == 1
+        claims = decode_grant(call["grant"])
+        assert claims["tool"] == FORWARD_TOOL
+        assert claims["args"] == FORWARD_TEXT
+        assert claims["connector"] == CONNECTOR
+        assert claims["agent"] == AGENT_NAME
+        report = rig.api.calls_to("outcome")[-1]["body"]
+        assert report["state"] == "confirmed" and report.get("code") is None
+        rig.assert_released()
+
+
+async def test_a_forward_execution_completes_its_ledger_row_with_the_digest(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-19 @spec ACTION-EXECUTOR-12: the row dispatch created
+    is completed through the ledger's completion route, under the worker token,
+    with the execution's ``connector`` and ``connector_digest`` and what the call
+    answered, before the outcome is reported.
+    """
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.runner.call_reply = _forward_reply()
+        execution = rig.api.add_forward()
+
+        await rig.loop().run_once()
+
+        subject = rig.execution(execution).subject_action_id
+        assert subject is not None
+        assert [c["action_id"] for c in rig.api.completions] == [subject]
+        body = rig.api.completions[0]["body"]
+        assert body["connector"] == CONNECTOR
+        assert body["connector_digest"] == DIGEST
+        assert body["failed"] is False
+        assert body["result"] == _forward_reply()["structured"]
+        completion = rig.api.calls_to("complete")[0]
+        assert completion["headers"].get("x-curie-worker-token") == WORKER_TOKEN
+        assert rig.api.ledger[subject]["status"] == "succeeded"
+        events = rig.timeline.events
+        assert events.index("runner:call") < events.index("api:complete")
+        assert events.index("api:complete") < events.index("api:outcome")
+
+
+async def test_a_forward_execution_refuses_when_the_in_force_digest_differs(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-19 @spec ACTION-EXECUTOR-14: the call runs against
+    the execution's digest or not at all: ``connector_digest_unavailable``
+    before any sandbox, dispatch, ledger row or grant.
+    """
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.in_force["digest"] = OTHER_DIGEST
+        execution = rig.api.add_forward()
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "connector_digest_unavailable")
+        assert rig.sandboxes.created == []
+        assert rig.runner.requests == []
+        assert rig.api.calls_to("dispatch") == []
+        assert rig.execution(execution).subject_action_id is None
+        assert minted == []
+
+
+async def test_a_forward_execution_refuses_when_the_digest_moves_before_the_call(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-14: the pinned digest is checked again after ``list``,
+    immediately before the dispatch commit; a moved image refuses with no write.
+    """
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        execution = rig.api.add_forward()
+
+        def move(_body: dict[str, Any]) -> None:
+            rig.in_force["digest"] = OTHER_DIGEST
+
+        rig.runner.hooks["list"] = move
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "connector_digest_unavailable")
+        assert _phases(rig) == ["list"]
+        assert rig.api.calls_to("dispatch") == []
+        assert rig.runner.writes == []
+        rig.assert_released()
+
+
+async def test_forward_arguments_that_drift_from_the_authorized_digest_are_refused(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-19 @spec ACTION-EXECUTOR-7: the worker recomputes
+    ``arguments_sha256`` over the text it would send; any difference from the
+    authorized digest is ``arguments_mismatch``, before any sandbox or dispatch.
+    """
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        drifted = {**FORWARD_ARGUMENTS, "replicas": 30}
+        execution = rig.api.add_forward(arguments=drifted, arguments_sha256=FORWARD_SHA256)
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "arguments_mismatch")
+        assert rig.sandboxes.created == []
+        assert rig.runner.requests == []
+        assert rig.api.calls_to("dispatch") == []
+        assert minted == []
+
+
+async def test_a_forward_tool_outside_the_gated_set_is_refused_before_any_sandbox(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-7: "a forward request naming an ungated tool is
+    refused before any sandbox claim" (``tool_not_grant_bound``).
+    """
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = deployment()  # gates ``restore`` only
+        execution = rig.api.add_forward()
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "tool_not_grant_bound")
+        assert rig.sandboxes.created == []
+        assert rig.runner.requests == []
+
+
+async def test_a_forward_tool_the_connector_does_not_advertise_is_refused(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-20: ``tool_not_advertised`` is pre-dispatch; no write."""
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.runner.tools = [t for t in list_tools() if t["name"] != FORWARD_TOOL]
+        execution = rig.api.add_forward()
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "tool_not_advertised")
+        assert _phases(rig) == ["list"]
+        assert rig.api.calls_to("dispatch") == []
+        rig.assert_released()
+
+
+async def test_a_stopped_agent_refuses_a_forward_execution_before_any_sandbox(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-21: the kill switch applies to forward executions."""
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.killswitch.killed = True
+        execution = rig.api.add_forward()
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "agent_stopped")
+        assert rig.sandboxes.created == []
+        assert rig.runner.requests == []
+
+
+async def test_a_lost_forward_call_is_indeterminate_and_never_repeated(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-17: past ``dispatched`` the call is never repeated."""
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.runner.call_mode = "crash"
+        execution = rig.api.add_forward()
+
+        await rig.loop().run_once()
+        await rig.loop("worker-b").run_once()
+
+        assert _final(rig, execution) == ("indeterminate", "response_lost")
+        assert len(rig.runner.writes) == 1
+        assert len(minted) == 1
+        rig.assert_released()
