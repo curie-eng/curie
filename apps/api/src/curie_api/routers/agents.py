@@ -1,6 +1,7 @@
 """Agents and their versions."""
 
 import functools
+import re
 import tempfile
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -24,6 +25,7 @@ from plugin_format import connector_lock
 from plugin_format.connector_render import AmbiguousObjectName
 from plugin_format.deploy_targets import connectors_for_agent, restrict_connectors
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.exc import DBAPIError, IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -32,6 +34,7 @@ from curie_api.crud import agents as crud_agents
 from curie_api.crud import channels as crud_channels
 from curie_api.crud import deployments as crud_deployments
 from curie_api.crud import versions as crud_versions
+from curie_api.schemas.action_executions import DIGEST_PATTERN
 from curie_api.schemas.agents import AgentCreate, AgentOut, AgentUpdate, enforce_behavior_packs_size
 from curie_api.schemas.channels import (
     ChannelBindingPatch,
@@ -43,11 +46,12 @@ from curie_api.schemas.deployments import ConnectorManifests
 from curie_api.schemas.versions import BundleFile, BundleFiles, VersionCreate, VersionOut
 
 from .. import bundles, deploy, hook_signing
+from ..action_forward import RESTORE_TOOL
 from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
 from ..e2e_connector import prepare_connectors
-from ..models import Agent, AgentChannel
+from ..models import Agent, AgentChannel, ConnectorCapability
 from ..publication_policy import PublicationPolicyConflict
 from ..runner_resources import RunnerResourcesError, quota_refusal
 
@@ -828,6 +832,48 @@ async def list_versions(agent_id: uuid.UUID, session: SessionDep) -> list[Versio
     return [VersionOut.model_validate(v) for v in versions]
 
 
+_LOCKED_DIGEST = re.compile(DIGEST_PATTERN)
+
+
+async def _restore_capable_digests(
+    session: AsyncSession, agent_id: uuid.UUID
+) -> frozenset[tuple[str, str]]:
+    """``(connector, digest)`` pairs whose probe recorded the paired verbs."""
+
+    rows = await session.execute(
+        select(ConnectorCapability.connector, ConnectorCapability.digest).where(
+            ConnectorCapability.agent_id == agent_id,
+            ConnectorCapability.restore_capable.is_(True),
+        )
+    )
+    return frozenset((connector, digest) for connector, digest in rows.tuples())
+
+
+def _with_probed_restore(
+    connector: str,
+    gated: tuple[str, ...],
+    image: str | None,
+    capable: frozenset[tuple[str, str]],
+) -> tuple[str, ...]:
+    """The connector's gated set, plus ``restore`` once its digest is capable.
+
+    @spec ACTION-EXECUTOR-8 @spec ACTION-EXECUTOR-13: once the probe records the
+    paired verbs for the digest this version's lock pins, the proxy must refuse
+    ``restore`` without a grant, so the executor never calls an ungated restore.
+    The bundle's own approval patterns are kept. A lone ``restore`` (a row that
+    is not capable), no row, a row for another digest, or an image not pinned by
+    digest adds nothing, and ``observe_version`` is never gated.
+    """
+
+    if not image or "@" not in image:
+        return gated
+    digest = image.rsplit("@", 1)[1]
+    if not _LOCKED_DIGEST.fullmatch(digest) or (connector, digest) not in capable:
+        return gated
+    restore = f"{connector}/{RESTORE_TOOL}"
+    return gated if restore in gated else (*gated, restore)
+
+
 @router.get("/{agent_id}/versions/{version_id}/connectors", response_model=ConnectorManifests)
 async def read_version_connectors(
     agent_id: uuid.UUID,
@@ -867,6 +913,7 @@ async def read_version_connectors(
     data = await store.get(version.bundle_ref)
     settings = get_settings()
     agent_name = agent.name
+    capable = await _restore_capable_digests(session, agent_id)
 
     def _render() -> ConnectorManifests:
         with tempfile.TemporaryDirectory() as tmp:
@@ -923,8 +970,13 @@ async def read_version_connectors(
             proxy = settings.connector_proxy()
             patterns = bundles.approval_tool_patterns(Path(tmp), agent.approval_required_tools)
             gated = {
-                name: bundles.gated_tools_for_connector(name, patterns)
-                for name in declared.connectors
+                name: _with_probed_restore(
+                    name,
+                    bundles.gated_tools_for_connector(name, patterns),
+                    spec.image if spec.is_hosted else None,
+                    capable,
+                )
+                for name, spec in declared.connectors.items()
             }
             e2e_install = settings.e2e_install()
             try:
