@@ -419,6 +419,28 @@ is closed; it cannot make a stale generation enqueue. Dedupe retention stays
 at least the existing declared delivery retention; it is not silently extended
 into permanent unbounded payload storage.
 
+<!-- @spec PROTECTED-HOOK-LANE-4 -->
+The [ingress admission wiring](2026-10-02-protected-hook-source-policy.md#ingress-admission-wiring)
+section realizes this criterion for the API: the provisioner supplied
+`enqueue.json` principal, protected turn construction without a placeholder
+or workspace, receipts and duplicates across the ordinary and protected
+stores, the fixed global quota, the reconciliation owner's lifecycle in the
+API process, and behavior with no protected worker deployed. The support
+probe and admission decide on one shared authority evaluation there. LANE-6,
+LANE-7 and LANE-8 remain separate work, so that change carries no delivery
+beyond the private stream.
+
+<!-- @spec PROTECTED-HOOK-LANE-3 -->
+The enqueue role is realized by a new `AuthenticatedEnqueueClient` beside the
+metadata reader and source writer. It applies the same input validation, TLS,
+CA, hostname, SPKI pin, RESP3 HELLO AUTH, two second timeouts, disabled
+retries, redaction and budget watchdog, verifies the live `INFO server` run_id
+on connection as the reader does, and never reconnects. It exports only the
+admission facade bound to its private connection, the source and control
+reads and observation used by the shared evaluation, a presence check of one
+delivery's private intent key, and `close`. It exports no raw client or
+generic command.
+
 <!-- @spec PROTECTED-HOOK-LANE-5 -->
 Source activation and recovery use
 [PROTECTED-HOOK-SOURCE-6/7](2026-10-02-protected-hook-source-policy.md#broker-authoritative-activation-and-recovery).

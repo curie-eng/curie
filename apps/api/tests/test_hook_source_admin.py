@@ -205,10 +205,12 @@ class Evaluation:
 def test_read_reports_the_route_dto_with_locked_counter(
     admin_agent: uuid.UUID, kind: str, answer: tuple[str, str | None]
 ) -> None:
-    """GET's DTO: no row closed (null or pending_history), protected closed publication_deferred.
+    """GET's DTO: no row closed (null or pending_history); tombstone and protected evaluated.
 
-    Only a tombstone is evaluated, once, after the gate and the transaction
-    ended, and its activation is the evaluation's. legacy_generation is the
+    A tombstone and a protected row are evaluated, once, after the gate and the
+    transaction ended, and the activation is the evaluation's (A3: a protected
+    row reports ``active`` on the tombstone's rule, ``publication_deferred`` is
+    retired). legacy_generation is the
     locked agent counter. @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-5
     @spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-SOURCE-10.
     """
@@ -232,8 +234,8 @@ def test_read_reports_the_route_dto_with_locked_counter(
             assert result.legacy_generation == "7"
             assert result.generation == ("0" if kind in ("absent", "pending") else "9")
             assert result.mode == ("protected" if kind == "protected" else "ordinary")
-            assert len(evaluation.calls) == (1 if kind == "ordinary" else 0)
-            if kind == "ordinary":
+            assert len(evaluation.calls) == (1 if kind in ("ordinary", "protected") else 0)
+            if kind in ("ordinary", "protected"):
                 assert (result.activation, result.refusal_reason) == answer
             else:
                 assert result.activation == "closed"
@@ -242,7 +244,6 @@ def test_read_reports_the_route_dto_with_locked_counter(
                     == {
                         "absent": None,
                         "pending": "pending_history",
-                        "protected": "publication_deferred",
                     }[kind]
                 )
             assert (result.updated_at is None) == (kind in ("absent", "pending"))
@@ -254,7 +255,9 @@ def test_read_reports_the_route_dto_with_locked_counter(
 
 @pytest.mark.parametrize("kind", ["absent", "pending", "ordinary", "protected"])
 def test_secret_refusals_are_the_route_answers(admin_agent: uuid.UUID, kind: str) -> None:
-    """Absent, history only and tombstone 409 source_not_protected; protected 503 deferred.
+    """Absent, history only and tombstone 409 source_not_protected; an unpublished protected
+    row 503 with a closed reason (``source_closed``, ``runtime_unavailable`` or
+    ``broker_unavailable``), never the retired ``source_publication_deferred``.
 
     Always a refusal with a null committed generation, never a key, no write.
     @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-6.
@@ -275,9 +278,14 @@ def test_secret_refusals_are_the_route_answers(admin_agent: uuid.UUID, kind: str
             with pytest.raises(module.SourceAdminError) as caught:
                 await admin.refuse_secret(str(admin_agent), HOOK)
             assert_error(caught.value, 503 if kind == "protected" else 409)
-            assert caught.value.code == (
-                "source_publication_deferred" if kind == "protected" else "source_not_protected"
-            )
+            if kind == "protected":
+                assert caught.value.code in (
+                    "source_closed",
+                    "runtime_unavailable",
+                    "broker_unavailable",
+                ), caught.value.code
+            else:
+                assert caught.value.code == "source_not_protected"
 
     asyncio.run(asyncio.wait_for(scenario(), 10))
     assert state(admin_agent) == before
@@ -402,12 +410,11 @@ def test_read_uses_current_agent_counter_without_rewriting_policy(admin_agent: u
     async def scenario() -> None:
         """@spec PROTECTED-HOOK-SOURCE-3/5/6."""
         async with service(module) as (admin, _gate, _work):
-            result = await admin.read_policy(str(admin_agent), HOOK, _never)
+            evaluation = Evaluation(_gate, _work, ("active", None))
+            result = await admin.read_policy(str(admin_agent), HOOK, evaluation)
             assert result.legacy_generation == "7"
-            assert (result.activation, result.refusal_reason) == (
-                "closed",
-                "publication_deferred",
-            )
+            assert len(evaluation.calls) == 1
+            assert (result.activation, result.refusal_reason) == ("active", None)
 
     asyncio.run(asyncio.wait_for(scenario(), 10))
     assert state(admin_agent) == before

@@ -933,13 +933,13 @@ def test_first_failing_step_decides_the_reason(
 
 
 @pytest.mark.parametrize("requested", [None, "read-only"])
-def test_fully_valid_tuple_reports_unsupported_with_runtime_members(
+def test_fully_valid_tuple_without_enqueue_file_reports_runtime_unavailable_with_members(
     runtime_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, requested: str | None
 ) -> None:
-    """Every step passes: 503 configuration_unsupported, members from the tuple.
-
-    Ingress does not yet admit protected deliveries, so the probe never claims
-    support; runtime_generation is a canonical decimal string.
+    """Steps 1 through 11 pass but no ``enqueue.json`` exists: step 12 answers 503
+    runtime_unavailable with members from the tuple; the final configuration_unsupported
+    of the base contract is removed. The 200 ``supported`` answer is covered by
+    ``test_hook_source_support_parity.py``; runtime_generation is a canonical decimal string.
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-LANE-2/3.
     """
     run_case(
@@ -947,7 +947,7 @@ def test_fully_valid_tuple_reports_unsupported_with_runtime_members(
         tmp_path,
         monkeypatch,
         _valid,
-        "configuration_unsupported",
+        "runtime_unavailable",
         True,
         requested=requested,
     )
@@ -1001,11 +1001,12 @@ def test_tolerated_bootstrap_variants_reach_the_valid_outcome(
     """Manifests compare by canonical bytes; extra files are ignored; symlinks to
     regular files are followed.
 
-    Each variant over an otherwise valid tuple still reaches
-    configuration_unsupported with the runtime members.
+    Each variant over an otherwise valid tuple passes steps 1 through 11 and,
+    with no ``enqueue.json`` in this suite's runtime, reaches step 12's
+    runtime_unavailable with the runtime members, as ``_valid`` does.
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-LANE-2.
     """
-    run_case(runtime_broker, tmp_path, monkeypatch, mutate, "configuration_unsupported", True)
+    run_case(runtime_broker, tmp_path, monkeypatch, mutate, "runtime_unavailable", True)
 
 
 # -- bootstrap directory -----------------------------------------------------------------
@@ -1152,7 +1153,9 @@ def test_bootstrap_is_read_afresh_on_each_evaluation(
 ) -> None:
     """A provisioner rotation is seen without restarting the API.
 
-    @spec PROTECTED-HOOK-SOURCE-9.
+    The restored bootstrap passes steps 1 through 11, so the second answer
+    carries the runtime members; without ``enqueue.json`` step 12 reports
+    runtime_unavailable. @spec PROTECTED-HOOK-SOURCE-9.
     """
 
     async def scenario() -> None:
@@ -1175,7 +1178,7 @@ def test_bootstrap_is_read_afresh_on_each_evaluation(
             rt.write_bootstrap()
             second = await probe_with(client, agent, delivery="second")
             assert second.status_code == 503, second.text
-            want = expected(None, "read-only", str(GENERATION), "configuration_unsupported")
+            want = expected(None, "read-only", str(GENERATION), "runtime_unavailable")
             want.update(runtime_members(rt))
             assert second.json() == want
 

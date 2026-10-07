@@ -116,14 +116,15 @@ class SourceAdminService:
         self,
         agent_id: str,
         hook: str,
-        tombstone_activation: Callable[[SourcePolicySnapshot], Awaitable[SourceActivation]],
+        source_activation: Callable[[SourcePolicySnapshot], Awaitable[SourceActivation]],
     ) -> HookSourcePolicyOut:
         """GET with source publication activation, evaluated after the gate is released.
 
-        No row reports closed with a null or ``pending_history`` reason and a
-        protected row closed with ``publication_deferred``, neither touching
-        the broker. Only an ordinary tombstone is evaluated, by the caller
-        supplied reader evaluation, once the gate and the transaction ended.
+        No row reports closed with a null or ``pending_history`` reason,
+        touching no broker. A tombstone and a protected row are evaluated once
+        by the caller supplied reader evaluation, after the gate and the
+        transaction ended; a protected row answers on the tombstone's rule with
+        mode ``protected``, attesting publication rather than current readiness.
         ``legacy_generation`` is the locked agent counter.
         @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-5/6/10.
         """
@@ -133,10 +134,8 @@ class SourceAdminService:
         activation: Literal["closed", "active"] = "closed"
         if policy is None:
             reason = snapshot.refusal_reason
-        elif policy.mode != "ordinary":
-            reason = "publication_deferred"
         else:
-            activation, reason = await tombstone_activation(policy)
+            activation, reason = await source_activation(policy)
         return policy_out(
             snapshot.agent_id,
             hook,
@@ -146,15 +145,32 @@ class SourceAdminService:
             refusal_reason=reason,
         )
 
-    async def refuse_secret(self, agent_id: str, hook: str) -> None:
-        """The source secret route in this slice: always a refusal, never a key.
+    async def refuse_secret(
+        self,
+        agent_id: str,
+        hook: str,
+        source_activation: (
+            Callable[[SourcePolicySnapshot], Awaitable[SourceActivation]] | None
+        ) = None,
+    ) -> SourcePolicySnapshot:
+        """Refuse every state whose secret may not be served; else the active protected row.
 
-        Absent, history only and tombstone are 409 ``source_not_protected``; a
-        protected row is 503 ``source_publication_deferred`` with a null
-        committed generation until the LANE-4 change. @spec PROTECTED-HOOK-SOURCE-3/6.
+        Absent, history only and tombstone rows are 409 ``source_not_protected``.
+        A protected row is evaluated by the caller supplied reader evaluation
+        after the gate and the transaction ended; anything but ``active`` is 503
+        with its closed reason (``source_closed``, ``runtime_unavailable`` or
+        ``broker_unavailable``) and a null committed generation. With no
+        evaluation composed it is ``runtime_unavailable``. Never a key.
+        @spec PROTECTED-HOOK-SOURCE-3/6.
         """
         async with self._locked(agent_id, hook) as (_, snapshot):
-            policy = snapshot.policy
-            if policy is None or policy.mode == "ordinary":
-                raise SourceAdminError("source_not_protected", 409)
-            raise SourceAdminError("source_publication_deferred", 503)
+            pass
+        policy = snapshot.policy
+        if policy is None or policy.mode == "ordinary":
+            raise SourceAdminError("source_not_protected", 409)
+        if source_activation is None:
+            raise SourceAdminError("runtime_unavailable", 503)
+        activation, reason = await source_activation(policy)
+        if activation != "active":
+            raise SourceAdminError(reason or "source_closed", 503)
+        return policy

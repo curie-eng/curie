@@ -615,10 +615,13 @@ def test_get_without_row_reports_closed_generation_zero_and_locked_counter(
 
 
 @pytest.mark.parametrize("references", ["deployment", "foreign"])
-def test_get_protected_row_is_closed_publication_deferred_without_broker(
+def test_get_unpublished_protected_row_is_source_closed_without_writes(
     principals: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, references: str
 ) -> None:
-    """A committed protected row reports closed with publication_deferred, no broker use.
+    """A committed protected row with no active record reports closed source_closed.
+
+    A3 retires the deferred reason: GET reads one reader session for a protected
+    row, on the tombstone's rule, and writes nothing.
 
     @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-6.
     """
@@ -634,7 +637,7 @@ def test_get_protected_row_is_closed_publication_deferred_without_broker(
             await asyncio.to_thread(set_counter, agent, 4)
             target = dict(mode="protected", tool_access="read-only", **refs)
             await asyncio.to_thread(seed_row, agent, 9, target)
-            before, opened = await state(agent), connections(principals)
+            before = await state(agent), broker_snapshot(principals)
             response = await get_policy(client, agent)
             assert_dto(
                 response,
@@ -642,13 +645,12 @@ def test_get_protected_row_is_closed_publication_deferred_without_broker(
                     agent,
                     generation="9",
                     legacy="4",
-                    reason="publication_deferred",
+                    reason="source_closed",
                     protected=True,
                     references=refs,
                 ),
             )
-            assert connections(principals) == opened, "GET of a protected row opened a broker"
-            assert await state(agent) == before
+            assert (await state(agent), broker_snapshot(principals)) == before
 
     run(scenario)
 
@@ -793,13 +795,15 @@ def test_get_unknown_agent_is_404_source_agent_not_found(
 # -- PUT and rotate: commit, then deferred publication -------------------------------------
 
 
-def test_protected_put_commits_then_answers_publication_deferred(
+def test_protected_put_commits_then_stays_closed_without_runtime_evidence(
     principals: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """PUT registers, reserves, commits the row with the SOURCE-5 counter bump, then 503.
 
-    The broker holds the reservation with no active record; GET stays closed
-    with publication_deferred and reports the advanced legacy counter.
+    No selection, qualification or readiness is provisioned, so publication's
+    evaluation answers ``runtime_unavailable`` with the committed generation
+    (A3); the broker holds the reservation with no active record and GET stays
+    closed with ``source_closed`` and the advanced legacy counter.
     @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-5 @spec PROTECTED-HOOK-SOURCE-6
     @spec PROTECTED-HOOK-SOURCE-7 @spec PROTECTED-HOOK-SOURCE-10.
     """
@@ -811,7 +815,7 @@ def test_protected_put_commits_then_answers_publication_deferred(
             op = str(uuid.uuid4())
             async with captured_logs() as logs:
                 response = await put_policy(client, agent, "0", op)
-                assert_refusal(response, 503, "source_publication_deferred", "1")
+                assert_refusal(response, 503, "runtime_unavailable", "1")
                 assert await asyncio.to_thread(ledger, agent) == [
                     (op, 1, "committed", _intent(PROTECTED_TARGET))
                 ]
@@ -834,7 +838,7 @@ def test_protected_put_commits_then_answers_publication_deferred(
                         agent,
                         generation="1",
                         legacy="4",
-                        reason="publication_deferred",
+                        reason="source_closed",
                         protected=True,
                     ),
                 )
@@ -862,7 +866,7 @@ def test_protected_put_revokes_a_published_tombstone(
             )
             op = str(uuid.uuid4())
             response = await put_policy(client, agent, "9", op)
-            assert_refusal(response, 503, "source_publication_deferred", "13")
+            assert_refusal(response, 503, "runtime_unavailable", "13")
             assert source_record(principals, agent) == {
                 "floor": "13",
                 "operation_id": op,
@@ -880,7 +884,7 @@ def test_protected_put_revokes_a_published_tombstone(
                     agent,
                     generation="13",
                     legacy="1",
-                    reason="publication_deferred",
+                    reason="source_closed",
                     protected=True,
                 ),
             )
@@ -888,10 +892,13 @@ def test_protected_put_revokes_a_published_tombstone(
     run(scenario)
 
 
-def test_rotate_keeps_the_protected_target_and_answers_publication_deferred(
+def test_rotate_keeps_the_protected_target_and_stays_closed_without_runtime_evidence(
     principals: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Rotate allocates a fresh generation for the same target without a counter bump.
+
+    With no runtime evidence provisioned it answers 503 ``runtime_unavailable``
+    with the committed generation and stays closed (A3).
 
     @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-5 @spec PROTECTED-HOOK-SOURCE-6
     @spec PROTECTED-HOOK-SOURCE-10.
@@ -904,7 +911,7 @@ def test_rotate_keeps_the_protected_target_and_answers_publication_deferred(
             first = await asyncio.to_thread(seed_row, agent, 9, PROTECTED_TARGET)
             op = str(uuid.uuid4())
             response = await rotate_policy(client, agent, "9", op)
-            assert_refusal(response, 503, "source_publication_deferred", "10")
+            assert_refusal(response, 503, "runtime_unavailable", "10")
             assert await asyncio.to_thread(policy_row, agent) == {
                 "generation": 10,
                 "operation_id": op,
@@ -927,7 +934,7 @@ def test_rotate_keeps_the_protected_target_and_answers_publication_deferred(
                     agent,
                     generation="10",
                     legacy="5",
-                    reason="publication_deferred",
+                    reason="source_closed",
                     protected=True,
                 ),
             )
@@ -1202,12 +1209,12 @@ def test_exact_protected_replay_answers_the_committed_generation_without_new_sta
             assert rt is not None
             op = str(uuid.uuid4())
             assert_refusal(
-                await put_policy(client, agent, "0", op), 503, "source_publication_deferred", "1"
+                await put_policy(client, agent, "0", op), 503, "runtime_unavailable", "1"
             )
             before = await state(agent), broker_snapshot(principals)
             for expected in ("0", "5"):
                 replay = await put_policy(client, agent, expected, op)
-                assert_refusal(replay, 503, "source_publication_deferred", "1")
+                assert_refusal(replay, 503, "runtime_unavailable", "1")
                 assert (await state(agent), broker_snapshot(principals)) == before
             rt.manifest["qualification_id"] = str(uuid.UUID(int=13))
             rt.write()
@@ -1217,9 +1224,7 @@ def test_exact_protected_replay_answers_the_committed_generation_without_new_sta
             assert (await state(agent), broker_snapshot(principals)) == before
             assert_dto(
                 await get_policy(client, agent),
-                dto(
-                    agent, generation="1", legacy="1", reason="publication_deferred", protected=True
-                ),
+                dto(agent, generation="1", legacy="1", reason="source_closed", protected=True),
             )
 
     run(scenario)
@@ -1376,9 +1381,11 @@ def test_disabled_principal_refuses_before_registration(
 def test_secret_route_refuses_every_state_and_never_returns_a_key(
     principals: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    """409 source_not_protected for absent, history only and tombstone; 503 deferred for protected.
+    """409 source_not_protected for absent, history only and tombstone; 503 source_closed for
+    an unpublished protected row (A3: one reader session shows no active record).
 
-    No broker connection, no write and no key in the response or logs.
+    No broker connection except the protected row's reader, no write and no key
+    in the response or logs.
     @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-6.
     """
 
@@ -1397,11 +1404,11 @@ def test_secret_route_refuses_every_state_and_never_returns_a_key(
             async with captured_logs() as logs:
                 response = await get_secret(client, agent)
             if kind == "protected":
-                assert_refusal(response, 503, "source_publication_deferred")
+                assert_refusal(response, 503, "source_closed")
             else:
                 assert_refusal(response, 409, "source_not_protected")
+                assert connections(principals) == opened
             assert "secret" not in response.json()
-            assert connections(principals) == opened
             assert (await state(agent), broker_snapshot(principals)) == before
             assert_no_secret([response.text, *logs.lines], agent, rt, [9])
 
@@ -1730,12 +1737,12 @@ def test_get_secret_and_probe_never_open_the_writer_file(
 
             baseline = await answers()
             assert baseline[1][0] == 200, baseline
-            assert baseline[1][1]["refusal_reason"] == "publication_deferred"
+            assert baseline[1][1]["refusal_reason"] == "source_closed"
             assert baseline[2][0] == 200, baseline
             assert baseline[2][1]["activation"] == "active", baseline
             assert baseline[3] == (
                 503,
-                {"detail": {"code": "source_publication_deferred", "committed_generation": None}},
+                {"detail": {"code": "source_closed", "committed_generation": None}},
             )
             variant(rt, principals)
             rt.write()
@@ -1918,7 +1925,7 @@ def test_console_session_authenticates_and_cross_origin_mutation_is_refused(
                 headers={**cookie, "Origin": "http://test"},
                 json=put_body("0", str(uuid.uuid4())),
             )
-            assert_refusal(accepted, 503, "source_publication_deferred", "1")
+            assert_refusal(accepted, 503, "runtime_unavailable", "1")
 
     run(scenario)
 
@@ -1947,10 +1954,10 @@ def test_route_lifecycle_keeps_exact_durable_state(
                     responses[-1], dto(agent, generation="5", legacy="0", activation="active")
                 )
                 responses.append(await put_policy(client, agent, "5", ops[1]))
-                assert_refusal(responses[-1], 503, "source_publication_deferred", "6")
+                assert_refusal(responses[-1], 503, "runtime_unavailable", "6")
                 assert (source_record(principals, agent) or {}).get("active") is None
                 responses.append(await rotate_policy(client, agent, "6", ops[2]))
-                assert_refusal(responses[-1], 503, "source_publication_deferred", "7")
+                assert_refusal(responses[-1], 503, "runtime_unavailable", "7")
                 responses.append(await delete_policy(client, agent, "7", ops[3]))
                 assert_dto(
                     responses[-1], dto(agent, generation="8", legacy="1", activation="active")

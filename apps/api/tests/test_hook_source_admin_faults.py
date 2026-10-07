@@ -376,7 +376,7 @@ def test_concurrent_mutations_on_one_agent_serialize_on_the_gate(
             finally:
                 await asyncio.to_thread(unpause, principals)
             winner, loser = await asyncio.wait_for(asyncio.gather(first, other), 15)
-            assert_refusal(winner, 503, "source_publication_deferred", "1")
+            assert_refusal(winner, 503, "runtime_unavailable", "1")
             assert_refusal(loser, 409, "stale_source_generation")
             assert await asyncio.to_thread(ledger, agent) == [
                 (first_op, 1, "committed", _intent(PROTECTED_TARGET))
@@ -478,7 +478,7 @@ def test_admin_requests_give_up_on_the_gate_after_five_seconds_without_effects(
                 *(put_policy(client, other, "0", str(uuid.uuid4())) for other in others)
             )
             for response in freed:
-                assert_refusal(response, 503, "source_publication_deferred", "1")
+                assert_refusal(response, 503, "runtime_unavailable", "1")
 
     run(scenario)
 
@@ -549,7 +549,7 @@ def test_gate_pool_exhaustion_by_slow_mutations_is_bounded_for_other_agents(
                 # The paused reserve outlives the writer's two second socket timeout or not.
                 slow = await first
                 assert slow.status_code == 503 and slow.json()["detail"]["code"] in (
-                    "source_publication_deferred",
+                    "runtime_unavailable",
                     "broker_unavailable",
                 ), slow.text
                 await asyncio.gather(*waiters, return_exceptions=True)
@@ -562,13 +562,14 @@ def test_gate_pool_exhaustion_by_slow_mutations_is_bounded_for_other_agents(
 # -- exact protected replay from SQL alone ---------------------------------------------------
 
 
-def test_exact_protected_replay_answers_deferred_with_the_broker_frozen(
+def test_exact_protected_replay_with_the_broker_frozen_is_bounded_broker_unavailable(
     principals: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """With the owned broker frozen, an exact protected replay still answers from SQL alone.
-
-    503 ``source_publication_deferred`` with the committed generation, fast,
-    with no broker connection and no new durable state.
+    """With the owned broker frozen, an exact replay of a committed unpublished protected
+    operation retries publication (A3) and answers 503 ``broker_unavailable`` with the
+    committed generation within the five second publication deadline, with no new durable
+    state. No runtime evidence is provisioned, so the first PUT answers
+    ``runtime_unavailable`` with the committed generation.
     @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-7.
     """
 
@@ -577,17 +578,16 @@ def test_exact_protected_replay_answers_deferred_with_the_broker_frozen(
         async with admin_app(tmp_path, monkeypatch, principals) as (_app, client, agent, _rt):
             op = str(uuid.uuid4())
             assert_refusal(
-                await put_policy(client, agent, "0", op), 503, "source_publication_deferred", "1"
+                await put_policy(client, agent, "0", op), 503, "runtime_unavailable", "1"
             )
-            before, opened = await state(agent), connections(principals)
+            before = await state(agent)
             await asyncio.to_thread(principals.docker, "pause", principals.cid)
             try:
                 replay, elapsed = await timed(put_policy(client, agent, "4", op))
             finally:
                 await asyncio.to_thread(principals.docker, "unpause", principals.cid)
-            assert_refusal(replay, 503, "source_publication_deferred", "1")
-            assert elapsed < 1.5, f"replay waited on the broker: {elapsed:.2f}s"
-            assert connections(principals) == opened, "replay opened a broker connection"
+            assert_refusal(replay, 503, "broker_unavailable", "1")
+            assert elapsed < 7, f"replay publication was not bounded: {elapsed:.2f}s"
             assert await state(agent) == before
 
     run(scenario)

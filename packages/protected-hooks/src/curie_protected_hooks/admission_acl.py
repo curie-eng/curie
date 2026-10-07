@@ -25,7 +25,7 @@ _ENQUEUE = (
     *_READS,
     "+eval",
     "(+get +type +set +del " + " ".join(_METADATA_KEYS) + ")",
-    "(+type +zadd +zcard +zrem +zscore %RW~protected:admission:quota)",
+    "(+type +zadd +zcard +zrem +zscore +zrange %RW~protected:admission:quota)",
     "(+type +xinfo|stream +xrange +xadd %RW~curie:runs)",
     "(+eval %RW~protected:source:* %RW~protected:control:* " + " ".join(_ADMISSION_KEYS) + ")",
 )

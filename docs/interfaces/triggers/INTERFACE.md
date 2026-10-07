@@ -149,21 +149,96 @@ another handler that mints a `QueuedTurn` with the right `source`. The eight tha
   `GET`, `PUT` and `DELETE /agents/{agent_id}/hooks/{hook}/source-policy`,
   `POST .../rotate` and `GET .../secret` take the platform key or a live console
   session, never a hook signature. Every mutation needs the provisioner's
-  runtime directory, including its `source_writer.json`; without it each one
-  answers 503 `runtime_unavailable` and changes nothing. A protected `PUT` or
-  `rotate` that answers 503 `source_publication_deferred` with a
-  `committed_generation` has committed: the policy row is durable, the first
-  protected policy of an agent advanced its legacy hook counter, which
-  invalidates every ordinary hook key of that agent, and the source stays
-  closed until the LANE-4 ingress admission change (#4075). It is not a
-  transient failure; do not retry it with a new operation. Reissue the
-  agent's ordinary keys through the legacy `GET /agents/{agent_id}/hook-secret`
-  route. `DELETE` commits and publishes an ordinary tombstone without moving
-  the counter, but ingress keeps refusing a tombstoned hook until the same
-  LANE-4 change admits tombstones. After that change, an exact replay of a
-  deferred protected operation publishes it when its broker reservation still
-  matches, and otherwise a fresh `rotate` does. The `secret` route refuses
-  every state until then.
+  runtime directory (`CURIE_PROTECTED_RUNTIME_DIR`), including its
+  `source_writer.json`; without it each one answers 503 `runtime_unavailable`
+  and changes nothing. The first protected policy of an agent advances its
+  legacy hook counter, which invalidates every ordinary hook key of that agent;
+  reissue them through the legacy `GET /agents/{agent_id}/hook-secret` route.
+
+  **Protected publication.** A protected `PUT` or `rotate` commits the policy
+  row, then publishes it on the broker once a control reader session finds the
+  runtime evidence current, and answers 200 with `activation: active`. A
+  refusal after the commit answers 503 with the `committed_generation` and one
+  of `runtime_unavailable`, `broker_identity_mismatch`,
+  `qualification_unavailable`, `evidence_missing`, `evidence_expired`,
+  `configuration_unsupported`, `source_reservation_lost` or
+  `broker_unavailable`. The row is durable and stays closed; do not retry with
+  a new operation. Once the cause is fixed, an exact replay of the same
+  operation publishes it while its broker reservation still matches, and
+  otherwise a fresh `rotate` does. `source_publication_deferred` and GET's
+  `publication_deferred` no longer exist. GET `active` and the `secret` route
+  attest publication only, never current readiness: the secret is served, with
+  `no-store`, only for a published protected source, and is refused 503
+  (`source_closed`, `runtime_unavailable`, `broker_unavailable`) otherwise.
+  `DELETE` publishes an ordinary tombstone without moving the counter. Signed
+  delivery to that tombstone runs the ordinary path only while its ordinary
+  publication is active on the broker; otherwise it answers 503
+  `source_closed`, a delivery ID that already has a private intent answers 409
+  `delivery_conflict`, and a broker failure answers 503 `broker_unavailable`.
+
+  **Runtime files.** The provisioner writes `manifest.json`, `ca.pem`,
+  `bootstrap.json`, `source_writer.json` and `enqueue.json` into the runtime
+  directory and mounts it read only into the API. `enqueue.json` holds exactly
+  `schema_version: 1`, `credential_ref` and the `enqueue` username and password.
+  Its `credential_ref` must equal the manifest's `credential_refs.enqueue`, and
+  its username must differ from `default` and from the control reader, so a
+  stale file after a provisioner rotation is invalid rather than used. Ingress
+  and the reconciler read it; administration never does; the probe parses it
+  and never connects with it. No route, CLI verb, chart default or environment
+  variable creates it, and mounting the directory in a cluster is LANE-8
+  (#4076).
+
+  **Support probe.** `POST /hooks/{agent_id}/{hook}/support` answers 200
+  `supported` exactly when a delivery would be admitted: a published protected
+  row, no `source_bindings` on the agent, valid runtime and enqueue files, and
+  one control reader session that finds the selection open, the manifest equal
+  to the provisioner's, the qualification present and the readiness current.
+  Every other state is 503 with its first failing reason. `supported` does not
+  cover per delivery conditions such as the quota, a duplicate, the reply
+  target or broker reachability for the enqueue principal. A published
+  tombstone still answers `source_closed`; GET's `activation` says whether
+  ordinary delivery is restored.
+
+  **Protected delivery.** A signed delivery to a published protected source is
+  admitted atomically onto the private broker and never touches the ordinary
+  store, backlog slot, workspace or SQL. It refuses a caller supplied
+  `conversation_id` or `placeholder` with 422
+  `protected_reply_target_unsupported`, an agent with `source_bindings` with
+  503 `configuration_unsupported`, and a turn larger than 262144 bytes with
+  413. An ordinary claim already enqueued for the same delivery ID answers 409
+  `delivery_conflict`; a pending one answers 503 `ordinary_delivery_pending`
+  with `Retry-After`. The receipt adds `requested_tool_access`,
+  `effective_tool_access`, `source_generation` and `acceptance_status`
+  (`accepted`, `pending` or `preparing`); `tool_access` remains the effective
+  policy. Admission answers 200 `accepted`, 200 with `duplicate` true and the
+  original receipt for any retry, 202 `preparing` while an interrupted intent
+  awaits recovery, 409 `protected_delivery_failed` for an intent that failed
+  for good, 409 `delivery_conflict`, and 503 with the admission reason or
+  `broker_unavailable`. A full protected backlog answers 429
+  `protected_backlog_full` with no `Retry-After`: the quota is 64 members
+  across the broker, and only the future protected worker releases them, so
+  waiting does not help.
+
+  **Reconciler.** Each API process runs one protected admission reconciler,
+  idle while `CURIE_PROTECTED_RUNTIME_DIR` is unset or a runtime file is
+  invalid. Every five seconds it recovers preparing intents with no caller:
+  one commits once authority opens, and one that stays closed fails with its
+  quota refunded after ten attempts or 300 seconds. Each tick logs only counts:
+  `protected admission reconciler tick outcome=ok quota=N parked=N preparing=N
+  recovered=N failed=N skipped=N`, or `outcome=broker_unavailable`. `quota` is
+  occupancy, `parked` counts committed deliveries waiting for a worker, and
+  `failed` counts intents failed this tick; a caller retry of a failed delivery
+  ID then answers 409 `protected_delivery_failed`.
+
+  **Still unavailable.** No protected worker exists (LANE-6, LANE-7), so an
+  admitted payload parks privately on the broker with its receipt and quota
+  member and is never dispatched or answered; after 64 admissions every
+  delivery answers 429. Provisioning and the shared bootstrap grammar (LANE-8,
+  #4076), private cron routing and the CLI and console siblings (#4053, #4054)
+  remain out. If a misprovisioned runtime opens admission early, set
+  `admission_open: false` in the provisioner's selection: new admission stops
+  at once, parked entries and their quota stay private until LANE-6, and the
+  tick log's `quota` and `parked` counts show them.
 
 The eight share no abstraction: a Slack Bolt event listener, three paths through a
 FastAPI GitHub HMAC route, three asyncio timers, and a FastAPI generic HMAC route. The GitHub push

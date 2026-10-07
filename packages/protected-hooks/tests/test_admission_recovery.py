@@ -135,18 +135,28 @@ def test_real_failure_after_every_successful_write_has_no_false_acceptance(
 
 
 def test_preparing_retry_cannot_replace_original_payload_or_event(admission_broker):
-    """@spec PROTECTED-HOOK-ADMISSION-4/5."""
+    """Same signed tuple, other payload bytes: a recovery attempt without a supplied payload,
+    never a conflict and never a replacement, @spec PROTECTED-HOOK-ADMISSION-4/5/7."""
     b = admission_broker
     r, f, _ = setup_product(b)
     req = request(r)
     owned = interrupt(b, r, f, req, "recovery")
-    before = snapshot(b)
+    original_intent = b.command("GET", owned["intent"])
+    original_binding = b.command("GET", owned["binding"])
     out = f.admit(
         request(r, payload=queued_payload(event_id="event/changed", text="changed"))
     ).as_dict()
-    assert out == dict(status="conflict", reason="delivery_conflict", receipt=None)
-    assert snapshot(b) == before
+    assert out == dict(status="preparing", reason=None, receipt=None)
+    assert b.command("GET", owned["intent"]) == original_intent
+    assert b.command("GET", owned["binding"]) == original_binding
+    assert not b.command("EXISTS", "protected:admission:binding:event/changed")
     assert not b.command("EXISTS", owned["recovery"])
+    assert not b.command("EXISTS", owned["runs"])
+    assert not b.command("EXISTS", owned["commit"])
+    accepted = f.admit(req).as_dict()
+    assert accepted["status"] == "accepted"
+    assert accepted["receipt"]["event_id"] == "event/example"
+    assert b.raw_command("XRANGE", "curie:runs", "-", "+")[0][1][1] == req.queued_payload
 
 
 @pytest.mark.parametrize("closed", ["source", "readiness", "selection"])
@@ -370,7 +380,7 @@ def test_real_committed_response_loss_is_safe_and_retry_never_duplicates(admissi
         c.connection_pool.connection_kwargs["port"] = relay.port
         f = atomic.AtomicAdmission(
             c,
-            broker_identity=b.manifest().as_dict()["broker_identity"],
+            trusted_manifest=b.manifest(),
             trusted_max_readiness_ms=60000,
             backlog_limit=100,
         )

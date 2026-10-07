@@ -1,4 +1,4 @@
-"""Authenticated metadata transport, @spec PROTECTED-HOOK-LANE-2/3/SOURCE-6."""
+"""Authenticated metadata and enqueue transport, @spec PROTECTED-HOOK-LANE-2/3/SOURCE-6."""
 
 from __future__ import annotations
 
@@ -20,10 +20,12 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from redis._parsers.helpers import parse_info
 from redis.backoff import NoBackoff
 from redis.connection import SSLConnection
-from redis.exceptions import ConnectionError
+from redis.exceptions import ConnectionError, ResponseError
 from redis.maint_notifications import MaintNotificationsConfig
 from redis.retry import Retry
 
+from curie_protected_hooks.admission_records import DeliveryIdentity, delivery_digest
+from curie_protected_hooks.atomic_admission import AtomicAdmission
 from curie_protected_hooks.authority_records import Manifest
 from curie_protected_hooks.broker_metadata import (
     _CONTROL_KEY,
@@ -224,13 +226,75 @@ class SourceWriterCredential:
             raise BrokerMetadataUnavailable() from None
 
 
+@dataclass(frozen=True, slots=True)
+class EnqueueCredential:
+    """Provisioner supplied LANE-3 enqueue principal, @spec PROTECTED-HOOK-SOURCE-6 LANE-3."""
+
+    username: str = field(repr=False)
+    password: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        """@spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-LANE-3."""
+        if (
+            not isinstance(self.username, str)
+            or not self.username
+            or self.username == "default"
+            or not isinstance(self.password, str)
+            or not self.password
+        ):
+            raise BrokerMetadataUnavailable() from None
+
+
+_Credential = MetadataReaderCredential | SourceWriterCredential | EnqueueCredential
+
+
+def _trusted_identity(
+    manifest: Manifest, credential: _Credential, expected: type, ca_pem: str
+) -> dict[str, Any]:
+    """Validate every connection input before any network, @spec PROTECTED-HOOK-LANE-2/3."""
+    if type(manifest) is not Manifest or type(credential) is not expected:
+        raise BrokerMetadataUnavailable()
+    credential.__post_init__()
+    identity: dict[str, Any] = Manifest(manifest.canonical_bytes).as_dict()["broker_identity"]
+    if identity["endpoint"]["host"] != identity["tls_server_name"]:
+        raise BrokerMetadataUnavailable()
+    trusted_ca_pem(ca_pem)
+    return identity
+
+
+def _get(connection: _PinnedConnection, key: str) -> bytes | None:
+    """One GET whose answer is bytes or nil, @spec PROTECTED-HOOK-LANE-3/SOURCE-6."""
+    connection.send_command("GET", key, check_health=False)
+    raw: Any = connection.read_response()
+    if raw is not None and type(raw) is not bytes:
+        raise BrokerMetadataUnavailable()
+    return raw
+
+
+def _observe(connection: _PinnedConnection, run_id: str) -> BrokerObservation:
+    """Broker TIME on the verified connection, @spec PROTECTED-HOOK-LANE-2/3."""
+    connection.send_command("TIME", check_health=False)
+    clock: Any = connection.read_response()
+    if (
+        type(clock) is not list
+        or len(clock) != 2
+        or any(type(value) is not bytes for value in clock)
+        or any(re.fullmatch(rb"[0-9]+", value) is None for value in clock)
+    ):
+        raise BrokerMetadataUnavailable()
+    seconds, microseconds = int(clock[0]), int(clock[1])
+    if not 0 <= microseconds < 1000000:
+        raise BrokerMetadataUnavailable()
+    return BrokerObservation(run_id, seconds * 1000 + microseconds // 1000)
+
+
 class _PinnedConnection(SSLConnection):
     """Socket identity enforcement, @spec PROTECTED-HOOK-LANE-2/3."""
 
     def __init__(
         self,
         identity: dict[str, Any],
-        credential: MetadataReaderCredential | SourceWriterCredential,
+        credential: _Credential,
         ca_pem: str,
     ) -> None:
         """@spec PROTECTED-HOOK-LANE-2/3."""
@@ -345,13 +409,7 @@ class AuthenticatedMetadataReader:
         """@spec PROTECTED-HOOK-LANE-2/3."""
         connection: _PinnedConnection | None = None
         try:
-            if type(manifest) is not Manifest or type(credential) is not MetadataReaderCredential:
-                raise BrokerMetadataUnavailable()
-            credential.__post_init__()
-            identity = Manifest(manifest.canonical_bytes).as_dict()["broker_identity"]
-            if identity["endpoint"]["host"] != identity["tls_server_name"]:
-                raise BrokerMetadataUnavailable()
-            trusted_ca_pem(ca_pem)
+            identity = _trusted_identity(manifest, credential, MetadataReaderCredential, ca_pem)
             connection = _PinnedConnection(identity, credential, ca_pem)
             connection.connect()  # type: ignore[no-untyped-call]
             reader = object.__new__(cls)
@@ -370,14 +428,6 @@ class AuthenticatedMetadataReader:
             raise BrokerMetadataUnavailable()
         return self.__connection._identity()
 
-    def __get(self, key: str) -> bytes | None:
-        """@spec PROTECTED-HOOK-LANE-3/SOURCE-6."""
-        self.__connection.send_command("GET", key, check_health=False)
-        raw: Any = self.__connection.read_response()
-        if raw is not None and type(raw) is not bytes:
-            raise BrokerMetadataUnavailable()
-        return raw
-
     def read_source(self, agent_id: str, hook: str) -> SourceState:
         """@spec PROTECTED-HOOK-LANE-3/SOURCE-6."""
         try:
@@ -387,7 +437,7 @@ class AuthenticatedMetadataReader:
         with self.__lock:
             try:
                 self.__identity()
-                raw = self.__get(key)
+                raw = _get(self.__connection, key)
                 if raw is None:
                     return {"floor": 0, "operation_id": None, "active": None}
                 return _decode_source(raw)
@@ -402,7 +452,7 @@ class AuthenticatedMetadataReader:
         with self.__lock:
             try:
                 self.__identity()
-                return self.__get(key)
+                return _get(self.__connection, key)
             except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
                 self.__connection.disconnect()
                 raise BrokerMetadataUnavailable() from None
@@ -411,20 +461,7 @@ class AuthenticatedMetadataReader:
         """@spec PROTECTED-HOOK-LANE-2/3."""
         with self.__lock:
             try:
-                run_id = self.__identity()
-                self.__connection.send_command("TIME", check_health=False)
-                clock: Any = self.__connection.read_response()
-                if (
-                    type(clock) is not list
-                    or len(clock) != 2
-                    or any(type(value) is not bytes for value in clock)
-                    or any(re.fullmatch(rb"[0-9]+", value) is None for value in clock)
-                ):
-                    raise BrokerMetadataUnavailable()
-                seconds, microseconds = int(clock[0]), int(clock[1])
-                if not 0 <= microseconds < 1000000:
-                    raise BrokerMetadataUnavailable()
-                return BrokerObservation(run_id, seconds * 1000 + microseconds // 1000)
+                return _observe(self.__connection, self.__identity())
             except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
                 self.__connection.disconnect()
                 raise BrokerMetadataUnavailable() from None
@@ -491,7 +528,7 @@ _FENCE_REFUSALS = (SourceFenceConflict, SourceFenceExhausted, SourceFenceInvalid
 
 
 class AuthenticatedSourceWriter:
-    """Closed source writer: reserve, ordinary publication and close only.
+    """Closed source writer: reserve, ordinary and protected publication and close only.
 
     It validates input, pins TLS and authenticates exactly as the metadata
     reader does and honors ``metadata_reader_budget``, but sends no INFO and
@@ -523,13 +560,7 @@ class AuthenticatedSourceWriter:
         """@spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-LANE-3."""
         connection: _PinnedWriterConnection | None = None
         try:
-            if type(manifest) is not Manifest or type(credential) is not SourceWriterCredential:
-                raise BrokerMetadataUnavailable()
-            credential.__post_init__()
-            identity = Manifest(manifest.canonical_bytes).as_dict()["broker_identity"]
-            if identity["endpoint"]["host"] != identity["tls_server_name"]:
-                raise BrokerMetadataUnavailable()
-            trusted_ca_pem(ca_pem)
+            identity = _trusted_identity(manifest, credential, SourceWriterCredential, ca_pem)
             connection = _PinnedWriterConnection(identity, credential, ca_pem)
             connection.connect()  # type: ignore[no-untyped-call]
             writer = object.__new__(cls)
@@ -587,8 +618,264 @@ class AuthenticatedSourceWriter:
                 self.__connection.disconnect()
                 raise BrokerMetadataUnavailable() from None
 
+    def publish_protected(
+        self,
+        agent_id: str,
+        hook: str,
+        generation: int,
+        operation_id: str,
+        policy_fingerprint: str,
+    ) -> bool:
+        """@spec PROTECTED-HOOK-SOURCE-6/7."""
+        with self.__lock:
+            if self.__closed:
+                raise BrokerMetadataUnavailable()
+            try:
+                return self.__fence.publish_protected(
+                    agent_id, hook, generation, operation_id, policy_fingerprint
+                )
+            except _FENCE_REFUSALS:
+                raise
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self.__connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+
     def close(self) -> None:
         """@spec PROTECTED-HOOK-SOURCE-6."""
+        with self.__lock:
+            if self.__closed:
+                return
+            self.__closed = True
+            try:
+                self.__connection.disconnect()
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                raise BrokerMetadataUnavailable() from None
+
+
+class _PinnedEnqueueConnection(_PinnedConnection):
+    """Enqueue socket: reader pinning, budget and INFO run_id, connected exactly once.
+
+    @spec PROTECTED-HOOK-LANE-3 @spec PROTECTED-HOOK-SOURCE-2.
+    """
+
+    _connected_once = False
+
+    def connect_check_health(self, *args: Any, **kwargs: Any) -> None:
+        """Connect exactly once; a lost connection stays lost, @spec PROTECTED-HOOK-LANE-3."""
+        if self._sock:
+            return
+        if self._connected_once:
+            raise ConnectionError("Broker metadata unavailable")
+        self._connected_once = True
+        super().connect_check_health(*args, **kwargs)
+
+
+_INTENT_PREFIX = "protected:admission:intent:"
+_INTENT_TYPES = {b"none": False, b"string": True}
+
+
+class _AdmissionCommands:
+    """The commands the admission facade issues, over the pinned enqueue socket only.
+
+    Private: the facade receives it as its client and nothing exports it. Each
+    command holds the enqueue client's lock; any failure other than a command
+    error reply drops the connection for good, so a lost socket is never
+    reopened. @spec PROTECTED-HOOK-ADMISSION-1 @spec PROTECTED-HOOK-LANE-3.
+    """
+
+    __slots__ = ("_connection", "_lock")
+
+    def __init__(self, connection: _PinnedEnqueueConnection, lock: Lock) -> None:
+        """@spec PROTECTED-HOOK-ADMISSION-1."""
+        self._connection = connection
+        self._lock = lock
+
+    def __repr__(self) -> str:
+        """@spec PROTECTED-HOOK-ADMISSION-1."""
+        return "<admission commands>"
+
+    def _call(self, *args: Any) -> Any:
+        """@spec PROTECTED-HOOK-ADMISSION-1 @spec PROTECTED-HOOK-LANE-3."""
+        with self._lock:
+            try:
+                self._connection.send_command(*args, check_health=False)
+                return self._connection.read_response()
+            except ResponseError:
+                raise
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self._connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+
+    def get(self, key: str) -> Any:
+        """@spec PROTECTED-HOOK-ADMISSION-4."""
+        return self._call("GET", key)
+
+    def eval(self, script: str, numkeys: int, *args: Any) -> Any:
+        """@spec PROTECTED-HOOK-ADMISSION-4/5."""
+        return self._call("EVAL", script, numkeys, *args)
+
+    def zrange(self, key: str, start: int, end: int) -> Any:
+        """@spec PROTECTED-HOOK-ADMISSION-5 @spec PROTECTED-HOOK-ADMISSION-6."""
+        return self._call("ZRANGE", key, start, end)
+
+    def zcard(self, key: str) -> Any:
+        """@spec PROTECTED-HOOK-LANE-4."""
+        return self._call("ZCARD", key)
+
+    def info(self, section: str) -> Any:
+        """@spec PROTECTED-HOOK-ADMISSION-4 @spec PROTECTED-HOOK-LANE-2."""
+        return parse_info(self._call("INFO", section))  # type: ignore[no-untyped-call]
+
+    def time(self) -> tuple[int, int]:
+        """@spec PROTECTED-HOOK-ADMISSION-4 @spec PROTECTED-HOOK-LANE-2."""
+        clock: Any = self._call("TIME")
+        if (
+            type(clock) is not list
+            or len(clock) != 2
+            or any(type(value) is not bytes for value in clock)
+            or any(re.fullmatch(rb"[0-9]+", value) is None for value in clock)
+        ):
+            raise BrokerMetadataUnavailable()
+        return int(clock[0]), int(clock[1])
+
+
+class AuthenticatedEnqueueClient:
+    """Closed LANE-3 enqueue transport over one pinned, authenticated connection.
+
+    It validates input, pins TLS, authenticates by name, verifies the live
+    ``INFO server`` run_id on connection and before every operation as the
+    metadata reader does, honors ``metadata_reader_budget`` and never
+    reconnects: any connection loss leaves it permanently unusable. It exports
+    the source and control reads and observation the shared authority
+    evaluation uses, a presence check of one delivery's private intent key and
+    ``close``; never a raw client or generic command. Every failure is the
+    single safe error. @spec PROTECTED-HOOK-LANE-3 @spec PROTECTED-HOOK-SOURCE-2/8/9.
+    """
+
+    __slots__ = ("__connection", "__lock", "__closed")
+    __connection: _PinnedEnqueueConnection
+    __lock: Lock
+    __closed: bool
+
+    def __new__(cls) -> AuthenticatedEnqueueClient:
+        """@spec PROTECTED-HOOK-LANE-3."""
+        raise BrokerMetadataUnavailable() from None
+
+    def __repr__(self) -> str:
+        """@spec PROTECTED-HOOK-LANE-3."""
+        return "AuthenticatedEnqueueClient()"
+
+    @classmethod
+    def connect(
+        cls, manifest: Manifest, credential: EnqueueCredential, ca_pem: str
+    ) -> AuthenticatedEnqueueClient:
+        """@spec PROTECTED-HOOK-LANE-3."""
+        connection: _PinnedEnqueueConnection | None = None
+        try:
+            identity = _trusted_identity(manifest, credential, EnqueueCredential, ca_pem)
+            connection = _PinnedEnqueueConnection(identity, credential, ca_pem)
+            connection.connect()  # type: ignore[no-untyped-call]
+            client = object.__new__(cls)
+            client.__connection = connection
+            client.__lock = Lock()
+            client.__closed = False
+            return client
+        except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+            if connection is not None:
+                connection.disconnect()
+            raise BrokerMetadataUnavailable() from None
+
+    def __identity(self) -> str:
+        """@spec PROTECTED-HOOK-LANE-2/3."""
+        if self.__closed:
+            raise BrokerMetadataUnavailable()
+        return self.__connection._identity()
+
+    def read_source(self, agent_id: str, hook: str) -> SourceState:
+        """@spec PROTECTED-HOOK-LANE-3/SOURCE-6."""
+        try:
+            key = _source_key(agent_id, hook)
+        except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+            raise BrokerMetadataUnavailable() from None
+        with self.__lock:
+            try:
+                self.__identity()
+                raw = _get(self.__connection, key)
+                if raw is None:
+                    return {"floor": 0, "operation_id": None, "active": None}
+                return _decode_source(raw)
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self.__connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+
+    def read_control(self, key: str) -> bytes | None:
+        """@spec PROTECTED-HOOK-LANE-3."""
+        if type(key) is not str or _CONTROL_KEY.fullmatch(key) is None:
+            raise BrokerMetadataUnavailable() from None
+        with self.__lock:
+            try:
+                self.__identity()
+                return _get(self.__connection, key)
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self.__connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+
+    def observe(self) -> BrokerObservation:
+        """@spec PROTECTED-HOOK-LANE-2/3."""
+        with self.__lock:
+            try:
+                return _observe(self.__connection, self.__identity())
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self.__connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+
+    def intent_present(self, identity: DeliveryIdentity) -> bool:
+        """Whether one delivery's private intent key exists, reading no bytes.
+
+        @spec PROTECTED-HOOK-SOURCE-8 @spec PROTECTED-HOOK-ADMISSION-2.
+        """
+        if type(identity) is not DeliveryIdentity:
+            raise BrokerMetadataUnavailable() from None
+        try:
+            key = _INTENT_PREFIX + delivery_digest(identity)
+        except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+            raise BrokerMetadataUnavailable() from None
+        with self.__lock:
+            try:
+                self.__identity()
+                self.__connection.send_command("TYPE", key, check_health=False)
+                kind: Any = self.__connection.read_response()
+                if type(kind) is not bytes or kind not in _INTENT_TYPES:
+                    raise BrokerMetadataUnavailable()
+                return _INTENT_TYPES[kind]
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self.__connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+
+    def admission(
+        self, trusted_manifest: Manifest, *, trusted_max_readiness_ms: int, backlog_limit: int
+    ) -> AtomicAdmission:
+        """The admission facade bound to this connection, which this client owns.
+
+        The facade constructs and closes no connection; closing this client
+        ends it. It first confirms the live run_id. @spec PROTECTED-HOOK-ADMISSION-1
+        @spec PROTECTED-HOOK-LANE-3.
+        """
+        with self.__lock:
+            try:
+                self.__identity()
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self.__connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+        return AtomicAdmission(
+            _AdmissionCommands(self.__connection, self.__lock),  # type: ignore[arg-type]
+            trusted_manifest=trusted_manifest,
+            trusted_max_readiness_ms=trusted_max_readiness_ms,
+            backlog_limit=backlog_limit,
+        )
+
+    def close(self) -> None:
+        """@spec PROTECTED-HOOK-LANE-3."""
         with self.__lock:
             if self.__closed:
                 return

@@ -5575,8 +5575,18 @@
         "type": "object"
       },
       "HookAccepted": {
-        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).\n\n``conversation_id`` is the thread this delivery ACTUALLY landed on. A\npartitioned hook (ADR-0134) mints one id per partition value, and the caller\nhas no other way to learn which of them it got -- it is the last segment of\nthe thread key that ``POST /agents/{agent_id}/threads/{thread_key}/reset``\ntakes, and it is also what the\n``GET /approvals?conversation_id=`` filter takes directly.\n\nOn a DUPLICATE it is read back from the queued turn, never re-derived from\nthis request's body: a retry of the same delivery id may carry a different\npartition value, or the operator may have changed the pointer since, and\neither would name a thread the queued turn never landed on.\n\nIt is None on an ordinary 202 pending/no-claim receipt, which attests no\naccepted turn. An unavailable completed turn or a restricted pending retry\nreturns 409 because its original tool policy cannot be verified.\n\n``tool_access`` is the queued policy, not proof of worker support, runner\nexecution or delivery. A completed duplicate must match the original policy.",
+        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).\n\n``conversation_id`` is the thread this delivery ACTUALLY landed on. A\npartitioned hook (ADR-0134) mints one id per partition value, and the caller\nhas no other way to learn which of them it got -- it is the last segment of\nthe thread key that ``POST /agents/{agent_id}/threads/{thread_key}/reset``\ntakes, and it is also what the\n``GET /approvals?conversation_id=`` filter takes directly.\n\nOn a DUPLICATE it is read back from the queued turn, never re-derived from\nthis request's body: a retry of the same delivery id may carry a different\npartition value, or the operator may have changed the pointer since, and\neither would name a thread the queued turn never landed on.\n\nIt is None on an ordinary 202 pending/no-claim receipt, which attests no\naccepted turn. An unavailable completed turn or a restricted pending retry\nreturns 409 because its original tool policy cannot be verified.\n\n``tool_access`` is the queued policy, not proof of worker support, runner\nexecution or delivery. A completed duplicate must match the original policy.\n\n``requested_tool_access`` is the policy as signed and ``effective_tool_access``\nthe policy the source resolved; ``tool_access`` is the effective alias. An\nordinary answer reports the requested policy as both. ``source_generation``\nis the committed source generation that admitted the delivery, as a\ncanonical decimal string: null for a never configured hook and for any\nordinary duplicate (the ordinary store never recorded one).\n``acceptance_status`` is ``accepted``, ``pending`` (an ordinary 202) or\n``preparing`` (a protected 202). @spec PROTECTED-HOOK-SOURCE-8.",
         "properties": {
+          "acceptance_status": {
+            "default": "accepted",
+            "enum": [
+              "accepted",
+              "pending",
+              "preparing"
+            ],
+            "title": "Acceptance Status",
+            "type": "string"
+          },
           "conversation_id": {
             "anyOf": [
               {
@@ -5592,9 +5602,40 @@
             "title": "Duplicate",
             "type": "boolean"
           },
+          "effective_tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "event_id": {
             "title": "Event Id",
             "type": "string"
+          },
+          "requested_tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Generation"
           },
           "stream_id": {
             "anyOf": [
@@ -13367,7 +13408,7 @@
         ]
       },
       "put": {
-        "description": "Target mandatory read-only protected delivery under the deployment's runtime.\n\nA committed protected PUT answers 503 ``source_publication_deferred`` with\nits committed generation: the commit happened, the agent's legacy counter\nmay have advanced, and the source stays closed until the LANE-4 change.",
+        "description": "Target mandatory read-only protected delivery under the deployment's runtime.\n\nThe commit happens and the agent's legacy counter may advance; the row is\nthen published once current runtime evidence is confirmed, answering 200\n``active``. A refusal after the commit answers 503 with the committed\ngeneration and the source stays closed.",
         "operationId": "put_source_policy_agents__agent_id__hooks__hook__source_policy_put",
         "parameters": [
           {
@@ -13482,7 +13523,7 @@
     },
     "/agents/{agent_id}/hooks/{hook}/source-policy/rotate": {
       "post": {
-        "description": "Allocate a fresh generation for the current protected target.",
+        "description": "Allocate and publish a fresh generation for the current protected target.",
         "operationId": "rotate_source_policy_agents__agent_id__hooks__hook__source_policy_rotate_post",
         "parameters": [
           {
@@ -13597,7 +13638,7 @@
     },
     "/agents/{agent_id}/hooks/{hook}/source-policy/secret": {
       "get": {
-        "description": "Refuses every state in this slice and writes nothing.",
+        "description": "The scoped source key of an active protected source; writes nothing.\n\nServed only when one reader session, after the gate is released, shows the\nrow's active protected record; that attests publication, not current\nreadiness. A rotation committing after that read makes the returned key\nalready revoked. Every other state is refused with no key.",
         "operationId": "get_source_secret_agents__agent_id__hooks__hook__source_policy_secret_get",
         "parameters": [
           {
@@ -18654,7 +18695,7 @@
     },
     "/hooks/{agent_id}/{hook}": {
       "post": {
-        "description": "Verify one hook delivery and enqueue it as a turn.\n\n``tool_access=read-only`` opts into the existing TOOL-ACCESS contract.\nBefore requesting it, the operator must verify homogeneous worker artifacts\nimplementing TOOL-ACCESS-6 and compatible runner artifacts. This API does\nnot discover worker support; an old worker can discard the field. The\nimplementing worker checks the exact target runner before dispatch. Omission\npreserves ordinary hooks, including approvals. The receipt proves only the\nqueued policy, not runtime enforcement or successful reply delivery.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the timestamp, delivery id, decoded hook name, parsed\n   requested policy and raw body, with the timestamp required and inside\n   ``hook_signing.TOLERANCE_S``; a missing delivery id is verified as the\n   empty string, so an absent id is only reported to a caller who could sign;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the optional explicit reply TARGET, after authentication so malformed\n   coordinates reveal nothing to an unsigned caller;\n7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n8. routability, then the claim, quota and enqueue.",
+        "description": "Verify one hook delivery and enqueue it as a turn.\n\n``tool_access=read-only`` opts into the existing TOOL-ACCESS contract.\nBefore requesting it, the operator must verify homogeneous worker artifacts\nimplementing TOOL-ACCESS-6 and compatible runner artifacts. This API does\nnot discover worker support; an old worker can discard the field. The\nimplementing worker checks the exact target runner before dispatch. Omission\npreserves ordinary hooks, including approvals. The receipt proves only the\nqueued policy, not runtime enforcement or successful reply delivery.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the timestamp, delivery id, decoded hook name, parsed\n   requested policy and raw body, with the timestamp required and inside\n   ``hook_signing.TOLERANCE_S``; a missing delivery id is verified as the\n   empty string, so an absent id is only reported to a caller who could sign;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the optional explicit reply TARGET, after authentication so malformed\n   coordinates reveal nothing to an unsigned caller;\n7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n8. routability, then the claim, quota and enqueue.\n\nThe gate-held snapshot decides the path. A committed protected row is\nadmitted atomically onto the private broker (``_ingest_protected``) and\nnever touches the ordinary store. A tombstone first requires its ordinary\npublication to be active and no private intent for the delivery, then\nruns the ordinary path; pending history stays closed.",
         "operationId": "ingest_hook_hooks__agent_id___hook__post",
         "parameters": [
           {
@@ -18851,7 +18892,7 @@
     },
     "/hooks/{agent_id}/{hook}/support": {
       "post": {
-        "description": "Report the current protected support resolution for one hook; write nothing.\n\nThe JSON body is ``HookSupportIn``, read raw because its exact bytes are\nsigned. Order follows the spec: hook name, bounded body, strict parse,\nungated support signature, delivery id, gate-held reauthentication, snapshot,\ngate release, then broker evaluation of a protected row only.\nThe delivery id is signed context only and reserves nothing.",
+        "description": "Report the current protected support resolution for one hook; write nothing.\n\nThe JSON body is ``HookSupportIn``, read raw because its exact bytes are\nsigned. Order follows the spec: hook name, bounded body, strict parse,\nungated support signature, delivery id, gate-held reauthentication, snapshot\nand source bindings, gate release, then broker evaluation of a protected\nrow without source bindings only. ``supported`` (200) is answered exactly\nwhen admission would accept, outside the per delivery exclusions.\nThe delivery id is signed context only and reserves nothing.",
         "operationId": "probe_hook_support_hooks__agent_id___hook__support_post",
         "parameters": [
           {

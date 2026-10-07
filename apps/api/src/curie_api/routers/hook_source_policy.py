@@ -16,10 +16,13 @@ Mutations follow one order: an unset runtime directory is 503
 ``broker_unavailable``; then the runtime files, read once on that slot, else
 503 ``runtime_unavailable``; then for PUT the deployment's one runtime, else
 422 ``unknown_source_reference``; then the gate, the coordinator's checks and
-the registration, broker and SQL effects. Protected publication stays
-unavailable until the LANE-4 ingress admission change, so a committed protected
-PUT or rotate answers 503 ``source_publication_deferred`` with its committed
-generation. The source secret route refuses every state in this slice.
+the registration, broker and SQL effects. A committed protected PUT or rotate
+then publishes its active protected record once a reader bracketed evaluation
+in its publication phase accepts (``accept`` or ``admission_closed``) and
+answers 200 ``active``; otherwise 503 with the committed generation and the
+outcome code, ``source_reservation_lost`` or ``broker_unavailable``. The source
+secret route serves the scoped key only for a protected row whose active
+protected record one reader session shows.
 """
 
 from __future__ import annotations
@@ -32,10 +35,11 @@ from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from .. import hook_source_signing
 from ..auth import require_api_key
 from ..config import get_settings
 from ..hook_source_admin import SourceAdminError, SourceAdminService, policy_out
-from ..hook_source_broker import ProvisionedSourceAuthority, admin_slot, tombstone_activation
+from ..hook_source_broker import ProvisionedSourceAuthority, admin_slot, source_activation
 from ..hook_source_mutation import SourceMutationCoordinator
 from ..hook_source_policy_schemas import (
     HookSourcePolicyMutation,
@@ -148,7 +152,7 @@ async def get_source_policy(agent_id: AgentPath, hook: HookPath, request: Reques
     try:
         gate, engine = _stores(request)
         body = await SourceAdminService(gate, engine).read_policy(
-            agent_id, hook, lambda policy: tombstone_activation(policy, directory)
+            agent_id, hook, lambda policy: source_activation(policy, directory)
         )
     except SourceAdminError as error:
         return _refusal(error)
@@ -165,9 +169,10 @@ async def put_source_policy(
 ) -> JSONResponse:
     """Target mandatory read-only protected delivery under the deployment's runtime.
 
-    A committed protected PUT answers 503 ``source_publication_deferred`` with
-    its committed generation: the commit happened, the agent's legacy counter
-    may have advanced, and the source stays closed until the LANE-4 change.
+    The commit happens and the agent's legacy counter may advance; the row is
+    then published once current runtime evidence is confirmed, answering 200
+    ``active``. A refusal after the commit answers 503 with the committed
+    generation and the source stays closed.
     \f
     @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-5/6/7/10.
     """
@@ -188,8 +193,7 @@ async def put_source_policy(
         )
     except SourceAdminError as error:
         return _refusal(error)
-    # Unreachable while protected publication is deferred; kept for the LANE-4 change.
-    return _refusal(_deferred(policy))
+    return _ok(_active(policy, hook))
 
 
 @router.delete(
@@ -217,17 +221,9 @@ async def delete_source_policy(
                 agent_id, hook, cas.expected_generation, cas.operation_id
             ),
         )
-        body = policy_out(
-            policy.agent_id,
-            hook,
-            policy,
-            legacy_generation=policy.legacy_generation,
-            activation="active",
-            refusal_reason=None,
-        )
     except SourceAdminError as error:
         return _refusal(error)
-    return _ok(body)
+    return _ok(_active(policy, hook))
 
 
 @router.post(
@@ -238,7 +234,7 @@ async def delete_source_policy(
 async def rotate_source_policy(
     agent_id: AgentPath, hook: HookPath, body: HookSourcePolicyMutation, request: Request
 ) -> JSONResponse:
-    """Allocate a fresh generation for the current protected target.
+    """Allocate and publish a fresh generation for the current protected target.
 
     \f
     @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-6/7/10.
@@ -252,8 +248,7 @@ async def rotate_source_policy(
         )
     except SourceAdminError as error:
         return _refusal(error)
-    # Unreachable while protected publication is deferred; kept for the LANE-4 change.
-    return _refusal(_deferred(policy))
+    return _ok(_active(policy, hook))
 
 
 @router.get(
@@ -262,21 +257,43 @@ async def rotate_source_policy(
     responses=_REFUSALS,
 )
 async def get_source_secret(agent_id: AgentPath, hook: HookPath, request: Request) -> JSONResponse:
-    """Refuses every state in this slice and writes nothing.
+    """The scoped source key of an active protected source; writes nothing.
 
-    \f
-    @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-6.
+    Served only when one reader session, after the gate is released, shows the
+    row's active protected record; that attests publication, not current
+    readiness. A rotation committing after that read makes the returned key
+    already revoked. Every other state is refused with no key. \f
+    @spec PROTECTED-HOOK-SOURCE-3 @spec PROTECTED-HOOK-SOURCE-4/6.
     """
+    directory = get_settings().protected_runtime_dir
     try:
         gate, engine = _stores(request)
-        await SourceAdminService(gate, engine).refuse_secret(agent_id, hook)
+        policy = await SourceAdminService(gate, engine).refuse_secret(
+            agent_id, hook, lambda row: source_activation(row, directory)
+        )
+        body = HookSourceSecretOut(
+            agent_id=str(policy.agent_id),
+            hook=policy.hook,
+            generation=str(policy.generation),
+            secret=hook_source_signing.derive(
+                get_settings().api_key,
+                agent_id=str(policy.agent_id),
+                hook=policy.hook,
+                generation=policy.generation,
+            ),
+        )
     except SourceAdminError as error:
         return _refusal(error)
-    return _refusal(SourceAdminError("source_publication_deferred", 503))
+    return JSONResponse(content=body.model_dump(mode="json"), headers=_NO_STORE)
 
 
-def _deferred(policy: SourcePolicySnapshot) -> SourceAdminError:
-    """@spec PROTECTED-HOOK-SOURCE-3."""
-    error = SourceAdminError("source_publication_deferred", 503)
-    error.committed_generation = str(policy.generation)
-    return error
+def _active(policy: SourcePolicySnapshot, hook: str) -> HookSourcePolicyOut:
+    """The DTO of a committed and published row, @spec PROTECTED-HOOK-SOURCE-3/6."""
+    return policy_out(
+        policy.agent_id,
+        hook,
+        policy,
+        legacy_generation=policy.legacy_generation,
+        activation="active",
+        refusal_reason=None,
+    )

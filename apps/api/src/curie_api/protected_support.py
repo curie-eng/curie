@@ -14,30 +14,32 @@ process, on their own small executor; a probe beyond that reports
 one opened directory, as bounded regular files opened without blocking. One
 evaluation opens one ``AuthenticatedMetadataReader`` under a five second budget,
 reads the source record, the selected control records and one broker
-observation on that connection, always closes it, and then decides the spec's
-ordered steps over what it read. A fully valid tuple still reports
-``configuration_unsupported`` until ingress admits protected deliveries
-(LANE-4). @spec PROTECTED-HOOK-LANE-2/3.
+observation on that connection, always closes it, and then decides over what
+it read with the shared ``authority_evaluation`` in its admission phase, the
+same decision atomic admission takes. Step 0 (declared source bindings) is the
+caller's, decided under the gate before any file is read. When the evaluation
+accepts, step 12 parses ``enqueue.json`` through ``load_ingress`` and requires
+it bound to the same manifest; the credential is discarded unused and never
+connected with. Only then is the answer ``supported``.
+@spec PROTECTED-HOOK-LANE-2/3 @spec PROTECTED-HOOK-SOURCE-9.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from curie_protected_hooks.admission_records import parse_selection
-from curie_protected_hooks.authority_records import (
-    AuthorityRecordInvalid,
-    Manifest,
-    Qualification,
-    Readiness,
-    parse_manifest,
-    parse_qualification,
-    parse_readiness,
-    validate_authority,
+from curie_protected_hooks.authority_evaluation import (
+    AuthorityOutcome,
+    AuthorityReads,
+    AuthorityTarget,
+    evaluate_authority,
 )
 from curie_protected_hooks.broker_metadata import BrokerMetadataUnavailable, BrokerObservation
 from curie_protected_hooks.broker_transport import (
@@ -52,6 +54,7 @@ from .hook_source_policy_schemas import HookSupportReason
 from .protected_runtime_files import RuntimeBootstrap as _Bootstrap
 from .protected_runtime_files import RuntimeFilesInvalid as _BootstrapInvalid
 from .protected_runtime_files import load_bootstrap as _load_bootstrap
+from .protected_runtime_files import load_ingress as _load_ingress
 
 # @spec PROTECTED-HOOK-SOURCE-9
 _CONCURRENCY = 4
@@ -102,10 +105,7 @@ class _BrokerReads:
 
 
 def _parsed(parse: Any, raw: bytes | None) -> Any:
-    """A control record, or None when absent or malformed (same step).
-
-    @spec PROTECTED-HOOK-SOURCE-9.
-    """
+    """A control record, or None when absent or malformed, @spec PROTECTED-HOOK-SOURCE-9."""
     if raw is None:
         return None
     try:
@@ -153,83 +153,55 @@ def _read_session(bootstrap: _Bootstrap, runtime: str, agent_id: str, hook: str)
     )
 
 
+# @spec PROTECTED-HOOK-SOURCE-9: the one to one outcome to probe reason map. A
+# closed selection stays the probe's runtime_unavailable; an accepted tuple is
+# supported once step 12 also passes.
+_PROBE_REASONS: Mapping[AuthorityOutcome, HookSupportReason] = MappingProxyType(
+    {
+        "accept": "supported",
+        "source_closed": "source_closed",
+        "runtime_unavailable": "runtime_unavailable",
+        "broker_identity_mismatch": "broker_identity_mismatch",
+        "qualification_unavailable": "qualification_unavailable",
+        "evidence_missing": "evidence_missing",
+        "evidence_expired": "evidence_expired",
+        "configuration_unsupported": "configuration_unsupported",
+        "admission_closed": "runtime_unavailable",
+    }
+)
+
+
 def _decide(
     policy: SourcePolicySnapshot, fingerprint: str, bootstrap: _Bootstrap, reads: _BrokerReads
 ) -> ProtectedSupport:
-    """Steps 3 through 11 over one session's reads, @spec PROTECTED-HOOK-SOURCE-9."""
-    manifest = bootstrap.manifest
-    m = manifest.as_dict()
-    observation = reads.observation
-
-    # 3. The published source authority is this committed protected row.
-    active = reads.source["active"]
-    if (
-        active is None
-        or active["generation"] != policy.generation
-        or active["operation_id"] != str(policy.operation_id)
-        or active["mode"] != "protected"
-        or active["policy_fingerprint"] != fingerprint
-    ):
-        return ProtectedSupport("source_closed")
-
-    # 4. The selection names the bootstrap manifest, whose control bytes match.
-    selection: dict[str, Any] | None = _parsed(parse_selection, reads.selection)
-    control: Manifest | None = _parsed(parse_manifest, reads.manifest)
-    if (
-        selection is None
-        or selection["manifest_digest"] != manifest.digest
-        or control is None
-        or control.canonical_bytes != manifest.canonical_bytes
-    ):
-        return ProtectedSupport("runtime_unavailable")
-
-    # 5. The selected and the observed broker epoch are the manifest's.
-    run_id = m["broker_identity"]["run_id"]
-    if selection["broker_run_id"] != run_id or observation.run_id != run_id:
-        return ProtectedSupport("broker_identity_mismatch")
-
-    # 6, 7. The selected qualification and readiness records are present.
-    qualification: Qualification | None = _parsed(parse_qualification, reads.qualification)
-    if qualification is None:
-        return ProtectedSupport("qualification_unavailable")
-    readiness: Readiness | None = _parsed(parse_readiness, reads.readiness)
-    if readiness is None:
-        return ProtectedSupport("evidence_missing")
-
-    # 8. Broker time has not reached the readiness expiry.
-    if observation.now_ms >= int(readiness.as_dict()["expires_at_ms"]):
-        return ProtectedSupport("evidence_expired")
-
-    # 9. The trusted facts bind the tuple, and the selection names it exactly.
-    try:
-        validate_authority(
-            manifest,
-            qualification,
-            readiness,
-            broker_identity=m["broker_identity"],
-            broker_now_ms=observation.now_ms,
-            trusted_max_readiness_ms=bootstrap.max_readiness_ms,
-        )
-    except AuthorityRecordInvalid:
-        return ProtectedSupport("qualification_unavailable")
-    generation = qualification.as_dict()["qualification_generation"]
-    if selection["qualification_generation"] != generation or any(
-        selection[key] != m[key] for key in ("runtime_id", "runtime_generation", "qualification_id")
-    ):
-        return ProtectedSupport("qualification_unavailable")
-    members = RuntimeMembers(m["runtime_id"], m["runtime_generation"], m["qualification_id"])
-
-    # 10. The row references the selected qualification and bundle.
-    if (
-        selection["qualification_id"] != policy.qualification_id
-        or m["bundle_digest"]["sha256"] != policy.bundle_digest
-    ):
-        return ProtectedSupport("configuration_unsupported", members)
-
-    # 11. Admission is open; ingress still cannot honor protected deliveries.
-    if not selection["admission_open"]:
-        return ProtectedSupport("runtime_unavailable", members)
-    return ProtectedSupport("configuration_unsupported", members)
+    """The shared evaluation over one session's reads, @spec PROTECTED-HOOK-SOURCE-9."""
+    target = AuthorityTarget(
+        generation=policy.generation,
+        operation_id=str(policy.operation_id),
+        policy_fingerprint=fingerprint,
+        runtime_id=policy.runtime_id or "",
+        qualification_id=policy.qualification_id or "",
+        bundle_digest=policy.bundle_digest or "",
+    )
+    decision = evaluate_authority(
+        target,
+        AuthorityReads(
+            source=reads.source,
+            selection=reads.selection,
+            manifest=reads.manifest,
+            qualification=reads.qualification,
+            readiness=reads.readiness,
+            observation=reads.observation,
+        ),
+        trusted_manifest=bootstrap.manifest,
+        trusted_max_readiness_ms=bootstrap.max_readiness_ms,
+        phase="admission",
+    )
+    members = None
+    if decision.runtime_validated:
+        m = bootstrap.manifest.as_dict()
+        members = RuntimeMembers(m["runtime_id"], m["runtime_generation"], m["qualification_id"])
+    return ProtectedSupport(_PROBE_REASONS[decision.outcome], members)
 
 
 def _evaluate(policy: SourcePolicySnapshot, fingerprint: str, directory: str) -> ProtectedSupport:
@@ -249,7 +221,19 @@ def _evaluate(policy: SourcePolicySnapshot, fingerprint: str, directory: str) ->
         reads = _read_broker(bootstrap, str(policy.agent_id), policy.hook)
     except BrokerMetadataUnavailable:
         return ProtectedSupport("broker_unavailable")
-    return _decide(policy, fingerprint, bootstrap, reads)
+    decided = _decide(policy, fingerprint, bootstrap, reads)
+    if decided.reason != "supported":
+        return decided
+    # 12. The enqueue file is valid and bound to this manifest; parsed, never used.
+    try:
+        ingress = _load_ingress(directory)
+    except _BootstrapInvalid:
+        return ProtectedSupport("runtime_unavailable", decided.runtime)
+    bound = ingress.bootstrap.manifest.canonical_bytes == bootstrap.manifest.canonical_bytes
+    del ingress
+    if not bound:
+        return ProtectedSupport("runtime_unavailable", decided.runtime)
+    return decided
 
 
 async def evaluate_protected_support(

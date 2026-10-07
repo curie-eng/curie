@@ -25,6 +25,12 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import Any, TypeVar
 
+from curie_protected_hooks.admission_records import parse_selection
+from curie_protected_hooks.authority_evaluation import (
+    AuthorityReads,
+    AuthorityTarget,
+    evaluate_authority,
+)
 from curie_protected_hooks.broker_metadata import BrokerMetadataUnavailable
 from curie_protected_hooks.broker_transport import (
     AuthenticatedMetadataReader,
@@ -199,17 +205,72 @@ def _holds(state: SourceState, generation: int, operation_id: str) -> bool:
     return state["floor"] == generation and state["operation_id"] == operation_id
 
 
-def _published(state: SourceState, generation: int, operation_id: str, fingerprint: str) -> bool:
-    """Whether the record is exactly this ordinary publication, @spec PROTECTED-HOOK-SOURCE-6."""
+def _published(
+    state: SourceState,
+    generation: int,
+    operation_id: str,
+    fingerprint: str,
+    mode: str = "ordinary",
+) -> bool:
+    """Whether the record is exactly this publication, @spec PROTECTED-HOOK-SOURCE-6."""
     active = state["active"]
     return (
         _holds(state, generation, operation_id)
         and active is not None
         and active["generation"] == generation
         and active["operation_id"] == operation_id
-        and active["mode"] == "ordinary"
+        and active["mode"] == mode
         and active["policy_fingerprint"] == fingerprint
     )
+
+
+# @spec PROTECTED-HOOK-SOURCE-6: publication phase outcomes that permit the CAS.
+_PUBLISHABLE = frozenset({"accept", "admission_closed"})
+
+
+def _evidence(
+    reader: AuthenticatedMetadataReader,
+    bootstrap: RuntimeBootstrap,
+    state: SourceState,
+    target: AuthorityTarget,
+) -> str:
+    """The shared evaluation in its publication phase over one reader session.
+
+    @spec PROTECTED-HOOK-SOURCE-6 @spec PROTECTED-HOOK-SOURCE-9.
+    """
+    runtime = bootstrap.manifest.as_dict()["runtime_id"]
+    selection_raw = reader.read_control(f"protected:control:selection:{runtime}")
+    manifest_raw = reader.read_control(f"protected:control:manifest:{bootstrap.manifest.digest}")
+    qualification_raw = readiness_raw = None
+    try:
+        selection: dict[str, Any] | None = (
+            parse_selection(selection_raw) if selection_raw is not None else None
+        )
+    except Exception:  # noqa: BLE001  A malformed selection reads as absent (step 4).
+        selection = None
+    if selection is not None:
+        qualification_raw = reader.read_control(
+            "protected:control:qualification:"
+            f"{selection['qualification_id']}:{selection['qualification_generation']}"
+        )
+        readiness_raw = reader.read_control(
+            f"protected:control:readiness:{runtime}:{selection['runtime_generation']}"
+        )
+    decision = evaluate_authority(
+        target,
+        AuthorityReads(
+            source=state,
+            selection=selection_raw,
+            manifest=manifest_raw,
+            qualification=qualification_raw,
+            readiness=readiness_raw,
+            observation=reader.observe(),
+        ),
+        trusted_manifest=bootstrap.manifest,
+        trusted_max_readiness_ms=bootstrap.max_readiness_ms,
+        phase="publication",
+    )
+    return decision.outcome
 
 
 class _GateReader:
@@ -314,6 +375,50 @@ class _GateWriter:
         except _BROKER_FAILURES:
             raise _broker_unavailable() from None
 
+    def _publish_protected(self, target: AuthorityTarget) -> bool:
+        """Reader check of the reservation and evidence, the CAS, then reader confirmation.
+
+        Fresh reader and writer under one five second deadline; never a
+        reconnect. The evidence must be current at the reader check, which is
+        not atomic with the CAS: publication admits nothing, and every delivery
+        repeats the full evaluation atomically. @spec PROTECTED-HOOK-SOURCE-6/7.
+        """
+        agent, hook = self._source.agent_id, self._source.hook
+        generation, operation_id = target.generation, target.operation_id
+        fingerprint = target.policy_fingerprint
+        deadline = time.monotonic() + _DEADLINE_SECONDS
+        reader = writer = None
+        try:
+            reader = _connect_reader(self._runtime.bootstrap, deadline)
+            state = reader.read_source(agent, hook)
+            if not _holds(state, generation, operation_id):
+                raise SourceAdminError("source_reservation_lost", 503)
+            outcome = _evidence(reader, self._runtime.bootstrap, state, target)
+            if outcome not in _PUBLISHABLE:
+                raise SourceAdminError(outcome, 503)
+            writer = _connect_writer(self._runtime, deadline)
+            published = writer.publish_protected(
+                agent, hook, generation, operation_id, fingerprint
+            )
+            confirmed = reader.read_source(agent, hook)
+            if _published(confirmed, generation, operation_id, fingerprint, "protected"):
+                return True
+            if not _holds(confirmed, generation, operation_id):
+                raise SourceAdminError("source_reservation_lost", 503)
+            if not published:
+                raise SourceAdminError("source_closed", 503)
+            raise BrokerMetadataUnavailable()
+        finally:
+            _close(writer)
+            _close(reader)
+
+    async def publish_protected(self, *, target: AuthorityTarget) -> bool:
+        """@spec PROTECTED-HOOK-SOURCE-6/7."""
+        try:
+            return await self._slot.run(self._publish_protected, target)
+        except _BROKER_FAILURES:
+            raise _broker_unavailable() from None
+
 
 class ProvisionedSourceAuthority:
     """SourceAuthorityResolver from the runtime files the route loaded once.
@@ -386,12 +491,13 @@ def _close_pair(
     _close(reader)
 
 
-def _tombstone_activation(
+def _source_activation(
     policy: SourcePolicySnapshot, fingerprint: str, directory: str
 ) -> SourceActivation:
     """One authenticated reader session over the three bootstrap files.
 
-    Blocking; never opens the writer file. @spec PROTECTED-HOOK-SOURCE-3/6.
+    The record must be exactly the committed row's publication in its own
+    mode. Blocking; never opens the writer file. @spec PROTECTED-HOOK-SOURCE-3/6.
     """
     try:
         bootstrap = load_bootstrap(directory)
@@ -405,17 +511,19 @@ def _tombstone_activation(
         return "closed", "broker_unavailable"
     finally:
         _close(reader)
-    if _published(state, policy.generation, str(policy.operation_id), fingerprint):
+    if _published(state, policy.generation, str(policy.operation_id), fingerprint, policy.mode):
         return "active", None
     return "closed", "source_closed"
 
 
-async def tombstone_activation(
+async def source_activation(
     policy: SourcePolicySnapshot, directory: str | None
 ) -> SourceActivation:
-    """Activation of a committed ordinary tombstone; the gate is already released.
+    """Publication of a committed tombstone or protected row; the gate is already released.
 
-    Reasons in order: ``authority_unavailable`` (no fingerprint),
+    A protected row is answered on the tombstone's rule with mode
+    ``protected``. ``active`` attests publication only, never current
+    readiness. Reasons in order: ``authority_unavailable`` (no fingerprint),
     ``runtime_unavailable`` (setting unset or a file invalid),
     ``broker_unavailable`` (connection, identity or read failure, a full
     executor or an exhausted budget) and ``source_closed`` (any record
@@ -429,6 +537,6 @@ async def tombstone_activation(
         return "closed", "runtime_unavailable"
     try:
         async with admin_slot() as slot:
-            return await slot.run(_tombstone_activation, policy, fingerprint, directory)
+            return await slot.run(_source_activation, policy, fingerprint, directory)
     except SourceAdminError:
         return "closed", "broker_unavailable"

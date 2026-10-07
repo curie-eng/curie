@@ -44,12 +44,13 @@ receipt is ever consulted.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import secrets as pysecrets
 import uuid
 from datetime import UTC, datetime
 from html import escape
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import anyio
 import redis.asyncio as redis
@@ -64,7 +65,14 @@ from aci_protocol import (
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from channel_protocol import hook_conversation_id
 from curie_internal.keyspace import HOOK_KEY_PREFIX
-from curie_protected_hooks.source_policy_sql import SourceSnapshot
+from curie_protected_hooks.admission_records import (
+    AdmissionRequest,
+    AdmissionResult,
+    DeliveryIdentity,
+    Receipt,
+)
+from curie_protected_hooks.source_policy_records import SourcePolicyRecordInvalid
+from curie_protected_hooks.source_policy_sql import SourcePolicySnapshot
 from curie_telemetry import (
     TRACEPARENT_STREAM_FIELD,
     inject_trace_context,
@@ -76,6 +84,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ValidationError
+from redis.exceptions import RedisError
 from sqlalchemy.exc import SQLAlchemyError
 
 from curie_api.crud import channels as crud_channels
@@ -100,12 +109,23 @@ from ..hook_partition import (
 )
 from ..hook_source_auth import (
     MISSING_DELIVERY_DETAIL,
+    AuthenticatedHookSource,
+    SupportSnapshot,
     authenticated_source,
     authenticated_support,
 )
+from ..hook_source_mutation import committed_policy_fingerprint
 from ..hook_source_policy_schemas import HookSupportIn, HookSupportOut, HookSupportReason
 from ..identities import refuse_undeclared
 from ..models import Agent, AgentChannel
+from ..protected_ingress import (
+    TURN_LIMIT,
+    IngressBrokerUnavailable,
+    admit,
+    ingress_slot,
+    read_ingress_runtime,
+    tombstone_check,
+)
 from ..protected_support import (
     RuntimeMembers,
     SupportAuthorityUnavailable,
@@ -148,6 +168,15 @@ class HookAccepted(BaseModel):
 
     ``tool_access`` is the queued policy, not proof of worker support, runner
     execution or delivery. A completed duplicate must match the original policy.
+
+    ``requested_tool_access`` is the policy as signed and ``effective_tool_access``
+    the policy the source resolved; ``tool_access`` is the effective alias. An
+    ordinary answer reports the requested policy as both. ``source_generation``
+    is the committed source generation that admitted the delivery, as a
+    canonical decimal string: null for a never configured hook and for any
+    ordinary duplicate (the ordinary store never recorded one).
+    ``acceptance_status`` is ``accepted``, ``pending`` (an ordinary 202) or
+    ``preparing`` (a protected 202). @spec PROTECTED-HOOK-SOURCE-8.
     """
 
     event_id: str
@@ -156,6 +185,10 @@ class HookAccepted(BaseModel):
     conversation_id: str | None
     # Proof of the queued policy only, never worker/runner capability or delivery.
     tool_access: ToolAccess | None = None
+    requested_tool_access: ToolAccess | None = None
+    effective_tool_access: ToolAccess | None = None
+    source_generation: str | None = None
+    acceptance_status: Literal["accepted", "pending", "preparing"] = "accepted"
 
 
 def _hook_text(hook: str, body: bytes, outcome: MappingOutcome | None = None) -> str:
@@ -261,6 +294,7 @@ async def _duplicate_receipt(
             duplicate=True,
             conversation_id=None,
             tool_access=None,
+            acceptance_status="pending",
         )
     original = await _landed_turn(client, stream, current)
     if original is None:
@@ -273,12 +307,16 @@ async def _duplicate_receipt(
             status.HTTP_409_CONFLICT,
             "hook delivery tool access differs from the original turn",
         )
+    stream_id = duplicate_stream_id(current, response)
     return HookAccepted(
         event_id=event_id,
-        stream_id=duplicate_stream_id(current, response),
+        stream_id=stream_id,
         duplicate=True,
         conversation_id=original.conversation_id,
         tool_access=original.tool_access,
+        requested_tool_access=original.tool_access,
+        effective_tool_access=original.tool_access,
+        acceptance_status="accepted" if stream_id is not None else "pending",
     )
 
 
@@ -337,6 +375,76 @@ def _mint_turn(
     )
 
 
+def _reply_binding(
+    agent: Agent, kind: str | None, address: str | None, adapter: str | None
+) -> AgentChannel:
+    """The reply surface: the existing kind, address and adapter rules and answers.
+
+    Shared by ordinary and protected ingress, so both select a surface the same
+    way with the same 422, 404 and 409. @spec PROTECTED-HOOK-LANE-4.
+    """
+    if (kind is None) != (address is None):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "hook reply surface requires both kind and address",
+        )
+    if adapter is not None and kind is None:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "hook reply surface adapter names a route within kind and address; pass all three",
+        )
+    # Both or neither, checked just above; naming both here lets the type
+    # checker see that the `else` branch holds a full pair.
+    if kind is None or address is None:
+        if len(agent.channels) != 1:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                "this agent has multiple surfaces; select the hook reply surface "
+                "with both kind and address query parameters",
+            )
+        binding = agent.channels[0]
+    else:
+        # The route is the triple (ADR-0168 decision 3): `adapter` names the
+        # identity for Slack and the adapter slug for any other kind, and an
+        # omitted one means what it means to every reader -- the default Slack
+        # identity, or the agent's single route on a non-Slack pair.
+        # `crud.channels.matching_bindings` is the one matching rule every reader of a
+        # route shares; `agent.channels` is already loaded, so this calls it
+        # directly rather than issuing a fresh query.
+        if adapter is not None:
+            try:
+                refuse_undeclared(kind, route_identity(kind, adapter))
+            except ValueError as exc:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        matches = crud_channels.matching_bindings(agent.channels, kind, address, adapter)
+        if not matches:
+            unbound = "this agent has no binding for the selected kind and address"
+            if adapter is not None:
+                unbound += f" as {route_identity(kind, adapter)!r}"
+            elif kind == SLACK_KIND:
+                identities = sorted(
+                    route_identity(binding.kind, binding.adapter) or DEFAULT_IDENTITY
+                    for binding in agent.channels
+                    if binding.kind == kind and binding.address == address
+                )
+                if identities:
+                    unbound += (
+                        f" as {DEFAULT_IDENTITY!r}; it binds {kind}:{address} only as "
+                        f"{', '.join(map(repr, identities))}, so pass adapter to name one"
+                    )
+            raise HTTPException(status.HTTP_404_NOT_FOUND, unbound)
+        if len(matches) > 1:
+            # Two of this agent's routes on one pair and no adapter to name
+            # one: replying through either would be a guess.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{len(matches)} routes are bound to {kind}:{address}; "
+                "pass adapter to name one",
+            )
+        binding = matches[0]
+    return binding
+
+
 def _require_hook_name(hook: str) -> None:
     """Refuse a hook name before it reaches any key or signed context.
 
@@ -349,6 +457,231 @@ def _require_hook_name(hook: str) -> None:
             "hook name must be 1-63 characters of lowercase letters, digits, dot, "
             "dash or underscore",
         )
+
+
+async def _tombstone_open(
+    source: AuthenticatedHookSource, policy: SourcePolicySnapshot, delivery_id: str
+) -> None:
+    """Refuse a tombstone delivery unless its ordinary publication is active.
+
+    Valid runtime and enqueue files, then one enqueue connection on the ingress
+    executor under its budget reads the source record and the delivery's
+    private intent key; it closes before the ordinary path runs under the same
+    gate. @spec PROTECTED-HOOK-SOURCE-8 @spec PROTECTED-HOOK-SOURCE-2.
+    """
+    runtime = await read_ingress_runtime(get_settings().protected_runtime_dir)
+    if runtime is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "runtime_unavailable")
+    try:
+        async with ingress_slot() as slot:
+            await source.ensure_live()
+            outcome = await tombstone_check(slot, runtime, policy, delivery_id)
+    except IngressBrokerUnavailable:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "broker_unavailable") from None
+    if outcome == "source_closed":
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "source_closed")
+    if outcome == "delivery_conflict":
+        raise HTTPException(status.HTTP_409_CONFLICT, "delivery_conflict")
+
+
+def _protected_turn(
+    binding: AgentChannel, hook: str, event_id: str, body: bytes, conversation: str, stamp: str
+) -> bytes:
+    """The exact protected ``QueuedTurn`` bytes.
+
+    No placeholder, workspace or mapping block; ``received_at`` is the signed
+    timestamp rendered in canonical UTC ISO, so resending one signed request
+    yields identical bytes. @spec PROTECTED-HOOK-LANE-4 @spec PROTECTED-HOOK-ADMISSION-4.
+    """
+    turn = QueuedTurn(
+        event_id=event_id,
+        conversation_id=conversation,
+        author=f"hook:{hook}",
+        text=_hook_text(hook, body),
+        source=TurnSource.WEBHOOK,
+        tool_access=ToolAccess.READ_ONLY,
+        reply_handle=ReplyHandle(
+            kind=binding.kind,
+            channel=binding.address,
+            placeholder=None,
+            endpoint=binding.endpoint,
+            adapter=binding.adapter,
+        ),
+        received_at=datetime.fromtimestamp(int(stamp), UTC).isoformat(),
+    )
+    return turn.model_dump_json().encode("utf-8")
+
+
+def _admission_policy(policy: SourcePolicySnapshot) -> dict[str, Any]:
+    """The committed row's SOURCE-6 fields, @spec PROTECTED-HOOK-SOURCE-6/8."""
+    return {
+        "agent_id": str(policy.agent_id),
+        "hook": policy.hook,
+        "generation": str(policy.generation),
+        "operation_id": str(policy.operation_id),
+        "legacy_generation": str(policy.legacy_generation),
+        "mode": policy.mode,
+        "tool_access": policy.tool_access,
+        "runtime_id": policy.runtime_id,
+        "qualification_id": policy.qualification_id,
+        "bundle_digest": policy.bundle_digest,
+    }
+
+
+def _admission_answer(
+    result: AdmissionResult,
+    response: Response,
+    *,
+    event_id: str,
+    requested: ToolAccess | None,
+    generation: int,
+) -> HookAccepted:
+    """The SOURCE-8 result table, @spec PROTECTED-HOOK-SOURCE-8 @spec PROTECTED-HOOK-LANE-4."""
+    if result.status in ("accepted", "duplicate") and isinstance(result.receipt, Receipt):
+        receipt = result.receipt.as_dict()
+        return HookAccepted(
+            event_id=receipt["event_id"],
+            stream_id=receipt["stream_id"],
+            duplicate=result.status == "duplicate",
+            conversation_id=receipt["conversation_id"],
+            tool_access=receipt["effective_tool_access"],
+            requested_tool_access=receipt["requested_tool_access"],
+            effective_tool_access=receipt["effective_tool_access"],
+            source_generation=receipt["source_generation"],
+            acceptance_status="accepted",
+        )
+    if result.status == "preparing":
+        response.status_code = status.HTTP_202_ACCEPTED
+        return HookAccepted(
+            event_id=event_id,
+            stream_id=None,
+            duplicate=False,
+            conversation_id=None,
+            tool_access=ToolAccess.READ_ONLY,
+            requested_tool_access=requested,
+            effective_tool_access=ToolAccess.READ_ONLY,
+            source_generation=str(generation),
+            acceptance_status="preparing",
+        )
+    if result.status == "failed":
+        raise HTTPException(status.HTTP_409_CONFLICT, "protected_delivery_failed")
+    if result.status == "conflict":
+        raise HTTPException(status.HTTP_409_CONFLICT, "delivery_conflict")
+    if result.status == "refused" and result.reason == "quota_full":
+        # No Retry-After: capacity frees only when the future protected worker
+        # completes deliveries (LANE-6).
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "protected_backlog_full")
+    if result.status == "refused" and result.reason:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, result.reason)
+    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "broker_unavailable")
+
+
+async def _ingest_protected(
+    request: Request,
+    response: Response,
+    source: AuthenticatedHookSource,
+    policy: SourcePolicySnapshot,
+    *,
+    hook: str,
+    raw: bytes,
+    requested: ToolAccess | None,
+    timestamp: str,
+    delivery_id: str,
+    kind: str | None,
+    address: str | None,
+    adapter: str | None,
+    explicit_target: bool,
+) -> HookAccepted:
+    """Admit one signed delivery to a committed protected row, the gate held throughout.
+
+    Order after authentication and the delivery ID: explicit reply target 422,
+    partition 422, the reply surface checks, declared source bindings 503
+    ``configuration_unsupported``, the runtime and enqueue files 503
+    ``runtime_unavailable``, a full ingress executor 503 ``broker_unavailable``,
+    the ordinary claim lookup, turn construction and its bound (413), then one
+    atomic admission. No ordinary claim, backlog slot, workspace row or SQL
+    write is made. @spec PROTECTED-HOOK-SOURCE-2/8 @spec PROTECTED-HOOK-LANE-4.
+    """
+    agent = source.agent
+    if explicit_target:
+        # No protected turn joins a preposted message in an existing thread.
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, "protected_reply_target_unsupported"
+        )
+    try:
+        partition = derive_partition(agent.hook_partitions, hook, raw)
+    except PartitionError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    binding = _reply_binding(agent, kind, address, adapter)
+    # Decided from configuration, never the body, so the probe decides it too.
+    if agent.source_bindings:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "configuration_unsupported")
+    settings = get_settings()
+    runtime = await read_ingress_runtime(settings.protected_runtime_dir)
+    if runtime is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "runtime_unavailable")
+    event_id = f"hook-{agent.id}-{hook}-{sha16(delivery_id)}"
+    try:
+        async with ingress_slot() as slot:
+            await source.ensure_live()
+            # SOURCE-8 across both stores: a prior ordinary claim of this delivery
+            # prevents a private enqueue; read only, never written.
+            client: redis.Redis = request.app.state.valkey
+            try:
+                held = await client.get(
+                    f"{HOOK_KEY_PREFIX}:delivery:{agent.id}:{hook}:{sha16(delivery_id)}"
+                )
+            except RedisError:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
+                ) from None
+            if held is not None:
+                if text(held).startswith("pending:"):
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "ordinary_delivery_pending",
+                        headers={"Retry-After": str(settings.channel_delivery_lease_s)},
+                    )
+                raise HTTPException(status.HTTP_409_CONFLICT, "delivery_conflict")
+            payload = _protected_turn(
+                binding,
+                hook,
+                event_id,
+                raw,
+                hook_conversation_id(agent.id, hook, partition),
+                timestamp,
+            )
+            if len(payload) > TURN_LIMIT:
+                raise HTTPException(
+                    status.HTTP_413_CONTENT_TOO_LARGE,
+                    "protected hook turn exceeds the admission payload limit",
+                )
+            try:
+                admission = AdmissionRequest(
+                    identity=DeliveryIdentity(
+                        agent_id=str(agent.id), hook=hook, delivery_id=delivery_id
+                    ),
+                    source_policy=_admission_policy(policy),
+                    requested_tool_access=requested.value if requested is not None else None,
+                    request_body_sha256=hashlib.sha256(raw).hexdigest(),
+                    queued_payload=payload,
+                )
+            except ValueError:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "the delivery id or turn cannot be admitted to a protected source",
+                ) from None
+            await source.ensure_live()
+            result = await admit(slot, runtime, admission)
+    except IngressBrokerUnavailable:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "broker_unavailable") from None
+    answer = _admission_answer(
+        result, response, event_id=event_id, requested=requested, generation=policy.generation
+    )
+    logger.info(
+        "protected hook ingress status=%s duplicate=%s", result.status, answer.duplicate
+    )
+    return answer
 
 
 @router.post("/{agent_id}/{hook}", response_model=HookAccepted)
@@ -398,8 +731,14 @@ async def ingest_hook(
     7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
        after both of those and before anything is claimed;
     8. routability, then the claim, quota and enqueue.
+
+    The gate-held snapshot decides the path. A committed protected row is
+    admitted atomically onto the private broker (``_ingest_protected``) and
+    never touches the ordinary store. A tombstone first requires its ordinary
+    publication to be active and no private intent for the delivery, then
+    runs the ordinary path; pending history stays closed.
     \f
-    @spec PROTECTED-HOOK-SOURCE-2/4/10.
+    @spec PROTECTED-HOOK-SOURCE-2/4/8/10 @spec PROTECTED-HOOK-LANE-4.
     """
 
     _require_hook_name(hook)
@@ -421,6 +760,23 @@ async def ingest_hook(
         agent = source.agent
         if not x_curie_delivery_id:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, MISSING_DELIVERY_DETAIL)
+        policy = source.snapshot.policy
+        if policy is not None and policy.mode == "protected":
+            return await _ingest_protected(
+                request,
+                response,
+                source,
+                policy,
+                hook=hook,
+                raw=raw,
+                requested=tool_access,
+                timestamp=x_curie_timestamp or "",
+                delivery_id=x_curie_delivery_id,
+                kind=kind,
+                address=address,
+                adapter=adapter,
+                explicit_target=conversation_id is not None or placeholder is not None,
+            )
 
         target_supplied = conversation_id is not None or placeholder is not None
         if target_supplied and (not conversation_id or not placeholder):
@@ -451,65 +807,7 @@ async def ingest_hook(
         if mapping.status in {"unauthorized", "wrong_binding"}:
             raise HTTPException(status.HTTP_403_FORBIDDEN, mapping.reason)
 
-        if (kind is None) != (address is None):
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "hook reply surface requires both kind and address",
-            )
-        if adapter is not None and kind is None:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "hook reply surface adapter names a route within kind and address; pass all three",
-            )
-        # Both or neither, checked just above; naming both here lets the type
-        # checker see that the `else` branch holds a full pair.
-        if kind is None or address is None:
-            if len(agent.channels) != 1:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    "this agent has multiple surfaces; select the hook reply surface "
-                    "with both kind and address query parameters",
-                )
-            binding = agent.channels[0]
-        else:
-            # The route is the triple (ADR-0168 decision 3): `adapter` names the
-            # identity for Slack and the adapter slug for any other kind, and an
-            # omitted one means what it means to every reader -- the default Slack
-            # identity, or the agent's single route on a non-Slack pair.
-            # `crud.channels.matching_bindings` is the one matching rule every reader of a
-            # route shares; `agent.channels` is already loaded, so this calls it
-            # directly rather than issuing a fresh query.
-            if adapter is not None:
-                try:
-                    refuse_undeclared(kind, route_identity(kind, adapter))
-                except ValueError as exc:
-                    raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
-            matches = crud_channels.matching_bindings(agent.channels, kind, address, adapter)
-            if not matches:
-                unbound = "this agent has no binding for the selected kind and address"
-                if adapter is not None:
-                    unbound += f" as {route_identity(kind, adapter)!r}"
-                elif kind == SLACK_KIND:
-                    identities = sorted(
-                        route_identity(binding.kind, binding.adapter) or DEFAULT_IDENTITY
-                        for binding in agent.channels
-                        if binding.kind == kind and binding.address == address
-                    )
-                    if identities:
-                        unbound += (
-                            f" as {DEFAULT_IDENTITY!r}; it binds {kind}:{address} only as "
-                            f"{', '.join(map(repr, identities))}, so pass adapter to name one"
-                        )
-                raise HTTPException(status.HTTP_404_NOT_FOUND, unbound)
-            if len(matches) > 1:
-                # Two of this agent's routes on one pair and no adapter to name
-                # one: replying through either would be a guess.
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    f"{len(matches)} routes are bound to {kind}:{address}; "
-                    "pass adapter to name one",
-                )
-            binding = matches[0]
+        binding = _reply_binding(agent, kind, address, adapter)
 
         thread_id = conversation_id or hook_conversation_id(agent.id, hook, partition)
         if mapping.selects_workspace and mapping.repository is not None:
@@ -543,6 +841,14 @@ async def ingest_hook(
         key = f"{HOOK_KEY_PREFIX}:delivery:{agent.id}:{hook}:{digest}"
         owner = f"pending:{pysecrets.token_hex(16)}"
         client: redis.Redis = request.app.state.valkey
+
+        # A tombstone restores ordinary delivery only while its ordinary
+        # publication is active and the delivery holds no private intent,
+        # decided before any ordinary claim, quota or workspace effect.
+        generation: str | None = None
+        if policy is not None:
+            await _tombstone_open(source, policy, x_curie_delivery_id)
+            generation = str(policy.generation)
 
         reservation = backlog_reservation(
             key_prefix=f"{HOOK_KEY_PREFIX}:backlog:{agent.id}",
@@ -693,6 +999,10 @@ async def ingest_hook(
                             duplicate=False,
                             conversation_id=turn.conversation_id,
                             tool_access=turn.tool_access,
+                            requested_tool_access=tool_access,
+                            effective_tool_access=turn.tool_access,
+                            source_generation=generation,
+                            acceptance_status="accepted",
                         )
                     # Not `turn.conversation_id`: this request enqueued nothing, so the thread
                     # the delivery landed on is the one the WINNING turn named, whatever
@@ -736,6 +1046,7 @@ async def ingest_hook(
             stream_id=None,
             duplicate=True,
             conversation_id=None,
+            acceptance_status="pending",
         )
 
 
@@ -758,15 +1069,18 @@ def _parse_support(raw: bytes) -> HookSupportIn:
 
 
 async def _resolve_support(
-    snapshot: SourceSnapshot, requested: ToolAccess | None, runtime_dir: str | None
+    gated: SupportSnapshot, requested: ToolAccess | None, runtime_dir: str | None
 ) -> HookSupportOut:
     """The spec's resolution table over a snapshot captured under the gate.
 
     Called after the source gate is released: only a committed protected row
     runs the observational broker evaluation, and only it can carry runtime
-    members. Nothing from the bootstrap or the row's references is echoed.
-    @spec PROTECTED-HOOK-SOURCE-9.
+    members. Declared source bindings, read in the same gate hold, are step 0:
+    ``configuration_unsupported`` before any runtime file or broker I/O, as
+    ingress refuses them. Nothing from the bootstrap or the row's references is
+    echoed. @spec PROTECTED-HOOK-SOURCE-9.
     """
+    snapshot = gated.snapshot
     policy = snapshot.policy
     effective: ToolAccess | None = requested
     generation: str | None = None
@@ -780,12 +1094,17 @@ async def _resolve_support(
     elif policy.mode == "protected":
         effective, generation = ToolAccess.READ_ONLY, str(policy.generation)
         try:
-            evaluation = await evaluate_protected_support(policy, runtime_dir)
-        except SupportAuthorityUnavailable:
+            if gated.source_bound:
+                # 0. Before any runtime file or broker I/O, once the row computes.
+                committed_policy_fingerprint(policy)
+                reason = "configuration_unsupported"
+            else:
+                evaluation = await evaluate_protected_support(policy, runtime_dir)
+                reason, runtime = evaluation.reason, evaluation.runtime
+        except (SupportAuthorityUnavailable, SourcePolicyRecordInvalid, ValueError, TypeError):
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
             ) from None
-        reason, runtime = evaluation.reason, evaluation.runtime
     else:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable")
     return HookSupportOut(
@@ -795,7 +1114,7 @@ async def _resolve_support(
         runtime_id=runtime.runtime_id if runtime is not None else None,
         runtime_generation=runtime.runtime_generation if runtime is not None else None,
         qualification_id=runtime.qualification_id if runtime is not None else None,
-        supported=False,
+        supported=reason == "supported",
         reason=reason,
     )
 
@@ -844,8 +1163,10 @@ async def probe_hook_support(
 
     The JSON body is ``HookSupportIn``, read raw because its exact bytes are
     signed. Order follows the spec: hook name, bounded body, strict parse,
-    ungated support signature, delivery id, gate-held reauthentication, snapshot,
-    gate release, then broker evaluation of a protected row only.
+    ungated support signature, delivery id, gate-held reauthentication, snapshot
+    and source bindings, gate release, then broker evaluation of a protected
+    row without source bindings only. ``supported`` (200) is answered exactly
+    when admission would accept, outside the per delivery exclusions.
     The delivery id is signed context only and reserves nothing.
     \f
     @spec PROTECTED-HOOK-SOURCE-9 @spec PROTECTED-HOOK-SOURCE-2/4.
