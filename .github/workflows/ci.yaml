@@ -24,6 +24,32 @@ permissions:
   contents: read
 
 jobs:
+  adapter-credential-reconciliation:
+    name: SRE bot adapter credential reconciliation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Test reconciliation decisions and Kubernetes transport
+        run: uv run pytest -q examples/tests/test_adapter_credentials_sync.py examples/tests/test_adapter_credentials_transport.py
+
   action-pins:
     name: Action SHA pins
     runs-on: ubuntu-latest

@@ -47,6 +47,7 @@ ACQUISITION_ACTIONS = frozenset(
 # one entry covers all three steps of a single wrap.
 RETRY_ALLOWLIST = frozenset(
     {
+        ("ci.yaml", "adapter-credential-reconciliation", "Install uv"),
         ("ci.yaml", "python", "Install uv"),
         ("ci.yaml", "python-pytest", "Install uv"),
         ("fix-pin.yaml", "fix-pin", "Install uv"),
