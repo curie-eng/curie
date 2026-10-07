@@ -704,7 +704,8 @@ async def resolve_approval(
         # ruling under the approving principal: exactly one restore, because
         # only the winner of the claim above reaches here. Rejection creates
         # nothing. A ruling refusal is returned as the ruling route returns it,
-        # with its audit row on the record.
+        # with its audit row on the record; a ruling that never committed is
+        # rerun by the sweeper (``remediation_undo_recovery``).
         out = ApprovalOut.model_validate(claimed)
         if claimed.status == ApprovalStatus.approved:
             subject = await undo_subject(session, claimed)
@@ -713,7 +714,12 @@ async def resolve_approval(
                     status.HTTP_409_CONFLICT, "no undoable record is bound to this approval"
                 )
             await rule_undo(
-                session, subject, principal=principal, approver_sets=approver_sets, store=store
+                session,
+                subject,
+                principal=principal,
+                approver_sets=approver_sets,
+                store=store,
+                approval_id=claimed.id,
             )
         return out
 

@@ -27,6 +27,7 @@ requires the authenticated principal. It is reached from ``POST
 an ``approval`` is authorized against that authority's route, never ungated.
 """
 
+import functools
 import hashlib
 import json
 import logging
@@ -592,6 +593,7 @@ async def rule_undo(
     principal: AuthenticatedApprovalPrincipal,
     approver_sets: ApproverSetSelector,
     store: ObjectStore | None,
+    approval_id: uuid.UUID | None = None,
 ) -> ActionUndoOut:
     """The undo ruling (ACTION-EXECUTOR-3): authorize, check, request one restore.
 
@@ -601,11 +603,22 @@ async def rule_undo(
     (``routers/approvals.py``) both call it with the authenticated principal,
     and nothing calls it without one. Raises the refusal as an
     ``HTTPException`` after committing its audit row.
+
+    ``approval_id`` is the undo approval driving the ruling, when one is. Every
+    audit row the ruling writes then names it in its evidence, and the restore
+    is keyed ``restore:<action id>:approval:<approval id>``, so an approval
+    yields at most one restore however often its ruling is rerun
+    (``remediation_undo_recovery``) and a rerun can tell that it was decided.
     """
+
+    ruling_evidence: dict[str, object] | None = (
+        {"approval_id": str(approval_id)} if approval_id is not None else None
+    )
+    refuse = functools.partial(_refuse, evidence=ruling_evidence)
 
     authorizer, allowed, reason = await _authorize_undo(session, action, principal, approver_sets)
     if not allowed:
-        await _refuse(
+        await refuse(
             session,
             action.id,
             principal,
@@ -616,7 +629,7 @@ async def rule_undo(
         )
 
     if action.undone_at is not None:
-        await _refuse(
+        await refuse(
             session,
             action.id,
             principal,
@@ -625,7 +638,7 @@ async def rule_undo(
             code=status.HTTP_409_CONFLICT,
         )
     if action.status != ActionStatus.succeeded:
-        await _refuse(
+        await refuse(
             session,
             action.id,
             principal,
@@ -646,14 +659,14 @@ async def rule_undo(
             # The connector's own words when it had them: the receipt and the
             # refusal state the same sentence.
             reason = action.detail
-        await _refuse(
+        await refuse(
             session, action.id, principal, kind=code, reason=reason, code=status.HTTP_409_CONFLICT
         )
     # @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-20: the last ruling check.
     # Off, an undo that would authorize a restore is refused with 503, one
     # audit row and no execution.
     if not get_settings().action_executor_enabled:
-        await _refuse(
+        await refuse(
             session,
             action.id,
             principal,
@@ -682,8 +695,13 @@ async def rule_undo(
         authority_ref=str(audit_id),
         requested_by=principal.subject,
         arguments_sha256=restore_arguments_sha256(action.target, action.prior_state),
-        # @spec ACTION-EXECUTOR-2: keyed by the authorizing audit row.
-        idempotency_key=f"restore:{subject_id}:{audit_id}",
+        # @spec ACTION-EXECUTOR-2: keyed by the authorizing audit row, or by
+        # the undo approval that drives it (AUTOMATED-REMEDIATION-19).
+        idempotency_key=(
+            f"restore:{subject_id}:approval:{approval_id}"
+            if approval_id is not None
+            else f"restore:{subject_id}:{audit_id}"
+        ),
         state=ExecutionState.requested.value,
         attempt=0,
     )
@@ -705,6 +723,7 @@ async def rule_undo(
                 "execution_id": str(execution_id),
                 "kid": action.prior_state.get("kid"),
                 "version": action.post_version,
+                **(ruling_evidence or {}),
             },
             created_at=func.clock_timestamp(),
         )
@@ -721,7 +740,7 @@ async def rule_undo(
         if mapped is None:
             raise
         kind, reason = mapped
-        await _refuse(
+        await refuse(
             session,
             subject_id,
             principal,

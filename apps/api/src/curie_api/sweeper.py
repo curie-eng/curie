@@ -62,6 +62,7 @@ from .remediation_approvals import (
     reconcile_remediation_approvals,
     settle_remediation_approval,
 )
+from .remediation_undo_recovery import reconcile_undo_approvals
 from .resumequeue import (
     ResumeQueue,
     approval_trace_context,
@@ -218,6 +219,13 @@ async def sweep_expired_approvals(
     except Exception:
         await session.rollback()
         logger.exception("remediation approval reconciliation pass failed")
+    # AUTOMATED-REMEDIATION-19: complete approved undo approvals whose undo
+    # ruling did not commit, under the approving principal, at most once.
+    try:
+        await reconcile_undo_approvals(session, limit=limit)
+    except Exception:
+        await session.rollback()
+        logger.exception("remediation undo approval reconciliation pass failed")
     await observe_pending_approvals(session, now=now)
     return flipped
 
