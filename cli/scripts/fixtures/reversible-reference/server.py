@@ -138,7 +138,12 @@ def _parse_key(entry: str, name: str) -> tuple[str, AESGCM]:
 
 
 class Keyring:
-    """The current sealing key, if any, and every key that may open."""
+    """The current sealing key, if any, and every key that may open.
+
+    One kid names one key. A retained entry reusing the current kid, or two
+    retained entries sharing a kid, would leave a key that can never open
+    anything, so the configuration is refused rather than silently shadowed.
+    """
 
     def __init__(self, current: str, retained: str) -> None:
         self.current: tuple[str, AESGCM] | None = None
@@ -149,7 +154,11 @@ class Keyring:
         for entry in retained.split(","):
             if entry.strip():
                 kid, aead = _parse_key(entry, "SNAPSHOT_SEALING_KEYS_RETAINED")
-                self.openers.setdefault(kid, aead)
+                if kid in self.openers:
+                    raise KeyConfigError(
+                        f"SNAPSHOT_SEALING_KEYS_RETAINED: kid {kid} is already in use"
+                    )
+                self.openers[kid] = aead
 
     @classmethod
     def from_env(cls) -> "Keyring":
