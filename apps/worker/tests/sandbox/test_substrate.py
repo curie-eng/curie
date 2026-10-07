@@ -30,6 +30,8 @@ from curie_worker.sandbox import (
     UnschedulableClaimError,
 )
 from curie_worker.sandbox.k8s import KubernetesSandboxClient, _claim_view
+from curie_worker.sandbox.types import KubeTransientError
+from urllib3.exceptions import ReadTimeoutError
 
 from .conftest import FakeClaim, FakeSandbox, FakeSandboxClient
 
@@ -39,6 +41,11 @@ from .conftest import FakeClaim, FakeSandbox, FakeSandboxClient
 # the runner that has to read it (#488).
 HISTORY_ENV = BootEnv.env_key("history_ref")
 SESSION_ENV = BootEnv.env_key("session_id")
+
+# After their first poll, the bind and serviceFQDN loops send no poll in the
+# last half second of their budget (#4181). A short-budget test that needs more
+# than one poll adds its polling window on top of this.
+_POLL_GUARD_S = 0.5
 
 
 @pytest.fixture
@@ -634,7 +641,7 @@ def test_later_non_quota_condition_replaces_earlier_quota_evidence(
         return view
 
     fake_k8s.get_claim = get_claim_after_quota_rejection  # type: ignore[method-assign]
-    short_config = replace(config, claim_timeout_seconds=0.05)
+    short_config = replace(config, claim_timeout_seconds=_POLL_GUARD_S + 0.05)
     substrate = SandboxSubstrate(fake_k8s, affinity, short_config)
 
     with pytest.raises(ClaimTimeoutError) as excinfo:
@@ -1692,7 +1699,7 @@ def test_non_quota_reconciler_error_stays_on_slow_bind_path(
         return current
 
     fake_k8s.get_claim = get_claim_with_updated_condition  # type: ignore[method-assign]
-    short_config = replace(config, claim_timeout_seconds=0.05)
+    short_config = replace(config, claim_timeout_seconds=_POLL_GUARD_S + 0.05)
     substrate = SandboxSubstrate(fake_k8s, affinity, short_config)
 
     with pytest.raises(ClaimTimeoutError) as excinfo:
@@ -1940,6 +1947,17 @@ def test_service_fqdn_polling_backs_off_over_a_cold_boot(
     assert len(fake_k8s.sandbox_polls) >= 10
 
 
+class _SlowVirtualBindClient(_VirtualBindClient):
+    """A ``_VirtualBindClient`` whose every claim read takes 0.2 virtual seconds."""
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        view = super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
+        self.clock.now += 0.2
+        return view
+
+
 def test_backoff_is_capped_and_never_overshoots_the_claim_budget(
     affinity: AffinityStore, key_prefix: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1949,13 +1967,15 @@ def test_backoff_is_capped_and_never_overshoots_the_claim_budget(
     # at claim_timeout_seconds rather than a cap-length overshoot past it.
     clock = _VirtualClock()
     monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
-    # 90.0s lands the backoff grid (6 x 0.05, then 0.1 + 0.2 + 0.4, then 0.5
-    # steps) exactly on the deadline, so the clamp would never fire and the
-    # test would pass even with the ``min(..., deadline - now)`` clamp
-    # deleted. 90.3 leaves a 0.3s remainder, smaller than
-    # poll_interval_max_seconds, so only the clamp can produce the final sleep.
-    config = replace(_production_poll_config(key_prefix), claim_timeout_seconds=90.3)
-    fake_k8s = _VirtualBindClient(clock, bind_after_seconds=float("inf"))
+    # Each claim read takes 0.2s of apiserver round trip. With instant reads no
+    # poll can leave less than the cap behind it (no poll is sent with under
+    # _POLL_GUARD_S left, and the shipped cap equals that guard), so the clamp
+    # would never fire and the test would pass with the ``min(..., deadline -
+    # now)`` clamp deleted. A read that eats budget is exactly when production
+    # needs the clamp. 90.2 starts the last poll 0.6s out and ends it with 0.4s
+    # left, under the cap, so only the clamp can produce the 0.4s final sleep.
+    config = replace(_production_poll_config(key_prefix), claim_timeout_seconds=90.2)
+    fake_k8s = _SlowVirtualBindClient(clock, bind_after_seconds=float("inf"))
     substrate = SandboxSubstrate(fake_k8s, affinity, config)
 
     with pytest.raises(ClaimTimeoutError):
@@ -1964,7 +1984,7 @@ def test_backoff_is_capped_and_never_overshoots_the_claim_budget(
     assert max(clock.sleeps) <= config.poll_interval_max_seconds
     # The clamp is what produced this final sleep: an unclamped backoff would
     # have kept it at the cap instead of shortening it.
-    assert clock.sleeps[-1] < config.poll_interval_max_seconds
+    assert clock.sleeps[-1] == pytest.approx(0.4)
     assert clock.now == pytest.approx(config.claim_timeout_seconds)
     # The claim that never bound is still cleaned up.
     assert fake_k8s.deleted == fake_k8s.created
@@ -2486,7 +2506,7 @@ def test_a_pod_that_becomes_schedulable_is_not_reported_unschedulable(
 
     fake_k8s.pod_unschedulable = placed_after_first_read  # type: ignore[method-assign]
     substrate = SandboxSubstrate(
-        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.05)
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=_POLL_GUARD_S + 0.05)
     )
 
     with pytest.raises(ClaimTimeoutError) as excinfo:
@@ -2494,3 +2514,196 @@ def test_a_pod_that_becomes_schedulable_is_not_reported_unschedulable(
 
     assert not isinstance(excinfo.value, UnschedulableClaimError)
     assert len(fake_k8s.pod_reads) >= 2
+
+
+# --- Transient kube API reads in the bind/serviceFQDN loops (#4181) -----------
+# A poll that fails in transport or with a 5xx is no observation: the loop keeps
+# polling on its normal schedule and, at the deadline, raises the timeout built
+# from the last REAL observation. These run on the virtual clock above.
+
+
+def _transient() -> KubeTransientError:
+    # Chained from the urllib3 error the kube client actually raises, so the
+    # substrate sees exactly what KubernetesSandboxClient._get produces.
+    try:
+        raise ReadTimeoutError(None, "/apis/sandboxclaims/c", "Read timed out.")  # type: ignore[arg-type]
+    except ReadTimeoutError as exc:
+        try:
+            raise KubeTransientError("kube API transport error") from exc
+        except KubeTransientError as transient:
+            return transient
+
+
+class _ScriptedClaimClient(FakeSandboxClient):
+    """Answers ``get_claim``/``get_sandbox`` from a script; the last entry repeats.
+
+    An entry that is an exception is raised, anything else is returned.
+    """
+
+    def __init__(
+        self,
+        claim_script: list[ClaimView | None | Exception] | None = None,
+        sandbox_script: list[SandboxView | None | Exception] | None = None,
+    ) -> None:
+        super().__init__()
+        self.claim_script = claim_script or [None]
+        self.sandbox_script = sandbox_script or [None]
+        self.claim_timeouts: list[float] = []
+        self.sandbox_calls = 0
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        del name
+        self.claim_timeouts.append(request_timeout_seconds)
+        index = min(len(self.claim_timeouts) - 1, len(self.claim_script) - 1)
+        entry = self.claim_script[index]
+        if isinstance(entry, Exception):
+            raise entry
+        return entry
+
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        del name, request_timeout_seconds
+        self.sandbox_calls += 1
+        entry = self.sandbox_script[min(self.sandbox_calls, len(self.sandbox_script)) - 1]
+        if isinstance(entry, Exception):
+            raise entry
+        return entry
+
+
+def _claim(*, ready: bool, reason: str | None = None) -> ClaimView:
+    return ClaimView(
+        name="claim-x",
+        ready=ready,
+        sandbox_name="sbx-claim-x" if ready else None,
+        created_at=datetime.now(UTC),
+        quota_rejection=None,
+        ready_reason=reason,
+        ready_message="waiting for dependencies" if reason else None,
+    )
+
+
+def test_await_bound_survives_one_transient_read(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _ScriptedClaimClient(claim_script=[_transient(), _claim(ready=True)])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    assert substrate._await_bound("claim-x", deadline=10.0) == "sbx-claim-x"  # noqa: SLF001
+    assert len(fake_k8s.claim_timeouts) == 2
+
+
+def test_await_bound_times_out_on_last_real_observation_under_transient_reads(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _ScriptedClaimClient(
+        claim_script=[_claim(ready=False, reason="DependenciesNotReady"), _transient()]
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    with pytest.raises(ClaimTimeoutError, match="DependenciesNotReady") as excinfo:
+        substrate._await_bound("claim-x", deadline=10.0)  # noqa: SLF001
+
+    assert not isinstance(excinfo.value, UnschedulableClaimError)
+    # The loop kept polling through the transient reads rather than bailing on
+    # the first one, and never sent a sub-second request near the deadline.
+    assert len(fake_k8s.claim_timeouts) > 2
+    assert min(fake_k8s.claim_timeouts) >= 0.5
+
+
+class _SlowFirstPollClient(_ScriptedClaimClient):
+    """Its first claim read takes 0.7 virtual seconds, leaving the clock 0.3s
+    short of a 1.0s deadline when it returns."""
+
+    def __init__(
+        self, clock: _VirtualClock, claim_script: list[ClaimView | None | Exception]
+    ) -> None:
+        super().__init__(claim_script=claim_script)
+        self.clock = clock
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        view = super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
+        if len(self.claim_timeouts) == 1:
+            self.clock.now += 0.7
+        return view
+
+
+def test_await_bound_sends_no_further_poll_with_under_half_a_second_left(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _SlowFirstPollClient(clock, claim_script=[_claim(ready=False)])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    with pytest.raises(ClaimTimeoutError):
+        substrate._await_bound("claim-x", deadline=1.0)  # noqa: SLF001
+
+    assert len(fake_k8s.claim_timeouts) == 1
+
+
+def test_await_bound_polls_once_under_a_budget_below_the_floor(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Any positive CURIE_CLAIM_TIMEOUT_SECONDS is accepted, so a budget under
+    # the floor must still get its one look rather than refusing every claim.
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _ScriptedClaimClient(claim_script=[_claim(ready=True)])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    assert substrate._await_bound("claim-x", deadline=0.3) == "sbx-claim-x"  # noqa: SLF001
+    assert fake_k8s.claim_timeouts == pytest.approx([0.3])
+
+
+def test_await_bound_still_polls_with_just_over_half_a_second_left(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _ScriptedClaimClient(claim_script=[_claim(ready=True)])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    assert substrate._await_bound("claim-x", deadline=0.6) == "sbx-claim-x"  # noqa: SLF001
+    assert fake_k8s.claim_timeouts == pytest.approx([0.6])
+
+
+def test_await_service_fqdn_survives_one_transient_read(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    view = SandboxView(
+        name="sbx-claim-x",
+        ready=True,
+        service_fqdn="sbx-claim-x.test-ns.svc.cluster.local",
+        operating_mode="Running",
+        port=8080,
+    )
+    fake_k8s = _ScriptedClaimClient(sandbox_script=[_transient(), view])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    assert substrate._await_service_fqdn("sbx-claim-x", deadline=10.0) == view  # noqa: SLF001
+    assert fake_k8s.sandbox_calls == 2
+
+
+def test_await_service_fqdn_times_out_under_persistent_transient_reads(
+    affinity: AffinityStore, config: SubstrateConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _VirtualClock()
+    monkeypatch.setattr("curie_worker.sandbox.substrate.time", clock)
+    fake_k8s = _ScriptedClaimClient(sandbox_script=[_transient()])
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    with pytest.raises(ClaimTimeoutError, match="has no serviceFQDN"):
+        substrate._await_service_fqdn("sbx-claim-x", deadline=10.0)  # noqa: SLF001
+
+    assert fake_k8s.sandbox_calls > 1

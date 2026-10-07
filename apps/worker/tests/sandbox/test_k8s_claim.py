@@ -24,6 +24,9 @@ from curie_worker.sandbox.k8s import (
     KubernetesSandboxClient,
     _claim_view,
 )
+from curie_worker.sandbox.types import KubeTransientError
+from kubernetes.client import ApiException
+from urllib3.exceptions import MaxRetryError, ReadTimeoutError
 
 # Captured live with `kubectl get sandboxclaims` in JSON form. The controller's
 # direct Pod admission failure emitted no Warning quota Event, so this Ready
@@ -1409,3 +1412,61 @@ def test_only_recent_oom_last_state_explains_a_running_pod(recent: bool) -> None
         assert termination.detail == "exit code 137"
     else:
         assert termination is None
+
+
+class _RaisingCustomObjectsApi:
+    """The CustomObjectsApi boundary, failing every read with one exception."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def get_namespaced_custom_object(self, *args: object, **kwargs: object) -> dict[str, Any]:
+        del args, kwargs
+        raise self.error
+
+
+def _raising_client(error: Exception) -> KubernetesSandboxClient:
+    client = KubernetesSandboxClient.__new__(KubernetesSandboxClient)
+    client._api = _RaisingCustomObjectsApi(error)
+    client._namespace = "test-ns"
+    return client
+
+
+_READ_TIMEOUT = ReadTimeoutError(
+    None,  # type: ignore[arg-type]
+    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxclaims/c",
+    "Read timed out. (read timeout=0.07)",
+)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _READ_TIMEOUT,
+        MaxRetryError(None, "/apis/sandboxclaims/c", _READ_TIMEOUT),  # type: ignore[arg-type]
+        ApiException(status=503),
+    ],
+    ids=["read-timeout", "max-retry", "503"],
+)
+def test_transient_kube_read_failures_raise_kube_transient_error(error: Exception) -> None:
+    # #4181: a urllib3 transport error escaped _get as a non-SandboxError and
+    # left the claim's stream entry pending.
+    with pytest.raises(KubeTransientError, match="sandboxclaims/c") as excinfo:
+        _raising_client(error).get_claim("c", request_timeout_seconds=1.0)
+
+    assert excinfo.value.__cause__ is error
+
+
+def test_kube_read_404_is_absence() -> None:
+    client = _raising_client(ApiException(status=404))
+
+    assert client.get_claim("c", request_timeout_seconds=1.0) is None
+
+
+def test_kube_read_403_is_reraised_unchanged() -> None:
+    error = ApiException(status=403)
+
+    with pytest.raises(ApiException) as excinfo:
+        _raising_client(error).get_claim("c", request_timeout_seconds=1.0)
+
+    assert excinfo.value is error
