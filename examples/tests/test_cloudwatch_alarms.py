@@ -484,7 +484,9 @@ def test_occupied_listener_exits_with_safe_configuration_error(reader):
         " us-east-1 ",
     ],
 )
-def test_invalid_region_is_refused_before_credential_or_listener(reader, monkeypatch, capsys, region):
+def test_invalid_region_is_refused_before_credential_or_listener(
+    reader, monkeypatch, capsys, region
+):
     # @spec SRE-CW-1 SRE-CW-5. Reject a hostile endpoint before any token access.
     required = {
         "TOPIC_ARN": TOPIC,

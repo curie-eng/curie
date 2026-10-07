@@ -23,6 +23,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 FORM = "application/x-www-form-urlencoded; charset=utf-8"
 STS_NS = {"sts": "https://sts.amazonaws.com/doc/2011-06-15/"}
@@ -34,6 +35,7 @@ HTTP_TIMEOUT = 20
 
 DEFAULT_METRIC_PREFIX = "curie_cloudwatch"
 METRIC_PREFIX_PATTERN = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
+REGION_PATTERN = re.compile(r"(?:af|ap|ca|eu|il|me|mx|sa|us)(?:-gov)?-[a-z]+-[1-9][0-9]*")
 
 Http = Callable[[str, str, dict[str, str], bytes], tuple[int, bytes]]
 
@@ -177,6 +179,12 @@ def _validate_prefix(metric_prefix: str) -> None:
         raise ValueError("METRIC_PREFIX")
 
 
+# @spec SRE-CW-1 SRE-CW-5
+def _validate_region(region: str) -> None:
+    if not REGION_PATTERN.fullmatch(region):
+        raise ValueError("AWS_REGION")
+
+
 # @spec SRE-CW-4
 def _label(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
@@ -239,6 +247,7 @@ class Poller:
         metric_prefix: str = DEFAULT_METRIC_PREFIX,
     ):
         _validate_prefix(metric_prefix)
+        _validate_region(region)
         self.metric_prefix = metric_prefix
         self.topic_arn, self.region, self.role_arn = topic_arn, region, role_arn
         self.token_file = pathlib.Path(token_file)
@@ -365,10 +374,19 @@ def make_server(listen_addr: str, poller: Poller) -> ThreadingHTTPServer:
 
 
 # @spec SRE-CW-2 SRE-CW-5
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+# @spec SRE-CW-2 SRE-CW-5
 def _http(method: str, url: str, headers: dict[str, str], body: bytes) -> tuple[int, bytes]:
     request = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+        with _OPENER.open(request, timeout=HTTP_TIMEOUT) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
         with exc:
@@ -400,6 +418,7 @@ def main() -> int:
             raise ValueError("POLL_SECONDS")
         metric_prefix = os.environ.get("METRIC_PREFIX", DEFAULT_METRIC_PREFIX)
         _validate_prefix(metric_prefix)
+        _validate_region(os.environ["AWS_REGION"])
         listen_addr = os.environ.get("LISTEN_ADDR", "0.0.0.0:9108")
         host, port = listen_addr.rsplit(":", 1)
         if not host or not 0 <= int(port) <= 65535:
