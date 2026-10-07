@@ -147,13 +147,18 @@ def _summary(nomination: RemediationNomination, connector: str, tool: str) -> st
     )
 
 
-async def _lock_identity(session: AsyncSession, nomination: RemediationNomination) -> None:
-    """Serialize raise-or-attach for one (agent, hook, action, digest) identity."""
+async def _lock_identity(
+    session: AsyncSession, agent_id: uuid.UUID, hook: str, action: str | None, sha: str | None
+) -> None:
+    """Serialize raise-or-attach with resolution for one (agent, hook, action, digest).
 
-    identity = (
-        f"remediation-approval:{nomination.agent_id}:{nomination.hook}:"
-        f"{nomination.action}:{nomination.arguments_sha256}"
-    )
+    Held for the transaction. An attach holds it from reading the pending
+    approval to committing; ending an approval's nominations takes it first, so
+    a nomination that attached while the approval was being resolved is
+    committed, and ended with the outcome, before the resolution finishes them.
+    """
+
+    identity = f"remediation-approval:{agent_id}:{hook}:{action}:{sha}"
     await session.execute(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:identity, 0))"),
         {"identity": identity},
@@ -251,7 +256,13 @@ async def request_remediation_approval(
         await session.rollback()
         raise RemediationApprovalUnavailable("the protected delivery has no reply handle")
 
-    await _lock_identity(session, nomination)
+    await _lock_identity(
+        session,
+        nomination.agent_id,
+        nomination.hook,
+        nomination.action,
+        nomination.arguments_sha256,
+    )
     if nomination.current_generation is None:
         # The generation the approval is bound under, so a later change to the
         # action is judged ``policy_changed`` against it (AUTOMATED-REMEDIATION-16).
@@ -407,6 +418,19 @@ async def resolution_refusal(session: AsyncSession, approval: Approval) -> Forwa
     return judged if isinstance(judged, ForwardRefused) else None
 
 
+async def _lock_request(
+    session: AsyncSession, approval_id: uuid.UUID
+) -> RemediationApprovalRequest | None:
+    """The approval's request row, after taking its identity's attach lock."""
+
+    request = await session.get(RemediationApprovalRequest, approval_id, populate_existing=True)
+    if request is not None:
+        await _lock_identity(
+            session, request.agent_id, request.hook, request.action, request.arguments_sha256
+        )
+    return request
+
+
 async def _finish_nominations(
     session: AsyncSession,
     approval_id: uuid.UUID,
@@ -416,7 +440,10 @@ async def _finish_nominations(
     raising_id: uuid.UUID | None,
     generation: int | None = None,
 ) -> None:
-    """Move the raising nomination and every attached one off ``approval_requested``."""
+    """Move the raising nomination and every attached one off ``approval_requested``.
+
+    The caller holds the identity lock (``_lock_request``).
+    """
 
     values: dict[str, Any] = {"state": raising, "decided_at": func.now()}
     if generation is not None:
@@ -455,8 +482,8 @@ async def execute_approved(session: AsyncSession, approval_id: uuid.UUID) -> For
     raises ``ForwardRefused``. Replays adopt the same execution.
     """
 
+    request = await _lock_request(session, approval_id)
     approval = await session.get(Approval, approval_id, populate_existing=True)
-    request = await session.get(RemediationApprovalRequest, approval_id)
     if approval is None or request is None or approval.status != ApprovalStatus.approved:
         await session.rollback()
         raise ForwardRefused(AUTHORITY_UNAVAILABLE, "no approved remediation approval")
@@ -497,13 +524,11 @@ async def settle_remediation_approval(
 
     if outcome not in (ApprovalStatus.rejected, ApprovalStatus.expired):
         raise ValueError(f"{outcome!r} is not a terminal outcome without execution")
-    raising_id = await session.scalar(
-        select(RemediationApprovalRequest.nomination_id).where(
-            RemediationApprovalRequest.approval_id == approval_id
-        )
-    )
+    request = await _lock_request(session, approval_id)
+    raising_id = request.nomination_id if request is not None else None
     state = str(outcome)
     await _finish_nominations(
         session, approval_id, raising=state, attached=state, raising_id=raising_id
     )
     await session.commit()
+
