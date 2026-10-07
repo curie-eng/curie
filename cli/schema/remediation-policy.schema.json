@@ -1,50 +1,117 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/remediation-policy/v1.1.json",
+  "$id": "https://schemas.curietech.ai/cli/remediation-policy/v1.2.json",
   "title": "curie <tier> remediation-policy --json",
-  "description": "The agent-facing payload of `curie <tier> remediation-policy <show|apply|arm|disarm|remove>` (AUTOMATED-REMEDIATION-3): the hook's committed policy generation exactly as the API's `RemediationPolicyOut` carries it. `generation` is a canonical decimal string, `bound_by` names the operator principal's subject (never its token), and a removed policy is `active` false with an empty `policy`. A write (never `show`) adds the `operation_id` it sent, passed or minted, so a rerun with `--operation-id` replays it (v1.1). Refusals are the shared error object.",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "agent_id",
-    "hook",
-    "generation",
-    "armed",
-    "active",
-    "bound_by",
-    "policy",
-    "updated_at"
-  ],
-  "properties": {
-    "agent_id": {
-      "type": "string"
-    },
-    "hook": {
-      "type": "string"
-    },
-    "generation": {
-      "type": "string",
-      "pattern": "^(0|[1-9][0-9]{0,18})$"
-    },
-    "armed": {
-      "type": "boolean"
-    },
-    "active": {
-      "type": "boolean"
-    },
-    "bound_by": {
-      "type": "string"
-    },
+  "description": "The agent-facing payload of `curie <tier> remediation-policy <show|apply|arm|disarm|remove|close-breaker>`. `show` and the policy writes (AUTOMATED-REMEDIATION-3) print the hook's committed policy generation exactly as the API's `RemediationPolicyOut` carries it. `generation` is a canonical decimal string, `bound_by` names the operator principal's subject (never its token), and a removed policy is `active` false with an empty `policy`. A policy write (never `show`) adds the `operation_id` it sent, passed or minted, so a rerun with `--operation-id` replays it (v1.1). `close-breaker` (AUTOMATED-REMEDIATION-11) prints the closed circuit breaker exactly as the API's `RemediationBreakerOut` carries it, `closed_by` naming the operator principal's subject (v1.2). Refusals are the shared error object.",
+  "$defs": {
     "policy": {
       "type": "object",
-      "description": "The closed policy document (route, limits, actions), or {} once removed."
+      "additionalProperties": false,
+      "required": [
+        "agent_id",
+        "hook",
+        "generation",
+        "armed",
+        "active",
+        "bound_by",
+        "policy",
+        "updated_at"
+      ],
+      "properties": {
+        "agent_id": {
+          "type": "string"
+        },
+        "hook": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]{0,18})$"
+        },
+        "armed": {
+          "type": "boolean"
+        },
+        "active": {
+          "type": "boolean"
+        },
+        "bound_by": {
+          "type": "string"
+        },
+        "policy": {
+          "type": "object",
+          "description": "The closed policy document (route, limits, actions), or {} once removed."
+        },
+        "updated_at": {
+          "type": "string"
+        },
+        "operation_id": {
+          "type": "string",
+          "description": "The idempotency key the write carried. Absent on show."
+        }
+      }
     },
-    "updated_at": {
-      "type": "string"
-    },
-    "operation_id": {
-      "type": "string",
-      "description": "The idempotency key the write carried. Absent on show."
+    "breaker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "agent_id",
+        "connector",
+        "tool",
+        "target",
+        "opened_at",
+        "closed_at",
+        "closed_by",
+        "close_reason"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "agent_id": {
+          "type": "string"
+        },
+        "connector": {
+          "type": "string"
+        },
+        "tool": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string",
+          "description": "The canonical target the breaker holds open."
+        },
+        "opened_at": {
+          "type": "string"
+        },
+        "closed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "closed_by": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The closing operator principal's subject, never its token."
+        },
+        "close_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
     }
-  }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/policy"
+    },
+    {
+      "$ref": "#/$defs/breaker"
+    }
+  ]
 }

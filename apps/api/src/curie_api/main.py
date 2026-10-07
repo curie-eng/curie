@@ -10,6 +10,7 @@ import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
+from functools import partial
 
 import httpx
 import redis.asyncio as redis
@@ -43,6 +44,7 @@ from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
 from .protected_reconciler import ProtectedAdmissionReconciler
+from .remediation_admission import reconcile_admissions
 from .resumequeue import ResumeQueue
 from .resumereconciler import ResumeReconciler
 from .routers import (
@@ -233,6 +235,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 settings.approval_sweep_interval_s,
                 sweeper_stop,
                 publication_patch_retention_seconds=(settings.publication_patch_retention_seconds),
+                remediation_admissions=(
+                    partial(
+                        reconcile_admissions,
+                        store=app.state.bundle_store,
+                        kill_switch=app.state.kill_switch,
+                    )
+                    if settings.remediation_enabled and settings.action_executor_enabled
+                    else None
+                ),
             )
         )
     else:

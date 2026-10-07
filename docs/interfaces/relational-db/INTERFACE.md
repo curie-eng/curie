@@ -159,6 +159,34 @@ card loop leases. It cascades with its approval, nomination and agent. Rows are
 written by `apps/api/src/curie_api/remediation_approvals.py`; the downgrade drops
 the table and deletes remediation approvals before restoring the check.
 
+Migration `0093_remediation_admission.py` (automated remediation,
+AUTOMATED-REMEDIATION-8 to -11) is additive. `remediation_breakers`
+(`apps/api/src/curie_api/models.py::RemediationBreaker`) holds one row per
+breaker keyed by agent, connector, tool and target key, with at most one open
+per key (a partial unique index); it opens on any verification outcome other
+than `verified` and records `closed_at`, `closed_by` (the operator principal)
+and `close_reason` when the policy's administrative route closes it.
+`remediation_reservations` (`RemediationReservation`) holds the check 11
+reservation of each nomination admitted to its precondition read (policy,
+action, target key, turn, `reserved_at`, `released_at`), counted under the
+per-agent admission lock. Both cascade with the agent (reservations also with
+the nomination). `remediation_nominations.approval_reason` names the admission
+check that sent a nomination to approval, one of the frozen `approval_reasons`
+of `tests/vectors/remediation-codes.json`, and
+`remediation_delivery_surfaces` (`RemediationDeliverySurface`) records, per
+protected delivery event id, the reply surface the hook route chose (written by
+`apps/api/src/curie_api/routers/hooks.py` with remediation on, committed before
+the broker admits the delivery; pruned once a submission copied it); it cascades with
+the agent. `remediation_nomination_submissions` gains `conversation_id` and the
+reply surface (`reply_kind`, `reply_channel`, `reply_endpoint`, `reply_adapter`)
+copied from that row at nomination time, which the approval request is raised on;
+existing rows read NULL. `remediation_nominations_refusal_ck` gains
+`reply_surface_unavailable`.
+Rows are written by `apps/api/src/curie_api/remediation_admission.py` and
+`remediation_limits.py`; the downgrade drops the three tables and the added columns,
+deletes nominations refused `reply_surface_unavailable` and restores the refusal
+check.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.

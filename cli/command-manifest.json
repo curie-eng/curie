@@ -2261,7 +2261,7 @@
           ]
         },
         {
-          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
           "hidden": false,
           "name": "remediation-policy",
           "subcommands": [
@@ -2561,6 +2561,66 @@
               ],
               "hidden": false,
               "name": "remove"
+            },
+            {
+              "about": "Close an open circuit breaker so automatic remediation of its target may resume (`POST .../remediation-policy/breakers/{id}/close`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The breaker's id (a UUID)",
+                  "id": "breaker_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Why the breaker may close, recorded with the closing operator. Required and never blank; checked by the verb so its absence is one ADR-0021 error object like every other input refusal",
+                  "id": "reason",
+                  "long": "reason",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "http://localhost:28000"
+                  ],
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie-dev-key"
+                  ],
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "close-breaker"
             }
           ]
         },
@@ -7727,7 +7787,7 @@
           ]
         },
         {
-          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
+          "about": "A protected hook's remediation policy: show it, apply a document, arm, disarm or remove it, or close an open circuit breaker. Writes run as the operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN",
           "hidden": false,
           "name": "remediation-policy",
           "subcommands": [
@@ -8112,6 +8172,83 @@
               ],
               "hidden": false,
               "name": "remove"
+            },
+            {
+              "about": "Close an open circuit breaker so automatic remediation of its target may resume (`POST .../remediation-policy/breakers/{id}/close`)",
+              "args": [
+                {
+                  "global": false,
+                  "help": "Agent name or id",
+                  "id": "agent",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Protected hook name",
+                  "id": "hook",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "The breaker's id (a UUID)",
+                  "id": "breaker_id",
+                  "positional": true,
+                  "required": true
+                },
+                {
+                  "global": false,
+                  "help": "Why the breaker may close, recorded with the closing operator. Required and never blank; checked by the verb so its absence is one ADR-0021 error object like every other input refusal",
+                  "id": "reason",
+                  "long": "reason",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_URL",
+                  "global": false,
+                  "help": "Platform API base URL. Omit to self-plumb a loopback tunnel to the release API",
+                  "id": "api_url",
+                  "long": "api-url",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "env": "CURIE_API_KEY",
+                  "global": false,
+                  "help": "Platform API key. Omit to read the release's `api.apiKey` from its Secret",
+                  "id": "api_key",
+                  "long": "api-key",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "env": "CURIE_NAMESPACE",
+                  "global": false,
+                  "help": "Kubernetes namespace of the release. Default: curie",
+                  "id": "namespace",
+                  "long": "namespace",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "default_values": [
+                    "curie"
+                  ],
+                  "global": false,
+                  "help": "Helm release name. Default: curie",
+                  "id": "release",
+                  "long": "release",
+                  "positional": false,
+                  "required": false
+                }
+              ],
+              "hidden": false,
+              "name": "close-breaker"
             }
           ]
         },

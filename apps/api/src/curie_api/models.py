@@ -2383,6 +2383,17 @@ class RemediationNominationSubmission(Base):
     )
     hook: Mapped[str] = mapped_column(String(63), nullable=False)
     block_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    # The protected delivery's conversation (its envelope's
+    # ``logical_conversation_key``), which an approval raised later names
+    # (AUTOMATED-REMEDIATION-15). NULL for a submission recorded before 0093.
+    conversation_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The reply surface the delivery's turn named, copied from its
+    # ``remediation_delivery_surfaces`` row at nomination time; an approval is
+    # raised on it (AUTOMATED-REMEDIATION-15). NULL when none was recorded.
+    reply_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_channel: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_adapter: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -2404,7 +2415,8 @@ class RemediationNomination(Base):
         ),
         CheckConstraint(
             "refusal_code IS NULL OR refusal_code IN ('nomination_malformed', 'unknown_action', "
-            "'nomination_duplicate', 'arguments_schema_mismatch', 'agent_stopped')",
+            "'nomination_duplicate', 'arguments_schema_mismatch', 'agent_stopped', "
+            "'reply_surface_unavailable')",
             name="remediation_nominations_refusal_ck",
         ),
         CheckConstraint(
@@ -2437,6 +2449,16 @@ class RemediationNomination(Base):
             "current_generation IS NULL OR current_generation > 0",
             name="remediation_nominations_current_ck",
         ),
+        CheckConstraint(
+            "approval_reason IS NULL OR approval_reason IN ('generation_not_current', "
+            "'policy_disarmed', 'not_automatic', 'qualification_missing', "
+            "'qualification_stale', 'verifier_not_independent', 'out_of_bounds', "
+            "'not_reversible_now', 'breaker_open', 'policy_rate_limit', "
+            "'action_rate_limit', 'incident_limit', 'turn_limit', 'target_live', "
+            "'precondition_not_met', 'precondition_unavailable', 'admission_unreadable', "
+            "'policy_changed')",
+            name="remediation_nominations_approval_reason_ck",
+        ),
         Index("ix_remediation_nominations_event", "event_id"),
     )
 
@@ -2463,6 +2485,8 @@ class RemediationNomination(Base):
     approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     execution_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     verification_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The admission check that sent the nomination to approval (AUTOMATED-REMEDIATION-8).
+    approval_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     # The code of a forward execution that ended failed, indeterminate or refused after
     # admission (AUTOMATED-REMEDIATION-18); the nomination then finishes not-recovered.
     execution_code: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -2929,3 +2953,99 @@ class ChannelIdentity(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
+
+
+class RemediationDeliverySurface(Base):
+    """The reply surface the hook route chose for one protected delivery.
+
+    @spec AUTOMATED-REMEDIATION-15. Written by the protected ingress (remediation
+    on) for an admitted delivery, keyed by its event id, so an approval for its
+    nominations is raised on the surface its ``QueuedTurn`` names. The broker's
+    admission records keep their released key sets.
+    """
+
+    __tablename__ = "remediation_delivery_surfaces"
+
+    event_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    reply_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    reply_channel: Mapped[str] = mapped_column(Text, nullable=False)
+    reply_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_adapter: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationBreaker(Base):
+    """One breaker on an agent's connector, tool and target key.
+
+    @spec AUTOMATED-REMEDIATION-11. Opened on any verification outcome other
+    than ``verified``; closed only through the policy's administrative route,
+    which records the operator principal and a reason. At most one breaker per
+    key is open.
+    """
+
+    __tablename__ = "remediation_breakers"
+    __table_args__ = (
+        CheckConstraint(
+            "(closed_at IS NULL) = (closed_by IS NULL) "
+            "AND (closed_at IS NULL) = (close_reason IS NULL)",
+            name="remediation_breakers_closed_ck",
+        ),
+        Index(
+            "uq_remediation_breakers_open",
+            "agent_id",
+            "connector",
+            "tool",
+            "target",
+            unique=True,
+            postgresql_where=text("closed_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    connector: Mapped[str] = mapped_column(Text, nullable=False)
+    tool: Mapped[str] = mapped_column(Text, nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False)
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    close_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class RemediationReservation(Base):
+    """The check 11 reservation of one nomination admitted to its precondition read.
+
+    @spec AUTOMATED-REMEDIATION-10. Taken under the per-agent admission lock in
+    the transaction that admits the nomination; ``released_at`` is set when the
+    nomination does not execute, after which it counts toward nothing.
+    """
+
+    __tablename__ = "remediation_reservations"
+    __table_args__ = (Index("ix_remediation_reservations_agent", "agent_id", "reserved_at"),)
+
+    nomination_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(f"{SCHEMA}.remediation_nominations.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    target: Mapped[str] = mapped_column(Text, nullable=False)
+    event_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    reserved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

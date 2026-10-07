@@ -835,7 +835,7 @@ one stage; only ruling and pre-dispatch codes are provable non-writes.
 | Stage | Codes |
 | --- | --- |
 | Ruling (HTTP 409, 412 or 503; audit row, no execution) | `executor_disabled`, `refused_restore_in_flight`, `refused_no_agent`, `refused_unsealed`, `refused_unversioned`, `refused_no_digest`, `refused_not_restore_capable`, `refused_key_custody`, `refused_authority_unresolved`, `refused_actor_mismatch` (HTTP 403), `refused_duplicate_ruling` (HTTP 409), plus the existing ruling refusals |
-| Pre-dispatch (`refused`) | `agent_stopped`, `authority_unavailable`, `reserved_verb_via_forward`, `arguments_mismatch`, `tool_not_grant_bound`, `connector_not_hosted`, `connector_digest_unavailable`, `restore_not_advertised`, `restore_schema_mismatch`, `tool_not_advertised`, `version_conflict`, `sandbox_unavailable`, `runner_unavailable`, `connector_unreachable`; amendment E6 adds `tool_not_read_only` (worker reported) |
+| Pre-dispatch (`refused`) | `agent_stopped`, `authority_unavailable`, `reserved_verb_via_forward`, `arguments_mismatch`, `tool_not_grant_bound`, `connector_not_hosted`, `connector_digest_unavailable`, `restore_not_advertised`, `restore_schema_mismatch`, `tool_not_advertised`, `version_conflict`, `sandbox_unavailable`, `runner_unavailable`, `connector_unreachable`; amendment E6 adds `tool_not_read_only` (worker reported) and the API-decided `not_reversible_now` and `policy_changed` (amendment E8, at claim) |
 | Connector refusal during `call` (`failed`) | `version_conflict_at_write`, `sealing_key_unavailable`, `snapshot_unopenable` |
 | Post-dispatch (`failed` or `indeterminate`) | `connector_error`, `unstructured_reply`, `response_lost`, `deadline_exceeded` |
 
@@ -903,6 +903,15 @@ claim and again immediately before the `dispatched` commit; a stopped agent or
 an unreadable switch refuses `agent_stopped`. Rate limits, the circuit breaker
 and the per-policy disarm belong to admission
 ([#4071](https://github.com/curie-eng/curie/issues/4071)).
+
+Amendment E8 (AUTOMATED-REMEDIATION-11): for a `forward` execution whose
+`authority_kind` is `policy`, the claim route also calls the remediation
+authority hook (`apps/api/src/curie_api/remediation_admission.py::authority_refusal`)
+before handing it out. When the nomination's admitted policy generation is no
+longer current and armed, or a breaker is open for its connector, tool and
+target key, the execution ends `refused` with `policy_changed` before any
+sandbox claim, its nomination returns to approval, and the claim considers the
+next due execution. Executions of any other authority are claimed as above.
 
 Acceptance: stopping the agent between claim and dispatch yields `agent_stopped`
 with no write call; an unreachable switch yields a refusal, not a dispatch.

@@ -44,13 +44,14 @@ from ..action_execution_codes import (
     EXHAUSTED_CLAIM_CODE,
     EXPIRED_DISPATCH_CODE,
     NOT_REVERSIBLE_NOW_CODE,
+    POLICY_CHANGED_CODE,
     SKIPPED_SAMPLE,
     CodeRejected,
     outcome_code,
 )
 from ..auth import require_internal_worker_token, require_platform_key
 from ..config import get_settings
-from ..deps import SessionDep, StoreDep
+from ..deps import KillSwitchDep, SessionDep, StoreDep
 from ..models import (
     ActionAuditEntry,
     ActionExecution,
@@ -62,10 +63,17 @@ from ..models import (
     ExecutionState,
     RemediationNomination,
 )
+from ..remediation_admission import (
+    authority_refusal,
+    precondition_nomination,
+    preconditions_ended,
+    raise_approval,
+    refuse_changed_authority,
+    return_to_approval,
+)
 from ..remediation_forward import (
     ADMITTED,
     APPROVAL_AUTHORITY,
-    APPROVAL_REQUESTED,
     POLICY_AUTHORITY,
     nomination_for_execution,
     not_reversible_now,
@@ -400,7 +408,7 @@ _CLAIM_LOCK = text(
 _LIVE = (ExecutionState.claimed, ExecutionState.dispatched)
 
 
-async def _expire_claimed_reads(session: AsyncSession, now: datetime) -> list[str]:
+async def _expire_claimed_reads(session: AsyncSession, now: datetime) -> list[ActionExecution]:
     """@spec AUTOMATED-REMEDIATION-12: a read whose lease expired is never re-queued.
 
     It ends ``refused`` with ``runner_unavailable``, an unsuccessful sample,
@@ -420,7 +428,7 @@ async def _expire_claimed_reads(session: AsyncSession, now: datetime) -> list[st
     ).all()
     for execution in expired:
         _finish(session, execution, ExecutionState.refused, EXHAUSTED_CLAIM_CODE, now)
-    return [execution.idempotency_key for execution in expired]
+    return list(expired)
 
 
 async def _skip_missed_samples(session: AsyncSession, now: datetime) -> list[str]:
@@ -458,7 +466,9 @@ def _due(now: datetime) -> Any:
     response_model=ExecutionOut,
     responses={204: {"description": "Nothing is claimable."}},
 )
-async def claim_execution(data: ExecutionClaim, session: SessionDep) -> Any:
+async def claim_execution(
+    data: ExecutionClaim, session: SessionDep, store: StoreDep, kill_switch: KillSwitchDep
+) -> Any:
     """Claim the oldest due execution under a lease, or ``204``.
 
     @spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a
@@ -475,15 +485,41 @@ async def claim_execution(data: ExecutionClaim, session: SessionDep) -> Any:
     dispatched) across the installation, and while two or more slots exist at
     most all but one are reads. An expired read is refused ``runner_unavailable``
     and never reclaimed; a due read whose series successor is due is skipped.
+
+    @spec AUTOMATED-REMEDIATION-11 (executor amendment E8): a ``policy`` forward
+    execution is handed out only while its remediation authority holds
+    (``remediation_admission.authority_refusal``); otherwise it ends ``refused``
+    ``policy_changed`` before any sandbox claim, its nomination goes back to
+    approval, and the next due execution is considered. An expired precondition
+    read decides its nomination's check 12 (AUTOMATED-REMEDIATION-9).
     """
 
+    owed: list[uuid.UUID] = []
+    expired_reads: list[ActionExecution] = []
+    answer = await _claim(data, session, owed, expired_reads)
+    preconditions = [r.id for r in expired_reads if precondition_nomination(r.idempotency_key)]
+    # After the claim transaction ended: the approvals of nominations a changed
+    # authority returned, and the preconditions an expiry ended.
+    for nomination_id in owed:
+        await raise_approval(session, nomination_id)
+    await preconditions_ended(session, store, kill_switch, preconditions)
+    return answer
+
+
+async def _claim(
+    data: ExecutionClaim,
+    session: AsyncSession,
+    owed: list[uuid.UUID],
+    expired_reads: list[ActionExecution],
+) -> Any:
     settings = get_settings()
     if not settings.action_executor_enabled:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     await session.execute(_CLAIM_LOCK)
     now = await _now(session)
     await _expire_dispatched(session, now)
-    ended = await _expire_claimed_reads(session, now)
+    expired_reads.extend(await _expire_claimed_reads(session, now))
+    ended = [execution.idempotency_key for execution in expired_reads]
     ended += await _skip_missed_samples(session, now)
     await session.flush()
     # @spec AUTOMATED-REMEDIATION-18: a read the claim route ended may decide
@@ -536,6 +572,14 @@ async def claim_execution(data: ExecutionClaim, session: SessionDep) -> Any:
             _finish(session, execution, ExecutionState.refused, EXHAUSTED_CLAIM_CODE, now)
             await session.flush()
             await finish_unverified(session, execution, now)
+            continue
+        if await authority_refusal(session, execution) is not None:
+            # @spec AUTOMATED-REMEDIATION-11 (E8): before any sandbox claim.
+            _finish(session, execution, ExecutionState.refused, POLICY_CHANGED_CODE, now)
+            await session.flush()
+            returned = await refuse_changed_authority(session, execution)
+            if returned is not None:
+                owed.append(returned)
             continue
         execution.state = ExecutionState.claimed
         execution.attempt = execution.attempt + 1
@@ -689,17 +733,17 @@ async def dispatch_execution(
             _finish(session, execution, ExecutionState.refused, NOT_REVERSIBLE_NOW_CODE, now)
             # Only a nomination still ``admitted`` goes back to approval; one
             # already rejected, expired or finished keeps its state.
-            await session.execute(
-                update(RemediationNomination)
-                .where(
-                    RemediationNomination.id == nomination.id,
-                    RemediationNomination.state == ADMITTED,
-                )
-                .values(state=APPROVAL_REQUESTED)
+            # @spec AUTOMATED-REMEDIATION-10: it did not execute, so its
+            # reservation is released.
+            returned = await return_to_approval(
+                session, nomination.id, NOT_REVERSIBLE_NOW_CODE, from_states=(ADMITTED,)
             )
             await session.commit()
             await session.refresh(execution)
-            return _out(execution)
+            answer = _out(execution)
+            if returned:
+                await raise_approval(session, nomination.id)
+            return answer
         await _record_forward_action(session, execution)
     elif execution.kind != ExecutionKind.restore:
         raise _conflict(f"a {execution.kind} execution cannot dispatch")
@@ -885,7 +929,11 @@ def _reported(execution: ActionExecution) -> tuple[str, str | None, bool | None]
 
 @router.post("/{execution_id}/outcome", response_model=ExecutionOut)
 async def report_outcome(
-    execution_id: uuid.UUID, data: ExecutionOutcome, session: SessionDep, store: StoreDep
+    execution_id: uuid.UUID,
+    data: ExecutionOutcome,
+    session: SessionDep,
+    store: StoreDep,
+    kill_switch: KillSwitchDep,
 ) -> ExecutionOut:
     """Record how an execution ended.
 
@@ -903,6 +951,9 @@ async def report_outcome(
     with the execution's code (``failed``, ``indeterminate``, ``refused``) in
     the same transaction; a refused read
     is evaluated by its verification.
+
+    @spec AUTOMATED-REMEDIATION-9: a refused precondition read sends its
+    nomination to approval ``precondition_unavailable`` once this commits.
     """
 
     try:
@@ -974,7 +1025,10 @@ async def report_outcome(
         await reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
-    return _out(execution)
+    answer = _out(execution)
+    if precondition_nomination(execution.idempotency_key) is not None:
+        await preconditions_ended(session, store, kill_switch, [execution_id])
+    return answer
 
 
 # --------------------------------------------------------------------------- #
@@ -993,7 +1047,11 @@ def _same_sample(stored: dict[str, Any] | None, reported: dict[str, Any]) -> boo
 
 @router.post("/{execution_id}/samples", response_model=ExecutionOut)
 async def report_sample(
-    execution_id: uuid.UUID, data: ExecutionSample, session: SessionDep
+    execution_id: uuid.UUID,
+    data: ExecutionSample,
+    session: SessionDep,
+    store: StoreDep,
+    kill_switch: KillSwitchDep,
 ) -> ExecutionOut:
     """Record the one sample a claimed read execution took, ending it ``confirmed``.
 
@@ -1003,6 +1061,9 @@ async def report_sample(
     reports one; a replay of the stored sample answers the row unchanged and a
     different one is refused (``409``). The answer is the receipt, which never
     carries the value or the pointer.
+
+    @spec AUTOMATED-REMEDIATION-9: a precondition read's sample decides its
+    nomination's check 12 once this commits (``remediation_admission``).
     """
 
     execution = await _locked(session, execution_id)
@@ -1026,4 +1087,7 @@ async def report_sample(
     await reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
-    return _out(execution)
+    answer = _out(execution)
+    if precondition_nomination(execution.idempotency_key) is not None:
+        await preconditions_ended(session, store, kill_switch, [execution_id])
+    return answer

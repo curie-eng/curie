@@ -21,9 +21,13 @@
 //! document with the mirrored validator first and refuses with the API's code
 //! and path (`tests/vectors/remediation-policy.json`) before any request.
 //!
-//! `close-breaker` lands with its route (task 9) and the `remediation`
-//! receipt group (AUTOMATED-REMEDIATION-20) with a nomination read route
-//! (task 13): a CLI verb with no API route behind it is out of scope here.
+//! - `close-breaker <agent> <hook> <breaker id> --reason <text>`
+//!   -> `POST   .../remediation-policy/breakers/{breaker id}/close` body
+//!   `{"reason": "<text>"}` (AUTOMATED-REMEDIATION-11, plan task 9)
+//!
+//! The `remediation` receipt group (AUTOMATED-REMEDIATION-20) lands with a
+//! nomination read route (task 13): a CLI verb with no API route behind it is
+//! out of scope here.
 //!
 //! These drive the compiled binary against a wire-level stub of the platform
 //! API, as `actions_cli.rs` does. Every error is the ADR-0021 `{"error","fix"}`
@@ -51,6 +55,11 @@ const STALE_HOOK: &str = "stale";
 const ROUTE_HOOK: &str = "badroute";
 
 const OPERATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+/// An open breaker of `HOOK` the stub closes (AUTOMATED-REMEDIATION-11).
+const BREAKER_ID: &str = "22222222-2222-4222-8222-222222222222";
+/// A breaker id the stub does not know (404).
+const UNKNOWN_BREAKER_ID: &str = "33333333-3333-4333-8333-333333333333";
+const CLOSE_REASON: &str = "connector fixed and redeployed";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -96,6 +105,21 @@ fn policy_out(hook: &str, generation: &str, armed: bool, active: bool) -> Value 
         "bound_by": "operator@example.com",
         "policy": if active { base_document() } else { json!({}) },
         "updated_at": "2026-10-07T00:00:00Z",
+    })
+}
+
+/// One closed breaker as the close route answers (AUTOMATED-REMEDIATION-11).
+fn breaker_out() -> Value {
+    json!({
+        "id": BREAKER_ID,
+        "agent_id": AGENT_ID,
+        "connector": "k8s",
+        "tool": "scale_deployment",
+        "target": "k8s:\"example-api\"",
+        "opened_at": "2026-10-07T00:00:00Z",
+        "closed_at": "2026-10-07T01:00:00Z",
+        "closed_by": "operator@example.com",
+        "close_reason": CLOSE_REASON,
     })
 }
 
@@ -155,6 +179,12 @@ fn api() -> MockServer {
             }
             ("DELETE", p) if p == base(HOOK) => {
                 Response::json(200, &policy_out(HOOK, "5", false, false).to_string())
+            }
+            ("POST", p) if p == format!("{}/breakers/{BREAKER_ID}/close", base(HOOK)) => {
+                Response::json(200, &breaker_out().to_string())
+            }
+            ("POST", p) if p == format!("{}/breakers/{UNKNOWN_BREAKER_ID}/close", base(HOOK)) => {
+                Response::json(404, r#"{"detail":"breaker not found"}"#)
             }
             _ => Response::json(405, r#"{"detail":"unexpected request"}"#),
         }
@@ -288,7 +318,7 @@ fn query_pairs(path: &str) -> Vec<(String, String)> {
 // Surface: both tiers expose the group, and the manifest records it
 // --------------------------------------------------------------------------
 
-const POLICY_VERBS: [&str; 5] = ["show", "apply", "arm", "disarm", "remove"];
+const POLICY_VERBS: [&str; 6] = ["show", "apply", "arm", "disarm", "remove", "close-breaker"];
 
 // @spec AUTOMATED-REMEDIATION-3
 #[test]
@@ -568,6 +598,14 @@ fn write_argv<'a>(verb: &'a str, file: &'a str) -> Vec<&'a str> {
             "--expected-generation",
             "4",
         ],
+        "close-breaker" => vec![
+            "close-breaker",
+            AGENT_NAME,
+            HOOK,
+            BREAKER_ID,
+            "--reason",
+            CLOSE_REASON,
+        ],
         _ => vec![verb, AGENT_NAME, HOOK, "--expected-generation", "4"],
     }
 }
@@ -580,7 +618,7 @@ fn every_write_without_a_principal_is_refused_before_any_request() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = write_file(dir.path(), "policy.json", &base_document().to_string());
     for tier in ["local", "cluster"] {
-        for verb in ["apply", "arm", "disarm", "remove"] {
+        for verb in ["apply", "arm", "disarm", "remove", "close-breaker"] {
             for principal in [None, Some("   ")] {
                 let server = api();
                 let output = run(tier, &write_argv(verb, &file), &server, principal);
@@ -1273,4 +1311,109 @@ fn apply_refuses_each_numeric_text_with_the_api_code_and_path_before_any_request
             "{what}: refused before any request"
         );
     }
+}
+
+// --------------------------------------------------------------------------
+// close-breaker (AUTOMATED-REMEDIATION-11, plan task 9)
+// --------------------------------------------------------------------------
+
+fn close_argv<'a>(breaker: &'a str, reason: Option<&'a str>) -> Vec<&'a str> {
+    let mut argv = vec!["close-breaker", AGENT_NAME, HOOK, breaker];
+    if let Some(reason) = reason {
+        argv.extend(["--reason", reason]);
+    }
+    argv
+}
+
+// @spec AUTOMATED-REMEDIATION-11 @spec AUTOMATED-REMEDIATION-3
+/// `close-breaker` posts exactly the reason to the breaker's close route with
+/// the operator principal, and prints the closed breaker as one JSON object.
+#[test]
+fn close_breaker_posts_the_reason_with_the_principal() {
+    for tier in ["local", "cluster"] {
+        let server = api();
+        let output = run(
+            tier,
+            &close_argv(BREAKER_ID, Some(CLOSE_REASON)),
+            &server,
+            Some(OPERATOR_PRINCIPAL),
+        );
+        let what = format!("{tier} remediation-policy close-breaker");
+        assert_eq!(output.status.code(), Some(0), "{what}:\n{}", text(&output));
+        let value = one_object(&output, &what);
+        assert_eq!(value["id"], BREAKER_ID, "{what}: {value}");
+        assert_eq!(value["close_reason"], CLOSE_REASON, "{what}: {value}");
+        assert!(
+            value["closed_at"].as_str().is_some(),
+            "{what}: the breaker is closed: {value}"
+        );
+
+        let sent = writes(&server);
+        assert_eq!(sent.len(), 1, "{what}: one write");
+        let request = &sent[0];
+        assert_eq!(request.method, "POST", "{what}");
+        assert_eq!(
+            request.path,
+            format!("{}/breakers/{BREAKER_ID}/close", base(HOOK)),
+            "{what}"
+        );
+        assert_eq!(
+            request.header("X-Curie-Approval-Principal"),
+            Some(OPERATOR_PRINCIPAL),
+            "{what}"
+        );
+        let body: Value = serde_json::from_slice(&request.body).expect("body is JSON");
+        assert_eq!(body, json!({ "reason": CLOSE_REASON }), "{what}");
+        assert!(
+            !text(&output).contains(OPERATOR_PRINCIPAL),
+            "{what}: token never printed"
+        );
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-11
+/// A breaker id that is not a UUID, a missing reason and a blank reason are
+/// usage errors (exit 2) before any request.
+#[test]
+fn close_breaker_refuses_a_malformed_id_or_a_missing_reason_before_any_request() {
+    for tier in ["local", "cluster"] {
+        for (argv, why) in [
+            (close_argv("not-a-uuid", Some(CLOSE_REASON)), "malformed id"),
+            (close_argv(BREAKER_ID, None), "missing reason"),
+            (close_argv(BREAKER_ID, Some("   ")), "blank reason"),
+        ] {
+            let server = api();
+            let output = run(tier, &argv, &server, Some(OPERATOR_PRINCIPAL));
+            let what = format!("{tier} remediation-policy close-breaker ({why})");
+            assert_eq!(output.status.code(), Some(2), "{what}:\n{}", text(&output));
+            let value = one_object(&output, &what);
+            assert_error_object(&value, &what);
+            assert!(
+                server.recorded().is_empty(),
+                "{what}: no request is sent: {:?}",
+                server
+                    .recorded()
+                    .iter()
+                    .map(|r| &r.path)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-11
+/// An unknown breaker is one error object and a failure (exit 1).
+#[test]
+fn close_breaker_of_an_unknown_breaker_is_one_error_object() {
+    let server = api();
+    let output = run(
+        "local",
+        &close_argv(UNKNOWN_BREAKER_ID, Some(CLOSE_REASON)),
+        &server,
+        Some(OPERATOR_PRINCIPAL),
+    );
+    let what = "local remediation-policy close-breaker (unknown)";
+    assert_eq!(output.status.code(), Some(1), "{what}:\n{}", text(&output));
+    let value = one_object(&output, what);
+    assert_error_object(&value, what);
 }

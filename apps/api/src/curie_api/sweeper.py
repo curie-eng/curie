@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 from curie_telemetry import operation_span, record_metric
@@ -228,8 +229,14 @@ async def run_expiry_sweeper(
     stop: asyncio.Event,
     *,
     publication_patch_retention_seconds: int = 3600,
+    remediation_admissions: Callable[[AsyncSession], Awaitable[int]] | None = None,
 ) -> None:
     """Periodic loop driving ``sweep_expired_approvals`` until ``stop`` is set.
+
+    ``remediation_admissions``, when given, runs each pass after the sweep: it
+    finishes remediation admission work a crash or an unreadable store left
+    undone (``remediation_admission.reconcile_admissions``,
+    AUTOMATED-REMEDIATION-8).
 
     Mirrors the worker heartbeat's sleep-or-stop shape (an
     ``asyncio.wait_for(stop.wait(), timeout=interval_s)`` that wakes early on
@@ -272,6 +279,8 @@ async def run_expiry_sweeper(
                         - timedelta(seconds=publication_patch_retention_seconds),
                         limit=100,
                     )
+                    if remediation_admissions is not None:
+                        await remediation_admissions(session)
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):
