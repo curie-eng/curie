@@ -302,7 +302,7 @@ def test_an_admitted_nomination_creates_one_policy_forward_execution(
     """@spec AUTOMATED-REMEDIATION-13: connector, tool and canonical arguments come
     from the nomination row and its policy generation; ``authority_kind`` is
     ``policy`` with the generation in ``authority_ref``; the key is
-    ``remediation:<nomination id>``; no ledger row exists before dispatch.
+    ``remediation:<nomination id>:policy``; no ledger row exists before dispatch.
     """
 
     agent_id = _setup(client, auth_headers, tmp_path)
@@ -325,7 +325,7 @@ def test_an_admitted_nomination_creates_one_policy_forward_execution(
     assert row["arguments_sha256"] == _sha(NOMINATED)
     assert row["authority_kind"] == "policy"
     assert row["authority_ref"] == _policy_ref(agent_id, nomination_id)
-    assert row["idempotency_key"] == f"remediation:{nomination_id}"
+    assert row["idempotency_key"] == f"remediation:{nomination_id}:policy"
     assert _nomination(nomination_id)["execution_id"] == created.execution_id
     assert _ledger() == []
 
@@ -394,7 +394,7 @@ def test_an_approved_nomination_creates_an_approval_forward_execution(
     row = _executions()[0]
     assert row["authority_kind"] == "approval"
     assert row["authority_ref"] == str(approval_id)
-    assert row["idempotency_key"] == f"remediation:{nomination_id}"
+    assert row["idempotency_key"] == f"remediation:{nomination_id}:approval:{approval_id}"
     assert row["forward_arguments"] == NOMINATED
 
     dispatched = _dispatch(client, created.execution_id)
@@ -907,3 +907,139 @@ def test_a_refused_undo_audit_row_records_the_undo_ruling_actor(
     assert len(entries) == 1
     assert entries[0]["authorized"] is False
     assert entries[0]["actor_kind"] == "undo_ruling"
+
+
+# --------------------------------------------------------------------------- #
+# Review round 2: one execution per authority (AR-13 per-authority key)
+# --------------------------------------------------------------------------- #
+
+
+def _claim_fence(client: Any, execution_id: Any) -> dict[str, Any]:
+    claimed = client.post(
+        "/action-executions/claim",
+        json={"lease_owner": "worker-a", "lease_seconds": 60},
+        headers=worker_headers(),
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["id"] == str(execution_id)
+    return {"lease_owner": claimed.json()["lease_owner"], "attempt": claimed.json()["attempt"]}
+
+
+def _refused_not_reversible_now(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> tuple[str, uuid.UUID, Any]:
+    """A policy execution refused ``not_reversible_now``; its nomination back at approval."""
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    nomination_id = _nominate(agent_id)
+    policy = _create(nomination_id)
+    _lose_capability(agent_id, "row-gone")
+    fence = _claim_fence(client, policy.execution_id)
+    client.post(
+        f"/action-executions/{policy.execution_id}/dispatch", json=fence, headers=worker_headers()
+    )
+    refused = _executions()[0]
+    assert refused["state"] == "refused"
+    assert refused["refusal_code"] == "not_reversible_now"
+    assert _nomination(nomination_id)["state"] == "approval_requested"
+    return agent_id, nomination_id, policy
+
+
+def _approve(nomination_id: uuid.UUID, approval_id: uuid.UUID) -> None:
+    """What task 10's resolution leaves on the nomination row when its approval is approved."""
+
+    sql_rows(
+        "UPDATE curie.remediation_nominations SET state = 'approved', approval_id = :a "
+        "WHERE id = :id",
+        {"a": approval_id, "id": nomination_id},
+    )
+
+
+def test_the_approval_after_a_not_reversible_now_refusal_creates_its_own_execution(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-13: the idempotency key is per authority
+    (``remediation:<nomination id>:policy`` and
+    ``remediation:<nomination id>:approval:<approval id>``), so the approval that
+    follows a ``not_reversible_now`` refusal does not adopt the refused policy
+    execution: it creates a second execution, which dispatches (the refusal
+    judges a ``policy`` authority only) and records one ledger row.
+    """
+
+    _agent_id, nomination_id, policy = _refused_not_reversible_now(client, auth_headers, tmp_path)
+    approval_id = uuid.uuid4()
+    _approve(nomination_id, approval_id)
+
+    approved = _create(nomination_id, approval_id=approval_id)
+
+    assert approved.created is True
+    assert approved.execution_id != policy.execution_id
+    rows = {row["id"]: row for row in _executions()}
+    assert set(rows) == {policy.execution_id, approved.execution_id}
+    assert rows[policy.execution_id]["state"] == "refused"
+    assert rows[policy.execution_id]["idempotency_key"] == f"remediation:{nomination_id}:policy"
+    second = rows[approved.execution_id]
+    assert second["authority_kind"] == "approval"
+    assert second["authority_ref"] == str(approval_id)
+    assert second["idempotency_key"] == f"remediation:{nomination_id}:approval:{approval_id}"
+    assert second["state"] == "requested"
+    assert _nomination(nomination_id)["execution_id"] == approved.execution_id
+
+    dispatched = _dispatch(client, approved.execution_id)
+
+    assert dispatched["state"] == "dispatched"
+    ledger = _ledger()
+    assert len(ledger) == 1
+    assert ledger[0]["authority_kind"] == "approval"
+    assert ledger[0]["gate_approval_id"] == approval_id
+    assert ledger[0]["nomination_id"] == nomination_id
+
+
+def test_a_replay_of_each_authority_adopts_its_own_execution(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-13: each authority yields at most one execution;
+    a replayed admission adopts the refused policy execution (it never re-runs),
+    and a replayed approval adopts the approval execution.
+    """
+
+    _agent_id, nomination_id, policy = _refused_not_reversible_now(client, auth_headers, tmp_path)
+    approval_id = uuid.uuid4()
+    _approve(nomination_id, approval_id)
+    approved = _create(nomination_id, approval_id=approval_id)
+
+    replayed_approval = _create(nomination_id, approval_id=approval_id)
+    assert replayed_approval.execution_id == approved.execution_id
+    assert replayed_approval.created is False
+
+    # The nomination is no longer ``admitted``, so a late admission replay is
+    # either refused or adopts the refused policy execution; it never creates.
+    try:
+        replayed_policy = _create(nomination_id)
+    except _seam().ForwardRefused:
+        pass
+    else:
+        assert replayed_policy.execution_id == policy.execution_id
+        assert replayed_policy.created is False
+    assert len(_executions()) == 2
+
+
+def test_an_approval_other_than_the_nominations_creates_nothing_after_one_executed(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-13 @spec AUTOMATED-REMEDIATION-15: a nomination has
+    at most one approval (the approval's ``dedupe_key`` ``remediation:<nomination
+    id>`` is unique across all statuses), so a second approval id for the same
+    nomination authorizes nothing, even though the per-authority key would be new.
+    """
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    approval_id = uuid.uuid4()
+    nomination_id = _nominate(agent_id, state="approved", approval_id=approval_id)
+    first = _create(nomination_id, approval_id=approval_id)
+
+    with pytest.raises(_seam().ForwardRefused):
+        _create(nomination_id, approval_id=uuid.uuid4())
+
+    assert [row["id"] for row in _executions()] == [first.execution_id]
+    assert _nomination(nomination_id)["execution_id"] == first.execution_id
