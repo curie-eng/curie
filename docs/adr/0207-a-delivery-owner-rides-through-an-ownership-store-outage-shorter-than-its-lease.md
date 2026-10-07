@@ -2,19 +2,21 @@
 
 Date: 2026-10-06
 
-Status: Draft
+Status: Accepted
 
-This Draft proposes to supersede in part
+Accepted 2026-10-08. This ADR supersedes in part
 [ADR 0131](0131-a-delivery-has-one-deadline-and-one-renewable-fenced-owner.md),
 on one point only: the Decision sentence "If Valkey cannot confirm renewal, the
 owner fails closed as lease-lost" and the matching Consequence "A transient
 ownership-store outage may interrupt otherwise healthy work". Everything else
 in ADR 0131 stands: one overall delivery deadline, the fenced lease as delivery
 authority, fenced reclaim, fenced terminal settlement, and runs and evals
-sharing one lease implementation. If this ADR is accepted, ADR 0131 gains a
-back link under its Status line as
+sharing one lease implementation. ADR 0131 carries a back link under its
+Status line as
 [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)
-allows, and stays Accepted.
+allows, and stays Accepted. Point 8 below extends the same rule to the
+worker's consumer liveness lease, which ADR 0131 does not name but which ends
+the same in flight work during the same outage.
 
 ## Context
 
@@ -93,12 +95,23 @@ fences independently. That second fence is unaffected by a Valkey outage.
    loss is not ridden through.
 7. Runs and evals share this rule through `StreamConsumer`, as ADR 0131
    requires of every lease change.
+8. The consumer liveness lease follows points 1 to 3. A liveness renewal that
+   raises is not liveness lost by itself; the consumer fails closed with
+   `ConsumerLivenessExpired` only when its own local deadline passes, timed the
+   same way as point 2. The default consumer liveness TTL equals the delivery
+   lease TTL (45 seconds, renewed every 10), so a consumer never cancels its in
+   flight handlers before their delivery leases could still be held. A refusal
+   (the liveness key held by another generation, or gone after Valkey
+   returns) is liveness lost at once, as today.
 
 The realizing code path is `StreamConsumer._heartbeat_lease` in
 `apps/worker/src/curie_worker/stream_consumer.py` and
 `apps/worker/src/curie_worker/delivery_lease.py` for points 1 to 3 and 6, and
 `_apply_frame` in `apps/worker/src/curie_worker/kernel.py` with
 `mark_side_effect` in `apps/worker/src/curie_worker/markers.py` for point 4.
+Point 8 is realized in `StreamConsumer._liveness_refresh_loop` in the same
+file and the `consumer_heartbeat_ttl_ms` default in
+`apps/worker/src/curie_worker/config.py`.
 
 ## Consequences
 
@@ -122,6 +135,16 @@ The realizing code path is `StreamConsumer._heartbeat_lease` in
    giving it a truthful terminal cause is a separate change that does not need
    this ADR, and is the companion of the API outage handling in
    [#4174](https://github.com/curie-eng/curie/issues/4174).
+
+7. A worker that really dies keeps its pending stream entries unclaimable for
+   up to 45 seconds after its last liveness renewal instead of 15, so a
+   replacement consumer reclaims them about 30 seconds later than today. Lost
+   factory runs are re-admitted by ADR 0206 either way.
+8. Evidence for point 8: on a disposable install a Valkey pod restart made the
+   worker log `ConsumerLivenessExpired` about 11 seconds after the delete,
+   while the name lookups for the new pod were still failing, and the consumer
+   then cancelled every in flight handler. Without point 8 the delivery lease
+   ride-through alone would not save a live turn.
 
 ## Alternatives considered
 
