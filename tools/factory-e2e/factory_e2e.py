@@ -916,7 +916,8 @@ def install_values(
     runner_values: dict[str, Any] = {"tag": "latest" if local_images else tag}
     if local_images:
         runner_values["image"] = "curie-runner"
-        runner_values["imagePullPolicy"] = "IfNotPresent"
+        runner_values["imagePullPolicy"] = "Never"
+        runner_values["prewarm"] = {"imagePullPolicy": "Never"}
     values["agentSandbox"] = {
         "runner": runner_values,
         "controller": {"deploy": not consumer_controller},

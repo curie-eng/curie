@@ -309,3 +309,135 @@ def test_failure_diagnostics_precede_cleanup_without_masking_failure(
     else:
         assert preflight.evidence["failure_diagnostics"]["ownership"] == "verified"
     assert not workdir.exists()
+
+
+def test_kind_loaded_runner_never_resolves_a_registry_pull(tmp_path: Path) -> None:
+    import yaml
+
+    kind = _load_kind()
+    values = kind.scripted_values(
+        model_base_url="http://10.1.2.3:8080",
+        github_api="https://10.9.9.9:8443/api/v3",
+        clone_base="https://10.9.9.9:8443",
+        ca_configmap="github-stub-ca",
+    )
+    runner = values["agentSandbox"]["runner"]
+    assert runner["image"] == "curie-runner" and runner["tag"] == "latest"
+    assert runner["imagePullPolicy"] == "Never"
+    assert runner["prewarm"]["imagePullPolicy"] == "Never"
+    path = tmp_path / "values.yaml"
+    path.write_text(yaml.safe_dump(values))
+    rendered = subprocess.check_output(
+        [
+            "helm",
+            "template",
+            "curie-factory-scripted",
+            str(ROOT.parents[1] / "charts/curie"),
+            "--namespace",
+            "test-factory-scripted",
+            "-f",
+            str(path),
+        ],
+        text=True,
+    )
+    prewarm = next(d for d in yaml.safe_load_all(rendered) if d and d["kind"] == "DaemonSet")
+    image = prewarm["spec"]["template"]["spec"]["containers"][0]
+    assert image["image"] == "curie-runner:latest" and image["imagePullPolicy"] == "Never"
+
+
+@pytest.mark.parametrize("context", ["kind-other", "production"])
+def test_ladder_retirement_refuses_any_other_context(context: str) -> None:
+    kind = _load_kind()
+    with pytest.raises(kind.fe.PreflightFailed, match="job-owned"):
+        kind.retire_ci_ladder(context)
+
+
+def test_ladder_retirement_requires_the_expected_release_identity() -> None:
+    kind = _load_kind()
+    expected = {"name": "curie", "namespace": "curie", "info": {"status": "deployed"}}
+    kind.validate_ladder_release(expected)
+    for field, value in [("name", "other"), ("namespace", "other")]:
+        wrong = {**expected, field: value}
+        with pytest.raises(kind.fe.PreflightFailed, match="release"):
+            kind.validate_ladder_release(wrong)
+
+
+def test_factory_workflow_retires_ladder_only_after_its_required_proofs() -> None:
+    import yaml
+
+    workflow = yaml.safe_load((ROOT.parents[1] / ".github/workflows/ci.yaml").read_text())
+    steps = workflow["jobs"]["e2e-ladder-cluster"]["steps"]
+    names = [x.get("name", "") for x in steps]
+    retire = names.index("Retire the proven ladder namespace before the factory scenario")
+    assert names.index("Credential free redeploy clears stale secret metadata") < retire
+    assert retire < names.index("Scripted factory scenario")
+    assert steps[retire]["if"] == "needs.changes.outputs.factory == 'true'"
+    assert "retire_ci_ladder" in steps[retire]["run"]
+    # Kubernetes is a uv workspace dependency, not guaranteed in system Python.
+    assert steps[retire]["run"].startswith("uv run python - <<")
+
+
+@pytest.mark.parametrize("replaced_shared", [False, True])
+def test_ladder_retirement_deletes_only_the_observed_namespace_uid(
+    monkeypatch: pytest.MonkeyPatch,
+    replaced_shared: bool,
+) -> None:
+    # Provider contract: mismatched UID preconditions reject deletion with 409.
+    # https://kubernetes.io/docs/reference/kubernetes-api/common-definitions/delete-options/
+    from kubernetes import client, config
+
+    kind = _load_kind()
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.setenv("GITHUB_JOB", "e2e-ladder-cluster")
+    monkeypatch.setattr(config, "load_kube_config", lambda **_kwargs: None)
+    deleted = []
+    core = SimpleNamespace(
+        read_namespace=lambda name, **kwargs: SimpleNamespace(
+            metadata=SimpleNamespace(uid="owned-namespace-uid", deletion_timestamp=None)
+        ),
+        delete_namespace=lambda name, body, **kwargs: deleted.append(
+            (name, body.preconditions.uid)
+        ),
+    )
+    apps = SimpleNamespace(
+        read_namespaced_deployment=lambda name, namespace, **kwargs: SimpleNamespace(
+            metadata=SimpleNamespace(uid="controller-uid"),
+            status=SimpleNamespace(available_replicas=1),
+        )
+    )
+    monkeypatch.setattr(client, "CoreV1Api", lambda: core)
+    monkeypatch.setattr(client, "AppsV1Api", lambda: apps)
+    commands = []
+    shared_reads = 0
+
+    def run(argv):
+        nonlocal shared_reads
+        commands.append(argv)
+        if argv[0] == "helm":
+            return json.dumps(
+                {"name": "curie", "namespace": "curie", "info": {"status": "deployed"}}
+            )
+        if "crds,priorityclasses" in argv:
+            shared_reads += 1
+            uid = "changed" if replaced_shared and shared_reads == 2 else "original"
+            return json.dumps(
+                {
+                    "items": [
+                        {
+                            "kind": "CustomResourceDefinition",
+                            "metadata": {"name": "sandboxes.example.com", "uid": uid},
+                        }
+                    ]
+                }
+            )
+        return "sanitized capacity columns"
+
+    monkeypatch.setattr(kind.fe, "run", run)
+    if replaced_shared:
+        with pytest.raises(kind.fe.PreflightFailed, match="identity changed"):
+            kind.retire_ci_ladder("kind-curie-e2e")
+    else:
+        kind.retire_ci_ladder("kind-curie-e2e")
+    assert deleted == [("curie", "owned-namespace-uid")]
+    assert any("namespace/curie" in cmd and "--timeout=300s" in cmd for cmd in commands)
+    assert not any("uninstall" in cmd for cmd in commands)

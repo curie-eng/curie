@@ -394,6 +394,102 @@ def finish_run(
     return code, cleanup
 
 
+def validate_ladder_release(release: dict[str, Any]) -> None:
+    if (release.get("name"), release.get("namespace"), release.get("info", {}).get("status")) != (
+        "curie",
+        "curie",
+        "deployed",
+    ):
+        raise fe.PreflightFailed("refusing to retire an unexpected ladder release")
+
+
+def retire_ci_ladder(context: str) -> None:
+    """Release CPU after the completed ladder; keep the independent controller.
+
+    This is a CI implementation helper, never a general namespace cleanup command.
+    UID deletion preconditions preserve a replaced namespace (Kubernetes DeleteOptions).
+    """
+    if (
+        context != "kind-curie-e2e"
+        or os.environ.get("GITHUB_ACTIONS") != "true"
+        or os.environ.get("GITHUB_JOB") != "e2e-ladder-cluster"
+    ):
+        raise fe.PreflightFailed("retirement requires this job-owned kind context")
+    from kubernetes import client, config
+
+    config.load_kube_config(context=context)
+    core, apps = client.CoreV1Api(), client.AppsV1Api()
+    validate_ladder_release(
+        json.loads(
+            fe.run(
+                ["helm", "--kube-context", context, "status", "curie", "-n", "curie", "-o", "json"]
+            )
+        )
+    )
+    namespace = core.read_namespace("curie", _request_timeout=15)
+    if namespace.metadata.deletion_timestamp is not None:
+        raise fe.PreflightFailed("ladder namespace already terminating")
+    k = ["kubectl", "--context", context, "--request-timeout=15s"]
+
+    def shared_identity() -> tuple[str, dict[str, str]]:
+        controller = apps.read_namespaced_deployment(
+            "agent-sandbox-controller", "agent-sandbox-system", _request_timeout=15
+        )
+        if not controller.status.available_replicas:
+            raise fe.PreflightFailed("shared controller unavailable")
+        objects = json.loads(fe.run([*k, "get", "crds,priorityclasses", "-o", "json"]))
+        return controller.metadata.uid, {
+            item["kind"] + "/" + item["metadata"]["name"]: item["metadata"]["uid"]
+            for item in objects["items"]
+        }
+
+    def capacity(stage: str) -> None:
+        print(f"factory-e2e: {stage} node allocatable and pod request ledger", file=sys.stderr)
+        print(
+            fe.run(
+                [
+                    *k,
+                    "get",
+                    "nodes",
+                    "-o",
+                    "custom-columns="
+                    "NAME:.metadata.name,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory",
+                ]
+            ),
+            file=sys.stderr,
+        )
+        print(
+            fe.run(
+                [
+                    *k,
+                    "get",
+                    "pods",
+                    "-A",
+                    "-o",
+                    "custom-columns="
+                    "NAMESPACE:.metadata.namespace,NAME:.metadata.name,PHASE:.status.phase,"
+                    "CPU:.spec.containers[*].resources.requests.cpu,"
+                    "INIT_CPU:.spec.initContainers[*].resources.requests.cpu",
+                ]
+            ),
+            file=sys.stderr,
+        )
+
+    identity = shared_identity()
+    capacity("before ladder retirement")
+    core.delete_namespace(
+        "curie",
+        body=client.V1DeleteOptions(
+            preconditions=client.V1Preconditions(uid=namespace.metadata.uid)
+        ),
+        _request_timeout=15,
+    )
+    fe.run([*k, "wait", "--for=delete", "namespace/curie", "--timeout=300s"])
+    if shared_identity() != identity:
+        raise fe.PreflightFailed("controller, CRD or priority class identity changed")
+    capacity("after ladder retirement")
+
+
 def main(args: argparse.Namespace) -> int:
     record = getattr(args, "record", False)
     transcript = Path(args.transcript).resolve()
