@@ -902,8 +902,8 @@ class ActionExecutorLoop:
         @spec AUTOMATED-REMEDIATION-12: the declaration's, never a caller's. An
         API that never answers is ``runner_unavailable``; one that will not
         produce them is ``authority_unavailable``; a tool other than the one
-        claimed, arguments without a canonical form, a digest that differs from
-        the claimed ``arguments_sha256`` or no pointer are ``arguments_mismatch``.
+        claimed, arguments without a canonical form, a claimed ``arguments_sha256``
+        that is missing, empty or differs, or no pointer are ``arguments_mismatch``.
         """
 
         answer = await self._send(execution, "arguments", {})
@@ -921,8 +921,9 @@ class ActionExecutorLoop:
             text = connector_grant.canonical_arguments(answer.row.get("arguments"))
         except (TypeError, ValueError):
             raise _Refuse("arguments_mismatch", "arguments") from None
-        expected = execution.arguments_sha256
-        if expected and not secrets.compare_digest(
+        # Fail closed like a forward: a missing or empty digest is no pass.
+        expected = execution.arguments_sha256 or ""
+        if not expected or not secrets.compare_digest(
             connector_grant.arguments_sha256(text), expected
         ):
             raise _Refuse("arguments_mismatch", "arguments")
