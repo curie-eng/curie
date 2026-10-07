@@ -816,6 +816,17 @@ class ActionExecutorLoop:
         tools = await self._list(execution, run, handle)
         if tool not in {t.get("name") for t in tools if isinstance(t, Mapping)}:
             raise _Refuse("tool_not_advertised", "list")
+        if tool in (RESTORE_TOOL, OBSERVE_TOOL):
+            # @spec ACTION-EXECUTOR-19 @spec ACTION-EXECUTOR-20 @spec ACTION-EXECUTOR-8:
+            # judged from `list`, before the dispatch commit, because the
+            # runner's `call` preflight refuses it and a refusal after the
+            # commit can only end `indeterminate`. `observe_version` is never a
+            # forward tool, and a `restore` beside it is the restore verb. A
+            # lone `restore` is an ordinary tool, but the runner's frozen route
+            # (runner-execute.json `restore_without_observe`) serves a call
+            # named `restore` only after `observe`, so it cannot be forwarded
+            # either; it is refused here rather than dispatched and lost.
+            raise _Refuse("reserved_verb_via_forward", "list")
         run.stage = "digest"
         await self._require_serving(execution)
         run.stage = "killswitch"

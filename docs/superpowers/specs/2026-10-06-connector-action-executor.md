@@ -781,9 +781,14 @@ admitted by [#4065](https://github.com/curie-eng/curie/issues/4065) or an
 argument-bound approval from [#4069](https://github.com/curie-eng/curie/issues/4069).
 Connector, tool and canonical arguments come from that record, never from a
 caller, and it refuses `authority_unavailable` while no authority source
-exists. A forward execution may not target `observe_version`, or `restore` on a
-connector whose probe recorded the pair (`reserved_verb_via_forward`); a lone
-`restore` is an ordinary tool. At dispatch the API creates exactly one
+exists. A forward execution never calls `restore` or `observe_version`,
+whether or not the connector pairs them: the frozen `runner-execute` vector
+treats a `call` of `restore` as the restore phase, which requires `observe`
+first, so a lone `restore` stays an ordinary tool for model turns but cannot be
+a forward action. Either verb is refused `reserved_verb_via_forward` before
+dispatch (amended during plan task 14: the worker refuses it from the `list`
+reply, before the `dispatched` commit, because a runner preflight refusal after
+the commit could only end `indeterminate`). At dispatch the API creates exactly one
 `agent_actions` row: `dedupe_key` and `call_id` both `exec:<execution id>`,
 tool `mcp__<connector>__<tool>`, the canonical arguments, the authority fields,
 and `connector` and `connector_digest` copied from the execution, status
