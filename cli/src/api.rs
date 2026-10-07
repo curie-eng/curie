@@ -1876,6 +1876,12 @@ fn named_identity<'a>(kind: &str, adapter: Option<&'a str>) -> Option<&'a str> {
     adapter.filter(|adapter| !(kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
 }
 
+// @spec ACTION-EXECUTOR-23
+/// The undo ruling's `503` reason when the executor is switched off
+/// (`_EXECUTOR_DISABLED_REASON` in `apps/api/src/curie_api/routers/actions.py`).
+const ACTION_EXECUTOR_DISABLED_REASON: &str =
+    "the action executor is not enabled on this installation";
+
 /// The reason a FastAPI error body states: its `detail` string, or the joined
 /// `msg`s of a validation error's `detail` list. `None` for any other body.
 fn api_detail_reason(body: &str) -> Option<String> {
@@ -3908,6 +3914,15 @@ impl ApiClient {
             StatusCode::FORBIDDEN | StatusCode::CONFLICT => CliError::failure(message),
             StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
                 CliError::usage(message).with_fix("pass the action or execution id as a UUID")
+            }
+            // A disabled executor is a configuration refusal, not an outage:
+            // retrying cannot change the answer, only the operator can.
+            StatusCode::SERVICE_UNAVAILABLE if reason == ACTION_EXECUTOR_DISABLED_REASON => {
+                CliError::failure(message).with_fix(
+                    "enable the action executor: set the chart value actionExecutor.enabled=true \
+                     on the release (cluster), or CURIE_ACTION_EXECUTOR_ENABLED=true for the API \
+                     and worker (local), then ask for the undo again",
+                )
             }
             s if s.is_server_error() => CliError::transient(message),
             _ => CliError::failure(message),
