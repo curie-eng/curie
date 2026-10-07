@@ -567,6 +567,7 @@ def build(
             api_base_url=config.api_base_url,
             api_key=config.api_key,
             client=eval_http,
+            worker_token=config.internal_worker_token,
         ),
     )
     sink = build_reply_sink(config, slack_tokens=slack_tokens)
@@ -989,12 +990,18 @@ def _build_action_recorder(
 
     @spec ACTION-EXECUTOR-12: only on the cluster tier with the connector
     reconciler (which owns the Deployments read) and the executor (whose chart
-    gate is what grants the worker ``get`` on Deployments) both enabled. With
-    either off the worker Role has no such ``get``, so the wrapper is not
-    composed and every action records a null digest, as on the local tier.
+    gate is what grants the worker ``get`` on Deployments) both enabled, and an
+    internal worker token to send attribution under. With either flag off the
+    worker Role has no such ``get``, so the wrapper is not composed and every
+    action records a null digest, as on the local tier.
     """
 
     if not (config.connector_reconcile_enabled and config.action_executor_enabled):
+        return client
+    if not config.internal_worker_token:
+        # The API takes attribution only under the worker token; without one
+        # every attributed completion would be refused and fail its turn.
+        logger.warning("no internal worker token; actions record no connector digest")
         return client
     from .action_digest import DigestAttributingRecorder, agent_deployment_resolver
     from .connector_k8s import connector_deployments_api

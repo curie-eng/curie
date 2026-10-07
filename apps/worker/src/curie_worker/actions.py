@@ -129,9 +129,13 @@ class ActionClient:
         api_base_url: str,
         api_key: str,
         client: httpx.AsyncClient,
+        worker_token: str = "",
     ) -> None:
         self._url = f"{api_base_url.rstrip('/')}/actions"
         self._headers = {"X-API-Key": api_key} if api_key else {}
+        # Sent only beside a connector attribution, the one part of a
+        # completion the API takes from the worker alone (ACTION-EXECUTOR-12).
+        self._worker_headers = {"X-Curie-Worker-Token": worker_token} if worker_token else {}
         self._client = client
 
     async def record(
@@ -182,8 +186,10 @@ class ActionClient:
 
         ``connector`` and ``connector_digest`` are the digest-attributing
         wrapper's verdict (``action_digest``, @spec ACTION-EXECUTOR-12). They
-        travel as a pair or not at all; the API refuses half of one, and a
-        refused completion would fail the turn, so half a pair is dropped here.
+        travel as a pair, under the internal worker token, or not at all; the
+        API refuses half of one, and a refused completion would fail the turn,
+        so half a pair is dropped here. ``run.py`` composes the attributing
+        wrapper only when a worker token is configured.
         """
 
         snapshot = _snapshot(frame)
@@ -196,16 +202,32 @@ class ActionClient:
             "target": snapshot.target,
             "detail": frame.detail,
         }
+        headers = self._headers
         if connector is not None and connector_digest is not None:
             body["connector"] = connector
             body["connector_digest"] = connector_digest
+            headers = {**self._headers, **self._worker_headers}
         elif connector is not None or connector_digest is not None:
-            logger.warning("action %s: half a connector attribution dropped", action_id)
-        return await self._post(f"{self._url}/{action_id}/complete", body, "action complete")
+            logger.warning(
+                "action %s: half a connector attribution dropped",
+                action_id,
+            )
+        return await self._post(
+            f"{self._url}/{action_id}/complete", body, "action complete", headers=headers
+        )
 
-    async def _post(self, url: str, body: dict[str, Any], what: str) -> dict[str, Any]:
+    async def _post(
+        self,
+        url: str,
+        body: dict[str, Any],
+        what: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         try:
-            response = await self._client.post(url, json=body, headers=self._headers)
+            response = await self._client.post(
+                url, json=body, headers=self._headers if headers is None else headers
+            )
         except httpx.HTTPError as exc:
             raise ActionBackendError(f"{what} failed: {exc}") from exc
         # 201 is a fresh record; 200 is the idempotent replay of either call.
