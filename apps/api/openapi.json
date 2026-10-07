@@ -5229,12 +5229,23 @@
         "type": "object"
       },
       "ExecutionOut": {
-        "description": "One execution as the worker and the receipt read it.\n\n@spec ACTION-EXECUTOR-18. Deliberately without ``outcome``,\n``arguments_sha256`` or ``forward_arguments``: the read names what ran and\nhow it ended, never a version, an argument or a state.",
+        "description": "One execution as the worker and the receipt read it.\n\n@spec ACTION-EXECUTOR-18. Deliberately without ``outcome`` or\n``forward_arguments``: the read names what ran and how it ended, never a\nversion, an argument or a state.\n\n@spec ACTION-EXECUTOR-14 @spec ACTION-EXECUTOR-7. Two non-secret digests\nthe worker checks before dispatch: ``connector_digest``, the image the\ncall must run against, and ``arguments_sha256``, the ruling's digest over\nthe restore's canonical ``{target, prior_state}`` (null on a probe). A\ndigest names neither the arguments nor the state it covers.",
         "properties": {
           "agent_id": {
             "format": "uuid",
             "title": "Agent Id",
             "type": "string"
+          },
+          "arguments_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Arguments Sha256"
           },
           "attempt": {
             "title": "Attempt",
@@ -5242,6 +5253,10 @@
           },
           "connector": {
             "title": "Connector",
+            "type": "string"
+          },
+          "connector_digest": {
+            "title": "Connector Digest",
             "type": "string"
           },
           "created_at": {
@@ -5382,7 +5397,9 @@
           "failure_code",
           "dispatched_at",
           "finished_at",
-          "created_at"
+          "created_at",
+          "connector_digest",
+          "arguments_sha256"
         ],
         "title": "ExecutionOut",
         "type": "object"

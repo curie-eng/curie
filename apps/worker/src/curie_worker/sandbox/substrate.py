@@ -834,6 +834,27 @@ class SandboxSubstrate:
             raise error
         return released
 
+    def release_claim(self, thread_key: str, handle: SandboxHandle) -> bool:
+        """Release exactly the claim ``handle`` names (@spec ACTION-EXECUTOR-5).
+
+        For a holder that may have been fenced out: its own claim is retired
+        (an idempotent delete) and the route is dropped only while it still
+        names that claim, so a later holder's live sandbox on the same thread
+        key is never touched. True when the route was dropped.
+        """
+
+        self._retire_claim(
+            handle.claim_name,
+            request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            handle=handle,
+        )
+        dropped = self._affinity.delete_if_claim(thread_key, handle.claim_name)
+        record_metric(
+            "curie.sandbox.lifecycle",
+            attributes=_sandbox_attributes("release", "released" if dropped else "observed"),
+        )
+        return dropped
+
     def terminate_thread(
         self,
         thread_key: str,

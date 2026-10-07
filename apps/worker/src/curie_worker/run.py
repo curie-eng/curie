@@ -34,6 +34,7 @@ from redis.maint_notifications import MaintNotificationsConfig
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from . import __version__
+from .action_executor_loop import ActionExecutorLoop
 from .actions import ActionClient, ActionRecorder
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
@@ -140,6 +141,9 @@ class Runtime:
     # Runtime constructed elsewhere need not name it.
     cron_loop: CronSchedulerLoop | None = None
     publication_loop: PublicationReconcileLoop | None = None
+    # None unless the action executor is enabled (ACTION-EXECUTOR-1). Launched
+    # beside the connector reconcile loop, never inside the consumer.
+    action_executor: ActionExecutorLoop | None = None
     # None when the worker has no internal token and so no WorkItem client.
     orphan_sweeper: WorkItemOrphanSweeper | None = None
     # None unless the end to end connector and the connector reconciler are
@@ -772,6 +776,16 @@ def build(
             else None
         ),
         connector_loop=_build_connector_loop(config, engine),
+        action_executor=_build_action_executor(
+            config,
+            engine,
+            substrate=substrate,
+            runner=runner,
+            killswitch=killswitch,
+            binding=binding,
+            client=eval_http,
+            bundles=cron_bundle_store,
+        ),
         e2e_reaper=_build_e2e_reaper(config, work_items),
         cron_loop=CronSchedulerLoop(
             source_guard=CronHookSourceGuard(source_gate, engine),
@@ -1028,6 +1042,104 @@ def _build_action_recorder(
         deployment_name=agent_deployment_resolver(
             engine, db_schema=config.db_schema, release=config.connector_release
         ),
+    )
+
+
+# The executor loop's timing (ACTION-EXECUTOR-17). The dispatch deadline bounds
+# the one ``call`` and the grant's expiry. The lease is sized for the sandbox
+# claim budget, the runner phases and the deadline, with headroom; the loop
+# bounds each phase by what is left of it and refuses before dispatch when the
+# rest cannot carry the call.
+_ACTION_EXECUTOR_DISPATCH_DEADLINE_S = 60.0
+_ACTION_EXECUTOR_INTERVAL_S = 5.0
+_ACTION_EXECUTOR_LEASE_HEADROOM_S = 240
+_ACTION_EXECUTOR_LEASE_MAX_S = 3600
+
+
+def _build_action_executor(
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    *,
+    substrate: SandboxSubstrate,
+    runner: RunnerClient,
+    killswitch: KillSwitch,
+    binding: BindingResolver,
+    client: httpx.AsyncClient,
+    bundles: BundleStore,
+) -> ActionExecutorLoop | None:
+    """The connector action executor loop, or None when it is switched off.
+
+    @spec ACTION-EXECUTOR-1: off by default; with it off the worker claims
+    nothing. The executor routes take only the internal worker token, so a
+    worker without one cannot run it.
+
+    Tiers. With the connector reconciler on (the cluster tier) the loop reads
+    the connector Deployment, which the chart lets the worker ``get`` only with
+    the executor enabled, and the in-force digest from the same API render the
+    reconciler applies. Without it (the local tier) there is no Deployment and
+    no caller proxy: every restore refuses ``tool_not_grant_bound`` and every
+    probe ``connector_digest_unavailable``, which is what the local tier proves
+    (ACTION-EXECUTOR-7). No consumer, stream, thread lock or marker is touched.
+    """
+
+    if not config.action_executor_enabled:
+        return None
+    if not config.internal_worker_token:
+        logger.warning("action executor enabled without an internal worker token; not started")
+        return None
+    from .action_digest import agent_deployment_resolver
+    from .action_executor_binding import ExecutorBindings
+    from .action_executor_loop import ExecutionApi
+
+    deployments = None
+    manifests = None
+    if config.connector_reconcile_enabled:
+        from .connector_k8s import connector_deployments_api
+
+        deployments = connector_deployments_api()
+        manifests = HttpManifestSource(
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            release=config.connector_release,
+            namespace=config.connector_namespace,
+            app_name=config.connector_app_name,
+        )
+    bindings = ExecutorBindings(
+        binding=binding,
+        bundles=bundles,
+        manifests=manifests,
+        release=config.connector_release,
+        namespace=config.connector_namespace,
+        max_uncompressed_bytes=config.bundle_max_uncompressed_bytes,
+        max_compression_ratio=config.bundle_max_compression_ratio,
+        max_members=config.bundle_max_members,
+    )
+    lease_seconds = min(
+        _ACTION_EXECUTOR_LEASE_MAX_S,
+        int(substrate.claim_timeout_seconds) + _ACTION_EXECUTOR_LEASE_HEADROOM_S,
+    )
+    return ActionExecutorLoop(
+        api=ExecutionApi(
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            worker_token=config.internal_worker_token,
+            client=client,
+        ),
+        substrate=substrate,
+        runner=runner,
+        killswitch=killswitch,
+        deployments=deployments,
+        namespace=config.connector_namespace,
+        deployment_name=agent_deployment_resolver(
+            engine, db_schema=config.db_schema, release=config.connector_release
+        ),
+        in_force_digest=bindings.in_force_digest,
+        executor_boot=bindings.executor_boot,
+        grant_signing_key=config.connector_caller_signing_key,
+        lease_owner=config.consumer_name,
+        lease_seconds=lease_seconds,
+        dispatch_deadline_s=_ACTION_EXECUTOR_DISPATCH_DEADLINE_S,
+        interval_seconds=_ACTION_EXECUTOR_INTERVAL_S,
     )
 
 
@@ -1348,6 +1460,8 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
         tasks.append(launch("deploy-notices", rt.deploy_notice_consumer.run))
     if rt.connector_loop is not None:
         tasks.append(launch("connectors", lambda: rt.connector_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    if getattr(rt, "action_executor", None) is not None:
+        tasks.append(launch("action-executor", lambda: rt.action_executor.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "e2e_reaper", None) is not None:
         tasks.append(launch("e2e-reaper", lambda: rt.e2e_reaper.run_forever(shutdown)))  # type: ignore[union-attr]
     if rt.cron_loop is not None:

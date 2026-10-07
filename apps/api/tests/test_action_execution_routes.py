@@ -1801,3 +1801,53 @@ def test_an_unknown_constraint_violation_is_re_raised_not_mapped(
         assert response.status_code == 500, response.text
         assert [e["action"] for e in _audit(client, auth_headers, action["id"])] == []
     assert [str(row["id"]) for row in executions_of(action["id"])] == [str(pinned)]
+
+
+# --------------------------------------------------------------------------- #
+# What the worker loop needs from a claim (plan task 11)
+# --------------------------------------------------------------------------- #
+
+
+def test_a_claimed_restore_names_its_pinned_digest_and_ruled_arguments_digest(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-14 @spec ACTION-EXECUTOR-7: the claim carries what the
+    worker checks before dispatch: the ``connector_digest`` the call must run
+    against and the ruling's ``arguments_sha256`` over ``{target, prior_state}``.
+    Both are non-secret; no envelope, state or version rides with them.
+    """
+
+    from curie_api.routers.actions import restore_arguments_sha256
+
+    _, execution_id = _requested(client, auth_headers, tmp_path)
+
+    claimed = _claim(client, auth_headers)
+
+    assert claimed.status_code == 200, claimed.text
+    body = claimed.json()
+    assert body["id"] == execution_id
+    assert body["connector_digest"] == DIGEST
+    assert body["arguments_sha256"] == restore_arguments_sha256(TARGET, ENVELOPE)
+    _assert_no_snapshot(claimed.text)
+
+
+def test_a_claimed_probe_names_its_digest_and_no_arguments_digest(
+    client: Any, auth_headers: dict[str, str]
+) -> None:
+    """@spec ACTION-EXECUTOR-13 @spec ACTION-EXECUTOR-14: a probe is bracketed by the
+    digest check, so the claim names the digest; it has no arguments, so null.
+    """
+
+    agent_id = _agent(client, auth_headers)
+    created = _probe(client, auth_headers, _probe_body(agent_id))
+    assert created.status_code == 201, created.text
+
+    claimed = _claim(client, auth_headers)
+
+    assert claimed.status_code == 200, claimed.text
+    body = claimed.json()
+    assert body["id"] == str(created.json()["execution_id"])
+    assert body["kind"] == "probe"
+    assert body["connector_digest"] == DIGEST
+    assert "arguments_sha256" in body
+    assert body["arguments_sha256"] is None

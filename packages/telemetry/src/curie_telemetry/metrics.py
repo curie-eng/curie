@@ -463,6 +463,51 @@ _BACKGROUND_AGE_ATTRIBUTES = {
 # skipping right now (#1215). Which agents, and why, is in the log line each
 # skip transition emits; an agent label here would be a deployment identifier.
 _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES = {"service.name": ["curie-worker"]}
+# @spec ACTION-EXECUTOR-22. One point per claimed connector action execution:
+# kind, state, stage, code and connector only, never an argument, envelope,
+# target or version. ``unreported`` is a run whose outcome the API never
+# acknowledged (the lease sweep ends it); ``none`` is a code-free outcome. The
+# codes are the closed ACTION-EXECUTOR-20 pre-dispatch and post-dispatch sets.
+_ACTION_EXECUTION_CODES = [
+    "agent_stopped",
+    "authority_unavailable",
+    "reserved_verb_via_forward",
+    "arguments_mismatch",
+    "tool_not_grant_bound",
+    "connector_not_hosted",
+    "connector_digest_unavailable",
+    "restore_not_advertised",
+    "restore_schema_mismatch",
+    "tool_not_advertised",
+    "version_conflict",
+    "sandbox_unavailable",
+    "runner_unavailable",
+    "connector_unreachable",
+    "version_conflict_at_write",
+    "sealing_key_unavailable",
+    "snapshot_unopenable",
+    "connector_error",
+    "unstructured_reply",
+    "response_lost",
+    "deadline_exceeded",
+    "none",
+]
+_ACTION_EXECUTION_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "kind": ["restore", "probe", "other"],
+    "state": ["confirmed", "failed", "indeterminate", "refused", "unreported"],
+    "stage": ["pre_dispatch", "connector_refusal", "post_dispatch", "none"],
+    "code": _ACTION_EXECUTION_CODES,
+    # Connector names are RFC 1123 labels chosen by bundle authors; past the
+    # ceiling they share ``other``.
+    "connector": {
+        "kind": "bounded",
+        "ceiling": 16,
+        "reserved": ["other"],
+        "overflow": "other",
+        "pattern": r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+    },
+}
 # The end to end namespace reaper's health (#3245, ADR 0176 decision 4): when
 # it last finished a clean sweep, and how many scoped namespaces were past
 # their TTL at the last pass. Namespace and run names are in the WARNING line
@@ -731,6 +776,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Age of the last successful background pass.",
         False,
         _BACKGROUND_AGE_ATTRIBUTES,
+    ),
+    "curie.action_executor.execution": _definition(
+        "counter",
+        "{execution}",
+        "Connector action executions by kind, terminal state, stage, code and connector.",
+        True,
+        _ACTION_EXECUTION_ATTRIBUTES,
     ),
     "curie.connector.reconcile.skipped_agents": _definition(
         "gauge",
