@@ -19,6 +19,7 @@ from typing import Any
 from aci_protocol import BootEnv
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from ..attachments import ATTACHMENTS_REF_ENV
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
@@ -28,6 +29,7 @@ from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     ClaimView,
+    KubeTransientError,
     OperatingMode,
     QuotaRejection,
     SandboxTermination,
@@ -39,6 +41,9 @@ CORE_GROUP = "agents.x-k8s.io"
 CORE_VERSION = "v1beta1"
 EXT_GROUP = "extensions.agents.x-k8s.io"
 EXT_VERSION = "v1beta1"
+
+# Apiserver statuses a read may recover from on the next poll.
+_TRANSIENT_STATUSES = frozenset({500, 502, 503, 504})
 
 # Per-claim env with no containerName reaches only the FIRST main container (the
 # agent-sandbox Overrides policy). The bundle ref must additionally reach the
@@ -760,5 +765,13 @@ class KubernetesSandboxClient:
         except k8s_client.ApiException as exc:
             if exc.status == 404:
                 return None
+            if exc.status in _TRANSIENT_STATUSES:
+                raise KubeTransientError(f"kube API {exc.status} reading {plural}/{name}") from exc
             raise
+        except Urllib3HTTPError as exc:
+            # With retries=0 a read timeout or dropped connection surfaces as a
+            # raw urllib3 error; typed here so it is a SandboxError (#4181).
+            raise KubeTransientError(
+                f"kube API transport error reading {plural}/{name}: {type(exc).__name__}"
+            ) from exc
         return dict(obj)

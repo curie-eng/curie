@@ -460,6 +460,10 @@ class ClaimTimeoutError(SandboxError):
     """The claim did not bind a ready sandbox within the configured timeout."""
 
 
+class KubeTransientError(SandboxError):
+    """A Kubernetes API read failed in transport or with a 5xx."""
+
+
 class UnschedulableClaimError(ClaimTimeoutError):
     """The claim timed out while its pod was Unschedulable: no node has room.
 

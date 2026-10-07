@@ -56,6 +56,7 @@ from .types import (
     TURN_PROGRESS_ELIGIBILITY_ENV,
     CapacityExhaustedError,
     ClaimTimeoutError,
+    KubeTransientError,
     NoRouteError,
     PressureScanResult,
     QuotaRejection,
@@ -114,6 +115,12 @@ logger = logging.getLogger(__name__)
 # drops the stale route and rebinds. Slow turn, not corruption.
 REAP_GRACE_MARGIN_SECONDS = 30.0
 _CONTROL_REQUEST_TIMEOUT_S = 5.0
+# After its first poll, a wait loop sends no further poll with less than this
+# left before its deadline: a sub-second request timeout cannot get an answer
+# from a loaded apiserver and only produces a misleading kube API error in place
+# of the real timeout (#4181). The first poll is exempt, so a claim budget an
+# operator configured below this floor still gets one look at the claim.
+_MIN_POLL_BUDGET_S = 0.5
 _GONE_READ_TIMEOUT_S = 1.0
 _POD_TERMINATION_TIMEOUT_S = 2.0
 
@@ -1405,14 +1412,23 @@ class SandboxSubstrate:
         last_unschedulable: str | None = None
         last_pod_name = claim_name
         sleeps = _poll_sleeps(self._config)
-        while time.monotonic() < deadline:
-            claim = self._k8s.get_claim(
-                claim_name,
-                request_timeout_seconds=min(
-                    _CONTROL_REQUEST_TIMEOUT_S,
-                    max(0.001, deadline - time.monotonic()),
-                ),
-            )
+        polled = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (polled and remaining < _MIN_POLL_BUDGET_S):
+                break
+            polled = True
+            try:
+                claim = self._k8s.get_claim(
+                    claim_name,
+                    request_timeout_seconds=min(_CONTROL_REQUEST_TIMEOUT_S, remaining),
+                )
+            except KubeTransientError as exc:
+                # No observation this poll: the debounce and the last Ready
+                # condition stay as the last real read left them, so the final
+                # timeout still reports what the claim was actually waiting on.
+                logger.info("transient read of claim %s: %s", claim_name, exc)
+                claim = None
             if claim is not None:
                 last_pod_name = claim.sandbox_name or claim_name
                 last_quota_rejection = claim.quota_rejection
@@ -1473,14 +1489,20 @@ class SandboxSubstrate:
 
     def _await_service_fqdn(self, sandbox_name: str, deadline: float) -> SandboxView:
         sleeps = _poll_sleeps(self._config)
-        while time.monotonic() < deadline:
-            sandbox = self._k8s.get_sandbox(
-                sandbox_name,
-                request_timeout_seconds=min(
-                    _CONTROL_REQUEST_TIMEOUT_S,
-                    max(0.001, deadline - time.monotonic()),
-                ),
-            )
+        polled = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (polled and remaining < _MIN_POLL_BUDGET_S):
+                break
+            polled = True
+            try:
+                sandbox = self._k8s.get_sandbox(
+                    sandbox_name,
+                    request_timeout_seconds=min(_CONTROL_REQUEST_TIMEOUT_S, remaining),
+                )
+            except KubeTransientError as exc:
+                logger.info("transient read of sandbox %s: %s", sandbox_name, exc)
+                sandbox = None
             if sandbox is not None and sandbox.service_fqdn:
                 return sandbox
             time.sleep(max(0.0, min(next(sleeps), deadline - time.monotonic())))
