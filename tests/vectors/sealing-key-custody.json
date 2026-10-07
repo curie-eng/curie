@@ -68,6 +68,30 @@
     {
       "text": "$MY_SEAL_KEY",
       "names": []
+    },
+    {
+      "text": "${\u001cSNAPSHOT_SEALING_KEY}",
+      "names": [
+        "SNAPSHOT_SEALING_KEY"
+      ]
+    },
+    {
+      "text": "${\u001dSNAPSHOT_SEALING_KEY}",
+      "names": [
+        "SNAPSHOT_SEALING_KEY"
+      ]
+    },
+    {
+      "text": "${\u001eSNAPSHOT_SEALING_KEY}",
+      "names": [
+        "SNAPSHOT_SEALING_KEY"
+      ]
+    },
+    {
+      "text": "${\u001fSNAPSHOT_SEALING_KEY}",
+      "names": [
+        "SNAPSHOT_SEALING_KEY"
+      ]
     }
   ],
   "bundles": [
@@ -345,6 +369,46 @@
         {
           "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
           "location": "connectors.yaml (connectors.k8s.secret_files)"
+        }
+      ]
+    },
+    {
+      "name": "url_reference_separator_x1c.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  remote:\n    url: \"https://mcp.example.com/mcp?k=${\\x1cSNAPSHOT_SEALING_KEY}\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.remote.url)"
+        }
+      ]
+    },
+    {
+      "name": "url_reference_separator_x1d.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  remote:\n    url: \"https://mcp.example.com/mcp?k=${\\x1dSNAPSHOT_SEALING_KEY}\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.remote.url)"
+        }
+      ]
+    },
+    {
+      "name": "url_reference_separator_x1e.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  remote:\n    url: \"https://mcp.example.com/mcp?k=${\\x1eSNAPSHOT_SEALING_KEY}\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.remote.url)"
+        }
+      ]
+    },
+    {
+      "name": "url_reference_separator_x1f.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  remote:\n    url: \"https://mcp.example.com/mcp?k=${\\x1fSNAPSHOT_SEALING_KEY}\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.remote.url)"
         }
       ]
     }
