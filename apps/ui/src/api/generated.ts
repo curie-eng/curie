@@ -244,7 +244,9 @@ export interface paths {
          *     ``connector_digest`` are the worker's attribution, so a completion carrying
          *     them also needs the internal worker token (403 otherwise), and the connector
          *     must be the one the stored tool names (422 otherwise). Either refusal stores
-         *     nothing. A completion without them still takes the platform key alone.
+         *     nothing. A completion without them still takes the platform key alone,
+         *     except for a forward execution's ``exec:`` row (ACTION-EXECUTOR-19), which
+         *     only the worker token completes (403 otherwise, nothing stored).
          */
         post: operations["complete_action_actions__action_id__complete_post"];
         delete?: never;

@@ -153,6 +153,17 @@ def _tool_connector(tool: str) -> str | None:
     return match.group(1) if match else None
 
 
+# The ``dedupe_key`` and ``call_id`` prefix of a forward execution's ledger row
+# (ACTION-EXECUTOR-19), written only by the dispatch commit.
+_EXECUTED_CALL_PREFIX = "exec:"
+
+
+def _platform_executed(action: AgentAction) -> bool:
+    """Whether the executor, not a model turn, made this call (ACTION-EXECUTOR-19)."""
+
+    return action.authority_kind is not None or action.dedupe_key.startswith(_EXECUTED_CALL_PREFIX)
+
+
 @router.post("/{action_id}/complete", response_model=ActionOut)
 async def complete_action(
     action_id: uuid.UUID,
@@ -171,7 +182,9 @@ async def complete_action(
     ``connector_digest`` are the worker's attribution, so a completion carrying
     them also needs the internal worker token (403 otherwise), and the connector
     must be the one the stored tool names (422 otherwise). Either refusal stores
-    nothing. A completion without them still takes the platform key alone.
+    nothing. A completion without them still takes the platform key alone,
+    except for a forward execution's ``exec:`` row (ACTION-EXECUTOR-19), which
+    only the worker token completes (403 otherwise, nothing stored).
     """
 
     if data.connector is not None and not verify_internal_worker_token(x_curie_worker_token):
@@ -183,6 +196,15 @@ async def complete_action(
     action = await crud_actions.get_action(session, action_id)
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
+    if _platform_executed(action) and not verify_internal_worker_token(x_curie_worker_token):
+        # @spec ACTION-EXECUTOR-19: a forward execution's ledger row is the
+        # platform's own record of a call the worker made, so only the worker
+        # completes it; the platform key alone could forge a restore target.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "a platform-executed action is completed only by the worker",
+            headers={"Cache-Control": "no-store"},
+        )
     if data.connector is not None and _tool_connector(action.tool) != data.connector:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
