@@ -154,6 +154,16 @@ def _sandbox_attributes(operation: str, outcome: str) -> dict[str, str]:
     }
 
 
+def _refuse_executor_key(thread_key: str, operation: str) -> None:
+    """Refuse an executor route on a path that cannot strip its template."""
+
+    if is_executor_thread_key(thread_key):
+        raise ValueError(
+            f"{operation} refuses an {EXECUTOR_THREAD_KEY_PREFIX!r} route; an executor "
+            "sandbox is claimed fresh and released, never carried over"
+        )
+
+
 def _record_inventory(*, active: float, suspended: float) -> None:
     # Both inventories intentionally use one fixed series each. Lifecycle
     # operation labels belong on curie.sandbox.lifecycle; putting claim/release
@@ -551,8 +561,13 @@ class SandboxSubstrate:
         the claim+generation fence deletes only the unexposed candidate. After
         a successful swap the old claim is cleanup-only; a failed deletion is
         intentionally recoverable by the ordinary orphan reaper.
+
+        An executor route is refused with ``ValueError`` before any write: its
+        replacement would boot from the unstripped pool template (@spec
+        ACTION-EXECUTOR-5).
         """
 
+        _refuse_executor_key(thread_key, "handoff")
         boot = dict(env)
         boot[SESSION_ENV] = expected.session_id
         if expected.history_ref is not None:
@@ -678,8 +693,13 @@ class SandboxSubstrate:
         session identity and any recorded history ref are preserved on top,
         and the runner token is minted fresh when the caller did not already
         mint one (issue #63: the old token died with the old claim).
+
+        An executor route is refused with ``ValueError`` before any route read
+        or write: executor routes are never suspended, and a replacement would
+        boot from the unstripped pool template (@spec ACTION-EXECUTOR-5).
         """
 
+        _refuse_executor_key(thread_key, "resume")
         started = time.monotonic()
         handle: SandboxHandle | None = None
         old: SandboxHandle | None = None
