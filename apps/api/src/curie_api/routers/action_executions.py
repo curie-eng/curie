@@ -70,7 +70,12 @@ from ..remediation_forward import (
     policy_generation,
 )
 from ..remediation_reads import missed_samples
-from ..remediation_verifier import is_observe_only, reads_ended, schedule_verification
+from ..remediation_verifier import (
+    finish_unverified,
+    is_observe_only,
+    reads_ended,
+    schedule_verification,
+)
 from ..schemas.action_executions import (
     ExecutionArguments,
     ExecutionClaim,
@@ -362,6 +367,8 @@ async def _expire_dispatched(session: AsyncSession, now: datetime) -> None:
     """@spec ACTION-EXECUTOR-17: a ``dispatched`` lease that expired is ``indeterminate``.
 
     The call may have reached the connector, so it is never repeated.
+    @spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending so
+    finishes its nomination ``not-recovered`` with the code.
     """
 
     expired = (
@@ -376,6 +383,10 @@ async def _expire_dispatched(session: AsyncSession, now: datetime) -> None:
     ).all()
     for execution in expired:
         _finish(session, execution, ExecutionState.indeterminate, EXPIRED_DISPATCH_CODE, now)
+    if expired:
+        await session.flush()
+    for execution in expired:
+        await finish_unverified(session, execution, now)
 
 
 # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): one transaction-scoped
@@ -522,6 +533,7 @@ async def claim_execution(data: ExecutionClaim, session: SessionDep) -> Any:
         if execution.state == ExecutionState.claimed and execution.attempt >= MAX_ATTEMPTS:
             _finish(session, execution, ExecutionState.refused, EXHAUSTED_CLAIM_CODE, now)
             await session.flush()
+            await finish_unverified(session, execution, now)
             continue
         execution.state = ExecutionState.claimed
         execution.attempt = execution.attempt + 1
@@ -886,7 +898,8 @@ async def report_outcome(
 
     @spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending
     schedules its verifier (``confirmed``) or finishes it ``not-recovered``
-    (``failed``, ``indeterminate``) in the same transaction; a refused read
+    with the execution's code (``failed``, ``indeterminate``, ``refused``) in
+    the same transaction; a refused read
     is evaluated by its verification.
     """
 

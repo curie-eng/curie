@@ -34,8 +34,9 @@ from sqlalchemy.exc import DBAPIError
 # The head of next when the tests were written; the new revision revises it.
 BELOW = "0086"
 # The single head now: the nomination revision (task 6), the ledger fields
-# revision (task 8), the read executions revision (task 7) and the remediation
-# approvals revision (task 10) follow the policy one.
+# revision (task 8), the read executions revision (task 7), the execution code
+# revision (task 11) and the remediation approvals revision (task 10) follow the
+# policy one.
 HEAD = "0091"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}

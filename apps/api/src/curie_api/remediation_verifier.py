@@ -16,14 +16,20 @@ acting connector's digest is recorded ``restore_capable`` (it advertises
 ``observe_version``) and the ledger record carries its target and
 ``post_version``, an observe-only execution of the acting connector is due
 beside each sample (E3). The nomination is ``verifying``. A forward that ends
-``failed`` or ``indeterminate`` gets no verifier and is ``not-recovered`` at
-once. A verifier that cannot be scheduled (none declared, no in-force digest
+``failed``, ``indeterminate`` or ``refused`` after admission
+(``finish_unverified``) gets no verifier: its nomination finishes
+``not-recovered`` at once with the execution's code in ``execution_code``, and
+a ledger record, when one exists, carries the outcome too. A refusal that
+returns the nomination to approval (``not_reversible_now``, ``policy_changed``)
+is not an outcome. A verifier that cannot be scheduled (none declared, no in-force digest
 for its connector, not independent now) is ``verifier-unavailable``.
 
 Evaluation (``reads_ended``, called after every transition that ends a read):
 
-* ``superseded`` first: a later ledger record whose nomination has the same
-  target key, or an observe-only execution that reported a version other than
+* ``superseded`` first: any later ledger record on the same target key (a
+  remediation's, by its nomination's key; a model turn's or an approval's, by
+  its connector and the value of the action's declared target argument in its
+  arguments), or an observe-only execution that reported a version other than
   the record's ``post_version``. Attribution, never success;
 * ``verifier-unavailable`` at once when a sample read was ``refused``;
 * ``verified`` once ``consecutive`` adjacent samples due at or after settle
@@ -50,6 +56,7 @@ admission.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -60,12 +67,13 @@ from tempfile import TemporaryDirectory
 from typing import Any, Final
 
 from plugin_format.connectors import ConnectorSpec
-from sqlalchemy import select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import cast, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from . import bundles
+from .action_execution_codes import NOT_REVERSIBLE_NOW_CODE
 from .action_undoable import in_force_bundle_refs
 from .config import get_settings
 from .models import (
@@ -100,6 +108,13 @@ FINISHED: Final = "finished"
 
 # @spec AUTOMATED-REMEDIATION-12: a verification is at most 60 samples.
 MAX_SAMPLES: Final = 60
+# @spec AUTOMATED-REMEDIATION-11 @spec AUTOMATED-REMEDIATION-13: refusals that send
+# the nomination back to approval instead of finishing it.
+_BACK_TO_APPROVAL: Final = frozenset({NOT_REVERSIBLE_NOW_CODE, "policy_changed"})
+_UNVERIFIED: Final = frozenset(
+    {ExecutionState.failed, ExecutionState.indeterminate, ExecutionState.refused}
+)
+
 # The code the rest of a decided verification's reads end with: the authority
 # that scheduled them is spent, and no read under it runs.
 SPENT_CODE: Final = "authority_unavailable"
@@ -376,6 +391,56 @@ async def _observable(
     return bool(capable)
 
 
+async def finish_unverified(
+    session: AsyncSession, execution: ActionExecution, now: datetime
+) -> bool:
+    """Finish a remediation whose forward execution ended without confirming.
+
+    @spec AUTOMATED-REMEDIATION-18: "An execution that ends ``failed``,
+    ``indeterminate`` or ``refused`` after admission gets no verifier and
+    finishes ``not-recovered`` for reporting, with the execution code". The
+    nomination is ``finished`` ``not-recovered`` with ``execution_code``; a
+    ledger record (``failed`` and ``indeterminate`` have one, a refusal never
+    does) carries the outcome too. Written once. A refusal that returns the
+    nomination to approval is left alone. Returns whether ``execution`` was such
+    an ending of a remediation's forward execution. Commits nothing.
+    """
+
+    if execution.kind != ExecutionKind.forward or execution.state not in _UNVERIFIED:
+        return False
+    code = execution.refusal_code or execution.failure_code
+    if execution.state == ExecutionState.refused and code in _BACK_TO_APPROVAL:
+        return True
+    nomination = await nomination_for_execution(session, execution)
+    if nomination is None:
+        return True
+    if execution.subject_action_id is not None:
+        await session.execute(
+            update(AgentAction)
+            .where(
+                AgentAction.id == execution.subject_action_id,
+                AgentAction.verification_outcome.is_(None),
+            )
+            .values(verification_outcome=NOT_RECOVERED, verified_at=now)
+            .execution_options(synchronize_session=False)
+        )
+    finished = await session.scalar(
+        update(RemediationNomination)
+        .where(
+            RemediationNomination.id == nomination.id,
+            RemediationNomination.verification_outcome.is_(None),
+        )
+        .values(verification_outcome=NOT_RECOVERED, state=FINISHED, execution_code=code)
+        .returning(RemediationNomination.id)
+        .execution_options(synchronize_session=False)
+    )
+    if finished is not None:
+        logger.info(
+            "remediation verification ended nomination=%s outcome=%s", nomination.id, NOT_RECOVERED
+        )
+    return True
+
+
 async def schedule_verification(
     session: AsyncSession,
     store: ObjectStore,
@@ -389,6 +454,8 @@ async def schedule_verification(
     Commits nothing.
     """
 
+    if await finish_unverified(session, execution, now):
+        return
     if execution.kind != ExecutionKind.forward or execution.subject_action_id is None:
         return
     nomination = await nomination_for_execution(session, execution)
@@ -413,10 +480,6 @@ async def schedule_verification(
             now=now,
         )
 
-    if execution.state in (ExecutionState.failed, ExecutionState.indeterminate):
-        # "gets no verifier and finishes not-recovered for reporting".
-        await decide(NOT_RECOVERED)
-        return
     if execution.state != ExecutionState.confirmed:
         return
 
@@ -532,13 +595,44 @@ async def schedule_verification(
 # --------------------------------------------------------------------------- #
 
 
+def _record_target_matches(declared: Mapping[str, Any], action: AgentAction) -> Any | None:
+    """A ledger record without a nomination on this verification's target key.
+
+    The AUTOMATED-REMEDIATION-10 key of a record no nomination names: its
+    connector (the ``connector`` column, else the ``mcp__<connector>__`` tool
+    prefix) and the value of the declared action's target argument in its
+    arguments, compared as JSON.
+    """
+
+    target = declared.get("target")
+    connector = declared.get("connector")
+    if not isinstance(target, Mapping) or not isinstance(connector, str):
+        return None
+    argument = target.get("argument")
+    arguments = action.arguments or {}
+    if not isinstance(argument, str) or argument not in arguments:
+        return None
+    connector_matches = or_(
+        AgentAction.connector == connector,
+        AgentAction.connector.is_(None)
+        & AgentAction.tool.startswith(f"mcp__{connector}__", autoescape=True),
+    )
+    value = cast(literal(json.dumps(arguments[argument])), JSONB)
+    return (
+        AgentAction.nomination_id.is_(None)
+        & connector_matches
+        & (AgentAction.arguments[argument] == value)
+    )
+
+
 async def _superseded(
     session: AsyncSession,
     action: AgentAction,
     nomination: RemediationNomination,
+    declared: Mapping[str, Any],
     observes: list[ActionExecution],
 ) -> bool:
-    """A later record on the same target key, or another version observed."""
+    """Any later ledger record on the same target key, or another version observed."""
 
     for observed in observes:
         if observed.state != ExecutionState.confirmed:
@@ -546,17 +640,28 @@ async def _superseded(
         version = (observed.outcome or {}).get("observed_version")
         if version != action.post_version:
             return True
-    if nomination.target is None:
+    same_target = []
+    if nomination.target is not None:
+        same_target.append(
+            AgentAction.nomination_id.in_(
+                select(RemediationNomination.id).where(
+                    RemediationNomination.agent_id == action.agent_id,
+                    RemediationNomination.target == nomination.target,
+                )
+            )
+        )
+    unnominated = _record_target_matches(declared, action)
+    if unnominated is not None:
+        same_target.append(unnominated)
+    if not same_target:
         return False
     later = await session.scalar(
         select(AgentAction.id)
-        .join(RemediationNomination, RemediationNomination.id == AgentAction.nomination_id)
         .where(
             AgentAction.agent_id == action.agent_id,
             AgentAction.id != action.id,
             AgentAction.created_at > action.created_at,
-            RemediationNomination.agent_id == action.agent_id,
-            RemediationNomination.target == nomination.target,
+            or_(*same_target),
         )
         .limit(1)
     )
@@ -593,7 +698,7 @@ async def _evaluate(
     found = await _verifier_of(session, forward, nomination)
     if found is None:
         return
-    _declared, verifier = found
+    declared, verifier = found
     settle = _seconds(verifier, "settle_seconds") or 0
 
     reads = (
@@ -625,7 +730,7 @@ async def _evaluate(
             now=now,
         )
 
-    if await _superseded(session, action, nomination, observes):
+    if await _superseded(session, action, nomination, declared, observes):
         await decide(SUPERSEDED)
         return
     if any(sample.state == ExecutionState.refused for sample in samples):
@@ -698,6 +803,7 @@ __all__ = [
     "SUPERSEDED",
     "UNAVAILABLE",
     "VERIFIED",
+    "finish_unverified",
     "header_secret_names",
     "independence_refusal",
     "is_observe_only",

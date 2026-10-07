@@ -475,6 +475,7 @@ mod tests {
         let candidate_release = window_for("0.13.0").expect("feature candidate is catalogued");
         assert_eq!(candidate_release.schema_min, candidate.schema_min);
         assert_eq!(candidate_release.schema_head, candidate.schema_head);
+        assert!(live_in_window("0090", &candidate_release));
         assert!(live_in_window("0091", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let published =

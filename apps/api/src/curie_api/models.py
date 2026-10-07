@@ -2463,6 +2463,9 @@ class RemediationNomination(Base):
     approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     execution_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     verification_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The code of a forward execution that ended failed, indeterminate or refused after
+    # admission (AUTOMATED-REMEDIATION-18); the nomination then finishes not-recovered.
+    execution_code: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
     )
