@@ -94,6 +94,10 @@ export interface paths {
          *     probe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a
          *     ``claimed`` forward execution dispatches without observing, and the commit
          *     creates its one ledger row; a replay answers the row it already names.
+         *     @spec AUTOMATED-REMEDIATION-13: a policy remediation of a ``reversible``
+         *     action whose capability or custody no longer holds ends ``refused``
+         *     ``not_reversible_now`` instead, with no ledger row, and its nomination goes
+         *     back to approval.
          */
         post: operations["dispatch_execution_action_executions__execution_id__dispatch_post"];
         delete?: never;
@@ -2999,6 +3003,8 @@ export interface components {
             actor: string;
             /** Actor Channel */
             actor_channel: string | null;
+            /** Actor Kind */
+            actor_kind: string | null;
             /** Authorized */
             authorized: boolean;
             /** Authorizer */
@@ -3062,12 +3068,18 @@ export interface components {
         };
         /** ActionOut */
         ActionOut: {
+            /** Actor Kind */
+            actor_kind: string | null;
             /** Agent Id */
             agent_id: string | null;
             /** Arguments */
             arguments: {
                 [key: string]: unknown;
             } | null;
+            /** Authority Kind */
+            authority_kind: string | null;
+            /** Authority Ref */
+            authority_ref: string | null;
             /** Call Id */
             call_id: string;
             /** Completed At */
@@ -3081,6 +3093,8 @@ export interface components {
             created_at: string;
             /** Dedupe Key */
             dedupe_key: string;
+            /** Delivery Event Id */
+            delivery_event_id: string | null;
             /** Detail */
             detail: string | null;
             /** Gate Approval Id */
@@ -3090,6 +3104,8 @@ export interface components {
              * Format: uuid
              */
             id: string;
+            /** Nomination Id */
+            nomination_id: string | null;
             /** Post State */
             post_state: {
                 [key: string]: unknown;
@@ -3116,6 +3132,10 @@ export interface components {
             undone_at: string | null;
             /** Undone By */
             undone_by: string | null;
+            /** Verification Outcome */
+            verification_outcome: string | null;
+            /** Verified At */
+            verified_at: string | null;
         };
         /**
          * ActionRecord

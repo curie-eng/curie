@@ -48,6 +48,17 @@
             ],
             "title": "Actor Channel"
           },
+          "actor_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Kind"
+          },
           "authorized": {
             "title": "Authorized",
             "type": "boolean"
@@ -100,7 +111,8 @@
           "authorized",
           "reason",
           "evidence",
-          "created_at"
+          "created_at",
+          "actor_kind"
         ],
         "title": "ActionAuditOut",
         "type": "object"
@@ -218,6 +230,17 @@
       },
       "ActionOut": {
         "properties": {
+          "actor_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Kind"
+          },
           "agent_id": {
             "anyOf": [
               {
@@ -241,6 +264,28 @@
               }
             ],
             "title": "Arguments"
+          },
+          "authority_kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authority Kind"
+          },
+          "authority_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Authority Ref"
           },
           "call_id": {
             "title": "Call Id",
@@ -271,6 +316,17 @@
             "title": "Dedupe Key",
             "type": "string"
           },
+          "delivery_event_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Event Id"
+          },
           "detail": {
             "anyOf": [
               {
@@ -298,6 +354,18 @@
             "format": "uuid",
             "title": "Id",
             "type": "string"
+          },
+          "nomination_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nomination Id"
           },
           "post_state": {
             "anyOf": [
@@ -381,6 +449,29 @@
               }
             ],
             "title": "Undone By"
+          },
+          "verification_outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verification Outcome"
+          },
+          "verified_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verified At"
           }
         },
         "required": [
@@ -402,6 +493,13 @@
           "completed_at",
           "undone_at",
           "undone_by",
+          "authority_kind",
+          "authority_ref",
+          "actor_kind",
+          "delivery_event_id",
+          "nomination_id",
+          "verification_outcome",
+          "verified_at",
           "undoable"
         ],
         "title": "ActionOut",
@@ -11831,7 +11929,7 @@
     },
     "/action-executions/{execution_id}/dispatch": {
       "post": {
-        "description": "Commit ``dispatched``, the last step before a write call.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``\nrestore whose observed version equalled the recorded one dispatches. A\nprobe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a\n``claimed`` forward execution dispatches without observing, and the commit\ncreates its one ledger row; a replay answers the row it already names.",
+        "description": "Commit ``dispatched``, the last step before a write call.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``\nrestore whose observed version equalled the recorded one dispatches. A\nprobe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a\n``claimed`` forward execution dispatches without observing, and the commit\ncreates its one ledger row; a replay answers the row it already names.\n@spec AUTOMATED-REMEDIATION-13: a policy remediation of a ``reversible``\naction whose capability or custody no longer holds ends ``refused``\n``not_reversible_now`` instead, with no ledger row, and its nomination goes\nback to approval.",
         "operationId": "dispatch_execution_action_executions__execution_id__dispatch_post",
         "parameters": [
           {

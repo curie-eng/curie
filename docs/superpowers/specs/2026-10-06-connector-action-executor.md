@@ -186,7 +186,10 @@ only by:
 
 1. the undo ruling (ACTION-EXECUTOR-3), `authority_kind = undo_ruling`;
 2. the forward creation function (ACTION-EXECUTOR-19), `authority_kind` `policy`
-   or `approval`; an API function, not an HTTP route;
+   or `approval`; an API function, not an HTTP route. Its remediation caller
+   (automated remediation amendment E1, AUTOMATED-REMEDIATION-13) builds the
+   authority from an admitted or approved nomination row and the policy
+   generation that declares its action, never from a request;
 3. the capability probe route `POST /connector-capabilities/probes`
    (ACTION-EXECUTOR-13), worker API key only, whose body is exactly
    `{agent_id, connector, digest}`, `authority_kind = capability_probe`, and
@@ -217,7 +220,7 @@ adds `action_executions`:
 | `arguments_sha256` | text, nullable | SHA-256 of the canonical argument bytes (ACTION-EXECUTOR-7). |
 | `forward_arguments` | JSONB, nullable | Forward only: the canonical arguments the authority bound. |
 | `connector_digest` | text | The `sha256:` digest the call must run against. |
-| `authority_kind`, `authority_ref` | text | `undo_ruling` with the authorizing audit row id, `policy` with the generation reference, `approval` with the approval id, `capability_probe` with the reconcile pass id. |
+| `authority_kind`, `authority_ref` | text | `undo_ruling` with the authorizing audit row id, `policy` with the generation reference, `approval` with the approval id, `capability_probe` with the reconcile pass id. Amendment E1 adds `qualification`; a check constraint closes `authority_kind` to those five (revision 0089, AUTOMATED-REMEDIATION-14). |
 | `requested_by` | text, nullable | The ruling's actor; copied to `undone_by` on confirmation. |
 | `idempotency_key` | text, unique per `agent_id` | Restore: `restore:<action id>:<authorizing audit row id>`. Forward: supplied by the authority owner. Probe: `probe:<agent>:<connector>:<digest>`. |
 | `state` | text | ACTION-EXECUTOR-17. |

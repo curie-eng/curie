@@ -115,25 +115,37 @@ async def sealing_custody(
 
     wanted = sorted(set(agent_ids))
     custody: dict[uuid.UUID, frozenset[str]] = dict.fromkeys(wanted, frozenset())
-    if not wanted:
-        return custody
-    rows = (
-        await session.execute(text(_IN_FORCE_BUNDLES_SQL), {"agent_ids": wanted})
-    ).mappings()
-    for row in rows:
-        bundle_ref = row["bundle_ref"]
-        if bundle_ref is None:
-            continue
+    for agent_id, bundle_ref in (await in_force_bundle_refs(session, wanted)).items():
         try:
-            data = await store.get(str(bundle_ref))
-            custody[row["agent_id"]] = await run_in_threadpool(_sealed_connectors, data)
+            data = await store.get(bundle_ref)
+            custody[agent_id] = await run_in_threadpool(_sealed_connectors, data)
         except Exception as exc:  # noqa: BLE001 - an unreadable bundle is no custody
             # The exception type only: a parser error could echo bundle input.
             logger.warning(
                 "in-force bundle unreadable; treating sealing key custody as absent",
-                extra={"agent_id": str(row["agent_id"]), "error": type(exc).__name__},
+                extra={"agent_id": str(agent_id), "error": type(exc).__name__},
             )
     return custody
+
+
+async def in_force_bundle_refs(
+    session: AsyncSession, agent_ids: Iterable[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    """Per agent, the stored bundle of the version in force now.
+
+    The platform's in-force rule (``_IN_FORCE_BUNDLES_SQL``). An agent with no
+    in-force version, or whose version has no stored bundle, is absent.
+    """
+
+    wanted = sorted(set(agent_ids))
+    if not wanted:
+        return {}
+    rows = (
+        await session.execute(text(_IN_FORCE_BUNDLES_SQL), {"agent_ids": wanted})
+    ).mappings()
+    return {
+        row["agent_id"]: str(row["bundle_ref"]) for row in rows if row["bundle_ref"] is not None
+    }
 
 
 def authority_refusal(action: AgentAction) -> str | None:

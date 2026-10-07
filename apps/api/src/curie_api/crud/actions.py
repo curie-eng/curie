@@ -29,6 +29,8 @@ async def create_action(session: AsyncSession, data: ActionRecord) -> AgentActio
         gate_approval_id=data.gate_approval_id,
         dedupe_key=data.dedupe_key,
         status=ActionStatus.pending,
+        # @spec AUTOMATED-REMEDIATION-14: a call a turn recorded; no authority.
+        actor_kind="model_turn",
     )
     session.add(action)
     await session.commit()

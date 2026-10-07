@@ -41,12 +41,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..action_execution_codes import (
     EXHAUSTED_CLAIM_CODE,
     EXPIRED_DISPATCH_CODE,
+    NOT_REVERSIBLE_NOW_CODE,
     CodeRejected,
     outcome_code,
 )
 from ..auth import require_internal_worker_token, require_platform_key
 from ..config import get_settings
-from ..deps import SessionDep
+from ..deps import SessionDep, StoreDep
 from ..models import (
     ActionAuditEntry,
     ActionExecution,
@@ -56,6 +57,16 @@ from ..models import (
     ConnectorCapability,
     ExecutionKind,
     ExecutionState,
+    RemediationNomination,
+)
+from ..remediation_forward import (
+    ADMITTED,
+    APPROVAL_AUTHORITY,
+    APPROVAL_REQUESTED,
+    POLICY_AUTHORITY,
+    nomination_for_execution,
+    not_reversible_now,
+    policy_generation,
 )
 from ..schemas.action_executions import (
     ExecutionArguments,
@@ -173,6 +184,8 @@ def _audit(
         action=kind,
         actor=execution.requested_by or _EXECUTOR,
         actor_channel=None,
+        # @spec AUTOMATED-REMEDIATION-14: a restore's rows belong to its ruling.
+        actor_kind="undo_ruling",
         authorizer=_EXECUTOR,
         authorized=authorized,
         reason=reason,
@@ -484,7 +497,7 @@ async def record_observation(
 
 @router.post("/{execution_id}/dispatch", response_model=ExecutionOut)
 async def dispatch_execution(
-    execution_id: uuid.UUID, data: ExecutionFence, session: SessionDep
+    execution_id: uuid.UUID, data: ExecutionFence, session: SessionDep, store: StoreDep
 ) -> ExecutionOut:
     """Commit ``dispatched``, the last step before a write call.
 
@@ -493,6 +506,10 @@ async def dispatch_execution(
     probe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a
     ``claimed`` forward execution dispatches without observing, and the commit
     creates its one ledger row; a replay answers the row it already names.
+    @spec AUTOMATED-REMEDIATION-13: a policy remediation of a ``reversible``
+    action whose capability or custody no longer holds ends ``refused``
+    ``not_reversible_now`` instead, with no ledger row, and its nomination goes
+    back to approval.
     """
 
     execution = await _locked(session, execution_id)
@@ -509,6 +526,24 @@ async def dispatch_execution(
     if execution.state != ExecutionState.claimed:
         raise _conflict(f"an execution in state {execution.state} cannot dispatch")
     if execution.kind == ExecutionKind.forward:
+        nomination = await nomination_for_execution(session, execution)
+        if nomination is not None and await not_reversible_now(
+            session, store, execution, nomination
+        ):
+            _finish(session, execution, ExecutionState.refused, NOT_REVERSIBLE_NOW_CODE, now)
+            # Only a nomination still ``admitted`` goes back to approval; one
+            # already rejected, expired or finished keeps its state.
+            await session.execute(
+                update(RemediationNomination)
+                .where(
+                    RemediationNomination.id == nomination.id,
+                    RemediationNomination.state == ADMITTED,
+                )
+                .values(state=APPROVAL_REQUESTED)
+            )
+            await session.commit()
+            await session.refresh(execution)
+            return _out(execution)
         await _record_forward_action(session, execution)
     elif execution.kind != ExecutionKind.restore:
         raise _conflict(f"a {execution.kind} execution cannot dispatch")
@@ -543,6 +578,11 @@ async def _record_forward_action(session: AsyncSession, execution: ActionExecuti
     if not execution.tool or execution.forward_arguments is None:
         raise _conflict("this forward execution has no bound call")
     key = f"{_FORWARD_CALL_PREFIX}{execution.id}"
+    # @spec AUTOMATED-REMEDIATION-13 @spec AUTOMATED-REMEDIATION-14: a
+    # remediation's record carries its delivery, nomination and actor, and an
+    # approval authority's gating approval. Other forward calls keep them NULL.
+    nomination = await nomination_for_execution(session, execution)
+    provenance = _remediation_provenance(execution, nomination)
     action_id = await session.scalar(
         insert(AgentAction)
         .values(
@@ -552,17 +592,19 @@ async def _record_forward_action(session: AsyncSession, execution: ActionExecuti
             call_id=key,
             tool=f"mcp__{execution.connector}__{execution.tool}",
             arguments=execution.forward_arguments,
-            gate_approval_id=None,
             status=ActionStatus.pending.value,
             dedupe_key=key,
             connector=execution.connector,
             connector_digest=execution.connector_digest,
             authority_kind=execution.authority_kind,
             authority_ref=execution.authority_ref,
+            **provenance,
         )
         .on_conflict_do_nothing(index_elements=["dedupe_key"])
         .returning(AgentAction.id)
     )
+    if action_id is not None and nomination is not None:
+        session.add(await _remediation_audit(session, execution, nomination, action_id))
     if action_id is None:
         action_id = await session.scalar(
             select(AgentAction.id).where(
@@ -572,6 +614,66 @@ async def _record_forward_action(session: AsyncSession, execution: ActionExecuti
     if action_id is None:
         raise _conflict("the ledger row of this forward call could not be recorded")
     execution.subject_action_id = action_id
+
+
+def _remediation_provenance(
+    execution: ActionExecution, nomination: RemediationNomination | None
+) -> dict[str, Any]:
+    """The ledger columns a remediation adds (AUTOMATED-REMEDIATION-13, -14)."""
+
+    if nomination is None or execution.authority_kind not in (
+        POLICY_AUTHORITY,
+        APPROVAL_AUTHORITY,
+    ):
+        return {"gate_approval_id": None}
+    approval = execution.authority_kind == APPROVAL_AUTHORITY
+    return {
+        "gate_approval_id": nomination.approval_id if approval else None,
+        "actor_kind": execution.authority_kind,
+        "delivery_event_id": nomination.event_id,
+        "nomination_id": nomination.id,
+    }
+
+
+async def _remediation_audit(
+    session: AsyncSession,
+    execution: ActionExecution,
+    nomination: RemediationNomination,
+    action_id: uuid.UUID,
+) -> ActionAuditEntry:
+    """@spec AUTOMATED-REMEDIATION-14: the audit row naming a remediation's actor.
+
+    A policy actor is ``actor_kind`` ``policy`` with the policy reference as
+    ``actor``; the evidence names the policy, its generation and the operator
+    principal that bound it, the delivery and the nomination. An approval actor
+    is ``approval`` with the approval as ``actor``. Never an empty human field.
+    """
+
+    generation = await policy_generation(session, nomination, execution.authority_kind)
+    approval = execution.authority_kind == APPROVAL_AUTHORITY
+    return ActionAuditEntry(
+        action_id=action_id,
+        action="authorized",
+        actor=f"approval:{execution.authority_ref}" if approval else execution.authority_ref,
+        actor_channel=None,
+        actor_kind=execution.authority_kind,
+        authorizer="remediation-approval" if approval else "remediation-policy",
+        authorized=True,
+        reason=(
+            "an approved remediation approval authorized this call"
+            if approval
+            else "an admitted nomination under a bound policy authorized this call"
+        ),
+        evidence={
+            "execution_id": str(execution.id),
+            "nomination_id": str(nomination.id),
+            "delivery_event_id": nomination.event_id,
+            "policy": f"{nomination.agent_id}:{nomination.hook}",
+            "generation": generation.generation if generation is not None else None,
+            "bound_by": generation.bound_by if generation is not None else None,
+        },
+        created_at=func.clock_timestamp(),
+    )
 
 
 @router.post("/{execution_id}/arguments", response_model=ExecutionArguments)

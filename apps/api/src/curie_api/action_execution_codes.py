@@ -45,6 +45,13 @@ _ACCEPTED: Final = {
     "indeterminate": POST_DISPATCH_CODES,
 }
 
+# @spec AUTOMATED-REMEDIATION-13 (executor amendment E6): the pre-dispatch code
+# the API itself ends a policy-authorized forward execution with when its action
+# is declared ``reversible`` but its restore capability or sealing key custody
+# no longer holds at dispatch. Decided by the API, never reported by a worker,
+# so it is not in ``PRE_DISPATCH_CODES``.
+NOT_REVERSIBLE_NOW_CODE: Final = "not_reversible_now"
+
 # The pre-dispatch code a row ends with when its lease expired in ``claimed``
 # on the last permitted attempt (ACTION-EXECUTOR-17). The holder vanished
 # without reporting, so the runner side is what was unavailable.

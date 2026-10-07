@@ -330,6 +330,8 @@ async def _refuse(
             action=kind,
             actor=principal.subject,
             actor_channel=principal.actor_channel,
+            # @spec AUTOMATED-REMEDIATION-14: the undo ruling's principal acted.
+            actor_kind="undo_ruling",
             authorizer=authorizer,
             authorized=False,
             reason=reason,
@@ -606,6 +608,8 @@ async def undo_action(
             action="authorized",
             actor=principal.subject,
             actor_channel=principal.actor_channel,
+            # @spec AUTOMATED-REMEDIATION-14: the undo ruling's principal acted.
+            actor_kind="undo_ruling",
             authorizer=authorizer,
             authorized=True,
             # @spec ACTION-EXECUTOR-3: the execution id, the key identifier and

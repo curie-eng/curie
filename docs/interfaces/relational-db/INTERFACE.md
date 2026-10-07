@@ -110,6 +110,24 @@ the approval, execution and verification outcome that later admission fills,
 and `created_at` and `decided_at`. Both tables cascade with the agent and a
 nomination cascades with its submission.
 
+Migration `0089_remediation_ledger_fields.py` (automated remediation,
+AUTOMATED-REMEDIATION-14) is additive. `agent_actions`
+(`apps/api/src/curie_api/models.py::AgentAction`) gains `delivery_event_id` (the
+protected delivery a remediation was nominated from), `nomination_id` (not a
+foreign key, so the record outlives the nomination), `verification_outcome`,
+`verified_at` and `actor_kind`; `action_audit_entries`
+(`apps/api/src/curie_api/models.py::ActionAuditEntry`) gains `actor_kind`. All
+are nullable with no backfill, so existing rows read NULL. Check constraints
+close `authority_kind` on `agent_actions` and `action_executions` to
+`undo_ruling`, `capability_probe`, `policy`, `approval` and `qualification`
+(NULL allowed on the ledger), `actor_kind` on both ledger tables to
+`model_turn`, `policy`, `approval` and `undo_ruling`, and
+`verification_outcome` to `verified`, `not-recovered`, `verifier-unavailable`
+and `superseded`. A model turn's record carries `actor_kind` `model_turn`; a
+remediation's forward record carries its authority, actor, delivery and
+nomination from the dispatch commit
+(`apps/api/src/curie_api/remediation_forward.py`).
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.
