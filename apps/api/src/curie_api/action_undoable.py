@@ -74,7 +74,11 @@ ORDER BY d.agent_id, (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DES
 
 
 def _sealed_connectors(data: bytes) -> frozenset[str]:
-    """Connectors whose declaration gives them custody of the sealing key."""
+    """Connectors whose declaration gives them custody of the sealing key.
+
+    Only a hosted connector: the key must reach "only the hosted connector",
+    and a ``SecretRef`` on a remote (``url:``) connector reaches no pod.
+    """
 
     settings = get_settings()
     with tempfile.TemporaryDirectory() as tmp:
@@ -89,7 +93,8 @@ def _sealed_connectors(data: bytes) -> frozenset[str]:
     return frozenset(
         name
         for name, spec in declared.connectors.items()
-        if any(
+        if spec.is_hosted
+        and any(
             isinstance(secret, SecretRef) and secret.name == SEALING_KEY_NAME
             for secret in spec.secrets
         )
