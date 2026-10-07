@@ -16,7 +16,7 @@ from aci_protocol import BootEnv
 from curie_worker.sandbox.types import claim_warm_pool
 from plugin_format import is_reserved_boot_env_name
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parents[1] / "sre-bot" / "observability" / "startability"
 PROGRAM = HERE / "observer.py"
 IMAGE = "ghcr.io/acme-corp/worker@sha256:" + "a" * 64
 SENTINEL = "EXAMPLE-CREDENTIAL-MUST-NOT-APPEAR"

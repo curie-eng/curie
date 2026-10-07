@@ -14,7 +14,7 @@ on:
       - "packages/curie-internal/**"
       - "packages/aci-protocol/**"
       - "packages/plugin-format/**"
-      - "pyproject.toml"
+      - "examples/tests/test_startability_observer.py"
       - "uv.lock"
       - ".github/workflows/startability.yaml"
   workflow_dispatch:
@@ -27,7 +27,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  observer:
+  startability-contract:
+    name: SRE startability contract verification
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -39,8 +40,8 @@ jobs:
           python-version: "3.13"
       - run: uv sync --locked
       - name: Lint observer and tests
-        run: uv run ruff check examples/sre-bot/observability/startability
+        run: uv run ruff check examples/sre-bot/observability/startability examples/tests/test_startability_observer.py
       - name: Type check observer
         run: uv run mypy examples/sre-bot/observability/startability/observer.py
       - name: Exercise observer command and current worker policy
-        run: uv run pytest -q examples/sre-bot/observability/startability/test_observer.py
+        run: uv run pytest -q examples/tests/test_startability_observer.py
