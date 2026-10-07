@@ -359,3 +359,57 @@ def test_durable_intent_clears_only_after_confirmed_reset(tmp_path):
         )
     assert result.cleanup_degraded is True
     assert json.loads(state_file.read_text())["pending"] is not None
+
+
+def test_existing_empty_state_fails_closed(tmp_path):
+    """@spec TURN-CANARY-4"""
+    canary = _canary()
+    state_file = tmp_path / "canary-state.json"
+    state_file.write_text("")
+    with pytest.raises(ValueError, match="state"):
+        with canary.StateJournal(state_file):
+            pass
+
+
+@pytest.mark.parametrize("operation", ["clear", "save"])
+def test_interrupted_state_replacement_preserves_pending_and_blocks_next_run(
+    tmp_path, monkeypatch, operation
+):
+    """@spec TURN-CANARY-4"""
+    canary = _canary()
+    state_file = tmp_path / "canary-state.json"
+    agent_id = _binding()["agent_id"]
+    thread_key = "slack:blue:C-EXAMPLE-1:eval%3Aprobe"
+    with canary.StateJournal(state_file) as journal:
+        journal.record_intent(agent_id, thread_key)
+    before = state_file.read_text()
+
+    def interrupt_replace(*args):
+        raise SystemExit("interrupted before atomic replacement")
+
+    with canary.StateJournal(state_file) as journal:
+        with monkeypatch.context() as patch:
+            patch.setattr(canary.os, "replace", interrupt_replace)
+            with pytest.raises(SystemExit):
+                if operation == "clear":
+                    journal.clear_intent(agent_id, thread_key)
+                else:
+                    journal.save_result(canary.CycleResult(cleanup_degraded=True))
+    assert state_file.read_text() == before
+    lock_file = tmp_path / "canary-state.json.lock"
+    assert lock_file.is_file()
+    next_platform = CyclePlatform()
+    with canary.StateJournal(state_file) as journal:
+        assert journal.pending == {"agent_id": agent_id, "thread_key": thread_key}
+        result = asyncio.run(
+            canary.run_cycle(
+                next_platform,
+                _routes()[:1],
+                journal=journal,
+                turn_deadline=0.02,
+                cleanup_deadline=0.02,
+                poll_period=0.005,
+            )
+        )
+    assert result.cleanup_degraded is True
+    assert not any(call[0] == "enqueue" for call in next_platform.calls if isinstance(call, tuple))
