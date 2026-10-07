@@ -1134,6 +1134,24 @@ class WorkerConfig(BaseSettings):
     attachment_retention_ttl_seconds: int = Field(
         default=3600, gt=0, validation_alias="CURIE_ATTACHMENT_RETENTION_TTL_SECONDS"
     )
+    # The per-thread budget (ADR 0205 decision 7): every boot rebuilds the
+    # thread's files, so one boot's work is bounded per thread, separately from
+    # the per-message cap. The file count may never be below one message's cap,
+    # because the current message's files are always kept whole. The byte
+    # budget must fit the sandbox's attachments volume; the chart checks that.
+    # The prepare timeout bounds the worker's own rebuild (ledger read, cache
+    # re-mint, channel re-fetch) inside the turn's remaining budget.
+    attachment_thread_max_files: int = Field(
+        default=20, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_MAX_FILES"
+    )
+    attachment_thread_max_bytes: int = Field(
+        default=256 * 1024 * 1024,
+        gt=0,
+        validation_alias="CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+    )
+    attachment_thread_prepare_timeout_seconds: float = Field(
+        default=15.0, gt=0, validation_alias="CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS"
+    )
     # Approval-gated publication runs only on the Kubernetes substrate. These
     # values shape the worker-owned Job; none are bundle inputs.
     publication_enabled: bool = Field(default=True, validation_alias="CURIE_PUBLICATION_ENABLED")
@@ -1171,6 +1189,19 @@ class WorkerConfig(BaseSettings):
         default=(),
         validation_alias="CURIE_PUBLICATION_PROTECTED_PATHS",
     )
+
+    @field_validator("attachment_thread_max_files")
+    @classmethod
+    def _thread_budget_holds_one_message(cls, value: int) -> int:
+        from .attachments import AttachmentLimits
+
+        per_message = AttachmentLimits().max_files
+        if value < per_message:
+            raise ValueError(
+                f"CURIE_ATTACHMENT_THREAD_MAX_FILES must be at least the per-message "
+                f"cap of {per_message}"
+            )
+        return value
 
     @field_validator("publication_protected_paths")
     @classmethod

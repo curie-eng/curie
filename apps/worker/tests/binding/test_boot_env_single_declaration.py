@@ -100,6 +100,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_ATTACHMENT_MAX_FILE_BYTES",
         "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
         "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
+        # ADR 0205 decision 7 (#4079): the per-thread budget every boot's
+        # rebuild is bounded by, and the worker's own prepare timeout.
+        "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+        "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+        "CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
         "CURIE_BOOTING_TEXT",
         # Read by the worker capacity wait store, which bounds how long a
         # queued chat turn may wait. It is never sent to a sandbox.
