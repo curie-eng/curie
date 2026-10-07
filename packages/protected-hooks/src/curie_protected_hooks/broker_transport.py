@@ -26,7 +26,7 @@ from redis.retry import Retry
 
 from curie_protected_hooks.admission_records import DeliveryIdentity, delivery_digest
 from curie_protected_hooks.atomic_admission import AtomicAdmission
-from curie_protected_hooks.authority_records import Manifest
+from curie_protected_hooks.authority_records import Manifest, _scalar
 from curie_protected_hooks.broker_metadata import (
     _CONTROL_KEY,
     BrokerMetadataUnavailable,
@@ -672,6 +672,8 @@ class _PinnedEnqueueConnection(_PinnedConnection):
 
 _INTENT_PREFIX = "protected:admission:intent:"
 _INTENT_TYPES = {b"none": False, b"string": True}
+_BINDING_PREFIX = "protected:admission:binding:"
+_BINDING_MAXIMUM = 16384
 
 
 class _AdmissionCommands:
@@ -848,6 +850,30 @@ class AuthenticatedEnqueueClient:
                 if type(kind) is not bytes or kind not in _INTENT_TYPES:
                     raise BrokerMetadataUnavailable()
                 return _INTENT_TYPES[kind]
+            except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+                self.__connection.disconnect()
+                raise BrokerMetadataUnavailable() from None
+
+    def read_binding(self, event_id: str) -> bytes | None:
+        """One event's binding (its envelope bytes), or None when absent.
+
+        A plain GET on the retained session, never a write; only an opaque_ref
+        event id names a binding key, refused before any command. The nomination
+        route resolves a protected event through it.
+        @spec AUTOMATED-REMEDIATION-6 @spec PROTECTED-HOOK-LANE-3.
+        """
+        try:
+            _scalar(event_id, "opaque_ref")
+            key = _BINDING_PREFIX + event_id
+        except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
+            raise BrokerMetadataUnavailable() from None
+        with self.__lock:
+            try:
+                self.__identity()
+                raw = _get(self.__connection, key)
+                if raw is not None and len(raw) > _BINDING_MAXIMUM:
+                    raise BrokerMetadataUnavailable()
+                return raw
             except Exception:  # noqa: BLE001  Credential-bearing transport errors must stay redacted.
                 self.__connection.disconnect()
                 raise BrokerMetadataUnavailable() from None

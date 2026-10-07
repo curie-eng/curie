@@ -94,6 +94,22 @@ policy document as JSONB, the flags and the operator principal that wrote it
 (`bound_by`). A trigger refuses any update of a generation row and its deletion
 while the agent exists; both tables cascade with the agent.
 
+Migration `0088_remediation_nominations.py` (automated remediation,
+AUTOMATED-REMEDIATION-6 and -7) is additive. The
+`remediation_nomination_submissions` table
+(`apps/api/src/curie_api/models.py::RemediationNominationSubmission`) holds the
+one accepted nomination submission of a protected event, keyed on the event id,
+with the agent and hook resolved from the protected binding and the SHA-256 of
+the submitted bytes. The `remediation_nominations` table
+(`apps/api/src/curie_api/models.py::RemediationNomination`) holds one row per
+nominated entry, or one row for a malformed block: the agent, hook and event,
+the admitted and current policy generations, the action, kind, canonical
+arguments and their digest, the target key, the stored reason, a closed
+`state`, a closed `refusal_code` (present exactly when the state is `refused`),
+the approval, execution and verification outcome that later admission fills,
+and `created_at` and `decided_at`. Both tables cascade with the agent and a
+nomination cascades with its submission.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.

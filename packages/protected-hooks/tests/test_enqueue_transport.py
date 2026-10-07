@@ -259,6 +259,7 @@ ALLOWED_PUBLIC = {
     "read_control",
     "observe",
     "intent_present",
+    "read_binding",
     "admission",
     "close",
 }
@@ -416,6 +417,73 @@ def test_a_wrong_run_id_refuses_before_any_application_command(owned):
             time.sleep(0.02)
     finally:
         owned.restore()
+
+
+BINDING_EVENT = "hook-11111111-1111-4111-8111-111111111111-incident-0123456789abcdef"
+
+
+def test_read_binding_returns_the_exact_envelope_bytes_on_the_retained_session(owned):
+    """``read_binding(event_id)`` reads one event's binding: bytes or ``None``.
+
+    The nomination route resolves a protected event through it (AUTOMATED-
+    REMEDIATION-6); it is a plain GET of ``protected:admission:binding:<event_id>``
+    on the one retained session, with no denied command and no write.
+    @spec AUTOMATED-REMEDIATION-6 @spec PROTECTED-HOOK-LANE-3.
+    """
+    broker = owned.broker
+    key = "protected:admission:binding:" + BINDING_EVENT
+    broker.command("SET", key, b'{"schema_version":1}')
+    client = owned.connect()
+    try:
+        initial = owned.sessions()
+        assert client.read_binding(BINDING_EVENT) == b'{"schema_version":1}'
+        assert client.read_binding("hook-absent-event") is None
+        assert [session["id"] for session in owned.sessions()] == [initial[0]["id"]]
+        assert broker.command("ACL", "LOG") == []
+        assert broker.command("GET", key) == b'{"schema_version":1}'
+        assert broker.command("PTTL", key) == -1
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    "event", ["", " leading-space", "-leading-dash", "a" * 257, "with space", "x\n", None, 7, b"x"]
+)
+def test_read_binding_refuses_an_invalid_event_id_before_any_command(owned, event):
+    """Only an opaque_ref event id names a binding key, @spec AUTOMATED-REMEDIATION-6.
+
+    @spec PROTECTED-HOOK-LANE-3.
+    """
+    broker = owned.broker
+    client = owned.connect()
+    broker.command("ACL", "SETUSER", owned.username, "-get")
+    try:
+        before = command_count(broker, "get")
+        with pytest.raises(BrokerMetadataUnavailable) as caught:
+            client.read_binding(event)
+        assert_safe(caught.value, owned)
+        assert command_count(broker, "get") == before
+        assert broker.command("ACL", "LOG") == []
+    finally:
+        client.close()
+        owned.restore()
+
+
+def test_read_binding_after_loss_or_close_is_the_safe_error(owned):
+    """@spec AUTOMATED-REMEDIATION-6 @spec PROTECTED-HOOK-LANE-3."""
+    broker = owned.broker
+    client = owned.connect()
+    try:
+        assert broker.command("CLIENT", "KILL", "USER", owned.username, "SKIPME", "yes") == 1
+        accepted = connections(broker)
+        with pytest.raises(BrokerMetadataUnavailable) as caught:
+            client.read_binding(BINDING_EVENT)
+        assert_safe(caught.value, owned)
+        assert connections(broker) == accepted
+    finally:
+        client.close()
+    with pytest.raises(BrokerMetadataUnavailable):
+        client.read_binding(BINDING_EVENT)
 
 
 def test_a_killed_connection_is_never_reopened(owned):

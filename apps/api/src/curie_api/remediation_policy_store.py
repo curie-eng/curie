@@ -2,7 +2,9 @@
 
 Every write (bind, arm, disarm, removal) runs in one transaction that
 
-1. takes a transaction-scoped advisory lock keyed by agent and hook, and a
+1. takes the agent's source gate (ordering it with the protected ingress's
+   read of the remediation generation, AUTOMATED-REMEDIATION-4), then a
+   transaction-scoped advisory lock keyed by agent and hook, and a
    share lock on the agent row so the agent cannot vanish mid-write;
 2. answers a replayed ``operation_id`` with the generation it committed, or
    ``policy_operation_conflict`` when the intent differs;
@@ -138,6 +140,14 @@ async def write_policy(
     """
     intent = intent_sha256(verb, document)
     async with session.begin():
+        # The agent's source gate first (the key ``SourceGate.hold`` takes): the
+        # protected ingress reads the remediation generation while holding it,
+        # so a write lands wholly before or after each admission
+        # (AUTOMATED-REMEDIATION-4).
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {"key": f"hook-source:{agent_id}"},
+        )
         await session.execute(
             text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
             {"key": f"remediation_policy:{agent_id}:{hook}"},

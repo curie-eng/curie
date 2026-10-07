@@ -85,7 +85,9 @@ from fastapi.responses import JSONResponse
 from opentelemetry.trace import SpanKind, StatusCode
 from pydantic import BaseModel, ValidationError
 from redis.exceptions import RedisError
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.crud import channels as crud_channels
 from curie_api.crud import workspaces as crud_workspaces
@@ -117,7 +119,7 @@ from ..hook_source_auth import (
 from ..hook_source_mutation import committed_policy_fingerprint
 from ..hook_source_policy_schemas import HookSupportIn, HookSupportOut, HookSupportReason
 from ..identities import refuse_undeclared
-from ..models import Agent, AgentChannel
+from ..models import Agent, AgentChannel, RemediationPolicy
 from ..protected_ingress import (
     TURN_LIMIT,
     IngressBrokerUnavailable,
@@ -576,9 +578,27 @@ def _admission_answer(
     raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "broker_unavailable")
 
 
+async def _remediation_generation(
+    session: AsyncSession, agent_id: uuid.UUID, hook: str
+) -> str | None:
+    """The hook's current remediation policy generation, or None when unbound.
+
+    Read while the agent's source gate is held; remediation policy writes take
+    the same gate, so the value is the generation current at admission. A
+    removed policy keeps its positive generation. @spec AUTOMATED-REMEDIATION-4.
+    """
+    generation = await session.scalar(
+        select(RemediationPolicy.generation).where(
+            RemediationPolicy.agent_id == agent_id, RemediationPolicy.hook == hook
+        )
+    )
+    return None if generation is None else str(generation)
+
+
 async def _ingest_protected(
     request: Request,
     response: Response,
+    session: AsyncSession,
     source: AuthenticatedHookSource,
     policy: SourcePolicySnapshot,
     *,
@@ -657,6 +677,12 @@ async def _ingest_protected(
                     "protected hook turn exceeds the admission payload limit",
                 )
             try:
+                remediation_generation = await _remediation_generation(session, agent.id, hook)
+            except SQLAlchemyError:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, "authority_unavailable"
+                ) from None
+            try:
                 admission = AdmissionRequest(
                     identity=DeliveryIdentity(
                         agent_id=str(agent.id), hook=hook, delivery_id=delivery_id
@@ -665,6 +691,7 @@ async def _ingest_protected(
                     requested_tool_access=requested.value if requested is not None else None,
                     request_body_sha256=hashlib.sha256(raw).hexdigest(),
                     queued_payload=payload,
+                    remediation_generation=remediation_generation,
                 )
             except ValueError:
                 raise HTTPException(
@@ -765,6 +792,7 @@ async def ingest_hook(
             return await _ingest_protected(
                 request,
                 response,
+                session,
                 source,
                 policy,
                 hook=hook,
