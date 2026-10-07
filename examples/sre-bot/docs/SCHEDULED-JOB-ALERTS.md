@@ -8,7 +8,7 @@ Feature #4251. This opt-in example watches maintenance CronJobs separately from 
 
 `SRE-SCHEDULED-JOBS c2`: a job whose last schedule timestamp exceeds its last successful timestamp, or whose schedule has no successful timestamp, pages after fifteen minutes. An unscheduled job and a latest successful schedule do not fire. This is a schedule/success comparison, not a missed-schedule or exporter-liveness detector.
 
-`SRE-SCHEDULED-JOBS c3`: both rules retain namespace and cronjob labels, set severity `page` and component `scheduled-job`, and use installation supplied impact text. Namespace is an explicit validated Kubernetes namespace argument. No identifiers or credentials from an installation are defaults.
+`SRE-SCHEDULED-JOBS c3`: both rules retain namespace and cronjob labels, set severity `page` and component `scheduled-job`, and use installation supplied impact text. Summaries name the scheduled job and whether it is suspended or its last run did not succeed. Namespace is an explicit validated Kubernetes namespace argument. No identifiers or credentials from an installation are defaults.
 
 `SRE-SCHEDULED-JOBS c4`: `python3 examples/sre-bot/observability/scheduled_job_alerts.py --namespace acme-system --description "Maintenance credentials and inventory depend on these jobs."` writes one JSON Helm values object locally. JSON is valid YAML. It needs no third party Python package, cluster, registry, Helm invocation or credential. Invalid arguments fail before output.
 
