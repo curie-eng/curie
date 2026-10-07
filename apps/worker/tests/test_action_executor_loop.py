@@ -1623,3 +1623,82 @@ async def test_cancelling_a_run_mid_phase_releases_the_sandbox_and_writes_nothin
         assert rig.runner.writes == []
         assert minted == []
         rig.assert_released()
+
+
+# --------------------------------------------------------------------------- #
+# Review round 2: a stale holder's late cleanup (NEW-1)
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_stale_holders_late_cleanup_never_releases_the_reclaimers_sandbox(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-5 @spec ACTION-EXECUTOR-17: release only what you claimed.
+
+    Attempt 1 overruns its lease inside ``observe``. Attempt 2 reclaims, releases
+    attempt 1's sandbox, boots its own and is mid-``call`` when attempt 1 wakes,
+    meets a stale fence and cleans up. That cleanup must not release attempt 2's
+    sandbox: release is of the handle the holder claimed (or skipped after a
+    stale-fence answer), never whatever the ``action-exec:<id>`` route names now.
+    """
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+        first_observe = asyncio.Event()
+        resume_first = asyncio.Event()
+        second_in_call = asyncio.Event()
+        finish_call = asyncio.Event()
+        observes = 0
+
+        async def observe(body: dict[str, Any]) -> None:
+            nonlocal observes
+            observes += 1
+            if observes == 1:
+                first_observe.set()
+                await resume_first.wait()
+
+        async def call(body: dict[str, Any]) -> None:
+            second_in_call.set()
+            await finish_call.wait()
+
+        rig.runner.hooks["observe"] = observe
+        rig.runner.hooks["call"] = call
+
+        first = asyncio.create_task(rig.loop("worker-a").run_once())
+        tasks: list[asyncio.Task[bool]] = [first]
+        try:
+            await asyncio.wait_for(first_observe.wait(), timeout=5.0)
+            first_claim = rig.sandboxes.created[0].name
+
+            # Attempt 1's lease runs out while it waits on the connector.
+            rig.api.expire_lease(rig.execution(execution))
+            second = asyncio.create_task(rig.loop("worker-b").run_once())
+            tasks.append(second)
+            await asyncio.wait_for(second_in_call.wait(), timeout=5.0)
+            assert rig.execution(execution).attempt == 2
+            assert rig.execution(execution).state == "dispatched"
+            second_claim = rig.sandboxes.created[1].name
+            assert first_claim in rig.sandboxes.deleted
+
+            # Attempt 1 wakes, is fenced out, and cleans up while attempt 2 calls.
+            resume_first.set()
+            await asyncio.wait_for(first, timeout=10.0)
+
+            assert second_claim in rig.sandboxes.claims, "stale holder released the live sandbox"
+            assert second_claim not in rig.sandboxes.deleted
+            assert rig.affinity.get(f"action-exec:{execution.id}") is not None
+
+            finish_call.set()
+            assert await asyncio.wait_for(second, timeout=10.0) is True
+
+            assert _final(rig, execution) == ("confirmed", None)
+            assert len(rig.runner.writes) == 1
+            assert len(minted) == 1
+            rig.assert_released()
+        finally:
+            resume_first.set()
+            finish_call.set()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
