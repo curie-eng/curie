@@ -56,7 +56,11 @@ from curie_api.crud import publications as crud_publications
 
 from .config import get_settings
 from .models import ApprovalStatus
-from .remediation_approvals import REMEDIATION_PURPOSE, settle_remediation_approval
+from .remediation_approvals import (
+    REMEDIATION_PURPOSE,
+    reconcile_remediation_approvals,
+    settle_remediation_approval,
+)
 from .resumequeue import (
     ResumeQueue,
     approval_trace_context,
@@ -206,6 +210,13 @@ async def sweep_expired_approvals(
                 retry,
             )
             continue
+    # AUTOMATED-REMEDIATION-16: complete resolved remediation approvals whose
+    # post-claim step (execution, nominations) did not commit.
+    try:
+        await reconcile_remediation_approvals(session, limit=limit)
+    except Exception:
+        await session.rollback()
+        logger.exception("remediation approval reconciliation pass failed")
     await observe_pending_approvals(session, now=now)
     return flipped
 

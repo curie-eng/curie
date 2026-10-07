@@ -32,6 +32,7 @@ rejected or expired approval with that outcome.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -62,6 +63,8 @@ from .remediation_forward import (
     policy_ref,
 )
 from .remediation_policy_document import APPROVAL_TTL_SECONDS_DEFAULT
+
+logger = logging.getLogger(__name__)
 
 REMEDIATION_PURPOSE: Final = "remediation"
 DEDUPE_PREFIX: Final = "remediation:"
@@ -509,7 +512,23 @@ async def execute_approved(session: AsyncSession, approval_id: uuid.UUID) -> For
         generation=judged.live_generation,
     )
     await session.commit()
-    return await create_remediation_forward(session, raising_id, approval_id=approval_id)
+    try:
+        return await create_remediation_forward(session, raising_id, approval_id=approval_id)
+    except ForwardRefused:
+        # A refusal is final for this authority: end the raising nomination, so
+        # reconciliation does not retry it. Any other error leaves it ``approved``
+        # with no execution, which ``reconcile_remediation_approvals`` completes.
+        await session.execute(
+            update(RemediationNomination)
+            .where(
+                RemediationNomination.id == raising_id,
+                RemediationNomination.state == "approved",
+                RemediationNomination.execution_id.is_(None),
+            )
+            .values(state="finished")
+        )
+        await session.commit()
+        raise
 
 
 async def settle_remediation_approval(
@@ -532,3 +551,67 @@ async def settle_remediation_approval(
     )
     await session.commit()
 
+
+_TERMINAL: Final = (ApprovalStatus.approved, ApprovalStatus.rejected, ApprovalStatus.expired)
+
+
+async def reconcile_remediation_approvals(session: AsyncSession, *, limit: int = 100) -> int:
+    """Complete the post-claim work of resolved remediation approvals.
+
+    @spec AUTOMATED-REMEDIATION-16. The resolution or expiry claim commits
+    before the nominations move and the execution is created; a failure between
+    them leaves a resolved approval with a nomination still
+    ``approval_requested``, or an ``approved`` raiser with no execution. Each
+    pass finds those and runs the same step again: ``execute_approved`` adopts
+    the one execution by its per-authority key, and ending nominations only
+    moves rows still ``approval_requested``, so a replay changes nothing twice.
+    Returns how many approvals it completed; a failure is logged and retried on
+    the next pass.
+    """
+
+    owed = (
+        select(RemediationNomination.id)
+        .where(
+            RemediationNomination.approval_id == Approval.id,
+            or_(
+                RemediationNomination.state == _APPROVAL_REQUESTED,
+                (RemediationNomination.state == "approved")
+                & RemediationNomination.execution_id.is_(None)
+                & (RemediationNomination.id == RemediationApprovalRequest.nomination_id),
+            ),
+        )
+        .exists()
+    )
+    rows = (
+        await session.execute(
+            select(Approval.id, Approval.status)
+            .join(RemediationApprovalRequest, RemediationApprovalRequest.approval_id == Approval.id)
+            .where(
+                Approval.purpose == REMEDIATION_PURPOSE,
+                Approval.status.in_(_TERMINAL),
+                owed,
+            )
+            .order_by(Approval.resolved_at)
+            .limit(limit)
+        )
+    ).all()
+    await session.commit()
+    completed = 0
+    for approval_id, outcome in rows:
+        try:
+            if outcome == ApprovalStatus.approved:
+                try:
+                    await execute_approved(session, approval_id)
+                except ForwardRefused as refused:
+                    logger.warning(
+                        "remediation approval %s refused %s on reconciliation",
+                        approval_id,
+                        refused.code,
+                    )
+            else:
+                await settle_remediation_approval(session, approval_id, outcome)
+            completed += 1
+        except Exception:  # noqa: BLE001 - one approval must not stop the pass
+            await session.rollback()
+            logger.exception("remediation approval %s reconciliation failed", approval_id)
+    return completed
