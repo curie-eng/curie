@@ -140,6 +140,9 @@ class DispatcherConfig(BaseSettings):
     test_installation_drivers: Annotated[tuple[DeclaredDriver, ...], NoDecode] = Field(
         default=(), validation_alias=TEST_INSTALLATION_DRIVERS_ENV
     )
+    test_installation_thread_turn_limit: int = Field(
+        default=10, ge=1, le=100, validation_alias="CURIE_TEST_INSTALLATION_THREAD_TURN_LIMIT"
+    )
 
     valkey_host: str = "localhost"
     valkey_port: int = 6379
@@ -271,6 +274,15 @@ class DispatcherConfig(BaseSettings):
         # Decode here so JSON null is rejected instead of being discarded by
         # the settings env source and silently replaced by the empty default.
         return json.loads(value) if isinstance(value, str) else value
+
+    @field_validator("test_installation_thread_turn_limit", mode="before")
+    @classmethod
+    def _thread_cap_is_not_a_boolean(cls, value: object) -> object:
+        if isinstance(value, bool):
+            raise ValueError(
+                "test installation thread turn limit must be an integer, not a boolean"
+            )
+        return value
 
     @field_validator("test_installation_drivers", mode="before")
     @classmethod

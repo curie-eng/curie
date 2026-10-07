@@ -20,6 +20,12 @@ Installations can also opt into [scheduled job health alerts](docs/SCHEDULED-JOB
 The renderer requires an explicit namespace and impact description; it does not
 change the default installation or treat intentionally suspended templates as healthy.
 
+Installations with existing paired adapter reply credentials can opt into
+the worker map reconciler described in
+[`docs/ADAPTER-CREDENTIALS.md`](docs/ADAPTER-CREDENTIALS.md). Its inventory is
+explicit and provider independent; credential issuance and renewal remain with
+the existing adapter and platform interfaces.
+
 ## Kubernetes authority
 
 The bundle's `toolPolicy` classifies the pinned server's complete 19-tool core

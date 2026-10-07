@@ -845,6 +845,10 @@ remediation:
 testInstallation:
   enabled: false
   drivers: []
+  # Maximum driver-started turns per Slack identity/channel/thread in any ten
+  # minutes, shared by all listed drivers (1–100). Pings and duplicate deliveries
+  # spend no turn budget. Valkey reservations make the cap atomic across replicas.
+  threadTurnLimit: 10
 
 rustfs:
   deploy: true
