@@ -52,7 +52,10 @@ from _migration_support import sql_dicts, sql_rows
 from _sealed_actions import (
     CONNECTOR,
     DIGEST,
+    POST_VERSION,
     executor_enabled,  # noqa: F401 - fixture, requested by name
+    operator_headers,
+    sealed_action,
     undoable_agent,
     worker_headers,
 )
@@ -137,8 +140,11 @@ def _seam() -> Any:
 # --------------------------------------------------------------------------- #
 
 
-def _bind_policy(agent_id: str) -> None:
-    """Generation ``GENERATION`` of the agent's ``HOOK`` policy, bound by ``BOUND_BY``."""
+def _bind_policy(agent_id: str, documents: dict[int, dict[str, Any]] | None = None) -> None:
+    """Generation ``GENERATION`` of the agent's ``HOOK`` policy, bound by ``BOUND_BY``.
+
+    ``documents`` overrides the document of a given generation (``DOCUMENT`` otherwise).
+    """
 
     agent = uuid.UUID(agent_id)
     for generation in range(1, GENERATION + 1):
@@ -154,7 +160,7 @@ def _bind_policy(agent_id: str) -> None:
                 "generation": generation,
                 "operation_id": uuid.uuid4(),
                 "intent": f"{generation:02x}" * 32,
-                "document": json.dumps(DOCUMENT),
+                "document": json.dumps((documents or {}).get(generation, DOCUMENT)),
                 "bound_by": BOUND_BY if generation == GENERATION else "U0EXAMPLE1",
             },
         )
@@ -178,6 +184,7 @@ def _nominate(
     approval_id: uuid.UUID | None = None,
     event_id: str = EVENT_ID,
     arguments: dict[str, Any] | None = None,
+    admitted_generation: int | None = GENERATION,
 ) -> uuid.UUID:
     """One well-formed nomination of ``ACTION_NAME`` from the protected delivery ``event_id``."""
 
@@ -197,13 +204,14 @@ def _nominate(
         "INSERT INTO curie.remediation_nominations "
         "(id, agent_id, hook, event_id, admitted_generation, current_generation, action, "
         "kind, arguments, arguments_sha256, target, reason, state, approval_id) "
-        "VALUES (:id, :agent_id, :hook, :e, :generation, :generation, :action, 'remediate', "
+        "VALUES (:id, :agent_id, :hook, :e, :admitted, :generation, :action, 'remediate', "
         ":arguments, :sha, :target, 'error ratio above threshold', :state, :approval_id)",
         {
             "id": nomination_id,
             "agent_id": agent,
             "hook": HOOK,
             "e": event_id,
+            "admitted": admitted_generation,
             "generation": GENERATION,
             "action": ACTION_NAME,
             "arguments": _canonical(bound),
@@ -691,3 +699,211 @@ def test_an_unknown_audit_actor_kind_violates_the_check() -> None:
         {"id": action_id},
     )
     assert rows == [{"actor_kind": "undo_ruling"}]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1: approval of a nomination with no admitted generation
+# --------------------------------------------------------------------------- #
+
+
+def _audit(client: Any, headers: dict[str, str], action_id: Any) -> list[dict[str, Any]]:
+    response = client.get(f"/actions/{action_id}/audit", headers=headers)
+    assert response.status_code == 200, response.text
+    return list(response.json())
+
+
+@pytest.mark.parametrize("admitted", [None, GENERATION - 1], ids=["no-admitted", "older"])
+def test_an_approved_nomination_resolves_its_action_from_the_current_generation(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, admitted: int | None
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-13 @spec AUTOMATED-REMEDIATION-14: AUTOMATED-
+    REMEDIATION-4 sends a nomination with no admitted generation (a delivery
+    admitted before any policy existed, or an envelope without the field), or one
+    whose admitted generation is no longer current, to approval. Once approved it
+    executes: the action is read from the current generation (the one the
+    approval card and AR-16's ``policy_changed`` judge), ``authority_ref`` is the
+    approval id (AR-13), and the audit row names that current generation and the
+    operator who bound it.
+    """
+
+    agent_id = undoable_agent(client, auth_headers, tmp_path)
+    older = {**DOCUMENT, "actions": [{**ACTION, "tool": "scale_deployment_legacy"}]}
+    _bind_policy(agent_id, {GENERATION - 1: older})
+    approval_id = uuid.uuid4()
+    nomination_id = _nominate(
+        agent_id, state="approved", approval_id=approval_id, admitted_generation=admitted
+    )
+
+    created = _create(nomination_id, approval_id=approval_id)
+
+    row = _executions()[0]
+    assert row["id"] == created.execution_id
+    assert row["connector"] == CONNECTOR
+    assert row["tool"] == TOOL
+    assert row["forward_arguments"] == NOMINATED
+    assert row["authority_kind"] == "approval"
+    assert row["authority_ref"] == str(approval_id)
+    dispatched = _dispatch(client, created.execution_id)
+    action = _ledger()[0]
+    assert action["tool"] == f"mcp__{CONNECTOR}__{TOOL}"
+    assert action["gate_approval_id"] == approval_id
+    assert action["nomination_id"] == nomination_id
+    entries = [
+        entry
+        for entry in _audit(client, auth_headers, dispatched["subject_action_id"])
+        if entry["actor_kind"] == "approval"
+    ]
+    assert len(entries) == 1
+    assert entries[0]["actor"]
+    assert entries[0]["evidence"]["generation"] == GENERATION
+    assert BOUND_BY in json.dumps(entries[0])
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1: ``not_reversible_now`` at dispatch (AR-13, executor E6)
+# --------------------------------------------------------------------------- #
+
+
+def _lose_capability(agent_id: str, how: str) -> None:
+    params = {"agent_id": uuid.UUID(agent_id)}
+    if how == "not-capable":
+        sql_rows(
+            "UPDATE curie.connector_capabilities SET restore_capable = false "
+            "WHERE agent_id = :agent_id",
+            params,
+        )
+    else:
+        sql_rows("DELETE FROM curie.connector_capabilities WHERE agent_id = :agent_id", params)
+
+
+@pytest.mark.parametrize("how", ["not-capable", "row-gone"])
+def test_a_reversible_action_whose_capability_no_longer_holds_is_refused_at_dispatch(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, how: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-13: "A forward execution of a ``reversible``
+    action whose capability or custody no longer holds at dispatch is refused
+    ``not_reversible_now`` and its nomination goes to approval." A pre-dispatch
+    refusal (E6): the execution never reaches ``dispatched``, no ledger row is
+    written and the worker can no longer read the call's arguments.
+    """
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    nomination_id = _nominate(agent_id)
+    created = _create(nomination_id)
+    _lose_capability(agent_id, how)
+    claimed = client.post(
+        "/action-executions/claim",
+        json={"lease_owner": "worker-a", "lease_seconds": 60},
+        headers=worker_headers(),
+    )
+    assert claimed.status_code == 200, claimed.text
+    fence = {"lease_owner": claimed.json()["lease_owner"], "attempt": claimed.json()["attempt"]}
+
+    response = client.post(
+        f"/action-executions/{created.execution_id}/dispatch", json=fence, headers=worker_headers()
+    )
+
+    assert not (response.status_code == 200 and response.json().get("state") == "dispatched"), (
+        response.text
+    )
+    execution = _executions()[0]
+    assert execution["state"] == "refused"
+    assert execution["refusal_code"] == "not_reversible_now"
+    assert execution["dispatched_at"] is None
+    assert execution["subject_action_id"] is None
+    assert _ledger() == []
+    arguments = client.post(
+        f"/action-executions/{created.execution_id}/arguments",
+        json=fence,
+        headers=worker_headers(),
+    )
+    assert arguments.status_code != 200, arguments.text
+    assert _nomination(nomination_id)["state"] == "approval_requested"
+
+
+def test_an_idempotent_action_dispatches_without_a_restore_capability(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-13: the control. ``not_reversible_now`` applies
+    to ``reversible`` actions only; an ``idempotent`` one needs no restore pair.
+    """
+
+    agent_id = undoable_agent(client, auth_headers, tmp_path)
+    idempotent = {**DOCUMENT, "actions": [{**ACTION, "reversibility": "idempotent"}]}
+    _bind_policy(agent_id, {GENERATION: idempotent})
+    nomination_id = _nominate(agent_id)
+    created = _create(nomination_id)
+    _lose_capability(agent_id, "row-gone")
+
+    dispatched = _dispatch(client, created.execution_id)
+
+    assert dispatched["state"] == "dispatched"
+    assert len(_ledger()) == 1
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1: undo audit rows record the ``undo_ruling`` actor
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("closing", ["refused", "confirmed"])
+def test_an_undo_rulings_audit_rows_record_the_undo_ruling_actor(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, closing: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-14: ``actor_kind`` ``undo_ruling`` on the
+    authorized ruling row and on the restore's closing row, never empty.
+    """
+
+    agent_id = undoable_agent(client, auth_headers, tmp_path)
+    action = sealed_action(client, auth_headers, agent_id)
+    ruled = client.post(f"/actions/{action['id']}/undo", json={}, headers=operator_headers())
+    assert ruled.status_code == 202, ruled.text
+    execution_id = ruled.json()["execution_id"]
+    claimed = client.post(
+        "/action-executions/claim",
+        json={"lease_owner": "worker-a", "lease_seconds": 60},
+        headers=worker_headers(),
+    )
+    assert claimed.status_code == 200, claimed.text
+    fence = {"lease_owner": claimed.json()["lease_owner"], "attempt": claimed.json()["attempt"]}
+    if closing == "refused":
+        body: dict[str, Any] = {**fence, "state": "refused", "code": "tool_not_advertised"}
+    else:
+        observed = client.post(
+            f"/action-executions/{execution_id}/observation",
+            json={**fence, "version": POST_VERSION},
+            headers=worker_headers(),
+        )
+        assert observed.status_code == 200, observed.text
+        dispatch = client.post(
+            f"/action-executions/{execution_id}/dispatch", json=fence, headers=worker_headers()
+        )
+        assert dispatch.status_code == 200, dispatch.text
+        body = {**fence, "state": "confirmed"}
+    reported = client.post(
+        f"/action-executions/{execution_id}/outcome", json=body, headers=worker_headers()
+    )
+    assert reported.status_code == 200, reported.text
+
+    entries = _audit(client, auth_headers, action["id"])
+
+    assert [entry["action"] for entry in entries] == ["authorized", closing]
+    assert [entry["actor_kind"] for entry in entries] == ["undo_ruling", "undo_ruling"]
+    assert all(entry["actor"] for entry in entries)
+
+
+def test_a_refused_undo_audit_row_records_the_undo_ruling_actor(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-14: a refused ruling's row is ``undo_ruling`` too."""
+
+    agent_id = undoable_agent(client, auth_headers, tmp_path)
+    action = sealed_action(client, auth_headers, agent_id, failed=True)
+
+    ruled = client.post(f"/actions/{action['id']}/undo", json={}, headers=operator_headers())
+
+    assert ruled.status_code == 409, ruled.text
+    entries = _audit(client, auth_headers, action["id"])
+    assert len(entries) == 1
+    assert entries[0]["authorized"] is False
+    assert entries[0]["actor_kind"] == "undo_ruling"
