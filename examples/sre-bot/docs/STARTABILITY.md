@@ -123,6 +123,11 @@ Argument usage failures follow the same structured error contract.
 
 ### STARTABILITY-7: Pure and command tests
 
+The behavioral tests live at `examples/tests/test_startability_observer.py` in
+the existing root collection tree; this example does not change the root
+dependency manifest to add a new collection path.
+
+
 Pin the judgment against real current worker and protocol helpers, without
 stubbing or replacing the worker routing implementation. Exercise the actual
 command in subprocesses against fixture-backed Kubernetes and database clients.
