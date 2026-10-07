@@ -34,6 +34,12 @@ import uuid
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 
+# @spec ACTION-EXECUTOR-16: the reserved name the first release recognizes as
+# the sealing key, defined once in ``curie_internal.sealing_key``. Custody holds
+# only when the in-force version declares it as a ``SecretRef`` on the
+# connector that recorded the action; a plain named secret, another name, or
+# ``SNAPSHOT_SEALING_KEYS_RETAINED`` alone does not.
+from curie_internal.sealing_key import SEALING_KEY_NAME
 from plugin_format.connectors import SecretRef
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -53,12 +59,6 @@ from .storage import ObjectStore
 
 logger = logging.getLogger(__name__)
 
-# @spec ACTION-EXECUTOR-16: the reserved name the first release recognizes as
-# the sealing key. Custody holds only when the in-force version declares it as
-# a ``SecretRef`` on the connector that recorded the action; a plain named
-# secret, another name, or ``SNAPSHOT_SEALING_KEYS_RETAINED`` alone does not.
-SEALING_KEY_NAME = "SNAPSHOT_SEALING_KEY"
-
 # The platform's in-force rule, as hook_fire's ``_IN_FORCE_SQL`` and the
 # worker's binding ``_RESOLVE_SQL`` apply it: an active deployment, prod
 # outranks dev, then the most recent.
@@ -74,7 +74,11 @@ ORDER BY d.agent_id, (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DES
 
 
 def _sealed_connectors(data: bytes) -> frozenset[str]:
-    """Connectors whose declaration gives them custody of the sealing key."""
+    """Connectors whose declaration gives them custody of the sealing key.
+
+    Only a hosted connector: the key must reach "only the hosted connector",
+    and a ``SecretRef`` on a remote (``url:``) connector reaches no pod.
+    """
 
     settings = get_settings()
     with tempfile.TemporaryDirectory() as tmp:
@@ -89,7 +93,8 @@ def _sealed_connectors(data: bytes) -> frozenset[str]:
     return frozenset(
         name
         for name, spec in declared.connectors.items()
-        if any(
+        if spec.is_hosted
+        and any(
             isinstance(secret, SecretRef) and secret.name == SEALING_KEY_NAME
             for secret in spec.secrets
         )

@@ -84,6 +84,7 @@ from aci_protocol.turn import (
     matching_routes,
 )
 from curie_internal import sandbox_token
+from curie_internal.sealing_key import is_sealing_key_name
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel
 from sqlalchemy import text
@@ -1750,6 +1751,15 @@ def inject_connector_secrets(
             # k8s substrate would look for a sandbox secretKeyRef.
             logger.warning(
                 "Dropping connector secret withheld from the sandbox (never injected, never marked)"
+            )
+            continue
+        if is_sealing_key_name(name):
+            # @spec ACTION-EXECUTOR-16: the snapshot sealing key reaches only
+            # the hosted connector. Withheld from every sandbox and kept out of
+            # the marker, so the k8s substrate wires no secretKeyRef for it.
+            logger.warning(
+                "Dropping connector secret reserved for the sealing key "
+                "(never injected, never marked)"
             )
             continue
         if is_reserved_boot_env_name(name):

@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
+from curie_internal.sealing_key import custody_reason, is_sealing_key_name
 from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
 from plugin_format.connector_render import agent_forges_join
@@ -171,6 +172,11 @@ def _validate_secret_map(value: dict[str, str] | None) -> dict[str, str] | None:
                 "model-credential, or redirect/capture-capable key and cannot be "
                 "used for a connector secret"
             )
+        if is_sealing_key_name(name):
+            # @spec ACTION-EXECUTOR-16: the worker forwards these values into
+            # the sandbox env, and the sealing key must reach only the hosted
+            # connector, as a SecretRef in the bundle.
+            raise ValueError(custody_reason(name))
         if not secret:
             raise ValueError(f"secret {name!r} has an empty value")
     return value

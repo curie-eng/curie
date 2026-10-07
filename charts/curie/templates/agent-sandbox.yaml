@@ -158,6 +158,16 @@ roleRef:
 {{- end -}}
 {{- with .root }}
 {{- $runner := .Values.agentSandbox.runner }}
+{{- /* @spec ACTION-EXECUTOR-16: key custody. runner.extraEnv reaches every
+       agent's runner sandbox (outside the connector-secret marker, so
+       unredacted too), and the snapshot sealing key must reach only the hosted
+       connector: fail the render, naming the key and never its value. */}}
+{{- $sealing := splitList " " (trim (include "curie.sealingKeyNames" .)) }}
+{{- range $runner.extraEnv }}
+{{- if has .name $sealing }}
+{{- fail (printf "agentSandbox.runner.extraEnv contains %q, a reserved snapshot sealing key: it must reach only the hosted connector, so declare it as a SecretRef (from_secret) on that connector in the bundle, never in the runner environment" .name) }}
+{{- end }}
+{{- end }}
 {{- /* An agent whose bundle layers its own runner image (ADR-0173) renders
        that digest in every container that would run the platform runner. */}}
 {{- $runnerImageRef := include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) }}
