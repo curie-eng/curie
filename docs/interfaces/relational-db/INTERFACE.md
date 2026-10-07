@@ -138,6 +138,14 @@ kind check is replaced so `kind` gains `read`. Read executions are created only 
 `apps/api/src/curie_api/remediation_reads.py::create_read_execution`; the
 downgrade deletes them before restoring the check.
 
+Migration `0091_remediation_execution_code.py` (automated remediation,
+AUTOMATED-REMEDIATION-18) is additive. `remediation_nominations`
+(`apps/api/src/curie_api/models.py::RemediationNomination`) gains
+`execution_code`, nullable with no backfill: the code of a forward execution
+that ended `failed`, `indeterminate` or `refused` after admission, written when
+the nomination finishes `not-recovered` without a verifier
+(`apps/api/src/curie_api/remediation_verifier.py`). The downgrade drops it.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.
