@@ -14,15 +14,15 @@ when it admitted the delivery, never from the request:
   admission never wrote has no binding, and a binding's envelope must name the
   same event.
 * The admitted remediation generation is the envelope's
-  ``remediation_generation`` (AUTOMATED-REMEDIATION-4). The envelope schema does
-  not carry it yet (task 5, the protected lane owner's change under #3603), so
-  it is absent, which AUTOMATED-REMEDIATION-4 treats as "admitted before any
-  policy existed": every nomination goes to approval, never to execution.
+  ``remediation_generation`` (AUTOMATED-REMEDIATION-4), written at admission
+  from the policy generation current under the agent's source gate. A binding
+  written before the field existed, or one admitted with no policy bound, has
+  none, which AUTOMATED-REMEDIATION-4 sends to approval, never to execution.
 
-The broker read itself is the protected lane's closed enqueue transport
-(``curie_protected_hooks.broker_transport.AuthenticatedEnqueueClient``), whose
-surface exports no binding read today. Until it does, ``_read_binding`` fails
-closed as unavailable, so the route refuses with ``503`` rather than guessing.
+The binding is read through the protected lane's closed enqueue transport
+(``AuthenticatedEnqueueClient.read_binding``) on a fresh connection, and an
+unreadable broker or an invalid binding is ``BindingUnavailable`` (503), never
+a guess.
 """
 
 from __future__ import annotations
@@ -33,10 +33,15 @@ import uuid
 from dataclasses import dataclass
 from typing import Final
 
-from curie_protected_hooks.admission_records import parse_envelope
+from curie_protected_hooks.admission_records import REMEDIATION_GENERATION, parse_envelope
+from curie_protected_hooks.broker_metadata import BrokerMetadataUnavailable
+from curie_protected_hooks.broker_transport import (
+    AuthenticatedEnqueueClient,
+    metadata_reader_budget,
+)
 
 from .config import get_settings
-from .protected_ingress import read_ingress_runtime
+from .protected_ingress import BUDGET_SECONDS, read_ingress_runtime
 from .protected_runtime_files import IngressRuntime
 
 # The hook route's event id: ``hook-{agent.id}-{hook}-{sha16(delivery_id)}``.
@@ -64,12 +69,25 @@ class ProtectedEvent:
 def _read_binding(runtime: IngressRuntime, event_id: str) -> bytes | None:
     """The binding's envelope bytes, None when absent, else ``BindingUnavailable``.
 
-    The enqueue transport (PROTECTED-HOOK-LANE-3) is a closed surface that does
-    not yet export a binding read; adding one is the protected lane owner's
-    change (#3603, remediation task 5). Until then nothing is read and the route
-    fails closed. @spec AUTOMATED-REMEDIATION-6.
+    One enqueue connection under one budget, one ``read_binding`` (a plain GET;
+    the binding is never written, expired or deleted here), always closed.
+    @spec AUTOMATED-REMEDIATION-6 @spec PROTECTED-HOOK-LANE-3.
     """
-    raise BindingUnavailable()
+    client: AuthenticatedEnqueueClient | None = None
+    try:
+        with metadata_reader_budget(BUDGET_SECONDS):
+            client = AuthenticatedEnqueueClient.connect(
+                runtime.bootstrap.manifest, runtime.enqueue, runtime.bootstrap.ca_pem
+            )
+            return client.read_binding(event_id)
+    except BrokerMetadataUnavailable:
+        raise BindingUnavailable() from None
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except BrokerMetadataUnavailable:
+                pass
 
 
 async def resolve_protected_event(event_id: str) -> ProtectedEvent | None:
@@ -92,9 +110,12 @@ async def resolve_protected_event(event_id: str) -> ProtectedEvent | None:
         raise BindingUnavailable() from None
     if envelope.get("event_id") != event_id:
         raise BindingUnavailable()
+    # Absent from a binding written before the field: no admitted generation,
+    # which sends the turn to approval and never refuses it.
+    admitted = envelope.get(REMEDIATION_GENERATION)
     return ProtectedEvent(
         event_id=event_id,
         agent_id=uuid.UUID(shape["agent"]),
         hook=shape["hook"],
-        admitted_generation=None,
+        admitted_generation=None if admitted is None else int(admitted),
     )
