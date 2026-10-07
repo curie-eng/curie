@@ -88,6 +88,14 @@ _RECEIPT = {
 # @spec AUTOMATED-REMEDIATION-4: the remediation generation at admission, a
 # canonical generation or null; absent from records written before it existed.
 REMEDIATION_GENERATION = "remediation_generation"
+# @spec AUTOMATED-REMEDIATION-6 @spec AUTOMATED-REMEDIATION-15: the reply surface
+# the delivery's queued turn names (its ``reply_handle``: kind, channel, endpoint,
+# adapter), recorded in the intent, binding and receipt when the ingress asks
+# for it (remediation on), so a remediation approval is raised on the
+# delivery's own surface. Absent from records written without it.
+REPLY_HANDLE = "reply_handle"
+_REPLY_HANDLE_KEYS = frozenset({"kind", "channel", "endpoint", "adapter"})
+_OPTIONAL_RECORD_FIELDS = frozenset({REMEDIATION_GENERATION, REPLY_HANDLE})
 _STATE = {
     "schema_version": "version",
     "status": "status",
@@ -178,14 +186,35 @@ def _remediation_generation(value: Any) -> None:
         _scalar(value, "generation")
 
 
+def _reply_handle(value: Any) -> None:
+    """The delivery's reply surface, @spec AUTOMATED-REMEDIATION-6 AUTOMATED-REMEDIATION-15."""
+    _require(type(value) is dict and value.keys() == _REPLY_HANDLE_KEYS)
+    _logical(value["kind"])
+    _logical(value["channel"])
+    for field in ("endpoint", "adapter"):
+        if value[field] is not None:
+            _logical(value[field])
+
+
+def reply_handle_record(
+    kind: str, channel: str, endpoint: str | None, adapter: str | None
+) -> dict[str, Any]:
+    """A turn's reply handle as an admission record field. @spec AUTOMATED-REMEDIATION-6."""
+    value = {"kind": kind, "channel": channel, "endpoint": endpoint, "adapter": adapter}
+    _reply_handle(value)
+    return value
+
+
 def _validate(value: Any, schema: dict[str, str]) -> None:
     """@spec PROTECTED-HOOK-ADMISSION-2/3 PROTECTED-HOOK-LANE-2 AUTOMATED-REMEDIATION-4."""
     _require(type(value) is dict)
     if schema is _ENVELOPE or schema is _INTENT or schema is _RECEIPT:
         extra = value.keys() - schema.keys()
-        _require(extra <= {REMEDIATION_GENERATION} and schema.keys() <= value.keys())
-        if extra:
+        _require(extra <= _OPTIONAL_RECORD_FIELDS and schema.keys() <= value.keys())
+        if REMEDIATION_GENERATION in extra:
             _remediation_generation(value[REMEDIATION_GENERATION])
+        if REPLY_HANDLE in extra:
+            _reply_handle(value[REPLY_HANDLE])
     else:
         _require(value.keys() == schema.keys())
     for field, kind in schema.items():
@@ -404,6 +433,7 @@ class AdmissionRequest:
     request_body_sha256: str
     queued_payload: bytes
     remediation_generation: str | None
+    record_reply_handle: bool
 
     def __init__(
         self,
@@ -414,12 +444,15 @@ class AdmissionRequest:
         request_body_sha256: str,
         queued_payload: bytes,
         remediation_generation: str | None = None,
+        record_reply_handle: bool = False,
     ) -> None:
         """@spec PROTECTED-HOOK-ADMISSION-2 PROTECTED-HOOK-SOURCE-6/8 AUTOMATED-REMEDIATION-4.
 
         ``remediation_generation`` is the hook's remediation policy generation
         current at admission, read by the ingress under the agent gate, or None
-        when no policy is bound.
+        when no policy is bound. ``record_reply_handle`` (remediation on) records
+        the queued turn's reply handle in the intent, binding and receipt
+        (AUTOMATED-REMEDIATION-6, -15).
         """
         try:
             _require(type(identity) is DeliveryIdentity)
@@ -437,6 +470,7 @@ class AdmissionRequest:
             )
             _scalar(request_body_sha256, "sha256")
             _remediation_generation(remediation_generation)
+            _require(type(record_reply_handle) is bool)
             policy_bytes = _encode(policy)
             _require(len(policy_bytes) <= _MAX_METADATA)
             payload = _decode(queued_payload, _MAX_PAYLOAD)
@@ -463,6 +497,7 @@ class AdmissionRequest:
                 ("request_body_sha256", request_body_sha256),
                 ("queued_payload", queued_payload),
                 ("remediation_generation", remediation_generation),
+                ("record_reply_handle", record_reply_handle),
             ):
                 object.__setattr__(self, field, value)
         except (ValueError, TypeError, OverflowError, RecursionError):

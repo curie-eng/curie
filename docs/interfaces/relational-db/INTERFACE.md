@@ -173,10 +173,15 @@ per-agent admission lock. Both cascade with the agent (reservations also with
 the nomination). `remediation_nominations.approval_reason` names the admission
 check that sent a nomination to approval, one of the frozen `approval_reasons`
 of `tests/vectors/remediation-codes.json`, and
-`remediation_nomination_submissions.conversation_id` keeps the protected
-delivery's conversation for the approval request; existing rows read NULL.
+`remediation_nomination_submissions` gains `conversation_id` and the reply
+surface (`reply_kind`, `reply_channel`, `reply_endpoint`, `reply_adapter`) read
+from the delivery's protected binding, which the approval request is raised on;
+existing rows read NULL. `remediation_nominations_refusal_ck` gains
+`reply_surface_unavailable`.
 Rows are written by `apps/api/src/curie_api/remediation_admission.py` and
-`remediation_limits.py`; the downgrade drops both tables and both columns.
+`remediation_limits.py`; the downgrade drops both tables and the added columns,
+deletes nominations refused `reply_surface_unavailable` and restores the refusal
+check.
 
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,

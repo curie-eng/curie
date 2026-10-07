@@ -2387,6 +2387,13 @@ class RemediationNominationSubmission(Base):
     # ``logical_conversation_key``), which an approval raised later names
     # (AUTOMATED-REMEDIATION-15). NULL for a submission recorded before 0093.
     conversation_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # The reply surface the delivery's turn named (its binding's ``reply_handle``),
+    # which an approval is raised on (AUTOMATED-REMEDIATION-15). NULL when the
+    # binding recorded none.
+    reply_kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_channel: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_endpoint: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_adapter: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -2408,7 +2415,8 @@ class RemediationNomination(Base):
         ),
         CheckConstraint(
             "refusal_code IS NULL OR refusal_code IN ('nomination_malformed', 'unknown_action', "
-            "'nomination_duplicate', 'arguments_schema_mismatch', 'agent_stopped')",
+            "'nomination_duplicate', 'arguments_schema_mismatch', 'agent_stopped', "
+            "'reply_surface_unavailable')",
             name="remediation_nominations_refusal_ck",
         ),
         CheckConstraint(

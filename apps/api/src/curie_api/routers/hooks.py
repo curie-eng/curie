@@ -692,6 +692,9 @@ async def _ingest_protected(
                     request_body_sha256=hashlib.sha256(raw).hexdigest(),
                     queued_payload=payload,
                     remediation_generation=remediation_generation,
+                    # AUTOMATED-REMEDIATION-6, -15: the binding names the turn's
+                    # reply surface, which a remediation approval is raised on.
+                    record_reply_handle=settings.remediation_enabled,
                 )
             except ValueError:
                 raise HTTPException(

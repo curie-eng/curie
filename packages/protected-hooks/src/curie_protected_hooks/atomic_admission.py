@@ -19,6 +19,7 @@ from redis import Redis
 
 from .admission_records import (
     REMEDIATION_GENERATION,
+    REPLY_HANDLE,
     AdmissionRequest,
     AdmissionResult,
     AdmissionUnavailable,
@@ -32,6 +33,7 @@ from .admission_records import (
     parse_intent,
     parse_selection,
     parse_state,
+    reply_handle_record,
 )
 from .admission_scripts import TRANSACTION
 from .authority_evaluation import (
@@ -383,6 +385,7 @@ class AtomicAdmission:
                     or ed["logical_conversation_key"] != original["conversation_id"]
                     or ed.get(REMEDIATION_GENERATION, _ABSENT)
                     != original.get(REMEDIATION_GENERATION, _ABSENT)
+                    or ed.get(REPLY_HANDLE, _ABSENT) != original.get(REPLY_HANDLE, _ABSENT)
                 ):
                     raise AdmissionUnavailable()
                 envelope_raw = binding
@@ -534,6 +537,14 @@ class AtomicAdmission:
                 # still reads them (AUTOMATED-REMEDIATION-4).
                 if request.remediation_generation is not None:
                     original[REMEDIATION_GENERATION] = request.remediation_generation
+                # The delivery's reply surface, only when the ingress asks for it
+                # (AUTOMATED-REMEDIATION-6, -15): the nomination route reads it
+                # from the binding to raise an approval on the delivery's surface.
+                if request.record_reply_handle and turn.reply_handle is not None:
+                    handle = turn.reply_handle
+                    original[REPLY_HANDLE] = reply_handle_record(
+                        handle.kind, handle.channel, handle.endpoint, handle.adapter
+                    )
                 envelope_raw = self._envelope(original, manifest).canonical_bytes
                 original["envelope_sha256"] = hashlib.sha256(envelope_raw).hexdigest()
                 params.update(mode="new", intent=original)
@@ -572,8 +583,9 @@ class AtomicAdmission:
     def _envelope(intent: dict[str, Any], manifest: dict[str, Any]) -> Envelope:
         """The binding, @spec PROTECTED-HOOK-ADMISSION-3/4/5 AUTOMATED-REMEDIATION-4.
 
-        It carries the intent's remediation generation exactly when the intent
-        does, so a pre-field intent recovers to the same envelope digest.
+        It carries the intent's remediation generation and reply handle exactly
+        when the intent does, so a pre-field intent recovers to the same
+        envelope digest (AUTOMATED-REMEDIATION-4, -6).
         """
         value = dict(
             schema_version=1,
@@ -596,6 +608,8 @@ class AtomicAdmission:
         )
         if REMEDIATION_GENERATION in intent:
             value[REMEDIATION_GENERATION] = intent[REMEDIATION_GENERATION]
+        if REPLY_HANDLE in intent:
+            value[REPLY_HANDLE] = intent[REPLY_HANDLE]
         return Envelope(_encode(value))
 
 

@@ -25,11 +25,17 @@ a well-formed nomination to approval (AUTOMATED-REMEDIATION-8), one of the
 frozen ``approval_reasons`` of ``tests/vectors/remediation-codes.json``.
 Existing rows read NULL.
 
-``remediation_nomination_submissions.conversation_id`` keeps the protected
-delivery's conversation (the envelope's ``logical_conversation_key``), which an
-approval raised after the binding is gone still names. Existing rows read NULL.
+``remediation_nomination_submissions`` gains the protected delivery's
+conversation (the envelope's ``logical_conversation_key``) and reply surface
+(the envelope's ``reply_handle``: ``reply_kind``, ``reply_channel``,
+``reply_endpoint``, ``reply_adapter``), which an approval raised after the
+binding is gone is raised on (AUTOMATED-REMEDIATION-15). Existing rows read
+NULL. ``remediation_nominations_refusal_ck`` gains ``reply_surface_unavailable``:
+a nomination whose delivery recorded no reply surface has nowhere to ask.
 
-The downgrade drops both tables and both columns.
+The downgrade drops both tables and the added columns, deletes the nominations
+refused ``reply_surface_unavailable`` (they never executed or asked) and
+restores the refusal check.
 
 @spec AUTOMATED-REMEDIATION-8 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-11
 """
@@ -51,6 +57,23 @@ RESERVATIONS = "remediation_reservations"
 NOMINATIONS = "remediation_nominations"
 SUBMISSIONS = "remediation_nomination_submissions"
 REASON_CHECK = "remediation_nominations_approval_reason_ck"
+REFUSAL_CHECK = "remediation_nominations_refusal_ck"
+REFUSALS_BEFORE = (
+    "refusal_code IS NULL OR refusal_code IN ('nomination_malformed', 'unknown_action', "
+    "'nomination_duplicate', 'arguments_schema_mismatch', 'agent_stopped')"
+)
+REFUSALS_WITH_REPLY = (
+    "refusal_code IS NULL OR refusal_code IN ('nomination_malformed', 'unknown_action', "
+    "'nomination_duplicate', 'arguments_schema_mismatch', 'agent_stopped', "
+    "'reply_surface_unavailable')"
+)
+SUBMISSION_COLUMNS = (
+    "conversation_id",
+    "reply_kind",
+    "reply_channel",
+    "reply_endpoint",
+    "reply_adapter",
+)
 
 # tests/vectors/remediation-codes.json ``approval_reasons``, frozen here.
 APPROVAL_REASONS = (
@@ -147,15 +170,22 @@ def upgrade() -> None:
         f"approval_reason IS NULL OR approval_reason IN ({reasons})",
         schema=SCHEMA,
     )
-    op.add_column(
-        SUBMISSIONS, sa.Column("conversation_id", sa.Text(), nullable=True), schema=SCHEMA
-    )
+    for column in SUBMISSION_COLUMNS:
+        op.add_column(SUBMISSIONS, sa.Column(column, sa.Text(), nullable=True), schema=SCHEMA)
+    op.drop_constraint(REFUSAL_CHECK, NOMINATIONS, type_="check", schema=SCHEMA)
+    op.create_check_constraint(REFUSAL_CHECK, NOMINATIONS, REFUSALS_WITH_REPLY, schema=SCHEMA)
 
 
 def downgrade() -> None:
     """@spec AUTOMATED-REMEDIATION-8 @spec AUTOMATED-REMEDIATION-10
     @spec AUTOMATED-REMEDIATION-11."""
-    op.drop_column(SUBMISSIONS, "conversation_id", schema=SCHEMA)
+    op.execute(
+        f"DELETE FROM {SCHEMA}.{NOMINATIONS} WHERE refusal_code = 'reply_surface_unavailable'"
+    )
+    op.drop_constraint(REFUSAL_CHECK, NOMINATIONS, type_="check", schema=SCHEMA)
+    op.create_check_constraint(REFUSAL_CHECK, NOMINATIONS, REFUSALS_BEFORE, schema=SCHEMA)
+    for column in reversed(SUBMISSION_COLUMNS):
+        op.drop_column(SUBMISSIONS, column, schema=SCHEMA)
     op.drop_constraint(REASON_CHECK, NOMINATIONS, type_="check", schema=SCHEMA)
     op.drop_column(NOMINATIONS, "approval_reason", schema=SCHEMA)
     op.drop_index("ix_remediation_reservations_agent", table_name=RESERVATIONS, schema=SCHEMA)

@@ -102,7 +102,6 @@ from .killswitch import KillSwitch
 from .models import (
     ActionExecution,
     AgentAction,
-    AgentChannel,
     ConnectorCapability,
     ExecutionKind,
     ExecutionState,
@@ -165,6 +164,7 @@ PRECONDITION_NOT_MET: Final = "precondition_not_met"
 PRECONDITION_UNAVAILABLE: Final = "precondition_unavailable"
 ADMISSION_UNREADABLE: Final = "admission_unreadable"
 POLICY_CHANGED: Final = "policy_changed"
+REPLY_SURFACE_UNAVAILABLE: Final = "reply_surface_unavailable"
 
 # The precondition read's idempotency key: ``remediation:<nomination id>:precondition``.
 _PRECONDITION: Final = "precondition"
@@ -631,47 +631,42 @@ async def _reserve_and_read(
 # --------------------------------------------------------------------------- #
 
 
-async def _delivery_turn(session: AsyncSession, nomination: RemediationNomination) -> QueuedTurn:
-    """The protected delivery's turn as an approval request needs it.
+async def _delivery_turn(
+    session: AsyncSession, nomination: RemediationNomination
+) -> QueuedTurn | None:
+    """The protected delivery's turn as an approval request needs it, or None.
 
-    @spec AUTOMATED-REMEDIATION-15: only its conversation and reply handle are
-    used, never its text. The conversation is the one recorded with the
-    submission (the binding's ``logical_conversation_key``); the reply surface
-    is the agent's binding the hook route selects without a surface selector
-    (its only binding), else the binding the approval route resolves to, else
-    none, which raises no approval.
+    @spec AUTOMATED-REMEDIATION-15: ``reply_kind`` and ``reply_channel`` (and
+    the nullable reply columns) are copied from the protected delivery's
+    ``QueuedTurn``, never its text. Both were recorded on the submission row at
+    nomination time from the delivery's binding (its ``logical_conversation_key``
+    and ``reply_handle``), so the surface is the one the delivery selected even
+    after the agent's channels change. None when the submission recorded no
+    reply surface: there is nowhere to ask, and nothing is guessed.
     """
 
-    conversation = await session.scalar(
-        select(RemediationNominationSubmission.conversation_id).where(
+    submission = await session.scalar(
+        select(RemediationNominationSubmission).where(
             RemediationNominationSubmission.event_id == nomination.event_id
         )
     )
-    channels = (
-        await session.scalars(
-            select(AgentChannel)
-            .where(AgentChannel.agent_id == nomination.agent_id)
-            .order_by(AgentChannel.id)
-        )
-    ).all()
-    handle: ReplyHandle | None = None
-    if len(channels) == 1:
-        channel = channels[0]
-        handle = ReplyHandle(
-            kind=channel.kind,
-            channel=channel.address,
-            placeholder=None,
-            endpoint=channel.endpoint,
-            adapter=channel.adapter,
-        )
+    if submission is None or not submission.reply_kind or not submission.reply_channel:
+        return None
     return QueuedTurn(
         event_id=nomination.event_id,
-        conversation_id=conversation or hook_conversation_id(nomination.agent_id, nomination.hook),
+        conversation_id=submission.conversation_id
+        or hook_conversation_id(nomination.agent_id, nomination.hook),
         author=f"hook:{nomination.hook}",
         text="",
         source=TurnSource.WEBHOOK,
         tool_access=ToolAccess.READ_ONLY,
-        reply_handle=handle,
+        reply_handle=ReplyHandle(
+            kind=submission.reply_kind,
+            channel=submission.reply_channel,
+            placeholder=None,
+            endpoint=submission.reply_endpoint,
+            adapter=submission.reply_adapter,
+        ),
         received_at=datetime.now(UTC).isoformat(),
     )
 
@@ -682,8 +677,10 @@ async def raise_approval(
     """Raise (or attach to) the approval of a nomination already sent to approval.
 
     @spec AUTOMATED-REMEDIATION-15. The nomination is ``approval_requested``
-    with its ``approval_reason``; this names the approval on it. A failure
-    leaves it for ``reconcile_admissions``. Commits; returns the approval id.
+    with its ``approval_reason``; this names the approval on it, on the reply
+    surface its delivery recorded. A nomination whose delivery recorded none,
+    and any other failure, is left for ``reconcile_admissions``. Commits;
+    returns the approval id.
     """
 
     try:
@@ -700,6 +697,11 @@ async def raise_approval(
             await session.rollback()
             return approval_id
         turn = await _delivery_turn(session, nomination)
+        if turn is None:
+            # Nowhere to ask: nothing is guessed.
+            await session.rollback()
+            logger.warning("remediation approval has no reply surface nomination=%s", nomination_id)
+            return None
         requested = await request_remediation_approval(
             session,
             nomination_id,
@@ -1056,6 +1058,7 @@ async def reconcile_admissions(
     ``approval_requested`` nomination that names its reason but no approval.
     Each step is the same idempotent step the routes run. Returns how many it
     handled; failures are logged and retried on the next pass.
+
     """
 
     stranded = (

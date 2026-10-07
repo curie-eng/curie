@@ -150,6 +150,10 @@ async def record_submission(
             hook=event.hook,
             block_sha256=digest,
             conversation_id=event.conversation_id,
+            reply_kind=event.reply_kind,
+            reply_channel=event.reply_channel,
+            reply_endpoint=event.reply_endpoint,
+            reply_adapter=event.reply_adapter,
         )
         .on_conflict_do_nothing(index_elements=["event_id"])
         .returning(RemediationNominationSubmission.event_id)
