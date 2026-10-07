@@ -245,3 +245,46 @@ async def test_a_refused_write_is_raised_not_swallowed() -> None:
                 conversation_id="C1",
                 agent_id=None,
             )
+
+
+# -- ACTION-EXECUTOR-12: the connector digest rides the completion -------------
+#
+# The digest-attributing recorder wrapper hands its verdict to this client as
+# keyword arguments, so the kernel's two-argument ``complete(action_id, frame)``
+# keeps working unchanged.
+
+_DIGEST = "sha256:" + "ab" * 32
+
+
+async def _complete_with(**kwargs: Any) -> dict[str, Any]:
+    client, seen = _client(lambda _r: httpx.Response(200, json={"id": "a1"}))
+    async with client:
+        await ActionClient(api_base_url="http://api", api_key="k", client=client).complete(
+            "a1",
+            SideEffectFlag(tool="mcp__grafana__scale", call_id="c", result={"ok": True}),
+            **kwargs,
+        )
+    assert [s["path"] for s in seen] == ["/actions/a1/complete"]
+    body: dict[str, Any] = seen[0]["body"]
+    return body
+
+
+async def test_completion_forwards_the_connector_and_its_digest() -> None:
+    """@spec ACTION-EXECUTOR-12."""
+
+    body = await _complete_with(connector="grafana", connector_digest=_DIGEST)
+
+    assert body["connector"] == "grafana"
+    assert body["connector_digest"] == _DIGEST
+    assert body["result"] == {"ok": True}
+
+
+async def test_completion_without_attribution_sends_none() -> None:
+    """@spec ACTION-EXECUTOR-12: omitted or null, never a placeholder."""
+
+    for body in (
+        await _complete_with(connector=None, connector_digest=None),
+        await _complete_with(),
+    ):
+        assert body.get("connector") is None
+        assert body.get("connector_digest") is None
