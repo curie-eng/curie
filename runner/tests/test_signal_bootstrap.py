@@ -142,7 +142,9 @@ def test_runner_process_bootstraps_logs_and_metrics_without_endpoint_and_keeps_s
         assert telemetry._closed is True  # noqa: SLF001 - process ownership proof
 
         stderr_records = [
-            json.loads(line) for line in output.err.splitlines() if line.startswith("{")
+            json.loads(line)
+            for line in output.err.splitlines()
+            if line.startswith("{")
         ]
         messages = {record["message"] for record in stderr_records}
         assert "runner starting fake_model=True" in messages
@@ -223,7 +225,9 @@ def test_runner_turn_records_declared_metrics_through_configured_provider() -> N
 
     async def go() -> None:
         await runner.start()
-        async for _ in runner.run_turn(Event(type="message", text="go", user="U0EXAMPLE1", ts="1")):
+        async for _ in runner.run_turn(
+            Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+        ):
             pass
         await runner.close()
 
@@ -232,7 +236,9 @@ def test_runner_turn_records_declared_metrics_through_configured_provider() -> N
         assert provider.force_flush(timeout_millis=5000)
         points = _metric_points(reader)
 
-        assert {"curie.turn.accepted", "curie.turn.completed", "curie.turn.duration"} <= set(points)
+        assert {"curie.turn.accepted", "curie.turn.completed", "curie.turn.duration"} <= set(
+            points
+        )
         accepted = points["curie.turn.accepted"]
         assert len(accepted) == 1
         assert dict(accepted[0].attributes) == {

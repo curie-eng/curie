@@ -310,7 +310,9 @@ class _ProviderCapture:
             sorted(
                 name
                 for item in tools
-                if isinstance(item, dict) and isinstance((name := item.get("name")), str) and name
+                if isinstance(item, dict)
+                and isinstance((name := item.get("name")), str)
+                and name
             )
         )
 

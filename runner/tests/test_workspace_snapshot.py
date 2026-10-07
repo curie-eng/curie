@@ -28,7 +28,9 @@ def snapshot(monkeypatch: pytest.MonkeyPatch) -> Any:
 
 
 def _git(repo: Path, *args: str) -> str:
-    result = subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True)
+    result = subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    )
     return result.stdout.strip()
 
 
@@ -224,7 +226,9 @@ def test_snapshot_accepts_unquoted_and_c_quoted_git_headers_with_spaces(
 
 
 @pytest.mark.parametrize("size", [899_999, 900_000])
-def test_snapshot_patch_cap_accepts_every_raw_byte_through_900000(snapshot: Any, size: int) -> None:
+def test_snapshot_patch_cap_accepts_every_raw_byte_through_900000(
+    snapshot: Any, size: int
+) -> None:
     payload = b"x" * size
     assert snapshot.enforce_patch_cap(payload) == payload
 
@@ -243,12 +247,16 @@ def test_snapshot_patch_cap_rejects_900001_raw_bytes(snapshot: Any) -> None:
         b"diff --git a/link b/link\nnew file mode 120000\n",
     ],
 )
-def test_snapshot_refuses_unsafe_patch_paths_and_special_files(snapshot: Any, patch: bytes) -> None:
+def test_snapshot_refuses_unsafe_patch_paths_and_special_files(
+    snapshot: Any, patch: bytes
+) -> None:
     with pytest.raises(snapshot.WorkspaceSnapshotError):
         snapshot.validate_patch(patch)
 
 
-def test_snapshot_refuses_missing_empty_and_wrong_repository(snapshot: Any, tmp_path: Path) -> None:
+def test_snapshot_refuses_missing_empty_and_wrong_repository(
+    snapshot: Any, tmp_path: Path
+) -> None:
     with pytest.raises(snapshot.WorkspaceSnapshotError, match="workspace"):
         snapshot.capture_workspace_snapshot(tmp_path / "missing", expected_repo=REPO)
 
@@ -276,7 +284,7 @@ def _runner() -> SessionRunner:
 
 
 def test_snapshot_route_requires_runner_token_and_returns_base64_binary_patch(
-    snapshot: Any,
+    snapshot: Any
 ) -> None:
     captured = snapshot.WorkspaceSnapshot(
         repo_full_name=REPO,

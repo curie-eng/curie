@@ -356,16 +356,9 @@ def _two_round_script(*, include_boundaries: bool = True) -> list[object]:
 _FIRST_STREAMED_CALL_ID = "streamed-call-one-PLACEHOLDER"
 _SECOND_STREAMED_CALL_ID = "streamed-call-two-PLACEHOLDER"
 _PRIVATE_OTEL_VALUES = (
-    _STREAM_BODY,
-    _STREAM_ARGUMENT,
-    _TOOL_ARGUMENT,
-    _TOOL_RESULT,
-    _STREAM_UUID,
-    _STREAM_SESSION_ID,
-    _PARENT_TOOL_ID,
-    _TOOL_CALL_ID,
-    _FIRST_STREAMED_CALL_ID,
-    _SECOND_STREAMED_CALL_ID,
+    _STREAM_BODY, _STREAM_ARGUMENT, _TOOL_ARGUMENT, _TOOL_RESULT,
+    _STREAM_UUID, _STREAM_SESSION_ID, _PARENT_TOOL_ID, _TOOL_CALL_ID,
+    _FIRST_STREAMED_CALL_ID, _SECOND_STREAMED_CALL_ID,
     "sdk-result-session-PLACEHOLDER",
 )
 
@@ -531,10 +524,10 @@ def test_ttft_is_first_boundary_once_and_is_measured_from_each_round_start(
     generations = _spans_by_name(finished)["llm.generation"]
 
     assert observed_timestamps == list(timestamps)
-    assert [generation.attributes["curie.generation.ttft_ms"] for generation in generations] == [
-        7,
-        11,
-    ]
+    assert [
+        generation.attributes["curie.generation.ttft_ms"]
+        for generation in generations
+    ] == [7, 11]
 
 
 def test_steer_during_provider_wait_preserves_generation_and_ttft(
@@ -674,7 +667,9 @@ def test_fake_partial_boundaries_are_opt_in_payload_free_and_precede_each_assist
 
     default_messages = anyio.run(replay, FakeModelSession(lambda: script))
     assert default_messages == script
-    assert not any(isinstance(message, PartialMessageBoundary) for message in default_messages)
+    assert not any(
+        isinstance(message, PartialMessageBoundary) for message in default_messages
+    )
 
     boundary_messages = anyio.run(
         replay,
@@ -685,7 +680,11 @@ def test_fake_partial_boundaries_are_opt_in_payload_free_and_precede_each_assist
         for index, message in enumerate(boundary_messages)
         if isinstance(message, AssistantMessage)
     ]
-    boundaries = [boundary_messages[index - 1] for index in assistant_positions if index > 0]
+    boundaries = [
+        boundary_messages[index - 1]
+        for index in assistant_positions
+        if index > 0
+    ]
 
     assert len(assistant_positions) == 2
     assert boundaries == [
@@ -723,12 +722,9 @@ def test_two_streamed_tool_starts_without_final_tool_blocks_emit_two_intervals(
 
     assert len(generations) == 2
     assert len(tools) == 2
-    assert (
-        next(
-            span for span in generations if span.attributes["curie.generation.round"] == 1
-        ).end_time
-        == tools[0].start_time
-    )
+    assert next(
+        span for span in generations if span.attributes["curie.generation.round"] == 1
+    ).end_time == tools[0].start_time
     assert [span.attributes["gen_ai.tool.name"] for span in tools] == ["Bash", "Write"]
     assert [span.attributes["curie.tool.call.index"] for span in tools] == [1, 2]
     assert root.context is not None
@@ -746,7 +742,9 @@ def test_two_streamed_tool_starts_without_final_tool_blocks_emit_two_intervals(
         2 if repeat_final_blocks else 0
     )
     if repeat_final_blocks:
-        first = next(span for span in generations if span.attributes["curie.generation.round"] == 1)
+        first = next(
+            span for span in generations if span.attributes["curie.generation.round"] == 1
+        )
         assert first.attributes["gen_ai.usage.input_tokens"] == 23
         assert first.attributes["gen_ai.usage.output_tokens"] == 29
         assert first.attributes["gen_ai.usage.cache_read_input_tokens"] == 31
@@ -776,7 +774,9 @@ def test_streamed_tool_failure_status_matches_success_and_error_result(
         else [_tool_result(_TOOL_CALL_ID, is_error=tool_failed), _result()]
     )
     _, finished = _export_turn(
-        _adapter_session_factory([_streamed_tool_start(_TOOL_CALL_ID, "Read"), *tail])
+        _adapter_session_factory(
+            [_streamed_tool_start(_TOOL_CALL_ID, "Read"), *tail]
+        )
     )
     tool = _spans_by_name(finished)["execute_tool"][0]
 
@@ -858,7 +858,13 @@ def _wait_for_exact_trace_counts(
             counts = (
                 len(roots),
                 names.count("llm.generation"),
-                tuple(sorted(item["name"] for item in observations if item.get("type") == "TOOL")),
+                tuple(
+                    sorted(
+                        item["name"]
+                        for item in observations
+                        if item.get("type") == "TOOL"
+                    )
+                ),
             )
             if counts == (1, expected_generations, expected_tool_names):
                 return counts
@@ -1011,9 +1017,12 @@ def test_parallel_tools_are_root_siblings_and_reopen_provider_after_both_results
     assert [tool.attributes["curie.tool.call.index"] for tool in tools] == [1, 2]
     assert root.context is not None
     assert all(
-        tool.parent is not None and tool.parent.span_id == root.context.span_id for tool in tools
+        tool.parent is not None and tool.parent.span_id == root.context.span_id
+        for tool in tools
     )
-    second_tool = next(tool for tool in tools if tool.attributes["gen_ai.tool.name"] == "Grep")
+    second_tool = next(
+        tool for tool in tools if tool.attributes["gen_ai.tool.name"] == "Grep"
+    )
     assert generations[1].start_time is not None
     assert second_tool.end_time is not None
     assert generations[1].start_time >= second_tool.end_time
@@ -1082,7 +1091,8 @@ def test_run_emits_agent_generation_and_tool_spans() -> None:
     generations = spans["llm.generation"]
     assert len(generations) == 2
     assert all(
-        generation.attributes["gen_ai.request.model"] == "fake-model" for generation in generations
+        generation.attributes["gen_ai.request.model"] == "fake-model"
+        for generation in generations
     )
     assert generations[1].attributes["gen_ai.usage.output_tokens"] == 8
     assert spans["execute_tool"][0].attributes["gen_ai.tool.name"] == "Bash"
@@ -1119,7 +1129,8 @@ def test_generation_model_backfilled_from_sdk_when_unconfigured() -> None:
     generations = _spans_by_name(list(exporter.get_finished_spans()))["llm.generation"]
     assert len(generations) == 2
     assert all(
-        generation.attributes["gen_ai.request.model"] == "fake-model" for generation in generations
+        generation.attributes["gen_ai.request.model"] == "fake-model"
+        for generation in generations
     )
     # The usage counts only land on a model-bearing generation, so their presence
     # is the end-to-end proof the span was typed as a generation, not a bare span.
@@ -1490,7 +1501,8 @@ def test_successful_turn_sets_explicit_ok_status() -> None:
     assert root.attributes["curie.terminal.cause"] == "completed"
     assert root.attributes["curie.terminal.status"] == "succeeded"
     assert all(
-        generation.status.status_code is StatusCode.OK for generation in spans["llm.generation"]
+        generation.status.status_code is StatusCode.OK
+        for generation in spans["llm.generation"]
     )
 
 
@@ -1508,14 +1520,17 @@ def test_caught_runner_failure_sets_explicit_error_status() -> None:
     assert root.attributes["curie.terminal.cause"] == "classified_failure"
     assert root.attributes["curie.terminal.status"] == "failed"
     assert all(
-        generation.status.status_code is StatusCode.ERROR for generation in spans["llm.generation"]
+        generation.status.status_code is StatusCode.ERROR
+        for generation in spans["llm.generation"]
     )
 
 
 def test_classified_failure_uses_bounded_cause_without_raw_provider_reason() -> None:
     raw_reason = "private-provider-failure-reason-PLACEHOLDER"
     events, spans = _run_and_export(
-        lambda: FakeModelSession(lambda: [_result(is_error=True, terminal_reason=raw_reason)])
+        lambda: FakeModelSession(
+            lambda: [_result(is_error=True, terminal_reason=raw_reason)]
+        )
     )
     assert isinstance(events[-1], Final)
     assert events[-1].status is SessionStatus.CLASSIFIED_FAILURE
@@ -1532,7 +1547,9 @@ def test_classified_failure_uses_bounded_cause_without_raw_provider_reason() -> 
 @pytest.mark.parametrize("reason", ("aborted_streaming", "aborted_tools"))
 def test_sdk_abort_without_runner_interrupt_is_a_classified_failure(reason: str) -> None:
     events, spans = _run_and_export(
-        lambda: FakeModelSession(lambda: [_result(is_error=True, terminal_reason=reason)])
+        lambda: FakeModelSession(
+            lambda: [_result(is_error=True, terminal_reason=reason)]
+        )
     )
     assert [event.type for event in events] == ["error", "final"]
     assert isinstance(events[0], ErrorEvent)
@@ -1552,7 +1569,9 @@ def test_approval_halt_abort_is_a_paused_non_error_terminal() -> None:
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
-    gate = ApprovalGate(required=frozenset({"Bash"}), route_by_tool={"Bash": "ops"})
+    gate = ApprovalGate(
+        required=frozenset({"Bash"}), route_by_tool={"Bash": "ops"}
+    )
 
     async def record_gate(
         tool_name: str, tool_input: dict[str, Any], _context: Any
@@ -1649,7 +1668,9 @@ def test_interrupt_requested_wins_over_error_result_and_sdk_abort_reason() -> No
 
     async def go() -> None:
         await runner.start()
-        turn = runner.run_turn(Event(type="message", text="go", user="U0EXAMPLE1", ts="1"))
+        turn = runner.run_turn(
+            Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
+        )
         events.append(parse_ndjson_line(await anext(turn)))
         await runner.interrupt("operator stop")
         async for line in turn:
@@ -1780,7 +1801,9 @@ def test_abandoned_turn_reports_interrupted_not_stale_prior_success(
 
     anyio.run(go)
     outcomes = [
-        attributes["outcome"] for name, attributes in points if name == "curie.turn.completed"
+        attributes["outcome"]
+        for name, attributes in points
+        if name == "curie.turn.completed"
     ]
     assert outcomes == ["done", "interrupted", "done"]
 

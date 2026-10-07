@@ -185,7 +185,9 @@ def _probe_advertised_tools(
     monkeypatch: pytest.MonkeyPatch, names: list[str]
 ) -> mcp_tool_capability.McpToolCapabilityProbe:
     @asynccontextmanager
-    async def server_streams(*_args: Any, **_kwargs: Any) -> AsyncIterator[tuple[object, object]]:
+    async def server_streams(
+        *_args: Any, **_kwargs: Any
+    ) -> AsyncIterator[tuple[object, object]]:
         yield object(), object()
 
     class ToolListSession:
@@ -272,7 +274,9 @@ def test_conforming_mcp_tool_name_punctuation_reaches_catalog_projection(
 ) -> None:
     valid_names = ["write.denied", "write-denied", "write_denied"]
     result = _probe_advertised_tools(monkeypatch, valid_names)
-    expected = {f"mcp__operations__{tool_name}" for tool_name in valid_names}
+    expected = {
+        f"mcp__operations__{tool_name}" for tool_name in valid_names
+    }
 
     assert result.complete
     assert result.has_potential_write_tool
@@ -448,7 +452,9 @@ def test_a_bundle_with_no_policy_is_unchanged() -> None:
 
 @pytest.mark.parametrize("interceptor", ["hook", "callback"])
 @pytest.mark.parametrize("decision", ["allow", "approval", "deny", "unmatched"])
-def test_channel_read_tools_remain_inside_policy_scope(interceptor: str, decision: str) -> None:
+def test_channel_read_tools_remain_inside_policy_scope(
+    interceptor: str, decision: str
+) -> None:
     from plugin_format.connectors import CHANNEL_READ_SERVER_NAME
 
     collections = {
@@ -486,7 +492,9 @@ def test_the_callback_agrees_with_the_hook(tool: str) -> None:
     -- the defect class #1852 closed for the two invocation contexts."""
     gate = _gate(_policy(deny=["k8s-write/restart_deployment"]))
     callback = build_can_use_tool(gate)
-    result = anyio.run(callback, tool, {}, ToolPermissionContext(tool_use_id="toolu_policy_test"))
+    result = anyio.run(
+        callback, tool, {}, ToolPermissionContext(tool_use_id="toolu_policy_test")
+    )
     assert type(result).__name__ == "PermissionResultDeny"
 
 
@@ -560,7 +568,8 @@ def test_the_shipped_sre_bundle_can_still_reach_its_channel_memory() -> None:
     refused = [
         tool_name
         for tool_name in _CHANNEL_MEMORY_TOOLS
-        if "not permitted for this agent" in _interception_reason(gate, tool_name, "callback")
+        if "not permitted for this agent"
+        in _interception_reason(gate, tool_name, "callback")
     ]
 
     assert refused == [], (
@@ -750,7 +759,9 @@ def test_a_wildcarded_server_segment_cannot_reach_a_platform_tool(
 @pytest.mark.parametrize(
     "tool_name", ["mcp__curie-state__get", APPROVAL_TOOL_NAME], ids=["state", "curie"]
 )
-def test_each_platform_server_covers_its_own_tools(tool_name: str, interceptor: str) -> None:
+def test_each_platform_server_covers_its_own_tools(
+    tool_name: str, interceptor: str
+) -> None:
     """Both directions of the overlapping-name pair, in one table.
 
     `curie` is a prefix of `curie-state`, so a check that answered by walking
@@ -787,7 +798,9 @@ def test_a_server_that_merely_shares_a_platform_prefix_is_still_refused(
     """
 
     gate = _gate(_policy(allow=["k8s-write/restart_deployment"]))
-    assert "not permitted for this agent" in _interception_reason(gate, tool_name, "hook")
+    assert "not permitted for this agent" in _interception_reason(
+        gate, tool_name, "hook"
+    )
 
 
 @pytest.mark.parametrize("interceptor", ["hook", "callback"])
@@ -810,7 +823,9 @@ def test_a_plugin_mounted_bundle_server_named_curie_stays_inside_policy_scope(
         mcp_servers={"curie"},
         connector_servers=set(),
     )
-    reason = _interception_reason(gate, "mcp__plugin_sre-bot_curie__delete_everything", interceptor)
+    reason = _interception_reason(
+        gate, "mcp__plugin_sre-bot_curie__delete_everything", interceptor
+    )
 
     assert "not permitted for this agent" in reason
     _assert_no_approval_was_recorded(gate)
@@ -857,7 +872,9 @@ def test_a_platform_prefix_with_no_tool_left_ends_at_the_deny_default(
     """
 
     gate = _gate(_policy(allow=["k8s-write/restart_deployment"]))
-    assert "not permitted for this agent" in _interception_reason(gate, tool_name, "hook")
+    assert "not permitted for this agent" in _interception_reason(
+        gate, tool_name, "hook"
+    )
 
 
 @pytest.mark.parametrize("interceptor", ["hook", "callback"])

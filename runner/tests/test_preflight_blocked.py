@@ -81,7 +81,9 @@ def test_locked_fetch_without_registry_answers_every_turn_without_a_model(
         ) as booted:
             first = _assert_blocked_turn(await _turn(booted.runner, _ISSUE_TEXT))
             assert "model_started" not in booted.events
-            second = _assert_blocked_turn(await _turn(booted.runner, _EARLY_STOP_CONTINUATION))
+            second = _assert_blocked_turn(
+                await _turn(booted.runner, _EARLY_STOP_CONTINUATION)
+            )
             assert "model_started" not in booted.events
             assert booted.runner is not None
             await booted.runner.reset()

@@ -117,7 +117,9 @@ def test_mixed_read_only_and_write_tools_keep_write_capability(tmp_path: Path) -
     )
     # Even on a mixed surface that keeps the pager, the observed read-only tool
     # remains available to the receipt classifier by its SDK-visible name.
-    assert result.readonly_tools == frozenset({"mcp__plugin_acme-bot_inventory__inspect_or_change"})
+    assert result.readonly_tools == frozenset(
+        {"mcp__plugin_acme-bot_inventory__inspect_or_change"}
+    )
 
 
 def test_successful_observed_names_survive_a_sibling_probe_failure(
@@ -161,7 +163,10 @@ def test_successful_observed_names_survive_a_sibling_probe_failure(
         {f"{plugin_prefix}{name}" for name in names}
         | {f"{connector_prefix}{name}" for name in names}
     )
-    assert "mcp__plugin_acme-bot_operations__write_unmatched" not in result.observed_tools
+    assert (
+        "mcp__plugin_acme-bot_operations__write_unmatched"
+        not in result.observed_tools
+    )
     assert result.readonly_tools == frozenset(
         {f"{plugin_prefix}read_allowed", f"{connector_prefix}read_allowed"}
     )
@@ -192,7 +197,9 @@ def test_successful_read_only_names_survive_a_sibling_probe_failure(
     assert result.has_potential_write_tool
     assert result.tool_count == 1
     assert result.failures == ("operations",)
-    assert result.readonly_tools == frozenset({"mcp__plugin_acme-bot_inventory__inspect_or_change"})
+    assert result.readonly_tools == frozenset(
+        {"mcp__plugin_acme-bot_inventory__inspect_or_change"}
+    )
 
 
 def test_derived_connector_read_only_tool_uses_connector_runtime_prefix(

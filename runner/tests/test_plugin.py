@@ -41,7 +41,9 @@ def test_bundle_system_prompt_absent_is_none(tmp_path: Path) -> None:
     from curie_runner import load_bundle_system_prompt
 
     (tmp_path / ".claude-plugin").mkdir()
-    (tmp_path / ".claude-plugin" / "plugin.json").write_text('{"name": "demo"}', encoding="utf-8")
+    (tmp_path / ".claude-plugin" / "plugin.json").write_text(
+        '{"name": "demo"}', encoding="utf-8"
+    )
     assert load_bundle_system_prompt(str(tmp_path)) is None
     # No plugin dir, and a dir with no manifest, both resolve to None.
     assert load_bundle_system_prompt(None) is None
@@ -184,4 +186,6 @@ def test_a_missing_plugin_dir_with_a_set_ref_is_diagnosed(tmp_path: Path) -> Non
     from curie_runner.plugin import BUNDLE_REF_ENV
 
     with pytest.raises(PluginBundleError, match="containerName"):
-        load_plugins(str(tmp_path / "absent"), env={BUNDLE_REF_ENV: "bundles/agent-v7.tgz"})
+        load_plugins(
+            str(tmp_path / "absent"), env={BUNDLE_REF_ENV: "bundles/agent-v7.tgz"}
+        )

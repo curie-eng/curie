@@ -168,7 +168,9 @@ def _executable(bindir: Path, name: str, body: str) -> Path:
     return bindir
 
 
-def _uv_on_path(root: Path, marker: Path, *, exit_status: int = 0, error: str = "") -> Path:
+def _uv_on_path(
+    root: Path, marker: Path, *, exit_status: int = 0, error: str = ""
+) -> Path:
     return _executable(
         root / "bin",
         "uv",
@@ -186,7 +188,7 @@ def _recording_tool(bindir: Path, name: str, order: Path, *, exit_status: int = 
         f"printf '%s %s\\n' '{name}' \"$*\" >> '{order}'\n"
         'if [ "$1" = "run" ] && [ "$2" = "pytest" ]; then\n'
         '  test -f "$3/test_conversion.py" || exit 66\n'
-        "fi\n"
+        'fi\n'
         f"exit {exit_status}\n",
     )
 
@@ -267,7 +269,9 @@ async def _booted(
         result.events.append("usage_posted")
         return web.json_response({"recorded": True}, status=201)
 
-    app.router.add_post("/v1/work-item-progress/example-request/verification", record)
+    app.router.add_post(
+        "/v1/work-item-progress/example-request/verification", record
+    )
     app.router.add_post("/v1/work-item-progress/example-request/usage", record_usage)
 
     async with TestServer(app) as server:
@@ -337,7 +341,9 @@ def _assert_blocked_turn(outbound: list[Any]) -> Final:
     return final
 
 
-def _blocked_first_turn(tmp_path: Path, monkeypatch: Any, **kw: Any) -> tuple[_Boot, Final]:
+def _blocked_first_turn(
+    tmp_path: Path, monkeypatch: Any, **kw: Any
+) -> tuple[_Boot, Final]:
     """Boot, then run the issue turn; the run must stop before any model start."""
 
     async def run() -> tuple[_Boot, Final]:
@@ -418,7 +424,9 @@ def test_bundle_declared_command_runs_in_the_workspace_before_model_start(
     _executable(
         bindir,
         "factory-check",
-        f"printf '%s\\n' \"$*\" > '{marker}'\npwd > '{cwd_marker}'\nexit 0\n",
+        f"printf '%s\\n' \"$*\" > '{marker}'\n"
+        f"pwd > '{cwd_marker}'\n"
+        "exit 0\n",
     )
     bundle = {
         "checks": [
@@ -499,7 +507,9 @@ def test_repository_declaration_is_used_when_the_bundle_checks_are_empty(
     assert order.read_text(encoding="utf-8").splitlines() == ["repo-check "]
 
 
-def test_bundle_declaration_wins_when_both_declare(tmp_path: Path, monkeypatch: Any) -> None:
+def test_bundle_declaration_wins_when_both_declare(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
     bindir = tmp_path / "bin"
     order = tmp_path / "order"
     _recording_tool(bindir, "bundle-check", order)
@@ -587,7 +597,9 @@ def test_synced_environment_reports_passed_after_the_lockfile_install(
     bindir = _synced_uv_on_path(tmp_path, order)
     bundle = {"lockfile_installs": True, "checks": [_python_with_install()]}
 
-    received, events, prompt = _boot(tmp_path, monkeypatch, path=str(bindir), bundle=bundle)
+    received, events, prompt = _boot(
+        tmp_path, monkeypatch, path=str(bindir), bundle=bundle
+    )
 
     assert order.read_text(encoding="utf-8").splitlines() == [
         "sync --frozen",
@@ -730,7 +742,11 @@ def test_lockfile_pinned_install_is_accepted(tmp_path: Path, install: list[str])
             id="unpinned-pip-install",
         ),
         pytest.param(
-            {"checks": [{**_PYTHON_CHECK, "id": f"check_{index}"} for index in range(5)]},
+            {
+                "checks": [
+                    {**_PYTHON_CHECK, "id": f"check_{index}"} for index in range(5)
+                ]
+            },
             id="more-than-four-checks",
         ),
         pytest.param(
@@ -756,7 +772,9 @@ def test_lockfile_pinned_install_is_accepted(tmp_path: Path, install: list[str])
         pytest.param("{not json", id="not-json"),
     ],
 )
-def test_malformed_bundle_declaration_raises(tmp_path: Path, bundle: dict[str, Any] | str) -> None:
+def test_malformed_bundle_declaration_raises(
+    tmp_path: Path, bundle: dict[str, Any] | str
+) -> None:
     plugin, workspace = _declare(tmp_path, bundle=bundle)
 
     with pytest.raises(ValueError):
@@ -793,13 +811,19 @@ def test_malformed_repository_declaration_is_unreadable_not_fatal(
 # --- outcomes of a declared check ----------------------------------------------------
 
 
-def test_declared_check_that_passes_is_reported_passed(tmp_path: Path, monkeypatch: Any) -> None:
+def test_declared_check_that_passes_is_reported_passed(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
     marker = tmp_path / "uv-arguments"
     bindir = _uv_on_path(tmp_path, marker)
 
-    received, events, prompt = _boot(tmp_path, monkeypatch, path=str(bindir), probe_marker=marker)
+    received, events, prompt = _boot(
+        tmp_path, monkeypatch, path=str(bindir), probe_marker=marker
+    )
 
-    assert marker.read_text(encoding="utf-8").splitlines() == ["run pytest unitconv/tests -q"]
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "run pytest unitconv/tests -q"
+    ]
     assert (_workspace_dir(tmp_path) / "unitconv/tests/test_conversion.py").is_file()
     assert not (_workspace_dir(tmp_path) / "runner").exists()
     assert received == [(_record(outcome="passed", exit_status=0), _TOKEN)]
@@ -822,7 +846,9 @@ def test_a_declared_test_command_refuses_an_absent_foreign_test_path(
         monkeypatch,
         path=str(bindir),
         bundle={
-            "checks": [{**_PYTHON_CHECK, "command": ["uv", "run", "pytest", "missing_tests", "-q"]}]
+            "checks": [
+                {**_PYTHON_CHECK, "command": ["uv", "run", "pytest", "missing_tests", "-q"]}
+            ]
         },
     )
 
@@ -840,7 +866,9 @@ def test_declared_check_reports_missing_uv_without_network_fallback(
     empty_path.mkdir()
     bundle = {"checks": [{**_PYTHON_CHECK, "delegated_to": "unit-tests"}]}
 
-    received, events, prompt = _boot(tmp_path, monkeypatch, path=str(empty_path), bundle=bundle)
+    received, events, prompt = _boot(
+        tmp_path, monkeypatch, path=str(empty_path), bundle=bundle
+    )
 
     assert received == [
         (
@@ -871,9 +899,13 @@ def test_declared_check_that_fails_is_not_reported_as_passed(
     marker = tmp_path / "uv-arguments"
     bindir = _uv_on_path(tmp_path, marker, exit_status=9)
 
-    received, events, prompt = _boot(tmp_path, monkeypatch, path=str(bindir), probe_marker=marker)
+    received, events, prompt = _boot(
+        tmp_path, monkeypatch, path=str(bindir), probe_marker=marker
+    )
 
-    assert marker.read_text(encoding="utf-8").splitlines() == ["run pytest unitconv/tests -q"]
+    assert marker.read_text(encoding="utf-8").splitlines() == [
+        "run pytest unitconv/tests -q"
+    ]
     assert received == [(_record(outcome="failed", exit_status=9), _TOKEN)]
     assert events == ["probe_executed", "verification_posted", "model_started"]
     assert prompt is not None
@@ -881,10 +913,14 @@ def test_declared_check_that_fails_is_not_reported_as_passed(
     assert "Do not use publish_changes while this command fails" in prompt
 
 
-def test_started_check_with_missing_pytest_is_unavailable(tmp_path: Path, monkeypatch: Any) -> None:
+def test_started_check_with_missing_pytest_is_unavailable(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
     # #3873: undelegated, so blocked: the run stops before the model.
     marker = tmp_path / "uv-arguments"
-    bindir = _uv_on_path(tmp_path, marker, exit_status=127, error="command not found: pytest")
+    bindir = _uv_on_path(
+        tmp_path, marker, exit_status=127, error="command not found: pytest"
+    )
 
     booted, final = _blocked_first_turn(
         tmp_path, monkeypatch, path=str(bindir), probe_marker=marker, model=_MODEL
@@ -992,7 +1028,9 @@ def test_declared_check_runs_with_offline_package_manager_env(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     env_marker = tmp_path / "check-env"
-    bindir = _executable(tmp_path / "bin", "envcheck", f"/usr/bin/env > '{env_marker}'\nexit 0\n")
+    bindir = _executable(
+        tmp_path / "bin", "envcheck", f"/usr/bin/env > '{env_marker}'\nexit 0\n"
+    )
 
     received, _, _ = _boot(
         tmp_path,
@@ -1029,7 +1067,9 @@ def test_two_declared_checks_post_two_records_in_declaration_order(
     ]
     assert [body for body, _ in received] == [
         _record(outcome="passed", exit_status=0),
-        _record(check="rust", command="cargo test --locked", outcome="passed", exit_status=0),
+        _record(
+            check="rust", command="cargo test --locked", outcome="passed", exit_status=0
+        ),
     ]
     assert events == ["verification_posted", "verification_posted", "model_started"]
     assert prompt is not None
@@ -1268,7 +1308,9 @@ def test_path_globs_may_contain_spaces(tmp_path: Path) -> None:
         tmp_path, bundle={"checks": [{**_PYTHON_CHECK, "paths": ["docs/My File.md"]}]}
     )
 
-    assert load_verification_declaration(plugin, workspace).checks[0].paths == ("docs/My File.md",)
+    assert load_verification_declaration(plugin, workspace).checks[0].paths == (
+        "docs/My File.md",
+    )
 
 
 # --- #3873: delegated checks start the model -------------------------------------
@@ -1360,7 +1402,9 @@ def _units_check(**extra: Any) -> dict[str, Any]:
 
 def test_delegated_to_of_64_characters_is_accepted(tmp_path: Path) -> None:
     value = "d" * 64
-    plugin, workspace = _declare(tmp_path, bundle={"checks": [_units_check(delegated_to=value)]})
+    plugin, workspace = _declare(
+        tmp_path, bundle={"checks": [_units_check(delegated_to=value)]}
+    )
 
     declaration = load_verification_declaration(plugin, workspace)
 
@@ -1389,7 +1433,9 @@ _BAD_DELEGATED_TO = [
 def test_bundle_delegated_to_outside_the_rule_is_rejected_without_echo(
     tmp_path: Path, value: object
 ) -> None:
-    plugin, workspace = _declare(tmp_path, bundle={"checks": [_units_check(delegated_to=value)]})
+    plugin, workspace = _declare(
+        tmp_path, bundle={"checks": [_units_check(delegated_to=value)]}
+    )
 
     with pytest.raises(ValueError) as raised:
         load_verification_declaration(plugin, workspace)
@@ -1418,7 +1464,9 @@ def test_repository_delegated_to_outside_the_rule_is_unreadable_without_echo(
 
 
 def test_an_unknown_check_key_is_still_rejected(tmp_path: Path) -> None:
-    plugin, workspace = _declare(tmp_path, bundle={"checks": [_units_check(delegated="unit-ci")]})
+    plugin, workspace = _declare(
+        tmp_path, bundle={"checks": [_units_check(delegated="unit-ci")]}
+    )
 
     with pytest.raises(ValueError):
         load_verification_declaration(plugin, workspace)

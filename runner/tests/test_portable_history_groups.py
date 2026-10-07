@@ -201,25 +201,11 @@ def _reduced_turn(user_text, assistant_texts):
 # The shape of a durable hook thread written before group capture: a sequential
 # turn, a turn whose second batch ran two calls at once, then a later turn.
 def _legacy_thread():
-    earlier = (
-        _text("user", "acme first alert"),
-        _call(1, None),
-        _result(1),
-        _text("assistant", "acme first answer"),
-    )
-    ambiguous = (
-        _text("user", "acme second alert"),
-        _thinking(),
-        _call(2, None),
-        _result(2),
-        _thinking(),
-        _call(3, None),
-        _call(4, None),
-        _result(3),
-        _result(4),
-        _text("assistant", "acme second "),
-        _text("assistant", "answer"),
-    )
+    earlier = (_text("user", "acme first alert"), _call(1, None), _result(1),
+               _text("assistant", "acme first answer"))
+    ambiguous = (_text("user", "acme second alert"), _thinking(), _call(2, None), _result(2),
+                 _thinking(), _call(3, None), _call(4, None), _result(3), _result(4),
+                 _text("assistant", "acme second "), _text("assistant", "answer"))
     later = (_text("user", "acme third alert"), _text("assistant", "acme third answer"))
     return earlier, ambiguous, later
 

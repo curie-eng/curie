@@ -215,7 +215,9 @@ def test_structural_compaction_keeps_pending_approval_call_without_orphan_result
                 ConversationMessage(role="assistant", content=tool_blocks),
                 ConversationMessage(
                     role="user",
-                    content=[{"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}],
+                    content=[
+                        {"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}
+                    ],
                 ),
             ]
         )
@@ -300,7 +302,9 @@ def test_bounding_preserves_or_omits_complete_signed_and_image_blocks() -> None:
             ),
             ConversationMessage(
                 role="user",
-                content=[{"type": "tool_result", "tool_use_id": "read-image", "content": [image]}],
+                content=[
+                    {"type": "tool_result", "tool_use_id": "read-image", "content": [image]}
+                ],
             ),
             ConversationMessage(
                 role="assistant",

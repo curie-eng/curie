@@ -55,7 +55,10 @@ def _write_manifest(tmp_path, manifest: dict) -> str:
 
 async def _drain(runner, text: str) -> list[dict[str, object]]:
     lines = [
-        line async for line in runner.run_turn(Event(type="message", text=text, user="U", ts="1"))
+        line
+        async for line in runner.run_turn(
+            Event(type="message", text=text, user="U", ts="1")
+        )
     ]
     return [json.loads(line) for line in lines]
 
@@ -83,7 +86,9 @@ def test_empty_policy_and_env_preserve_bypass_without_workspace_on_fake_boot_pat
     tmp_path,
 ) -> None:
     plugin_dir = _write_manifest(tmp_path, {"name": "publisher"})
-    runner = build_runner(RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True)
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True
+    )
 
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
     assert gate is None
@@ -93,7 +98,9 @@ def test_empty_policy_and_env_preserve_bypass_without_workspace_on_real_boot_pat
     tmp_path,
 ) -> None:
     plugin_dir = _write_manifest(tmp_path, {"name": "publisher"})
-    runner = build_runner(RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=False)
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=False
+    )
 
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
     assert gate is None
@@ -115,10 +122,14 @@ def test_tool_policy_alone_constructs_both_live_interceptors(tmp_path) -> None:
         },
     )
     (tmp_path / "connectors.yaml").write_text(
-        "connectors:\n  kubernetes:\n    image: ghcr.io/example/kubernetes-mcp-server:0.0.1\n",
+        "connectors:\n"
+        "  kubernetes:\n"
+        "    image: ghcr.io/example/kubernetes-mcp-server:0.0.1\n",
         encoding="utf-8",
     )
-    runner = build_runner(RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True)
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True
+    )
 
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
     assert gate is not None
@@ -131,25 +142,35 @@ def test_tool_policy_alone_constructs_both_live_interceptors(tmp_path) -> None:
         denied = "mcp__kubernetes__resources_delete"
         unclassified = "mcp__kubernetes__configuration_view"
 
-        assert await hook({"tool_name": allowed, "tool_input": {}}, None, None) == {}
+        assert await hook(
+            {"tool_name": allowed, "tool_input": {}}, None, None
+        ) == {}
         assert isinstance(
             await callback(allowed, {}, ToolPermissionContext()),
             PermissionResultAllow,
         )
 
-        hook_refusal = await hook({"tool_name": denied, "tool_input": {}}, None, None)
+        hook_refusal = await hook(
+            {"tool_name": denied, "tool_input": {}}, None, None
+        )
         assert hook_refusal["hookSpecificOutput"]["permissionDecision"] == "deny"
         callback_refusal = await callback(denied, {}, ToolPermissionContext())
         assert isinstance(callback_refusal, PermissionResultDeny)
         assert gate.pending_summary is None
 
-        unclassified_refusal = await callback(unclassified, {}, ToolPermissionContext())
+        unclassified_refusal = await callback(
+            unclassified, {}, ToolPermissionContext()
+        )
         assert isinstance(unclassified_refusal, PermissionResultDeny)
         assert gate.pending_summary is None
 
-        hook_block = await hook({"tool_name": approval_required, "tool_input": {}}, None, None)
+        hook_block = await hook(
+            {"tool_name": approval_required, "tool_input": {}}, None, None
+        )
         assert hook_block["hookSpecificOutput"]["permissionDecision"] == "deny"
-        callback_block = await callback(approval_required, {}, ToolPermissionContext())
+        callback_block = await callback(
+            approval_required, {}, ToolPermissionContext()
+        )
         assert isinstance(callback_block, PermissionResultDeny)
         assert gate.pending_summary is not None
 
@@ -166,7 +187,9 @@ def test_tool_policy_allow_preserves_a_separate_legacy_connector_gate(
         tmp_path,
         {
             "name": "acme-bot",
-            "approvalPolicy": {"gates": [{"gate": tool, "route": "sre-approvals"}]},
+            "approvalPolicy": {
+                "gates": [{"gate": tool, "route": "sre-approvals"}]
+            },
             "toolPolicy": {
                 "enforcement": "curie/mcp-tool-policy@1",
                 "allow": ["self-upgrade/upgrade_platform"],
@@ -176,17 +199,23 @@ def test_tool_policy_allow_preserves_a_separate_legacy_connector_gate(
         },
     )
     (tmp_path / "connectors.yaml").write_text(
-        "connectors:\n  self-upgrade:\n    image: ghcr.io/example/self-upgrade:0.0.1\n",
+        "connectors:\n"
+        "  self-upgrade:\n"
+        "    image: ghcr.io/example/self-upgrade:0.0.1\n",
         encoding="utf-8",
     )
-    runner = build_runner(RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True)
+    runner = build_runner(
+        RunnerConfig.from_env(_base_env(plugin_dir)), fake_model=True
+    )
     gate = runner._approval_gate  # noqa: SLF001 - boot wiring is the assertion
     assert gate is not None
     hook = build_approval_hook(gate)["PreToolUse"][0].hooks[0]
     callback = build_can_use_tool(gate)
 
     async def go() -> None:
-        hook_result = await hook({"tool_name": tool, "tool_input": {}}, None, None)
+        hook_result = await hook(
+            {"tool_name": tool, "tool_input": {}}, None, None
+        )
         assert hook_result["hookSpecificOutput"]["permissionDecision"] == "deny"
         callback_result = await callback(tool, {}, ToolPermissionContext())
         assert isinstance(callback_result, PermissionResultDeny)

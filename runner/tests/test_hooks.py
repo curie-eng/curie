@@ -68,7 +68,9 @@ def test_factory_progress_credentials_wire_foreground_guard_into_session_options
 
     assert options.hooks is not None
     matcher = next(
-        matcher for matcher in options.hooks["PreToolUse"] if matcher.matcher == "Bash|Agent|Task"
+        matcher
+        for matcher in options.hooks["PreToolUse"]
+        if matcher.matcher == "Bash|Agent|Task"
     )
     (callback,) = matcher.hooks
     denied = anyio.run(

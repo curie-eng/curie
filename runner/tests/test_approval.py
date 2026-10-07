@@ -364,7 +364,9 @@ def test_publish_tool_is_always_listed_but_unmounted_invocation_refuses() -> Non
         # Discovery is unconditional so the model knows how publication works,
         # but authority remains mount-keyed: an unmounted session has no gate.
         assert (
-            build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=False)
+            build_approval_gate(
+                operator_tools=None, policy_routes={}, managed_workspace=False
+            )
             is None
         )
         mounted_gate = build_approval_gate(
@@ -1197,7 +1199,9 @@ def test_publish_permission_block_carries_policy_route() -> None:
 
 def test_publish_gate_denial_has_exact_trusted_provenance_and_no_route() -> None:
     async def go() -> None:
-        gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
+        gate = build_approval_gate(
+            operator_tools=None, policy_routes={}, managed_workspace=True
+        )
         assert gate is not None
         result = await build_can_use_tool(gate)(
             PLATFORM_PUBLISH_TOOL_NAME,
@@ -1216,7 +1220,9 @@ def test_publish_gate_denial_has_exact_trusted_provenance_and_no_route() -> None
 
 def test_invalid_publish_proposal_creates_no_pending_approval() -> None:
     async def go() -> None:
-        gate = build_approval_gate(operator_tools=None, policy_routes={}, managed_workspace=True)
+        gate = build_approval_gate(
+            operator_tools=None, policy_routes={}, managed_workspace=True
+        )
         assert gate is not None
         result = await build_can_use_tool(gate)(
             PLATFORM_PUBLISH_TOOL_NAME, {"title": "   ", "body": "ignored"}, ToolPermissionContext()
@@ -1313,10 +1319,9 @@ def test_observe_publication_is_idempotent_for_a_duplicate_call() -> None:
     # publish_changes twice in one turn creates two approvals for one action, and
     # the human resolves against the second while the first stays pending.
     gate = _managed_publish_gate()
-    assert (
-        anyio.run(gate.observe_publication, "publish-1", {"title": "First proposal", "body": "one"})
-        is True
-    )
+    assert anyio.run(
+        gate.observe_publication, "publish-1", {"title": "First proposal", "body": "one"}
+    ) is True
     first_summary = gate.pending_summary
 
     second = anyio.run(
@@ -1355,14 +1360,9 @@ def test_observe_publication_never_overwrites_a_hook_recorded_block() -> None:
     gate.block(PLATFORM_PUBLISH_TOOL_NAME, {"title": "Hook recorded", "body": "hook body"})
     hook_summary = gate.pending_summary
 
-    assert (
-        anyio.run(
-            gate.observe_publication,
-            "publish-1",
-            {"title": "Stream observed", "body": "stream body"},
-        )
-        is False
-    )
+    assert anyio.run(
+        gate.observe_publication, "publish-1", {"title": "Stream observed", "body": "stream body"}
+    ) is False
 
     assert gate.pending_summary == hook_summary
     assert gate.publication_title == "Hook recorded"
@@ -1390,19 +1390,17 @@ def test_observe_publication_never_mints_a_grant() -> None:
     # build_approval_gate already refuses to carry a publish grant (safe_grant_tool).
     assert gate.grant_tool is None
 
-    assert (
-        anyio.run(gate.observe_publication, "publish-1", {"title": "Ship changes", "body": "body"})
-        is True
-    )
+    assert anyio.run(
+        gate.observe_publication, "publish-1", {"title": "Ship changes", "body": "body"}
+    ) is True
 
     assert gate.grant_tool is None
     assert gate.consume_grant(PLATFORM_PUBLISH_TOOL_NAME) is False
     # And the record it wrote is still the one-per-turn record: a second call
     # blocks again rather than being waved through.
-    assert (
-        anyio.run(gate.observe_publication, "publish-2", {"title": "Ship changes", "body": "body"})
-        is False
-    )
+    assert anyio.run(
+        gate.observe_publication, "publish-2", {"title": "Ship changes", "body": "body"}
+    ) is False
     assert gate.pending_granted_tool == PLATFORM_PUBLISH_TOOL_NAME
 
 
@@ -3180,7 +3178,9 @@ def test_route_normalization_vector_matches_the_runtime_loader(tmp_path) -> None
         manifest: dict[str, object] = {"name": "route-vector", "version": "0.1.0"}
         if case["gates"] is not None:
             manifest["approvalPolicy"] = {"gates": case["gates"]}
-        (root / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+        (root / ".claude-plugin" / "plugin.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
 
         if case["expected"] == "rejected":
             with pytest.raises(ApprovalPolicyError):
@@ -3193,6 +3193,7 @@ def test_route_normalization_vector_matches_the_runtime_loader(tmp_path) -> None
             f"frozen vector says {case['expected']!r} -- normalization drift between "
             "the deploy-time reader and the loader is the #453/#544 fail-open shape"
         )
+
 
 
 # --- #3077: the platform report_progress tool -----------------------------------
@@ -3245,7 +3246,9 @@ def test_approval_server_lists_report_progress_only_when_a_tool_is_passed() -> N
 
     async def go() -> None:
         assert "report_progress" not in await names(build_approval_server())
-        assert "report_progress" in await names(build_approval_server(progress_tool=progress_tool))
+        assert "report_progress" in await names(
+            build_approval_server(progress_tool=progress_tool)
+        )
         assert await names(
             build_approval_server(include_request_approval=False, progress_tool=progress_tool)
         ) == {"publish_changes", "report_progress"}
@@ -3377,7 +3380,9 @@ def test_declared_gate_summary_sentence_boundaries_preserve_exact_request() -> N
     for case in cases:
         tool = case["tool"]
         arguments = {"file_name": tool + ".json"}
-        gate = ApprovalGate(required=frozenset({tool}), summary_by_tool={tool: case["summary"]})
+        gate = ApprovalGate(
+            required=frozenset({tool}), summary_by_tool={tool: case["summary"]}
+        )
         gate.block(tool, arguments)
         assert gate.pending_display == case["display"], case
         assert gate.pending_summary == summarize_tool_call(tool, arguments)

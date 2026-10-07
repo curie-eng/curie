@@ -18,7 +18,9 @@ _DOCKERIGNORE = _REPO_ROOT / "runner" / "Dockerfile.dockerignore"
 _REQUIREMENTS_PATH = "/tmp/runner-dependency-pins.txt"
 _RUNNER_SOURCE_COPY = "COPY runner ./runner"
 _PIN_EXPORTER_COPY = "COPY runner/export_dependency_pins.py ./runner/export_dependency_pins.py"
-_PIP_REQUIREMENTS_COPY = "COPY runner/pip-requirements.txt ./runner/pip-requirements.txt"
+_PIP_REQUIREMENTS_COPY = (
+    "COPY runner/pip-requirements.txt ./runner/pip-requirements.txt"
+)
 _LOCKFILE_COPY = "COPY uv.lock ./uv.lock"
 
 # Mirror apps/api/Dockerfile.dockerignore plus the trees a repo-root build

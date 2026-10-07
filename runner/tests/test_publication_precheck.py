@@ -180,7 +180,9 @@ async def _boot(
     # Production boot performs synchronous capability discovery with anyio.run.
     # Keep that boot outside this test server's running event loop.
     return await anyio.to_thread.run_sync(
-        lambda: build_runner(config, workspace_path=repo, fake_model=False, sdk_env=sdk_env)
+        lambda: build_runner(
+            config, workspace_path=repo, fake_model=False, sdk_env=sdk_env
+        )
     )
 
 
@@ -426,7 +428,9 @@ def test_body_only_revision_reaches_publication_approval(
             runner = await _boot(tmp_path, repo, url, monkeypatch)
             gate = runner._approval_gate
             assert gate is not None
-            model = _PublicationModel(gate, [("bodyfix", {"title": TITLE, "body": changed_body})])
+            model = _PublicationModel(
+                gate, [("bodyfix", {"title": TITLE, "body": changed_body})]
+            )
             frames = await _run(runner, model, _event(_context(head, url)))
             assert frames[-1]["status"] == "awaiting-approval"
             assert gate.publication_body == changed_body
@@ -746,7 +750,9 @@ def test_real_sdk_publication_call_shares_stream_hook_and_permission_identity(
         assert hook_ids == stream_ids
         assert permission_ids == stream_ids
         assert order == ["stream", "hook", "permission"]
-        assert "no_change" in hook_results[0]["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "no_change" in hook_results[0]["hookSpecificOutput"][
+            "permissionDecisionReason"
+        ]
         assert "no_change" in permission_results[0].message
         assert permission_results[0].interrupt is False
         assert len(calls) == 1

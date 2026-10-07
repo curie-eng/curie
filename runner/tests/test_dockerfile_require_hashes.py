@@ -87,7 +87,9 @@ def _dockerfile_violations(dockerfile_text: str) -> list[str]:
         if re.search(r"(--upgrade|-U)\s+pip\b", instruction):
             violations.append("pip is upgraded unhashed")
 
-    pip_installs = [i for i in runs if "pip-requirements.txt" in i and "pip install" in i]
+    pip_installs = [
+        i for i in runs if "pip-requirements.txt" in i and "pip install" in i
+    ]
     if len(pip_installs) != 1:
         violations.append("pip must be installed once from runner/pip-requirements.txt")
     elif not re.search(
@@ -117,7 +119,9 @@ def _dockerfile_violations(dockerfile_text: str) -> list[str]:
         if "--no-deps" not in flags:
             violations.append("dependency install lacks --no-deps")
 
-    copy_index = next((n for n, i in enumerate(instructions) if i == _PIP_REQUIREMENTS_COPY), None)
+    copy_index = next(
+        (n for n, i in enumerate(instructions) if i == _PIP_REQUIREMENTS_COPY), None
+    )
     venv_index = next(
         (n for n, i in enumerate(instructions) if i.startswith("RUN ") and "-m venv" in i),
         None,
@@ -170,13 +174,15 @@ wheels = [
     result = _run_exporter(lock_text)
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == (f"pkg==1.0.0 --hash={a} --hash={b} --hash={c}")
+    assert result.stdout.strip() == (
+        f"pkg==1.0.0 --hash={a} --hash={b} --hash={c}"
+    )
 
 
 def test_exporter_puts_hashes_after_the_marker() -> None:
     h = "sha256:" + "2" * 64
     lock_text = _lock(
-        '    { name = "win", marker = "sys_platform == \'win32\'" },',
+        "    { name = \"win\", marker = \"sys_platform == 'win32'\" },",
         f"""\
 [[package]]
 name = "win"

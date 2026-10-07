@@ -64,7 +64,10 @@ def test_a_connector_tool_maps_to_its_bare_server() -> None:
 
 
 def test_a_plugin_mounted_tool_carries_the_bundle_infix() -> None:
-    assert _canonical("mcp__plugin_sre-bot_probe__ping", mcp_servers={"probe"}) == "probe/ping"
+    assert (
+        _canonical("mcp__plugin_sre-bot_probe__ping", mcp_servers={"probe"})
+        == "probe/ping"
+    )
 
 
 def test_an_underscored_server_name_still_resolves() -> None:
@@ -95,12 +98,17 @@ def test_overlapping_plugin_servers_use_the_longest_policy_name_everywhere() -> 
             connector_servers=set(),
         )
 
-    assert _canonical(live_long, mcp_servers={"logs", "logs__audit"}) == "logs__audit/export"
+    assert (
+        _canonical(live_long, mcp_servers={"logs", "logs__audit"})
+        == "logs__audit/export"
+    )
     assert policy_disallowed_tools(gate(), [live_short, live_long]) == (live_short,)
 
     hook_gate = gate()
     hook = build_approval_hook(hook_gate)["PreToolUse"][0].hooks[0]
-    hook_result = anyio.run(hook, {"tool_name": live_long, "tool_input": {}}, None, None)
+    hook_result = anyio.run(
+        hook, {"tool_name": live_long, "tool_input": {}}, None, None
+    )
     assert hook_result["hookSpecificOutput"]["permissionDecision"] == "deny"
     assert "denied by this agent's tool policy" not in hook_result["stopReason"]
     assert hook_gate.pending_granted_tool == live_long
@@ -170,7 +178,9 @@ def test_no_bundle_name_cannot_resolve_a_plugin_mount() -> None:
     prefix to match, and guessing would attribute a tool to a server on the
     strength of a substring."""
     assert (
-        _canonical("mcp__plugin_sre-bot_probe__ping", bundle_name=None, mcp_servers={"probe"})
+        _canonical(
+            "mcp__plugin_sre-bot_probe__ping", bundle_name=None, mcp_servers={"probe"}
+        )
         is None
     )
 
