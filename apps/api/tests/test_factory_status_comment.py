@@ -1146,7 +1146,10 @@ def test_a_retried_owner_lost_hands_the_label_to_the_successor(
 
     (lost,) = _marked(sink, lost_id)
     body = lost["body"]
-    assert RETRIED.format(attempt=2) in body
+    assert "Status: RETRYING" in body
+    assert f"Retrying: {RETRIED.format(attempt=2)}" in body
+    assert "Could not complete:" not in body
+    assert "NEEDS HUMAN" not in body
     assert EXHAUSTED not in body
     assert "Cause: owner_lost" in body
     assert FINAL_MARKER in body
@@ -1172,7 +1175,10 @@ def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F8
         assert len(requests) == attempt, requests
         (comment,) = _marked(sink, current)
         body = comment["body"]
-        assert RETRIED.format(attempt=attempt) in body
+        assert "Status: RETRYING" in body
+        assert f"Retrying: {RETRIED.format(attempt=attempt)}" in body
+        assert "Could not complete:" not in body
+        assert "NEEDS HUMAN" not in body
         assert "Cause: owner_lost" in body
         assert FINAL_MARKER in body
         assert _curie_labels(sink, number) == {"curie-factory:queued"}
@@ -1185,7 +1191,7 @@ def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F8
     ] * 3
     (comment,) = _marked(sink, current)
     body = comment["body"]
-    assert EXHAUSTED in body
+    assert f"Could not complete: {EXHAUSTED}" in body
     assert "Curie started the work again" not in body
     assert "Cause: owner_lost" in body
     assert "Status: NEEDS HUMAN" in body
@@ -1195,7 +1201,12 @@ def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F8
     # The earlier comments keep their retry text once the third loss lands.
     for attempt, request_id in zip((2, 3), lost, strict=True):
         (earlier,) = _marked(sink, request_id)
-        assert RETRIED.format(attempt=attempt) in earlier["body"]
+        assert "Status: RETRYING" in earlier["body"]
+        assert f"Retrying: {RETRIED.format(attempt=attempt)}" in earlier["body"]
+        assert "Could not complete:" not in earlier["body"]
+        assert "NEEDS HUMAN" not in earlier["body"]
+        assert "Cause: owner_lost" in earlier["body"]
+        assert FINAL_MARKER in earlier["body"]
 
 
 def test_an_expired_run_shows_needs_human_status(admitted: Any) -> None:  # noqa: F811
