@@ -87,6 +87,14 @@ spec:
             # app cannot drift.
             - name: CURIE_HEARTBEAT_FILE
               value: /tmp/curie-dispatcher.heartbeat
+            # The test installation declaration (ADR 0202 decision 1), from the
+            # helpers api.yaml renders it with. The dispatcher refuses to boot
+            # on a published default secret while it is on, and its Slack
+            # preflight keeps each driver identity to its own agent.
+            - name: CURIE_TEST_INSTALLATION_ENABLED
+              value: {{ include "curie.testInstallation.enabled" . | quote }}
+            - name: CURIE_TEST_INSTALLATION_DRIVERS
+              value: {{ include "curie.testInstallation.drivers" . | quote }}
             {{- $threadedReserved := dict -}}
             {{- if .Values.dispatcher.threadedBotAllowlist }}
             # First-class allowlist (#2437). Rendered ONLY when the typed value is

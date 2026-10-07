@@ -35,6 +35,8 @@ Env mapping:
     CURIE_THREAD_CONTEXT_TTL_SECONDS  -> thread_context_ttl_seconds
     CURIE_HEARTBEAT_FILE             -> heartbeat_file
     CURIE_HEARTBEAT_INTERVAL_SECONDS -> heartbeat_interval_s
+    CURIE_TEST_INSTALLATION_ENABLED  -> test_installation_enabled (ADR 0202)
+    CURIE_TEST_INSTALLATION_DRIVERS  -> test_installation_drivers (ADR 0202)
 """
 
 import json
@@ -52,6 +54,13 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_internal.driver_declaration import (
+    TEST_INSTALLATION_DRIVERS_ENV,
+    TEST_INSTALLATION_ENABLED_ENV,
+    DeclaredDriver,
+    parse_drivers,
+    refuse_published_defaults,
+)
 from curie_internal.keyspace import (
     ADMISSION_KEY_PREFIX_DEFAULT,
     DEDUPE_KEY_PREFIX_DEFAULT,
@@ -119,6 +128,17 @@ class DispatcherConfig(BaseSettings):
     slack_identities: SlackIdentities = Field(default=(), validation_alias=SLACK_IDENTITIES_ENV)
     slack_threaded_bot_allowlist: Annotated[tuple[ThreadedBotAdmission, ...], NoDecode] = Field(
         default=(), validation_alias="CURIE_SLACK_THREADED_BOT_ALLOWLIST"
+    )
+
+    # The test installation declaration (ADR 0202 decision 1), rendered only
+    # by the chart. On, the boot refuses a published default secret, and the
+    # Slack preflight keeps each driver identity to its own agent
+    # (preflight.check_test_installation_drivers).
+    test_installation_enabled: bool = Field(
+        default=False, validation_alias=TEST_INSTALLATION_ENABLED_ENV
+    )
+    test_installation_drivers: Annotated[tuple[DeclaredDriver, ...], NoDecode] = Field(
+        default=(), validation_alias=TEST_INSTALLATION_DRIVERS_ENV
     )
 
     valkey_host: str = "localhost"
@@ -251,6 +271,28 @@ class DispatcherConfig(BaseSettings):
         # Decode here so JSON null is rejected instead of being discarded by
         # the settings env source and silently replaced by the empty default.
         return json.loads(value) if isinstance(value, str) else value
+
+    @field_validator("test_installation_drivers", mode="before")
+    @classmethod
+    def _parse_test_installation_drivers(cls, value: object) -> object:
+        return parse_drivers(value)
+
+    @model_validator(mode="after")
+    def _refuse_published_defaults_on_a_test_installation(self) -> "DispatcherConfig":
+        """Refuse boot on a published default secret while declared a test installation.
+
+        The chart cannot see a secret supplied another way, and a compose stack
+        never renders the chart (ADR 0202). The dispatcher checks the two it
+        holds; the API checks its own.
+        """
+        refuse_published_defaults(
+            self.test_installation_enabled,
+            {
+                API_KEY_ENV: self.api_key,
+                "CURIE_APPROVAL_CHAT_ATTESTER_SECRET": self.approval_chat_attester_secret,
+            },
+        )
+        return self
 
     @model_validator(mode="after")
     def _stale_window_covers_the_ttl(self) -> "DispatcherConfig":
