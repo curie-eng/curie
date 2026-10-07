@@ -268,6 +268,12 @@ prerequisites, and the expected evidence for each are in [DEMO.md](DEMO.md).
 
 ## Alert source (opt-in)
 
+The optional [CloudWatch source](observability/cloudwatch-alarms/INSTALL.md)
+reads metric and composite alarms for an operator-owned SNS topic. It requires
+separate read-only web identity configuration and a Prometheus overlay; the
+default installer does not enable it. Its [contract](docs/CLOUDWATCH-ALARMS.md)
+distinguishes retained alarm evidence from current provider state.
+
 Alertmanager stays off in the default observability overlay. The optional source
 uses the signer in `observability/alert-signer.yaml` because Alertmanager cannot
 sign webhook bodies. The signer runs the checked in `server.py` in a pinned
