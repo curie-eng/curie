@@ -2,6 +2,133 @@
 // Do not edit by hand. Regenerate with `pnpm gen:api-types` in apps/ui and commit.
 
 export interface paths {
+    "/action-executions/claim": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Claim Execution
+         * @description Claim the oldest claimable execution under a lease, or ``204``.
+         *
+         *     @spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a
+         *     ``requested`` row is claimable, and so is a ``claimed`` row whose lease
+         *     expired, which is reclaimed with the next attempt so the earlier holder's
+         *     fence is stale. A reclaim forgets the earlier attempt's observation, so the
+         *     new holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.
+         *     @spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.
+         */
+        post: operations["claim_execution_action_executions_claim_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/action-executions/{execution_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Execution
+         * @description @spec ACTION-EXECUTOR-18: the execution's receipt.
+         */
+        get: operations["get_execution_action_executions__execution_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/action-executions/{execution_id}/dispatch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Dispatch Execution
+         * @description Commit ``dispatched``, the last step before a write call.
+         *
+         *     @spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``
+         *     restore whose observed version equalled the recorded one dispatches. A
+         *     probe never does (ACTION-EXECUTOR-1). A forward execution dispatches only
+         *     once the API creates its ledger row at dispatch (ACTION-EXECUTOR-19), which
+         *     is not built yet, so it is refused here too.
+         */
+        post: operations["dispatch_execution_action_executions__execution_id__dispatch_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/action-executions/{execution_id}/observation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record Observation
+         * @description Compare the version observed now with the version the action left.
+         *
+         *     @spec ACTION-EXECUTOR-15. Equal: recorded, the execution stays ``claimed``
+         *     and may dispatch. Any difference, or an absent or malformed version: the
+         *     execution ends ``refused`` with ``version_conflict`` and the action is
+         *     released, with the ``refused_conflict`` audit row naming both versions.
+         */
+        post: operations["record_observation_action_executions__execution_id__observation_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/action-executions/{execution_id}/outcome": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Report Outcome
+         * @description Record how an execution ended.
+         *
+         *     @spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20.
+         *     ``refused`` lands only on a ``claimed`` row, with a pre-dispatch code:
+         *     past ``dispatched`` the call may have reached the connector. ``confirmed``,
+         *     ``failed`` and ``indeterminate`` land only on a ``dispatched`` row, except
+         *     a probe, which never dispatches and is ``confirmed`` from ``claimed`` with
+         *     the verbs it observed. An unknown post-dispatch code is normalized by stage.
+         *     A replay of the stored outcome returns the row unchanged; a different one
+         *     is refused and the first stands.
+         */
+        post: operations["report_outcome_action_executions__execution_id__outcome_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/actions": {
         parameters: {
             query?: never;
@@ -85,6 +212,12 @@ export interface paths {
          *     ``prior_state`` and ``target`` are what a restore replays. A completion that
          *     carries neither produces a record that is not undoable, which is the honest
          *     answer for a connector that replied in prose -- nothing has to declare it.
+         *
+         *     @spec ACTION-EXECUTOR-11 @spec ACTION-EXECUTOR-12: ``connector`` and
+         *     ``connector_digest`` are the worker's attribution, so a completion carrying
+         *     them also needs the internal worker token (403 otherwise), and the connector
+         *     must be the one the stored tool names (422 otherwise). Either refusal stores
+         *     nothing. A completion without them still takes the platform key alone.
          */
         post: operations["complete_action_actions__action_id__complete_post"];
         delete?: never;
@@ -104,17 +237,26 @@ export interface paths {
         put?: never;
         /**
          * Undo Action
-         * @description Rule on putting back what this action changed.
+         * @description Rule on putting back what this action changed, and request the restore.
          *
-         *     A 200 authorizes a restore and names the call that performs it; every other
-         *     outcome is a refusal that changed nothing. The refusals are ordered from the
-         *     record's own state outward to the world, so the most specific true reason is
-         *     the one the operator is told.
+         *     @spec ACTION-EXECUTOR-3. A 202 means a ``requested`` restore execution and
+         *     its ``authorized`` audit row were written together; every other outcome is
+         *     a refusal that wrote one audit row and no execution. The refusals are
+         *     ordered from the record's own state outward, so the most specific true
+         *     reason is the one the operator is told.
+         *
+         *     The actor is ``principal``, authenticated as the approval resolver
+         *     authenticates one; a body ``actor`` is not authority, and one that differs
+         *     from the principal is refused before anything else is examined.
          *
          *     Authorization runs first, before any of the record's own state is examined:
          *     whether an actor may undo at all precedes whether this particular undo is
-         *     safe, and it keeps a refused actor from learning the resource's state through
-         *     a conflict message.
+         *     possible, and it keeps a refused actor from learning anything about the
+         *     record, its versions included.
+         *
+         *     The caller no longer supplies the live state: the executor observes the
+         *     version through the pinned connector and the API compares it before any
+         *     write (ACTION-EXECUTOR-15).
          */
         post: operations["undo_action_actions__action_id__undo_post"];
         delete?: never;
@@ -306,6 +448,159 @@ export interface paths {
         };
         /** Get Hook Secret */
         get: operations["get_hook_secret_agents__agent_id__hook_secret_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Remediation Policy
+         * @description The current remediation policy generation of a hook.
+         */
+        get: operations["get_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_get"];
+        /**
+         * Put Remediation Policy
+         * @description Bind, tighten or widen a protected hook's remediation policy.
+         *
+         *     A new binding starts disarmed; a later write keeps the armed flag. Each
+         *     write creates a generation recorded with the operator principal.
+         */
+        put: operations["put_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_put"];
+        post?: never;
+        /**
+         * Delete Remediation Policy
+         * @description Remove the policy: a new generation, inactive, disarmed and with no actions.
+         */
+        delete: operations["delete_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Arm Remediation Policy
+         * @description Arm the current policy as a new generation.
+         */
+        post: operations["arm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_arm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Disarm Remediation Policy
+         * @description Disarm the current policy as a new generation.
+         */
+        post: operations["disarm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_disarm_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/source-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Source Policy
+         * @description Committed source policy and its publication activation.
+         */
+        get: operations["get_source_policy_agents__agent_id__hooks__hook__source_policy_get"];
+        /**
+         * Put Source Policy
+         * @description Target mandatory read-only protected delivery under the deployment's runtime.
+         *
+         *     The commit happens and the agent's legacy counter may advance; the row is
+         *     then published once current runtime evidence is confirmed, answering 200
+         *     ``active``. A refusal after the commit answers 503 with the committed
+         *     generation and the source stays closed.
+         */
+        put: operations["put_source_policy_agents__agent_id__hooks__hook__source_policy_put"];
+        post?: never;
+        /**
+         * Delete Source Policy
+         * @description Commit and publish the ordinary tombstone.
+         *
+         *     Pending history without a row commits a fresh tombstone above every
+         *     attempt without rotating the legacy counter; an absent row without history
+         *     is 409 ``source_not_configured``.
+         */
+        delete: operations["delete_source_policy_agents__agent_id__hooks__hook__source_policy_delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/source-policy/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rotate Source Policy
+         * @description Allocate and publish a fresh generation for the current protected target.
+         */
+        post: operations["rotate_source_policy_agents__agent_id__hooks__hook__source_policy_rotate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/source-policy/secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Source Secret
+         * @description The scoped source key of an active protected source; writes nothing.
+         *
+         *     Served only when one reader session, after the gate is released, shows the
+         *     row's active protected record; that attests publication, not current
+         *     readiness. A rotation committing after that read makes the returned key
+         *     already revoked. Every other state is refused with no key.
+         */
+        get: operations["get_source_secret_agents__agent_id__hooks__hook__source_policy_secret_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1023,6 +1318,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/channel-canvas": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Channel Canvas */
+        post: operations["channel_canvas_channel_canvas_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/channel-identities": {
         parameters: {
             query?: never;
@@ -1211,6 +1523,34 @@ export interface paths {
         get: operations["get_config_config_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/connector-capabilities/probes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create Probe
+         * @description Request a capability probe of one connector image for one agent.
+         *
+         *     @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13 and the route decisions.
+         *     The first probe is keyed ``probe:<agent>:<connector>:<digest>``; a request
+         *     while the latest probe is pending or confirmed adopts it (``200``). After a
+         *     probe that ended ``refused`` or ``failed``, the next one is a new execution
+         *     whose key carries the next probe attempt number (``...:<digest>:2`` and
+         *     so on). A probe's ``authority_ref`` is its key: the body is exactly three
+         *     keys, so no reconcile pass id can reach it.
+         */
+        post: operations["create_probe_connector_capabilities_probes_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1523,8 +1863,42 @@ export interface paths {
          *     7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),
          *        after both of those and before anything is claimed;
          *     8. routability, then the claim, quota and enqueue.
+         *
+         *     The gate-held snapshot decides the path. A committed protected row is
+         *     admitted atomically onto the private broker (``_ingest_protected``) and
+         *     never touches the ordinary store. A tombstone first requires its ordinary
+         *     publication to be active and no private intent for the delivery, then
+         *     runs the ordinary path; pending history stays closed.
          */
         post: operations["ingest_hook_hooks__agent_id___hook__post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/hooks/{agent_id}/{hook}/support": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Probe Hook Support
+         * @description Report the current protected support resolution for one hook; write nothing.
+         *
+         *     The JSON body is ``HookSupportIn``, read raw because its exact bytes are
+         *     signed. Order follows the spec: hook name, bounded body, strict parse,
+         *     ungated support signature, delivery id, gate-held reauthentication, snapshot
+         *     and source bindings, gate release, then broker evaluation of a protected
+         *     row without source bindings only. ``supported`` (200) is answered exactly
+         *     when admission would accept, outside the per delivery exclusions.
+         *     The delivery id is signed context only and reserves nothing.
+         */
+        post: operations["probe_hook_support_hooks__agent_id___hook__support_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1772,7 +2146,7 @@ export interface paths {
         };
         /**
          * List Schedules
-         * @description Cron hooks on each in-force deployment, newest slot first in the record.
+         * @description Cron hooks on each in-force deployment, with separate latest run histories.
          */
         get: operations["list_schedules_schedules_get"];
         put?: never;
@@ -2048,6 +2422,26 @@ export interface paths {
         patch: operations["advance_publication_lineage_v1_internal_publications__publication_id__lineage_patch"];
         trace?: never;
     };
+    "/v1/internal/remediation/nominations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Submit Remediation Nominations
+         * @description Record one protected turn's nomination block.
+         */
+        post: operations["submit_remediation_nominations_v1_internal_remediation_nominations_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/state/released-credentials": {
         parameters: {
             query?: never;
@@ -2065,6 +2459,40 @@ export interface paths {
          *     (``SANDBOX_CREDENTIAL_RELEASED_TTL_S``).
          */
         post: operations["release_sandbox_credential_v1_internal_state_released_credentials_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/thread-attachments/append": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Append Thread Attachments */
+        post: operations["append_thread_attachments_v1_internal_thread_attachments_append_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/thread-attachments/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Query Thread Attachments */
+        post: operations["query_thread_attachments_v1_internal_thread_attachments_query_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2573,6 +3001,10 @@ export interface components {
          *     missing one.
          */
         ActionComplete: {
+            /** Connector */
+            connector?: string | null;
+            /** Connector Digest */
+            connector_digest?: string | null;
             /** Detail */
             detail?: string | null;
             /**
@@ -2584,6 +3016,8 @@ export interface components {
             post_state?: {
                 [key: string]: unknown;
             } | null;
+            /** Post Version */
+            post_version?: string | null;
             /** Prior State */
             prior_state?: {
                 [key: string]: unknown;
@@ -2683,49 +3117,37 @@ export interface components {
             tool: string;
         };
         /**
-         * ActionRestore
-         * @description The call an authorized undo permits: put this state back on that target.
-         */
-        ActionRestore: {
-            /** Prior State */
-            prior_state: {
-                [key: string]: unknown;
-            };
-            /** Target */
-            target: {
-                [key: string]: unknown;
-            };
-        };
-        /**
          * ActionUndo
          * @description A request to put back what an action changed.
          *
-         *     ``observed_state`` is the resource as it looks NOW, read by whoever will
-         *     perform the restore. The platform cannot read it itself -- nothing here can
-         *     reach a connector -- and it will not assume: an absent observation is refused
-         *     rather than treated as "unchanged".
+         *     @spec ACTION-EXECUTOR-3: the actor is the authenticated principal, never
+         *     this body. ``actor`` is accepted only as a cross-check: one that differs
+         *     from the principal is refused. Channel evidence likewise comes from the
+         *     principal. The platform observes the live version itself through the
+         *     pinned connector (ACTION-EXECUTOR-15), so a caller-supplied observation is
+         *     no longer evidence; an ``observed_state`` sent by an older caller is
+         *     ignored as an unknown field, never compared.
          */
         ActionUndo: {
             /** Actor */
-            actor: string;
-            /** Actor Channel */
-            actor_channel?: string | null;
-            /** Observed State */
-            observed_state?: {
-                [key: string]: unknown;
-            } | null;
+            actor?: string | null;
         };
         /**
          * ActionUndoOut
-         * @description An authorization, not a receipt.
+         * @description A requested restore, not a receipt and not the call to make.
          *
-         *     The API rules and returns; something else performs the restore (ADR-0117
-         *     leaves where that executor lives undecided). So this names the call to make
-         *     rather than claiming it was made.
+         *     @spec ACTION-EXECUTOR-3: the ruling answers with the execution it created
+         *     and that execution's state. It never carries the ``target``, the sealed
+         *     ``prior_state`` or a version; the receipt is the execution's own read.
          */
         ActionUndoOut: {
-            action: components["schemas"]["ActionOut"];
-            restore: components["schemas"]["ActionRestore"];
+            /**
+             * Execution Id
+             * Format: uuid
+             */
+            execution_id: string;
+            /** State */
+            state: string;
         };
         /** Activity */
         Activity: {
@@ -2900,6 +3322,8 @@ export interface components {
             publication_policy?: "approve" | "auto";
             /** Repo Full Name */
             repo_full_name?: string | null;
+            /** Reviewer Model */
+            reviewer_model?: string | null;
             /** Secrets */
             secrets?: {
                 [key: string]: string;
@@ -2974,6 +3398,8 @@ export interface components {
             publication_policy_version?: number;
             /** Repo Full Name */
             repo_full_name: string | null;
+            /** Reviewer Model */
+            reviewer_model: string | null;
             /** Runner Resources */
             runner_resources?: {
                 [key: string]: unknown;
@@ -3047,6 +3473,8 @@ export interface components {
             publication_policy?: ("approve" | "auto") | null;
             /** Repo Full Name */
             repo_full_name?: string | null;
+            /** Reviewer Model */
+            reviewer_model?: string | null;
             /** Runner Resources */
             runner_resources?: {
                 [key: string]: unknown;
@@ -3744,6 +4172,49 @@ export interface components {
             /** Expected Version */
             expected_version: number;
         };
+        /**
+         * CanvasCell
+         * @description One table cell. ``section_id`` is set only when the cell is editable.
+         */
+        CanvasCell: {
+            /** Section Id */
+            section_id: string | null;
+            /** Text */
+            text: string;
+            /** Truncated */
+            truncated: boolean;
+        };
+        /**
+         * CanvasParagraph
+         * @description Text outside any table; its ``section_id`` is informational, never editable.
+         */
+        CanvasParagraph: {
+            /** Section Id */
+            section_id: string | null;
+            /** Text */
+            text: string;
+            /** Truncated */
+            truncated: boolean;
+        };
+        /** CanvasSummary */
+        CanvasSummary: {
+            /** Created */
+            created: string;
+            /** Id */
+            id: string;
+            /** Title */
+            title: string;
+        };
+        /**
+         * CanvasTable
+         * @description A table by position: the first row is the header, the rest are rows.
+         */
+        CanvasTable: {
+            /** Header */
+            header: components["schemas"]["CanvasCell"][];
+            /** Rows */
+            rows: components["schemas"]["CanvasCell"][][];
+        };
         /** ChannelAddress */
         ChannelAddress: {
             /** Address */
@@ -3879,6 +4350,54 @@ export interface components {
         ChannelCallersWrite: {
             /** Allowed Callers */
             allowed_callers: string[] | null;
+        };
+        /**
+         * ChannelCanvasRequest
+         * @description One canvas list, read or cell edit on a bound surface (ADR 0200).
+         *
+         *     Which fields an operation takes is checked by the service, so a misplaced
+         *     one is refused by name: ``channel`` for a list; ``kind`` and ``canvas_id``
+         *     for a read; those plus ``section_id`` and ``text`` for an edit.
+         */
+        ChannelCanvasRequest: {
+            /** Canvas Id */
+            canvas_id?: string | null;
+            channel?: components["schemas"]["ChannelSelector"] | null;
+            /** Kind */
+            kind?: string | null;
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "list" | "read" | "edit";
+            /** Section Id */
+            section_id?: string | null;
+            /** Text */
+            text?: string | null;
+        };
+        /** ChannelCanvasResult */
+        ChannelCanvasResult: {
+            /** Canvas Id */
+            canvas_id?: string | null;
+            /** Canvases */
+            canvases?: components["schemas"]["CanvasSummary"][] | null;
+            /** Edited */
+            edited?: boolean | null;
+            /** Has More */
+            has_more?: boolean | null;
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "list" | "read" | "edit";
+            /** Paragraphs */
+            paragraphs?: components["schemas"]["CanvasParagraph"][] | null;
+            /** Section Id */
+            section_id?: string | null;
+            /** Tables */
+            tables?: components["schemas"]["CanvasTable"][] | null;
+            /** Title */
+            title?: string | null;
         };
         /**
          * ChannelIdentityCreate
@@ -4622,6 +5141,137 @@ export interface components {
              */
             version_id: string;
         };
+        /**
+         * ExecutionClaim
+         * @description @spec ACTION-EXECUTOR-17: who claims, and for how long the lease holds.
+         */
+        ExecutionClaim: {
+            /** Lease Owner */
+            lease_owner: string;
+            /** Lease Seconds */
+            lease_seconds: number;
+        };
+        /**
+         * ExecutionCreated
+         * @description A created or adopted execution: its identity and state, nothing else.
+         */
+        ExecutionCreated: {
+            /**
+             * Execution Id
+             * Format: uuid
+             */
+            execution_id: string;
+            /** State */
+            state: string;
+        };
+        /**
+         * ExecutionFence
+         * @description @spec ACTION-EXECUTOR-17: the fence every later transition presents.
+         */
+        ExecutionFence: {
+            /** Attempt */
+            attempt: number;
+            /** Lease Owner */
+            lease_owner: string;
+        };
+        /**
+         * ExecutionObservation
+         * @description @spec ACTION-EXECUTOR-15: the version ``observe_version`` reported now.
+         *
+         *     Absent, empty or malformed is accepted here and answered as a conflict by
+         *     the route, never as a 422: the spec refuses the restore in that case, and a
+         *     rejected request would leave the execution waiting instead.
+         */
+        ExecutionObservation: {
+            /** Attempt */
+            attempt: number;
+            /** Lease Owner */
+            lease_owner: string;
+            /** Version */
+            version?: string | null;
+        };
+        /**
+         * ExecutionOut
+         * @description One execution as the worker and the receipt read it.
+         *
+         *     @spec ACTION-EXECUTOR-18. Deliberately without ``outcome`` or
+         *     ``forward_arguments``: the read names what ran and how it ended, never a
+         *     version, an argument or a state.
+         *
+         *     @spec ACTION-EXECUTOR-14 @spec ACTION-EXECUTOR-7. Two non-secret digests
+         *     the worker checks before dispatch: ``connector_digest``, the image the
+         *     call must run against, and ``arguments_sha256``, the ruling's digest over
+         *     the restore's canonical ``{target, prior_state}`` (null on a probe). A
+         *     digest names neither the arguments nor the state it covers.
+         */
+        ExecutionOut: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Arguments Sha256 */
+            arguments_sha256: string | null;
+            /** Attempt */
+            attempt: number;
+            /** Connector */
+            connector: string;
+            /** Connector Digest */
+            connector_digest: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Dispatched At */
+            dispatched_at: string | null;
+            /** Failure Code */
+            failure_code: string | null;
+            /** Finished At */
+            finished_at: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Kind */
+            kind: string;
+            /** Lease Expires At */
+            lease_expires_at: string | null;
+            /** Lease Owner */
+            lease_owner: string | null;
+            /** Refusal Code */
+            refusal_code: string | null;
+            /** Requested By */
+            requested_by: string | null;
+            /** State */
+            state: string;
+            /** Subject Action Id */
+            subject_action_id: string | null;
+            /** Tool */
+            tool: string | null;
+        };
+        /**
+         * ExecutionOutcome
+         * @description @spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20: the terminal report.
+         *
+         *     ``state`` is one of ``refused``, ``confirmed``, ``failed`` or
+         *     ``indeterminate``; ``code`` is checked against its stage by the route.
+         *     ``advertised`` is a probe's report only: the verbs whose ``tools/list``
+         *     entry met ACTION-EXECUTOR-13's rule.
+         */
+        ExecutionOutcome: {
+            /** Advertised */
+            advertised?: string[] | null;
+            /** Attempt */
+            attempt: number;
+            /** Code */
+            code?: string | null;
+            /** Lease Owner */
+            lease_owner: string;
+            /** State */
+            state: string;
+        };
         /** FinishBody */
         FinishBody: {
             /** Cause */
@@ -4745,14 +5395,33 @@ export interface components {
          *
          *     ``tool_access`` is the queued policy, not proof of worker support, runner
          *     execution or delivery. A completed duplicate must match the original policy.
+         *
+         *     ``requested_tool_access`` is the policy as signed and ``effective_tool_access``
+         *     the policy the source resolved; ``tool_access`` is the effective alias. An
+         *     ordinary answer reports the requested policy as both. ``source_generation``
+         *     is the committed source generation that admitted the delivery, as a
+         *     canonical decimal string: null for a never configured hook and for any
+         *     ordinary duplicate (the ordinary store never recorded one).
+         *     ``acceptance_status`` is ``accepted``, ``pending`` (an ordinary 202) or
+         *     ``preparing`` (a protected 202). @spec PROTECTED-HOOK-SOURCE-8.
          */
         HookAccepted: {
+            /**
+             * Acceptance Status
+             * @default accepted
+             * @enum {string}
+             */
+            acceptance_status?: "accepted" | "pending" | "preparing";
             /** Conversation Id */
             conversation_id: string | null;
             /** Duplicate */
             duplicate: boolean;
+            effective_tool_access?: components["schemas"]["ToolAccess"] | null;
             /** Event Id */
             event_id: string;
+            requested_tool_access?: components["schemas"]["ToolAccess"] | null;
+            /** Source Generation */
+            source_generation?: string | null;
             /** Stream Id */
             stream_id: string | null;
             tool_access?: components["schemas"]["ToolAccess"] | null;
@@ -4780,11 +5449,18 @@ export interface components {
             name: string;
             /** Outcome */
             outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
+            /** Reason */
+            reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
             /**
              * Slot Utc
              * Format: date-time
              */
             slot_utc: string;
+            /**
+             * Source
+             * @enum {string}
+             */
+            source: "schedule" | "manual";
             /**
              * Started At
              * Format: date-time
@@ -4826,6 +5502,124 @@ export interface components {
         HookSecretOut: {
             /** Secret */
             secret: string;
+        };
+        /**
+         * HookSourcePolicyMutation
+         * @description @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourcePolicyMutation: {
+            /** Expected Generation */
+            expected_generation: string;
+            /** Operation Id */
+            operation_id: string;
+        };
+        /**
+         * HookSourcePolicyOut
+         * @description @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourcePolicyOut: {
+            /**
+             * Activation
+             * @enum {string}
+             */
+            activation: "closed" | "active";
+            /** Agent Id */
+            agent_id: string;
+            /** Bundle Digest */
+            bundle_digest: string | null;
+            /** Generation */
+            generation: string;
+            /** Hook */
+            hook: string;
+            /** Legacy Generation */
+            legacy_generation: string;
+            /**
+             * Mode
+             * @enum {string}
+             */
+            mode: "ordinary" | "protected";
+            /** Qualification Id */
+            qualification_id: string | null;
+            /** Refusal Reason */
+            refusal_reason?: string | null;
+            /** Runtime Id */
+            runtime_id: string | null;
+            /** Tool Access */
+            tool_access: "read-only" | null;
+            /** Updated At */
+            updated_at: string | null;
+        };
+        /**
+         * HookSourcePolicyWrite
+         * @description @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourcePolicyWrite: {
+            /** Bundle Digest */
+            bundle_digest: string;
+            /** Expected Generation */
+            expected_generation: string;
+            /** Operation Id */
+            operation_id: string;
+            /** Qualification Id */
+            qualification_id: string;
+            /** Runtime Id */
+            runtime_id: string;
+        };
+        /**
+         * HookSourceRefusal
+         * @description @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourceRefusal: {
+            detail: components["schemas"]["HookSourceRefusalDetail"];
+        };
+        /**
+         * HookSourceRefusalDetail
+         * @description A source service refusal: a stable code and, only after a confirmed commit, its generation.
+         *
+         *     @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourceRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Committed Generation */
+            committed_generation: string | null;
+        };
+        /**
+         * HookSourceSecretOut
+         * @description @spec PROTECTED-HOOK-SOURCE-3.
+         */
+        HookSourceSecretOut: {
+            /** Agent Id */
+            agent_id: string;
+            /** Generation */
+            generation: string;
+            /** Hook */
+            hook: string;
+            /** Secret */
+            secret: string;
+        };
+        /**
+         * HookSupportOut
+         * @description Safe support resolution. @spec PROTECTED-HOOK-SOURCE-9.
+         */
+        HookSupportOut: {
+            effective_tool_access: components["schemas"]["ToolAccess"] | null;
+            /** Qualification Id */
+            qualification_id: string | null;
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "supported" | "source_unconfigured" | "source_closed" | "runtime_unavailable" | "qualification_unavailable" | "evidence_missing" | "evidence_expired" | "broker_unavailable" | "broker_identity_mismatch" | "configuration_unsupported";
+            requested_tool_access: components["schemas"]["ToolAccess"] | null;
+            /** Runtime Generation */
+            runtime_generation: string | null;
+            /** Runtime Id */
+            runtime_id: string | null;
+            /** Source Generation */
+            source_generation: string | null;
+            /** Supported */
+            supported: boolean;
         };
         /** IssueReadComment */
         IssueReadComment: {
@@ -5250,6 +6044,21 @@ export interface components {
             namespace: string;
             /** Pod */
             pod: string;
+        };
+        /**
+         * ProbeCreate
+         * @description @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13: exactly these three keys.
+         */
+        ProbeCreate: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Connector */
+            connector: string;
+            /** Digest */
+            digest: string;
         };
         /** ProgressReport */
         ProgressReport: {
@@ -5763,6 +6572,133 @@ export interface components {
             tool_access?: components["schemas"]["ToolAccess"] | null;
         };
         /**
+         * RemediationNominationAccepted
+         * @description The event's accepted submission: its nominations in block order.
+         *
+         *     @spec AUTOMATED-REMEDIATION-6 @spec AUTOMATED-REMEDIATION-7.
+         */
+        RemediationNominationAccepted: {
+            /** Event Id */
+            event_id: string;
+            /** Nomination Ids */
+            nomination_ids: string[];
+        };
+        /**
+         * RemediationNominationRefusal
+         * @description @spec AUTOMATED-REMEDIATION-6.
+         */
+        RemediationNominationRefusal: {
+            detail: components["schemas"]["RemediationNominationRefusalDetail"];
+        };
+        /**
+         * RemediationNominationRefusalDetail
+         * @description @spec AUTOMATED-REMEDIATION-6.
+         */
+        RemediationNominationRefusalDetail: {
+            /** Code */
+            code: string;
+        };
+        /**
+         * RemediationNominationSubmit
+         * @description One protected turn's nomination block. @spec AUTOMATED-REMEDIATION-6.
+         */
+        RemediationNominationSubmit: {
+            /**
+             * Block
+             * @description The withheld block text, fences included, exactly as extracted.
+             */
+            block: string;
+            /**
+             * Event Id
+             * @description The protected event whose turn produced the block.
+             */
+            event_id: string;
+        };
+        /**
+         * RemediationPolicyMutation
+         * @description Compare and swap plus idempotency for arm, disarm and removal.
+         *
+         *     @spec AUTOMATED-REMEDIATION-2.
+         */
+        RemediationPolicyMutation: {
+            /** Expected Generation */
+            expected_generation: string;
+            /** Operation Id */
+            operation_id: string;
+        };
+        /**
+         * RemediationPolicyOut
+         * @description One committed remediation policy generation.
+         *
+         *     @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
+         */
+        RemediationPolicyOut: {
+            /** Active */
+            active: boolean;
+            /** Agent Id */
+            agent_id: string;
+            /** Armed */
+            armed: boolean;
+            /**
+             * Bound By
+             * @description The operator principal that wrote this generation.
+             */
+            bound_by: string;
+            /** Generation */
+            generation: string;
+            /** Hook */
+            hook: string;
+            /** Policy */
+            policy: {
+                [key: string]: unknown;
+            };
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
+        };
+        /**
+         * RemediationPolicyRefusal
+         * @description @spec AUTOMATED-REMEDIATION-2.
+         */
+        RemediationPolicyRefusal: {
+            detail: components["schemas"]["RemediationPolicyRefusalDetail"];
+        };
+        /**
+         * RemediationPolicyRefusalDetail
+         * @description A stable refusal code and, where one applies, the offending path.
+         *
+         *     @spec AUTOMATED-REMEDIATION-2.
+         */
+        RemediationPolicyRefusalDetail: {
+            /** Code */
+            code: string;
+            /** Message */
+            message?: string | null;
+            /** Path */
+            path?: string | null;
+        };
+        /**
+         * RemediationPolicyWrite
+         * @description Bind or replace the policy document of a protected hook.
+         *
+         *     @spec AUTOMATED-REMEDIATION-2.
+         */
+        RemediationPolicyWrite: {
+            /** Expected Generation */
+            expected_generation: string;
+            /** Operation Id */
+            operation_id: string;
+            /**
+             * Policy
+             * @description The closed policy document: route, limits and actions (AUTOMATED-REMEDIATION-2). Unknown keys are refused.
+             */
+            policy: {
+                [key: string]: unknown;
+            };
+        };
+        /**
          * ReplyHandle
          * @description Channel-neutral coordinates for where a turn's reply is delivered.
          *
@@ -6123,13 +7059,21 @@ export interface components {
         };
         /**
          * ScheduleHookOut
-         * @description One cron hook on the in-force bundle, with its newest slot.
+         * @description One cron hook with its newest scheduled and manual run histories.
          */
         ScheduleHookOut: {
             /** Last Fire At */
             last_fire_at: string | null;
+            /** Last Manual Fire At */
+            last_manual_fire_at: string | null;
+            /** Last Manual Outcome */
+            last_manual_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
+            /** Last Manual Reason */
+            last_manual_reason: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
             /** Last Outcome */
             last_outcome: ("ran" | "deferred" | "skipped" | "blocked" | "reclaimed" | "failed") | null;
+            /** Last Reason */
+            last_reason?: ("turn_error" | "target_unbound" | "approval_gate_targetless" | "agent_killed" | "budget_exhausted" | "run_in_flight" | "catch_up_expired" | "deferred_expired" | "reply_undeliverable" | "prior_side_effect" | "deployment_missing" | "hook_paused" | "live_session" | "enqueue_failed" | "claim_expired") | null;
             /** Name */
             name: string;
             /** Paused */
@@ -6333,6 +7277,95 @@ export interface components {
         TerminationClaimBody: {
             /** Owner */
             owner: string;
+        };
+        /** ThreadAttachmentAppend */
+        ThreadAttachmentAppend: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Event Id */
+            event_id: string;
+            /** Refs */
+            refs: components["schemas"]["ThreadAttachmentRefBody"][];
+            /** Thread Key */
+            thread_key: string;
+        };
+        /** ThreadAttachmentAppendOut */
+        ThreadAttachmentAppendOut: {
+            /** Appended */
+            appended: number;
+        };
+        /** ThreadAttachmentQuery */
+        ThreadAttachmentQuery: {
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Thread Key */
+            thread_key: string;
+        };
+        /**
+         * ThreadAttachmentRefBody
+         * @description One recorded file. Exactly these fields: never an endpoint, URL or bytes.
+         */
+        ThreadAttachmentRefBody: {
+            /** Disk Name */
+            disk_name: string;
+            /** File Id */
+            file_id: string;
+            /** Mime Type */
+            mime_type?: string | null;
+            /** Name */
+            name: string;
+            /** Ordinal */
+            ordinal: number;
+            /** Route Adapter */
+            route_adapter?: string | null;
+            /** Route Identity */
+            route_identity: string;
+            /** Route Kind */
+            route_kind: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes?: number | null;
+        };
+        /**
+         * ThreadAttachmentRefRow
+         * @description A query row: the appended ref plus the event it was recorded under, so a
+         *     redelivered turn's worker recognises its own rows by (event_id, file_id).
+         */
+        ThreadAttachmentRefRow: {
+            /** Disk Name */
+            disk_name: string;
+            /** Event Id */
+            event_id: string;
+            /** File Id */
+            file_id: string;
+            /** Mime Type */
+            mime_type?: string | null;
+            /** Name */
+            name: string;
+            /** Ordinal */
+            ordinal: number;
+            /** Route Adapter */
+            route_adapter?: string | null;
+            /** Route Identity */
+            route_identity: string;
+            /** Route Kind */
+            route_kind: string;
+            /** Sha256 */
+            sha256: string;
+            /** Size Bytes */
+            size_bytes?: number | null;
+        };
+        /** ThreadAttachmentRefsOut */
+        ThreadAttachmentRefsOut: {
+            /** Refs */
+            refs: components["schemas"]["ThreadAttachmentRefRow"][];
         };
         /**
          * ThreadResetState
@@ -6662,6 +7695,7 @@ export interface components {
             /** Objective Truncated */
             objective_truncated: boolean;
             pr: components["schemas"]["WorkItemPrOut"] | null;
+            progress?: components["schemas"]["WorkItemProgressOut"] | null;
             publication: components["schemas"]["WorkItemPublicationOut"] | null;
             /** Repo Full Name */
             repo_full_name: string;
@@ -6674,6 +7708,8 @@ export interface components {
              * @enum {string}
              */
             state: "queued" | "waiting" | "running" | "cancellation_requested" | "cancelled" | "expired" | "failed" | "awaiting_approval" | "publishing" | "published" | "completed_unpublished";
+            /** Title */
+            title?: string | null;
             /**
              * Updated At
              * Format: date-time
@@ -6688,6 +7724,18 @@ export interface components {
             status: string;
             /** Url */
             url: string;
+        };
+        /**
+         * WorkItemProgressOut
+         * @description The latest execution's progress, derived by ``factory_progress.phase_view``.
+         */
+        WorkItemProgressOut: {
+            /** Current */
+            current: string | null;
+            /** Note */
+            note: string | null;
+            /** Stages */
+            stages: components["schemas"]["WorkItemStageOut"][];
         };
         /** WorkItemPublicationOut */
         WorkItemPublicationOut: {
@@ -6729,6 +7777,23 @@ export interface components {
             termination_observation: string | null;
             /** Wait Deadline */
             wait_deadline: string | null;
+        };
+        /**
+         * WorkItemStageOut
+         * @description One stage of the factory progress strip, as the status card shows it.
+         */
+        WorkItemStageOut: {
+            /** Id */
+            id: string;
+            /** Label */
+            label: string;
+            /** Round Label */
+            round_label: string | null;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "done" | "current" | "redo" | "blocked" | "pending";
         };
         /** WorkItemUsageModel */
         WorkItemUsageModel: {
@@ -6896,6 +7961,192 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    claim_execution_action_executions_claim_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionClaim"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Nothing is claimable. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_execution_action_executions__execution_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    dispatch_execution_action_executions__execution_id__dispatch_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionFence"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    record_observation_action_executions__execution_id__observation_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionObservation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    report_outcome_action_executions__execution_id__outcome_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionOutcome"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_actions_actions_get: {
         parameters: {
             query?: {
@@ -7036,6 +8287,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
+                "X-Curie-Worker-Token"?: string | null;
                 "x-api-key"?: string | null;
             };
             path: {
@@ -7073,12 +8325,16 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
-                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+                "X-Curie-Adapter-Principal"?: string | null;
+                "X-Curie-Approval-Actor"?: string | null;
             };
             path: {
                 action_id: string;
             };
-            cookie?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
         };
         requestBody: {
             content: {
@@ -7087,7 +8343,7 @@ export interface operations {
         };
         responses: {
             /** @description Successful Response */
-            200: {
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7633,6 +8889,619 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyOut"];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationPolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyOut"];
+                };
+            };
+            /** @description Policy refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named policy refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    delete_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_delete: {
+        parameters: {
+            query: {
+                expected_generation: string;
+                operation_id: string;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyOut"];
+                };
+            };
+            /** @description Policy refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named policy refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    arm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_arm_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationPolicyMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyOut"];
+                };
+            };
+            /** @description Policy refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named policy refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    disarm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_disarm_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationPolicyMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyOut"];
+                };
+            };
+            /** @description Policy refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Policy refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named policy refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    get_source_policy_agents__agent_id__hooks__hook__source_policy_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourcePolicyOut"];
+                };
+            };
+            /** @description Source refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Source refusal */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+        };
+    };
+    put_source_policy_agents__agent_id__hooks__hook__source_policy_put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HookSourcePolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourcePolicyOut"];
+                };
+            };
+            /** @description Source refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Validation error or unknown source reference */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+        };
+    };
+    delete_source_policy_agents__agent_id__hooks__hook__source_policy_delete: {
+        parameters: {
+            query: {
+                expected_generation: string;
+                operation_id: string;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourcePolicyOut"];
+                };
+            };
+            /** @description Source refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Source refusal */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+        };
+    };
+    rotate_source_policy_agents__agent_id__hooks__hook__source_policy_rotate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HookSourcePolicyMutation"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourcePolicyOut"];
+                };
+            };
+            /** @description Source refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Validation error or unknown source reference */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+        };
+    };
+    get_source_secret_agents__agent_id__hooks__hook__source_policy_secret_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceSecretOut"];
+                };
+            };
+            /** @description Source refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Source refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Source refusal */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSourceRefusal"];
                 };
             };
         };
@@ -9165,6 +11034,95 @@ export interface operations {
             };
         };
     };
+    channel_canvas_channel_canvas_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Channel-Read"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChannelCanvasRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChannelCanvasResult"];
+                };
+            };
+            /** @description No channel or kind named and no default channel */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Missing or invalid channel read capability */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Operation not granted, channel or kind not bound, canvas not shared into a bound channel, the app is not a member, or the provider refused the edit */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Canvas not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Turn inactive or expired, grant revoked, kind unsupported, section not read this turn or no longer editable, or the canvas is too large */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid identifier, cell text, misplaced field, body, or not a canvas */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Page or attempt budget exhausted, or the provider rate limited */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The provider returned an error, the canvas was unreadable, or the edit outcome is unknown */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Ledger unavailable, no provider credential, or a provider scope missing */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_channel_identities_channel_identities_get: {
         parameters: {
             query?: {
@@ -9577,6 +11535,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AppConfig"];
+                };
+            };
+        };
+    };
+    create_probe_connector_capabilities_probes_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProbeCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionCreated"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -10116,6 +12109,57 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    probe_hook_support_hooks__agent_id___hook__support_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-curie-signature-256"?: string | null;
+                "x-curie-delivery-id"?: string | null;
+                "x-curie-timestamp"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    tool_access?: components["schemas"]["ToolAccess"] | null;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSupportOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Authenticated, protected support unavailable (supported=false). Without this DTO, {"detail": "authority_unavailable"} when no current server resolution could be read. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HookSupportOut"];
                 };
             };
         };
@@ -11248,6 +13292,66 @@ export interface operations {
             };
         };
     };
+    submit_remediation_nominations_v1_internal_remediation_nominations_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationNominationSubmit"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationNominationAccepted"];
+                };
+            };
+            /** @description Refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationNominationRefusal"];
+                };
+            };
+            /** @description Refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationNominationRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Broker unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     release_sandbox_credential_v1_internal_state_released_credentials_post: {
         parameters: {
             query?: never;
@@ -11269,6 +13373,76 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    append_thread_attachments_v1_internal_thread_attachments_append_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ThreadAttachmentAppend"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadAttachmentAppendOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    query_thread_attachments_v1_internal_thread_attachments_query_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ThreadAttachmentQuery"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ThreadAttachmentRefsOut"];
+                };
             };
             /** @description Validation Error */
             422: {

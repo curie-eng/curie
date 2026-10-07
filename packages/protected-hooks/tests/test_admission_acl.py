@@ -185,14 +185,18 @@ def test_facade_exports_only_closed_operations_and_owns_no_client_lifecycle(admi
     c = client(b)
     f = a.AtomicAdmission(
         c,
-        broker_identity=b.manifest().as_dict()["broker_identity"],
+        trusted_manifest=b.manifest(),
         trusted_max_readiness_ms=60000,
         backlog_limit=1,
     )
-    assert {name for name in dir(f) if not name.startswith("_")} == {"admit", "recover"}
+    assert {name for name in dir(f) if not name.startswith("_")} == {
+        "admit",
+        "recover",
+        "preparing",
+    }
     assert list(inspect.signature(a.AtomicAdmission).parameters) == [
         "client",
-        "broker_identity",
+        "trusted_manifest",
         "trusted_max_readiness_ms",
         "backlog_limit",
     ]
@@ -212,6 +216,9 @@ def test_facade_exports_only_closed_operations_and_owns_no_client_lifecycle(admi
         ("trusted_max_readiness_ms", 0),
         ("trusted_max_readiness_ms", 9007199254740992),
         ("trusted_max_readiness_ms", 1.0),
+        ("trusted_manifest", "broker_identity"),
+        ("trusted_manifest", "manifest_dict"),
+        ("trusted_manifest", None),
     ],
 )
 def test_constructor_invalid_bounds_before_broker_io(admission_broker, field, bad):
@@ -221,10 +228,14 @@ def test_constructor_invalid_bounds_before_broker_io(admission_broker, field, ba
     r = module("admission_records")
     c = client(b)
     options = dict(
-        broker_identity=b.manifest().as_dict()["broker_identity"],
+        trusted_manifest=b.manifest(),
         trusted_max_readiness_ms=60000,
         backlog_limit=1,
     )
+    if field == "trusted_manifest" and bad is not None:
+        # A bare broker identity or a manifest mapping is not the trusted manifest record.
+        manifest = b.manifest().as_dict()
+        bad = manifest["broker_identity"] if bad == "broker_identity" else manifest
     options[field] = bad
     b.command("ACL", "LOG", "RESET")
     b.command("ACL", "SETUSER", "enqueue", "-info", "-get", "-eval", "-time")

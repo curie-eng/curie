@@ -1,4 +1,4 @@
-"""Wire shapes of the channel read routes (ADR 0100, #2877).
+"""Wire shapes of the channel read routes and the canvas route (ADR 0100, ADR 0200).
 
 Times stay strings in the request so a malformed one is refused with the named
 ``channel_read.window_invalid`` rather than a bare validation error.
@@ -93,3 +93,62 @@ class ChannelReadContext(BaseModel):
     generation: int
     expires_at: int
     turn_key: str
+
+
+class ChannelCanvasRequest(BaseModel):
+    """One canvas list, read or cell edit on a bound surface (ADR 0200).
+
+    Which fields an operation takes is checked by the service, so a misplaced
+    one is refused by name: ``channel`` for a list; ``kind`` and ``canvas_id``
+    for a read; those plus ``section_id`` and ``text`` for an edit.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["list", "read", "edit"]
+    channel: ChannelSelector | None = None
+    kind: str | None = Field(default=None, min_length=1, max_length=64)
+    canvas_id: str | None = Field(default=None, max_length=64)
+    section_id: str | None = Field(default=None, max_length=128)
+    text: str | None = Field(default=None, max_length=4096)
+
+
+class CanvasSummary(BaseModel):
+    id: str
+    title: str
+    created: str  # RFC 3339
+
+
+class CanvasCell(BaseModel):
+    """One table cell. ``section_id`` is set only when the cell is editable."""
+
+    section_id: str | None
+    text: str
+    truncated: bool
+
+
+class CanvasTable(BaseModel):
+    """A table by position: the first row is the header, the rest are rows."""
+
+    header: list[CanvasCell]
+    rows: list[list[CanvasCell]]
+
+
+class CanvasParagraph(BaseModel):
+    """Text outside any table; its ``section_id`` is informational, never editable."""
+
+    section_id: str | None
+    text: str
+    truncated: bool
+
+
+class ChannelCanvasResult(BaseModel):
+    operation: Literal["list", "read", "edit"]
+    canvases: list[CanvasSummary] | None = None
+    has_more: bool | None = None
+    canvas_id: str | None = None
+    title: str | None = None
+    tables: list[CanvasTable] | None = None
+    paragraphs: list[CanvasParagraph] | None = None
+    section_id: str | None = None
+    edited: bool | None = None

@@ -32,6 +32,7 @@ from .gate_summary import (
 )
 from .manifest import MANIFEST_LOCATIONS, resolve_manifest
 from .models import (
+    PLATFORM_SLACK_GRANT_FIELDS,
     ApprovalGate,
     ApprovalPolicy,
     Author,
@@ -71,6 +72,7 @@ __all__ = [
     "__version__",
     "PLATFORM_PUBLISH_TOOL_NAME",
     "CHANNEL_READ_SERVER_NAME",
+    "PLATFORM_SLACK_GRANT_FIELDS",
     "RESERVED_BOOT_ENV",
     "is_reserved_boot_env_name",
     "MANIFEST_LOCATIONS",

@@ -1,4 +1,4 @@
-"""Migration 0078 adds curie.provider_installations and curie.channel_identities (#2909)."""
+"""Migration 0083 adds curie.provider_installations and curie.channel_identities (#2909)."""
 
 from __future__ import annotations
 
@@ -75,14 +75,14 @@ def _constraint_names(table: str) -> set[str]:
     return {row["conname"] for row in rows}
 
 
-def test_0078_revises_0077() -> None:
+def test_0083_revises_0082() -> None:
     script = ScriptDirectory.from_config(_config())
-    revision = script.get_revision("0078")
+    revision = script.get_revision("0083")
     assert revision is not None
-    assert revision.down_revision == "0077"
+    assert revision.down_revision == "0082"
 
 
-def test_0078_round_trip_creates_and_drops_both_tables(
+def test_0083_round_trip_creates_and_drops_both_tables(
     isolated_migration_db: None,
 ) -> None:
     config = _config()
@@ -90,7 +90,7 @@ def test_0078_round_trip_creates_and_drops_both_tables(
     assert _regclass("provider_installations") is not None
     assert _regclass("channel_identities") is not None
     try:
-        command.downgrade(config, "0077")
+        command.downgrade(config, "0082")
         assert _regclass("channel_identities") is None
         assert _regclass("provider_installations") is None
         # The FK targets from 0051 (tenants) and 0057 (principals) must outlive the downgrade.

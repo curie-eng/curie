@@ -42,9 +42,11 @@ from .graveyardwatcher import GraveyardWatcher
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
+from .protected_reconciler import ProtectedAdmissionReconciler
 from .resumequeue import ResumeQueue
 from .resumereconciler import ResumeReconciler
 from .routers import (
+    action_executions,
     actions,
     agents,
     approval_recovery,
@@ -65,15 +67,19 @@ from .routers import (
     github,
     github_reviews,
     hook_fire,
+    hook_source_policy,
     hooks,
     memory,
     observability,
     provider_installations,
     publication_precheck,
     publications,
+    remediation_nominations,
+    remediation_policy,
     runs,
     schedules,
     state,
+    thread_attachments,
     turn_progress,
     work_item_issue,
     work_item_outcomes,
@@ -288,9 +294,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         source_gate_engine = create_source_gate_engine()
         source_resources.push_async_callback(source_gate_engine.dispose)
         app.state.source_gate = SourceGate(source_gate_engine)
+        # @spec PROTECTED-HOOK-LANE-4: one admission reconciler per process, inside
+        # the source resource scope, stopped before Valkey and the engines close.
+        protected_reconciler = ProtectedAdmissionReconciler(
+            lambda: get_settings().protected_runtime_dir
+        )
+        app.state.protected_admission_reconciler = protected_reconciler
+        protected_reconciler.start()
         try:
             yield
         finally:
+            await protected_reconciler.stop()
             notice_task = app.state.deploy_notice_reconciler_task
             if notice_task is not None:
                 notice_task.cancel()
@@ -458,6 +472,9 @@ def create_app() -> FastAPI:
     app.include_router(config.router)
     app.include_router(console.router)
     app.include_router(agents.router)
+    app.include_router(hook_source_policy.router)
+    app.include_router(remediation_policy.router)
+    app.include_router(remediation_nominations.router)
     app.include_router(deployments.router)
     app.include_router(bundles.router)
     app.include_router(deploy_targets.router)
@@ -473,12 +490,17 @@ def create_app() -> FastAPI:
     app.include_router(state.router)
     app.include_router(state.internal_router)
     app.include_router(state.released_router)
+    app.include_router(thread_attachments.internal_router)
     app.include_router(memory.router)
     # BEFORE approvals.router: GET /approvals/identity-report would otherwise
     # be matched by GET /approvals/{approval_id} and fail as a bad uuid.
     app.include_router(approval_recovery.router)
     app.include_router(approvals.router)
     app.include_router(actions.router)
+    app.include_router(actions.undo_router)
+    app.include_router(action_executions.probe_router)
+    app.include_router(action_executions.router)
+    app.include_router(action_executions.receipt_router)
     app.include_router(publication_precheck.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)

@@ -3,8 +3,11 @@
 The single home of outcome semantics: ``derive_outcome`` is the only place an
 outcome ``state`` and ``actionable_cause`` are computed, and the CLI and the
 console render those strings verbatim. The module reads canonical WorkItem,
-ExecutionRequest, publication-lineage, Publication and Approval rows; it
-writes nothing and adds no store.
+ExecutionRequest, publication-lineage, Publication, Approval, factory status
+comment and execution phase report rows; it writes nothing and adds no store.
+The title and progress strip come from the status comment rows and the phase
+reports through ``factory_progress.phase_view``, the same derivation the
+GitHub status card uses (#4102).
 
 Output is an allowlist: every view is built from explicit fields below, never
 from an ORM row, so a runtime-owner token, a reply transport address, a patch,
@@ -21,11 +24,11 @@ import re
 import threading
 import uuid
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import anyio
 import httpx
@@ -38,16 +41,21 @@ from curie_api.schemas.workitems import (
     WorkItemCorrectnessOut,
     WorkItemOutcomeOut,
     WorkItemOutcomeState,
+    WorkItemProgressOut,
     WorkItemPrOut,
     WorkItemPublicationOut,
     WorkItemRequestOut,
+    WorkItemStageOut,
 )
 
 from .config import Settings
+from .factory_progress import phase_view
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import (
     Approval,
     ExecutionRequest,
+    ExecutionRequestPhaseReport,
+    FactoryStatusComment,
     Publication,
     ThreadPublicationLineage,
     WorkItem,
@@ -77,6 +85,9 @@ CI_JOB_LOG_MAX_DECODED_BYTES = 8 * 1024 * 1024
 CI_JOB_LOG_MAX_CHARS = 6_000
 CI_JOB_LOG_MAX_LINES = 80
 CI_JOB_LOG_TIMEOUT_SECONDS = 5.0
+# Bound on reading the PR base branch head's checks for pre-existing failures (#4105).
+# The base read runs last and only spends what the log deadline leaves.
+CI_BASE_READ_TIMEOUT_SECONDS = 5.0
 _CI_LOG_HOST = "pipelines.actions.githubusercontent.com"
 # GitHub's job log redirect has also been observed on Azure Blob storage.
 _CI_AZURE_LOG_HOST = re.compile(r"productionresults[a-z0-9]+\.blob\.core\.windows\.net")
@@ -89,6 +100,7 @@ _FAILING_CONCLUSIONS = frozenset(
 )
 _PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
 SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
+_COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
 
 CiObservation = WorkItemCiOut
 
@@ -503,6 +515,34 @@ async def _views(
             )
         )
 
+    sequences = {req.id: req.sequence for rows in requests.values() for req in rows}
+    comments: dict[uuid.UUID, list[FactoryStatusComment]] = defaultdict(list)
+    for comment in (
+        await session.scalars(
+            select(FactoryStatusComment).where(FactoryStatusComment.work_item_id.in_(ids))
+        )
+    ).all():
+        comments[comment.work_item_id].append(comment)
+    latest: dict[uuid.UUID, ExecutionRequest] = {
+        item_id: max(rows, key=lambda r: r.sequence) for item_id, rows in requests.items() if rows
+    }
+    latest_comment: dict[uuid.UUID, FactoryStatusComment] = {}
+    for item_id, req in latest.items():
+        row = next((c for c in comments[item_id] if c.execution_request_id == req.id), None)
+        if row is not None:
+            latest_comment[item_id] = row
+    reports: dict[uuid.UUID, list[ExecutionRequestPhaseReport]] = defaultdict(list)
+    progressed = {latest[item_id].id for item_id in latest_comment}
+    if progressed:
+        for report in (
+            await session.scalars(
+                select(ExecutionRequestPhaseReport)
+                .where(ExecutionRequestPhaseReport.execution_request_id.in_(progressed))
+                .order_by(ExecutionRequestPhaseReport.id)
+            )
+        ).all():
+            reports[report.execution_request_id].append(report)
+
     views = []
     for item in items:
         item_requests = requests.get(item.id, [])
@@ -522,20 +562,64 @@ async def _views(
         )
         lineage = chosen[item.id]
         chosen_pub = latest_pub.get(lineage.id) if lineage is not None else None
-        views.append((
-            derive_outcome(
-                item,
-                item_requests,
-                lineage,
-                chosen_pub,
-                approvals.get(chosen_pub.approval_id) if chosen_pub is not None else None,
-                pending_turn,
-                now,
-                issue_base=settings.github_clone_base,
-            ),
+        view = derive_outcome(
+            item,
+            item_requests,
             lineage,
-        ))
+            chosen_pub,
+            approvals.get(chosen_pub.approval_id) if chosen_pub is not None else None,
+            pending_turn,
+            now,
+            issue_base=settings.github_clone_base,
+        )
+        view.title = _title(comments[item.id], sequences)
+        comment_row = latest_comment.get(item.id)
+        if comment_row is not None:
+            req = latest[item.id]
+            view.progress = _progress(comment_row, reports[req.id], req)
+        views.append((view, lineage))
     return views
+
+
+def _title(rows: Sequence[FactoryStatusComment], sequences: dict[uuid.UUID, int]) -> str | None:
+    """The subject title of the work item's most recent status comment row."""
+
+    if not rows:
+        return None
+    newest = max(
+        rows,
+        key=lambda row: (row.created_at, sequences.get(row.execution_request_id, 0)),
+    )
+    return newest.subject_title
+
+
+def _progress(
+    row: FactoryStatusComment,
+    reports: Sequence[ExecutionRequestPhaseReport],
+    req: ExecutionRequest,
+) -> WorkItemProgressOut:
+    """The status card's phase view for one request, as explicit fields."""
+
+    view = phase_view(
+        row.declaration or {"phases": [], "loops": []},
+        reports,
+        req.status,
+        req.terminal_cause,
+    )
+    slots = view.stages if view.staged else view.phases
+    return WorkItemProgressOut(
+        current=view.current,
+        note=next((report.note for report in reversed(reports) if report.note), None),
+        stages=[
+            WorkItemStageOut(
+                id=slot.id,
+                label=slot.label,
+                state=slot.state,
+                round_label=slot.round_label,
+            )
+            for slot in slots
+        ],
+    )
 
 
 async def load_outcomes(
@@ -809,6 +893,11 @@ class CiDetail:
     annotations: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     job_logs: dict[int, str] = field(default_factory=dict)
     job_log_unavailable: set[int] = field(default_factory=set)
+    # The check runs and commit statuses of the commit the PR's base branch
+    # points to at this observation (#4105). Both None when not read or
+    # unreadable; set both or neither.
+    base_check_runs: list[dict[str, Any]] | None = None
+    base_statuses: list[dict[str, Any]] | None = None
 
 
 def _detail_unavailable(reason: str, head_sha: str | None) -> CiDetail:
@@ -822,6 +911,69 @@ def _check_runs_reason(payload: Any) -> str | None:
     if verdict in ("passing", "failing", "pending", "none"):
         return None
     return verdict
+
+
+def _statuses_list(payload: Any) -> list[dict[str, Any]] | None:
+    """The commit statuses list, or None when the payload is malformed.
+
+    Only the statuses list counts: the combined ``state`` reads pending when no
+    status exists at all.
+    """
+
+    statuses = payload.get("statuses") if isinstance(payload, dict) else None
+    if not isinstance(statuses, list) or not all(
+        isinstance(item, dict) and isinstance(item.get("state"), str) for item in statuses
+    ):
+        return None
+    return list(statuses)
+
+
+def _has_failure(check_runs: list[dict[str, Any]], statuses: list[dict[str, Any]]) -> bool:
+    return any(
+        run.get("status") == "completed" and run.get("conclusion") in _FAILING_CONCLUSIONS
+        for run in check_runs
+    ) or any(item.get("state") in ("error", "failure") for item in statuses)
+
+
+async def _read_base_checks(
+    get: Callable[[str, dict[str, Any]], Awaitable[tuple[Any, str | None]]],
+    base_ref: str,
+    log_deadline: float,
+) -> tuple[list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+    """Check runs and statuses of the base branch's current head (#4105).
+
+    Returns ``(None, None)`` on any failure: an unreadable base only means every
+    head failure counts as caused by the change, never an unavailable head. It
+    runs after the annotation and job log reads and only spends what is left of
+    ``log_deadline``, so a slow base never delays the head observation.
+    """
+
+    loop = asyncio.get_running_loop()
+    budget = max(0.0, min(CI_BASE_READ_TIMEOUT_SECONDS, log_deadline - loop.time()))
+    try:
+        async with asyncio.timeout(budget):
+            # https://docs.github.com/en/rest/branches/branches#get-a-branch
+            branch, reason = await get(f"/branches/{quote(base_ref, safe='/')}", {})
+            commit = branch.get("commit") if reason is None and isinstance(branch, dict) else None
+            sha = commit.get("sha") if isinstance(commit, dict) else None
+            if not isinstance(sha, str) or not _COMMIT_SHA_RE.fullmatch(sha):
+                return None, None
+            runs_payload, reason = await get(
+                f"/commits/{sha}/check-runs",
+                {"per_page": CHECK_RUNS_PAGE, "filter": "latest"},
+            )
+            if reason is not None or _check_runs_reason(runs_payload) is not None:
+                return None, None
+            status_payload, reason = await get(
+                f"/commits/{sha}/status", {"per_page": CHECK_RUNS_PAGE}
+            )
+            statuses = _statuses_list(status_payload) if reason is None else None
+            if statuses is None:
+                return None, None
+            return list(runs_payload["check_runs"]), statuses
+    except Exception:  # noqa: BLE001
+        # TimeoutError included: the base read is advisory and never fails the head.
+        return None, None
 
 
 def _signed_job_log_url(location: str | None) -> httpx.URL | None:
@@ -985,12 +1137,8 @@ async def _observe_ci_detail(
         )
         if reason is not None:
             return _detail_unavailable(reason, head_sha)
-        # Only the statuses list counts: the combined ``state`` reads pending
-        # when no status exists at all.
-        statuses = status_payload.get("statuses") if isinstance(status_payload, dict) else None
-        if not isinstance(statuses, list) or not all(
-            isinstance(item, dict) and isinstance(item.get("state"), str) for item in statuses
-        ):
+        statuses = _statuses_list(status_payload)
+        if statuses is None:
             return _detail_unavailable("malformed_response", head_sha)
         check_runs: list[dict[str, Any]] = list(runs_payload["check_runs"])
         annotations: dict[int, list[dict[str, Any]]] = {}
@@ -1038,6 +1186,12 @@ async def _observe_ci_detail(
                 job_logs[job_id] = log
             else:
                 job_log_unavailable.add(job_id)
+        # Last, so it only spends what the log deadline leaves (#4105).
+        base_check_runs: list[dict[str, Any]] | None = None
+        base_statuses: list[dict[str, Any]] | None = None
+        base_ref = getattr(lineage, "base_ref", None)
+        if isinstance(base_ref, str) and base_ref and _has_failure(check_runs, statuses):
+            base_check_runs, base_statuses = await _read_base_checks(get, base_ref, log_deadline)
     finally:
         del token
         headers.clear()
@@ -1046,8 +1200,10 @@ async def _observe_ci_detail(
         reason=None,
         head_sha=head_sha,
         check_runs=check_runs,
-        statuses=list(statuses),
+        statuses=statuses,
         annotations=annotations,
         job_logs=job_logs,
         job_log_unavailable=job_log_unavailable,
+        base_check_runs=base_check_runs,
+        base_statuses=base_statuses,
     )

@@ -34,7 +34,8 @@ declare neither name.
 
 **Reservation does not imply mounting, publication or exemption.** The
 reserved ``curie-slack`` platform capability is fully governed by ``toolPolicy``
-when the manifest grants ``channelRead: true``. Granting it recognizes its
+when the manifest grants any of ``channelRead``, ``canvasList``, ``canvasRead``
+or ``canvasEdit`` (ADR 0100, #3819). Granting one recognizes its
 canonical server name during policy validation, but does not override deny or
 approval decisions. Without that grant a literal pattern gets
 ``channel_read.grant_required``. A wildcard does not grant or mount a capability.

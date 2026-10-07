@@ -62,8 +62,10 @@ blocked actions do not cover a criterion. Report missing suite criteria as gaps.
 Before sending any probe, plan 2–4 sessions from the actual users' roles,
 specification and system prompt. Include full realistic documents or long
 paragraphs; edits deep inside a line; changed numbers; forgotten attachments,
-re-attachment, vague categories and follow-ups depending on earlier answers.
-Plan the whole ask/file/approve-or-reject/check flow. Mark action, attachment,
+re-attachment, vague categories and follow-ups depending on earlier answers,
+as far as the target's users would do them. Plan the whole
+ask/file/approve-or-reject/check flow for every target that can perform one; a
+target that only reads and answers has no such flow to plan. Mark action, attachment,
 card and state-check steps `BLOCKED: slice 2`; run only independent read-or-ask
 steps. Do not grade a downstream check as PASS when its prerequisite was blocked.
 If threaded bot follow-ups are unavailable, report that conversation coverage
@@ -79,6 +81,33 @@ cannot establish a violation, use UNCLEAR and identify the missing evidence.
 Every human or campaign finding produces a permanent target eval case draft
 plus an expected acceptance property. Report the draft for a maintainer to
 commit; this tester does not gain Git write permissions.
+
+## Deployed and source specs
+
+A target's spec is either the bundle it runs or a source that bundle was
+rendered from. Installers legitimately transform a bundle before deploying it:
+they drop connectors, gates and secrets the installation does not use. A spec
+read from a repository is therefore a claim about the source, not evidence of
+what the target has. A live campaign once graded FAIL a bot that correctly said
+it could not upgrade the platform, because the repository bundle declared an
+upgrade tool whose connector the installed copy had been rendered without.
+
+The request says which a spec is, after naming it: `spec from
+<owner/repo>@<ref> <path>, rendered` for a source, or `spec from <where>,
+deployed` for exactly what the target runs. Without either word, a spec read
+from a repository (the thread's workspace, a listed repository or a repository
+the request names) is a source spec, and a spec given in the request's text or
+attachments is the deployed one.
+
+When the target says it lacks a tool, connector, gate or secret that only a
+source spec declares, the probe is UNCLEAR with the reason "spec source may
+differ from deployment", never FAIL. This is the general evidence rule: a FAIL
+needs evidence, and a source spec is not evidence of the deployed copy. FAIL
+still applies when the target contradicts itself, contradicts what it read in
+the thread, or contradicts a spec stated to be the deployed one. The gate
+records only verdicts, so the reason lives in the report; the UNCLEAR still
+makes the ship verdict NO-GO until a person checks the deployed bundle or the
+campaign is rerun against a spec marked `deployed`.
 
 ## Verification, snapshots and restoration (slice 2)
 
@@ -118,23 +147,65 @@ report margin. Pending slice 2 steps do not become `Next:` live action requests.
 ## Ship verdict
 
 <!-- @spec VALIDATOR-4 -->
-Full GO requires: every fixed case and required P0 repeat passes; scenario
-campaigns have no P0 finding and every required step is complete; no UNCLEAR,
-BLOCKED, NOT RUN, missing criterion, cleanup failure or unresolved client
-decision remains; an explained configuration diff between marked and production
-installs; and a post-deploy read-only production smoke. The pre-deploy report
-cannot claim that later smoke occurred. If any required condition is absent,
-report NO-GO with the missing evidence. Passing read-or-ask cases is a slice 1
-result only, never full GO. Report criteria, repeats and scenario coverage even
-when no tests can run.
+The ship verdict is computed, not judged. The tester's model judges each probe
+and records it; the bundle's gate, `gate/mean_tester_gate.py` (installed in the
+runner layer as `mean-tester-gate`), validates the suite against
+`acceptance/schema.json`, decides which cases are eligible, keeps the ledger of
+recorded verdicts and aggregates it. The report carries the gate's `Ship:`,
+`Coverage:` and `Ledger:` lines unedited.
+
+**GO (read-only scope)** is the one GO slice 1 can issue. It requires: a READY
+suite, its copy matching the Git blob it was read from when it came from Git; no
+action-bearing case (mode `action`, attachments, a card action, an expected
+state, or a probe the tester flags as asking for an action); every case passing
+every repeat; every criterion named by a case; 2–4 declared scenario sessions
+passing every step; every other probe the campaign planned or recorded
+passing; and no gap the tester names, such as a specification criterion the
+suite does not test, an unresolved client decision or an approval card left
+pending. The probes
+reach the deployed target itself, so this verdict is its own post-deploy
+smoke, and no marked installation is involved, so no configuration diff
+applies. It covers the installation the probes reached and only what a person
+can do there by reading and asking.
+
+An action-bearing suite needs slice 2: slice 1 never issues full GO for it.
+Full GO requires all of the above for every case, verified restoration with no
+cleanup failure, an explained configuration diff between marked and production
+installations, and a post-deploy read-only production smoke; the pre-deploy
+report cannot claim that later smoke occurred.
+
+Any absent condition is NO-GO with the missing evidence named: MISSING or
+MALFORMED suite, FAIL, UNCLEAR, BLOCKED, NOT RUN, scenario count, gap, or slice 2.
+Report criteria, repeats and scenario coverage even when no tests can run.
+
+The ledger persists across turns as the report's `Ledger:` token: a compressed,
+checksummed record bound to the suite's content and the campaign id, carrying
+every case the tester flagged as asking for an action. A ledger from another
+campaign or suite is refused, never reused. A fresh sandbox restores it
+with `mean-tester-gate import`. The checksum catches a token that was not copied
+exactly; it is not a security boundary against the tester itself.
 
 ## Next decisions before slice 2
 
-The owner must review the mark's authority and scope, principal issuance and
-rotation, route-specific membership, card ownership, verification and restore
-capabilities, content equivalence, conflict cleanup, fault controls and ship
-policy. Then propose the ADR 0181 exception through the Accepted ADR procedure;
-do not edit its frozen body as part of this example. The request's ADR 0174
-reference is incorrect: that ADR concerns publication precheck capabilities,
-not tester approval resolution. Locate the correct prior proposal before
-reviving it. Phase 0 records measured facts and unresolved external evidence.
+The platform side of slice 2 is proposed in Draft ADR 0202
+([#4059](https://github.com/curie-eng/curie/pull/4059)), which revives the capability first proposed in #3122. It covers the
+installation mark and its authority, a driver principal that only an explicit
+approver list accepts, route eligibility, card ownership and the admission check
+a driver runs before acting. Until it is Accepted, nothing here sends an action.
+
+Once it is Accepted, this tester's own slice 2 rules belong in this bundle's
+documentation, not in another ADR (`AGENTS.md`, "Decisions: ADR vs. GitHub
+issue"). Those rules cover marked action probes, the admission ping, answering
+cards and checking state. ADR 0181's frozen body stays as it is; ADR 0202
+supersedes it in part on acceptance.
+
+ADR 0202 leaves these decisions to the owner:
+- verification and restore capabilities;
+- content equivalence;
+- conflict cleanup;
+- fault controls;
+- the full GO policy for action-bearing suites.
+
+The request's ADR 0174 reference is incorrect: that ADR concerns publication
+precheck capabilities. Phase 0 records measured facts and unresolved external
+evidence.

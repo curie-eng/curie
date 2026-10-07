@@ -5,6 +5,11 @@ Authorization, bounds, budgets and cursors are surface neutral and live in
 ``slack_reads`` and registering it in ``service.channel_readers``. A kind with no
 reader, or whose reader does not advertise ``history-read``, is a capability
 miss, never an empty page.
+
+Canvases are the second, optional read family (ADR 0200): a surface that has
+them adds a ``CanvasReader`` advertising ``canvas-read`` (list and read) and,
+when it can replace a cell, ``canvas-edit``. A surface without canvases
+advertises neither and its kind is refused by name.
 """
 
 from __future__ import annotations
@@ -107,5 +112,96 @@ class ChannelReader(Protocol):
 def reader_for(readers: Mapping[str, ChannelReader], kind: str) -> ChannelReader | None:
     reader = readers.get(kind)
     if reader is None or ChannelCapability.HISTORY_READ not in reader.capabilities:
+        return None
+    return reader
+
+
+@dataclass(frozen=True)
+class CanvasFile:
+    """What the provider's metadata says about one canvas: where it is shared,
+    whether it is a canvas at all, and where its content is fetched from."""
+
+    id: str
+    title: str
+    created: int
+    shared_in: frozenset[str]
+    is_canvas: bool
+    url: str
+
+
+@dataclass(frozen=True)
+class CanvasSummaryRecord:
+    id: str
+    title: str
+    created: int
+
+
+@dataclass(frozen=True)
+class CanvasCellRecord:
+    section_id: str | None
+    text: str
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class CanvasTableRecord:
+    header: list[CanvasCellRecord]
+    rows: list[list[CanvasCellRecord]]
+
+
+@dataclass(frozen=True)
+class CanvasParagraphRecord:
+    section_id: str | None
+    text: str
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class CanvasDocument:
+    tables: list[CanvasTableRecord]
+    paragraphs: list[CanvasParagraphRecord]
+
+
+@dataclass(frozen=True)
+class CanvasPage:
+    canvases: list[CanvasSummaryRecord]
+    has_more: bool
+
+
+class CanvasReader(Protocol):
+    """Canvas operations of one surface. The caller authorizes every canvas
+    against the agent's bindings; a reader only answers what it is asked."""
+
+    capabilities: frozenset[ChannelCapability]
+
+    def identity(self, routes: list[BindingRoute]) -> str: ...
+
+    def has_identity(self, identity: str) -> bool: ...
+
+    def identity_key(self, identity: str) -> str: ...
+
+    def valid_canvas_id(self, value: str) -> bool: ...
+
+    def valid_section_id(self, value: str) -> bool: ...
+
+    async def locate(self, *, identity: str, canvas_id: str) -> CanvasFile | None:
+        """The canvas's metadata, or None when the provider cannot see it."""
+
+    async def is_member(self, *, identity: str, channel: str) -> bool: ...
+
+    async def list(self, *, identity: str, channel: str) -> CanvasPage: ...
+
+    async def document(self, *, identity: str, file: CanvasFile) -> CanvasDocument: ...
+
+    async def replace_cell(
+        self, *, identity: str, canvas_id: str, section_id: str, text: str
+    ) -> None: ...
+
+
+def canvas_reader_for(
+    readers: Mapping[str, CanvasReader], kind: str, capability: ChannelCapability
+) -> CanvasReader | None:
+    reader = readers.get(kind)
+    if reader is None or capability not in reader.capabilities:
         return None
     return reader

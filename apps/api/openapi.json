@@ -108,6 +108,32 @@
       "ActionComplete": {
         "description": "The closing frame: what came back, and what it takes to put it back.\n\n``prior_state`` and ``target`` are what a restore replays. Both are optional\nbecause a connector that answers in prose reports neither, and a record that\nholds neither is not undoable -- which is the honest answer rather than a\nmissing one.",
         "properties": {
+          "connector": {
+            "anyOf": [
+              {
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector"
+          },
+          "connector_digest": {
+            "anyOf": [
+              {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector Digest"
+          },
           "detail": {
             "anyOf": [
               {
@@ -135,6 +161,20 @@
               }
             ],
             "title": "Post State"
+          },
+          "post_version": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "pattern": "^[\\x20-\\x7e]+$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Post Version"
           },
           "prior_state": {
             "anyOf": [
@@ -443,77 +483,41 @@
         "title": "ActionRecord",
         "type": "object"
       },
-      "ActionRestore": {
-        "description": "The call an authorized undo permits: put this state back on that target.",
-        "properties": {
-          "prior_state": {
-            "additionalProperties": true,
-            "title": "Prior State",
-            "type": "object"
-          },
-          "target": {
-            "additionalProperties": true,
-            "title": "Target",
-            "type": "object"
-          }
-        },
-        "required": [
-          "target",
-          "prior_state"
-        ],
-        "title": "ActionRestore",
-        "type": "object"
-      },
       "ActionUndo": {
-        "description": "A request to put back what an action changed.\n\n``observed_state`` is the resource as it looks NOW, read by whoever will\nperform the restore. The platform cannot read it itself -- nothing here can\nreach a connector -- and it will not assume: an absent observation is refused\nrather than treated as \"unchanged\".",
+        "description": "A request to put back what an action changed.\n\n@spec ACTION-EXECUTOR-3: the actor is the authenticated principal, never\nthis body. ``actor`` is accepted only as a cross-check: one that differs\nfrom the principal is refused. Channel evidence likewise comes from the\nprincipal. The platform observes the live version itself through the\npinned connector (ACTION-EXECUTOR-15), so a caller-supplied observation is\nno longer evidence; an ``observed_state`` sent by an older caller is\nignored as an unknown field, never compared.",
         "properties": {
           "actor": {
-            "title": "Actor",
-            "type": "string"
-          },
-          "actor_channel": {
             "anyOf": [
               {
+                "maxLength": 256,
                 "type": "string"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Actor Channel"
-          },
-          "observed_state": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Observed State"
+            "title": "Actor"
           }
         },
-        "required": [
-          "actor"
-        ],
         "title": "ActionUndo",
         "type": "object"
       },
       "ActionUndoOut": {
-        "description": "An authorization, not a receipt.\n\nThe API rules and returns; something else performs the restore (ADR-0117\nleaves where that executor lives undecided). So this names the call to make\nrather than claiming it was made.",
+        "description": "A requested restore, not a receipt and not the call to make.\n\n@spec ACTION-EXECUTOR-3: the ruling answers with the execution it created\nand that execution's state. It never carries the ``target``, the sealed\n``prior_state`` or a version; the receipt is the execution's own read.",
         "properties": {
-          "action": {
-            "$ref": "#/components/schemas/ActionOut"
+          "execution_id": {
+            "format": "uuid",
+            "title": "Execution Id",
+            "type": "string"
           },
-          "restore": {
-            "$ref": "#/components/schemas/ActionRestore"
+          "state": {
+            "title": "State",
+            "type": "string"
           }
         },
         "required": [
-          "action",
-          "restore"
+          "execution_id",
+          "state"
         ],
         "title": "ActionUndoOut",
         "type": "object"
@@ -929,6 +933,17 @@
             ],
             "title": "Repo Full Name"
           },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
+          },
           "secrets": {
             "anyOf": [
               {
@@ -1129,6 +1144,17 @@
             ],
             "title": "Repo Full Name"
           },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
+          },
           "runner_resources": {
             "anyOf": [
               {
@@ -1189,6 +1215,7 @@
           "deploy_notifications",
           "behavior_packs",
           "model",
+          "reviewer_model",
           "thinking",
           "approval_required_tools",
           "approval_routes",
@@ -1393,6 +1420,17 @@
               }
             ],
             "title": "Repo Full Name"
+          },
+          "reviewer_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewer Model"
           },
           "runner_resources": {
             "anyOf": [
@@ -3010,6 +3048,119 @@
         "title": "CancelBody",
         "type": "object"
       },
+      "CanvasCell": {
+        "description": "One table cell. ``section_id`` is set only when the cell is editable.",
+        "properties": {
+          "section_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Id"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "section_id",
+          "text",
+          "truncated"
+        ],
+        "title": "CanvasCell",
+        "type": "object"
+      },
+      "CanvasParagraph": {
+        "description": "Text outside any table; its ``section_id`` is informational, never editable.",
+        "properties": {
+          "section_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Id"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          },
+          "truncated": {
+            "title": "Truncated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "section_id",
+          "text",
+          "truncated"
+        ],
+        "title": "CanvasParagraph",
+        "type": "object"
+      },
+      "CanvasSummary": {
+        "properties": {
+          "created": {
+            "title": "Created",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "created"
+        ],
+        "title": "CanvasSummary",
+        "type": "object"
+      },
+      "CanvasTable": {
+        "description": "A table by position: the first row is the header, the rest are rows.",
+        "properties": {
+          "header": {
+            "items": {
+              "$ref": "#/components/schemas/CanvasCell"
+            },
+            "title": "Header",
+            "type": "array"
+          },
+          "rows": {
+            "items": {
+              "items": {
+                "$ref": "#/components/schemas/CanvasCell"
+              },
+              "type": "array"
+            },
+            "title": "Rows",
+            "type": "array"
+          }
+        },
+        "required": [
+          "header",
+          "rows"
+        ],
+        "title": "CanvasTable",
+        "type": "object"
+      },
       "ChannelAddress": {
         "additionalProperties": false,
         "properties": {
@@ -3185,6 +3336,200 @@
           "allowed_callers"
         ],
         "title": "ChannelCallersWrite",
+        "type": "object"
+      },
+      "ChannelCanvasRequest": {
+        "additionalProperties": false,
+        "description": "One canvas list, read or cell edit on a bound surface (ADR 0200).\n\nWhich fields an operation takes is checked by the service, so a misplaced\none is refused by name: ``channel`` for a list; ``kind`` and ``canvas_id``\nfor a read; those plus ``section_id`` and ``text`` for an edit.",
+        "properties": {
+          "canvas_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvas Id"
+          },
+          "channel": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelSelector"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "operation": {
+            "enum": [
+              "list",
+              "read",
+              "edit"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "section_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Id"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Text"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "ChannelCanvasRequest",
+        "type": "object"
+      },
+      "ChannelCanvasResult": {
+        "properties": {
+          "canvas_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvas Id"
+          },
+          "canvases": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CanvasSummary"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canvases"
+          },
+          "edited": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Edited"
+          },
+          "has_more": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Has More"
+          },
+          "operation": {
+            "enum": [
+              "list",
+              "read",
+              "edit"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "paragraphs": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CanvasParagraph"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Paragraphs"
+          },
+          "section_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Section Id"
+          },
+          "tables": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/CanvasTable"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tables"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "title": "ChannelCanvasResult",
         "type": "object"
       },
       "ChannelIdentityCreate": {
@@ -4781,6 +5126,340 @@
         "title": "EvalTriggerResult",
         "type": "object"
       },
+      "ExecutionClaim": {
+        "additionalProperties": false,
+        "description": "@spec ACTION-EXECUTOR-17: who claims, and for how long the lease holds.",
+        "properties": {
+          "lease_owner": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Lease Owner",
+            "type": "string"
+          },
+          "lease_seconds": {
+            "maximum": 3600.0,
+            "minimum": 1.0,
+            "title": "Lease Seconds",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "lease_owner",
+          "lease_seconds"
+        ],
+        "title": "ExecutionClaim",
+        "type": "object"
+      },
+      "ExecutionCreated": {
+        "description": "A created or adopted execution: its identity and state, nothing else.",
+        "properties": {
+          "execution_id": {
+            "format": "uuid",
+            "title": "Execution Id",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "execution_id",
+          "state"
+        ],
+        "title": "ExecutionCreated",
+        "type": "object"
+      },
+      "ExecutionFence": {
+        "additionalProperties": false,
+        "description": "@spec ACTION-EXECUTOR-17: the fence every later transition presents.",
+        "properties": {
+          "attempt": {
+            "minimum": 0.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "lease_owner": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Lease Owner",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_owner",
+          "attempt"
+        ],
+        "title": "ExecutionFence",
+        "type": "object"
+      },
+      "ExecutionObservation": {
+        "additionalProperties": false,
+        "description": "@spec ACTION-EXECUTOR-15: the version ``observe_version`` reported now.\n\nAbsent, empty or malformed is accepted here and answered as a conflict by\nthe route, never as a 422: the spec refuses the restore in that case, and a\nrejected request would leave the execution waiting instead.",
+        "properties": {
+          "attempt": {
+            "minimum": 0.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "lease_owner": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Lease Owner",
+            "type": "string"
+          },
+          "version": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Version"
+          }
+        },
+        "required": [
+          "lease_owner",
+          "attempt"
+        ],
+        "title": "ExecutionObservation",
+        "type": "object"
+      },
+      "ExecutionOut": {
+        "description": "One execution as the worker and the receipt read it.\n\n@spec ACTION-EXECUTOR-18. Deliberately without ``outcome`` or\n``forward_arguments``: the read names what ran and how it ended, never a\nversion, an argument or a state.\n\n@spec ACTION-EXECUTOR-14 @spec ACTION-EXECUTOR-7. Two non-secret digests\nthe worker checks before dispatch: ``connector_digest``, the image the\ncall must run against, and ``arguments_sha256``, the ruling's digest over\nthe restore's canonical ``{target, prior_state}`` (null on a probe). A\ndigest names neither the arguments nor the state it covers.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "arguments_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Arguments Sha256"
+          },
+          "attempt": {
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "connector": {
+            "title": "Connector",
+            "type": "string"
+          },
+          "connector_digest": {
+            "title": "Connector Digest",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "dispatched_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Dispatched At"
+          },
+          "failure_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Failure Code"
+          },
+          "finished_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Finished At"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "lease_expires_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Expires At"
+          },
+          "lease_owner": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lease Owner"
+          },
+          "refusal_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refusal Code"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "subject_action_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Subject Action Id"
+          },
+          "tool": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "state",
+          "agent_id",
+          "connector",
+          "tool",
+          "subject_action_id",
+          "requested_by",
+          "attempt",
+          "lease_owner",
+          "lease_expires_at",
+          "refusal_code",
+          "failure_code",
+          "dispatched_at",
+          "finished_at",
+          "created_at",
+          "connector_digest",
+          "arguments_sha256"
+        ],
+        "title": "ExecutionOut",
+        "type": "object"
+      },
+      "ExecutionOutcome": {
+        "additionalProperties": false,
+        "description": "@spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20: the terminal report.\n\n``state`` is one of ``refused``, ``confirmed``, ``failed`` or\n``indeterminate``; ``code`` is checked against its stage by the route.\n``advertised`` is a probe's report only: the verbs whose ``tools/list``\nentry met ACTION-EXECUTOR-13's rule.",
+        "properties": {
+          "advertised": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 256,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Advertised"
+          },
+          "attempt": {
+            "minimum": 0.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "lease_owner": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Lease Owner",
+            "type": "string"
+          },
+          "state": {
+            "maxLength": 32,
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "lease_owner",
+          "attempt",
+          "state"
+        ],
+        "title": "ExecutionOutcome",
+        "type": "object"
+      },
       "FinishBody": {
         "properties": {
           "cause": {
@@ -4939,8 +5618,18 @@
         "type": "object"
       },
       "HookAccepted": {
-        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).\n\n``conversation_id`` is the thread this delivery ACTUALLY landed on. A\npartitioned hook (ADR-0134) mints one id per partition value, and the caller\nhas no other way to learn which of them it got -- it is the last segment of\nthe thread key that ``POST /agents/{agent_id}/threads/{thread_key}/reset``\ntakes, and it is also what the\n``GET /approvals?conversation_id=`` filter takes directly.\n\nOn a DUPLICATE it is read back from the queued turn, never re-derived from\nthis request's body: a retry of the same delivery id may carry a different\npartition value, or the operator may have changed the pointer since, and\neither would name a thread the queued turn never landed on.\n\nIt is None on an ordinary 202 pending/no-claim receipt, which attests no\naccepted turn. An unavailable completed turn or a restricted pending retry\nreturns 409 because its original tool policy cannot be verified.\n\n``tool_access`` is the queued policy, not proof of worker support, runner\nexecution or delivery. A completed duplicate must match the original policy.",
+        "description": "The hook receipt. ``duplicate`` says whether THIS request enqueued.\n\n``stream_id`` is None only while another request holds the claim and has not\nenqueued yet (the 202 case).\n\n``conversation_id`` is the thread this delivery ACTUALLY landed on. A\npartitioned hook (ADR-0134) mints one id per partition value, and the caller\nhas no other way to learn which of them it got -- it is the last segment of\nthe thread key that ``POST /agents/{agent_id}/threads/{thread_key}/reset``\ntakes, and it is also what the\n``GET /approvals?conversation_id=`` filter takes directly.\n\nOn a DUPLICATE it is read back from the queued turn, never re-derived from\nthis request's body: a retry of the same delivery id may carry a different\npartition value, or the operator may have changed the pointer since, and\neither would name a thread the queued turn never landed on.\n\nIt is None on an ordinary 202 pending/no-claim receipt, which attests no\naccepted turn. An unavailable completed turn or a restricted pending retry\nreturns 409 because its original tool policy cannot be verified.\n\n``tool_access`` is the queued policy, not proof of worker support, runner\nexecution or delivery. A completed duplicate must match the original policy.\n\n``requested_tool_access`` is the policy as signed and ``effective_tool_access``\nthe policy the source resolved; ``tool_access`` is the effective alias. An\nordinary answer reports the requested policy as both. ``source_generation``\nis the committed source generation that admitted the delivery, as a\ncanonical decimal string: null for a never configured hook and for any\nordinary duplicate (the ordinary store never recorded one).\n``acceptance_status`` is ``accepted``, ``pending`` (an ordinary 202) or\n``preparing`` (a protected 202). @spec PROTECTED-HOOK-SOURCE-8.",
         "properties": {
+          "acceptance_status": {
+            "default": "accepted",
+            "enum": [
+              "accepted",
+              "pending",
+              "preparing"
+            ],
+            "title": "Acceptance Status",
+            "type": "string"
+          },
           "conversation_id": {
             "anyOf": [
               {
@@ -4956,9 +5645,40 @@
             "title": "Duplicate",
             "type": "boolean"
           },
+          "effective_tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "event_id": {
             "title": "Event Id",
             "type": "string"
+          },
+          "requested_tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Generation"
           },
           "stream_id": {
             "anyOf": [
@@ -5043,9 +5763,45 @@
             ],
             "title": "Outcome"
           },
+          "reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
           "slot_utc": {
             "format": "date-time",
             "title": "Slot Utc",
+            "type": "string"
+          },
+          "source": {
+            "enum": [
+              "schedule",
+              "manual"
+            ],
+            "title": "Source",
             "type": "string"
           },
           "started_at": {
@@ -5064,6 +5820,7 @@
           "agent",
           "name",
           "trigger",
+          "source",
           "slot_utc",
           "outcome",
           "started_at",
@@ -5122,6 +5879,358 @@
           "secret"
         ],
         "title": "HookSecretOut",
+        "type": "object"
+      },
+      "HookSourcePolicyMutation": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "expected_generation": {
+            "title": "Expected Generation",
+            "type": "string"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_generation",
+          "operation_id"
+        ],
+        "title": "HookSourcePolicyMutation",
+        "type": "object"
+      },
+      "HookSourcePolicyOut": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "activation": {
+            "enum": [
+              "closed",
+              "active"
+            ],
+            "title": "Activation",
+            "type": "string"
+          },
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "bundle_digest": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bundle Digest"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "string"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "legacy_generation": {
+            "title": "Legacy Generation",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "ordinary",
+              "protected"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "qualification_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qualification Id"
+          },
+          "refusal_reason": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z][a-z0-9_]{0,62}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Refusal Reason"
+          },
+          "runtime_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Id"
+          },
+          "tool_access": {
+            "anyOf": [
+              {
+                "const": "read-only",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Access"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation",
+          "mode",
+          "tool_access",
+          "runtime_id",
+          "qualification_id",
+          "bundle_digest",
+          "legacy_generation",
+          "activation",
+          "updated_at"
+        ],
+        "title": "HookSourcePolicyOut",
+        "type": "object"
+      },
+      "HookSourcePolicyWrite": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "bundle_digest": {
+            "title": "Bundle Digest",
+            "type": "string"
+          },
+          "expected_generation": {
+            "title": "Expected Generation",
+            "type": "string"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "qualification_id": {
+            "title": "Qualification Id",
+            "type": "string"
+          },
+          "runtime_id": {
+            "title": "Runtime Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_generation",
+          "operation_id",
+          "runtime_id",
+          "qualification_id",
+          "bundle_digest"
+        ],
+        "title": "HookSourcePolicyWrite",
+        "type": "object"
+      },
+      "HookSourceRefusal": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/HookSourceRefusalDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "HookSourceRefusal",
+        "type": "object"
+      },
+      "HookSourceRefusalDetail": {
+        "additionalProperties": false,
+        "description": "A source service refusal: a stable code and, only after a confirmed commit, its generation.\n\n@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "code": {
+            "pattern": "^[a-z][a-z0-9_]{0,62}$",
+            "title": "Code",
+            "type": "string"
+          },
+          "committed_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Committed Generation"
+          }
+        },
+        "required": [
+          "code",
+          "committed_generation"
+        ],
+        "title": "HookSourceRefusalDetail",
+        "type": "object"
+      },
+      "HookSourceSecretOut": {
+        "additionalProperties": false,
+        "description": "@spec PROTECTED-HOOK-SOURCE-3.",
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "string"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "secret": {
+            "minLength": 1,
+            "title": "Secret",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation",
+          "secret"
+        ],
+        "title": "HookSourceSecretOut",
+        "type": "object"
+      },
+      "HookSupportOut": {
+        "additionalProperties": false,
+        "description": "Safe support resolution. @spec PROTECTED-HOOK-SOURCE-9.",
+        "properties": {
+          "effective_tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "qualification_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Qualification Id"
+          },
+          "reason": {
+            "enum": [
+              "supported",
+              "source_unconfigured",
+              "source_closed",
+              "runtime_unavailable",
+              "qualification_unavailable",
+              "evidence_missing",
+              "evidence_expired",
+              "broker_unavailable",
+              "broker_identity_mismatch",
+              "configuration_unsupported"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "requested_tool_access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ToolAccess"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "runtime_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Generation"
+          },
+          "runtime_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime Id"
+          },
+          "source_generation": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Generation"
+          },
+          "supported": {
+            "title": "Supported",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "requested_tool_access",
+          "effective_tool_access",
+          "source_generation",
+          "runtime_id",
+          "runtime_generation",
+          "qualification_id",
+          "supported",
+          "reason"
+        ],
+        "title": "HookSupportOut",
         "type": "object"
       },
       "IssueReadComment": {
@@ -5996,6 +7105,36 @@
           "logs"
         ],
         "title": "PodLogs",
+        "type": "object"
+      },
+      "ProbeCreate": {
+        "additionalProperties": false,
+        "description": "@spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13: exactly these three keys.",
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "connector": {
+            "maxLength": 63,
+            "minLength": 1,
+            "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+            "title": "Connector",
+            "type": "string"
+          },
+          "digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Digest",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "connector",
+          "digest"
+        ],
+        "title": "ProbeCreate",
         "type": "object"
       },
       "ProgressReport": {
@@ -7322,6 +8461,237 @@
         "title": "QueuedTurn",
         "type": "object"
       },
+      "RemediationNominationAccepted": {
+        "additionalProperties": false,
+        "description": "The event's accepted submission: its nominations in block order.\n\n@spec AUTOMATED-REMEDIATION-6 @spec AUTOMATED-REMEDIATION-7.",
+        "properties": {
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "nomination_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Nomination Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "event_id",
+          "nomination_ids"
+        ],
+        "title": "RemediationNominationAccepted",
+        "type": "object"
+      },
+      "RemediationNominationRefusal": {
+        "additionalProperties": false,
+        "description": "@spec AUTOMATED-REMEDIATION-6.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/RemediationNominationRefusalDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "RemediationNominationRefusal",
+        "type": "object"
+      },
+      "RemediationNominationRefusalDetail": {
+        "additionalProperties": false,
+        "description": "@spec AUTOMATED-REMEDIATION-6.",
+        "properties": {
+          "code": {
+            "pattern": "^[a-z][a-z0-9_]{0,62}$",
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "RemediationNominationRefusalDetail",
+        "type": "object"
+      },
+      "RemediationNominationSubmit": {
+        "additionalProperties": false,
+        "description": "One protected turn's nomination block. @spec AUTOMATED-REMEDIATION-6.",
+        "properties": {
+          "block": {
+            "description": "The withheld block text, fences included, exactly as extracted.",
+            "maxLength": 262144,
+            "title": "Block",
+            "type": "string"
+          },
+          "event_id": {
+            "description": "The protected event whose turn produced the block.",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "block"
+        ],
+        "title": "RemediationNominationSubmit",
+        "type": "object"
+      },
+      "RemediationPolicyMutation": {
+        "additionalProperties": false,
+        "description": "Compare and swap plus idempotency for arm, disarm and removal.\n\n@spec AUTOMATED-REMEDIATION-2.",
+        "properties": {
+          "expected_generation": {
+            "title": "Expected Generation",
+            "type": "string"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_generation",
+          "operation_id"
+        ],
+        "title": "RemediationPolicyMutation",
+        "type": "object"
+      },
+      "RemediationPolicyOut": {
+        "additionalProperties": false,
+        "description": "One committed remediation policy generation.\n\n@spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.",
+        "properties": {
+          "active": {
+            "title": "Active",
+            "type": "boolean"
+          },
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "armed": {
+            "title": "Armed",
+            "type": "boolean"
+          },
+          "bound_by": {
+            "description": "The operator principal that wrote this generation.",
+            "title": "Bound By",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "string"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "policy": {
+            "additionalProperties": true,
+            "title": "Policy",
+            "type": "object"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "hook",
+          "generation",
+          "armed",
+          "active",
+          "bound_by",
+          "policy",
+          "updated_at"
+        ],
+        "title": "RemediationPolicyOut",
+        "type": "object"
+      },
+      "RemediationPolicyRefusal": {
+        "additionalProperties": false,
+        "description": "@spec AUTOMATED-REMEDIATION-2.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/RemediationPolicyRefusalDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "RemediationPolicyRefusal",
+        "type": "object"
+      },
+      "RemediationPolicyRefusalDetail": {
+        "additionalProperties": false,
+        "description": "A stable refusal code and, where one applies, the offending path.\n\n@spec AUTOMATED-REMEDIATION-2.",
+        "properties": {
+          "code": {
+            "pattern": "^[a-z][a-z0-9_]{0,62}$",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Message"
+          },
+          "path": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Path"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "RemediationPolicyRefusalDetail",
+        "type": "object"
+      },
+      "RemediationPolicyWrite": {
+        "additionalProperties": false,
+        "description": "Bind or replace the policy document of a protected hook.\n\n@spec AUTOMATED-REMEDIATION-2.",
+        "properties": {
+          "expected_generation": {
+            "title": "Expected Generation",
+            "type": "string"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "policy": {
+            "additionalProperties": true,
+            "description": "The closed policy document: route, limits and actions (AUTOMATED-REMEDIATION-2). Unknown keys are refused.",
+            "title": "Policy",
+            "type": "object"
+          }
+        },
+        "required": [
+          "expected_generation",
+          "operation_id",
+          "policy"
+        ],
+        "title": "RemediationPolicyWrite",
+        "type": "object"
+      },
       "ReplyHandle": {
         "description": "Channel-neutral coordinates for where a turn's reply is delivered.\n\n``kind`` and ``channel`` are the **routing pair** (ADR-0096): the channel kind\n(``slack``, ``email``, ...) plus the address within that kind. Both halves are\nneeded to resolve the binding, because one address can legitimately exist under\ntwo kinds. ``kind`` is REQUIRED and deliberately has no default: an optional\nkind forces the resolver to invent one, and every honest answer there is an\naddress-only fallback or a ``\"slack\"`` guess -- the silent misroute this field\nexists to close.\n\nThe reply model supports editing an existing reply or carrying no existing\nreply reference. ``placeholder`` is a required, nullable, opaque correlation\nhandle minted by the adapter. The worker never parses it and only ever hands\nit back to the adapter that minted it. For the Slack adapter it happens to be\nthe ts of the preposted placeholder message. For another kind it is whatever\nthat adapter needs to find the same message again. ``None`` means this turn\nhas no existing reply to edit.\n\n``endpoint`` is the per-turn reply target: the base URL of the channel API the\nworker delivers this turn's reply through. It routes the reply back to the\ningress that enqueued the turn instead of a worker-global setting, so two\ningress paths (a real Slack workspace and a no-Slack CLI stub) can coexist on\none worker (issue #19). ``None`` means \"use the worker's configured default\"\n(its ``slack_api_base_url``, i.e. real Slack), so a producer that does not set\nit keeps the pre-#19 behavior.\n\n``adapter`` names the egress adapter identity whose credential authenticates\nthe reply, so a sink call made *before* binding resolution can still select the\nright credential. For non-Slack kinds ``endpoint`` and ``adapter`` are both\n**platform-set from the binding row** (never accepted from an ingress request\nbody); ``slack`` carries no endpoint, because its route is the worker's\nconfigured Slack origin, and names its identity in ``adapter`` (ADR-0168\ndecision 3); a NULL there means ``DEFAULT_IDENTITY`` (see ``route_identity``).\n``adapter`` is optional at the schema so a third-party or pre-upgrade\nproducer is not rejected outright, but every first-party mint site sets it\nexplicitly.\n\n``identity`` is an optional Slack binding selector for a disconnected\ncluster message whose reserved ``adapter`` selects reply delivery. An absent\nvalue retains the default identity. Ordinary Slack turns continue to name\ntheir identity in ``adapter`` (INGRESS-CANARY-1).",
         "properties": {
@@ -7977,7 +9347,7 @@
         "type": "object"
       },
       "ScheduleHookOut": {
-        "description": "One cron hook on the in-force bundle, with its newest slot.",
+        "description": "One cron hook with its newest scheduled and manual run histories.",
         "properties": {
           "last_fire_at": {
             "anyOf": [
@@ -7990,6 +9360,65 @@
               }
             ],
             "title": "Last Fire At"
+          },
+          "last_manual_fire_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Fire At"
+          },
+          "last_manual_outcome": {
+            "anyOf": [
+              {
+                "enum": [
+                  "ran",
+                  "deferred",
+                  "skipped",
+                  "blocked",
+                  "reclaimed",
+                  "failed"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Outcome"
+          },
+          "last_manual_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Manual Reason"
           },
           "last_outcome": {
             "anyOf": [
@@ -8009,6 +9438,34 @@
               }
             ],
             "title": "Last Outcome"
+          },
+          "last_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "turn_error",
+                  "target_unbound",
+                  "approval_gate_targetless",
+                  "agent_killed",
+                  "budget_exhausted",
+                  "run_in_flight",
+                  "catch_up_expired",
+                  "deferred_expired",
+                  "reply_undeliverable",
+                  "prior_side_effect",
+                  "deployment_missing",
+                  "hook_paused",
+                  "live_session",
+                  "enqueue_failed",
+                  "claim_expired"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Reason"
           },
           "name": {
             "title": "Name",
@@ -8038,6 +9495,9 @@
           "zone",
           "last_fire_at",
           "last_outcome",
+          "last_manual_fire_at",
+          "last_manual_outcome",
+          "last_manual_reason",
           "paused"
         ],
         "title": "ScheduleHookOut",
@@ -8393,6 +9853,286 @@
           "owner"
         ],
         "title": "TerminationClaimBody",
+        "type": "object"
+      },
+      "ThreadAttachmentAppend": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "event_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          },
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/ThreadAttachmentRefBody"
+            },
+            "maxItems": 1000,
+            "title": "Refs",
+            "type": "array"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key",
+          "event_id",
+          "refs"
+        ],
+        "title": "ThreadAttachmentAppend",
+        "type": "object"
+      },
+      "ThreadAttachmentAppendOut": {
+        "properties": {
+          "appended": {
+            "title": "Appended",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "appended"
+        ],
+        "title": "ThreadAttachmentAppendOut",
+        "type": "object"
+      },
+      "ThreadAttachmentQuery": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "thread_key": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Thread Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_id",
+          "thread_key"
+        ],
+        "title": "ThreadAttachmentQuery",
+        "type": "object"
+      },
+      "ThreadAttachmentRefBody": {
+        "additionalProperties": false,
+        "description": "One recorded file. Exactly these fields: never an endpoint, URL or bytes.",
+        "properties": {
+          "disk_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Disk Name",
+            "type": "string"
+          },
+          "file_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "File Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ordinal": {
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "route_adapter": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Adapter"
+          },
+          "route_identity": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Route Identity",
+            "type": "string"
+          },
+          "route_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Route Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9A-Fa-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "file_id",
+          "ordinal",
+          "name",
+          "disk_name",
+          "sha256",
+          "route_kind",
+          "route_identity"
+        ],
+        "title": "ThreadAttachmentRefBody",
+        "type": "object"
+      },
+      "ThreadAttachmentRefRow": {
+        "additionalProperties": false,
+        "description": "A query row: the appended ref plus the event it was recorded under, so a\nredelivered turn's worker recognises its own rows by (event_id, file_id).",
+        "properties": {
+          "disk_name": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Disk Name",
+            "type": "string"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "file_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "File Id",
+            "type": "string"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          },
+          "name": {
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "ordinal": {
+            "minimum": 0.0,
+            "title": "Ordinal",
+            "type": "integer"
+          },
+          "route_adapter": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Route Adapter"
+          },
+          "route_identity": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Route Identity",
+            "type": "string"
+          },
+          "route_kind": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Route Kind",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9A-Fa-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Size Bytes"
+          }
+        },
+        "required": [
+          "file_id",
+          "ordinal",
+          "name",
+          "disk_name",
+          "sha256",
+          "route_kind",
+          "route_identity",
+          "event_id"
+        ],
+        "title": "ThreadAttachmentRefRow",
+        "type": "object"
+      },
+      "ThreadAttachmentRefsOut": {
+        "properties": {
+          "refs": {
+            "items": {
+              "$ref": "#/components/schemas/ThreadAttachmentRefRow"
+            },
+            "title": "Refs",
+            "type": "array"
+          }
+        },
+        "required": [
+          "refs"
+        ],
+        "title": "ThreadAttachmentRefsOut",
         "type": "object"
       },
       "ThreadResetState": {
@@ -9144,6 +10884,16 @@
               }
             ]
           },
+          "progress": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkItemProgressOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "publication": {
             "anyOf": [
               {
@@ -9192,6 +10942,17 @@
             ],
             "title": "State",
             "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
           },
           "updated_at": {
             "format": "date-time",
@@ -9243,6 +11004,47 @@
           "status"
         ],
         "title": "WorkItemPrOut",
+        "type": "object"
+      },
+      "WorkItemProgressOut": {
+        "description": "The latest execution's progress, derived by ``factory_progress.phase_view``.",
+        "properties": {
+          "current": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "stages": {
+            "items": {
+              "$ref": "#/components/schemas/WorkItemStageOut"
+            },
+            "title": "Stages",
+            "type": "array"
+          }
+        },
+        "required": [
+          "current",
+          "note",
+          "stages"
+        ],
+        "title": "WorkItemProgressOut",
         "type": "object"
       },
       "WorkItemPublicationOut": {
@@ -9398,6 +11200,49 @@
           "last_deferral_reason"
         ],
         "title": "WorkItemRequestOut",
+        "type": "object"
+      },
+      "WorkItemStageOut": {
+        "description": "One stage of the factory progress strip, as the status card shows it.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "round_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Round Label"
+          },
+          "state": {
+            "enum": [
+              "done",
+              "current",
+              "redo",
+              "blocked",
+              "pending"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "state",
+          "round_label"
+        ],
+        "title": "WorkItemStageOut",
         "type": "object"
       },
       "WorkItemUsageModel": {
@@ -9771,6 +11616,339 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/action-executions/claim": {
+      "post": {
+        "description": "Claim the oldest claimable execution under a lease, or ``204``.\n\n@spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a\n``requested`` row is claimable, and so is a ``claimed`` row whose lease\nexpired, which is reclaimed with the next attempt so the earlier holder's\nfence is stale. A reclaim forgets the earlier attempt's observation, so the\nnew holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.\n@spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.",
+        "operationId": "claim_execution_action_executions_claim_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionClaim"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "204": {
+            "description": "Nothing is claimable."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Claim Execution",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
+    "/action-executions/{execution_id}": {
+      "get": {
+        "description": "@spec ACTION-EXECUTOR-18: the execution's receipt.",
+        "operationId": "get_execution_action_executions__execution_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Execution",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
+    "/action-executions/{execution_id}/dispatch": {
+      "post": {
+        "description": "Commit ``dispatched``, the last step before a write call.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``\nrestore whose observed version equalled the recorded one dispatches. A\nprobe never does (ACTION-EXECUTOR-1). A forward execution dispatches only\nonce the API creates its ledger row at dispatch (ACTION-EXECUTOR-19), which\nis not built yet, so it is refused here too.",
+        "operationId": "dispatch_execution_action_executions__execution_id__dispatch_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionFence"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch Execution",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
+    "/action-executions/{execution_id}/observation": {
+      "post": {
+        "description": "Compare the version observed now with the version the action left.\n\n@spec ACTION-EXECUTOR-15. Equal: recorded, the execution stays ``claimed``\nand may dispatch. Any difference, or an absent or malformed version: the\nexecution ends ``refused`` with ``version_conflict`` and the action is\nreleased, with the ``refused_conflict`` audit row naming both versions.",
+        "operationId": "record_observation_action_executions__execution_id__observation_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionObservation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Observation",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
+    "/action-executions/{execution_id}/outcome": {
+      "post": {
+        "description": "Record how an execution ended.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-18 @spec ACTION-EXECUTOR-20.\n``refused`` lands only on a ``claimed`` row, with a pre-dispatch code:\npast ``dispatched`` the call may have reached the connector. ``confirmed``,\n``failed`` and ``indeterminate`` land only on a ``dispatched`` row, except\na probe, which never dispatches and is ``confirmed`` from ``claimed`` with\nthe verbs it observed. An unknown post-dispatch code is normalized by stage.\nA replay of the stored outcome returns the row unchanged; a different one\nis refused and the first stands.",
+        "operationId": "report_outcome_action_executions__execution_id__outcome_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionOutcome"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Outcome",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
     "/actions": {
       "get": {
         "description": "A conversation's actions, oldest first -- the order a receipt lists them.",
@@ -10051,7 +12229,7 @@
     },
     "/actions/{action_id}/complete": {
       "post": {
-        "description": "Record what the tool answered.\n\n``prior_state`` and ``target`` are what a restore replays. A completion that\ncarries neither produces a record that is not undoable, which is the honest\nanswer for a connector that replied in prose -- nothing has to declare it.",
+        "description": "Record what the tool answered.\n\n``prior_state`` and ``target`` are what a restore replays. A completion that\ncarries neither produces a record that is not undoable, which is the honest\nanswer for a connector that replied in prose -- nothing has to declare it.\n\n@spec ACTION-EXECUTOR-11 @spec ACTION-EXECUTOR-12: ``connector`` and\n``connector_digest`` are the worker's attribution, so a completion carrying\nthem also needs the internal worker token (403 otherwise), and the connector\nmust be the one the stored tool names (422 otherwise). Either refusal stores\nnothing. A completion without them still takes the platform key alone.",
         "operationId": "complete_action_actions__action_id__complete_post",
         "parameters": [
           {
@@ -10062,6 +12240,22 @@
               "format": "uuid",
               "title": "Action Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
             }
           },
           {
@@ -10121,7 +12315,7 @@
     },
     "/actions/{action_id}/undo": {
       "post": {
-        "description": "Rule on putting back what this action changed.\n\nA 200 authorizes a restore and names the call that performs it; every other\noutcome is a refusal that changed nothing. The refusals are ordered from the\nrecord's own state outward to the world, so the most specific true reason is\nthe one the operator is told.\n\nAuthorization runs first, before any of the record's own state is examined:\nwhether an actor may undo at all precedes whether this particular undo is\nsafe, and it keeps a refused actor from learning the resource's state through\na conflict message.",
+        "description": "Rule on putting back what this action changed, and request the restore.\n\n@spec ACTION-EXECUTOR-3. A 202 means a ``requested`` restore execution and\nits ``authorized`` audit row were written together; every other outcome is\na refusal that wrote one audit row and no execution. The refusals are\nordered from the record's own state outward, so the most specific true\nreason is the one the operator is told.\n\nThe actor is ``principal``, authenticated as the approval resolver\nauthenticates one; a body ``actor`` is not authority, and one that differs\nfrom the principal is refused before anything else is examined.\n\nAuthorization runs first, before any of the record's own state is examined:\nwhether an actor may undo at all precedes whether this particular undo is\npossible, and it keeps a refused actor from learning anything about the\nrecord, its versions included.\n\nThe caller no longer supplies the live state: the executor observes the\nversion through the pinned connector and the API compares it before any\nwrite (ACTION-EXECUTOR-15).",
         "operationId": "undo_action_actions__action_id__undo_post",
         "parameters": [
           {
@@ -10136,7 +12330,7 @@
           },
           {
             "in": "header",
-            "name": "x-api-key",
+            "name": "X-Curie-Approval-Principal",
             "required": false,
             "schema": {
               "anyOf": [
@@ -10147,7 +12341,55 @@
                   "type": "null"
                 }
               ],
-              "title": "X-Api-Key"
+              "title": "X-Curie-Approval-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Adapter-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Adapter-Principal"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Actor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Actor"
+            }
+          },
+          {
+            "in": "cookie",
+            "name": "__Host-curie_console_session",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "  Host-Curie Console Session"
             }
           }
         ],
@@ -10162,7 +12404,7 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "202": {
             "content": {
               "application/json": {
                 "schema": {
@@ -11251,6 +13493,1140 @@
         "summary": "Get Hook Secret",
         "tags": [
           "agents"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy": {
+      "delete": {
+        "description": "Remove the policy: a new generation, inactive, disarmed and with no actions.",
+        "operationId": "delete_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_generation",
+            "required": true,
+            "schema": {
+              "title": "Expected Generation",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "title": "Operation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Principal"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Validation error or named policy refusal"
+          }
+        },
+        "summary": "Delete Remediation Policy",
+        "tags": [
+          "remediation-policy"
+        ]
+      },
+      "get": {
+        "description": "The current remediation policy generation of a hook.",
+        "operationId": "get_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Remediation Policy",
+        "tags": [
+          "remediation-policy"
+        ]
+      },
+      "put": {
+        "description": "Bind, tighten or widen a protected hook's remediation policy.\n\nA new binding starts disarmed; a later write keeps the armed flag. Each\nwrite creates a generation recorded with the operator principal.",
+        "operationId": "put_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Principal"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemediationPolicyWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Validation error or named policy refusal"
+          }
+        },
+        "summary": "Put Remediation Policy",
+        "tags": [
+          "remediation-policy"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm": {
+      "post": {
+        "description": "Arm the current policy as a new generation.",
+        "operationId": "arm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_arm_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Principal"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemediationPolicyMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Validation error or named policy refusal"
+          }
+        },
+        "summary": "Arm Remediation Policy",
+        "tags": [
+          "remediation-policy"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm": {
+      "post": {
+        "description": "Disarm the current policy as a new generation.",
+        "operationId": "disarm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_disarm_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Approval-Principal",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Approval-Principal"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemediationPolicyMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Validation error or named policy refusal"
+          }
+        },
+        "summary": "Disarm Remediation Policy",
+        "tags": [
+          "remediation-policy"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/source-policy": {
+      "delete": {
+        "description": "Commit and publish the ordinary tombstone.\n\nPending history without a row commits a fresh tombstone above every\nattempt without rotating the legacy counter; an absent row without history\nis 409 ``source_not_configured``.",
+        "operationId": "delete_source_policy_agents__agent_id__hooks__hook__source_policy_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_generation",
+            "required": true,
+            "schema": {
+              "title": "Expected Generation",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "operation_id",
+            "required": true,
+            "schema": {
+              "title": "Operation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourcePolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          }
+        },
+        "summary": "Delete Source Policy",
+        "tags": [
+          "hook-source-policy"
+        ]
+      },
+      "get": {
+        "description": "Committed source policy and its publication activation.",
+        "operationId": "get_source_policy_agents__agent_id__hooks__hook__source_policy_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourcePolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          }
+        },
+        "summary": "Get Source Policy",
+        "tags": [
+          "hook-source-policy"
+        ]
+      },
+      "put": {
+        "description": "Target mandatory read-only protected delivery under the deployment's runtime.\n\nThe commit happens and the agent's legacy counter may advance; the row is\nthen published once current runtime evidence is confirmed, answering 200\n``active``. A refusal after the commit answers 503 with the committed\ngeneration and the source stays closed.",
+        "operationId": "put_source_policy_agents__agent_id__hooks__hook__source_policy_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HookSourcePolicyWrite"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourcePolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HookSourceRefusal"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Validation error or unknown source reference"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          }
+        },
+        "summary": "Put Source Policy",
+        "tags": [
+          "hook-source-policy"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/source-policy/rotate": {
+      "post": {
+        "description": "Allocate and publish a fresh generation for the current protected target.",
+        "operationId": "rotate_source_policy_agents__agent_id__hooks__hook__source_policy_rotate_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HookSourcePolicyMutation"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourcePolicyOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/HookSourceRefusal"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Validation error or unknown source reference"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          }
+        },
+        "summary": "Rotate Source Policy",
+        "tags": [
+          "hook-source-policy"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/source-policy/secret": {
+      "get": {
+        "description": "The scoped source key of an active protected source; writes nothing.\n\nServed only when one reader session, after the gate is released, shows the\nrow's active protected record; that attests publication, not current\nreadiness. A rotation committing after that read makes the returned key\nalready revoked. Every other state is refused with no key.",
+        "operationId": "get_source_secret_agents__agent_id__hooks__hook__source_policy_secret_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceSecretOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSourceRefusal"
+                }
+              }
+            },
+            "description": "Source refusal"
+          }
+        },
+        "summary": "Get Source Secret",
+        "tags": [
+          "hook-source-policy"
         ]
       }
     },
@@ -14534,6 +17910,82 @@
         ]
       }
     },
+    "/channel-canvas": {
+      "post": {
+        "operationId": "channel_canvas_channel_canvas_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Channel-Read",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Channel-Read"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelCanvasRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelCanvasResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "description": "No channel or kind named and no default channel"
+          },
+          "401": {
+            "description": "Missing or invalid channel read capability"
+          },
+          "403": {
+            "description": "Operation not granted, channel or kind not bound, canvas not shared into a bound channel, the app is not a member, or the provider refused the edit"
+          },
+          "404": {
+            "description": "Canvas not found"
+          },
+          "409": {
+            "description": "Turn inactive or expired, grant revoked, kind unsupported, section not read this turn or no longer editable, or the canvas is too large"
+          },
+          "422": {
+            "description": "Invalid identifier, cell text, misplaced field, body, or not a canvas"
+          },
+          "429": {
+            "description": "Page or attempt budget exhausted, or the provider rate limited"
+          },
+          "502": {
+            "description": "The provider returned an error, the canvas was unreadable, or the edit outcome is unknown"
+          },
+          "503": {
+            "description": "Ledger unavailable, no provider credential, or a provider scope missing"
+          }
+        },
+        "summary": "Channel Canvas",
+        "tags": [
+          "channel-read"
+        ]
+      }
+    },
     "/channel-identities": {
       "get": {
         "operationId": "list_channel_identities_channel_identities_get",
@@ -15212,6 +18664,66 @@
         "summary": "Get Config",
         "tags": [
           "config"
+        ]
+      }
+    },
+    "/connector-capabilities/probes": {
+      "post": {
+        "description": "Request a capability probe of one connector image for one agent.\n\n@spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13 and the route decisions.\nThe first probe is keyed ``probe:<agent>:<connector>:<digest>``; a request\nwhile the latest probe is pending or confirmed adopts it (``200``). After a\nprobe that ended ``refused`` or ``failed``, the next one is a new execution\nwhose key carries the next probe attempt number (``...:<digest>:2`` and\nso on). A probe's ``authority_ref`` is its key: the body is exactly three\nkeys, so no reconcile pass id can reach it.",
+        "operationId": "create_probe_connector_capabilities_probes_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProbeCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionCreated"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Probe",
+        "tags": [
+          "action-executions"
         ]
       }
     },
@@ -16079,7 +19591,7 @@
     },
     "/hooks/{agent_id}/{hook}": {
       "post": {
-        "description": "Verify one hook delivery and enqueue it as a turn.\n\n``tool_access=read-only`` opts into the existing TOOL-ACCESS contract.\nBefore requesting it, the operator must verify homogeneous worker artifacts\nimplementing TOOL-ACCESS-6 and compatible runner artifacts. This API does\nnot discover worker support; an old worker can discard the field. The\nimplementing worker checks the exact target runner before dispatch. Omission\npreserves ordinary hooks, including approvals. The receipt proves only the\nqueued policy, not runtime enforcement or successful reply delivery.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the timestamp, delivery id, decoded hook name, parsed\n   requested policy and raw body, with the timestamp required and inside\n   ``hook_signing.TOLERANCE_S``; a missing delivery id is verified as the\n   empty string, so an absent id is only reported to a caller who could sign;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the optional explicit reply TARGET, after authentication so malformed\n   coordinates reveal nothing to an unsigned caller;\n7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n8. routability, then the claim, quota and enqueue.",
+        "description": "Verify one hook delivery and enqueue it as a turn.\n\n``tool_access=read-only`` opts into the existing TOOL-ACCESS contract.\nBefore requesting it, the operator must verify homogeneous worker artifacts\nimplementing TOOL-ACCESS-6 and compatible runner artifacts. This API does\nnot discover worker support; an old worker can discard the field. The\nimplementing worker checks the exact target runner before dispatch. Omission\npreserves ordinary hooks, including approvals. The receipt proves only the\nqueued policy, not runtime enforcement or successful reply delivery.\n\nOrder, and why each step sits where it does:\n\n1. the hook NAME, validated before anything else, because it is about to be\n   used to build key names -- with ``fullmatch``, since the pattern's ``$``\n   matches before a trailing newline and would let one into those keys;\n2. the size bound, before the signature is computed, so an oversized body is\n   refused without the server ever HMAC-ing it;\n3. the agent row, which unavoidably precedes authentication here (see the\n   module docstring);\n4. the SIGNATURE over the timestamp, delivery id, decoded hook name, parsed\n   requested policy and raw body, with the timestamp required and inside\n   ``hook_signing.TOLERANCE_S``; a missing delivery id is verified as the\n   empty string, so an absent id is only reported to a caller who could sign;\n5. the delivery id, checked after authentication so an unsigned caller learns\n   nothing about what this route wants;\n6. the optional explicit reply TARGET, after authentication so malformed\n   coordinates reveal nothing to an unsigned caller;\n7. the PARTITION this delivery belongs to, if the hook has one (ADR-0134),\n   after both of those and before anything is claimed;\n8. routability, then the claim, quota and enqueue.\n\nThe gate-held snapshot decides the path. A committed protected row is\nadmitted atomically onto the private broker (``_ingest_protected``) and\nnever touches the ordinary store. A tombstone first requires its ordinary\npublication to be active and no private intent for the delivery, then\nruns the ordinary path; pending history stays closed.",
         "operationId": "ingest_hook_hooks__agent_id___hook__post",
         "parameters": [
           {
@@ -16269,6 +19781,142 @@
           }
         },
         "summary": "Ingest Hook",
+        "tags": [
+          "hooks"
+        ]
+      }
+    },
+    "/hooks/{agent_id}/{hook}/support": {
+      "post": {
+        "description": "Report the current protected support resolution for one hook; write nothing.\n\nThe JSON body is ``HookSupportIn``, read raw because its exact bytes are\nsigned. Order follows the spec: hook name, bounded body, strict parse,\nungated support signature, delivery id, gate-held reauthentication, snapshot\nand source bindings, gate release, then broker evaluation of a protected\nrow without source bindings only. ``supported`` (200) is answered exactly\nwhen admission would accept, outside the per delivery exclusions.\nThe delivery id is signed context only and reserves nothing.",
+        "operationId": "probe_hook_support_hooks__agent_id___hook__support_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-signature-256",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Signature-256"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-delivery-id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Delivery-Id"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-curie-timestamp",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Timestamp"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Signed requested policy, not configuration. @spec PROTECTED-HOOK-SOURCE-9.",
+                "properties": {
+                  "tool_access": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/ToolAccess"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "title": "HookSupportIn",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSupportOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HookSupportOut"
+                }
+              }
+            },
+            "description": "Authenticated, protected support unavailable (supported=false). Without this DTO, {\"detail\": \"authority_unavailable\"} when no current server resolution could be read."
+          }
+        },
+        "summary": "Probe Hook Support",
         "tags": [
           "hooks"
         ]
@@ -17430,7 +21078,7 @@
     },
     "/schedules": {
       "get": {
-        "description": "Cron hooks on each in-force deployment, newest slot first in the record.",
+        "description": "Cron hooks on each in-force deployment, with separate latest run histories.",
         "operationId": "list_schedules_schedules_get",
         "parameters": [
           {
@@ -18446,6 +22094,89 @@
         ]
       }
     },
+    "/v1/internal/remediation/nominations": {
+      "post": {
+        "description": "Record one protected turn's nomination block.",
+        "operationId": "submit_remediation_nominations_v1_internal_remediation_nominations_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemediationNominationSubmit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationNominationAccepted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationNominationRefusal"
+                }
+              }
+            },
+            "description": "Refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationNominationRefusal"
+                }
+              }
+            },
+            "description": "Refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "description": "Broker unavailable"
+          }
+        },
+        "summary": "Submit Remediation Nominations",
+        "tags": [
+          "internal-remediation"
+        ]
+      }
+    },
     "/v1/internal/state/released-credentials": {
       "post": {
         "description": "Record that a sandbox claim released its boot credential. Idempotent.\n\nThe record expires once no token carrying that id could still be valid\n(``SANDBOX_CREDENTIAL_RELEASED_TTL_S``).",
@@ -18496,6 +22227,124 @@
         "summary": "Release Sandbox Credential",
         "tags": [
           "internal-state"
+        ]
+      }
+    },
+    "/v1/internal/thread-attachments/append": {
+      "post": {
+        "operationId": "append_thread_attachments_v1_internal_thread_attachments_append_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadAttachmentAppend"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadAttachmentAppendOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append Thread Attachments",
+        "tags": [
+          "internal-thread-attachments"
+        ]
+      }
+    },
+    "/v1/internal/thread-attachments/query": {
+      "post": {
+        "operationId": "query_thread_attachments_v1_internal_thread_attachments_query_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThreadAttachmentQuery"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThreadAttachmentRefsOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Query Thread Attachments",
+        "tags": [
+          "internal-thread-attachments"
         ]
       }
     },

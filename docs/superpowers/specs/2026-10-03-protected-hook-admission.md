@@ -110,13 +110,39 @@ identity. No worker snapshot or caller chosen record substitutes for control.
 `qualification_id: UUID`, `runner_image_digest: oci_digest`,
 `bundle_digest: sha256`, `execution_config_digest: sha256`,
 `logical_conversation_key: str`, `execution_session_key: str`, and
-`payload_sha256: sha256`. Logical key is the unchanged QueuedTurn conversation
+`payload_sha256: sha256`, plus the optional `remediation_generation` described
+below (Intent and Receipt likewise). Logical key is the unchanged QueuedTurn conversation
 ID, a nonempty string of at most 1024 UTF-8 bytes without C0 controls/DEL.
 Execution key is `protected:{runtime_id}:{runtime_generation}:{h}`, where `h`
 is SHA256 of canonical ASCII JSON `[runtime_id, runtime_generation,
 logical_conversation_key]`. The library derives this from trusted selection;
 a source does not choose it. A future worker independently derives and checks
 it before using its private execution domain under LANE-7.
+
+Envelope, Intent and Receipt also carry `remediation_generation`
+(AUTOMATED-REMEDIATION-4 of
+`docs/superpowers/specs/2026-10-07-automated-remediation.md`): the hook's
+remediation policy generation current at admission, a canonical `generation`
+string. The key is optional: when no remediation policy is bound it is omitted,
+so those records have exactly the fields above and stay readable by a release
+that predates the key. A record carrying it is a one-way change: a rollback
+below the version that introduced it rejects the records written while a
+policy was bound, and those deliveries' retries and recovery are unavailable
+until they age out. It sits beside
+`source_revision` as internal transport metadata (ADR 0191), not an ACI field.
+The protected ingress reads it under the agent's source gate, which remediation
+policy writes also take, so it is the generation before or after any racing
+write, never a mix; the caller supplies it on `AdmissionRequest`
+(`remediation_generation`, refused outside the grammar). Admission copies it
+from the request into the Intent and from the Intent into the binding, so the
+envelope carries it exactly when its Intent does, and a binding whose value
+disagrees with its Intent is unavailable. A record written before the field
+existed parses without it and gains nothing on read; consumers treat the
+absence as no admitted generation, which refuses automatic remediation and
+never the turn. A retry never relabels a binding: the first admission's
+generation stays. The nomination route reads the binding through the enqueue
+client's `read_binding(event_id)`, a single GET of an `opaque_ref` event's
+binding that never writes or expires it.
 
 `Intent` contains exactly `schema_version: 1`, `identity: DeliveryIdentity`,
 `requested_tool_access`, `effective_tool_access: "read-only"`,
@@ -199,6 +225,16 @@ returns conflict. A preparing retry must match that same original tuple and
 exact payload/envelope digests before recovery; it cannot choose a new event,
 selection or reserved stream ID. Failed never becomes new admission. Invalid
 or missing original evidence closes, rather than inferring success from stream.
+Intent, State, commit, recovery, source and binding are read by separate GETs,
+not one atomic snapshot, so a concurrent admission of the same delivery that
+commits between those reads can present an internally inconsistent view, such
+as State or commit without Intent. Before refusing on such a view, the facade
+re-reads every admission record it read. If any changed, the view was torn and
+the attempt is retried within the existing bounded attempt loop; exhausting
+that loop is unavailable. Only a view confirmed consistent by an unchanged
+re-read that still violates these invariants refuses as unavailable. A retry
+authorizes nothing by itself: EVAL still compares the exact raw snapshots it
+receives before any write.
 HTTP current authentication and cross-store ordinary receipt exclusion remain
 mandatory caller responsibilities in the parent SOURCE-8 integration.
 
@@ -307,6 +343,75 @@ campaign are required in the test-first realization; these observations alone
 do not qualify the role inventory, TLS or runtime. The anonymous local probe
 used the pinned image already recorded in ADR 0191 evidence and removed its
 exact container only after verifying its owned label and CID.
+
+## Ingress wiring
+
+The [ingress admission wiring](2026-10-02-protected-hook-source-policy.md#ingress-admission-wiring)
+section of the source policy contract wires this foundation into the signed
+hook route and the API reconciler. It changes the facade as follows, keeping
+the IDs. The torn read retry that
+[#4094](https://github.com/curie-eng/curie/pull/4094) added to ADMISSION-4 on
+main is a prerequisite. Signed retries of one delivery are serialized by the
+agent gate, but the gate free API reconcilers of every replica call `recover`
+on the same intents concurrently with those retries and with each other, which
+is exactly the torn view it retries. It reaches next through
+[#4131](https://github.com/curie-eng/curie/pull/4131), a cherry pick of its
+three commits, before this wiring.
+
+<!-- @spec PROTECTED-HOOK-ADMISSION-1 -->
+The facade receives `trusted_manifest: Manifest` from the provisioner runtime
+files in place of a bare broker identity, and derives the broker identity from
+it. Its client comes from the LANE-3 enqueue transport, which owns and closes
+the connection; the facade still constructs none and closes none.
+
+<!-- @spec PROTECTED-HOOK-ADMISSION-4 -->
+The preflight reads one broker observation through INFO server and TIME on the
+same connection and decides authority through the shared `authority_evaluation`
+module, so the probe and admission take the same decision and their reasons
+follow its frozen mapping. The script still compares the exact snapshots it is
+given and rechecks run_id and readiness expiry against live broker time; a
+change between preflight and script refuses or retries as today and never
+accepts on the preflight alone. A preparing original whose authenticated
+retry carries the same requested policy, body digest, source generation,
+operation and fingerprint but different payload bytes is a recovery attempt
+without a supplied payload, not a conflict: the retried turn differs only in
+API receive time or in reply coordinates the original already fixed, and the
+original wins as it does on the ordinary path. Only byte identical payload may
+restore missing recovery bytes. To make that path reachable over HTTP, a
+protected turn's `received_at` is the canonical UTC ISO rendering of the
+signed `X-Curie-Timestamp`, not API wall time, so an upstream resending the
+same signed request with the same reply selection yields identical bytes. A
+freshly signed retry yields different bytes and recovers without restoring
+them; if the recovery bytes are missing it cannot restore, and that intent
+ends in terminal failure at its deadline.
+
+<!-- @spec PROTECTED-HOOK-ADMISSION-5 -->
+The facade gains `preparing(limit: int) -> tuple[DeliveryIdentity, ...]` for
+the trusted reconciler, called with `limit` equal to the backlog limit. It
+reads every quota member in score order with ZRANGE, the set never exceeding
+the backlog limit, reads each member's intent, state and commit, and returns the
+identities of intents with neither a commit nor a failed state. It writes
+nothing and authorizes nothing; `recover` decides each one. An orphan member
+without an intent is skipped and reported only as a count.
+
+<!-- @spec PROTECTED-HOOK-ADMISSION-6 -->
+The enqueue rules add ZRANGE on exactly `protected:admission:quota`, within
+the existing quota selector, only once a measured observation against the
+pinned Valkey is recorded in the
+[ADR 0191 evidence record](../../adr/evidence/0191-protected-hooks/README.md):
+the exact recipe, command and observed outcome, including that ZRANGE on the
+quota key succeeds and on any other key refuses. Until that record exists the
+recipe stays unchanged and `preparing` is unavailable.
+
+<!-- @spec PROTECTED-HOOK-ADMISSION-7 -->
+Acceptance adds: a preparing retry with different payload bytes recovers the
+original and never conflicts; a byte identical retry restores missing recovery
+bytes, proven over HTTP by resending one signed request; a reconciler
+`recover` racing a signed retry of the same delivery returns one entry and the
+original receipt; `preparing` returns exactly the outstanding intents and writes nothing;
+a control manifest differing from the trusted manifest refuses; and a frozen
+vector of broker states yields the same decision from the probe evaluation
+and from `admit`, with reasons following the frozen mapping.
 
 ## Acceptance
 

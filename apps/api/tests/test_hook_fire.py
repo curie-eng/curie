@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
 import redis.asyncio as redis
 from aci_protocol import STREAM_PAYLOAD_FIELD
 from curie_api.config import get_settings
@@ -18,6 +19,17 @@ from curie_api.models import HookRun
 from curie_internal.keyspace import kill_key
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+
+@pytest.fixture(autouse=True)
+def _owned_runs_stream(valkey: Any) -> None:
+    """Give each test its own runs stream, deleted on teardown.
+
+    The assertions count queued turns by hook name, so a shared stream would
+    also count turns left by earlier runs. ``valkey`` pulls in the conftest
+    ``runs_stream`` fixture. Autouse fixtures are set up before ``client``,
+    so the app reads the per-test stream name.
+    """
 
 
 def _cron(name: str, schedule: str) -> dict[str, str]:
@@ -94,7 +106,9 @@ def _deploy(
     assert response.status_code == 201, response.text
 
 
-def _insert_run(agent_id: str, version_id: str, name: str, slot: datetime) -> None:
+def _insert_run(agent_id: str, version_id: str, name: str, slot: datetime) -> uuid.UUID:
+    run_id = uuid.uuid4()
+
     async def run() -> None:
         engine = create_async_engine(get_settings().database_url)
         try:
@@ -102,11 +116,12 @@ def _insert_run(agent_id: str, version_id: str, name: str, slot: datetime) -> No
             async with sessions() as session:
                 session.add(
                     HookRun(
-                        id=uuid.uuid4(),
+                        id=run_id,
                         agent_id=uuid.UUID(agent_id),
                         name=name,
                         slot_utc=slot,
                         version_id=uuid.UUID(version_id),
+                        source="schedule",
                         outcome=None,
                         started_at=slot,
                         ended_at=None,
@@ -117,6 +132,26 @@ def _insert_run(agent_id: str, version_id: str, name: str, slot: datetime) -> No
             await engine.dispose()
 
     asyncio.run(run())
+    return run_id
+
+
+def _stored_source(run_id: str) -> str:
+    async def read() -> str:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as connection:
+                return str(
+                    (
+                        await connection.execute(
+                            text("SELECT source FROM curie.hook_runs WHERE id = :id"),
+                            {"id": uuid.UUID(run_id)},
+                        )
+                    ).scalar_one()
+                )
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
 
 
 def _fire(client: Any, headers: dict[str, str], agent: str, name: str) -> Any:
@@ -167,6 +202,8 @@ def test_fire_queues_one_turn_and_a_second_fire_is_skipped(
     assert body["outcome"] is None
     assert body["name"] == "nightly-cleanup"
     assert body["trigger"] == "cron"
+    assert body["source"] == "manual"
+    assert _stored_source(body["id"]) == "manual"
     queued = _payloads_for("nightly-cleanup")
     assert len(queued) == 1
     assert queued[0]["source"] == "cron"
@@ -176,6 +213,10 @@ def test_fire_queues_one_turn_and_a_second_fire_is_skipped(
     second = _fire(client, auth_headers, "acme-fire", "nightly-cleanup")
     assert second.status_code == 200, second.text
     assert second.json()["outcome"] == "skipped"
+    assert second.json()["reason"] == "run_in_flight"
+    assert second.json()["source"] == "manual"
+    assert _stored_source(second.json()["id"]) == "manual"
+    assert body["reason"] is None
     assert len(_payloads_for("nightly-cleanup")) == 1
 
     fetched = client.get(
@@ -184,6 +225,7 @@ def test_fire_queues_one_turn_and_a_second_fire_is_skipped(
     )
     assert fetched.status_code == 200, fetched.text
     assert fetched.json()["outcome"] is None
+    assert fetched.json()["source"] == "manual"
 
 
 def test_unknown_hook_and_in_flight_and_kill_do_not_queue(
@@ -212,6 +254,9 @@ def test_unknown_hook_and_in_flight_and_kill_do_not_queue(
     blocked = _fire(client, auth_headers, "acme-fire-neg", "nightly-cleanup")
     assert blocked.status_code == 200, blocked.text
     assert blocked.json()["outcome"] == "blocked"
+    assert blocked.json()["reason"] == "agent_killed"
+    assert blocked.json()["source"] == "manual"
+    assert _stored_source(blocked.json()["id"]) == "manual"
     assert len(_payloads_for("nightly-cleanup")) == before
 
 
@@ -233,6 +278,7 @@ def test_open_row_skips_without_a_new_turn(
     fired = _fire(client, auth_headers, "acme-fire-open", "nightly-cleanup")
     assert fired.status_code == 200, fired.text
     assert fired.json()["outcome"] == "skipped"
+    assert fired.json()["reason"] == "run_in_flight"
     assert len(_payloads_for("nightly-cleanup")) == before
 
 
@@ -307,6 +353,7 @@ def test_a_target_bound_under_several_identities_none_default_fails(
     fired = _fire(client, auth_headers, "acme-fire-no-default", "ambiguous-check")
     assert fired.status_code == 200, fired.text
     assert fired.json()["outcome"] == "failed"
+    assert fired.json()["reason"] == "target_unbound"
     assert [
         item
         for item in _payloads_for("ambiguous-check")
@@ -350,4 +397,76 @@ def test_a_target_bound_under_two_kinds_fails_even_with_a_default_identity(
     fired = _fire(client, auth_headers, "acme-fire-two-kinds", "kinds-check")
     assert fired.status_code == 200, fired.text
     assert fired.json()["outcome"] == "failed"
+    assert fired.json()["reason"] == "target_unbound"
     assert _payloads_for("kinds-check") == []
+
+
+def test_spent_budget_records_blocked_budget_exhausted(
+    tmp_path: Any, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _bundle(tmp_path, [_cron("nightly-cleanup", "0 9 * * *")])
+    agent_id, version_id = _publish(
+        client, auth_headers, _archive(root), "acme-fire-budget", channel="C0EXAMPLE1"
+    )
+    _deploy(client, auth_headers, agent_id, version_id, "dev")
+
+    async def spend() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("UPDATE curie.agents SET max_usd_per_day = 0 WHERE id = :id"),
+                    {"id": uuid.UUID(agent_id)},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(spend())
+    fired = _fire(client, auth_headers, "acme-fire-budget", "nightly-cleanup")
+    assert fired.status_code == 200, fired.text
+    assert fired.json()["outcome"] == "blocked"
+    assert fired.json()["reason"] == "budget_exhausted"
+    assert [
+        item
+        for item in _payloads_for("nightly-cleanup")
+        if item["event_id"].startswith(f"cron:{agent_id}:")
+    ] == []
+
+
+def test_unbound_target_records_failed_target_unbound(
+    tmp_path: Any, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _bundle(tmp_path, [{**_cron("nightly-cleanup", "0 9 * * *"), "target": "C0EXAMPLE9"}])
+    agent_id, version_id = _publish(
+        client, auth_headers, _archive(root), "acme-fire-unbound", channel="C0EXAMPLE1"
+    )
+    _deploy(client, auth_headers, agent_id, version_id, "dev")
+    fired = _fire(client, auth_headers, "acme-fire-unbound", "nightly-cleanup")
+    assert fired.status_code == 200, fired.text
+    assert fired.json()["outcome"] == "failed"
+    assert fired.json()["reason"] == "target_unbound"
+    assert [
+        item
+        for item in _payloads_for("nightly-cleanup")
+        if item["event_id"].startswith(f"cron:{agent_id}:")
+    ] == []
+
+
+def test_reading_a_scheduled_run_preserves_its_source(
+    tmp_path: Path, client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    root = _bundle(tmp_path, [_cron("nightly-cleanup", "0 9 * * *")])
+    agent_id, version_id = _publish(
+        client, auth_headers, _archive(root), "acme-scheduled-record", channel="C0EXAMPLE1"
+    )
+    run_id = _insert_run(
+        agent_id, version_id, "nightly-cleanup", datetime(2026, 9, 25, 9, 0, tzinfo=UTC)
+    )
+    fetched = client.get(
+        f"/agents/acme-scheduled-record/hooks/nightly-cleanup/runs/{run_id}",
+        headers=auth_headers,
+    )
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["id"] == str(run_id)
+    assert fetched.json()["source"] == "schedule"
+    assert fetched.json()["outcome"] is None

@@ -103,8 +103,9 @@ queued turn whose `tool_access` is set (a canary sets `read-only`):
   classes: a turn the runner refuses escalates under its class, never as
   `unclassified`.
 
-The worker's half of channel read (ADR 0100, `kernel/channel_read.py`), for a
-bundle whose manifest grants `channelRead: true`. The worker is the only issuer
+The worker's half of channel read (ADR 0100, ADR 0200, `kernel/channel_read.py`),
+for a bundle whose manifest grants any of `channelRead`, `canvasList`,
+`canvasRead` or `canvasEdit`. The worker is the only issuer
 of the capability the runner's `curie-slack` tools use:
 
 - **WORKER-CHANNEL-READ-1:** At turn open, on every path that opens a turn (a
@@ -1206,6 +1207,66 @@ selection refusal and the same recovery. When repository workspaces are
 disabled, the existing workspaces disabled refusal takes precedence before the
 file is resolved. Fresh workspace claims and suspended workspace resumes still
 receive attachments. Retained workspace replacement is tracked in #2728.
+
+### Every boot rebuilds the thread's files (ADR 0205)
+
+With the attachment lane on and `CURIE_INTERNAL_WORKER_TOKEN` set, the worker
+wires the API's thread attachment ledger
+(`curie_worker.ledger_client.ThreadAttachmentLedgerClient`, the
+`/v1/internal/thread-attachments` routes behind `X-Curie-Worker-Token`). Without
+the token no ledger is wired and attachments behave exactly as above: a file
+turn resolves only its own files and a text turn reads nothing.
+
+- **A file turn** reads the ledger outside the route lock, then
+  `AttachmentCoordinator.prepare_thread_set` fetches the message's files all or
+  nothing and the thread's earlier files best effort. A failed ledger read
+  refuses the turn before any claim (`stage=ledger`). Once the files are
+  installed and the turn has opened, the worker appends the message's refs to
+  the ledger, outside the lock and idempotent per event and file. A failed append is
+  logged at WARNING and the turn goes on. A turn refused after preparing
+  appends nothing and discards what it wrote.
+- **A text turn that boots** (fresh claim, suspended resume, turn budget or
+  workspace handoff) reads the ledger and prepares the earlier files under the
+  route lock. The ledger read is bounded by
+  `CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS` (default 15) and the
+  delivery's remaining budget. The prepare has the same deadline plus a short
+  grace. A failed read boots with `ledger_unavailable` in the manifest. An
+  adopt, a steer and a sweep continuation read nothing. A route that the
+  locked snapshot saw live is read once more just before the claim, with a
+  ledger wired, using the readiness test the claim itself will use (a
+  workspace claim's `substrate.adopt`, which also needs the claim and sandbox
+  ready): if it fails, the claim cold-creates, so that boot carries the set
+  too.
+- **The rebuild is charged to the turn.** On the text-boot and the file paths,
+  the time spent preparing the thread's files comes off the delivery's
+  remaining budget before the claim and the turn start.
+- **An API without the ledger routes** (query answered a bare 404, a mixed
+  rollout) is treated as no ledger. A 404 carrying the ledger's own
+  `detail.code` (such as `thread_attachment.agent_not_found`) is an ordinary
+  ledger failure. No ledger means: a file turn resolves its own files and appends
+  nothing, and a text boot carries no attachment env.
+- **Names are fixed when recorded.** A current file's disk name is cleaned with
+  the init container's rules (a leading `.` becomes `_`) and disambiguated
+  against every name the ledger holds, ignoring case, and cut to fit 255
+  bytes. It is then stored on its ref and never recomputed. A redelivery is
+  the same (event, file id), and it keeps its stored name.
+- **Bytes stay short lived.** An earlier file whose parked copy outlives the
+  capability by a margin is re-minted, and a new owner record (still
+  `"version": 1`, with optional `agent` and `shas` fields), written before any
+  re-fetch starts, keeps it from the reaper. Otherwise it is fetched again through the agent's current bindings
+  (`BindingResolver.routes_for_agent`), never a recorded endpoint, and its
+  digest must match. The prepare deadline is checked as each chunk arrives,
+  so a slow earlier file is cut and named `deadline`. One that cannot be had is named unavailable (`no_route`,
+  `no_credential`, `not_found`, `forbidden`, `rate_limited`, `timeout`,
+  `digest_changed`, `deadline`, `fetch_failed`) and never fails the boot.
+- **The per-thread budget** (`CURIE_ATTACHMENT_THREAD_MAX_FILES`, default 20,
+  never below the per-message cap; `CURIE_ATTACHMENT_THREAD_MAX_BYTES`, default
+  256 MiB) keeps the current files and then the newest earlier files. The rest
+  are named as omitted.
+- Capabilities are presigned only after every fetch. The claim env carries
+  `CURIE_ATTACHMENTS_REF` (each entry with its exact name `n` and `c` 1 for
+  current, 0 for earlier) and `CURIE_ATTACHMENTS_MANIFEST` for the runner
+  (names and reasons only, no URL).
 
 Approval metadata references follow the same sentence boundary rules across API,
 worker, runner and the UI fallback for older API responses. A tool identifier

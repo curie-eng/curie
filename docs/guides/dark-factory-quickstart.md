@@ -28,7 +28,7 @@ token. The platform reads the issue for the sandbox.
 | [`kubectl`](https://kubernetes.io/docs/tasks/tools/) | Kubernetes operations, required for every context |
 | [`helm`](https://helm.sh/docs/intro/install/) | Curie installation, required for every context |
 | `curie` v0.12.1 or later | install it with the command below |
-| An [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | the factory model, `z-ai/glm-5.3-flash` by default, and the reviewers, which run `anthropic/claude-opus-5.5`. Plan on about 5 USD of available OpenRouter credit per run; actual spend varies. The command asks once, or reads `CURIE_CREDENTIALS`. |
+| An [Anthropic](https://console.anthropic.com/) API key (`sk-ant-`) or an [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | Anthropic defaults to `claude-sonnet-5-5` for implementation and `claude-opus-5-5` for review. OpenRouter defaults to `z-ai/glm-5.3-flash` for implementation and `anthropic/claude-opus-5.5` for review. Plan on about 5 USD of available OpenRouter credit per run; actual spend varies. The command asks once, or reads `CURIE_CREDENTIALS`. |
 | A GitHub account | your own GitHub App and the trial repository |
 
 The command checks all required tools on `PATH` before running any command or
@@ -71,10 +71,12 @@ its unpublished factory runner image.
 
 ## Create the repository
 
-In the GitHub website, create a public repository with one commit (an initial
-README is enough). The factory branches from the default branch, so the
-repository needs that commit. It does not need CI. Note the `owner/name` form,
-for example `acme-corp/acme-bot`.
+In the GitHub website, create a repository with one commit (an initial README
+is enough). The repository may be public or private. Either way, the GitHub App
+must be installed on it, which the **Install App** step under
+[Rerun with the App](#rerun-with-the-app) covers. The factory branches from the
+default branch, so the repository needs that commit. It does not need CI. Note
+the `owner/name` form, for example `acme-corp/acme-bot`.
 
 ## Choose the target and run the command
 
@@ -149,7 +151,7 @@ What it does:
    context never prompts.
 2. It installs Curie with `cluster up`. On the kind path it sets
    `security.gvisor.mode=off` before the first install. It asks for the
-   OpenRouter key once when `CURIE_CREDENTIALS` is unset and the release is
+   Anthropic or OpenRouter API key once when `CURIE_CREDENTIALS` is unset and the release is
    not already on a real model.
 3. It prints a prefilled GitHub App registration link and stops. Nothing about
    the App is applied yet.
@@ -216,13 +218,33 @@ The cluster factory command performs the same check for its allowlisted reposito
 Without `--app-id`, it prints `toolchain inference skipped: no --app-id`.
 Dry-run describes the inference without reading GitHub.
 
-Before deploying, the second run reads the key's remaining credit from
+An explicit `--model <id>` selects the implementer model instead of the
+credential's default, even when it matches the OpenRouter default. Both
+reviewers use the `opus` alias; the runner resolves it to the provider's Opus
+model. To pin another reviewer model for this agent, use the same context,
+namespace and release as the quickstart:
+
+```bash
+curie cluster overrides dark-factory --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
+  --reviewer-model <provider-model-id>
+```
+
+Use `--clear-reviewer-model` in place of `--reviewer-model <provider-model-id>`
+to restore the credential's default. `curie local overrides` accepts the same
+reviewer flags for a local installation.
+
+For OpenRouter credentials, before deploying, the second run reads the key's remaining credit from
 OpenRouter (the smaller of the key's limit and the account balance). It warns
 when that is below the recommended 5 USD of available credit for one run. When it cannot read
 the credit, for example because the key only lives in the cluster, it prints
 `OpenRouter credit not checked` and continues. The check never stops the
 command. The ready output names the reviewer model and the per-run credit. A run
 that runs out of credit ends with the out-of-credits cause on the issue.
+With an Anthropic API key, quickstart skips this OpenRouter credit request.
+If the provider reaches a usage limit, the run ends with cause
+`model_usage_limited`. Wait for the limit to reset, then re-add the factory
+label to try again. Credit exhaustion continues to use the add-credit remedy.
 
 The recommended 5 USD of available provider credit is a planning allowance,
 not a guaranteed minimum charge per run. Actual spend depends on the task,

@@ -421,6 +421,14 @@ services:
       # Only the API verifier and dispatcher producer receive it.
       CURIE_APPROVAL_CHAT_ATTESTER_SECRET: ${CURIE_APPROVAL_CHAT_ATTESTER_SECRET:-curie-dev-approval-chat-attester}
       CURIE_INTERNAL_WORKER_TOKEN: curie-dev-worker-token
+      # The action executor switch (ACTION-EXECUTOR-1). curie-worker reads the
+      # same interpolation, so one CURIE_ACTION_EXECUTOR_ENABLED in the
+      # environment turns both on and an unset one leaves both off.
+      CURIE_ACTION_EXECUTOR_ENABLED: ${CURIE_ACTION_EXECUTOR_ENABLED:-false}
+      # The automated remediation switch (AUTOMATED-REMEDIATION-1). curie-worker
+      # reads the same interpolation. It requires the executor switch above; the
+      # API and the worker refuse to boot with it on and the executor off.
+      CURIE_REMEDIATION_ENABLED: ${CURIE_REMEDIATION_ENABLED:-false}
       VALKEY_HOST: valkey
       VALKEY_PORT: "6379"
       VALKEY_PASSWORD: ${VALKEY_PASSWORD:-valkeypass}
@@ -698,6 +706,12 @@ services:
       # `curie` (cli/src/commands/connector_images.rs), the same as `local::COMPOSE_PROJECT`.
       - CURIE_RELEASE=${CURIE_RELEASE:-curie}
       - CURIE_NAMESPACE=${CURIE_NAMESPACE:-default}
+      # The action executor switch (ACTION-EXECUTOR-1). curie-api reads the
+      # same interpolation; the two must never differ.
+      - CURIE_ACTION_EXECUTOR_ENABLED=${CURIE_ACTION_EXECUTOR_ENABLED:-false}
+      # The automated remediation switch (AUTOMATED-REMEDIATION-1). curie-api
+      # reads the same interpolation; the two must never differ.
+      - CURIE_REMEDIATION_ENABLED=${CURIE_REMEDIATION_ENABLED:-false}
     restart: unless-stopped
 
   # Optional real Slack ingress for local development.

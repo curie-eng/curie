@@ -13,6 +13,9 @@ What this file holds:
 2. **Reversibility is deny-by-default.** ``undoable`` is derived from what the
    record actually holds, so a completion that carried no prior state produces a
    record that says it cannot be undone, with no connector declaring anything.
+   Under the sealed rule (ACTION-EXECUTOR-11) a cleartext prior state is history,
+   not a snapshot: it is stored as reported and never makes a record undoable.
+   ``test_action_undoable_ingredients.py`` holds the positive case.
 3. **A completion lands once.** Recording the same result twice must not
    overwrite a record with a second, later account of the same call.
 """
@@ -86,9 +89,17 @@ def test_a_redelivered_turn_adopts_the_record_it_already_wrote(
     assert len(listed.json()) == 1
 
 
-def test_a_completed_call_that_captured_its_prior_state_is_undoable(
+def test_a_completed_call_with_a_cleartext_prior_state_is_stored_but_not_undoable(
     client: Any, auth_headers: Any
 ) -> None:
+    """@spec ACTION-EXECUTOR-11: legacy cleartext rows are not undoable.
+
+    The completion still lands in full -- status, prior state, completion time --
+    because the record is the history of the call. What it no longer earns is an
+    undo: a cleartext ``prior_state`` is not a sealed envelope (ACTION-EXECUTOR-9),
+    and this record carries no version, digest, capability or custody either.
+    """
+
     action_id = client.post("/actions", json=_open_body(), headers=auth_headers).json()["id"]
 
     response = client.post(
@@ -99,8 +110,10 @@ def test_a_completed_call_that_captured_its_prior_state_is_undoable(
     body = response.json()
     assert body["status"] == "succeeded"
     assert body["prior_state"] == {"spec": {"replicas": 3}}
+    assert body["post_state"] == {"spec": {"replicas": 10}}
+    assert body["target"] == {"kind": "Deployment", "namespace": "public", "name": "api"}
     assert body["completed_at"] is not None
-    assert body["undoable"] is True
+    assert body["undoable"] is False
 
 
 def test_a_call_that_reported_no_prior_state_is_not_undoable(
@@ -237,9 +250,7 @@ def test_two_sessions_with_a_stale_pending_record_cannot_replace_the_first_compl
     assert stored.result == {"ok": True, "summary": "scaled 3 to 10"}
 
 
-def test_a_conversation_reads_back_its_actions_in_order(
-    client: Any, auth_headers: Any
-) -> None:
+def test_a_conversation_reads_back_its_actions_in_order(client: Any, auth_headers: Any) -> None:
     """The receipt is per turn, so the listing is what renders it."""
 
     client.post("/actions", json=_open_body(call_id="toolu_01"), headers=auth_headers)
@@ -248,9 +259,7 @@ def test_a_conversation_reads_back_its_actions_in_order(
         "/actions", json=_open_body(conversation_id="C2", call_id="toolu_03"), headers=auth_headers
     )
 
-    listed = client.get(
-        "/actions", params={"conversation_id": "C1"}, headers=auth_headers
-    ).json()
+    listed = client.get("/actions", params={"conversation_id": "C1"}, headers=auth_headers).json()
 
     assert [a["call_id"] for a in listed] == ["toolu_01", "toolu_02"]
 
@@ -277,3 +286,111 @@ def test_an_unknown_action_is_a_404(client: Any, auth_headers: Any) -> None:
 
 def test_recording_requires_the_api_key(client: Any) -> None:
     assert client.post("/actions", json=_open_body()).status_code == 401
+
+
+def test_a_completion_stores_the_post_version_it_reports(client: Any, auth_headers: Any) -> None:
+    """@spec ACTION-EXECUTOR-9 @spec ACTION-EXECUTOR-11: the API half of ``post_version``.
+
+    The worker records the version a sealed write left as ``post_version`` on
+    the completion; the ruling (ACTION-EXECUTOR-11) and the observation
+    comparison (ACTION-EXECUTOR-15) read it from the row, so the completion
+    must accept and store it rather than drop it as an unknown field.
+    """
+
+    action_id = client.post("/actions", json=_open_body(), headers=auth_headers).json()["id"]
+    envelope = {
+        "sealed": "curie.snapshot.v1",
+        "kid": "example-key-2026-10",
+        "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=",
+    }
+    response = client.post(
+        f"/actions/{action_id}/complete",
+        json=_complete_body(prior_state=envelope, post_version="rv-1041"),
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+
+    async def stored() -> tuple[Any, ...]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                row = (
+                    await conn.execute(
+                        text(
+                            "SELECT post_version, prior_state"
+                            " FROM curie.agent_actions WHERE id = :id"
+                        ),
+                        {"id": uuid.UUID(action_id)},
+                    )
+                ).one()
+                return tuple(row)
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(stored()) == ("rv-1041", envelope)
+    assert (
+        ActionComplete.model_validate({"post_version": "rv-1041"}).model_dump().get("post_version")
+        == "rv-1041"
+    )
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        pytest.param("v" * 257, id="over_256_chars"),
+        pytest.param("rv-1041\u0007", id="non_printable"),
+        pytest.param("rv-1041\nrv-1042", id="line_break"),
+        pytest.param("rv-1041-é", id="non_ascii"),
+        pytest.param("[REDACTED:jwt]", id="placeholder"),
+        pytest.param("rv-[REDACTED:held_secret]", id="embedded_placeholder"),
+        pytest.param("", id="empty"),
+    ],
+)
+def test_a_malformed_post_version_is_refused_not_truncated(
+    client: Any, auth_headers: Any, version: str
+) -> None:
+    """@spec ACTION-EXECUTOR-9: at most 256 characters of printable ASCII, no placeholder.
+
+    The API refuses rather than truncating or storing it, so a worker-credential
+    holder cannot plant a version the observation comparison would trust.
+    """
+
+    action_id = client.post("/actions", json=_open_body(), headers=auth_headers).json()["id"]
+    response = client.post(
+        f"/actions/{action_id}/complete",
+        json=_complete_body(post_version=version),
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 422
+    row = client.get(f"/actions/{action_id}", headers=auth_headers)
+    if row.status_code == 200:
+        assert row.json()["status"] == "pending"
+
+
+def test_a_256_char_printable_post_version_is_stored(client: Any, auth_headers: Any) -> None:
+    """@spec ACTION-EXECUTOR-9: the bound is inclusive."""
+
+    action_id = client.post("/actions", json=_open_body(), headers=auth_headers).json()["id"]
+    version = "~" * 256
+    response = client.post(
+        f"/actions/{action_id}/complete",
+        json=_complete_body(post_version=version),
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+
+    async def stored() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                return (
+                    await conn.execute(
+                        text("SELECT post_version FROM curie.agent_actions WHERE id = :id"),
+                        {"id": uuid.UUID(action_id)},
+                    )
+                ).scalar_one()
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(stored()) == version

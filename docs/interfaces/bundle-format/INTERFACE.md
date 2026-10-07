@@ -24,10 +24,12 @@ The frozen bundle/plugin manifest format: the **Claude Code plugin shape verbati
 distribution wedge. What is swappable is the harness that consumes a bundle; what stays fixed is
 the shape a bundle must have to be accepted. The base is the Claude Code plugin shape, and the
 models are lenient (`extra="allow"`) rather than strict so any bundle written for Claude Code
-validates unchanged. On top of that base the package **does add seven Curie authoring
-extensions**: `systemPrompt`, `starterPrompts`, `secrets`, `triggers`, `approvalPolicy`,
-`toolPolicy` and `channelRead` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
-fields Claude Code does not define. Leniency is what lets the Claude Code base and these
+validates unchanged. On top of that base the package **does add eleven Curie authoring
+extensions**: `systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`, `approvalPolicy`,
+`toolPolicy`, `channelRead`, `canvasList`, `canvasRead` and `canvasEdit` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
+fields Claude Code does not define. `secrets` names the secrets a deploy must bind;
+`optionalSecrets` (ADR 0209) names the ones it may leave unbound, validated the same
+way, and a name may not appear in both (`secrets.optional_overlap`). Leniency is what lets the Claude Code base and these
 extensions coexist; the earlier "does not invent format extensions" framing was wrong.
 
 The manifest is not the whole bundle either. Three **Curie-only root files** sit beside the Claude
@@ -419,7 +421,8 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   a bundle may still plugin mount either name with the plugin infix and full
   policy scope. Reservation does not imply mounting, publication or exemption.
   The reserved `curie-slack` capability is fully governed by policy when the
-  manifest grants `channelRead: true`, and a bundle cannot declare it in any MCP
+  manifest grants any platform Slack grant (`channelRead`, `canvasList`,
+  `canvasRead`, `canvasEdit`), and a bundle cannot declare it in any MCP
   map or in `connectors.yaml`. Without the grant a literal policy pattern gets
   `channel_read.grant_required`. A granted, real-model boot mounts it (#2877);
   its tools are governed by policy like a connector's. The server carries three
@@ -431,7 +434,12 @@ declarations rejected), but they differ in whether the runtime acts on them yet:
   sees, among them `channel_read.not_bound`, `channel_read.grant_revoked`,
   `channel_read.turn_inactive`, `channel_read.window_too_wide`,
   `channel_read.limit_invalid`, `channel_read.page_budget_exhausted` and
-  `channel_read.provider_rate_limited`. A granted turn on a runner that cannot
+  `channel_read.provider_rate_limited`. Three canvas tools share the server, each
+  present only with its own grant: `list_channel_canvases` (`canvasList`),
+  `read_canvas` (`canvasRead`) and `edit_canvas_cell` (`canvasEdit`). Each costs
+  one of the 8 pages, an edit is limited to one existing table cell whose section
+  id a read returned in the same logical turn, and every edit is audited
+  (ADR 0200). A granted turn on a runner that cannot
   enforce the grant is refused with `channel-read-unenforced`. The runtime exempts
   only exact platform tool names published by the existing two servers through
   `runner/src/curie_runner/approval.py::is_platform_owned_tool` before

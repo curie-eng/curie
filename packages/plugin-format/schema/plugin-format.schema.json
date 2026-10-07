@@ -631,6 +631,21 @@
           "default": null,
           "title": "Author"
         },
+        "canvasEdit": {
+          "default": false,
+          "title": "Canvasedit",
+          "type": "boolean"
+        },
+        "canvasList": {
+          "default": false,
+          "title": "Canvaslist",
+          "type": "boolean"
+        },
+        "canvasRead": {
+          "default": false,
+          "title": "Canvasread",
+          "type": "boolean"
+        },
         "channelRead": {
           "default": false,
           "title": "Channelread",
@@ -740,6 +755,21 @@
         "name": {
           "title": "Name",
           "type": "string"
+        },
+        "optionalSecrets": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Optionalsecrets"
         },
         "repository": {
           "anyOf": [

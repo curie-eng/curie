@@ -150,6 +150,55 @@ def test_channel_read_grant_does_not_override_tool_policy(
     assert classify_tool(policy, "curie-slack/history") is expected
 
 
+@pytest.mark.parametrize(
+    ("grant", "tool"),
+    [
+        ("canvasList", "curie-slack/list_channel_canvases"),
+        ("canvasRead", "curie-slack/read_canvas"),
+        ("canvasEdit", "curie-slack/edit_canvas_cell"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("collection", "expected"),
+    [
+        ("allow", ToolPolicyDecision.ALLOW),
+        ("approvalRequired", ToolPolicyDecision.APPROVAL_REQUIRED),
+        ("deny", ToolPolicyDecision.DENY),
+    ],
+)
+def test_canvas_grant_does_not_override_tool_policy(
+    grant: str, tool: str, collection: str, expected: ToolPolicyDecision
+) -> None:
+    manifest = PluginManifest.model_validate(
+        {
+            "name": "acme-bot",
+            grant: True,
+            "toolPolicy": {"enforcement": TOOL_POLICY_ENFORCEMENT, collection: [tool]},
+        }
+    )
+    assert getattr(manifest, grant) is True
+    policy = load_tool_policy(manifest, enforces=TOOL_POLICY_ENFORCEMENT)
+    assert policy is not None
+    assert classify_tool(policy, tool) is expected
+
+
+@pytest.mark.parametrize("grant", ["canvasList", "canvasRead", "canvasEdit"])
+def test_canvas_grant_does_not_allow_a_tool_the_policy_never_mentions(grant: str) -> None:
+    manifest = PluginManifest.model_validate(
+        {
+            "name": "acme-bot",
+            grant: True,
+            "toolPolicy": {
+                "enforcement": TOOL_POLICY_ENFORCEMENT,
+                "allow": ["curie-slack/history"],
+            },
+        }
+    )
+    policy = load_tool_policy(manifest, enforces=TOOL_POLICY_ENFORCEMENT)
+    assert policy is not None
+    assert classify_tool(policy, "curie-slack/edit_canvas_cell") is ToolPolicyDecision.DENY
+
+
 def test_a_newly_advertised_tool_the_policy_never_mentions_is_denied() -> None:
     """Server drift fails CLOSED: a sixth tool appearing after the policy was written is denied.
 

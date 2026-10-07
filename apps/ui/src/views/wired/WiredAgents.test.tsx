@@ -21,7 +21,7 @@ vi.mock("../../api/client", async (importOriginal) => {
 });
 
 const AGENTS: AgentOut[] = [
-  { id: "ag-1", name: "factory", channels: [{ kind: "github", address: "acme-corp/acme-bot" }], model: null, created_at: "2026-09-01T00:00:00Z", approval_required_tools: null, approval_routes: null, behavior_packs: null, deploy_notifications: true, hook_partitions: null, memory: false, repo_full_name: null, secrets: null, source_bindings: null, thinking: null },
+  { id: "ag-1", name: "factory", channels: [{ kind: "github", address: "acme-corp/acme-bot" }], model: null, reviewer_model: null, created_at: "2026-09-01T00:00:00Z", approval_required_tools: null, approval_routes: null, behavior_packs: null, deploy_notifications: true, hook_partitions: null, memory: false, repo_full_name: null, secrets: null, source_bindings: null, thinking: null },
 ];
 
 function summary(overrides: Partial<MetricsSummary> = {}): MetricsSummary {

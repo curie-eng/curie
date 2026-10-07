@@ -49,6 +49,7 @@ from .affinity import AffinityStore
 from .docker import DockerSandboxClient
 from .types import (
     AGENT_LABEL,
+    EXECUTOR_THREAD_KEY_PREFIX,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     THREAD_HASH_LABEL,
@@ -70,6 +71,7 @@ from .types import (
     UnschedulableClaimError,
     agent_warm_pool_name,
     claim_warm_pool,
+    is_executor_thread_key,
 )
 
 # The resume overlay writes these into the replacement claim's per-claim env, and
@@ -152,6 +154,16 @@ def _sandbox_attributes(operation: str, outcome: str) -> dict[str, str]:
     }
 
 
+def _refuse_executor_key(thread_key: str, operation: str) -> None:
+    """Refuse an executor route on a path that cannot strip its template."""
+
+    if is_executor_thread_key(thread_key):
+        raise ValueError(
+            f"{operation} refuses an {EXECUTOR_THREAD_KEY_PREFIX!r} route; an executor "
+            "sandbox is claimed fresh and released, never carried over"
+        )
+
+
 def _record_inventory(*, active: float, suspended: float) -> None:
     # Both inventories intentionally use one fixed series each. Lifecycle
     # operation labels belong on curie.sandbox.lifecycle; putting claim/release
@@ -175,11 +187,23 @@ class SandboxSubstrate:
         self._affinity = affinity
         self._config = config
         self._boot_credential_revoker: Callable[[str, str], bool] | None = None
+        self._boot_credential_minter: Callable[[Mapping[str, str]], dict[str, str]] | None = None
 
     def set_boot_credential_revoker(self, revoker: Callable[[str, str], bool]) -> None:
         """Report a released boot credential. The kernel wires the API call."""
 
         self._boot_credential_revoker = revoker
+
+    def set_boot_credential_minter(
+        self, minter: Callable[[Mapping[str, str]], dict[str, str]]
+    ) -> None:
+        """Give each new claim its own boot credential. The kernel wires the signer.
+
+        A retry claims again from the env whose credential the failed claim
+        already released, and the API refuses a released credential.
+        """
+
+        self._boot_credential_minter = minter
 
     def _remember_claim_credential(self, claim_name: str, env: Mapping[str, str] | None) -> None:
         token = None
@@ -293,6 +317,7 @@ class SandboxSubstrate:
         fresh_only: bool = False,
         runner_resources: dict[str, Any] | None = None,
         caller_run: str | None = None,
+        executor_secret_names: frozenset[str] | None = None,
     ) -> SandboxHandle:
         """Return the thread's live sandbox, claiming a warm one if needed.
 
@@ -306,8 +331,21 @@ class SandboxSubstrate:
         a concurrent winner of the route race, raises ``RouteChangedError``
         instead of being reused. Suspended routes still raise
         ``SuspendedThreadError``.
+
+        ``executor_secret_names`` marks an executor claim (@spec
+        ACTION-EXECUTOR-5): ``None`` is an ordinary claim, a set (possibly
+        empty) names the connector secrets the target connector's headers
+        expand, and the claim runs from a stripped per-claim template. It must
+        agree with the ``action-exec:`` thread key prefix, which is what
+        pressure filtering keys on; a mismatch raises ``ValueError`` before any
+        route read or Kubernetes write.
         """
 
+        if (executor_secret_names is not None) != is_executor_thread_key(thread_key):
+            raise ValueError(
+                "executor_secret_names must be given exactly for an "
+                f"{EXECUTOR_THREAD_KEY_PREFIX!r} thread key"
+            )
         started = time.monotonic()
         handle: SandboxHandle | None = None
         error: Exception | None = None
@@ -347,6 +385,7 @@ class SandboxSubstrate:
                         fresh_only=fresh_only,
                         runner_resources=runner_resources,
                         caller_run=caller_run,
+                        executor_secret_names=executor_secret_names,
                     )
                     outcome = "claimed"
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
@@ -423,11 +462,14 @@ class SandboxSubstrate:
         )
         if result.outcome != "complete":
             return result
+        # Executor routes never reach the kernel's reclamation (@spec
+        # ACTION-EXECUTOR-5): the loop releases its own sandbox on every path.
         return PressureScanResult(
             tuple(
                 candidate
                 for candidate in result.candidates
                 if candidate.record.handle.namespace == self._config.namespace
+                and not is_executor_thread_key(candidate.thread_key)
             ),
             "complete",
         )
@@ -519,8 +561,13 @@ class SandboxSubstrate:
         the claim+generation fence deletes only the unexposed candidate. After
         a successful swap the old claim is cleanup-only; a failed deletion is
         intentionally recoverable by the ordinary orphan reaper.
+
+        An executor route is refused with ``ValueError`` before any write: its
+        replacement would boot from the unstripped pool template (@spec
+        ACTION-EXECUTOR-5).
         """
 
+        _refuse_executor_key(thread_key, "handoff")
         boot = dict(env)
         boot[SESSION_ENV] = expected.session_id
         if expected.history_ref is not None:
@@ -646,8 +693,13 @@ class SandboxSubstrate:
         session identity and any recorded history ref are preserved on top,
         and the runner token is minted fresh when the caller did not already
         mint one (issue #63: the old token died with the old claim).
+
+        An executor route is refused with ``ValueError`` before any route read
+        or write: executor routes are never suspended, and a replacement would
+        boot from the unstripped pool template (@spec ACTION-EXECUTOR-5).
         """
 
+        _refuse_executor_key(thread_key, "resume")
         started = time.monotonic()
         handle: SandboxHandle | None = None
         old: SandboxHandle | None = None
@@ -781,6 +833,27 @@ class SandboxSubstrate:
         if error is not None:
             raise error
         return released
+
+    def release_claim(self, thread_key: str, handle: SandboxHandle) -> bool:
+        """Release exactly the claim ``handle`` names (@spec ACTION-EXECUTOR-5).
+
+        For a holder that may have been fenced out: its own claim is retired
+        (an idempotent delete) and the route is dropped only while it still
+        names that claim, so a later holder's live sandbox on the same thread
+        key is never touched. True when the route was dropped.
+        """
+
+        self._retire_claim(
+            handle.claim_name,
+            request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+            handle=handle,
+        )
+        dropped = self._affinity.delete_if_claim(thread_key, handle.claim_name)
+        record_metric(
+            "curie.sandbox.lifecycle",
+            attributes=_sandbox_attributes("release", "released" if dropped else "observed"),
+        )
+        return dropped
 
     def terminate_thread(
         self,
@@ -1278,6 +1351,7 @@ class SandboxSubstrate:
         fresh_only: bool = False,
         runner_resources: dict[str, Any] | None = None,
         caller_run: str | None = None,
+        executor_secret_names: frozenset[str] | None = None,
     ) -> SandboxHandle:
         config = self._config
         nonce = uuid.uuid4().hex[:6]
@@ -1306,7 +1380,16 @@ class SandboxSubstrate:
                 derived = self._existing_agent_pool(config.warm_pool, agent_name)
                 if derived is not None:
                     pool = derived
+        if env is not None and self._boot_credential_minter is not None:
+            env = self._boot_credential_minter(env)
         self._remember_claim_credential(name, env)
+        # Passed only for an executor claim, so a client that predates the
+        # keyword keeps serving ordinary claims unchanged.
+        executor_kwargs: dict[str, Any] = (
+            {"executor_secret_names": executor_secret_names}
+            if executor_secret_names is not None
+            else {}
+        )
         self._k8s.create_claim(
             name,
             pool=pool,
@@ -1314,6 +1397,7 @@ class SandboxSubstrate:
             labels=labels,
             runner_resources=runner_resources,
             agent_name=agent_name,
+            **executor_kwargs,
         )
         deadline = time.monotonic() + config.claim_timeout_seconds
         try:

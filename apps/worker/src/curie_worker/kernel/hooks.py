@@ -98,7 +98,7 @@ async def _close_hook_run_after_error(
             if shield:
                 close_task = asyncio.create_task(
                     asyncio.wait_for(
-                        carry.recorder.close(carry.ref, "failed"),
+                        carry.recorder.close(carry.ref, "failed", "turn_error"),
                         timeout=5.0,
                     )
                 )
@@ -114,7 +114,7 @@ async def _close_hook_run_after_error(
                         continue
                 closed = close_task.result()
             else:
-                closed = await carry.recorder.close(carry.ref, "failed")
+                closed = await carry.recorder.close(carry.ref, "failed", "turn_error")
         except BaseException:  # noqa: BLE001 - broad catch kept at a failure boundary
             logger.error(
                 "hook run failure close failed for event %s while preserving %s",

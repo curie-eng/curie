@@ -88,8 +88,8 @@ from .tool_access import (
     TOOL_ACCESS_UNENFORCED_CLASSIFICATION,
     TurnToolAccess,
 )
-from .tool_names import CHANNEL_READ_TOOL_NAMES
-from .translate import TurnState, translate_message
+from .tool_names import PLATFORM_SLACK_TOOL_NAMES
+from .translate import TurnState, is_credit_refusal, is_usage_refusal, translate_message
 from .turn_progress import ProgressCapability, TurnProgress
 from .usage_report import UsageSink
 
@@ -157,9 +157,9 @@ PUBLICATION_UNRECORDED_CLASSIFICATION = "publication-unrecorded"
 # Exact membership, as ``is_platform_owned_tool`` decides it (#2286), but over
 # the maximal set: a telemetry label grants nothing, so a ``curie-state`` name
 # counts as platform whether or not this session mounted that server.
-# The channel read tools (ADR 0100) join this label set only: they are
-# governed by toolPolicy and never exempt, and this label grants nothing.
-_PLATFORM_TOOL_NAMES = platform_tool_names(state_server_mounted=True) | CHANNEL_READ_TOOL_NAMES
+# The curie-slack tools (ADR 0100, ADR 0200) join this label set only: they
+# are governed by toolPolicy and never exempt, and this label grants nothing.
+_PLATFORM_TOOL_NAMES = platform_tool_names(state_server_mounted=True) | PLATFORM_SLACK_TOOL_NAMES
 
 
 def _tool_result_origin(tool_name: str) -> str:
@@ -173,11 +173,18 @@ def _tool_result_origin(tool_name: str) -> str:
 
 
 def _is_auth_rejection(message: object) -> bool:
-    """True when an SDK message reports a provider credential rejection (401/403)."""
+    """True when an SDK message reports a provider credential rejection (401/403).
+
+    A 403 whose text is a credit refusal, such as an OpenRouter key at its own
+    spend limit, is not one: translation classifies it credit-exhausted (#4104).
+    Subscription usage refusals also keep their own terminal classification.
+    """
 
     return (
         isinstance(message, AssistantMessage)
         and getattr(message, "error", None) == _AUTH_REJECTION_SDK_CODE
+        and not is_usage_refusal(message)
+        and not is_credit_refusal(message)
     )
 
 
@@ -236,12 +243,8 @@ def _apply_approval_override(final: Final, state: TurnState) -> Final:
     if state.tool_access is not None:
         # @spec RUNNER-TOOL-ACCESS-3: a restricted turn never pauses for a human.
         return final
-    runner_halted_the_turn = (
-        state.approval_halt_requested and state.error_classification is None
-    )
-    if state.approval_summary and (
-        final.status is SessionStatus.DONE or runner_halted_the_turn
-    ):
+    runner_halted_the_turn = state.approval_halt_requested and state.error_classification is None
+    if state.approval_summary and (final.status is SessionStatus.DONE or runner_halted_the_turn):
         return Final(
             text=final.text,
             status=SessionStatus.AWAITING_APPROVAL,
@@ -510,12 +513,7 @@ class SessionRunner:
         """Resolve a capacity turn before any connector or model work begins."""
 
         gate = self._admission_gate
-        if (
-            gate is None
-            or gate.is_set()
-            or not self._turn_open
-            or self._turn_epoch != turn_epoch
-        ):
+        if gate is None or gate.is_set() or not self._turn_open or self._turn_epoch != turn_epoch:
             return False
         self._admission_granted = allow
         self._remember_admission(turn_epoch, "granted" if allow else "denied")
@@ -690,9 +688,7 @@ class SessionRunner:
         except BaseException as exc:
             self._history_loss_observed = True
             self._history_durable = False
-            if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(
-                exc, Exception
-            ):
+            if isinstance(exc, anyio.get_cancelled_exc_class()) or not isinstance(exc, Exception):
                 raise
             status = getattr(exc, "status", None)
             if isinstance(status, int):
@@ -938,9 +934,7 @@ class SessionRunner:
             or not self._turn_open
             or self._timeout_requested
             or current_epoch is None
-            or not hmac.compare_digest(
-                turn_epoch.encode("utf-8"), current_epoch.encode("utf-8")
-            )
+            or not hmac.compare_digest(turn_epoch.encode("utf-8"), current_epoch.encode("utf-8"))
         ):
             return False
         # Only after the epoch guard: a stale timeout never touches the
@@ -1098,9 +1092,7 @@ class SessionRunner:
                 }
                 elapsed = time.monotonic() - start
                 record_metric("curie.turn.completed", attributes=completed_attributes)
-                record_metric(
-                    "curie.turn.duration", elapsed, attributes=completed_attributes
-                )
+                record_metric("curie.turn.duration", elapsed, attributes=completed_attributes)
 
             try:
                 with self._tracer.run_span(
@@ -1481,14 +1473,14 @@ class SessionRunner:
     def _retain_no_channel_bodies(
         message: ConversationMessage, state: TurnState
     ) -> ConversationMessage:
-        """Stub channel read results in the portable record (ADR 0100 section 7)."""
+        """Stub channel read and canvas results in the portable record (ADR 0100 section 7)."""
 
         if message.role == "assistant" and isinstance(message.content, list):
             state.channel_read_call_ids.update(
                 str(block["id"])
                 for block in message.content
                 if block.get("type") == "tool_use"
-                and block.get("name") in CHANNEL_READ_TOOL_NAMES
+                and block.get("name") in PLATFORM_SLACK_TOOL_NAMES
                 and isinstance(block.get("id"), str)
             )
             return message
@@ -1633,7 +1625,7 @@ class SessionRunner:
                     )
                     self._resume_cache_metric_recorded = True
             else:
-                tracker.add_increment(usage)
+                tracker.add_increment(usage, message_id=getattr(message, "message_id", None))
             budget_hit = tracker.exceeded
             events = translate_message(
                 message, state, self._classifier, gen, activity=self._progress_activity
@@ -1652,12 +1644,33 @@ class SessionRunner:
                     self._primary_model = getattr(message, "model", None) or None
                 if self._usage_reporter is not None:
                     self._usage_reporter.observe(message)
+            if state.usage_limited and not isinstance(message, ResultMessage):
+                # Stop on the refusal's own iteration, before the SDK retries
+                # or the parent continues after a failed reviewer. Interrupt
+                # failure cannot turn a terminal usage refusal into runner-error.
+                with contextlib.suppress(Exception):
+                    await self._session.interrupt()
+                self._set_failed(gen)
+                self._turn_open = False
+                self._turn_ready = False
+                self._status = SessionStatus.CLASSIFIED_FAILURE
+                for outbound in events:
+                    yield to_ndjson_line(outbound)
+                yield to_ndjson_line(
+                    Final(
+                        text="run failed: model provider usage limit reached",
+                        status=SessionStatus.CLASSIFIED_FAILURE,
+                    )
+                )
+                return
             if isinstance(message, ResultMessage):
                 terminal_reason = getattr(message, "terminal_reason", None)
                 cancelled = self._interrupt_requested and not self._timeout_requested
                 subtype = message.subtype or ""
-                result_failed = self._timeout_requested or budget_hit or (
-                    not cancelled and (message.is_error or subtype.startswith("error"))
+                result_failed = (
+                    self._timeout_requested
+                    or budget_hit
+                    or (not cancelled and (message.is_error or subtype.startswith("error")))
                 )
                 if not budget_hit:
                     self._merge_gate_block(state)
@@ -1677,8 +1690,7 @@ class SessionRunner:
                     failed=result_failed,
                     terminal_reason=terminal_reason,
                     approval_paused=decided_result_final is not None
-                    and decided_result_final.status
-                    is SessionStatus.AWAITING_APPROVAL,
+                    and decided_result_final.status is SessionStatus.AWAITING_APPROVAL,
                 )
 
             for outbound in events:
@@ -1692,8 +1704,7 @@ class SessionRunner:
                     outbound = outbound.model_copy(
                         update={
                             "message": (
-                                "USD budget exceeded "
-                                f"(max_usd_per_day={self._max_usd_per_day})"
+                                f"USD budget exceeded (max_usd_per_day={self._max_usd_per_day})"
                             )
                         }
                     )
@@ -1713,9 +1724,7 @@ class SessionRunner:
                         return
                     if decided_result_final is None:
                         self._merge_gate_block(state)
-                        final = _apply_approval_override(
-                            self._reclassify(outbound), state
-                        )
+                        final = _apply_approval_override(self._reclassify(outbound), state)
                     else:
                         final = decided_result_final
                     unrecorded = self._publication_unrecorded_lines(state, final)
@@ -1752,12 +1761,9 @@ class SessionRunner:
                     gen.finish_turn(
                         timeout_requested=self._timeout_requested,
                         interrupt_requested=self._interrupt_requested,
-                        classified_failure=final.status
-                        is SessionStatus.CLASSIFIED_FAILURE,
-                        approval_paused=final.status
-                        is SessionStatus.AWAITING_APPROVAL,
-                        completed_without_result=final.status
-                        is SessionStatus.AWAITING_APPROVAL,
+                        classified_failure=final.status is SessionStatus.CLASSIFIED_FAILURE,
+                        approval_paused=final.status is SessionStatus.AWAITING_APPROVAL,
+                        completed_without_result=final.status is SessionStatus.AWAITING_APPROVAL,
                     )
                     if capacity_failure:
                         for line in _history_capacity_lines(self._capacity_detail):
@@ -2308,11 +2314,7 @@ class SessionRunner:
 
         # See the "Approval halt" bullet above: an operator interrupt outranks a
         # runner-requested one, so the marker is copied only in its absence.
-        if (
-            gate.pending_halt
-            and not self._interrupt_requested
-            and not self._timeout_requested
-        ):
+        if gate.pending_halt and not self._interrupt_requested and not self._timeout_requested:
             state.approval_halt_requested = True
 
     def _budget_halt_lines(self) -> list[str]:
@@ -2330,8 +2332,7 @@ class SessionRunner:
             to_ndjson_line(
                 ErrorEvent(
                     message=(
-                        "output token budget exceeded "
-                        f"(max_output_tokens_per_run={self._ceiling})"
+                        f"output token budget exceeded (max_output_tokens_per_run={self._ceiling})"
                     ),
                     classification=BUDGET_CLASSIFICATION,
                 )
@@ -2376,9 +2377,7 @@ class SessionRunner:
             # leaks its pending entry and can leave a partial stdin write. The
             # SDK's own control timeout bounds it, and ensure_mcp_server maps
             # that to False.
-            self._connector_failures = await self._confirm_session_connectors(
-                prior, remaining
-            )
+            self._connector_failures = await self._confirm_session_connectors(prior, remaining)
         if self._connector_availability is not None:
             self._connector_availability.failures = self._connector_failures
         if self._connector_failures:

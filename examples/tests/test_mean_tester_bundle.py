@@ -513,12 +513,35 @@ def test_every_user_finding_has_a_permanent_grading_regression_and_controls():
     assert len(content) > 1500 and "$2.4M" in content and "$4.4M" in content
 
 
+def test_a_capability_only_a_source_spec_declares_is_never_a_fail():
+    # A deployment of the sre-bot bundle on another installation was rendered
+    # without its self-upgrade connector; the tester read the repository bundle
+    # and graded the bot's correct "I cannot upgrade" FAIL. The same denial
+    # must grade UNCLEAR against a source spec, and FAIL against a deployed
+    # spec or the target's own earlier reply.
+    indexed = {case["id"]: case for case in _cases()}
+    source = indexed["source-spec-capability-denied-unclear"]
+    deployed = indexed["deployed-spec-capability-denied-fail"]
+    contradicted = indexed["source-spec-capability-denied-after-claiming-it-fail"]
+    assert _demanded(source["grader"]["expected"], "UNCLEAR") == 1
+    assert _demanded(source["grader"]["expected"], "FAIL") == 0
+    assert "spec source may differ from deployment" in source["grader"]["expected"]
+    for case in (deployed, contradicted):
+        assert _demanded(case["grader"]["expected"], "FAIL") == 1
+    replies = {case["input"].rsplit("Reply:", 1)[1] for case in (source, deployed, contradicted)}
+    assert len(replies) == 1
+
+
 def test_campaign_reads_spec_and_suite_at_the_commit_resolved_first():
     start = _section("Starting a campaign")
     commit = start.index("list_commits")
     read = start.index("get_file_contents")
     assert commit < read
-    assert "exact SHA as `ref`" in start
+    # @modelcontextprotocol/server-github@2025.4.8 get_file_contents takes the
+    # revision as `branch`; its zod schema strips an unknown `ref`, so a read
+    # passing `ref` silently returns the default branch's file.
+    assert "exact SHA as `branch`" in start
+    assert "as `ref`" not in start
     assert "never the moving branch" in start
 
 
@@ -554,3 +577,122 @@ def test_recorded_timeout_and_uncertain_receipt_controls_have_explicit_evidence(
     assert "Recorded connector outcome: timeout" in receipt
     assert "could not be confirmed" in receipt
     assert "File attachment failed" not in receipt
+
+
+def _doc_section(path: Path, title: str) -> str:
+    found = re.search(rf"^## {re.escape(title)}\n(.*?)(?=^## |\Z)", path.read_text(), re.M | re.S)
+    assert found, f"{path.name} must keep a '## {title}' section"
+    return " ".join(found.group(1).split())
+
+
+def test_the_runner_layer_installs_the_gate_as_an_executable():
+    layer = (BUNDLE / "runner.Dockerfile").read_text()
+    lines = [line for line in layer.splitlines() if line.startswith("COPY")]
+    assert lines, "runner.Dockerfile must COPY the ship gate"
+    assert any(
+        "--chmod=0755" in line.split()
+        and "gate/mean_tester_gate.py" in line.split()
+        and line.split()[-1] == "/usr/local/bin/mean-tester-gate"
+        for line in lines
+    ), lines
+
+
+def test_the_ship_verdict_is_the_gates_and_copied_verbatim():
+    result = _section("Validation result")
+    for phrase in ("mean-tester-gate verdict", "`Ship:`", "`Ledger:`", "verbatim",
+                   "GO (read-only scope)", "never full GO"):
+        assert phrase in result, phrase
+    assert re.search(r"never writes? (a|the|any) ship verdict", result, re.I), result
+
+
+def test_the_skill_drives_every_gate_subcommand():
+    fixed = _section("Fixed acceptance suite")
+    assert "mean-tester-gate intake" in fixed and "--blob-sha" in fixed
+    recording = _section("Running a campaign") + " " + _section("Verdicts")
+    assert "mean-tester-gate record" in recording
+    assert "mean-tester-gate import" in _section('"continue"')
+
+
+def test_the_validator_doc_allows_only_a_read_only_scope_go():
+    ship = _doc_section(BUNDLE / "docs" / "VALIDATOR.md", "Ship verdict")
+    assert "GO (read-only scope)" in ship
+    # Full GO for an action-bearing suite still needs slice 2.
+    assert "slice 2" in ship and "full GO" in ship and "action" in ship
+
+
+def test_the_spec_can_come_from_the_threads_repository_workspace():
+    spec = _section("Where the spec comes from")
+    assert "/workspace" in spec
+    # A regex, not a substring test: the skill must show the URL's whole shape.
+    assert re.search(r"`https://github\.com/<owner>/<repo>`", spec)
+    assert "git -C /workspace rev-parse HEAD" in spec
+    # Request text stays first, and Git through the token stays a fallback.
+    assert spec.index("The request itself") < spec.index("/workspace") < spec.index(
+        "A listed repository"
+    )
+
+
+def test_a_workspace_suite_is_copied_byte_for_byte_not_retyped():
+    fixed = _section("Fixed acceptance suite")
+    assert "cp /workspace/" in fixed
+    assert "/tmp/mean-test-suite.json" in fixed
+
+
+def test_the_readme_places_the_tester_beside_its_target():
+    readme = (BUNDLE / "README.md").read_text()
+    for phrase in (
+        "sibling identity",
+        "ADR 0168",
+        "its own Slack app",
+        "api.githubRepoAllowlist",
+        "model credential",
+    ):
+        assert phrase in readme, phrase
+
+
+def test_a_sibling_tester_paces_under_the_platforms_sibling_limits():
+    skill = (BUNDLE / "skills/mean-tester/SKILL.md").read_text()
+    worker = (REPO / "apps/worker/src/curie_worker/sibling_turns.py").read_text()
+    notice = "Stopped here: the bots in this installation have messaged each other too"
+    # The notice the skill grades by must be the one the worker posts.
+    assert notice in worker and notice in skill
+    assert "SIBLING_TURN_LIMIT: Final = 5" in worker
+    assert "SIBLING_OPEN_LIMIT: Final = 5" in worker
+    assert "5 or less" in skill and "4 or less" in skill
+
+
+def test_the_report_starts_with_its_first_line_and_says_nothing_about_itself():
+    report = _section("Reporting")
+    assert "first line" in report
+    assert re.search(r"never describe the report", report, re.I)
+
+
+def test_continue_finds_a_report_inside_the_request_threads():
+    cont = _section('"continue"')
+    assert "slack_get_thread_replies" in cont
+    assert re.search(r"root messages? that mention(s)? you", cont)
+
+
+def test_gate_commands_that_exit_nonzero_by_design_do_not_read_as_failures():
+    skill = (BUNDLE / "skills/mean-tester/SKILL.md").read_text()
+    assert 'echo "exit=$?"' in skill
+    assert re.search(r"exit 1 .*NO-GO|NO-GO.*exit 1", " ".join(skill.split()))
+
+
+def test_a_spec_source_that_cannot_be_read_still_gets_a_report():
+    spec = _section("Where the spec comes from")
+    assert re.search(r"never end (the turn |your turn )?with an empty", spec, re.I)
+    assert "MISSING" in spec
+    # Evals stay recorded exchanges (no network), so this is a skill rule only.
+    assert "spec MISSING" in spec
+
+
+def test_the_readme_names_the_models_the_tester_was_graded_on():
+    readme = (BUNDLE / "README.md").read_text()
+    assert "Models" in readme and "Claude" in readme
+
+
+def test_unshown_evidence_is_unclear_not_an_invented_fact():
+    verdicts = _section("Verdicts")
+    assert re.search(r"evidence (that )?the target could not have", verdicts, re.I)
+    assert re.search(r"not shown[^.]*UNCLEAR|UNCLEAR[^.]*not shown", " ".join(verdicts.split()))

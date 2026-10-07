@@ -40,10 +40,10 @@ use curie::api::{
 };
 use curie::channel_token::ChannelTokenOutput;
 use curie::commands::{
-    ApprovalsOutput, BudgetOutput, CallersOutput, ChannelsOutput, DeleteOutput, HookFireOutput,
-    HookOutput, KillOutput, MemoryChannel, MemoryOutput, OverridesOutput, PublicationPolicyOutput,
-    ResetThreadOutput, ResumeOutput, SchedulesOutput, SkillApprovalsOutput, VersionsOutput,
-    WorkItemsOutput,
+    ActionsOutput, ApprovalsOutput, BudgetOutput, CallersOutput, ChannelsOutput, DeleteOutput,
+    HookFireOutput, HookOutput, KillOutput, MemoryChannel, MemoryOutput, OverridesOutput,
+    PublicationPolicyOutput, ResetThreadOutput, ResumeOutput, SchedulesOutput,
+    SkillApprovalsOutput, VersionsOutput, WorkItemsOutput,
 };
 use curie::comms::CommsOutput;
 use curie::factory_intake::FactoryIntakeOutput;
@@ -232,6 +232,57 @@ fn work_item_outcome() -> Box<curie::api::WorkItemOutcome> {
     )
 }
 
+/// One `ActionOut` row as `GET /actions` serializes it, decoded through the
+/// mirror (which drops `prior_state`/`post_state`).
+fn action_record() -> curie::api::ActionRecord {
+    serde_json::from_value(serde_json::json!({
+        "id": "11111111-1111-4111-8111-111111111111",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "conversation_id": "thread-1",
+        "call_id": "call-1",
+        "tool": "scale_deployment",
+        "arguments": {"name": "web", "replicas": 3},
+        "result": {"ok": true},
+        "prior_state": {"kid": "kid-1", "ciphertext": "sealed"},
+        "post_state": null,
+        "target": {"kind": "deployment", "name": "web"},
+        "detail": null,
+        "gate_approval_id": null,
+        "status": "succeeded",
+        "dedupe_key": "event-1:call-1",
+        "created_at": "2026-01-01T00:00:00Z",
+        "completed_at": "2026-01-01T00:00:01Z",
+        "undone_at": null,
+        "undone_by": null,
+        "undoable": true,
+    }))
+    .expect("ActionRecord mirror deserializes from its own wire shape")
+}
+
+/// One `ExecutionOut` row as `GET /action-executions/{id}` serializes it: a
+/// refused restore, so the receipt's `code` is populated.
+fn action_execution() -> curie::api::ActionExecution {
+    serde_json::from_value(serde_json::json!({
+        "id": "66666666-6666-4666-8666-666666666666",
+        "kind": "restore",
+        "state": "refused",
+        "agent_id": "44444444-4444-4444-8444-444444444444",
+        "connector": "reference-reversible",
+        "tool": "restore",
+        "subject_action_id": "11111111-1111-4111-8111-111111111111",
+        "requested_by": "U123",
+        "attempt": 1,
+        "lease_owner": null,
+        "lease_expires_at": null,
+        "refusal_code": "connector_digest_unavailable",
+        "failure_code": null,
+        "dispatched_at": null,
+        "finished_at": "2026-01-01T00:05:00Z",
+        "created_at": "2026-01-01T00:04:00Z",
+    }))
+    .expect("ActionExecution mirror deserializes from its own wire shape")
+}
+
 fn work_item_list() -> curie::api::WorkItemList {
     curie::api::WorkItemList {
         items: vec![*work_item_outcome()],
@@ -256,6 +307,10 @@ fn locked_schedule_list() -> serde_json::Value {
                         "zone": "UTC",
                         "last_fire_at": "2026-09-25T02:30:00Z",
                         "last_outcome": "failed",
+                        "last_reason": null,
+                        "last_manual_fire_at": null,
+                        "last_manual_outcome": null,
+                        "last_manual_reason": null,
                         "paused": false
                     }
                 ]
@@ -319,6 +374,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Done" => OverridesOutput::Done {
                 agent: "a".to_string(),
                 model: Some("kimi-k2".to_string()),
+                reviewer_model: Some("claude-opus-5-5".to_string()),
                 thinking: Some("adaptive".to_string()),
                 execution_deadline_seconds: Some(90),
                 runner_resources: None,
@@ -534,20 +590,22 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         "HookFireOutput",
         samples![
             "DryRun" => HookFireOutput::DryRun(plan()),
-            "Record" => HookFireOutput::Record(
+            "Record" => HookFireOutput::Record(Box::new(
                 serde_json::from_value::<HookFireRecord>(serde_json::json!({
                     "id": "22222222-2222-4222-8222-222222222222",
                     "agent_id": "11111111-1111-4111-8111-111111111111",
                     "agent": "acme-bot",
                     "name": "nightly-cleanup",
                     "trigger": "cron",
+                    "source": "manual",
+                    "reason": null,
                     "slot_utc": "2026-09-26T12:00:00Z",
                     "outcome": "ran",
                     "started_at": "2026-09-26T12:00:00Z",
                     "ended_at": "2026-09-26T12:00:01Z"
                 }))
                 .unwrap(),
-            ),
+            )),
         ],
     );
     m.insert(
@@ -570,6 +628,28 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "DryRun" => WorkItemsOutput::DryRun(plan()),
             "List" => WorkItemsOutput::List { list: work_item_list() },
             "Detail" => WorkItemsOutput::Detail { item: work_item_outcome() },
+        ],
+    );
+    // @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-18
+    m.insert(
+        "ActionsOutput",
+        samples![
+            "List" => ActionsOutput::List {
+                agent: Some("acme-bot".to_string()),
+                actions: vec![action_record()],
+                truncated: false,
+            },
+            "Show" => ActionsOutput::Show { action: Box::new(action_record()) },
+            "Undo" => ActionsOutput::Undo {
+                action_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                receipt: serde_json::from_value(serde_json::json!({
+                    "execution_id": "66666666-6666-4666-8666-666666666666",
+                    "state": "requested",
+                }))
+                .expect("ActionUndoReceipt mirror deserializes from its own wire shape"),
+                tier: "local",
+            },
+            "Execution" => ActionsOutput::Execution { execution: Box::new(action_execution()) },
         ],
     );
     m.insert(

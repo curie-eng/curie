@@ -31,7 +31,7 @@ import logging
 import tarfile
 import time
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -282,9 +282,14 @@ SKILL_MD = b"---\nname: reader-bot\ndescription: t\n---\nhi\n"
 
 
 def _bundle_archive(grant: bool | None) -> bytes:
+    return _grants_archive({} if grant is None else {"channelRead": grant})
+
+
+def _grants_archive(grants: Mapping[str, Any]) -> bytes:
+    """A bundle whose manifest carries exactly these platform Slack grant keys
+    (``channelRead``, ``canvasList``, ``canvasRead``, ``canvasEdit``; ADR 0200)."""
     manifest: dict[str, Any] = {"name": "reader-bot", "version": "0.1.0", "description": "t"}
-    if grant is not None:
-        manifest["channelRead"] = grant
+    manifest.update(grants)
     files = {
         "reader-bot/.claude-plugin/plugin.json": json.dumps(manifest).encode(),
         "reader-bot/skills/reader-bot/SKILL.md": SKILL_MD,
@@ -1055,6 +1060,48 @@ def test_invalid_capabilities_never_reach_slack(stack: Stack, forge: str) -> Non
     }[forge]
     response = stack.http.post(READ_URL, json=_yesterday(), headers=headers)
     _refused(response, 401, "channel_read.invalid_capability")
+    assert stack.slack.requests == []
+
+
+def test_a_capability_minted_before_the_grants_claim_is_invalid(stack: Stack) -> None:
+    """ADR 0200 adds the bundle's grants to the strict claims, so a token signed
+    with the right key in the old shape (no ``grants``) fails closed."""
+    from curie_internal import sandbox_token
+
+    _, token = stack.open()
+    prefix, payload, _ = token.split(".")
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    assert "grants" in claims, "the minted claims name the bundle's grants"
+    del claims["grants"]
+    encoded = json.dumps(claims, sort_keys=True, separators=(",", ":")).encode()
+    signed = f"{prefix}.{base64.urlsafe_b64encode(encoded).rstrip(b'=').decode()}"
+    old_shape = f"{signed}.{sandbox_token.signature(get_settings().api_key, signed)}"
+    _refused(stack.read(old_shape, **_yesterday()), 401, "channel_read.invalid_capability")
+    assert stack.slack.requests == []
+    _ok(stack.read(token, **_yesterday()))
+
+
+def test_a_canvas_only_bundle_mints_but_never_reads_history(stack: Stack) -> None:
+    """ADR 0200: any platform Slack grant mints the capability, but history needs
+    ``channelRead`` itself, refused after the digest check and before any Slack call."""
+    name = f"canvas-{uuid.uuid4().hex[:8]}"
+    agent_id = stack.admin("POST", "/agents", json={"name": name, "channel": _named(CHAN_A)})["id"]
+    stack.agents.append(agent_id)
+    label = {"version_label": f"v-{uuid.uuid4().hex[:6]}", "created_by": "operator"}
+    version_id = str(stack.admin("POST", f"/agents/{agent_id}/versions", json=label)["id"])
+    bundle = {"file": ("reader-bot.tar.gz", _grants_archive({"canvasRead": True}))}
+    stack.admin("PUT", f"/agents/{agent_id}/versions/{version_id}/bundle", files=bundle)
+    body = {"agent_id": agent_id, "version_id": version_id, "environment": "dev"}
+    deployment_id = str(stack.admin("POST", "/deployments", json=body)["id"])
+    deployed = Deployed(agent_id, version_id, deployment_id)
+    token = stack.mint(deployed)["token"]
+    for read in (_yesterday(), _thread(), _message(PARENT_USER)):
+        detail = _refused(stack.read(token, **read), 403, "channel_read.history_not_granted")
+        assert SECRET_TEXT not in json.dumps(detail)
+    assert stack.slack.requests == []
+    # The digest check still comes first: a stopped deployment is grant_revoked.
+    stack.undeploy(deployed)
+    _refused(stack.read(token, **_yesterday()), 409, "channel_read.grant_revoked")
     assert stack.slack.requests == []
 
 

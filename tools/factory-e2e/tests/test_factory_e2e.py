@@ -195,6 +195,17 @@ def test_request_id_matches_api_derivation() -> None:
     assert fe.request_id_for(123, 9, "d-1") == expected
 
 
+def test_last_label_event_id_keeps_the_newest_matching_event() -> None:
+    events = [
+        {"event": "labeled", "id": 10, "label": {"name": "factory"}},
+        {"event": "labeled", "id": 11, "label": {"name": "other"}},
+        {"event": "labeled", "id": "12", "label": {"name": "factory"}},
+        {"event": "labeled", "id": 13, "label": {"name": "factory"}},
+    ]
+    assert fe.last_label_event_id(events, "factory") == 13
+    assert fe.last_label_event_id(events, "missing") is None
+
+
 def _delivery(guid: str, number: int, repo: str, *, action: str = "labeled") -> dict[str, Any]:
     return {
         "guid": guid,
@@ -498,6 +509,41 @@ def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> N
     assert api["githubAppId"] == "42"
     assert api["githubAppExistingSecret"] == "factory-app"
     assert api["githubRepoAllowlist"] == ["acme/fixture"]
+
+
+def test_model_base_url_sets_worker_env_and_proxy_egress(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        CURIE_FACTORY_MODEL_BASE_URL="http://10.1.2.3:8080",
+        CURIE_FACTORY_MODEL_API_KEY="model-key-value",
+    )
+    values = _values(config)
+    assert {"name": "CURIE_MODEL_BASE_URL", "value": "http://10.1.2.3:8080"} in values["worker"][
+        "extraEnv"
+    ]
+    assert values["agentSandbox"]["runner"]["fakeModel"] is False
+    assert {"cidr": "10.1.2.3/32", "ports": [{"protocol": "TCP", "port": 8080}]} in values[
+        "security"
+    ]["networkPolicy"]["allowedEgress"]
+    # The GitHub API allowance from the caller stays beside the proxy pod.
+    assert {"cidr": "1.2.3.4/32", "ports": [{"protocol": "TCP", "port": 443}]} in values[
+        "security"
+    ]["networkPolicy"]["allowedEgress"]
+
+
+def test_model_base_url_without_a_key_dials_the_proxy(tmp_path: Path) -> None:
+    config = _config(tmp_path, CURIE_FACTORY_MODEL_BASE_URL="http://10.1.2.3:8080")
+    values = _values(config)
+    runner = values["agentSandbox"]["runner"]
+    assert runner["fakeModel"] is False
+    assert runner["credentials"] == "not-needed"
+    assert values["worker"]["extraEnv"][0]["name"] == "CURIE_MODEL_BASE_URL"
+
+
+def test_model_base_url_hostname_is_refused(tmp_path: Path) -> None:
+    config = _config(tmp_path, CURIE_FACTORY_MODEL_BASE_URL="http://model.example.com:8080")
+    with pytest.raises(fe.ConfigError, match="proxy pod IP"):
+        _values(config)
 
 
 def test_issue_file_parses_title_and_body(tmp_path: Path) -> None:

@@ -1,0 +1,281 @@
+{
+  "comment": "@spec ACTION-EXECUTOR-7. The one canonical form of a connector call's arguments, frozen across the images that compute or check it: the API ruling stores `arguments_sha256` of the restore call (`restore` cases), the worker recomputes it and mints the `ccg` grant over the canonical text, the caller proxy's production parser re-canonicalizes the arguments it forwards and compares them with the grant, and the runner's `call` preflight refuses a text that is not already canonical. `form` states the rule; every `vectors` entry gives the arguments object, the exact canonical text and the SHA-256 hex of its UTF-8 bytes. `non_canonical_texts` parse to an object whose canonical text differs from the text itself; `not_an_object_texts` do not parse to an object; the runner refuses both with `refusal`. `non_finite_texts` carry NaN or an infinity, which JSON cannot represent exactly: parsed with Python's permissive reader, the worker's and the proxy's canonicalizer refuse the object (one shared implementation), and the runner refuses the text with `refusal`. Read by apps/api/tests/test_action_canonical_arguments_vector.py, apps/worker/tests/test_action_canonical_arguments_vector.py and runner/tests/test_runner_execute_vector.py, each of which rejects an unknown key.",
+  "form": {
+    "sort_keys": true,
+    "item_separator": ",",
+    "key_separator": ":",
+    "ensure_ascii": false,
+    "encoding": "utf-8",
+    "digest": "sha256-hex"
+  },
+  "vectors": [
+    {
+      "name": "flat_object",
+      "arguments": {
+        "replicas": 3,
+        "name": "example-web"
+      },
+      "canonical": "{\"name\":\"example-web\",\"replicas\":3}",
+      "sha256": "e4b7f6894709b1529601f4f285b6d0a572152662026e97d39643509c7c18ddd5"
+    },
+    {
+      "name": "keys_out_of_order",
+      "arguments": {
+        "zeta": 1,
+        "alpha": 2,
+        "Mid": 3,
+        "_under": 4
+      },
+      "canonical": "{\"Mid\":3,\"_under\":4,\"alpha\":2,\"zeta\":1}",
+      "sha256": "0af0cfe5da6a20afdf685e08419cb4e3285224447de9e0dcd8bdf12c1500c42f"
+    },
+    {
+      "name": "nested_objects_sorted_at_every_depth",
+      "arguments": {
+        "b": {
+          "z": 1,
+          "a": {
+            "y": true,
+            "x": null
+          }
+        },
+        "a": [
+          {
+            "d": 1,
+            "c": 2
+          }
+        ]
+      },
+      "canonical": "{\"a\":[{\"c\":2,\"d\":1}],\"b\":{\"a\":{\"x\":null,\"y\":true},\"z\":1}}",
+      "sha256": "24cca65bfe6c8719f8e89e6a9125f4017f26fe783d98ff8cc78435e672fd5497"
+    },
+    {
+      "name": "list_order_is_kept",
+      "arguments": {
+        "items": [
+          3,
+          1,
+          2
+        ],
+        "names": [
+          "b",
+          "a"
+        ]
+      },
+      "canonical": "{\"items\":[3,1,2],\"names\":[\"b\",\"a\"]}",
+      "sha256": "4449411cab34c4a9bde37bf1c3a137a2297851c8d6b3f80b3b684c903d4da03c"
+    },
+    {
+      "name": "non_ascii_strings_stay_literal",
+      "arguments": {
+        "note": "café 日本語 ü",
+        "name": "naïve"
+      },
+      "canonical": "{\"name\":\"naïve\",\"note\":\"café 日本語 ü\"}",
+      "sha256": "53e6aca002110414749626a3dcb04bed0c09100e32ba0b8c8c83cc045a7c1ca0"
+    },
+    {
+      "name": "non_ascii_keys_sort_by_code_point",
+      "arguments": {
+        "é": 1,
+        "z": 2,
+        "日": 3,
+        "A": 4
+      },
+      "canonical": "{\"A\":4,\"z\":2,\"é\":1,\"日\":3}",
+      "sha256": "6e32746975d6bf196ef71777750227bfdcaa6ed93924740e101d22ae4728badb"
+    },
+    {
+      "name": "astral_plane_character",
+      "arguments": {
+        "label": "rocket 🚀"
+      },
+      "canonical": "{\"label\":\"rocket 🚀\"}",
+      "sha256": "e31bf7b8227d70284a485e5e50f277ba15f7061ce8e11802b55aa5bc44d698fd"
+    },
+    {
+      "name": "escapes_quote_backslash_newline_control",
+      "arguments": {
+        "text": "a \"quoted\" \\ path\nline\ttab\u0001"
+      },
+      "canonical": "{\"text\":\"a \\\"quoted\\\" \\\\ path\\nline\\ttab\\u0001\"}",
+      "sha256": "3c5e18b860f44c757fd7d55180d400fa4ef7b8a932cca5524da11c31b1998fd7"
+    },
+    {
+      "name": "numbers_bools_and_null",
+      "arguments": {
+        "int": -7,
+        "big": 12345678901234567890,
+        "float": 1.5,
+        "zero": 0,
+        "t": true,
+        "f": false,
+        "n": null
+      },
+      "canonical": "{\"big\":12345678901234567890,\"f\":false,\"float\":1.5,\"int\":-7,\"n\":null,\"t\":true,\"zero\":0}",
+      "sha256": "2cecaa5ef5b1bbeeeebf8870f0832f62538d55cd8835b7bfa64e42d2fd3de245"
+    },
+    {
+      "name": "empty_object",
+      "arguments": {},
+      "canonical": "{}",
+      "sha256": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+    },
+    {
+      "name": "empty_containers",
+      "arguments": {
+        "list": [],
+        "obj": {},
+        "str": ""
+      },
+      "canonical": "{\"list\":[],\"obj\":{},\"str\":\"\"}",
+      "sha256": "17e3a52836c948e6acb56c781b4d9c80e5998b810957f67a32ac464cac92d484"
+    },
+    {
+      "name": "slash_is_not_escaped",
+      "arguments": {
+        "path": "/a/b",
+        "html": "</script>"
+      },
+      "canonical": "{\"html\":\"</script>\",\"path\":\"/a/b\"}",
+      "sha256": "01d740e344a446ccdf5697412381ec935f89fb0e27afa4111f6248fe64991ffa"
+    },
+    {
+      "name": "sealed_restore_call",
+      "arguments": {
+        "target": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        },
+        "prior_state": {
+          "sealed": "curie.snapshot.v1",
+          "kid": "example-key-2026-10",
+          "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+        },
+        "expected_version": "rv-1041"
+      },
+      "canonical": "{\"expected_version\":\"rv-1041\",\"prior_state\":{\"ciphertext\":\"ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=\",\"kid\":\"example-key-2026-10\",\"sealed\":\"curie.snapshot.v1\"},\"target\":{\"kind\":\"Deployment\",\"name\":\"example-web\",\"namespace\":\"example-ns\"}}",
+      "sha256": "3e60bb4686f7193c573ce160cee6f29623f76106a1108b871e44dcccb69c065d"
+    }
+  ],
+  "restore": [
+    {
+      "name": "sealed_envelope_and_deployment_target",
+      "target": {
+        "kind": "Deployment",
+        "namespace": "example-ns",
+        "name": "example-web"
+      },
+      "prior_state": {
+        "sealed": "curie.snapshot.v1",
+        "kid": "example-key-2026-10",
+        "ciphertext": "ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE="
+      },
+      "canonical": "{\"prior_state\":{\"ciphertext\":\"ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=\",\"kid\":\"example-key-2026-10\",\"sealed\":\"curie.snapshot.v1\"},\"target\":{\"kind\":\"Deployment\",\"name\":\"example-web\",\"namespace\":\"example-ns\"}}",
+      "sha256": "f92f74a4e9772d57c7642e95c619bb52669fcc00fd37aa70f1b06ecd4cbf2495"
+    },
+    {
+      "name": "non_ascii_target",
+      "target": {
+        "kind": "ConfigMap",
+        "namespace": "example-ns",
+        "name": "café-settings"
+      },
+      "prior_state": {
+        "sealed": "curie.snapshot.v1",
+        "kid": "k1",
+        "ciphertext": "AAAA"
+      },
+      "canonical": "{\"prior_state\":{\"ciphertext\":\"AAAA\",\"kid\":\"k1\",\"sealed\":\"curie.snapshot.v1\"},\"target\":{\"kind\":\"ConfigMap\",\"name\":\"café-settings\",\"namespace\":\"example-ns\"}}",
+      "sha256": "96d9fd34d7b263d075e7186aba86b54d2b0ed101b0d4faebf937e39ef06ad323"
+    }
+  ],
+  "non_canonical_texts": [
+    {
+      "name": "spaces_after_separators",
+      "text": "{\"name\": \"example-web\", \"replicas\": 3}",
+      "canonical": "{\"name\":\"example-web\",\"replicas\":3}"
+    },
+    {
+      "name": "keys_not_sorted",
+      "text": "{\"replicas\":3,\"name\":\"example-web\"}",
+      "canonical": "{\"name\":\"example-web\",\"replicas\":3}"
+    },
+    {
+      "name": "ascii_escaped_non_ascii",
+      "text": "{\"note\":\"caf\\u00e9\"}",
+      "canonical": "{\"note\":\"café\"}"
+    },
+    {
+      "name": "trailing_newline",
+      "text": "{\"name\":\"example-web\"}\n",
+      "canonical": "{\"name\":\"example-web\"}"
+    },
+    {
+      "name": "leading_space",
+      "text": " {\"name\":\"example-web\"}",
+      "canonical": "{\"name\":\"example-web\"}"
+    },
+    {
+      "name": "escaped_slash",
+      "text": "{\"path\":\"\\/a\"}",
+      "canonical": "{\"path\":\"/a\"}"
+    },
+    {
+      "name": "float_exponent_spelling",
+      "text": "{\"n\":1.50}",
+      "canonical": "{\"n\":1.5}"
+    },
+    {
+      "name": "duplicate_key",
+      "text": "{\"a\":1,\"a\":1}",
+      "canonical": "{\"a\":1}"
+    }
+  ],
+  "not_an_object_texts": [
+    {
+      "name": "array",
+      "text": "[1,2]"
+    },
+    {
+      "name": "string",
+      "text": "\"x\""
+    },
+    {
+      "name": "number",
+      "text": "3"
+    },
+    {
+      "name": "null",
+      "text": "null"
+    },
+    {
+      "name": "not_json",
+      "text": "{name:example}"
+    },
+    {
+      "name": "empty",
+      "text": ""
+    }
+  ],
+  "non_finite_texts": [
+    {
+      "name": "nan",
+      "text": "{\"value\":NaN}"
+    },
+    {
+      "name": "infinity",
+      "text": "{\"value\":Infinity}"
+    },
+    {
+      "name": "negative_infinity",
+      "text": "{\"value\":-Infinity}"
+    },
+    {
+      "name": "nested_nan",
+      "text": "{\"outer\":{\"value\":NaN}}"
+    }
+  ],
+  "refusal": "arguments_mismatch"
+}

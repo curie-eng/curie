@@ -161,9 +161,9 @@ Helm and the deployed release with `up`, `upgrade`, `status`, `down`, `comms`, `
   `CURIE_MODEL_CREDENTIALS`) flows through this path.
   `curie cluster comms --slack` uses the same `SecretSet` masking for
   `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`, while `--disconnect --dry-run`
-  prints only the empty clears. After the helm upgrade it also rolls the
-  worker (and, on connect, the dispatcher) via `kubectl rollout restart` +
-  `rollout status` so the Secret-backed tokens go live.
+  prints only the empty clears. After the Helm upgrade it rolls every Slack
+  token consumer, the worker and API plus the dispatcher on connect, via
+  `kubectl rollout restart` + `rollout status` so the Secret-backed tokens go live.
 - **`local comms` shares the same Slack flag surface, but tokens travel through
   compose env, not argv.** `curie local comms --slack` reads
   `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`, passes them through a masked

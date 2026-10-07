@@ -175,6 +175,13 @@ _QUEUE_RETRY_ATTRIBUTES = {
         "sandbox-capacity",
     ],
 }
+# ADR 0205 (#4141): the worker's append of a turn's installed files to the
+# thread attachment ledger. Closed on purpose: no thread, agent or event label.
+_ATTACHMENT_LEDGER_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "outcome": ["success", "failure"],
+}
+
 _THREAD_ATTRIBUTES = {
     "service.name": ["curie-worker"],
     "source": ["worker"],
@@ -221,7 +228,16 @@ _SANDBOX_INVENTORY_ATTRIBUTES = {
 }
 _RUNNER_RPC_ATTRIBUTES = {
     "service.name": ["curie-worker"],
-    "operation": ["event", "steer", "interrupt", "reset", "status", "timeout", "turn-admit"],
+    "operation": [
+        "event",
+        "steer",
+        "interrupt",
+        "reset",
+        "status",
+        "timeout",
+        "turn-admit",
+        "execute",
+    ],
     "role": ["client"],
     "outcome": ["success", "failure", "conflict", "timeout"],
 }
@@ -271,6 +287,11 @@ _REPLY_RETRY_ATTRIBUTES = {
     "retry_class": ["block-fallback", "rate-limit", "transport-fallback"],
 }
 _HTTP_OPERATIONS = [
+    "/action-executions/claim",
+    "/action-executions/{execution_id}",
+    "/action-executions/{execution_id}/dispatch",
+    "/action-executions/{execution_id}/observation",
+    "/action-executions/{execution_id}/outcome",
     "/actions",
     "/actions/{action_id}",
     "/actions/{action_id}/audit",
@@ -299,6 +320,12 @@ _HTTP_OPERATIONS = [
     "/agents/{agent_id}/state/{namespace}/{key}",
     "/agents/{agent_id}/state/{namespace}/{key}/append",
     "/agents/{agent_id}/threads/{thread_key}/reset",
+    "/agents/{agent_id}/hooks/{hook}/source-policy",
+    "/agents/{agent_id}/hooks/{hook}/source-policy/rotate",
+    "/agents/{agent_id}/hooks/{hook}/source-policy/secret",
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy",
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
     "/agents/{agent_id}/hooks/{name}/fire",
     "/agents/{agent_id}/hooks/{name}/runs/{run_id}",
     "/agents/{agent_id}/versions",
@@ -315,12 +342,14 @@ _HTTP_OPERATIONS = [
     # Break-glass recovery (#2753).
     "/approvals/identity-report",
     "/approvals/{approval_id}/recover",
+    "/channel-canvas",
     "/channel-read",
     "/channels/admission",
     "/channels/token",
     "/channels/turns",
     "/cluster-message-replies/{reply_ref}",
     "/config",
+    "/connector-capabilities/probes",
     "/console/login-codes",
     "/console/session",
     "/deploy-targets/list",
@@ -335,6 +364,7 @@ _HTTP_OPERATIONS = [
     "/health",
     "/ready",
     "/hooks/{agent_id}/{hook}",
+    "/hooks/{agent_id}/{hook}/support",
     "/langfuse/traces",
     "/langfuse/traces/{trace_id}",
     "/langfuse/traces/{trace_id}/eval-case",
@@ -384,6 +414,11 @@ _HTTP_OPERATIONS = [
     "/v1/internal/work-items/requests/{request_id}/termination",
     "/v1/internal/work-items/issue-read/context",
     "/v1/internal/channel-read/context",
+    # The thread attachment ledger (ADR 0205).
+    "/v1/internal/thread-attachments/query",
+    "/v1/internal/thread-attachments/append",
+    # Automated remediation nominations (AUTOMATED-REMEDIATION-6).
+    "/v1/internal/remediation/nominations",
     "/v1/work-item-progress/{request_id}",
     "/v1/work-item-progress/{request_id}/usage",
     "/v1/work-item-progress/{request_id}/verification",
@@ -428,6 +463,51 @@ _BACKGROUND_AGE_ATTRIBUTES = {
 # skipping right now (#1215). Which agents, and why, is in the log line each
 # skip transition emits; an agent label here would be a deployment identifier.
 _CONNECTOR_RECONCILE_SKIPPED_ATTRIBUTES = {"service.name": ["curie-worker"]}
+# @spec ACTION-EXECUTOR-22. One point per claimed connector action execution:
+# kind, state, stage, code and connector only, never an argument, envelope,
+# target or version. ``unreported`` is a run whose outcome the API never
+# acknowledged (the lease sweep ends it); ``none`` is a code-free outcome. The
+# codes are the closed ACTION-EXECUTOR-20 pre-dispatch and post-dispatch sets.
+_ACTION_EXECUTION_CODES = [
+    "agent_stopped",
+    "authority_unavailable",
+    "reserved_verb_via_forward",
+    "arguments_mismatch",
+    "tool_not_grant_bound",
+    "connector_not_hosted",
+    "connector_digest_unavailable",
+    "restore_not_advertised",
+    "restore_schema_mismatch",
+    "tool_not_advertised",
+    "version_conflict",
+    "sandbox_unavailable",
+    "runner_unavailable",
+    "connector_unreachable",
+    "version_conflict_at_write",
+    "sealing_key_unavailable",
+    "snapshot_unopenable",
+    "connector_error",
+    "unstructured_reply",
+    "response_lost",
+    "deadline_exceeded",
+    "none",
+]
+_ACTION_EXECUTION_ATTRIBUTES = {
+    "service.name": ["curie-worker"],
+    "kind": ["restore", "probe", "other"],
+    "state": ["confirmed", "failed", "indeterminate", "refused", "unreported"],
+    "stage": ["pre_dispatch", "connector_refusal", "post_dispatch", "none"],
+    "code": _ACTION_EXECUTION_CODES,
+    # Connector names are RFC 1123 labels chosen by bundle authors; past the
+    # ceiling they share ``other``.
+    "connector": {
+        "kind": "bounded",
+        "ceiling": 16,
+        "reserved": ["other"],
+        "overflow": "other",
+        "pattern": r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+    },
+}
 # The end to end namespace reaper's health (#3245, ADR 0176 decision 4): when
 # it last finished a clean sweep, and how many scoped namespaces were past
 # their TTL at the last pass. Namespace and run names are in the WARNING line
@@ -585,6 +665,13 @@ _METRICS: dict[str, dict[str, Any]] = {
     "curie.thread.lock.wait.duration": _definition(
         "histogram", "s", "Thread lock acquisition duration.", False, _THREAD_ATTRIBUTES
     ),
+    "curie.attachments.ledger.append": _definition(
+        "counter",
+        "{append}",
+        "Thread attachment ledger appends after install.",
+        True,
+        _ATTACHMENT_LEDGER_ATTRIBUTES,
+    ),
     "curie.thread.route": _definition(
         "counter", "{decision}", "Thread routing decisions.", True, _THREAD_ATTRIBUTES
     ),
@@ -689,6 +776,13 @@ _METRICS: dict[str, dict[str, Any]] = {
         "Age of the last successful background pass.",
         False,
         _BACKGROUND_AGE_ATTRIBUTES,
+    ),
+    "curie.action_executor.execution": _definition(
+        "counter",
+        "{execution}",
+        "Connector action executions by kind, terminal state, stage, code and connector.",
+        True,
+        _ACTION_EXECUTION_ATTRIBUTES,
     ),
     "curie.connector.reconcile.skipped_agents": _definition(
         "gauge",

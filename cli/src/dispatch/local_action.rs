@@ -344,16 +344,15 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             })
             .await?,
         ),
-        LocalAction::Hook { action } => {
-            let LocalHookAction::Fire {
+        LocalAction::Hook { action } => match action {
+            LocalHookAction::Fire {
                 agent,
                 name,
                 wait_secs,
                 api_url,
                 api_key,
                 dry_run,
-            } = action;
-            emit(
+            } => emit(
                 commands::hook_fire(commands::HookFireOpts {
                     api_url,
                     api_key,
@@ -361,10 +360,29 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     name,
                     dry_run,
                     wait_secs,
+                    tier: "local",
                 })
                 .await?,
-            )
-        }
+            ),
+            LocalHookAction::Record {
+                agent,
+                name,
+                id,
+                api_url,
+                api_key,
+                dry_run,
+            } => emit(
+                commands::hook_record(commands::HookRecordOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    name,
+                    run_id: id,
+                    dry_run,
+                })
+                .await?,
+            ),
+        },
         LocalAction::Memory {
             target,
             add,
@@ -428,6 +446,24 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             )
             .await?,
         ),
+        // @spec ACTION-EXECUTOR-23
+        LocalAction::Actions { verb } => {
+            let (verb, conn) = verb.into_parts();
+            // Validated before the connection is resolved, so a malformed id
+            // or a missing principal never reaches discovery or the API.
+            let verb = verb.validate()?;
+            emit(
+                commands::actions(
+                    commands::ActionsOpts {
+                        api_url: conn.api_url,
+                        api_key: conn.api_key,
+                        tier: "local",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
         LocalAction::Observability { query, open } => match query {
             None => emit(commands::observability(open).await?),
             Some(_) if open => Err(curie::exit::usage(
@@ -439,6 +475,8 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             agent,
             model,
             clear_model,
+            reviewer_model,
+            clear_reviewer_model,
             thinking,
             clear_thinking,
             execution_deadline,
@@ -458,6 +496,11 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     dry_run,
                 },
                 commands::OverrideChange::resolve("model", model, clear_model)?,
+                commands::OverrideChange::resolve(
+                    "reviewer-model",
+                    reviewer_model,
+                    clear_reviewer_model,
+                )?,
                 commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
                 commands::OverrideChange::resolve_execution_deadline(
                     execution_deadline,

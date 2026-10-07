@@ -326,6 +326,11 @@ class BootEnv(_AciModel):
     model: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_MODEL", "worker", "substrate")
     )
+    # The agent's reviewer override (#4120), resolved by the runner against
+    # the effective credential when this field is absent.
+    reviewer_model: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_REVIEWER_MODEL", "worker")
+    )
     fake_model: bool | None = Field(
         default=None, json_schema_extra=_env("CURIE_FAKE_MODEL", "worker", "substrate")
     )
@@ -398,6 +403,33 @@ class BootEnv(_AciModel):
     )
     issue_read_token: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_ISSUE_READ_TOKEN", "kernel")
+    )
+    # Which attachment files are this message's (ADR 0205, decision 8). The
+    # kernel builds it per turn from the thread's attachment ledger; the runner
+    # reconciles it against the init container's status file and the disk, and
+    # the disk wins. Carried as a raw JSON string the runner parses, so the
+    # contract stays a single optional field. Shape, version 1:
+    #
+    #   {"v": 1,
+    #    "files": [{"name": "<on-disk name>", "current": <bool>}],
+    #    "unavailable": [{"name": "<on-disk name>", "reason": "<reason>"}],
+    #    "omitted": ["<on-disk name>"],
+    #    "ledger_unavailable": <bool>}
+    #
+    # ``current`` marks a file that arrived on this message rather than earlier
+    # in the thread. ``unavailable`` names earlier files that could not be
+    # fetched, ``omitted`` earlier files left out by the thread budget, and
+    # ``ledger_unavailable`` says the ledger itself could not be read.
+    # ``reason`` is one fixed code, never error text: ``no_route``, ``no_credential``,
+    # ``not_found``, ``forbidden``, ``rate_limited``, ``timeout``,
+    # ``digest_changed``, ``expired``, ``deadline`` or ``fetch_failed``. Names
+    # only: never a URL, a file id, or a capability. Absent or blank means no
+    # manifest, and the runner treats every file on disk as current. Not part
+    # of SessionConfig. The runner pod template and the docker substrate
+    # declare it empty so claim env injection can set it; the kernel's
+    # per-turn value wins.
+    attachments_manifest: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_ATTACHMENTS_MANIFEST", "kernel", "substrate")
     )
     # Per-agent permission gates (#245, ADR-0010).
     approval_required_tools: list[str] | None = Field(
@@ -627,6 +659,7 @@ class BootEnv(_AciModel):
         bundle_version: str | None = None,
         runner_token: str | None = None,
         model: str | None = None,
+        reviewer_model: str | None = None,
         fake_model: bool | None = None,
         credentials_ref: str | None = None,
         base_url: str | None = None,
@@ -701,6 +734,8 @@ class BootEnv(_AciModel):
             env[cls.env_key("model_env_key")] = model_env_key
         if model:
             env[cls.env_key("model")] = model
+        if reviewer_model:
+            env[cls.env_key("reviewer_model")] = reviewer_model
         if history_token:
             env[cls.env_key("history_token")] = history_token
         if memory_token:
@@ -749,6 +784,8 @@ class BootEnv(_AciModel):
             env[self.env_key("runner_token")] = self.runner_token
         if self.model is not None:
             env[self.env_key("model")] = self.model
+        if self.reviewer_model is not None:
+            env[self.env_key("reviewer_model")] = self.reviewer_model
         if self.fake_model is not None:
             env[self.env_key("fake_model")] = "1" if self.fake_model else "0"
         if self.history_ref is not None:
@@ -781,6 +818,8 @@ class BootEnv(_AciModel):
             env[self.env_key("issue_read_url")] = self.issue_read_url
         if self.issue_read_token is not None:
             env[self.env_key("issue_read_token")] = self.issue_read_token
+        if self.attachments_manifest is not None:
+            env[self.env_key("attachments_manifest")] = self.attachments_manifest
         if self.approval_required_tools:
             env[self.env_key("approval_required_tools")] = ",".join(self.approval_required_tools)
         if self.approval_grant_tool is not None:
@@ -849,6 +888,7 @@ class BootEnv(_AciModel):
             bundle_version=_str_or_none(env.get("CURIE_BUNDLE_VERSION")),
             runner_token=_str_or_none(env.get("CURIE_RUNNER_TOKEN")),
             model=_str_or_none(env.get("CURIE_MODEL")),
+            reviewer_model=_str_or_none(env.get(cls.env_key("reviewer_model"))),
             fake_model=_fake_model_or_none(env.get("CURIE_FAKE_MODEL")),
             history_ref=_str_or_none(env.get("CURIE_HISTORY_REF")),
             history_token=_str_or_none(env.get("CURIE_HISTORY_TOKEN")),
@@ -861,6 +901,7 @@ class BootEnv(_AciModel):
             progress_token=_str_or_none(env.get("CURIE_PROGRESS_TOKEN")),
             issue_read_url=_str_or_none(env.get("CURIE_ISSUE_READ_URL")),
             issue_read_token=_str_or_none(env.get("CURIE_ISSUE_READ_TOKEN")),
+            attachments_manifest=_stripped_or_none(env.get("CURIE_ATTACHMENTS_MANIFEST")),
             approval_required_tools=_list_or_none(env.get("CURIE_APPROVAL_REQUIRED_TOOLS")),
             approval_grant_tool=_stripped_or_none(env.get("CURIE_APPROVAL_GRANT_TOOL")),
             approval_grant_arguments=(

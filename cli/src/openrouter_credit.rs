@@ -22,6 +22,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::exit::CliError;
+use crate::ui::CliOutput;
 
 /// Overrides the OpenRouter API base, for tests.
 const BASE_URL_ENV: &str = "CURIE_OPENROUTER_API_URL";
@@ -62,7 +63,7 @@ pub async fn remaining_credit_usd(key: &str) -> Result<Option<f64>> {
         .map_err(|err| CliError::failure(format!("OpenRouter /key request failed: {err}")))?;
     let status = response.status();
     if !status.is_success() {
-        return Err(CliError::failure(format!("OpenRouter /key answered HTTP {status}")).into());
+        return Err(OpenRouterKeyHttp { status }.into());
     }
     let key_json: Value = response
         .json()
@@ -74,4 +75,90 @@ pub async fn remaining_credit_usd(key: &str) -> Result<Option<f64>> {
         _ => None,
     };
     Ok(remaining_from(&key_json, credits_json.as_ref()))
+}
+
+/// A non-success `GET /key`. Display stays `OpenRouter /key answered HTTP {status}`
+/// and never includes the credential. `status` is the HTTP status, so a 401 is
+/// distinct from any other status without parsing that sentence.
+#[derive(Debug)]
+pub struct OpenRouterKeyHttp {
+    pub status: reqwest::StatusCode,
+}
+
+impl std::fmt::Display for OpenRouterKeyHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OpenRouter /key answered HTTP {status}",
+            status = self.status
+        )
+    }
+}
+
+impl std::error::Error for OpenRouterKeyHttp {}
+
+const MODEL_CREDENTIAL_ENV: &str = "CURIE_CREDENTIALS";
+
+/// `curie dev model-credit` stdout. Human output is the class token. JSON is
+/// exactly `{"class":"<token>"}`.
+pub struct ModelCreditOutput {
+    class: &'static str,
+}
+
+impl CliOutput for ModelCreditOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "class": self.class })
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        ui.payload_plain(self.class);
+    }
+}
+
+/// Classify `CURIE_CREDENTIALS` and emit one credit class.
+///
+/// Exit 0 only for `credit-sufficient`. Every other class exits 1. The
+/// credential is never copied into a message.
+pub async fn model_credit() -> Result<()> {
+    let class = model_credit_class().await;
+    let output = ModelCreditOutput { class };
+    let ui = crate::ui::ui();
+    if class == "credit-sufficient" {
+        ui.emit(&output);
+        return Ok(());
+    }
+    let failure = CliError::failure(class);
+    if ui.json() {
+        Err(crate::exit::with_json_payload(
+            failure.into(),
+            output.to_json(),
+        ))
+    } else {
+        ui.emit(&output);
+        Err(failure.into())
+    }
+}
+
+async fn model_credit_class() -> &'static str {
+    let key = std::env::var(MODEL_CREDENTIAL_ENV).unwrap_or_default();
+    if key.trim().is_empty() {
+        return "credential-missing";
+    }
+    match remaining_credit_usd(&key).await {
+        Ok(Some(left)) if left < crate::factory_quickstart::RUN_CREDIT_USD => "credit-exhausted",
+        Ok(Some(_)) => "credit-sufficient",
+        Ok(None) => "credit-unknown",
+        Err(error) => match openrouter_key_status(&error) {
+            Some(401) => "credential-rejected",
+            _ => "credit-unavailable",
+        },
+    }
+}
+
+fn openrouter_key_status(error: &anyhow::Error) -> Option<u16> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<OpenRouterKeyHttp>()
+            .map(|http| http.status.as_u16())
+    })
 }

@@ -68,7 +68,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 from urllib.parse import quote
@@ -84,12 +84,14 @@ from aci_protocol.turn import (
     matching_routes,
 )
 from curie_internal import sandbox_token
+from curie_internal.sealing_key import is_sealing_key_name
 from plugin_format import is_reserved_boot_env_name
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from . import caller_token
+from .attachments import AgentRoute
 from .behaviorpacks import BehaviorPacks
 from .config import WorkerConfig
 
@@ -136,6 +138,7 @@ API_BACKEND_ENV = BootEnv.env_key("api_backend")
 # Which env var(s) carry the model credential (#514): a bare name or a JSON array.
 MODEL_ENV_KEY_ENV = BootEnv.env_key("model_env_key")
 MODEL_ENV = BootEnv.env_key("model")
+REVIEWER_MODEL_ENV = BootEnv.env_key("reviewer_model")
 # Thinking depth (#1182, ADR-0098): the model half's sibling, same producer and
 # same consumer, so it is named from BootEnv rather than typed as a literal.
 THINKING_ENV = BootEnv.env_key("thinking")
@@ -319,6 +322,7 @@ SELECT a.id AS agent_id,
        a.max_output_tokens_per_run AS max_output_tokens_per_run,
        a.behavior_packs AS behavior_packs,
        a.model AS model,
+       a.reviewer_model AS reviewer_model,
        a.thinking AS thinking,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
@@ -353,6 +357,7 @@ SELECT a.id AS agent_id,
        a.max_output_tokens_per_run AS max_output_tokens_per_run,
        a.behavior_packs AS behavior_packs,
        a.model AS model,
+       a.reviewer_model AS reviewer_model,
        a.thinking AS thinking,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
@@ -430,6 +435,9 @@ class ResolvedDeployment(BaseModel):
     # The agent's pinned model id (#254), forwarded as CURIE_MODEL at boot.
     # None falls back to the worker's configured default model.
     model: str | None = None
+    # The agent's reviewer override (#4120). None lets the runner choose its
+    # credential's provider default.
+    reviewer_model: str | None = None
     # The agent's thinking depth (#1182, ADR-0098), forwarded as CURIE_THINKING
     # at boot. None falls back to the worker's configured default; unset at both
     # layers sends nothing and leaves the model's own default standing.
@@ -715,6 +723,27 @@ class BindingResolver:
             )
             value = result.scalar()
         return value if isinstance(value, str) and value else None
+
+    async def routes_for_agent(self, agent_id: uuid.UUID) -> list[AgentRoute]:
+        """The agent's bindings as they are NOW (ADR 0205 decision 5).
+
+        A re-fetch of an earlier attachment resolves its route from these and
+        never from anything recorded with the file, so a removed binding makes
+        the file unavailable and a moved adapter endpoint is followed. Read
+        only; the address is not returned because no re-fetch needs it.
+        """
+
+        sql = text(
+            f"SELECT kind, adapter, endpoint FROM {self._config.db_schema}.agent_channels "
+            "WHERE agent_id = :id ORDER BY kind, adapter NULLS FIRST, endpoint NULLS FIRST"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            rows = result.all()
+        return [
+            AgentRoute(kind=str(row.kind), adapter=row.adapter, endpoint=row.endpoint)
+            for row in rows
+        ]
 
     async def repo_full_name(self, agent_id: uuid.UUID) -> str | None:
         """The agent's GitHub repo (owner/name), for the eval PR-check report."""
@@ -1004,25 +1033,26 @@ class BindingResolver:
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, dict[str, Any] | None]:
-        """The agent's model, thinking, and runner_resources for eval boots."""
+    ) -> tuple[str | None, str | None, str | None, dict[str, Any] | None]:
+        """Model, reviewer model, thinking, and resources for eval boots."""
         sql = text(
-            "SELECT model, thinking, runner_resources "
+            "SELECT model, reviewer_model, thinking, runner_resources "
             f"FROM {self._config.db_schema}.agents WHERE id = :id"
         )
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
         if row is None:
-            return None, None, None
+            return None, None, None, None
         model: str | None = row[0]
-        thinking: str | None = row[1]
-        runner_resources = row[2]
+        reviewer_model: str | None = row[1]
+        thinking: str | None = row[2]
+        runner_resources = row[3]
         if isinstance(runner_resources, str):
             runner_resources = json.loads(runner_resources)
         if runner_resources is not None and not isinstance(runner_resources, dict):
             runner_resources = None
-        return model, thinking, runner_resources
+        return model, reviewer_model, thinking, runner_resources
 
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         """The agent's parsed behavior packs (all-off when none are configured).
@@ -1232,6 +1262,7 @@ class BindingResolver:
             # The agent's pinned model (#254) overrides the worker default; None
             # falls back to the platform default.
             model=resolved.model if resolved.model is not None else self._config.model,
+            reviewer_model=resolved.reviewer_model,
             # Same precedence as the model above (#1182): the agent's value wins,
             # then the platform default, then nothing at all -- and "nothing at
             # all" is what makes an unconfigured install behave as it always has.
@@ -1510,6 +1541,66 @@ class BindingResolver:
             logger.warning("the API answered a channel read %s mint with a malformed body", mode)
         return mint
 
+    def fresh_boot_credential(self, env: Mapping[str, str]) -> dict[str, str]:
+        """A copy of ``env`` whose boot state tokens carry a new credential id (#3823).
+
+        Deleting a claim releases the credential its env carried, and a retry
+        claims again from the same env. The substrate calls this for every new
+        claim, so no claim boots with a credential an earlier claim released.
+        Every other claim, the agent, scope, and expiry, is kept. A token
+        without a credential id, or one this key did not sign, is left as is.
+        """
+
+        out = dict(env)
+        api_key = self._config.api_key
+        if not api_key:
+            return out
+        credential_id = uuid.uuid4().hex
+        reissued: dict[str, str] = {}
+        for key in (HISTORY_TOKEN_ENV, MEMORY_TOKEN_ENV, BootEnv.env_key("state_token")):
+            token = out.get(key)
+            if not token:
+                continue
+            if token not in reissued:
+                fresh = _reissue_boot_token(token, api_key, credential_id)
+                if fresh is None:
+                    if boot_token_facts(token)[1] is not None:
+                        logger.warning(
+                            "could not give %s a new sandbox credential; it keeps its own", key
+                        )
+                    continue
+                reissued[token] = fresh
+            out[key] = reissued[token]
+        return out
+
+
+def _reissue_boot_token(token: str, api_key: str, credential_id: str) -> str | None:
+    """``token`` re-signed with ``credential_id`` as its ``cred``, or None."""
+
+    agent, cred, _exp = boot_token_facts(token)
+    unsigned = _unsigned_payload(token)
+    scope = None if unsigned is None else unsigned.get("scope")
+    if agent is None or cred is None or not isinstance(scope, str):
+        return None
+    payload = sandbox_token.decode(token, api_key, agent=agent, scope=scope)
+    if payload is None:
+        return None
+    claims = {k: v for k, v in payload.items() if k not in {"agent", "scope", "exp"}}
+    claims["cred"] = credential_id
+    return sandbox_token.mint(api_key, agent=agent, scope=scope, exp=payload["exp"], claims=claims)
+
+
+def _unsigned_payload(token: str | None) -> dict[str, Any] | None:
+    if not token or token.count(".") != 2:
+        return None
+    try:
+        segment = token.split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (ValueError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def boot_token_facts(token: str | None) -> tuple[str | None, str | None, int | None]:
     """``(agent, cred, exp)`` from a boot state token this worker minted.
 
@@ -1518,15 +1609,8 @@ def boot_token_facts(token: str | None) -> tuple[str | None, str | None, int | N
     #3823 credential id.
     """
 
-    if not token or token.count(".") != 2:
-        return None, None, None
-    try:
-        segment = token.split(".")[1]
-        padded = segment + "=" * (-len(segment) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded))
-    except (ValueError, json.JSONDecodeError):
-        return None, None, None
-    if not isinstance(payload, dict):
+    payload = _unsigned_payload(token)
+    if payload is None:
         return None, None, None
     agent = payload.get("agent")
     cred = payload.get("cred")
@@ -1552,6 +1636,7 @@ def _boot_state_token_exp(token_ttl_s: float | None) -> int:
         lifetime = math.ceil(max(0.0, token_ttl_s))
     bounded = min(lifetime + BOOT_TOKEN_GRACE_SECONDS, SANDBOX_TOKEN_TTL_SECONDS)
     return int(time.time()) + bounded
+
 
 def _refusal_code(payload: object) -> str | None:
     """The ``channel_read.*`` code of a refusal body, or None; never its message."""
@@ -1598,6 +1683,7 @@ def apply_model_env(
     env: dict[str, str],
     config: WorkerConfig,
     model_override: str | None = None,
+    reviewer_model_override: str | None = None,
     thinking_override: str | None = None,
 ) -> None:
     """Layer the runner model + credentials passthrough onto a boot env.
@@ -1617,7 +1703,10 @@ def apply_model_env(
     the runner sends no thinking configuration and the model's own default
     stands.
 
-    Those two are the only per-agent knobs here. The api_backend and env_key declarations
+    ``reviewer_model_override`` is the per-agent reviewer model (#4120).
+    Without an override the runner resolves the default from its credential.
+
+    The api_backend and env_key declarations
     (#514) come from WorkerConfig only and take no override: they select which
     wire protocol is dialed and which env var a credential is read from, so a
     lower-privileged agent author must not be able to set them.
@@ -1639,6 +1728,8 @@ def apply_model_env(
     model = model_override if model_override is not None else config.model
     if model:
         env[MODEL_ENV] = model
+    if reviewer_model_override:
+        env[REVIEWER_MODEL_ENV] = reviewer_model_override
     thinking = thinking_override if thinking_override is not None else config.thinking
     if thinking:
         env[THINKING_ENV] = thinking
@@ -1682,6 +1773,15 @@ def inject_connector_secrets(
             # k8s substrate would look for a sandbox secretKeyRef.
             logger.warning(
                 "Dropping connector secret withheld from the sandbox (never injected, never marked)"
+            )
+            continue
+        if is_sealing_key_name(name):
+            # @spec ACTION-EXECUTOR-16: the snapshot sealing key reaches only
+            # the hosted connector. Withheld from every sandbox and kept out of
+            # the marker, so the k8s substrate wires no secretKeyRef for it.
+            logger.warning(
+                "Dropping connector secret reserved for the sealing key "
+                "(never injected, never marked)"
             )
             continue
         if is_reserved_boot_env_name(name):

@@ -1,5 +1,6 @@
 import pytest
 from plugin_format import (
+    PLATFORM_SLACK_GRANT_FIELDS,
     TOOL_POLICY_ENFORCEMENT,
     ApprovalGate,
     McpServer,
@@ -64,6 +65,87 @@ def test_manifest_channel_read_rejects_coercion_and_selector_objects(grant: obje
     with pytest.raises(ValidationError) as exc:
         PluginManifest.model_validate({"name": "acme-bot", "channelRead": grant})
     assert any(error["loc"] == ("channelRead",) for error in exc.value.errors())
+
+
+_CANVAS_GRANTS = ("canvasList", "canvasRead", "canvasEdit")
+
+
+def test_platform_slack_grant_vocabulary_is_the_four_exact_strings() -> None:
+    assert PLATFORM_SLACK_GRANT_FIELDS == ("channelRead", "canvasList", "canvasRead", "canvasEdit")
+
+
+@pytest.mark.parametrize("field", _CANVAS_GRANTS)
+@pytest.mark.parametrize("grant", [False, True])
+def test_manifest_canvas_grants_accept_only_boolean_grants(field: str, grant: bool) -> None:
+    manifest = PluginManifest.model_validate(
+        {"name": "acme-bot", field: grant, "futureClaudeField": {"enabled": True}}
+    )
+    assert getattr(manifest, field) is grant
+    dumped = manifest.model_dump()
+    assert dumped[field] is grant
+    assert dumped["futureClaudeField"] == {"enabled": True}
+    assert getattr(PluginManifest.model_validate(dumped), field) is grant
+
+
+def test_manifest_canvas_grants_default_to_false() -> None:
+    manifest = PluginManifest.model_validate({"name": "acme-bot", "futureClaudeField": 42})
+    dumped = manifest.model_dump()
+    for field in _CANVAS_GRANTS:
+        assert getattr(manifest, field) is False
+        assert dumped[field] is False
+    assert dumped["futureClaudeField"] == 42
+    assert manifest.platform_slack_grants() == frozenset()
+
+
+@pytest.mark.parametrize("field", _CANVAS_GRANTS)
+@pytest.mark.parametrize(
+    "grant",
+    [
+        None,
+        0,
+        1,
+        0.0,
+        1.0,
+        "",
+        "true",
+        "false",
+        "yes",
+        [],
+        ["C0EXAMPLE1"],
+        {},
+        {"channels": ["C0EXAMPLE1"]},
+    ],
+)
+def test_manifest_canvas_grants_reject_coercion_and_selector_objects(
+    field: str, grant: object
+) -> None:
+    with pytest.raises(ValidationError) as exc:
+        PluginManifest.model_validate({"name": "acme-bot", field: grant})
+    assert any(error["loc"] == (field,) for error in exc.value.errors())
+
+
+@pytest.mark.parametrize("field", PLATFORM_SLACK_GRANT_FIELDS)
+def test_platform_slack_grants_returns_only_the_true_field(field: str) -> None:
+    manifest = PluginManifest.model_validate({"name": "acme-bot", field: True})
+    assert manifest.platform_slack_grants() == frozenset({field})
+
+
+def test_platform_slack_grants_returns_exactly_the_true_subset() -> None:
+    manifest = PluginManifest.model_validate(
+        {"name": "acme-bot", "channelRead": True, "canvasList": False, "canvasEdit": True}
+    )
+    assert manifest.platform_slack_grants() == frozenset({"channelRead", "canvasEdit"})
+    everything = PluginManifest.model_validate(
+        {"name": "acme-bot", **{field: True for field in PLATFORM_SLACK_GRANT_FIELDS}}
+    )
+    assert everything.platform_slack_grants() == frozenset(PLATFORM_SLACK_GRANT_FIELDS)
+
+
+def test_channel_read_does_not_imply_canvas_grants() -> None:
+    manifest = PluginManifest.model_validate({"name": "acme-bot", "channelRead": True})
+    assert manifest.channelRead is True
+    assert all(getattr(manifest, field) is False for field in _CANVAS_GRANTS)
+    assert manifest.platform_slack_grants() == frozenset({"channelRead"})
 
 
 def test_manifest_author_may_be_string_or_object() -> None:

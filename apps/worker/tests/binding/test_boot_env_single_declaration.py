@@ -100,6 +100,11 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_ATTACHMENT_MAX_FILE_BYTES",
         "CURIE_ATTACHMENT_REFERENCE_TTL_SECONDS",
         "CURIE_ATTACHMENT_RETENTION_TTL_SECONDS",
+        # ADR 0205 decision 7 (#4079): the per-thread budget every boot's
+        # rebuild is bounded by, and the worker's own prepare timeout.
+        "CURIE_ATTACHMENT_THREAD_MAX_FILES",
+        "CURIE_ATTACHMENT_THREAD_MAX_BYTES",
+        "CURIE_ATTACHMENT_THREAD_PREPARE_TIMEOUT_SECONDS",
         "CURIE_BOOTING_TEXT",
         # Read by the worker capacity wait store, which bounds how long a
         # queued chat turn may wait. It is never sent to a sandbox.
@@ -280,6 +285,18 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # match the pod selector the connector NetworkPolicy uses.
         "CURIE_CONNECTOR_RECONCILE",
         "CURIE_CONNECTOR_RECONCILE_INTERVAL_S",
+        # The runner's executor mode switch (ACTION-EXECUTOR-5/25, #4067): set by
+        # the worker only on an executor sandbox claim and read by the runner's
+        # _serve before harness resolution. Runner-private by design, so it is
+        # deliberately not a BootEnv key (BootEnv is a frozen contract).
+        "CURIE_RUNNER_MODE",
+        # The connector action executor switch (ACTION-EXECUTOR, #4067): read by
+        # the API settings and by WorkerConfig at worker startup to decide
+        # whether executions are claimed and dispatched. Never a sandbox boot key.
+        "CURIE_ACTION_EXECUTOR_ENABLED",
+        # The automated remediation switch (AUTOMATED-REMEDIATION-1): read by the
+        # API settings and by WorkerConfig at startup. Never a sandbox boot key.
+        "CURIE_REMEDIATION_ENABLED",
         # End to end namespace reaper (#3245), read by the worker process only.
         # The test cluster kubeconfig is not among them: the reaper reads it
         # from the connector Secret at sweep time.
@@ -350,6 +367,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # The Claude SDK consumes this background model setting for session
         # titles. The runner passes it to the SDK, outside the BootEnv contract.
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        # SDK-owned runtime target for model: opus; BootEnv carries only the
+        # per-agent CURIE_REVIEWER_MODEL override (#4120).
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
         # PR #663 operator-tunable Docker runner hardening knobs; the docker
         # substrate reads these from its OWN env, never injected into the runner
         # boot contract.

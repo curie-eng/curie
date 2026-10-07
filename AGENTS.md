@@ -293,6 +293,43 @@ or older worktree does not automatically acquire newer instructions; read this
 section from the updated base when resuming. Do not edit a live claimed Bonus
 Drain task or launch a second copy to apply the guidance.
 
+### Preflight checks
+
+The full and fast preflight requirements in this section apply only when the
+checkout being checked contains both the `curie dev preflight` command and
+`tools/preflight/preflight.py`. Check the selected release train and worktree,
+even when these instructions were loaded from a different launch checkout.
+If that train does not contain preflight, run its applicable required checks
+directly using its own instructions and CI workflow, and require current-head
+PR checks to pass. Do not run another checkout's preflight against it or port
+preflight into the train to satisfy this section. Missing prerequisites or a
+failing preflight in a checkout that supports it remain failures.
+
+Before opening or updating a pull request, run the full tier from the source
+checkout: `curie dev preflight --pr-body <file> --title <text>`. The full tier
+is the default. It fetches the base and refuses a head that does not contain
+its current tip, printing `git merge origin/<base>` without merging for you.
+Failing required checks on the base produce a warning. It runs the PR body and
+Fix pin guards, then tests the changed Python workspace members and their
+transitive dependents in a private Compose project that it tears down on exit.
+Without `--pr-body`, the body and Fix pin checks are reported as skipped.
+Selected end to end tiers and kind jobs are listed as runs in CI only.
+
+After committing and before pushing, run `curie dev preflight --fast` from the
+source checkout. It selects the cheap PR gates for the committed change and
+runs their CI commands. The default base is `main`; use `--base <branch>`
+to compare against another fetched `origin/<branch>`. Use `--dry-run` to inspect
+the selected commands and `--json` for one structured report. A failing gate
+includes its output tail. This fast tier does not replace any required
+verification below.
+
+`curie install`, `curie update`, and `curie dev hooks install` configure the
+shared relative `core.hooksPath=.githooks`. Each linked worktree runs its own
+tracked hook. A differing existing path is preserved with a warning; use
+`git config --local core.hooksPath .githooks` to select the Curie hooks
+explicitly. The tracked pre-push hook runs fast preflight. The explicit escape
+hatch is `git push --no-verify`.
+
 **Rust CLI:**
 ```bash
 cd cli
@@ -656,6 +693,14 @@ as a whole; remembered only):
   [vector: `tests/vectors/workspace-selection-refusal.json`]
   [gate: `apps/api/tests/test_workspace_control_plane.py::test_first_repo_selection_is_sticky_allowlisted_and_conflict_safe`]
   [gate: `apps/worker/tests/test_workspace.py::test_internal_workspace_selection_409_maps_machine_code_not_detail_prose`]
+- API vs CLI snapshot sealing key custody -- the reserved names, refusal
+  reason and reference grammar (`packages/curie-internal/src/curie_internal/sealing_key.py`)
+  with the API's bundle check (`apps/api/src/curie_api/bundles.py::sealing_key_custody_issues`)
+  and the CLI deploy preflight's mirror (`cli/src/sealing_key.rs`) can't share
+  code across Python/Rust, so the names, the reason verbatim and every bundle's
+  refusals with their locations are frozen together in
+  `tests/vectors/sealing-key-custody.json` (ACTION-EXECUTOR-23).
+  [vector: `tests/vectors/sealing-key-custody.json`]
 - real SDK vs fake model session in the runner (`FakeModelSession`,
   `runner/src/curie_runner/fake.py`).
   [by construction: `runner/src/curie_runner/adapter.py::ModelSession`]
@@ -692,6 +737,46 @@ as a whole; remembered only):
   inbox stream the API appends to (`apps/api/src/curie_api/turn_progress.py`)
   and the worker's pump reads, cross three images, so they are frozen together.
   [vector: `tests/vectors/turn-progress-capability.json`]
+- worker vs runner executor route (ACTION-EXECUTOR-24) -- the worker's
+  `execute` client and executor mode variable
+  (`apps/worker/src/curie_worker/runner_client.py`) and the runner's
+  `/v1/execute` route and executor mode status body
+  (`runner/src/curie_runner/server.py::create_executor_app`) ship in different
+  images and cannot share code at runtime, so the request and response of every
+  phase, the route's refusal codes and the worker code each maps to, the status
+  body and the mode variable are frozen together. The `observe_version` and
+  `restore` call arguments and the reply-to-outcome mapping the two sides apply
+  around those phases are frozen beside it.
+  [vector: `tests/vectors/runner-execute.json`]
+  [vector: `tests/vectors/executor-restore-calls.json`]
+- runner vs worker sealed envelope (ACTION-EXECUTOR-9, -10) -- the runner's
+  redactor (`runner/src/curie_runner/redact.py::OutboundRedactor`) decides
+  whether an envelope crosses unaltered and the worker's `_snapshot`
+  (`apps/worker/src/curie_worker/actions.py`) decides whether it is recorded;
+  both validate the same envelope grammar in different images, so they read one
+  sealed-reply vector, as does the API's `undoable` grammar
+  (`apps/api/src/curie_api/sealed_snapshot.py`).
+  [vector: `tests/vectors/sealed-snapshot-reply.json`]
+- API vs worker vs proxy vs runner canonical arguments (ACTION-EXECUTOR-7) --
+  the undo ruling's `arguments_sha256`
+  (`apps/api/src/curie_api/routers/actions.py::restore_arguments_sha256`), the
+  worker's canonicalizer and digest (`apps/worker/src/curie_worker/connector_grant.py`),
+  the caller proxy's production parser
+  (`apps/worker/src/curie_connector_proxy/server.py::_canonical_arguments`) and
+  the runner's `call` preflight must agree byte for byte, and they ship in
+  different images, so the canonical texts and digests are frozen together.
+  [vector: `tests/vectors/action-canonical-arguments.json`]
+- attachments-init vs docker `_prepare_attachments` (ADR 0205) -- the program
+  the chart renders into the sandbox's `attachments-init` container
+  (`charts/curie/templates/agent-sandbox.yaml`) cannot import the worker, so the
+  docker driver (`apps/worker/src/curie_worker/sandbox/docker.py`) reimplements
+  it: exact names, current files first and all-or-nothing, earlier files best
+  effort with a recorded reason, digest mismatch always fatal, and the hidden
+  `.curie-attachments-status.json`, and the pre-ADR rules for a payload
+  without "c" (mixed-version rollout). Both run one payload-to-outcome corpus
+  (`charts/curie/ci/attachment-init-behavior-assertions.sh` and
+  `apps/worker/tests/sandbox/test_docker_attachment_claim.py`).
+  [vector: `tests/vectors/attachment-init-outcomes.json`]
 
 A PR touching one side of a seam must route the behavior through a shared helper
 both sides call, change both sides in the same PR, or name the sibling in the PR
@@ -824,15 +909,16 @@ required and proved, not carried on the original classification.
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
 | live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |
 | external integration | Slack, git push webhooks, connector OAuth, or any third-party API shape; Slack is required on the MCP/workspace/coding-tool path set below | drive the real integration; a replayed fixture or a fake does not close this tier |
-| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e run --scenario issue-to-pr` until the scenario in #3814 ships |
+| factory | API factory runtime, CI, progress, or publication behavior; runner verification preflight or factory progress; the dark factory example; worker work item execution | `curie dev factory-e2e scripted` on the kind rung when factory paths change |
 
 The factory path set includes `apps/api/src/curie_api/factory_runtime*`,
 `factory_ci*`, `factory_progress*`, and `routers/publications*`;
 runner verification preflight and progress; `examples/dark-factory/`; and
 worker work item execution. Factory evidence must run the production factory
 scenario through the changed components. A canned fixture or fake scenario
-does not close this tier. Until #3814 ships its scenario, use the command in
-the factory row.
+does not close this tier. The factory row names `curie dev factory-e2e scripted`,
+the kind-rung scenario that replays a recorded model transcript against the
+GitHub stub and a fixture whose layout is not this repository.
 
 The PR body guard derives minimum required tiers from changed files. A row
 required by those paths cannot be omitted or marked not applicable through
@@ -1087,6 +1173,15 @@ the work in a linked GitHub issue and pull request. Follow
   it is deletable and does not change the architecture, so it is a feature, not an
   architectural decision. The issue carries the what and the why; the *how* lives in
   the PR. An issue may cite an ADR.
+- **An example bundle or agent is never the subject of an ADR.** What a bundle
+  under `examples/` does (its skill text, prompts, tool policy, test or verdict
+  rules, safety rules, operator guidance) is that bundle's design, even when it
+  is safety relevant. Record it in the bundle's README or `docs/`, and track
+  changes in issues. When a bundle needs the platform itself to change shape,
+  the ADR covers only that platform contract, seam or invariant, stated so that
+  it holds for every bundle, not the bundle's own rules. The mean tester ADRs
+  (0169, 0172, 0181) are the counterexample: they record one example bundle's
+  behavior.
 - **When in doubt, write the issue.** Promote to an ADR only when the same decision
   gets re-explained across a third issue or PR.
 

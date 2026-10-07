@@ -358,6 +358,7 @@ async def _drop_ambiguous_route(
         telemetry_outcome="interrupted",
         lease=lease,
         hook_outcome="failed",
+        hook_reason="target_unbound",
     )
 
 

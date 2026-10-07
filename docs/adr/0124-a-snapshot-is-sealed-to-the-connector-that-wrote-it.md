@@ -2,7 +2,11 @@
 
 Date: 2026-08-25
 
-Status: Draft
+Status: Accepted
+
+Maintainer jw3329 explicitly approved acceptance on 2026-10-05, together with
+[ADR 0121](0121-a-restore-is-the-connectors-own-verb-run-under-the-same-pinned-connector.md),
+which names this decision as its prerequisite, and [ADR 0203](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md).
 
 Answers the exposure question [ADR-0117](0117-a-tool-that-changes-the-world-reports-what-it-changed.md)
 left to the connector author and

@@ -54,6 +54,7 @@ from claude_agent_sdk.types import (
     SessionStoreEntry,
     SettingSource,
 )
+from plugin_format.approval_policy import connector_tool_prefix
 
 from .history import (
     ConversationMessage,
@@ -160,6 +161,7 @@ def _recover_assistant_groups(
 # Claude or otherwise -- ever sees one.
 _SDK_ATTRIBUTION_OFF_SETTINGS = json.dumps({"attribution": {"commit": "", "pr": ""}})
 _SDK_TITLE_MODEL_ENV = "ANTHROPIC_DEFAULT_HAIKU_MODEL"
+_SDK_REVIEWER_MODEL_ENV = "ANTHROPIC_DEFAULT_OPUS_MODEL"
 # The settings the CLI loads, passed explicitly (#3766, ADR-0189). Today's
 # loading, kept on purpose: ``[]`` would also stop a workspace ``CLAUDE.md``.
 _SETTING_SOURCES: tuple[SettingSource, ...] = ("user", "project", "local")
@@ -493,6 +495,38 @@ class McpServerReconnector(Protocol):
         ...
 
 
+def hidden_restore_tools(
+    connectors: Iterable[str],
+    observed_tools: frozenset[str],
+    failed_connectors: frozenset[str],
+    *,
+    probe_complete: bool,
+) -> tuple[str, ...]:
+    """The connector ``restore`` tools to keep out of the model catalogue.
+
+    @spec ACTION-EXECUTOR-8. A connector that advertises both ``restore`` and
+    ``observe_version`` (from the boot ``tools/list``) has its
+    ``mcp__<connector>__restore`` hidden, since the executor alone calls it.
+    Hiding fails closed: a connector whose boot probe failed, or that an
+    incomplete probe never observed, has it hidden too, because a paired
+    ``restore`` must never be visible while the proxy may not yet gate it. A
+    lone ``restore`` on a probed connector stays an ordinary tool, and
+    ``observe_version`` is never hidden.
+    """
+
+    hidden: list[str] = []
+    for connector in sorted(set(connectors)):
+        prefix = connector_tool_prefix(connector)
+        restore = f"{prefix}restore"
+        paired = restore in observed_tools and f"{prefix}observe_version" in observed_tools
+        unobserved = not probe_complete and not any(
+            tool.startswith(prefix) for tool in observed_tools
+        )
+        if paired or connector in failed_connectors or unobserved:
+            hidden.append(restore)
+    return tuple(hidden)
+
+
 def build_options(
     *,
     plugins: list[SdkPluginConfig],
@@ -503,6 +537,7 @@ def build_options(
     resume: str | None,
     session_id: str | None = None,
     session_store: SessionStore | None = None,
+    reviewer_model: str | None = None,
     thinking: dict[str, Any] | None = None,
     task_budget_hint: int | None = None,
     env: dict[str, str] | None = None,
@@ -514,6 +549,7 @@ def build_options(
     policy_disallowed_tools: Iterable[str] = (),
     disallowed_tools: list[str] | tuple[str, ...] | None = None,
     skills: list[str] | None = None,
+    hidden_restore_tools: Iterable[str] = (),
 ) -> ClaudeAgentOptions:
     """Assemble ClaudeAgentOptions for the session.
 
@@ -555,9 +591,11 @@ def build_options(
     # both sources deny without changing the operator's declared order.
     explicit_disallowed = list(dict.fromkeys(disallowed_tools or ()))
     explicit_names = set(explicit_disallowed)
+    # @spec ACTION-EXECUTOR-8: a paired (or unprobed) connector ``restore`` is
+    # the executor's verb, never the model's; it joins the sorted policy tail.
     disallowed_tools = [
         *explicit_disallowed,
-        *sorted(set(policy_disallowed_tools) - explicit_names),
+        *sorted((set(policy_disallowed_tools) | set(hidden_restore_tools)) - explicit_names),
     ]
     if not web_search_enabled:
         disallowed_tools = [
@@ -565,6 +603,22 @@ def build_options(
             *(tool_name for tool_name in disallowed_tools if tool_name != "WebSearch"),
         ]
     sdk_env = dict(env or {})
+    # Auth has already been resolved at boot. An explicit SDK env value,
+    # including an empty value that fences inherited auth, wins over the
+    # process env. Reviewers use the Opus alias so install overrides do not
+    # require rebuilding the bundle (#4120).
+    credential = sdk_env.get(
+        "CLAUDE_CODE_OAUTH_TOKEN", os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "")
+    ) or sdk_env.get("ANTHROPIC_API_KEY", os.environ.get("ANTHROPIC_API_KEY", ""))
+    sdk_env[_SDK_REVIEWER_MODEL_ENV] = (
+        reviewer_model
+        if reviewer_model is not None
+        else (
+            "claude-opus-5-5"
+            if credential.startswith("sk-ant-")
+            else "anthropic/claude-opus-5.5"
+        )
+    )
     title_model = sdk_env.get(_SDK_TITLE_MODEL_ENV, os.environ.get(_SDK_TITLE_MODEL_ENV, ""))
     if not title_model.strip():
         sdk_env[_SDK_DISABLE_TERMINAL_TITLE_ENV] = "1"

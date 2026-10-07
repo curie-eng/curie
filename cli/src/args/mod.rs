@@ -112,7 +112,7 @@ pub(crate) struct ClusterConn {
 }
 
 /// Same connection as [`ClusterConn`], but the flags are global so they parse
-/// after `cluster hook fire` as well as on `cluster hook`.
+/// after `cluster hook fire` or `cluster hook record` as well as on `cluster hook`.
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ClusterHookConn {
     /// Platform API base URL. Omit to self-plumb a loopback tunnel to the release API.
@@ -361,6 +361,96 @@ pub(crate) struct ClusterAgentTarget {
     pub(crate) conn: ClusterConn,
     #[arg(long)]
     pub(crate) dry_run: bool,
+}
+
+// @spec ACTION-EXECUTOR-23
+/// The `actions` verbs, shared by `local` and `cluster` so the two tiers cannot
+/// drift. `C` is the tier's connection flags, carried on each leaf so they
+/// parse after the verb's own arguments.
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum ActionsCommand<C: clap::Args> {
+    /// List recorded actions (`GET /actions`), each with whether it can be undone.
+    List {
+        /// Scope to one agent (name or id).
+        #[arg(long, value_name = "NAME_OR_ID")]
+        agent: Option<String>,
+        /// Scope to one conversation (thread) id.
+        #[arg(long, value_name = "ID")]
+        conversation: Option<String>,
+        #[command(flatten)]
+        conn: C,
+    },
+    /// Read one recorded action (`GET /actions/{id}`). Snapshot material is never shown.
+    Show {
+        /// Action id.
+        #[arg(value_name = "ID")]
+        id: String,
+        #[command(flatten)]
+        conn: C,
+    },
+    /// Ask for an undo of one action (`POST /actions/{id}/undo`) and print the
+    /// execution it created. Authentication comes from
+    /// CURIE_APPROVAL_PRINCIPAL_TOKEN.
+    Undo {
+        /// Action id.
+        #[arg(value_name = "ID")]
+        id: String,
+        #[command(flatten)]
+        conn: C,
+    },
+    /// Read an execution's receipt (`GET /action-executions/{id}`): its state
+    /// and its refusal or failure code.
+    Execution {
+        /// Execution id.
+        #[arg(value_name = "ID")]
+        id: String,
+        #[command(flatten)]
+        conn: C,
+    },
+}
+
+impl<C: clap::Args> ActionsCommand<C> {
+    /// Split the verb from its connection flags.
+    pub(crate) fn into_parts(self) -> (commands::ActionsVerb, C) {
+        match self {
+            ActionsCommand::List {
+                agent,
+                conversation,
+                conn,
+            } => (
+                commands::ActionsVerb::List {
+                    agent,
+                    conversation,
+                },
+                conn,
+            ),
+            ActionsCommand::Show { id, conn } => (commands::ActionsVerb::Show { id }, conn),
+            ActionsCommand::Undo { id, conn } => (commands::ActionsVerb::Undo { id }, conn),
+            ActionsCommand::Execution { id, conn } => {
+                (commands::ActionsVerb::Execution { id }, conn)
+            }
+        }
+    }
+
+    /// The leaf's connection flags.
+    pub(crate) fn conn(&self) -> &C {
+        match self {
+            ActionsCommand::List { conn, .. }
+            | ActionsCommand::Show { conn, .. }
+            | ActionsCommand::Undo { conn, .. }
+            | ActionsCommand::Execution { conn, .. } => conn,
+        }
+    }
+
+    /// The leaf's connection flags, mutably.
+    pub(crate) fn conn_mut(&mut self) -> &mut C {
+        match self {
+            ActionsCommand::List { conn, .. }
+            | ActionsCommand::Show { conn, .. }
+            | ActionsCommand::Undo { conn, .. }
+            | ActionsCommand::Execution { conn, .. } => conn,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -861,9 +951,10 @@ pub(crate) enum FactoryAction {
         /// Kind cluster name used only when no kube context is targeted.
         #[arg(long, default_value = curie::factory_quickstart::DEFAULT_KIND_NAME)]
         kind_name: String,
-        /// Model id installed by cluster up.
-        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_MODEL)]
-        model: String,
+        /// Model id installed by cluster up. Defaults to Claude Sonnet for
+        /// Anthropic credentials, or GLM Flash for OpenRouter credentials.
+        #[arg(long)]
+        model: Option<String>,
         /// Per run execution deadline in seconds for the deployed agent.
         #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_DEADLINE_SECONDS)]
         execution_deadline: u32,

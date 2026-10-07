@@ -1082,6 +1082,8 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             agent,
             model,
             clear_model,
+            reviewer_model,
+            clear_reviewer_model,
             thinking,
             clear_thinking,
             execution_deadline,
@@ -1097,6 +1099,11 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             // operator wait on a cluster lookup to be told so is worse than
             // telling them immediately.
             let model = commands::OverrideChange::resolve("model", model, clear_model)?;
+            let reviewer_model = commands::OverrideChange::resolve(
+                "reviewer-model",
+                reviewer_model,
+                clear_reviewer_model,
+            )?;
             let thinking = commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?;
             let execution_deadline = commands::OverrideChange::resolve_execution_deadline(
                 execution_deadline,
@@ -1116,6 +1123,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                         dry_run,
                     },
                     model,
+                    reviewer_model,
                     thinking,
                     execution_deadline,
                     runner_resources,
@@ -1328,12 +1336,10 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             )
         }
         ClusterAction::Hook { action, conn } => {
-            let ClusterHookAction::Fire {
-                agent,
-                name,
-                wait_secs,
-                dry_run,
-            } = action;
+            let dry_run = match &action {
+                ClusterHookAction::Fire { dry_run, .. }
+                | ClusterHookAction::Record { dry_run, .. } => *dry_run,
+            };
             let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(
                 ClusterConn {
                     api_url: conn.api_url,
@@ -1344,17 +1350,41 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 dry_run,
             )
             .await?;
-            emit(
-                commands::hook_fire(commands::HookFireOpts {
-                    api_url,
-                    api_key,
+            match action {
+                ClusterHookAction::Fire {
                     agent,
                     name,
-                    dry_run,
                     wait_secs,
-                })
-                .await?,
-            )
+                    dry_run,
+                } => emit(
+                    commands::hook_fire(commands::HookFireOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        name,
+                        dry_run,
+                        wait_secs,
+                        tier: "cluster",
+                    })
+                    .await?,
+                ),
+                ClusterHookAction::Record {
+                    agent,
+                    name,
+                    id,
+                    dry_run,
+                } => emit(
+                    commands::hook_record(commands::HookRecordOpts {
+                        api_url,
+                        api_key,
+                        agent,
+                        name,
+                        run_id: id,
+                        dry_run,
+                    })
+                    .await?,
+                ),
+            }
         }
         ClusterAction::Delete {
             agent,
@@ -1448,6 +1478,27 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     emit(commands::memory_add(opts, content, "cluster").await?)
                 }
             }
+        }
+        // @spec ACTION-EXECUTOR-23
+        ClusterAction::Actions { verb } => {
+            let (verb, conn) = verb.into_parts();
+            // Validated before the connection is resolved, so a malformed id
+            // or a missing principal never reaches discovery or the API.
+            let verb = verb.validate()?;
+            // `_cluster_api_pf` is the port-forward guard; it must live for
+            // the whole call.
+            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, false).await?;
+            emit(
+                commands::actions(
+                    commands::ActionsOpts {
+                        api_url,
+                        api_key,
+                        tier: "cluster",
+                    },
+                    verb,
+                )
+                .await?,
+            )
         }
         ClusterAction::Approvals {
             target,

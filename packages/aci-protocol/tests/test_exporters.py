@@ -34,7 +34,7 @@ def test_event_session_context_fields_are_optional_nullable_strings() -> None:
 
 def test_channel_read_export_pairs_required_children_under_an_optional_parent() -> None:
     schema = build_schema()
-    assert schema["protocolVersion"] == "0.5.16"
+    assert schema["protocolVersion"] == "0.5.19"
     definitions = schema["$defs"]
     event = definitions["Event"]
     assert "channel_read" not in event["required"]

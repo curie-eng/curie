@@ -839,8 +839,15 @@ def test_a_late_open_after_settlement_is_refused(make_harness: Any) -> None:
         _zip(None),
         _zip("{not json"),
         _zip(json.dumps({"name": "acme-bot", "channelRead": "yes"})),
+        _zip(json.dumps({"name": "acme-bot", "canvasEdit": "true"})),
     ],
-    ids=["store-unavailable", "manifest-missing", "manifest-not-json", "channel-read-not-a-bool"],
+    ids=[
+        "store-unavailable",
+        "manifest-missing",
+        "manifest-not-json",
+        "channel-read-not-a-bool",
+        "canvas-edit-not-a-bool",
+    ],
 )
 def test_an_unreadable_or_malformed_bundle_is_an_unknown_grant(
     make_harness: Any, bundle: bytes | None
@@ -905,6 +912,82 @@ def test_a_slow_bundle_lookup_times_out_as_an_unknown_grant(
         assert h.runner.event_bodies[-1]["channel_read"] is None
 
     _run(make_harness, body, max_attempts=3)
+
+
+_SLACK_GRANTS = ("channelRead", "canvasList", "canvasRead", "canvasEdit")
+
+
+@pytest.mark.parametrize("grant", _SLACK_GRANTS)
+def test_a_single_platform_slack_grant_mints_the_capability(make_harness: Any, grant: str) -> None:
+    # Any one of the four grants (ADR 0200) is enough; the canvas-only grants must mint
+    # exactly as channelRead does, because the same capability serves the canvas tools.
+    async def body(h: Any, b: _ChannelReadBinding) -> None:
+        b.bundles.raw[_BUNDLE_V1] = _zip(json.dumps({"name": "acme-bot", grant: True}))
+        turn = _qevent("what is on the plan canvas", thread=f"th-cr-g-{grant}")
+
+        await h.kernel.process_event(turn)
+
+        assert b.bundles.reads, "the grant was not read from the bundle"
+        assert h.runner.opened == [turn.text]
+        assert h.sink.last_text == "ok"
+        (call,) = b.api.of_mode("open")
+        assert call["agent_id"] == AGENT_ID
+        assert call["deployment_id"] == DEPLOYMENT_ID
+        assert call["event_id"] == turn.event_id
+        assert h.runner.event_bodies[0]["channel_read"] == {
+            "url": _CAPABILITY_URL,
+            "token": b.api.mints[0].token,
+        }
+
+    _run(make_harness, body, runner_api_base_url=_RUNNER_FACING)
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        {"name": "acme-bot"},
+        {"name": "acme-bot", "channelRead": False, "canvasList": False},
+        {"name": "acme-bot", "canvasRead": False, "canvasEdit": False},
+    ],
+    ids=["no-grant", "all-false", "canvas-false"],
+)
+def test_a_bundle_granting_no_platform_slack_capability_mints_nothing(
+    make_harness: Any, manifest: dict[str, Any]
+) -> None:
+    # Only a literal true grants; the turn still runs, uncovered, and no mint is requested.
+    async def body(h: Any, b: _ChannelReadBinding) -> None:
+        b.bundles.raw[_BUNDLE_V1] = _zip(json.dumps(manifest))
+
+        await h.kernel.process_event(_qevent("hello", thread="th-cr-ng-1"))
+
+        assert b.bundles.reads, "the grant was not read from the bundle"
+        assert h.runner.opened == ["hello"]
+        assert h.sink.last_text == "ok"
+        assert b.api.of_mode("open") == []
+        assert not b.api.mints
+        assert h.runner.event_bodies[0]["channel_read"] is None
+
+    _run(make_harness, body)
+
+
+def test_a_channel_read_only_grant_still_mints_and_a_canvas_grant_adds_no_second_mint(
+    make_harness: Any,
+) -> None:
+    # channelRead alone is unchanged, and a bundle holding every grant needs one mint, not four.
+    async def body(h: Any, b: _ChannelReadBinding) -> None:
+        b.bundles.raw[_BUNDLE_V1] = _zip(json.dumps({"name": "acme-bot", "channelRead": True}))
+        await h.kernel.process_event(_qevent("first", thread="th-cr-co-1"))
+        assert len(b.api.of_mode("open")) == 1
+        assert h.runner.event_bodies[0]["channel_read"] is not None
+
+        b.bundles.raw[_BUNDLE_V1] = _zip(
+            json.dumps({"name": "acme-bot", **{g: True for g in _SLACK_GRANTS}})
+        )
+        await h.kernel.process_event(_qevent("second", thread="th-cr-co-2"))
+        assert len(b.api.of_mode("open")) == 2
+        assert h.runner.event_bodies[1]["channel_read"] is not None
+
+    _run(make_harness, body, runner_api_base_url=_RUNNER_FACING)
 
 
 def _surface_claim_bundle_refs(h: Any, monkeypatch: pytest.MonkeyPatch) -> None:

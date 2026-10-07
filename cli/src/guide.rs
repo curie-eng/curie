@@ -29,6 +29,7 @@ pub struct Primer {
     pub parity_ladder: Vec<Rung>,
     pub decision_logic: Vec<Decision>,
     pub approvals: Approvals,
+    pub cron: Cron,
     pub landmines: Vec<Landmine>,
     pub recovery: Vec<Recovery>,
 }
@@ -47,6 +48,22 @@ pub struct Approvals {
 
 #[derive(Serialize)]
 pub struct ApprovalFact {
+    pub title: &'static str,
+    pub detail: &'static str,
+}
+
+/// Scheduled turns (#4012). Nothing in the command tree says a bundle can
+/// declare `triggers`: the `schedules` and `hook fire` verbs read a record the
+/// manifest field creates, so without this section the feature is invisible.
+#[derive(Serialize)]
+pub struct Cron {
+    pub summary: &'static str,
+    pub facts: Vec<CronFact>,
+    pub commands: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+pub struct CronFact {
     pub title: &'static str,
     pub detail: &'static str,
 }
@@ -320,6 +337,57 @@ pub fn primer() -> Primer {
                 "curie local approvals <AGENT> --resolve <id>",
             ],
         },
+        cron: Cron {
+            summary: "A bundle can wake its agent on a schedule. The worker's scheduler fires \
+                      each declared cron trigger for every in-force deployment and records each \
+                      slot as one run, so schedules exist at the local and cluster tiers. A \
+                      fresh scaffold declares none.",
+            facts: vec![
+                CronFact {
+                    title: "Declaring one",
+                    detail: "Add a `triggers` array to .claude-plugin/plugin.json. Each entry is \
+                             {type: \"cron\", name, schedule, timezone, target, prompt}. `name` \
+                             is required and unique; it keys the run history, so renaming a \
+                             trigger starts a new one. `schedule` is a required five-field cron \
+                             expression (names such as FRI are allowed). `timezone` is an \
+                             optional IANA zone, default UTC. `prompt` is the required text of \
+                             the scheduled turn.",
+                },
+                CronFact {
+                    title: "Targeted or targetless",
+                    detail: "`target` is optional. When set it must be a channel bound to the \
+                             agent, and the reply is a new top-level post there. When omitted \
+                             the turn is targetless: it runs silently and posts nothing.",
+                },
+                CronFact {
+                    title: "A targetless turn cannot wait for approval",
+                    detail: "A targetless turn that hits an approval gate records `failed` and \
+                             the tool never runs. Give the trigger a `target` if its work needs \
+                             approval.",
+                },
+                CronFact {
+                    title: "Reading and firing",
+                    detail: "`schedules` lists each cron hook on the in-force deployment with \
+                             its newest slot and outcome (ran, failed, blocked, deferred, \
+                             skipped, reclaimed); `--agent` limits it to one agent. \
+                             `hook fire <AGENT> <NAME>` runs a hook now and prints its run \
+                             record.",
+                },
+                CronFact {
+                    title: "The skill tier has no scheduler",
+                    detail: "`skill hook fire <NAME>` runs the prompt against the local runner \
+                             and writes no run record. `skill schedules` is refused: that tier \
+                             has no scheduler and no run record.",
+                },
+            ],
+            commands: vec![
+                "curie local schedules",
+                "curie local hook fire <AGENT> <NAME>",
+                "curie cluster schedules",
+                "curie cluster hook fire <AGENT> <NAME>",
+                "curie skill hook fire <NAME>",
+            ],
+        },
         landmines: vec![
             Landmine {
                 title: "A terminal principal has no channel membership",
@@ -475,6 +543,17 @@ fn render_markdown(p: &Primer) -> String {
         s.push_str(&format!("- **{}**\n  {}\n\n", f.title, f.detail));
     }
     for c in &p.approvals.commands {
+        s.push_str(&format!("    {c}\n"));
+    }
+    s.push('\n');
+
+    s.push_str("## Cron triggers\n\n");
+    s.push_str(p.cron.summary);
+    s.push_str("\n\n");
+    for f in &p.cron.facts {
+        s.push_str(&format!("- **{}**\n  {}\n\n", f.title, f.detail));
+    }
+    for c in &p.cron.commands {
         s.push_str(&format!("    {c}\n"));
     }
     s.push('\n');

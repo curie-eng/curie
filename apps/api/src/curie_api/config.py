@@ -12,7 +12,7 @@ production deployments.
 
 import json
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit, urlunsplit
 
 from aci_protocol import (
@@ -24,20 +24,30 @@ from aci_protocol import (
     derive_dead_letter_stream_name,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_internal.driver_declaration import (
+    PUBLISHED_DEFAULT_API_KEY,
+    PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET,
+    PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN,
+    TEST_INSTALLATION_DRIVERS_ENV,
+    TEST_INSTALLATION_ENABLED_ENV,
+    DeclaredDriver,
+    parse_drivers,
+    refuse_published_defaults,
+)
 from curie_internal.keyspace import WORKER_KEY_PREFIX_DEFAULT
 from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .e2e_connector import E2EInstall
 from .workspace_policy import valid_allowlist_entry, valid_repository_name
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
-_DEV_DEFAULT_API_KEY = "curie-dev-key"
+_DEV_DEFAULT_API_KEY = PUBLISHED_DEFAULT_API_KEY
 _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
-_DEV_DEFAULT_INTERNAL_WORKER_TOKEN = "curie-dev-worker-token"
-_DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = "curie-dev-approval-chat-attester"
+_DEV_DEFAULT_INTERNAL_WORKER_TOKEN = PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN
+_DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET
 
 
 def valid_base_branch(name: Any) -> bool:
@@ -93,6 +103,40 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "CURIE_APPROVAL_RECOVERY_ENABLED", "approval_recovery_enabled"
         ),
+    )
+    # @spec ACTION-EXECUTOR-1: the action executor is closed by default. The
+    # chart value ``actionExecutor.enabled`` and the matching compose value
+    # render this one setting into both the API and the worker. Off, the undo
+    # ruling refuses ``executor_disabled`` before it creates any execution and
+    # the claim route hands out no work.
+    action_executor_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "CURIE_ACTION_EXECUTOR_ENABLED", "action_executor_enabled"
+        ),
+    )
+    # @spec AUTOMATED-REMEDIATION-1: automated remediation is closed by default.
+    # The chart value ``remediation.enabled`` and the matching compose value
+    # render this one setting into both the API and the worker. Enabling it
+    # requires the action executor; the policy routes stay readable and
+    # writable with it off, so a policy can be staged before activation.
+    remediation_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("CURIE_REMEDIATION_ENABLED", "remediation_enabled"),
+    )
+
+    # The test installation declaration (ADR 0202 decision 1). Rendered only
+    # by the chart from testInstallation.enabled and testInstallation.drivers,
+    # never derived from a channel name, a deployment's env or anything an
+    # agent says. Off by default. On, the boot refuses a published default
+    # secret (``_refuse_published_defaults_on_a_test_installation``).
+    test_installation_enabled: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(TEST_INSTALLATION_ENABLED_ENV, "test_installation_enabled"),
+    )
+    test_installation_drivers: Annotated[tuple[DeclaredDriver, ...], NoDecode] = Field(
+        default=(),
+        validation_alias=AliasChoices(TEST_INSTALLATION_DRIVERS_ENV, "test_installation_drivers"),
     )
 
     # Separate trust boundary for credential redemption. The operator/CLI API
@@ -578,6 +622,11 @@ class Settings(BaseSettings):
     # thread is deleted at its terminal.
     transcript_max_thread_bytes: int = 16 * 1024 * 1024  # 16 MiB per thread
     transcript_idle_ttl_seconds: int = 30 * 24 * 3600  # 30 days
+    # The thread attachment ledger (ADR 0205, #4079) lives as long as the
+    # transcript. This caps how many file references one thread may record;
+    # an append that would pass it is refused whole (413). The worker's own
+    # per-boot budget is separate and smaller.
+    thread_attachment_max_refs: int = 200
     # Cap on behavior-packs content per agent (#936, introduced by #883). Packs
     # are stored on the agent row and injected verbatim into the runner context
     # at each bind, so an uncapped pack bloats both the row and the prompt. Size
@@ -668,6 +717,14 @@ class Settings(BaseSettings):
     # same way as GITHUB_FACTORY_RECONCILE_INTERVAL_S (#3709): refused at boot
     # rather than surfacing mid-delivery (#3720).
     hook_backlog_window_s: int = Field(default=60, gt=0)
+    # Protected runtime bootstrap directory (PROTECTED-HOOK-SOURCE-9). Only the
+    # out of band provisioner writes it and mounts it read only into the API:
+    # manifest.json, ca.pem and bootstrap.json, read afresh by each support probe
+    # evaluation. Unset means no protected runtime is provisioned here, so a
+    # protected row reports runtime_unavailable. Nothing in this API creates it.
+    protected_runtime_dir: str | None = Field(
+        default=None, validation_alias="CURIE_PROTECTED_RUNTIME_DIR"
+    )
     channel_binding_backlog_limit: int = 64
     channel_binding_backlog_window_s: int = Field(default=60, gt=0)
     # Sandbox ResourceQuota hard limits (#3209). The chart sets all four when
@@ -981,6 +1038,20 @@ class Settings(BaseSettings):
         return entries
 
     @model_validator(mode="after")
+    def _remediation_requires_the_executor(self) -> "Settings":
+        """@spec AUTOMATED-REMEDIATION-1: fail closed with the executor off.
+
+        The chart refuses this combination at render; compose cannot refuse a
+        render, so the API refuses to boot with it instead.
+        """
+        if self.remediation_enabled and not self.action_executor_enabled:
+            raise ValueError(
+                "CURIE_REMEDIATION_ENABLED=true requires CURIE_ACTION_EXECUTOR_ENABLED=true "
+                "(remediation.enabled requires actionExecutor.enabled)"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_connector_proxy(self) -> "Settings":
         # At boot, not at the first render: a key the proxy cannot use would
         # otherwise surface as a 500 on every connector deploy.
@@ -1108,6 +1179,30 @@ class Settings(BaseSettings):
                     "with no query or fragment"
                 )
         self.github_factory_card_base_url = value
+        return self
+
+    @field_validator("test_installation_drivers", mode="before")
+    @classmethod
+    def _parse_test_installation_drivers(cls, value: object) -> object:
+        # Parse here so JSON null is refused instead of being discarded by the
+        # settings env source and silently replaced by the empty default.
+        return parse_drivers(value)
+
+    @model_validator(mode="after")
+    def _refuse_published_defaults_on_a_test_installation(self) -> "Settings":
+        """Refuse boot on a published default secret while declared a test installation.
+
+        The chart refuses the same render, but it cannot see a secret supplied
+        another way, and a compose stack never renders the chart (ADR 0202).
+        """
+        refuse_published_defaults(
+            self.test_installation_enabled,
+            {
+                "API_KEY": self.api_key,
+                "CURIE_INTERNAL_WORKER_TOKEN": self.internal_worker_token,
+                "CURIE_APPROVAL_CHAT_ATTESTER_SECRET": self.approval_chat_attester_secret,
+            },
+        )
         return self
 
     @model_validator(mode="after")

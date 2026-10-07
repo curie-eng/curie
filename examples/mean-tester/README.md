@@ -49,6 +49,15 @@ to know what the target is for. It takes the first of these the request gives:
 The report's first line names the source: `<owner/repo>@<commit>`,
 `request spec`, or `(no spec)`.
 
+A repository spec is the source the target was rendered from, not proof of
+what is deployed: an installer may drop connectors, gates and secrets before
+deploying. Add `, rendered` or `, deployed` after naming the spec to say which,
+for example `spec from acme-corp/acme-bot@main examples/acme-bot, rendered`.
+Without either, a repository spec counts as a source and a spec in the request
+counts as deployed. When the target says it lacks something only a source spec
+declares, the tester grades it UNCLEAR ("spec source may differ from
+deployment"), not FAIL. See [docs/VALIDATOR.md](docs/VALIDATOR.md#deployed-and-source-specs).
+
 ## A round without a spec
 
 Without a spec, the only thing to hold a reply against is ordinary use. The
@@ -63,9 +72,10 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
 
 ## Prerequisites
 
-- **Its own Curie installation.** Its Slack app must **not** be the app of any
-  agent it will test. A bot's own posts never reach its own dispatcher, so a
-  shared app would make the tester invisible to itself.
+- **Its own Slack app.** It must **not** be the app of any agent it will test.
+  A bot's own posts never reach its own dispatcher, so a shared app would make
+  the tester invisible to itself. Two installations must not hold the same app
+  either: Slack hands each event to one of the connections at random (#2248).
 - **Stdio MCP servers**: this bundle's `runner.Dockerfile` installs them in a
   runner layer (ADR 0173) that `curie build` builds. The platform runner image
   does not carry them.
@@ -79,7 +89,9 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
   fine-grained token on a machine account, or a GitHub App installation
   token, limited to those repositories with **Contents: Read** and nothing
   else. The token sits in the sandbox's environment, so its scope is the real
-  bound. The manifest declares the secret either way. With no repository
+  bound. A tester that reads every target through the workspace
+  still needs the secret bound, because the manifest declares it: give it a
+  token that can read no private repository. The manifest declares the secret either way. With no repository
   listed, give it a token that can read no private repository, such as a
   fine-grained token limited to public repositories.
 - **Enough agent steps for a campaign.** The runner ends a turn after
@@ -91,6 +103,43 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
 - **For attached specs:** turn the attachment lane on (`attachments.enabled`)
   and give the tester's Slack app the `files:read` scope. Without both,
   attached files are ignored, so paste the spec into the request instead.
+
+## Where to run it
+
+Run the tester beside the agents it tests: deploy it into the target's own
+Curie installation as a sibling identity
+([ADR 0168](../../docs/adr/0168-one-installation-hosts-several-bot-identities.md)),
+with its own Slack app. ADR 0169 requires a separate provider installation,
+which is the Slack app, not a separate Curie installation. In that placement:
+
+- it runs on the model credential that installation already gives its agents,
+  so it needs none of its own and the target's team pays for its runs;
+- it reads the target's bundle from the thread's repository workspace: put
+  `https://github.com/<owner>/<repo>` in the request, and the platform clones
+  it into `/workspace` with the installation's GitHub access (`api.githubToken`,
+  its existing secret, or the GitHub App). The repository must be in that
+  installation's `api.githubRepoAllowlist`; otherwise the whole request is
+  refused before the tester runs. The tester then copies the suite from disk
+  instead of retyping it;
+- its mentions inside a thread are admitted as an own identity's, so
+  conversation follow-ups need no `threadedBotAllowlist` entry.
+
+Turns between one installation's own bots are rate limited (ADR 0168
+decision 6): at most five new threads per pair of bots, and five messages per
+thread, in any ten minutes. Past that the platform ends the turn with a
+"Stopped here" notice. Set "New threads per 15 minutes" to 5 or less and
+"Follow-ups per thread" to 4 or less there.
+
+Settings under `agentSandbox.runner`, such as `extraEnv` for `CURIE_MAX_TURNS`,
+apply to every agent on the installation. Prefer the per-agent overrides
+(`curie cluster overrides <agent> --execution-deadline`) where one exists.
+
+The cost is shared fate. It takes sandboxes from the same capacity as the
+target's real users, and an outage that takes the platform down takes the
+tester down too, so it cannot report one.
+
+A tester in a separate installation still works as before, through the GitHub
+server and the listed repositories under "Where you work".
 
 ## Configure
 
@@ -240,6 +289,13 @@ seat. Attachments, actions, card resolution and state checks remain
 `BLOCKED: slice 2`, even on a marked installation. A missing or malformed suite,
 UNCLEAR, incomplete repeats or blocked steps cannot become PASS or full GO.
 
+The ship verdict comes from the bundle's gate, [`gate/mean_tester_gate.py`](gate/mean_tester_gate.py),
+which the runner layer installs as `mean-tester-gate`. It validates the suite,
+records each judged probe and computes the verdict; the report quotes it. A
+suite with no action-bearing case can receive `GO (read-only scope)` when
+every case, repeat, scenario step and other recorded or planned probe passes. A suite with actions,
+attachments, card actions or state checks stays NO-GO until slice 2.
+
 See [the validator design](docs/VALIDATOR.md) for the separate suite format,
 configuration comparison, smoke, snapshot/restore and fault-injection contracts,
 and [phase 0 evidence](docs/PHASE-0.md) for approval and attachment limitations.
@@ -247,6 +303,15 @@ The [illustrative suite](acceptance/cases.json) is sample data for a fictional
 target; the tester's own grading regressions remain in `evals/cases.json`.
 Human and campaign findings become permanent case drafts for a maintainer to
 commit. The shipped tool permissions and read-or-ask rule remain unchanged.
+
+## Models
+
+The recorded-exchange evals in `evals/cases.json` have been graded on Claude
+only. On another model, the tester's verdicts and its use of the gate are
+unverified. In one campaign on `z-ai/glm-5.3-flash`, the tester ended with an
+empty reply after its GitHub reads failed (#4130). Pin the tester to a Claude
+model (`curie cluster overrides <agent> --model …`) unless you have run the
+evals on the model you use.
 
 ## Evals
 
@@ -256,8 +321,9 @@ good replies PASS, with a spec and without one. The recorded exchanges include
 contradictions between a claimed capability and the target's own tool inventory,
 misleading tool-call
 inventories presented as changes, replies that leave their Slack thread,
-settled approval cards that still look pending, and approval messages in the
-wrong order. Approval cases are recorded exchanges only. The tester never
+settled approval cards that still look pending, approval messages in the
+wrong order, and a capability the target denies that only a source spec
+declares (UNCLEAR) against one a deployed spec declares (FAIL). Approval cases are recorded exchanges only. The tester never
 creates a card to exercise them. Run the cases with a model credential:
 
 ```bash

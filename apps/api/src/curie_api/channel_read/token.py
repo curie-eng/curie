@@ -1,9 +1,10 @@
 """The API issued channel read capability (ADR 0100).
 
 It follows ``curie_api.issue_read_token``: an HMAC signed claim set the sandbox
-presents to exactly one route. It names one agent, one deployment and the
-grant digest it was minted under, one logical turn and its generation. It
-carries no channel list: the bound set is read again on every request.
+presents to the channel read route and its canvas sibling (ADR 0200). It names
+one agent, one deployment, the grant digest it was minted under and which
+grants that bundle declares, one logical turn and its generation. It carries no
+channel list: the bound set is read again on every request.
 """
 
 from __future__ import annotations
@@ -12,16 +13,19 @@ import hmac
 import json
 import time
 import uuid
-from typing import Literal
+from typing import Literal, Self
 
 from curie_internal import sandbox_token
 from curie_internal.sandbox_token import b64url, b64url_decode
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 _PREFIX = "chr"
 # Mirrors the worker's SANDBOX_TOKEN_TTL_SECONDS: no capability outlives a day.
 MAX_TTL_SECONDS = 24 * 60 * 60
 _MAX_TOKEN_LENGTH = 4096
+
+# The platform Slack grant names (plugin_format.PLATFORM_SLACK_GRANT_FIELDS).
+GrantName = Literal["channelRead", "canvasList", "canvasRead", "canvasEdit"]
 
 
 class ChannelPair(BaseModel):
@@ -42,11 +46,19 @@ class ChannelReadClaims(BaseModel):
     agent: uuid.UUID
     deployment: uuid.UUID
     grant: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # Which platform Slack grants the bundle behind ``grant`` declares (ADR 0200).
+    grants: tuple[GrantName, ...] = Field(min_length=1, max_length=4)
     turn: str = Field(min_length=1, max_length=512)
     gen: int = Field(gt=0)
     default: ChannelPair | None
     iat: int = Field(ge=0)
     exp: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _grants_are_distinct(self) -> Self:
+        if len(set(self.grants)) != len(self.grants):
+            raise ValueError("a grant is named once")
+        return self
 
 
 def mint(api_key: str, claims: ChannelReadClaims) -> str:

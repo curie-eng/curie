@@ -102,9 +102,14 @@ class _StubRepo:
     """The B1 repo lookup, stubbed: a channel/agent resolves to a GitHub repo."""
 
     def __init__(
-        self, *, model: str | None = None, thinking: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reviewer_model: str | None = None,
+        thinking: str | None = None,
     ) -> None:
         self._model = model
+        self._reviewer_model = reviewer_model
         self._thinking = thinking
         self.model_settings_agent_ids: list[uuid.UUID] = []
 
@@ -121,9 +126,9 @@ class _StubRepo:
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+    ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
-        return self._model, self._thinking, None
+        return self._model, self._reviewer_model, self._thinking, None
 
 
 class _ObservedBindingResolver(BindingResolver):
@@ -135,7 +140,7 @@ class _ObservedBindingResolver(BindingResolver):
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+    ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
         return await super().model_settings_for(agent_id)
 
@@ -945,7 +950,7 @@ def test_entry_is_acked_after_report_even_when_report_fails(make_eval_harness, b
         ),
     ],
 )
-def test_provisioned_runner_end_to_end(
+def test_provisioned_runner_reviewer_model_end_to_end(
     make_eval_harness,
     bundles,
     platform_model: str | None,
@@ -976,13 +981,14 @@ def test_provisioned_runner_end_to_end(
                 await conn.execute(
                     text(
                         f"INSERT INTO {_DB_SCHEMA}.agents "
-                        "(id, name, model, thinking, repo_full_name) "
-                        "VALUES (:id, :name, :model, :thinking, :repo)"
+                        "(id, name, model, reviewer_model, thinking, repo_full_name) "
+                        "VALUES (:id, :name, :model, :reviewer_model, :thinking, :repo)"
                     ),
                     {
                         "id": agent_id,
                         "name": f"eval_agent_{token}",
                         "model": stored_model,
+                        "reviewer_model": "acme-reviewer-model" if stored_model else None,
                         "thinking": agent_thinking,
                         "repo": "acme-corp/acme-bot",
                     },
@@ -1101,6 +1107,9 @@ def test_provisioned_runner_end_to_end(
                         assert THINKING_ENV not in claim_env
                     else:
                         assert claim_env[THINKING_ENV] == expected_thinking
+                    assert claim_env.get("CURIE_REVIEWER_MODEL") == (
+                        "acme-reviewer-model" if stored_model else None
+                    )
                     assert repo_lookup.model_settings_agent_ids == [agent_id]
                     assert fake_k8s.deleted, "provisioned sandbox was never released"
                     assert not fake_k8s.claims
@@ -1446,7 +1455,7 @@ def test_eval_boot_env_mints_runner_token() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env.get(RUNNER_TOKEN_ENV), "_boot_env must mint a non-empty runner token"
 
 
@@ -1467,7 +1476,7 @@ def test_eval_lane_boot_env_omits_memory_ref() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert "CURIE_MEMORY_REF" not in env
     assert "CURIE_MEMORY_TOKEN" not in env
     assert "CURIE_HISTORY_REF" not in env
@@ -1491,7 +1500,7 @@ def test_eval_boot_env_forwards_sha_as_bundle_version() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env["CURIE_BUNDLE_VERSION"] == "deadbeef"
     assert env[BUNDLE_REF_ENV] == "bundles/x.zip"
 
@@ -1513,14 +1522,16 @@ def test_eval_requested_model_boots_and_tags_that_model() -> None:
     item = _item(
         suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None, model="claude-x"
     )
-    env = consumer._boot_env(item, None, None, model="claude-x")
+    env = consumer._boot_env(item, None, None, model="claude-x", reviewer_model=None)
     assert env[MODEL_ENV] == "claude-x"  # requested model wins over worker default
     assert consumer._eval_model(item, "claude-x") == "claude-x"
 
     # No requested model: the worker default is booted and tagged, as before.
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
     assert (
-        consumer._boot_env(default_item, None, None, model="worker-default")[MODEL_ENV]
+        consumer._boot_env(
+            default_item, None, None, model="worker-default", reviewer_model=None
+        )[MODEL_ENV]
         == "worker-default"
     )
     assert consumer._eval_model(default_item, "worker-default") == "worker-default"
@@ -1581,7 +1592,9 @@ def test_eval_fake_model_install_refuses_to_label_a_model_never_called(
     # A fake run with no requested model is unlabelled too (not the worker default,
     # which the fake session never calls either).
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    default_env = consumer._boot_env(default_item, None, None, model="stored_model")
+    default_env = consumer._boot_env(
+        default_item, None, None, model="stored_model", reviewer_model=None
+    )
     assert default_env[MODEL_ENV] == "stored_model"
     assert consumer._eval_model(default_item, "stored_model") is None
 
@@ -1642,7 +1655,10 @@ def test_eval_claim_creation_is_bounded_to_one_by_default() -> None:
 
     async def go() -> None:
         await asyncio.gather(
-            *(consumer._acquire_target(item, model=None, thinking=None) for item in items)
+            *(
+                consumer._acquire_target(item, model=None, reviewer_model=None, thinking=None)
+                for item in items
+            )
         )
 
     asyncio.run(go())
@@ -1671,7 +1687,10 @@ def test_eval_claim_creation_bound_admits_configured_parallelism() -> None:
 
     async def go() -> None:
         await asyncio.gather(
-            *(consumer._acquire_target(item, model=None, thinking=None) for item in items)
+            *(
+                consumer._acquire_target(item, model=None, reviewer_model=None, thinking=None)
+                for item in items
+            )
         )
 
     asyncio.run(go())
@@ -1938,6 +1957,7 @@ def test_eval_boot_env_drops_reserved_connector_secret() -> None:
         },
         None,
         model=None,
+        reviewer_model=None,
     )
     # The reserved model-credential key never carries the injected value.
     assert env.get("ANTHROPIC_BASE_URL") != "http://evil"

@@ -783,6 +783,60 @@ connectorCaller:
   signingKeyKey: signingKey
   verifyKeyKey: verifyKey
 
+# The connector action executor (ACTION-EXECUTOR-1). One switch, rendered as
+# CURIE_ACTION_EXECUTOR_ENABLED into both the API and the worker so the two can
+# never disagree. Off: the worker claims no execution and the API refuses an undo
+# that would authorize a restore with `executor_disabled`. On, with
+# worker.connectorReconciler.enabled, the worker Role also gains a single-object
+# `get` on Deployments so it can read the digest a connector ran at
+# (ACTION-EXECUTOR-12, -14); with the executor off that grant is absent and
+# actions record no digest, so they are not undoable.
+actionExecutor:
+  enabled: false
+
+# Automated remediation (AUTOMATED-REMEDIATION-1). One switch, rendered as
+# CURIE_REMEDIATION_ENABLED into both the API and the worker. Closed by default.
+# Enabling it requires actionExecutor.enabled: a render with remediation on and
+# the executor off fails. Off, the remediation policy routes stay readable and
+# writable so a policy can be staged before activation.
+remediation:
+  enabled: false
+
+# The test installation declaration (ADR 0202 decision 1). Off by default, and
+# set only here: it is never derived from a channel name, a deployment's env,
+# a bundle, or anything an agent or a message says. Rendered as
+# CURIE_TEST_INSTALLATION_ENABLED and CURIE_TEST_INSTALLATION_DRIVERS into the
+# API and the dispatcher, and neither may be set through extraEnv.
+#
+# Turning it on is the operator's statement that every credential this
+# installation's agents hold reaches only test accounts, and that a driver's
+# Slack token is reachable by no agent other than the driver itself. A test
+# installation owns its Slack app exclusively (#2248).
+#
+# The chart refuses to render it on when api.environment is prod (a tripwire,
+# not evidence), when the API key, the worker token or the approval attester
+# secret is still the published default, or when a driver has no channel. The
+# API and the dispatcher refuse to boot on a published default secret too, and
+# the dispatcher's preflight refuses a driver that is this installation's
+# authorized identity (default), a sibling driver that names no agent, and a
+# sibling driver whose identity is bound to any other agent.
+#
+# Each driver is a channel id, a Slack bot id and that bot's user id, validated
+# like a dispatcher.threadedBotAllowlist pair. A sibling driver, another Slack
+# identity of this installation (dispatcher.slack.identities), also names the
+# one agent it serves:
+#   drivers:
+#     - channel_id: C0EXAMPLE1     # ^[CG][A-Z0-9]+$
+#       bot_id: B0EXAMPLE1         # ^B[A-Z0-9]+$
+#       bot_user_id: U0EXAMPLE1    # ^U[A-Z0-9]+$
+#     - channel_id: C0EXAMPLE1
+#       bot_id: B0EXAMPLE2
+#       bot_user_id: U0EXAMPLE2
+#       agent: acme-tester         # sibling driver only
+testInstallation:
+  enabled: false
+  drivers: []
+
 rustfs:
   deploy: true
   image: rustfs/rustfs:1.0.0-beta.12
@@ -1407,6 +1461,11 @@ api:
   githubCloneBase: "https://github.com"
   # REST base used by credential minting, polling, and managed publication.
   githubApiUrl: "https://api.github.com"
+  # Optional ConfigMap name whose key ca.pem is a private CA for a GitHub
+  # stub. Empty leaves TLS trust on the image bundle. When set, the api,
+  # worker, and runner sandbox mount it and point SSL_CERT_FILE,
+  # GIT_SSL_CAINFO, and REQUESTS_CA_BUNDLE at that file.
+  githubStubCaConfigMap: ""
   # How often (seconds) the API scans for lapsed pending approvals and resumes
   # their stranded sessions (#412). Set to 0 (or any value <= 0) to disable the
   # expiry sweeper entirely. Default matches the app's built-in 30s cadence.
@@ -2016,6 +2075,15 @@ worker:
     # How long the parked bytes are retained so a redelivery of the same turn can
     # still fetch them. Swept by the worker's existing reap_orphans tick.
     retentionTtlSeconds: 3600
+    # ADR 0205 decision 7: every boot of a thread rebuilds the thread's whole
+    # file set, so it is bounded per thread, separately from the per-message
+    # cap. Over either bound the newest files are kept and the omitted ones are
+    # named to the agent. threadMaxBytes must fit
+    # agentSandbox.runner.attachments.sizeLimit (the chart refuses to render
+    # otherwise), and the set has to arrive within that block's
+    # fetchTimeoutSeconds.
+    threadMaxFiles: 20
+    threadMaxBytes: 268435456
   publication:
     enabled: true
     # Short-lived Jobs and their scoped token Secret live outside the platform
@@ -2476,15 +2544,17 @@ preflights:
   # runs a CLUSTER-scope NetworkPolicy informer; if its RBAC cannot satisfy that
   # cluster LIST the manager crash-loops and no SandboxClaim ever binds (issue
   # #350). This post-install/upgrade hook Job fails the Helm operation unless the
-  # controller reaches "Starting workers" (all informer caches synced), so an RBAC
-  # regression fails at install, not at first turn. Gated also on
-  # agentSandbox.controller.deploy.
+  # controller logs "Starting workers" or its current Running pod has positive
+  # successful-reconcile metrics (all informer caches synced). Failure logs and
+  # pod restarts take precedence over either signal. The metrics counter survives
+  # startup-log rotation. Gated also on agentSandbox.controller.deploy.
   controllerReady:
     enabled: true
     image: alpine/k8s:1.31.2
-    # Max seconds to wait for the controller to become Available and log
-    # "Starting workers". Sized for a fresh install; an upgrade over a
-    # crash-looping controller may need a manual pod delete + `helm test`.
+    # Max seconds to wait for "Starting workers" or positive successful-reconcile
+    # metrics after checking for controller failures. Sized for a fresh install;
+    # an upgrade over a crash-looping controller may need a manual pod delete
+    # + `helm test`.
     timeoutSeconds: 180
     resources:
       requests: { cpu: 50m, memory: 64Mi }
@@ -2720,8 +2790,16 @@ agentSandbox:
       mountPath: /attachments
       # ADR-0059 decision 2: every writable emptyDir in the sandbox pod carries
       # a ceiling, so a hostile or broken store cannot fill the node. Sized
-      # above worker.attachments.maxFileBytes x the lane's 10-file set cap.
+      # above worker.attachments.maxFileBytes x the lane's 10-file set cap,
+      # and at least worker.attachments.threadMaxBytes (ADR 0205 decision 7;
+      # the chart refuses a budget this volume cannot hold).
       sizeLimit: 512Mi
+      # The overall deadline for one boot's fetches, current and earlier
+      # files together, on a monotonic clock. Each read's socket timeout is
+      # what is left of it. A current file that misses it refuses the boot; an
+      # earlier one is skipped and named to the agent as unavailable (ADR 0205
+      # decision 6), so a thread's history never lengthens a boot past it. It
+      # must stay inside worker.claimTimeoutSeconds (90 by default).
       fetchTimeoutSeconds: 45
     # Extra env for the runner container, list of {name, value}.
     # Per-workload OTEL_EXPORTER_OTLP_* overrides still win over the

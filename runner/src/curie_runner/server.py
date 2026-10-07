@@ -41,6 +41,7 @@ from aci_protocol import (
     TOOL_ACCESS_STATUS_FIELD,
     Event,
     Interrupt,
+    SessionStatus,
     parse_inbound,
 )
 from aiohttp import web
@@ -48,6 +49,8 @@ from aiohttp.typedefs import Handler, Middleware
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, extract_trace_context
 from pydantic import ValidationError
 
+from .executor import EXECUTOR_MODE, ExecuteRefusal, Executor
+from .executor import RUNNER_MODE_ENV as RUNNER_MODE_ENV
 from .session import SessionRunner
 from .turn_progress import ProgressCapability
 from .workspace_snapshot import WorkspaceSnapshot, WorkspaceSnapshotError
@@ -71,6 +74,9 @@ _GATED_PATHS = frozenset(
         "/v1/reset",
         "/v1/snapshot",
         "/v1/status",
+        # @spec ACTION-EXECUTOR-6: served only in executor mode; an ordinary
+        # runner answers 404 behind the same bearer.
+        "/v1/execute",
     }
 )
 
@@ -189,6 +195,89 @@ def create_app(
     )
     app.on_cleanup.append(_on_cleanup)
     return app
+
+
+EXECUTOR: web.AppKey[Executor] = web.AppKey("executor", Executor)
+# The control routes an executor-mode runner refuses, naming its mode.
+_EXECUTOR_REFUSED_ROUTES = (
+    "/v1/event",
+    "/v1/steer",
+    "/v1/interrupt",
+    "/v1/timeout",
+    "/v1/turn-admit",
+    "/v1/reset",
+    "/v1/snapshot",
+)
+
+
+def create_executor_app(
+    connectors: Mapping[str, Mapping[str, object]],
+    token: str | None = None,
+    attestation: Mapping[str, object] | None = None,
+) -> web.Application:
+    """Build the executor-mode application (ACTION-EXECUTOR-6).
+
+    @spec ACTION-EXECUTOR-4 @spec ACTION-EXECUTOR-6. ``connectors`` are the
+    connector MCP entries an ordinary boot derives (name to entry, headers
+    already materialized); ``attestation`` the credential-free boot facts
+    ``/v1/status`` carries behind the bearer. Serves ``/healthz``, ``/status``,
+    ``/v1/status`` and ``POST /v1/execute``; every other control route answers
+    409 naming the mode. No SessionRunner, harness or model session exists.
+    """
+
+    middlewares = [_auth_middleware(token)] if token else []
+    app = web.Application(middlewares=middlewares)
+    app[EXECUTOR] = Executor(connectors)
+    app[STATUS_ATTESTATION] = (
+        MappingProxyType(dict(attestation)) if token and attestation is not None else None
+    )
+    app.add_routes(
+        [
+            web.get("/healthz", _healthz),
+            web.get("/status", _executor_status),
+            web.get("/v1/status", _executor_status),
+            web.post("/v1/execute", _execute),
+            # The ordinary app's own routes, refused here; not new endpoints.
+            *(web.route("POST", path, _executor_refused) for path in _EXECUTOR_REFUSED_ROUTES),
+        ]
+    )
+    return app
+
+
+async def _executor_status(request: web.Request) -> web.Response:
+    executor = request.app[EXECUTOR]
+    # No turn epoch or capacity admission: an executor sandbox admits no turn.
+    body: dict[str, object] = {
+        "mode": EXECUTOR_MODE,
+        "status": SessionStatus.IDLE_AWAITING_INPUT.value,
+        "ready": True,
+        "turn_active": executor.turn_active,
+        "history_durable": False,
+    }
+    if request.path == "/v1/status":
+        attestation = cast("Mapping[str, object] | None", request.app[STATUS_ATTESTATION])
+        if attestation is not None:
+            body.update(attestation)
+    return web.json_response(body)
+
+
+async def _executor_refused(_request: web.Request) -> web.Response:
+    return web.json_response(
+        {"error": "runner is in executor mode", "mode": EXECUTOR_MODE}, status=409
+    )
+
+
+async def _execute(request: web.Request) -> web.Response:
+    executor = request.app[EXECUTOR]
+    try:
+        try:
+            body: object = await request.json()
+        except ValueError as exc:
+            raise ExecuteRefusal("invalid_request") from exc
+        answer = await executor.handle(body)
+    except ExecuteRefusal as refusal:
+        return web.json_response(refusal.body(), status=refusal.status)
+    return web.json_response(answer)
 
 
 async def _on_cleanup(app: web.Application) -> None:

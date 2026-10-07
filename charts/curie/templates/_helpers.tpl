@@ -168,6 +168,17 @@ affinity:
 ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS ANTHROPIC_CUSTOM_HEADERS
 {{- end -}}
 
+{{/* @spec ACTION-EXECUTOR-16: the reserved snapshot sealing key names. The
+     source of truth is packages/curie-internal (module sealing_key); Helm
+     cannot import Python, so this is the second copy. Kept apart from
+     curie.reservedConnectorSecretNames because these are not boot-env names:
+     they are refused for a different reason (key custody) with a different
+     message, and the boot-env drift pin scans that define exactly. Emitted
+     space-separated for consumption via `splitList " "`. */}}
+{{- define "curie.sealingKeyNames" -}}
+SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED
+{{- end -}}
+
 {{/* ---- Backing-store hosts (in-cluster Service name, or BYO host) ---- */}}
 
 {{- define "curie.postgres.host" -}}
@@ -2273,4 +2284,31 @@ and every string in agentSandbox.poolAgents.
 {{- end -}}
 {{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) $extra -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
+{{- end -}}
+
+{{/*
+The action executor switch (ACTION-EXECUTOR-1): one value, rendered as "true"
+or "false" into both the API and the worker, so the two processes can never
+disagree about whether executions are created and claimed. Read through
+`default dict` because `actionExecutor` is a top level key a release that
+predates it does not carry under --reuse-values (#3505, #3544).
+*/}}
+{{- define "curie.actionExecutorEnabled" -}}
+{{- if (get (.Values.actionExecutor | default dict) "enabled") -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+
+{{/*
+The automated remediation switch (AUTOMATED-REMEDIATION-1): one value, rendered
+as "true" or "false" into both the API and the worker. Enabling it requires the
+action executor, so a render with remediation on and the executor off fails
+here, in the one helper both workloads include. Read through `default dict`
+for --reuse-values from a release that predates the key.
+*/}}
+{{- define "curie.remediationEnabled" -}}
+{{- if (get (.Values.remediation | default dict) "enabled") -}}
+{{- if ne (include "curie.actionExecutorEnabled" .) "true" -}}
+{{- fail "remediation.enabled=true requires actionExecutor.enabled=true (AUTOMATED-REMEDIATION-1): automated remediation executes through the connector action executor" -}}
+{{- end -}}
+true
+{{- else -}}false{{- end -}}
 {{- end -}}
