@@ -374,6 +374,9 @@ pub(crate) enum ActionsCommand<C: clap::Args> {
         /// Scope to one agent (name or id).
         #[arg(long, value_name = "NAME_OR_ID")]
         agent: Option<String>,
+        /// Scope to one conversation (thread) id.
+        #[arg(long, value_name = "ID")]
+        conversation: Option<String>,
         #[command(flatten)]
         conn: C,
     },
@@ -410,7 +413,17 @@ impl<C: clap::Args> ActionsCommand<C> {
     /// Split the verb from its connection flags.
     pub(crate) fn into_parts(self) -> (commands::ActionsVerb, C) {
         match self {
-            ActionsCommand::List { agent, conn } => (commands::ActionsVerb::List { agent }, conn),
+            ActionsCommand::List {
+                agent,
+                conversation,
+                conn,
+            } => (
+                commands::ActionsVerb::List {
+                    agent,
+                    conversation,
+                },
+                conn,
+            ),
             ActionsCommand::Show { id, conn } => (commands::ActionsVerb::Show { id }, conn),
             ActionsCommand::Undo { id, conn } => (commands::ActionsVerb::Undo { id }, conn),
             ActionsCommand::Execution { id, conn } => {

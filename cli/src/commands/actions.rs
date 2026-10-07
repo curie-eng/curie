@@ -15,10 +15,19 @@ use crate::api::{ActionExecution, ActionRecord, ActionUndoReceipt, ApiClient};
 // @spec ACTION-EXECUTOR-23
 /// The verb an `actions` invocation runs, as the dispatcher hands it over.
 pub enum ActionsVerb {
-    List { agent: Option<String> },
-    Show { id: String },
-    Undo { id: String },
-    Execution { id: String },
+    List {
+        agent: Option<String>,
+        conversation: Option<String>,
+    },
+    Show {
+        id: String,
+    },
+    Undo {
+        id: String,
+    },
+    Execution {
+        id: String,
+    },
 }
 
 // @spec ACTION-EXECUTOR-23
@@ -130,7 +139,8 @@ impl crate::ui::CliOutput for ActionsOutput {
                 ui.payload_plain(&trimmed.join("\n"));
                 if *truncated {
                     ui.payload_plain(&format!(
-                        "(showing the first {} actions; more exist)",
+                        "(showing the oldest {} actions; more may exist. The list is oldest \
+                         first, so narrow it with --agent or --conversation to reach recent ones)",
                         ApiClient::ACTIONS_LIST_LIMIT
                     ));
                 }
@@ -240,7 +250,13 @@ impl ActionsVerb {
     /// missing principal should trigger).
     pub fn validate(self) -> Result<ValidatedActions> {
         let verb = match self {
-            ActionsVerb::List { agent } => ActionsVerb::List { agent },
+            ActionsVerb::List {
+                agent,
+                conversation,
+            } => ActionsVerb::List {
+                agent,
+                conversation,
+            },
             ActionsVerb::Show { id } => ActionsVerb::Show {
                 id: validated_id("action", &id)?,
             },
@@ -272,13 +288,19 @@ pub async fn actions(opts: ActionsOpts, validated: ValidatedActions) -> Result<A
         ApiClient::new(&opts.api_url, &opts.api_key)?
     };
     match verb {
-        ActionsVerb::List { agent } => {
+        ActionsVerb::List {
+            agent,
+            conversation,
+        } => {
             let resolved = match &agent {
                 Some(agent) => Some(client.find_agent(agent).await?),
                 None => None,
             };
             let actions = client
-                .list_actions(resolved.as_ref().map(|agent| agent.id.as_str()))
+                .list_actions(
+                    resolved.as_ref().map(|agent| agent.id.as_str()),
+                    conversation.as_deref(),
+                )
                 .await?;
             let truncated = actions.len() >= ApiClient::ACTIONS_LIST_LIMIT;
             Ok(ActionsOutput::List {

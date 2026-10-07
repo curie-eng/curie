@@ -3792,12 +3792,21 @@ impl ApiClient {
     pub const ACTIONS_LIST_LIMIT: usize = 200;
 
     // @spec ACTION-EXECUTOR-23
-    /// Ledger actions: `GET /actions[?agent_id=..]&limit=..`, on the platform key.
-    pub async fn list_actions(&self, agent_id: Option<&str>) -> Result<Vec<ActionRecord>> {
+    /// Ledger actions: `GET /actions[?agent_id=..][&conversation_id=..]&limit=..`,
+    /// on the platform key.
+    /// The API answers oldest first, so a full page is the oldest actions.
+    pub async fn list_actions(
+        &self,
+        agent_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<Vec<ActionRecord>> {
         let limit = Self::ACTIONS_LIST_LIMIT.to_string();
         let mut query: Vec<(&str, &str)> = Vec::new();
         if let Some(agent_id) = agent_id {
             query.push(("agent_id", agent_id));
+        }
+        if let Some(conversation_id) = conversation_id {
+            query.push(("conversation_id", conversation_id));
         }
         query.push(("limit", limit.as_str()));
         let resp = self

@@ -2076,6 +2076,14 @@ export const commandManifest = {
                   "required": false
                 },
                 {
+                  "global": false,
+                  "help": "Scope to one conversation (thread) id",
+                  "id": "conversation",
+                  "long": "conversation",
+                  "positional": false,
+                  "required": false
+                },
+                {
                   "default_values": [
                     "http://localhost:28000"
                   ],
@@ -6947,6 +6955,14 @@ export const commandManifest = {
                   "help": "Scope to one agent (name or id)",
                   "id": "agent",
                   "long": "agent",
+                  "positional": false,
+                  "required": false
+                },
+                {
+                  "global": false,
+                  "help": "Scope to one conversation (thread) id",
+                  "id": "conversation",
+                  "long": "conversation",
                   "positional": false,
                   "required": false
                 },
