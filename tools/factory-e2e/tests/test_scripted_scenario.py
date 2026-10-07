@@ -13,6 +13,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -175,3 +176,96 @@ def test_scripted_release_cannot_take_ownership_of_the_ladder_policy() -> None:
     kind = _load_kind()
     assert kind.ScriptedPreflight.release == "curie-factory-scripted"
     assert kind.ScriptedPreflight.release != kind.fe.Preflight.release
+
+
+@pytest.mark.parametrize("owner", ["owned-run", "foreign-run", "timeout"])
+def test_failure_diagnostics_are_owned_bounded_and_exclude_specs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, owner: str
+) -> None:
+    kind = _load_kind()
+    calls = []
+
+    def kubectl(argv, **kwargs):
+        calls.append(argv)
+        assert kwargs["timeout"] == 15
+        assert "--request-timeout=10s" in argv
+        assert "--context" in argv and "kind-example" in argv
+        if "namespace" in argv:
+            if owner == "timeout":
+                raise subprocess.TimeoutExpired(argv, 15)
+            return subprocess.CompletedProcess(argv, 0, owner, "")
+        assert argv[argv.index("-n") + 1] == "test-factory-diagnostic"
+        assert not any(part in {"secrets", "describe", "-A", "yaml", "json"} for part in argv)
+        if "logs" in argv:
+            assert "job/curie-factory-scripted-schema-migrate" in argv
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "Waiting for Postgres readiness "
+                "postgresql://user:example-password@postgres/db example-provider-key",
+                "",
+            )
+        return subprocess.CompletedProcess(argv, 0, "schema-migrate Pending Unschedulable", "")
+
+    monkeypatch.setattr(kind.subprocess, "run", kubectl)
+    preflight = SimpleNamespace(
+        config=SimpleNamespace(kube_context="kind-example", model_api_key="example-provider-key"),
+        namespace="test-factory-diagnostic",
+        run_id="owned-run",
+        release="curie-factory-scripted",
+    )
+    diagnostics = kind.collect_failure_diagnostics(preflight)
+    if owner == "owned-run":
+        assert "Unschedulable" in diagnostics["pods"]["output"]
+        assert "Waiting for Postgres readiness" in diagnostics["schema_log"]["output"]
+        assert "example-password" not in str(diagnostics)
+        assert "example-provider-key" not in str(diagnostics)
+        assert {"pods", "jobs", "events", "schema_log"} <= diagnostics.keys()
+    else:
+        assert len(calls) == 1
+        assert diagnostics["ownership"] != "verified"
+
+
+@pytest.mark.parametrize("diagnostic_error", [False, True])
+def test_failure_diagnostics_precede_cleanup_without_masking_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, diagnostic_error: bool
+) -> None:
+    kind = _load_kind()
+    order = []
+
+    def diagnostics(_):
+        order.append("diagnostic")
+        if diagnostic_error:
+            raise RuntimeError("example-private-detail")
+        return {"ownership": "verified"}
+
+    monkeypatch.setattr(
+        kind,
+        "collect_failure_diagnostics",
+        diagnostics,
+        raising=False,
+    )
+    teardown = kind.fe.Teardown()
+    teardown.push("delete owned namespace", lambda: order.append("cleanup") or {})
+    workdir = tmp_path / "owned"
+    workdir.mkdir()
+    preflight = SimpleNamespace(
+        teardown=teardown,
+        evidence={},
+        workdir=workdir,
+        write_evidence=lambda: None,
+    )
+    code, _ = kind.finish_run(
+        preflight,
+        kind.fe.Teardown(),
+        SimpleNamespace(_exchanges=[]),
+        code=kind.fe.EXIT_FAILED,
+        record=True,
+    )
+    assert order == ["diagnostic", "cleanup"]
+    assert code == kind.fe.EXIT_FAILED
+    if diagnostic_error:
+        assert preflight.evidence["failure_diagnostics"] == {"error": "RuntimeError"}
+    else:
+        assert preflight.evidence["failure_diagnostics"]["ownership"] == "verified"
+    assert not workdir.exists()

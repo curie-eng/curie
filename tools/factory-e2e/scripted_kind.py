@@ -14,9 +14,11 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import ssl
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -273,6 +275,81 @@ def run_scenario(preflight: ScriptedPreflight) -> dict[str, Any]:
     return result
 
 
+def collect_failure_diagnostics(preflight: ScriptedPreflight) -> dict[str, Any]:
+    """Read bounded status and hook logs before deleting this run's namespace.
+
+    Never fetch Secrets, pod specs, environment values, or another namespace.
+    A missing or mismatched ownership marker refuses every workload query.
+    """
+    base = ["kubectl", "--context", preflight.config.kube_context, "--request-timeout=10s"]
+
+    def capture(args: list[str]) -> dict[str, Any]:
+        try:
+            result = subprocess.run(
+                [*base, *args], capture_output=True, text=True, check=False, timeout=15
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"error": type(exc).__name__}
+        output = result.stdout[-12000:] if result.returncode == 0 else ""
+        for name in ("model_api_key", "actor_token", "webhook_secret"):
+            secret = getattr(preflight.config, name, None)
+            if secret:
+                output = output.replace(secret, "[redacted]")
+        output = re.sub(r"(\w+://)[^\s/@]+:[^\s/@]+@", r"\1[redacted]@", output)
+        return {"exit_code": result.returncode, "output": output}
+
+    marker = capture(
+        [
+            "get",
+            "namespace",
+            preflight.namespace,
+            "--ignore-not-found",
+            "-o",
+            "jsonpath={.metadata.annotations.curie\\.dev/factory-e2e-run}",
+        ]
+    )
+    if marker.get("output", "").strip() != preflight.run_id:
+        return {"ownership": "unverified", "read_error": marker.get("error")}
+    prefix = ["-n", preflight.namespace]
+    queries = {
+        "pods": [
+            "get",
+            "pods",
+            "-o",
+            "custom-columns=NAME:.metadata.name,PHASE:.status.phase,REASON:.status.reason,"
+            "NODE:.spec.nodeName,WAITING:.status.containerStatuses[*].state.waiting.reason,"
+            "TERMINATED:.status.containerStatuses[*].state.terminated.reason,"
+            "RESTARTS:.status.containerStatuses[*].restartCount",
+        ],
+        "jobs": [
+            "get",
+            "jobs",
+            "-o",
+            "custom-columns=NAME:.metadata.name,ACTIVE:.status.active,SUCCEEDED:.status.succeeded,"
+            "FAILED:.status.failed,REASONS:.status.conditions[*].reason",
+        ],
+        "events": [
+            "get",
+            "events",
+            "--sort-by=.metadata.creationTimestamp",
+            "-o",
+            "custom-columns=OBJECT:.involvedObject.name,REASON:.reason,MESSAGE:.message",
+        ],
+        "schema_log": [
+            "logs",
+            f"job/{preflight.release}-schema-migrate",
+            "--all-containers=true",
+            "--tail=80",
+            "--limit-bytes=12000",
+            "--pod-running-timeout=5s",
+        ],
+    }
+    return {
+        "ownership": "verified",
+        **{name: capture([*prefix, *args]) for name, args in queries.items()},
+    }
+
+
 def finish_run(
     preflight: ScriptedPreflight | None,
     fixtures: fe.Teardown,
@@ -281,6 +358,13 @@ def finish_run(
     code: int,
     record: bool,
 ) -> tuple[int, list[dict[str, Any]]]:
+    if preflight is not None and code != 0:
+        try:
+            diagnostics = collect_failure_diagnostics(preflight)
+        except BaseException as exc:  # noqa: BLE001 - diagnostics cannot prevent owned cleanup
+            diagnostics = {"error": type(exc).__name__}
+        preflight.evidence["failure_diagnostics"] = diagnostics
+        print(f"factory-e2e: failure diagnostics {json.dumps(diagnostics)}", file=sys.stderr)
     cleanup = preflight.teardown.run() if preflight is not None else []
     cleanup += fixtures.run()
     if not all(result["ok"] for result in cleanup) or (model is not None and not model._exchanges):
