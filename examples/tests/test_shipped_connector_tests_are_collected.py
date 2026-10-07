@@ -91,6 +91,23 @@ def test_all_python_tests_are_collected() -> None:
     assert not missing, f"Python tests outside pytest testpaths: {missing!r}"
 
 
+# @spec ACTION-EXECUTOR-9: the reference reversible connector is a hosted test
+# fixture outside examples/, so the per-connector cases below never see it; its
+# tests are pinned to a collection root by name.
+REFERENCE_CONNECTOR = REPO / "cli/scripts/fixtures/reversible-reference"
+
+
+def test_the_reference_connector_fixture_tests_are_collected() -> None:
+    test_files = sorted(REFERENCE_CONNECTOR.glob("test_*.py"))
+    assert test_files, f"{REFERENCE_CONNECTOR.relative_to(REPO)} ships no test_*.py file"
+    testpaths = _testpaths()
+    for test_file in test_files:
+        assert _is_collected(test_file, testpaths), (
+            f"'{test_file.relative_to(REPO)}' falls under none of pyproject.toml's "
+            f"testpaths, so `uv run pytest -q` never collects it."
+        )
+
+
 def test_collection_audit_rejects_a_planted_test(tmp_path: Path) -> None:
     planted = tmp_path / "observability/test_planted.py"
     planted.parent.mkdir()

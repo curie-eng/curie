@@ -564,3 +564,149 @@ def test_every_vector_envelope_gets_the_grammars_outcome(connector: Any) -> None
         code = "sealing_key_unavailable" if valid else "snapshot_unopenable"
         assert outcomes[name] == (False, _REFUSAL[code]["structured"]), name
     assert process.record() == {"replicas": 3, "version": "seed-1"}
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1: check order, argument types, key configuration.
+# --------------------------------------------------------------------------- #
+
+
+def test_restore_checks_run_in_the_documented_order(connector: Any) -> None:
+    """@spec ACTION-EXECUTOR-9 @spec ACTION-EXECUTOR-15 @spec ACTION-EXECUTOR-16.
+
+    The order in the task plan: envelope grammar (``snapshot_unopenable``), kid
+    held (``sealing_key_unavailable``), open with the target as associated data
+    (``snapshot_unopenable``), compare-and-swap (``version_conflict``), write.
+    Each case below fails every later check too, so only the documented order
+    yields the expected code. A malformed target is not a check of its own: it
+    reaches the open and fails there, as a structured refusal, never a tool
+    error.
+    """
+
+    current, _ = _key(_KID_A)
+    process = connector(**_sealing_env(current))
+    reply = _scale(process, 5)
+    before = process.record()
+    malformed_target = {"kind": _TARGET["kind"], "namespace": _TARGET["namespace"]}
+    foreign = {**reply["prior"], "kid": "example-key-not-held"}
+    ungrammatical = {**foreign, "sealed": "example.wrong.constant"}
+    raw = bytearray(base64.b64decode(reply["prior"]["ciphertext"]))
+    raw[-1] ^= 0x01
+    tampered = {**reply["prior"], "ciphertext": base64.b64encode(bytes(raw)).decode("ascii")}
+    stale = "example-stale-version"
+
+    cases = [
+        ("grammar_before_kid_and_target", malformed_target, ungrammatical, "snapshot_unopenable"),
+        ("kid_before_target_and_cas", malformed_target, foreign, "sealing_key_unavailable"),
+        ("target_fails_the_open", malformed_target, reply["prior"], "snapshot_unopenable"),
+        ("open_before_cas", _TARGET, tampered, "snapshot_unopenable"),
+        ("cas_last", _TARGET, reply["prior"], "version_conflict_at_write"),
+    ]
+    for name, target, prior, code in cases:
+        got = process.call(
+            "restore", {"target": target, "prior_state": prior, "expected_version": stale}
+        )
+        expected = _REFUSAL[code]
+        assert got == (expected["is_error"], expected["structured"]), name
+        assert process.record() == before, name
+
+
+@pytest.mark.parametrize("replicas", [True, False])
+def test_scale_rejects_a_boolean_replica_count(connector: Any, replicas: bool) -> None:
+    """@spec ACTION-EXECUTOR-9: a bool is not a count; nothing is written or sealed."""
+
+    current, _ = _key(_KID_A)
+    process = connector(**_sealing_env(current))
+    is_error, reply = process.call("scale", {"target": _TARGET, "replicas": replicas})
+
+    assert is_error is True, reply
+    assert process.record() == {"replicas": 3, "version": "seed-1"}
+
+
+def _startup(tmp_path: Path, env: dict[str, str]) -> tuple[int | None, str]:
+    """Start the fixture and wait for it to exit; ``None`` if it kept running."""
+
+    if not _SERVER.is_file():
+        pytest.fail(f"reference connector fixture missing: {_SERVER} does not exist")
+    store = tmp_path / "startup-store.json"
+    store.write_text(json.dumps({_KEY: {"replicas": 3, "version": "seed-1"}}), "utf-8")
+    child_env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("SNAPSHOT_SEALING_", "REFERENCE_"))
+    }
+    child_env.update(
+        {
+            "BIND_ADDRESS": "127.0.0.1",
+            "PORT": str(_free_port()),
+            "REFERENCE_STORE_PATH": str(store),
+            **env,
+        }
+    )
+    process = subprocess.Popen(
+        [sys.executable, str(_SERVER)],
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        output, _ = process.communicate(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate(timeout=5)
+        return None, output.decode("utf-8", "replace")
+    return process.returncode, output.decode("utf-8", "replace")
+
+
+def _key_text(entry: str) -> str:
+    return entry.partition(":")[2]
+
+
+def test_a_retained_key_reusing_the_current_kid_refuses_to_start(tmp_path: Path) -> None:
+    """@spec ACTION-EXECUTOR-16: one kid names one key; a shadowed key fails closed.
+
+    A retained entry under the current key's kid could never open anything (the
+    current key wins the lookup), so the configuration is refused at startup
+    rather than silently ignored. The refusal names no key material.
+    """
+
+    current, _ = _key(_KID_A)
+    retained, _ = _key(_KID_A)
+    code, output = _startup(
+        tmp_path,
+        {"SNAPSHOT_SEALING_KEY": current, "SNAPSHOT_SEALING_KEYS_RETAINED": retained},
+    )
+
+    assert code is not None and code != 0, output
+    assert _key_text(current) not in output and _key_text(retained) not in output
+
+
+def test_two_retained_keys_with_one_kid_refuse_to_start(tmp_path: Path) -> None:
+    """@spec ACTION-EXECUTOR-16: a duplicate retained kid fails closed too."""
+
+    current, _ = _key(_KID_B)
+    first, _ = _key(_KID_A)
+    second, _ = _key(_KID_A)
+    code, output = _startup(
+        tmp_path,
+        {
+            "SNAPSHOT_SEALING_KEY": current,
+            "SNAPSHOT_SEALING_KEYS_RETAINED": f"{first},{second}",
+        },
+    )
+
+    assert code is not None and code != 0, output
+    for entry in (current, first, second):
+        assert _key_text(entry) not in output
+
+
+def test_distinct_retained_kids_start(tmp_path: Path) -> None:
+    """The control for the two refusals above: distinct kids keep running."""
+
+    current, _ = _key(_KID_B)
+    retained, _ = _key(_KID_A)
+    code, output = _startup(
+        tmp_path,
+        {"SNAPSHOT_SEALING_KEY": current, "SNAPSHOT_SEALING_KEYS_RETAINED": retained},
+    )
+    assert code is None, output
