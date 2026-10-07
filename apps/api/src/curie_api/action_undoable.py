@@ -19,7 +19,9 @@ undo ruling goes through ``undo_refusal``. Both answer from one derivation, so
 the single read, the list read and the ruling cannot disagree. Each missing
 ingredient maps to its ruling code (``refused_no_agent``, ``refused_unsealed``,
 ``refused_unversioned``, ``refused_no_digest``, ``refused_restore_in_flight``,
-``refused_not_restore_capable``, ``refused_key_custody``).
+``refused_not_restore_capable``, ``refused_key_custody``), and a record a
+forward execution created is ``refused_authority_unresolved`` before any of
+them (ACTION-EXECUTOR-19).
 
 The checks run cheapest first and only for records still in the running, so a
 read of rows that are not sealed (every legacy row) never touches the database
@@ -134,6 +136,20 @@ async def sealing_custody(
     return custody
 
 
+def authority_refusal(action: AgentAction) -> str | None:
+    """``refused_authority_unresolved`` for a platform-executed forward record.
+
+    @spec ACTION-EXECUTOR-19: a record a forward execution created carries the
+    authority that permitted it (``policy`` or ``approval``). Until #4068
+    delivers authority-aware undo authorization, its undo is refused, and ADR
+    0117 decision 3's ungated default must not apply: its ``gate_approval_id``
+    is null because no turn gated it, not because nothing authorized it. Any
+    recorded authority counts, so an authority kind added later fails closed.
+    """
+
+    return "refused_authority_unresolved" if action.authority_kind is not None else None
+
+
 async def _refusals(
     session: AsyncSession, store: ObjectStore, actions: Sequence[AgentAction]
 ) -> dict[uuid.UUID, str | None]:
@@ -146,7 +162,8 @@ async def _refusals(
     """
 
     refusals: dict[uuid.UUID, str | None] = {
-        action.id: action.restore_record_refusal() for action in actions
+        action.id: authority_refusal(action) or action.restore_record_refusal()
+        for action in actions
     }
     candidates = [action for action in actions if refusals[action.id] is None]
     if not candidates:

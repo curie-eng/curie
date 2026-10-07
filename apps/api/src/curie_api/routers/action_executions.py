@@ -5,9 +5,15 @@ executions, and it can only produce a ``tools/list``: its body is exactly
 ``{agent_id, connector, digest}`` and a probe can never commit ``dispatched``.
 @spec ACTION-EXECUTOR-18: the worker claims and reports through
 ``POST /action-executions/claim``, ``.../{id}/observation``,
-``.../{id}/dispatch``, ``.../{id}/outcome`` and ``GET /action-executions/{id}``.
-Each transition presents the fence the claim returned, is idempotent for the
-same fence and payload, and answers ``409`` for a conflicting one.
+``.../{id}/dispatch``, ``.../{id}/outcome`` and ``GET /action-executions/{id}``,
+plus ``.../{id}/arguments``, the holder's read of a forward execution's bound
+call (ACTION-EXECUTOR-7, -19). Each transition presents the fence the claim
+returned, is idempotent for the same fence and payload, and answers ``409`` for
+a conflicting one.
+
+@spec ACTION-EXECUTOR-19: a forward execution dispatches without observing,
+and its ``dispatched`` commit creates exactly one ``agent_actions`` row in the
+same transaction, which the execution names as its subject.
 
 @spec ACTION-EXECUTOR-15 and the ACTION-EXECUTOR-20 amendment: the worker posts
 the version ``observe_version`` reported and the API, as ledger owner, compares
@@ -44,6 +50,7 @@ from ..deps import SessionDep
 from ..models import (
     ActionAuditEntry,
     ActionExecution,
+    ActionStatus,
     Agent,
     AgentAction,
     ConnectorCapability,
@@ -51,6 +58,7 @@ from ..models import (
     ExecutionState,
 )
 from ..schemas.action_executions import (
+    ExecutionArguments,
     ExecutionClaim,
     ExecutionCreated,
     ExecutionFence,
@@ -482,9 +490,9 @@ async def dispatch_execution(
 
     @spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``
     restore whose observed version equalled the recorded one dispatches. A
-    probe never does (ACTION-EXECUTOR-1). A forward execution dispatches only
-    once the API creates its ledger row at dispatch (ACTION-EXECUTOR-19), which
-    is not built yet, so it is refused here too.
+    probe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a
+    ``claimed`` forward execution dispatches without observing, and the commit
+    creates its one ledger row; a replay answers the row it already names.
     """
 
     execution = await _locked(session, execution_id)
@@ -500,16 +508,98 @@ async def dispatch_execution(
         return _out(execution)
     if execution.state != ExecutionState.claimed:
         raise _conflict(f"an execution in state {execution.state} cannot dispatch")
-    if execution.kind != ExecutionKind.restore:
+    if execution.kind == ExecutionKind.forward:
+        await _record_forward_action(session, execution)
+    elif execution.kind != ExecutionKind.restore:
         raise _conflict(f"a {execution.kind} execution cannot dispatch")
-    seen, _ = _observed(execution)
-    if not seen:
+    elif not _observed(execution)[0]:
         raise _conflict("a restore dispatches only after an unchanged version is observed")
     execution.state = ExecutionState.dispatched
     execution.dispatched_at = now
     await session.commit()
     await session.refresh(execution)
     return _out(execution)
+
+
+# A forward call's ledger row is joined to its execution by this key, which is
+# both its ``dedupe_key`` and its ``call_id`` (ACTION-EXECUTOR-19).
+_FORWARD_CALL_PREFIX = "exec:"
+# The conversation a platform-executed call is listed under: the execution's
+# own thread key, as the worker claims its sandbox under it.
+_FORWARD_CONVERSATION_PREFIX = "action-exec:"
+
+
+async def _record_forward_action(session: AsyncSession, execution: ActionExecution) -> None:
+    """@spec ACTION-EXECUTOR-19: the one ``agent_actions`` row of a forward call.
+
+    Written in the dispatch transaction, before any request leaves: ``dedupe_key``
+    and ``call_id`` both ``exec:<execution id>``, tool
+    ``mcp__<connector>__<tool>``, the canonical arguments the authority bound, the
+    authority fields, and ``connector`` and ``connector_digest`` copied from the
+    execution, status ``pending`` and no gating approval. The execution names it
+    as its subject. The dedupe key makes a second insert adopt the first row.
+    """
+
+    if not execution.tool or execution.forward_arguments is None:
+        raise _conflict("this forward execution has no bound call")
+    key = f"{_FORWARD_CALL_PREFIX}{execution.id}"
+    action_id = await session.scalar(
+        insert(AgentAction)
+        .values(
+            id=uuid.uuid4(),
+            agent_id=execution.agent_id,
+            conversation_id=f"{_FORWARD_CONVERSATION_PREFIX}{execution.id}",
+            call_id=key,
+            tool=f"mcp__{execution.connector}__{execution.tool}",
+            arguments=execution.forward_arguments,
+            gate_approval_id=None,
+            status=ActionStatus.pending.value,
+            dedupe_key=key,
+            connector=execution.connector,
+            connector_digest=execution.connector_digest,
+            authority_kind=execution.authority_kind,
+            authority_ref=execution.authority_ref,
+        )
+        .on_conflict_do_nothing(index_elements=["dedupe_key"])
+        .returning(AgentAction.id)
+    )
+    if action_id is None:
+        action_id = await session.scalar(
+            select(AgentAction.id).where(
+                AgentAction.dedupe_key == key, AgentAction.agent_id == execution.agent_id
+            )
+        )
+    if action_id is None:
+        raise _conflict("the ledger row of this forward call could not be recorded")
+    execution.subject_action_id = action_id
+
+
+@router.post("/{execution_id}/arguments", response_model=ExecutionArguments)
+async def read_arguments(
+    execution_id: uuid.UUID, data: ExecutionFence, session: SessionDep
+) -> ExecutionArguments:
+    """The bound tool and arguments of the claimed forward execution this fence holds.
+
+    @spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19. The worker recomputes
+    ``arguments_sha256`` over the text it will send and refuses
+    ``arguments_mismatch`` on any difference, so it needs the bound arguments
+    before dispatch; ``ExecutionOut`` never carries them. The body is exactly
+    the fence (a body naming a tool or arguments is a 422), a stale fence is a
+    ``409``, and only a ``claimed`` forward execution answers. Nothing moves.
+    """
+
+    execution = await _locked(session, execution_id)
+    now = await _now(session)
+    _check_fence(execution, data, now)
+    if execution.kind != ExecutionKind.forward:
+        raise _conflict(f"a {execution.kind} execution has no bound arguments")
+    if execution.state != ExecutionState.claimed:
+        raise _conflict(f"an execution in state {execution.state} reads no arguments")
+    if not execution.tool or execution.forward_arguments is None:
+        raise _conflict("this forward execution has no bound call")
+    answer = ExecutionArguments(tool=execution.tool, arguments=execution.forward_arguments)
+    await session.commit()
+    return answer
 
 
 def _reported(execution: ActionExecution) -> tuple[str, str | None, bool | None]:

@@ -5126,6 +5126,26 @@
         "title": "EvalTriggerResult",
         "type": "object"
       },
+      "ExecutionArguments": {
+        "description": "A claimed forward execution's bound call, read by its holder only.\n\n@spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19: the worker recomputes\n``arguments_sha256`` over the text it sends, so it reads the tool and the\narguments the authority bound under its fence before dispatch. Answered\nonly by ``POST /action-executions/{id}/arguments`` (internal worker token);\n``ExecutionOut`` keeps carrying no argument.",
+        "properties": {
+          "arguments": {
+            "additionalProperties": true,
+            "title": "Arguments",
+            "type": "object"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool",
+          "arguments"
+        ],
+        "title": "ExecutionArguments",
+        "type": "object"
+      },
       "ExecutionClaim": {
         "additionalProperties": false,
         "description": "@spec ACTION-EXECUTOR-17: who claims, and for how long the lease holds.",
@@ -11739,9 +11759,79 @@
         ]
       }
     },
+    "/action-executions/{execution_id}/arguments": {
+      "post": {
+        "description": "The bound tool and arguments of the claimed forward execution this fence holds.\n\n@spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19. The worker recomputes\n``arguments_sha256`` over the text it will send and refuses\n``arguments_mismatch`` on any difference, so it needs the bound arguments\nbefore dispatch; ``ExecutionOut`` never carries them. The body is exactly\nthe fence (a body naming a tool or arguments is a 422), a stale fence is a\n``409``, and only a ``claimed`` forward execution answers. Nothing moves.",
+        "operationId": "read_arguments_action_executions__execution_id__arguments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionFence"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionArguments"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Arguments",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
     "/action-executions/{execution_id}/dispatch": {
       "post": {
-        "description": "Commit ``dispatched``, the last step before a write call.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``\nrestore whose observed version equalled the recorded one dispatches. A\nprobe never does (ACTION-EXECUTOR-1). A forward execution dispatches only\nonce the API creates its ledger row at dispatch (ACTION-EXECUTOR-19), which\nis not built yet, so it is refused here too.",
+        "description": "Commit ``dispatched``, the last step before a write call.\n\n@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``\nrestore whose observed version equalled the recorded one dispatches. A\nprobe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a\n``claimed`` forward execution dispatches without observing, and the commit\ncreates its one ledger row; a replay answers the row it already names.",
         "operationId": "dispatch_execution_action_executions__execution_id__dispatch_post",
         "parameters": [
           {

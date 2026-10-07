@@ -11,6 +11,7 @@ execution reads back as identity, state, fence and codes only.
 
 import uuid
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -114,3 +115,17 @@ class ExecutionOut(BaseModel):
     created_at: datetime
     connector_digest: str
     arguments_sha256: str | None
+
+
+class ExecutionArguments(BaseModel):
+    """A claimed forward execution's bound call, read by its holder only.
+
+    @spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19: the worker recomputes
+    ``arguments_sha256`` over the text it sends, so it reads the tool and the
+    arguments the authority bound under its fence before dispatch. Answered
+    only by ``POST /action-executions/{id}/arguments`` (internal worker token);
+    ``ExecutionOut`` keeps carrying no argument.
+    """
+
+    tool: str
+    arguments: dict[str, Any]

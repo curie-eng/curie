@@ -45,7 +45,7 @@ from curie_api.schemas.actions import (
     ActionUndoOut,
 )
 
-from ..action_undoable import undo_refusal, undoable_action_ids
+from ..action_undoable import authority_refusal, undo_refusal, undoable_action_ids
 from ..approval_auth import (
     ADAPTER_PRINCIPAL_HEADER,
     APPROVAL_ACTOR_HEADER,
@@ -226,6 +226,10 @@ _INGREDIENT_REASONS = {
     "refused_not_restore_capable": "this connector image is not known to restore",
     "refused_key_custody": (
         "the agent's in-force version does not hold the sealing key for this connector"
+    ),
+    "refused_authority_unresolved": (
+        "the platform executed this action under a policy or an approval, and undo "
+        "authorization for that authority is not available yet"
     ),
 }
 
@@ -471,6 +475,21 @@ async def undo_action(
             reason="the request names an actor other than the authenticated principal",
             code=status.HTTP_403_FORBIDDEN,
             authorizer="principal",
+        )
+
+    # @spec ACTION-EXECUTOR-19: a forward-executed record's authority is not
+    # resolvable until #4068, so authorization itself cannot be decided; the
+    # ungated default below must not apply to it.
+    unresolved = authority_refusal(action)
+    if unresolved is not None:
+        await _refuse(
+            session,
+            action.id,
+            principal,
+            kind=unresolved,
+            reason=_INGREDIENT_REASONS[unresolved],
+            code=status.HTTP_409_CONFLICT,
+            authorizer=str(action.authority_kind),
         )
 
     authorizer, allowed, reason = await _authorize_undo(session, action, principal, approver_sets)
