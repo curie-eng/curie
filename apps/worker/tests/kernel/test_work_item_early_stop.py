@@ -388,7 +388,7 @@ class _PublicationApi:
     async def get_publication_precheck_context(self, **_kwargs: object) -> None:
         return None
 
-    async def create_publication(self, request: object) -> object:
+    async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
         from curie_worker.approvals import CreatedPublication
 
         self.creates.append(request)
@@ -455,7 +455,7 @@ def test_failed_publication_approval_finishes_factory_request_immediately(
     from curie_worker.approvals import ApprovalBackendError
 
     class FailedPublicationApi(_PublicationApi):
-        async def create_publication(self, request: object) -> object:
+        async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
             self.creates.append(request)
             raise ApprovalBackendError("publication snapshot failed")
 
@@ -470,13 +470,9 @@ def test_failed_publication_approval_finishes_factory_request_immediately(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             assert len(publications.creates) == 1
-            assert [finish["cause"] for finish in items.finishes] == [
-                "approval_create_failed"
-            ]
+            assert [finish["cause"] for finish in items.finishes] == ["approval_create_failed"]
             assert "hold_for_approval" not in items.calls
 
     asyncio.run(exercise())
@@ -493,7 +489,7 @@ def test_a_coded_publication_refusal_names_its_cause_on_the_factory_run(
     message = "required Python CI does not select unitconv/convert.py"
 
     class RefusedPublicationApi(_PublicationApi):
-        async def create_publication(self, request: object) -> object:
+        async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
             self.creates.append(request)
             error = ApprovalBackendError(f"publication create failed: HTTP 409: {message}")
             error.refusal = f"{code}: {message}"
@@ -510,9 +506,7 @@ def test_a_coded_publication_refusal_names_its_cause_on_the_factory_run(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             assert len(items.finishes) == 1
             finish = items.finishes[0]
             assert finish["cause"] == "approval_create_failed"
@@ -535,7 +529,7 @@ def test_a_thread_refusal_code_keeps_its_message_on_the_factory_run(
     message = "GitHub pull request head differs from the stored lineage"
 
     class StalePublicationApi(_PublicationApi):
-        async def create_publication(self, request: object) -> object:
+        async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
             self.creates.append(request)
             raise WorkspaceSelectionRefused(message)
 
@@ -549,9 +543,7 @@ def test_a_thread_refusal_code_keeps_its_message_on_the_factory_run(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             assert len(items.finishes) == 1
             finish = items.finishes[0]
             assert finish["cause"] == "approval_create_failed"
@@ -570,7 +562,7 @@ def test_a_string_api_refusal_keeps_its_message_on_the_factory_run(
     message = "publication patch exceeds the 1048576-byte limit"
 
     class TooLargePublicationApi(_PublicationApi):
-        async def create_publication(self, request: object) -> object:
+        async def create_publication(self, request: object, *, budget_s: float = 120) -> object:
             self.creates.append(request)
             error = ApprovalBackendError("publication create failed: HTTP 413")
             error.refusal = message
@@ -586,9 +578,7 @@ def test_a_string_api_refusal_keeps_its_message_on_the_factory_run(
             h.kernel._work_items = items
             _patch_snapshot(h, monkeypatch)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             finish = items.finishes[0]
             assert finish["cause"] == "approval_create_failed"
             assert isinstance(finish["detail"], str)
@@ -633,9 +623,7 @@ def test_a_snapshot_base_mismatch_names_both_commits_on_the_factory_run(
 
             monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
             h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
             assert len(items.finishes) == 1
             finish = items.finishes[0]
             assert finish["outcome"] == "failed"
@@ -702,9 +690,7 @@ def test_a_preflight_blocked_runner_ends_as_early_stop_and_releases_the_claim(
             h.runner.turn_scripts = [blocked_turn(), blocked_turn()]
             h.runner.default_script = [_done("a third turn must never open")]
 
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
 
             assert len(h.runner.opened) == 2
             assert h.runner.opened[0] == ISSUE_PROMPT
@@ -926,9 +912,7 @@ def test_a_continuation_the_runner_refuses_keeps_the_runner_failure(make_harness
 
             h.kernel._runner.start_turn = start_turn  # type: ignore[method-assign]
 
-            await h.kernel.process_event(
-                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
-            )
+            await h.kernel.process_event(_turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT))
 
             assert len(opened) >= 2, "the continuation must have been attempted"
             assert "publish_changes" in opened[1]

@@ -345,9 +345,7 @@ def test_a_fix_publication_carries_the_adopted_request_and_epoch(
             self.creates: list[object] = []
             self.contexts: list[PublicationContext] = []
 
-        async def get_publication_precheck_context(
-            self, **kwargs: object
-        ) -> PublicationContext:
+        async def get_publication_precheck_context(self, **kwargs: object) -> PublicationContext:
             context = await super().get_publication_precheck_context(**kwargs)
             self.contexts.append(context)
             return context
@@ -355,7 +353,9 @@ def test_a_fix_publication_carries_the_adopted_request_and_epoch(
         async def get_publication_lineage(self, *_args: object) -> None:
             return None
 
-        async def create_publication(self, request: object) -> CreatedPublication:
+        async def create_publication(
+            self, request: object, *, budget_s: float = 120
+        ) -> CreatedPublication:
             self.creates.append(request)
             return CreatedPublication(
                 id="publication-ci-fix", approval_id="approval-ci-fix", status="pending"

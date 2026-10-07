@@ -388,7 +388,9 @@ class VerifiedReviewFeedback:
 class PublicationCreator(Protocol):
     """Atomic trusted write seam used only for exact publish provenance."""
 
-    async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication: ...
+    async def create_publication(
+        self, request: PublicationCreateRequest, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> CreatedPublication: ...
 
     async def get_publication_lineage(
         self,
@@ -658,12 +660,18 @@ class ApprovalClient:
             logger.warning("approval read returned an unusable body for %s: %s", approval_id, exc)
             return None
 
-    async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+    async def create_publication(
+        self, request: PublicationCreateRequest, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> CreatedPublication:
         """Atomically persist the approval and its private patch.
 
         The ordinary platform API key is intentionally not accepted on this
         route.  If the dedicated worker credential is absent, fail before any
         request so a local/non-cluster install cannot create a stranded card.
+
+        The route is replay safe on ``dedupe_key`` (an exact replay answers
+        200), so transient transport faults and 5xx are retried within
+        ``budget_s``. A 4xx is never retried.
         """
 
         if not self._worker_headers:
@@ -673,10 +681,12 @@ class ApprovalClient:
         headers = {**self._worker_headers, "Content-Type": "application/json"}
         inject_trace_context(headers)
         try:
-            response = await self._client.post(
+            response = await post_with_retry(
+                self._client,
                 self._publication_url,
                 json=request.to_json(),
                 headers=headers,
+                budget_s=budget_s,
             )
         except httpx.HTTPError as exc:
             raise ApprovalBackendError(f"publication create failed: {exc}") from exc
