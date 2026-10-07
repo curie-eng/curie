@@ -1,0 +1,65 @@
+# @spec SRE-CW-1 through SRE-CW-8. Fixtures and renders prove only the optional
+# example contract; they do not replace the required live qualification tiers.
+name: CloudWatch example
+on:
+  pull_request:
+    branches: [main, next]
+    paths:
+      - .github/workflows/cloudwatch-example.yaml
+      - examples/sre-bot/observability/cloudwatch-alarms/**
+      - examples/sre-bot/observability/cloudwatch-alarms.yaml
+      - examples/sre-bot/observability/prometheus-cloudwatch.yaml
+      - examples/sre-bot/observability/prometheus-values.yaml
+      - examples/sre-bot/observability/alertmanager-heartbeat.yaml
+      - examples/sre-bot/observability/alert-signer.yaml
+      - examples/sre-bot/docs/CLOUDWATCH-ALARMS.md
+      - examples/tests/test_cloudwatch_alarms.py
+      - examples/tests/cloudwatch-alarms.test.yaml
+  push:
+    branches: [main, next]
+    paths:
+      - .github/workflows/cloudwatch-example.yaml
+      - examples/sre-bot/observability/cloudwatch-alarms/**
+      - examples/sre-bot/observability/cloudwatch-alarms.yaml
+      - examples/sre-bot/observability/prometheus-cloudwatch.yaml
+      - examples/sre-bot/observability/prometheus-values.yaml
+      - examples/sre-bot/observability/alertmanager-heartbeat.yaml
+      - examples/sre-bot/observability/alert-signer.yaml
+      - examples/sre-bot/docs/CLOUDWATCH-ALARMS.md
+      - examples/tests/test_cloudwatch_alarms.py
+      - examples/tests/cloudwatch-alarms.test.yaml
+permissions:
+  contents: read
+jobs:
+  cloudwatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      - name: Install isolated verification tools
+        run: python -m pip install pytest pytest-xdist PyYAML types-PyYAML ruff mypy
+      - name: Verify standard library reader
+        run: |
+          ruff check examples/sre-bot/observability/cloudwatch-alarms/cloudwatch_alarms.py examples/tests/test_cloudwatch_alarms.py
+          mypy --strict --follow-imports=skip examples/sre-bot/observability/cloudwatch-alarms
+          python -I -S -c "import runpy; runpy.run_path('examples/sre-bot/observability/cloudwatch-alarms/cloudwatch_alarms.py')"
+      - name: Execute reader and production Prometheus rule vectors
+        run: |
+          docker pull prom/prometheus:v3.5.0
+          cat > "$RUNNER_TEMP/promtool-cloudwatch" <<'SH'
+          #!/bin/sh
+          exec docker run --rm --entrypoint /bin/promtool -v "$PWD:/rules:ro" -w /rules prom/prometheus:v3.5.0 "$@"
+          SH
+          chmod +x "$RUNNER_TEMP/promtool-cloudwatch"
+          PROMTOOL="$RUNNER_TEMP/promtool-cloudwatch" python -m pytest examples/tests/test_cloudwatch_alarms.py -q
+      - name: Render default and optional consumer configurations
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          PROMTOOL="$RUNNER_TEMP/promtool-cloudwatch" python examples/sre-bot/observability/cloudwatch-alarms/verify_overlay.py

@@ -180,7 +180,10 @@ def test_complete_pages_filter_disabled_alarms_and_preserve_episode(reader, tmp_
     # reader fixtures; provider contract API_DescribeAlarms.html (spec link).
     source, aws, _ = poller(reader, tmp_path)
     assert "curie_cloudwatch_alarm_poll_ok 0\n" in source.metrics()
-    assert "curie_cloudwatch_alarm_last_success_timestamp_seconds " not in source.metrics()
+    assert not any(
+        line.startswith("curie_cloudwatch_alarm_last_success_timestamp_seconds ")
+        for line in source.metrics().splitlines()
+    )
     assert aws.requests == []
     aws.pages = {
         None: (200, page(["example-alarm", "disabled"], disabled=["disabled"], token=NEXT)),
