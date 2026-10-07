@@ -2326,60 +2326,235 @@ def test_publication_create_stops_retrying_when_its_budget_is_spent() -> None:
     asyncio.run(go())
 
 
-def test_publication_turn_rides_out_two_503s_and_pauses_awaiting_approval(
-    make_harness,
+class _FactoryBinding:
+    """A workspace-enabled deployment for a factory execute turn."""
+
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+        return SimpleNamespace(
+            agent_id=uuid.UUID("11111111-1111-4111-8111-111111114180"),
+            agent_name="acme-bot",
+            deployment_id=uuid.UUID("22222222-2222-4222-8222-222222224180"),
+            endpoint=None,
+            adapter=None,
+            approval_routes=None,
+        )
+
+    def boot_env(self, _resolved: object, thread_key: str, **_: object) -> dict[str, str]:
+        return {
+            "CURIE_SESSION_ID": f"work-item-{thread_key}",
+            "CURIE_RUNNER_TOKEN": "example-work-item-runner-token",
+        }
+
+    def packs_for(self, _resolved: object) -> BehaviorPacks:
+        return BehaviorPacks()
+
+
+class _FactoryWorkspace:
+    def __init__(self, substrate: object) -> None:
+        self.substrate = substrate
+
+    def select_repository(self, **kwargs: object) -> object:
+        return kwargs["repo_full_name"]
+
+    def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+        handle = self.substrate.claim(  # type: ignore[attr-defined]
+            str(kwargs["thread_key"]),
+            env=kwargs.get("env"),
+            agent_name=kwargs.get("agent_name"),
+            workspace_repo=kwargs.get("repo_full_name"),
+            caller_run=kwargs.get("caller_run"),
+        )
+        return SimpleNamespace(handle=handle, prepared=None)
+
+    def touch(self, _thread_key: str, *, ttl_seconds: int) -> bool:
+        return True
+
+    def release(self, _thread_key: str) -> None:
+        return None
+
+
+class _FactoryWorkItems:
+    """The WorkItems dispatch double: an acquired execution that records each call."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.finishes: list[dict[str, object]] = []
+
+    async def acquire(self, request_id: uuid.UUID, *, owner: str, generation: int) -> object:
+        from datetime import timedelta
+
+        from curie_worker.workitem_dispatch import WorkItemAcquireGrant
+
+        self.calls.append("acquire")
+        return WorkItemAcquireGrant(
+            generation=generation,
+            work_item_id=request_id,
+            conversation_id=f"work-item-{request_id}",
+            wait_deadline=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            repo_full_name="acme-corp/widgets",
+        )
+
+    async def start(self, request_id: uuid.UUID, **_: object) -> object:
+        from datetime import timedelta
+
+        from curie_worker.workitem_dispatch import WorkItemStartGrant
+
+        self.calls.append("start")
+        return WorkItemStartGrant(
+            runtime_epoch=1,
+            execution_deadline=datetime.now(UTC) + timedelta(hours=1),
+            remaining_s=3600.0,
+            heartbeat_interval_s=60.0,
+        )
+
+    async def finish(self, _request_id: uuid.UUID, **kwargs: object) -> None:
+        self.calls.append("finish")
+        self.finishes.append(kwargs)
+
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        return "acme widgets issue 123", f"wir.capability-for-{request_id}"
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]  # noqa: ANN204
+        async def record(*_args: object, **_kwargs: object) -> None:
+            self.calls.append(name)
+
+        return record
+
+
+def test_factory_publication_turn_rides_out_two_503s_and_holds_for_approval(
+    make_harness,  # noqa: ANN001
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """#4180 AC5: a kernel publication turn retries 503, 503, then 201.
+    """#4180 AC5: a factory execute turn whose publication create sees 503, 503, 201.
 
-    The POST goes through the real ``ApprovalClient.create_publication``; only
-    the lineage read is the recording fake's. The replays are adopted by
-    publications.py::create_publication, so the turn pauses with no escalation.
+    The turn is a ``work-item-<request>-execute-<epoch>`` event with an acquired
+    execution, and its POST goes through the real
+    ``ApprovalClient.create_publication`` and the shared retry helper; only the
+    lineage and precheck reads are stubbed. publications.py::create_publication
+    adopts the identical replays, so the factory request is held for approval
+    and is never finished as ``approval_create_failed``.
     """
 
+    from aci_protocol import PublicationContext, ToolNote, TurnSource
     from curie_worker.approvals import PublicationLineage
+    from curie_worker.kernel import TURN_FAILURE_REPLY_PREFIX
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
 
-    class LineageFreeClient(ApprovalClient):
+    class PublicationClient(ApprovalClient):
         async def get_publication_lineage(
             self, deployment_id: uuid.UUID, conversation_id: str, repo_full_name: str
         ) -> PublicationLineage | None:
             return None
 
+        async def get_publication_precheck_context(
+            self,
+            *,
+            deployment_id: uuid.UUID,
+            work_item_id: uuid.UUID,
+            execution_request_id: uuid.UUID,
+            runtime_epoch: int,
+            queued_event_id: str,
+        ) -> PublicationContext | None:
+            return None
+
+    publish_tool = "mcp__curie__publish_changes"
+    event_id = f"work-item-{uuid.uuid4()}-execute-1"
+
     async def go() -> None:
         seen: list[httpx.Request] = []
 
         def handle(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1/internal/publications"
             seen.append(request)
             if len(seen) <= 2:
                 return httpx.Response(503, text="Service Unavailable")
             return httpx.Response(201, json=_CREATED_PUBLICATION)
 
+        async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+            return RunnerWorkspaceSnapshot(
+                repo_full_name="acme-corp/widgets",
+                base_sha="a1" * 20,
+                patch=b"diff --git a/src/widget.py b/src/widget.py\n",
+                changed_paths=("src/widget.py",),
+                contains_workflow_files=False,
+                publication_title="Fix the widget parser",
+                publication_body="Fixes the parser.",
+            )
+
         with _fake_retry_time() as sleeps, caplog.at_level(logging.DEBUG):
             async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
-                client = LineageFreeClient(
+                client = PublicationClient(
                     api_base_url="https://api.example.test",
                     api_key="",
                     client=http,
                     read_timeout_s=1.0,
                     worker_token="worker-test-token",
                 )
-                async with _publication_run(
-                    make_harness,
-                    monkeypatch,
-                    deployment_id=uuid.UUID("11111111-1111-4111-8111-111111114180"),
-                    thread="1700000000.004180",
+                async with make_harness(
+                    binding=_FactoryBinding(),
+                    workspace_factory=_FactoryWorkspace,
                     publication_creator=client,
-                ) as run:
-                    outcomes = [c.outcome for c in run.h.sink.completions]
-                    assert outcomes == ["awaiting-approval"]
+                ) as h:
+                    items = _FactoryWorkItems()
+                    h.kernel._work_items = items
+                    monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+                    monkeypatch.setattr(
+                        "curie_worker.kernel.validate_snapshot_against_base",
+                        lambda *_args, **_kwargs: None,
+                    )
+                    h.runner.turn_scripts = [
+                        [
+                            ToolNote(text=f"running tool {publish_tool}", tool=publish_tool),
+                            Final(
+                                text="Ready to publish",
+                                status=AWAITING,
+                                approval_summary="Publish the change",
+                                approval_gate_kind="permission",
+                                approval_granted_tool=publish_tool,
+                            ),
+                        ]
+                    ]
+                    h.runner.default_script = [
+                        Final(text="default script must not run", status=DONE)
+                    ]
+
+                    await h.kernel.process_event(
+                        QueuedTurn(
+                            event_id=event_id,
+                            conversation_id="1700000000.004180",
+                            author="U0EXAMPLE1",
+                            text="Resolve https://github.com/acme-corp/widgets/issues/123",
+                            reply_handle=ReplyHandle(
+                                kind="slack",
+                                channel="C0EXAMPLE1",
+                                placeholder=None,
+                                endpoint=None,
+                                adapter=None,
+                            ),
+                            received_at="2026-09-25T01:00:00+00:00",
+                            source=TurnSource.SLACK,
+                        )
+                    )
+
+                    assert len(h.runner.opened) == 1
+                    assert items.finishes == []
+                    assert "hold_for_approval" in items.calls
+                    outcomes = [c.outcome for c in h.sink.completions]
+                    assert "escalated" not in outcomes
+                    replies = [text for _address, _ref, text in h.sink.updates]
+                    assert not any("approval-create-failed" in text for text in replies)
+                    assert not any(
+                        text.lstrip().startswith(TURN_FAILURE_REPLY_PREFIX) for text in replies
+                    )
 
         assert len(seen) == 3
-        assert all(request.url.path == "/v1/internal/publications" for request in seen)
+        assert all(request.method == "POST" for request in seen)
         assert len({request.content for request in seen}) == 1
+        assert json.loads(seen[0].content)["dedupe_key"] == event_id
         assert sleeps == [0.5, 1.0]
-        assert "approval create failed" not in caplog.text
-        assert "approval-create-failed" not in caplog.text
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not any("approval create failed" in message for message in warnings)
 
     asyncio.run(go())
 
