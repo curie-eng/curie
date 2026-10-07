@@ -368,13 +368,15 @@ class Deliveries:
         return event
 
 
-def second_hook_event(stage: Stage, template_event: str, generation: int) -> str:
-    """The binding a delivery to ``HOOK_TWO`` admitted under ``generation`` would create.
+async def second_hook_event(stage: Stage, template_event: str, generation: int) -> str:
+    """What a delivery to ``HOOK_TWO`` admitted under ``generation`` would create.
 
     The harness provisions one protected hook's runtime; the plan drives tasks 6
-    to 13 by inserting the binding a delivery would have created. This is the
-    first hook's real binding with only the event id and the admitted
-    remediation generation changed, written to the real broker.
+    to 13 by inserting the records a delivery would have created. These are the
+    first hook's real records with only the event id, hook and admitted
+    remediation generation changed: the binding, written to the real broker,
+    and the reply surface the hook route records for an admitted delivery
+    (``remediation_delivery_surfaces``, AUTOMATED-REMEDIATION-15).
     """
 
     template = record(stage.broker, "protected:admission:binding:" + template_event)
@@ -383,6 +385,16 @@ def second_hook_event(stage: Stage, template_event: str, generation: int) -> str
     template["event_id"] = event
     template["remediation_generation"] = str(generation)
     stage.broker.command("SET", "protected:admission:binding:" + event, broker_canonical(template))
+    copied = await asyncio.to_thread(
+        sql_rows,
+        "INSERT INTO curie.remediation_delivery_surfaces "
+        "(event_id, agent_id, hook, reply_kind, reply_channel, reply_endpoint, reply_adapter) "
+        "SELECT :event, agent_id, :hook, reply_kind, reply_channel, reply_endpoint, "
+        "reply_adapter FROM curie.remediation_delivery_surfaces WHERE event_id = :template "
+        "RETURNING event_id",
+        {"event": event, "hook": HOOK_TWO, "template": template_event},
+    )
+    assert len(copied) == 1, "the template delivery recorded no reply surface"
     return event
 
 
@@ -769,7 +781,7 @@ class World:
 
     async def nominate_second_hook(self, *entries: Any) -> list[dict[str, Any]]:
         template = await self.deliveries.event()
-        event = second_hook_event(self.stage, template, self.hooks.generation[HOOK_TWO])
+        event = await second_hook_event(self.stage, template, self.hooks.generation[HOOK_TWO])
         return await submit(self.stage, event, *entries)
 
 
@@ -1627,7 +1639,9 @@ def test_two_hooks_racing_for_one_target_yield_exactly_one_execution(
             await w.bind()
             await w.second_hook()
             template = await w.deliveries.event()
-            hook_two_event = second_hook_event(w.stage, template, w.hooks.generation[HOOK_TWO])
+            hook_two_event = await second_hook_event(
+                w.stage, template, w.hooks.generation[HOOK_TWO]
+            )
             hook_one_event = await w.deliveries.event()
 
             results = await asyncio.gather(
