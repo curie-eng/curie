@@ -138,6 +138,19 @@ kind check is replaced so `kind` gains `read`. Read executions are created only 
 `apps/api/src/curie_api/remediation_reads.py::create_read_execution`; the
 downgrade deletes them before restoring the check.
 
+Migration `0092_remediation_approvals.py` (automated remediation,
+AUTOMATED-REMEDIATION-15) is additive. `approvals_purpose_ck` is replaced so
+`approvals.purpose` gains `remediation`; existing rows are untouched. The new
+`remediation_approval_requests` table
+(`apps/api/src/curie_api/models.py::RemediationApprovalRequest`) holds one row per
+remediation approval: the raising nomination, its agent, hook, action and
+`arguments_sha256` (the deduplication identity), the failed admission check and
+the observed precondition value the card names, the count and newest `event_id`
+of attached nominations, and the card delivery outbox the worker's remediation
+card loop leases. It cascades with its approval, nomination and agent. Rows are
+written by `apps/api/src/curie_api/remediation_approvals.py`; the downgrade drops
+the table and deletes remediation approvals before restoring the check.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.
