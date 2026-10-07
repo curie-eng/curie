@@ -106,6 +106,8 @@ _CAPACITY_ADMISSION_TIMEOUT_S = 30.0
 # turn was already interrupted, so the CLI normally answers within seconds; a
 # turn that finds it still running fails without querying, and the next retries.
 _ABANDONED_TURN_DRAIN_TIMEOUT_S = 30.0
+# Upper bound on posting an unfinished turn's usage (#4190); covers _post's two 10 s attempts.
+_UNFINISHED_USAGE_BOUND_S = 25.0
 _CAPACITY_ADMISSION_HISTORY = 1024
 # Re-dials the connectors named by the current failures and returns the ones
 # still failing (#2634). Bound by ``build_runner`` over the materialized servers.
@@ -1349,6 +1351,17 @@ class SessionRunner:
                                 self._turn_ready = False
                                 self._turn_epoch = None
             finally:
+                if self._usage_reporter is not None:
+                    # Every ending passes here, including GeneratorExit and
+                    # cancellation. A turn that reached its result already
+                    # reported, so this posts only an unfinished turn's observed
+                    # counts (#4190), bounded and unable to skip the cleanup below.
+                    with (
+                        contextlib.suppress(Exception),
+                        anyio.CancelScope(shield=True),
+                        anyio.move_on_after(_UNFINISHED_USAGE_BOUND_S),
+                    ):
+                        await self._usage_reporter.report_unfinished(self._primary_model)
                 if terminal_for_log:
                     logger.info(
                         "turn end session=%s status=%s duration_ms=%d",
@@ -1397,6 +1410,9 @@ class SessionRunner:
                 async for message in self._session.receive_turn():
                     discarded += 1
                     if isinstance(message, ResultMessage):
+                        if self._usage_reporter is not None:
+                            # Its tokens were posted as unfinished; move the baseline only.
+                            self._usage_reporter.absorb(message)
                         break
                 # Reaching the result, or the iterator's own end, means the old
                 # turn's stream is exhausted; only the timeout leaves it pending.
