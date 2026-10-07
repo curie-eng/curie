@@ -30,9 +30,9 @@ GROUP="curie-workers"
 WORKER_DEPLOYMENT="${RELEASE}-worker"
 VALKEY_STATEFULSET="${RELEASE}-valkey"
 # Empty unless the operator names one: by default the hold goes on the template
-# the first invocation's real SandboxClaim was served from (see
-# resolve_claim_sandbox_template), because a deploy that hosts a connector
-# routes the agent through its own per-agent pool, not `${RELEASE}-runner`.
+# source that a fresh claim will copy (see resolve_claim_sandbox_template).
+# A completed claim can name its own scoped-token template; holding that copy
+# does not block the next conversation. Connector agents use their own pool.
 SANDBOX_TEMPLATE="${CURIE_E2E_SANDBOX_TEMPLATE:-}"
 CONTROLLER_NAMESPACE="agent-sandbox-system"
 CONTROLLER_DEPLOYMENT="agent-sandbox-controller"
@@ -476,11 +476,12 @@ if items:
 ' "$baseline" "$exclude"
 }
 
-# The SandboxTemplate a claim was actually served from: its warm pool's
-# sandboxTemplateRef. Fails rather than guessing, since a hold on a template the
-# agent does not use would let the sandbox schedule and void the phase.
+# Resolve the source for the next claim, rather than a completed claim copy.
+# Scoped-token claims use private templates named <claim>-resources (#3842);
+# derive their source pool through the worker's actual naming contract. The
+# first claim's pod label identifies its agent without guessing from a name.
 resolve_claim_sandbox_template() {
-    local claim="$1" pool template
+    local claim="$1" pool template agent
     pool="$(kubectl -n "$NAMESPACE" get sandboxclaim "$claim" \
         -o jsonpath='{.spec.warmPoolRef.name}')"
     if [[ -z "$pool" ]]; then
@@ -492,6 +493,25 @@ resolve_claim_sandbox_template() {
     if [[ -z "$template" ]]; then
         echo "error: SandboxWarmPool $pool names no SandboxTemplate" >&2
         return 1
+    fi
+    if [[ "$template" == *-resources ]]; then
+        agent="$(kubectl -n "$NAMESPACE" get sandboxtemplate "$template" \
+            -o jsonpath='{.spec.podTemplate.metadata.labels.curietech\.ai/agent}')"
+        [[ -n "$agent" ]] || {
+            echo "error: claim template $template names no agent; cannot hold its source" >&2
+            return 1
+        }
+        pool="$(kubectl -n "$NAMESPACE" exec "$OLD_POD" -- python -c '
+import os,sys
+from curie_worker.sandbox.types import agent_warm_pool_name
+print(agent_warm_pool_name(os.environ["CURIE_WARM_POOL"], sys.argv[1]))
+' "$agent")" || return 1
+        template="$(kubectl -n "$NAMESPACE" get sandboxwarmpool "$pool" \
+            -o jsonpath='{.spec.sandboxTemplateRef.name}')" || return 1
+        if [[ -z "$template" || "$template" == *-resources ]]; then
+            echo "error: pool $pool does not name a reusable source SandboxTemplate" >&2
+            return 1
+        fi
     fi
     printf '%s\n' "$template"
 }
