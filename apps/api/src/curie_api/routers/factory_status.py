@@ -27,7 +27,7 @@ from .. import sandbox_token
 from ..config import get_settings
 from ..deps import SessionDep
 from ..factory_card import CardInput, render_card
-from ..factory_notices import cause_text, needs_human
+from ..factory_notices import cause_text
 from ..factory_progress import (
     PROGRESS_SCOPE,
     ProgressReport,
@@ -205,7 +205,6 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             cause_text=(
                 cause_text(terminal) if terminal and terminal != "completed" else None
             ),
-            needs_human=needs_human(request.status, terminal),
         )
     )
     return Response(

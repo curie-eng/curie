@@ -785,8 +785,9 @@ _PILLS: dict[str, tuple[str, str, bool]] = {
     "running": ("RUNNING", "#2f81f7", True),
     "cancellation_requested": ("STOPPING", "#bc4c00", True),
     "completed": ("SUCCEEDED", "#1a7f37", False),
-    "failed": ("FAILED", "#cf222e", False),
-    "expired": ("EXPIRED", "#953800", False),
+    # A failed or expired run carries curie-factory:needs-human; the pill says the same.
+    "failed": ("NEEDS HUMAN", "#bf8700", False),
+    "expired": ("NEEDS HUMAN", "#bf8700", False),
     "cancelled": ("CANCELLED", "#6e7781", False),
 }
 _PUBLISHING = ("PUBLISHING", "#8250df", True)
