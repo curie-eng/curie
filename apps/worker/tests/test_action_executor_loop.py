@@ -174,11 +174,16 @@ class Rig:
     affinity: AffinityStore
     in_force: dict[str, str | None] = field(default_factory=lambda: {"digest": DIGEST})
     boots: list[tuple[str, str]] = field(default_factory=list)
+    # The keyword arguments of every ``executor_boot`` call (the thread key).
+    boot_kwargs: list[dict[str, Any]] = field(default_factory=list)
+    # ``(phase, remaining_s)`` of every runner ``execute`` call.
+    runner_budgets: list[tuple[str, float | None]] = field(default_factory=list)
+    substrate: Any = None
     _loops: list[ActionExecutorLoop] = field(default_factory=list)
     _make: Any = None
 
-    def loop(self, lease_owner: str = "worker-a") -> ActionExecutorLoop:
-        built: ActionExecutorLoop = self._make(lease_owner)
+    def loop(self, lease_owner: str = "worker-a", **overrides: Any) -> ActionExecutorLoop:
+        built: ActionExecutorLoop = self._make(lease_owner, overrides)
         self._loops.append(built)
         return built
 
@@ -193,6 +198,25 @@ class Rig:
             assert claim.name in self.sandboxes.deleted
         for execution_id in self.api.executions:
             assert self.affinity.get(f"action-exec:{execution_id}") is None
+
+
+class _BudgetRecordingRunner(RunnerClient):
+    """The real client, noting the time budget each phase was given."""
+
+    def __init__(self, rig: Rig, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._rig = rig
+
+    async def execute(
+        self,
+        base_url: str,
+        request: Any,
+        *,
+        token: str,
+        remaining_s: float | None = None,
+    ) -> dict[str, Any]:
+        self._rig.runner_budgets.append((str(request.get("phase")), remaining_s))
+        return await super().execute(base_url, request, token=token, remaining_s=remaining_s)
 
 
 @pytest.fixture
@@ -242,7 +266,8 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
         affinity=affinity,
     )
     http = httpx.AsyncClient(transport=rig.api.transport())
-    runner_client = RunnerClient(connect_timeout_s=2.0, total_timeout_s=10.0)
+    runner_client = _BudgetRecordingRunner(rig, connect_timeout_s=2.0, total_timeout_s=10.0)
+    rig.substrate = substrate
 
     async def deployment_name(agent_id: str | None, connector: str) -> str | None:
         assert (agent_id, connector) == (AGENT_ID, CONNECTOR)
@@ -252,15 +277,22 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
         assert (str(agent_id), connector) == (AGENT_ID, CONNECTOR)
         return rig.in_force["digest"]
 
-    async def executor_boot(agent_id: str, connector: str) -> ExecutorBoot:
+    async def executor_boot(agent_id: str, connector: str, **kwargs: Any) -> ExecutorBoot:
         rig.boots.append((str(agent_id), connector))
+        rig.boot_kwargs.append(dict(kwargs))
         return ExecutorBoot(
             boot_env=_binding_boot_env(),
             header_secret_names=frozenset({TARGET_SECRET}),
             agent_name=AGENT_NAME,
         )
 
-    def make(lease_owner: str) -> ActionExecutorLoop:
+    def make(lease_owner: str, overrides: dict[str, Any]) -> ActionExecutorLoop:
+        settings: dict[str, Any] = {
+            "grant_signing_key": GRANT_SEED,
+            "lease_seconds": LEASE_SECONDS,
+            "dispatch_deadline_s": DISPATCH_DEADLINE_S,
+            **overrides,
+        }
         return ActionExecutorLoop(
             api=ExecutionApi(
                 api_base_url=API_BASE, api_key=API_KEY, worker_token=WORKER_TOKEN, client=http
@@ -273,10 +305,10 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
             deployment_name=deployment_name,
             in_force_digest=in_force_digest,
             executor_boot=executor_boot,
-            grant_signing_key=GRANT_SEED,
+            grant_signing_key=settings["grant_signing_key"],
             lease_owner=lease_owner,
-            lease_seconds=LEASE_SECONDS,
-            dispatch_deadline_s=DISPATCH_DEADLINE_S,
+            lease_seconds=settings["lease_seconds"],
+            dispatch_deadline_s=settings["dispatch_deadline_s"],
             interval_seconds=0.01,
         )
 
@@ -951,33 +983,29 @@ async def test_an_outcome_that_never_lands_ends_indeterminate_with_one_write(
         assert len(minted) == 1
 
 
-async def test_an_api_outage_before_dispatch_leaves_the_row_for_a_later_attempt(
+async def test_an_api_outage_before_dispatch_refuses_runner_unavailable_with_no_write(
     valkey: tuple[redis.Redis, str],
 ) -> None:
-    """@spec ACTION-EXECUTOR-17: kill before the ``dispatched`` commit; nothing was written."""
+    """@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-20: kill before the ``dispatched``
+    commit ends ``refused``. An observation the API never answered after the
+    resends refuses with the code the sweep uses for a vanished holder; the API
+    accepts a refusal only from ``claimed``, so it is a provable non-write.
+    """
 
     async with _rig(valkey) as rig:
         execution = rig.api.add_restore()
         rig.api.fail("observation", *["down"] * 10)
 
         await rig.loop().run_once()
-        first = rig.execution(execution).state
-        assert first in {"claimed", "refused"}
+
+        assert _final(rig, execution) == ("refused", "runner_unavailable")
         assert rig.runner.writes == []
         assert "dispatch" not in _api_routes(rig)
         rig.assert_released()
 
         rig.api.expire_lease(rig.execution(execution))
-        await rig.loop("worker-b").run_once()
-
-        if first == "refused":
-            assert _final(rig, execution)[0] == "refused"
-            assert rig.runner.writes == []
-        else:
-            # Reclaimed with the next attempt and finished once.
-            assert _final(rig, execution) == ("confirmed", None)
-            assert rig.execution(execution).attempt == 2
-            assert len(rig.runner.writes) == 1
+        assert await rig.loop("worker-b").run_once() is False
+        assert rig.runner.writes == []
 
 
 async def test_a_holder_whose_lease_expired_makes_no_call(
@@ -1241,4 +1269,357 @@ async def test_run_forever_drains_and_stops_on_shutdown(valkey: tuple[redis.Redi
         assert _final(rig, first) == ("confirmed", None)
         assert _final(rig, second) == ("confirmed", None)
         assert len(rig.runner.writes) == 2
+        rig.assert_released()
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1: the lease budget (M1)
+# --------------------------------------------------------------------------- #
+
+# A pre-dispatch run whose lease can no longer carry it ends with the code the
+# route decisions give an expired ``claimed`` lease (ACTION-EXECUTOR-20).
+_LEASE_SPENT = "runner_unavailable"
+
+
+async def test_list_and_observe_are_bounded_by_the_remaining_lease(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-17: no phase may outlive the lease the run holds.
+
+    The runner client's own ceiling (600 s by default) is far above the lease,
+    so every pre-dispatch phase must carry the lease that is left.
+    """
+
+    async with _rig(valkey) as rig:
+        rig.api.add_restore()
+
+        await rig.loop().run_once()
+
+        budgets = {phase: budget for phase, budget in rig.runner_budgets if phase != "call"}
+        assert set(budgets) == {"list", "observe"}
+        for phase, budget in budgets.items():
+            assert budget is not None, phase
+            assert 0 < budget <= LEASE_SECONDS, (phase, budget)
+
+
+async def test_a_list_slower_than_the_lease_refuses_before_dispatch(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-17: a slow ``list`` never runs the restore past the lease.
+
+    Otherwise another worker reclaims the row while this one still holds the
+    sandbox, and a later dispatch would run into the sweep.
+    """
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+
+        async def slow(body: dict[str, Any]) -> None:
+            await asyncio.sleep(4.0)
+
+        rig.runner.hooks["list"] = slow
+        started = time.monotonic()
+
+        await rig.loop(lease_seconds=2, dispatch_deadline_s=1.0).run_once()
+
+        assert time.monotonic() - started < 3.5
+        assert _final(rig, execution) == ("refused", _LEASE_SPENT)
+        assert "dispatch" not in _api_routes(rig)
+        assert rig.runner.writes == []
+        assert minted == []
+        rig.assert_released()
+
+
+async def test_a_lease_that_cannot_cover_the_call_refuses_before_dispatch(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-17: a dispatch whose call could outlive the lease never starts.
+
+    The sweep would end such a row ``indeterminate`` while a successful restore
+    landed. Refusing before the commit keeps it a provable non-write.
+    """
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+
+        async def slowish(body: dict[str, Any]) -> None:
+            await asyncio.sleep(1.5)
+
+        rig.runner.hooks["observe"] = slowish
+
+        await rig.loop(lease_seconds=4, dispatch_deadline_s=3.0).run_once()
+
+        assert _final(rig, execution) == ("refused", _LEASE_SPENT)
+        assert "dispatch" not in _api_routes(rig)
+        assert rig.runner.writes == []
+        assert minted == []
+        rig.assert_released()
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1: a restart before dispatch (M2) and the boot thread key
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_reclaim_releases_the_dead_holders_sandbox_and_completes(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-5: an expired claim before dispatch
+    "is reclaimed with the next attempt". The dead holder's ``action-exec:<id>``
+    sandbox is still running; the earlier fence can no longer dispatch, so the
+    reclaim releases it and claims a fresh one rather than refusing
+    ``sandbox_unavailable``.
+    """
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+        # A worker claimed it, booted its sandbox, then died before dispatch.
+        dead = httpx.Client(transport=httpx.MockTransport(rig.api))
+        claimed = dead.post(
+            f"{API_BASE}/action-executions/claim",
+            json={"lease_owner": "worker-dead", "lease_seconds": LEASE_SECONDS},
+            headers={"X-Curie-Worker-Token": WORKER_TOKEN},
+        )
+        dead.close()
+        assert claimed.status_code == 200
+        await asyncio.to_thread(
+            rig.substrate.claim,
+            f"action-exec:{execution.id}",
+            env={"CURIE_RUNNER_MODE": "execute", BootEnv.env_key("runner_token"): "stale"},
+            agent_name=AGENT_NAME,
+            fresh_only=True,
+            executor_secret_names=frozenset(),
+        )
+        stale = rig.sandboxes.created[0].name
+        rig.api.expire_lease(rig.execution(execution))
+
+        assert await rig.loop("worker-b").run_once() is True
+
+        assert _final(rig, execution) == ("confirmed", None)
+        assert rig.execution(execution).attempt == 2
+        assert stale in rig.sandboxes.deleted
+        assert len(rig.sandboxes.created) == 2
+        assert len(rig.runner.writes) == 1
+        assert len(minted) == 1
+        # The fresh runner, not the stale one, was dialed.
+        fresh_token = (rig.sandboxes.created[1].env or {})[BootEnv.env_key("runner_token")]
+        assert {r["authorization"] for r in rig.runner.requests} == {f"Bearer {fresh_token}"}
+        rig.assert_released()
+
+
+async def test_the_executor_boot_is_resolved_for_the_execution_thread_key(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-5: thread key ``action-exec:<execution id>``, not per connector."""
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+
+        await rig.loop().run_once()
+
+        assert rig.boot_kwargs == [{"thread_key": f"action-exec:{execution.id}"}]
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1: paths without a test
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_forward_execution_is_refused_authority_unavailable(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-19: no authority source exists yet; nothing is claimed or called.
+
+    Pins existing behaviour.
+    """
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_forward()
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "authority_unavailable")
+        assert rig.sandboxes.created == []
+        assert rig.runner.requests == []
+
+
+async def test_an_empty_signing_key_refuses_before_any_sandbox(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-7: a grant that cannot be attached refuses before dispatch.
+
+    Known before the run starts, so no sandbox is claimed for it.
+    """
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+
+        await rig.loop(grant_signing_key="").run_once()
+
+        assert _final(rig, execution) == ("refused", "tool_not_grant_bound")
+        assert "dispatch" not in _api_routes(rig)
+        assert rig.sandboxes.created == []
+        assert rig.runner.requests == []
+        assert minted == []
+
+
+async def test_a_ledger_without_the_action_refuses_arguments_mismatch(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-7: nothing to bind the ruling's digest to. Pins existing behaviour."""
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+        rig.api.answer("ledger", 404)
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "arguments_mismatch")
+        assert rig.sandboxes.created == []
+        assert rig.runner.requests == []
+
+
+async def test_a_transient_ledger_error_is_resent_and_the_restore_completes(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-18: the ledger read is resent like a transition, not
+    turned into a terminal refusal on one 5xx.
+    """
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+        rig.api.answer("ledger", 503)
+
+        await rig.loop().run_once()
+
+        assert len(rig.api.calls_to("ledger")) == 2
+        assert _final(rig, execution) == ("confirmed", None)
+        assert len(rig.runner.writes) == 1
+
+
+async def test_a_ledger_that_never_answers_refuses_before_any_sandbox(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-20: after the resends, the vanished-platform code."""
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+        rig.api.fail("ledger", *["down"] * 10)
+
+        await rig.loop().run_once()
+
+        assert len(rig.api.calls_to("ledger")) == 3
+        assert _final(rig, execution) == ("refused", "runner_unavailable")
+        assert rig.sandboxes.created == []
+        assert rig.runner.requests == []
+
+
+async def test_a_restore_whose_schema_lacks_prior_state_is_restore_schema_mismatch(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-13: the call preflight rechecks the rule. Pins existing behaviour."""
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+        tools = list_tools()
+        for tool in tools:
+            if tool["name"] == "restore":
+                tool["input_schema"]["required"] = ["target"]
+        rig.runner.tools = tools
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "restore_schema_mismatch")
+        assert "observe" not in _phases(rig)
+        assert rig.runner.writes == []
+        rig.assert_released()
+
+
+async def test_a_probe_of_a_killed_agent_is_refused_without_a_sandbox(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """@spec ACTION-EXECUTOR-21. Pins existing behaviour."""
+
+    async with _rig(valkey) as rig:
+        probe = rig.api.add_probe()
+        rig.killswitch.killed = True
+
+        await rig.loop().run_once()
+
+        assert _final(rig, probe) == ("refused", "agent_stopped")
+        assert rig.sandboxes.created == []
+        assert rig.runner.requests == []
+
+
+async def test_spans_and_metrics_over_a_full_restore_carry_no_argument_values(
+    valkey: tuple[redis.Redis, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec ACTION-EXECUTOR-22: spans and metrics carry kind, state, stage, code and
+    connector only. Pins existing behaviour.
+    """
+
+    from curie_worker import action_executor_loop
+    from curie_worker.sandbox import substrate as substrate_module
+    from otel_fixtures import install
+
+    probe = install(monkeypatch, action_executor_loop, substrate_module)
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+        await rig.loop().run_once()
+        assert _final(rig, execution) == ("confirmed", None)
+        grant = rig.runner.grants()[0]
+        token = (rig.sandboxes.created[0].env or {})[BootEnv.env_key("runner_token")]
+
+    assert "curie.action_executor.execution" in probe.span_names()
+    points = probe.points("curie.action_executor.execution")
+    assert len(points) == 1
+    allowed = {"service.name", "kind", "state", "stage", "code", "connector"}
+    assert set(points[0].attributes) <= allowed
+    assert points[0].attributes["state"] == "confirmed"
+    captured = repr(
+        [(s.name, s.attributes, s.events) for s in probe.spans]
+        + [(m.name, m.attributes) for m in probe.metrics]
+    )
+    for value in (
+        PRIOR_STATE["ciphertext"],
+        PRIOR_STATE["kid"],
+        TARGET["name"],
+        TARGET["namespace"],
+        RECORDED_VERSION,
+        "rv-1043",
+        grant,
+        token,
+        CALL_ARGUMENTS,
+        "placeholder-target-secret",
+    ):
+        assert value not in captured, value
+
+
+async def test_cancelling_a_run_mid_phase_releases_the_sandbox_and_writes_nothing(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-5 @spec ACTION-EXECUTOR-17: a shutdown mid-``observe``
+    releases the sandbox and leaves a pre-dispatch row for its lease. Pins existing
+    behaviour.
+    """
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+        entered = asyncio.Event()
+
+        async def hang(body: dict[str, Any]) -> None:
+            entered.set()
+            await asyncio.sleep(30)
+
+        rig.runner.hooks["observe"] = hang
+        task = asyncio.create_task(rig.loop().run_once())
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5.0)
+
+        assert rig.execution(execution).state == "claimed"
+        assert "dispatch" not in _api_routes(rig)
+        assert rig.runner.writes == []
+        assert minted == []
         rig.assert_released()

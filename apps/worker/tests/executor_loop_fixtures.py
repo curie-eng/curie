@@ -208,6 +208,14 @@ class FakeApi:
         self.order.append(execution.id)
         return execution
 
+    def add_forward(self, **fields: Any) -> Execution:
+        """A forward execution (ACTION-EXECUTOR-19), which has no authority source yet."""
+
+        execution = Execution(id=str(uuid.uuid4()), kind="forward", tool="scale", **fields)
+        self.executions[execution.id] = execution
+        self.order.append(execution.id)
+        return execution
+
     def fail(self, route: str, *modes: str) -> None:
         """Script ``route`` (claim, observation, dispatch, outcome, ledger)."""
 
