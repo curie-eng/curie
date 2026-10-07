@@ -4,6 +4,12 @@ This bundle combines Grafana, Tempo, and one pinned upstream Kubernetes MCP
 server. The Kubernetes connector runs only the `core` toolset, has config and
 multi-cluster disabled, is stateless, and reads one file-mounted kubeconfig.
 
+The optional read-only startability observer has a separate
+[observation contract](docs/STARTABILITY.md), explicit installation inputs, and
+a real Kubernetes/Postgres verification gate. It observes configuration;
+credential validity, successful sandbox claims, and execution need their own
+evidence. The default bundle and installer do not install the observer.
+
 Installations whose alert provider delivers email into Slack can opt into the
 per-message, source-thread intake described in
 [`docs/SLACK-EMAIL-INTAKE.md`](docs/SLACK-EMAIL-INTAKE.md). It is deliberately
