@@ -18,8 +18,11 @@ tool, connector or arguments from a caller:
 * an ``approval`` authority is an ``approved`` nomination whose recorded
   approval is the one named, with ``authority_ref`` the approval id; its action
   is read from the current generation (``authority_generation``);
-* the idempotency key is ``remediation:<nomination id>``, so a replayed
-  admission or approval adopts the one execution and creates nothing.
+* the idempotency key is per authority, ``remediation:<nomination id>:policy``
+  or ``remediation:<nomination id>:approval:<approval id>``, so a replayed
+  admission or approval adopts its own execution and creates nothing, while
+  the approval that follows a ``not_reversible_now`` policy refusal creates
+  its own.
 
 A refusal raises the seam's ``ForwardRefused`` and writes nothing. The ledger
 row is written at dispatch (``routers/action_executions.py``), which reads
@@ -67,10 +70,33 @@ _UNAVAILABLE: Final = "authority_unavailable"
 _DIGEST = re.compile(DIGEST_PATTERN)
 
 
-def idempotency_key(nomination_id: uuid.UUID) -> str:
-    """``remediation:<nomination id>`` (AUTOMATED-REMEDIATION-13)."""
+def idempotency_key(nomination_id: uuid.UUID, kind: str, ref: str) -> str:
+    """The per-authority key (AUTOMATED-REMEDIATION-13).
 
-    return f"{IDEMPOTENCY_PREFIX}{nomination_id}"
+    ``remediation:<nomination id>:policy`` for a policy authority and
+    ``remediation:<nomination id>:approval:<approval id>`` for an approval.
+    """
+
+    if kind == POLICY_AUTHORITY:
+        return f"{IDEMPOTENCY_PREFIX}{nomination_id}:{POLICY_AUTHORITY}"
+    return f"{IDEMPOTENCY_PREFIX}{nomination_id}:{APPROVAL_AUTHORITY}:{ref}"
+
+
+def _parse_key(key: str) -> tuple[uuid.UUID, str, str | None] | None:
+    """``(nomination id, authority kind, approval id or None)`` of a remediation key."""
+
+    if not key.startswith(IDEMPOTENCY_PREFIX):
+        return None
+    parts = key.removeprefix(IDEMPOTENCY_PREFIX).split(":")
+    try:
+        nomination_id = uuid.UUID(parts[0])
+    except ValueError:
+        return None
+    if parts[1:] == [POLICY_AUTHORITY]:
+        return nomination_id, POLICY_AUTHORITY, None
+    if len(parts) == 3 and parts[1] == APPROVAL_AUTHORITY:
+        return nomination_id, APPROVAL_AUTHORITY, parts[2]
+    return None
 
 
 def policy_ref(agent_id: uuid.UUID, hook: str, generation: int, nomination_id: uuid.UUID) -> str:
@@ -149,28 +175,56 @@ async def _refuse(session: AsyncSession, code: str, reason: str) -> ForwardRefus
 async def _adopted(
     session: AsyncSession, nomination: RemediationNomination, kind: str, ref: str
 ) -> ForwardCreated | None:
-    """The execution this nomination already names, when it is this authority's.
+    """The execution this authority already created for the nomination, or None.
 
-    A replay after the nomination moved on (``executing`` and later) still
-    answers the one execution, so a replayed admission creates nothing.
+    Found by the authority's own key, so a replay after the nomination moved on
+    (a refused policy execution sent back to approval, ``executing`` and later)
+    still answers that one execution and creates nothing.
     """
 
-    if nomination.execution_id is None:
+    execution = await session.scalar(
+        select(ActionExecution)
+        .where(
+            ActionExecution.agent_id == nomination.agent_id,
+            ActionExecution.idempotency_key == idempotency_key(nomination.id, kind, ref),
+        )
+        .execution_options(populate_existing=True)
+    )
+    if execution is None:
         return None
-    execution = await session.get(ActionExecution, nomination.execution_id)
     if (
-        execution is None
-        or execution.kind != ExecutionKind.forward
-        or execution.idempotency_key != idempotency_key(nomination.id)
+        execution.kind != ExecutionKind.forward
         or execution.authority_kind != kind
         or execution.authority_ref != ref
     ):
         raise await _refuse(
-            session, "arguments_mismatch", "this nomination already names another execution"
+            session, "arguments_mismatch", "this authority's key already names another execution"
         )
-    created = ForwardCreated(execution_id=execution.id, state=execution.state, created=False)
+    return ForwardCreated(execution_id=execution.id, state=execution.state, created=False)
+
+
+async def _record_on_nomination(
+    session: AsyncSession,
+    nomination: RemediationNomination,
+    required_state: str,
+    execution_id: uuid.UUID,
+) -> None:
+    """Name ``execution_id`` on the nomination while it holds this authority.
+
+    The nomination names the execution of the authority it currently holds:
+    a late replay of an earlier authority (an admission replayed after the
+    nomination went to approval) adopts its own execution without moving it.
+    """
+
+    await session.execute(
+        update(RemediationNomination)
+        .where(
+            RemediationNomination.id == nomination.id,
+            RemediationNomination.state == required_state,
+        )
+        .values(execution_id=execution_id)
+    )
     await session.commit()
-    return created
 
 
 async def create_remediation_forward(
@@ -212,10 +266,11 @@ async def create_remediation_forward(
         else str(approval_id)
     )
 
+    required_state = "admitted" if kind == POLICY_AUTHORITY else "approved"
     adopted = await _adopted(session, nomination, kind, ref)
     if adopted is not None:
+        await _record_on_nomination(session, nomination, required_state, adopted.execution_id)
         return adopted
-    required_state = "admitted" if kind == POLICY_AUTHORITY else "approved"
     if nomination.state != required_state:
         raise await _refuse(
             session, _UNAVAILABLE, f"a nomination in state {nomination.state} authorizes nothing"
@@ -260,21 +315,13 @@ async def create_remediation_forward(
             tool=tool,
             arguments=arguments,
             arguments_sha256=nomination.arguments_sha256,
-            idempotency_key=idempotency_key(nomination.id),
+            idempotency_key=idempotency_key(nomination.id, kind, ref),
         ),
     )
     # The seam committed the execution; the nomination now names it. A crash
     # between the two commits leaves the key to join them: a replay adopts the
     # execution and records it here, and dispatch finds the nomination by key.
-    await session.execute(
-        update(RemediationNomination)
-        .where(
-            RemediationNomination.id == nomination.id,
-            RemediationNomination.execution_id.is_(None),
-        )
-        .values(execution_id=created.execution_id)
-    )
-    await session.commit()
+    await _record_on_nomination(session, nomination, required_state, created.execution_id)
     return created
 
 
@@ -283,24 +330,21 @@ async def nomination_for_execution(
 ) -> RemediationNomination | None:
     """The nomination a remediation forward execution was created for, or None.
 
-    @spec AUTOMATED-REMEDIATION-14. Joined by the execution's own key
-    (``remediation:<nomination id>``) under the same agent, so a forward
-    execution of any other producer has none.
+    @spec AUTOMATED-REMEDIATION-14. Joined by the execution's own server-minted
+    key (``remediation:<nomination id>:<authority>``) under the same agent and
+    authority, so a forward execution of any other producer has none.
     """
 
-    key = execution.idempotency_key
-    if execution.kind != ExecutionKind.forward or not key.startswith(IDEMPOTENCY_PREFIX):
+    parsed = _parse_key(execution.idempotency_key)
+    if execution.kind != ExecutionKind.forward or parsed is None:
         return None
-    try:
-        nomination_id = uuid.UUID(key.removeprefix(IDEMPOTENCY_PREFIX))
-    except ValueError:
+    nomination_id, kind, approval = parsed
+    if execution.authority_kind != kind or (
+        approval is not None and execution.authority_ref != approval
+    ):
         return None
     nomination = await session.get(RemediationNomination, nomination_id)
-    if (
-        nomination is None
-        or nomination.agent_id != execution.agent_id
-        or nomination.execution_id not in (None, execution.id)
-    ):
+    if nomination is None or nomination.agent_id != execution.agent_id:
         return None
     return nomination
 
