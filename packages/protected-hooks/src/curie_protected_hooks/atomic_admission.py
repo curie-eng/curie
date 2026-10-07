@@ -18,6 +18,7 @@ from aci_protocol.ndjson import parse_queued_turn
 from redis import Redis
 
 from .admission_records import (
+    REMEDIATION_GENERATION,
     AdmissionRequest,
     AdmissionResult,
     AdmissionUnavailable,
@@ -45,6 +46,7 @@ from .source_fence import SourceState, _decode_source
 from .source_policy_records import policy_fingerprint
 
 # @spec PROTECTED-HOOK-ADMISSION-5
+_ABSENT = object()
 _DIGEST = re.compile(rb"[0-9a-f]{64}", re.ASCII)
 
 
@@ -379,6 +381,8 @@ class AtomicAdmission:
                     )
                     or ed["source_revision"] != original["source_generation"]
                     or ed["logical_conversation_key"] != original["conversation_id"]
+                    or ed.get(REMEDIATION_GENERATION, _ABSENT)
+                    != original.get(REMEDIATION_GENERATION, _ABSENT)
                 ):
                     raise AdmissionUnavailable()
                 envelope_raw = binding
@@ -524,6 +528,7 @@ class AtomicAdmission:
                     event_id=turn.event_id,
                     conversation_id=turn.conversation_id,
                     payload_sha256=hashlib.sha256(payload).hexdigest(),
+                    remediation_generation=request.remediation_generation,
                 )
                 envelope_raw = self._envelope(original, manifest).canonical_bytes
                 original["envelope_sha256"] = hashlib.sha256(envelope_raw).hexdigest()
@@ -561,30 +566,33 @@ class AtomicAdmission:
 
     @staticmethod
     def _envelope(intent: dict[str, Any], manifest: dict[str, Any]) -> Envelope:
-        """@spec PROTECTED-HOOK-ADMISSION-3/4/5."""
-        return Envelope(
-            _encode(
-                dict(
-                    schema_version=1,
-                    event_id=intent["event_id"],
-                    source_revision=intent["source_generation"],
-                    runtime_id=intent["runtime_id"],
-                    runtime_generation=intent["runtime_generation"],
-                    manifest_digest=intent["manifest_digest"],
-                    qualification_id=intent["qualification_id"],
-                    runner_image_digest=manifest["runner_image_digest"],
-                    bundle_digest=manifest["bundle_digest"]["sha256"],
-                    execution_config_digest=manifest["execution_config_digest"],
-                    logical_conversation_key=intent["conversation_id"],
-                    execution_session_key=execution_session_key(
-                        intent["runtime_id"],
-                        intent["runtime_generation"],
-                        intent["conversation_id"],
-                    ),
-                    payload_sha256=intent["payload_sha256"],
-                )
-            )
+        """The binding, @spec PROTECTED-HOOK-ADMISSION-3/4/5 AUTOMATED-REMEDIATION-4.
+
+        It carries the intent's remediation generation exactly when the intent
+        does, so a pre-field intent recovers to the same envelope digest.
+        """
+        value = dict(
+            schema_version=1,
+            event_id=intent["event_id"],
+            source_revision=intent["source_generation"],
+            runtime_id=intent["runtime_id"],
+            runtime_generation=intent["runtime_generation"],
+            manifest_digest=intent["manifest_digest"],
+            qualification_id=intent["qualification_id"],
+            runner_image_digest=manifest["runner_image_digest"],
+            bundle_digest=manifest["bundle_digest"]["sha256"],
+            execution_config_digest=manifest["execution_config_digest"],
+            logical_conversation_key=intent["conversation_id"],
+            execution_session_key=execution_session_key(
+                intent["runtime_id"],
+                intent["runtime_generation"],
+                intent["conversation_id"],
+            ),
+            payload_sha256=intent["payload_sha256"],
         )
+        if REMEDIATION_GENERATION in intent:
+            value[REMEDIATION_GENERATION] = intent[REMEDIATION_GENERATION]
+        return Envelope(_encode(value))
 
 
 def quota_census(admission: AtomicAdmission) -> tuple[int, int]:

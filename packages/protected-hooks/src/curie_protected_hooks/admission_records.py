@@ -85,6 +85,9 @@ _RECEIPT = {
     "acceptance_status": "accepted",
     "tool_access": "access",
 }
+# @spec AUTOMATED-REMEDIATION-4: the remediation generation at admission, a
+# canonical generation or null; absent from records written before it existed.
+REMEDIATION_GENERATION = "remediation_generation"
 _STATE = {
     "schema_version": "version",
     "status": "status",
@@ -169,9 +172,22 @@ def _logical(value: Any) -> None:
     _require(all(ord(c) >= 32 and ord(c) != 127 for c in value))
 
 
+def _remediation_generation(value: Any) -> None:
+    """A canonical generation or null, @spec AUTOMATED-REMEDIATION-4."""
+    if value is not None:
+        _scalar(value, "generation")
+
+
 def _validate(value: Any, schema: dict[str, str]) -> None:
-    """@spec PROTECTED-HOOK-ADMISSION-2/3 PROTECTED-HOOK-LANE-2."""
-    _require(type(value) is dict and value.keys() == schema.keys())
+    """@spec PROTECTED-HOOK-ADMISSION-2/3 PROTECTED-HOOK-LANE-2 AUTOMATED-REMEDIATION-4."""
+    _require(type(value) is dict)
+    if schema is _ENVELOPE or schema is _INTENT or schema is _RECEIPT:
+        extra = value.keys() - schema.keys()
+        _require(extra <= {REMEDIATION_GENERATION} and schema.keys() <= value.keys())
+        if extra:
+            _remediation_generation(value[REMEDIATION_GENERATION])
+    else:
+        _require(value.keys() == schema.keys())
     for field, kind in schema.items():
         item = value[field]
         if kind == "identity":
@@ -387,6 +403,7 @@ class AdmissionRequest:
     requested_tool_access: str | None
     request_body_sha256: str
     queued_payload: bytes
+    remediation_generation: str | None
 
     def __init__(
         self,
@@ -396,8 +413,14 @@ class AdmissionRequest:
         requested_tool_access: str | None,
         request_body_sha256: str,
         queued_payload: bytes,
+        remediation_generation: str | None = None,
     ) -> None:
-        """@spec PROTECTED-HOOK-ADMISSION-2 PROTECTED-HOOK-SOURCE-6/8."""
+        """@spec PROTECTED-HOOK-ADMISSION-2 PROTECTED-HOOK-SOURCE-6/8 AUTOMATED-REMEDIATION-4.
+
+        ``remediation_generation`` is the hook's remediation policy generation
+        current at admission, read by the ingress under the agent gate, or None
+        when no policy is bound.
+        """
         try:
             _require(type(identity) is DeliveryIdentity)
             _require(isinstance(source_policy, Mapping) and set(source_policy) == _POLICY_FIELDS)
@@ -413,6 +436,7 @@ class AdmissionRequest:
                 or (type(requested_tool_access) is str and requested_tool_access == "read-only")
             )
             _scalar(request_body_sha256, "sha256")
+            _remediation_generation(remediation_generation)
             policy_bytes = _encode(policy)
             _require(len(policy_bytes) <= _MAX_METADATA)
             payload = _decode(queued_payload, _MAX_PAYLOAD)
@@ -438,6 +462,7 @@ class AdmissionRequest:
                 ("requested_tool_access", requested_tool_access),
                 ("request_body_sha256", request_body_sha256),
                 ("queued_payload", queued_payload),
+                ("remediation_generation", remediation_generation),
             ):
                 object.__setattr__(self, field, value)
         except (ValueError, TypeError, OverflowError, RecursionError):
