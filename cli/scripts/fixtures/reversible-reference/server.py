@@ -58,6 +58,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from pydantic import StrictInt
 
 log = logging.getLogger("reversible-reference")
 
@@ -245,11 +246,12 @@ def build(store: Store, keys: Keyring, variant: str) -> MCPServer:
     checks_expected_version = variant != "ignores_expected_version"
 
     @mcp.tool(annotations=WRITE)
-    def scale(target: dict[str, Any], replicas: int) -> dict[str, Any]:
+    def scale(target: dict[str, Any], replicas: StrictInt) -> dict[str, Any]:
         """Set the replica count of ``target``; reply with the sealed prior state.
 
         @spec ACTION-EXECUTOR-9. Refuses ``sealing_key_unavailable`` and writes
-        nothing when no current sealing key is held.
+        nothing when no current sealing key is held. ``replicas`` is strict: a
+        JSON boolean is not a count and is refused before anything is sealed.
         """
 
         if replicas < 0:
