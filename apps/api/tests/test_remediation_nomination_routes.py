@@ -516,6 +516,105 @@ def test_a_malformed_first_submission_also_wins(
 
 
 # ---------------------------------------------------------------------------
+# The admitted generation and the binding's retention (task 5's envelope field)
+# ---------------------------------------------------------------------------
+
+
+def test_a_delivery_admitted_under_a_bound_policy_records_its_generation(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-4 @spec AUTOMATED-REMEDIATION-6
+
+    A delivery admitted while generation N is current carries N in its binding,
+    and the rows read it as ``admitted_generation``; a later write moves only
+    ``current_generation``, so the two differ (AUTOMATED-REMEDIATION-4 sends that
+    turn to approval at admission, task 9).
+    """
+
+    remediation(monkeypatch, enabled=True)
+
+    async def scenario() -> None:
+        async with staged(ingress_broker, tmp_path, monkeypatch) as stage:
+            admitted = await stage.bind()
+            event = await stage.protected_event()
+            current = await stage.bind()
+            assert current > admitted
+
+            response = await stage.submit(event, block(entry()))
+
+            assert response.status_code == 200, response.text
+            (row,) = await rows(event)
+            assert row["admitted_generation"] is not None
+            assert int(row["admitted_generation"]) == admitted
+            assert int(row["current_generation"]) == current
+
+    run(scenario)
+
+
+def test_a_binding_written_before_the_field_records_no_admitted_generation(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-4
+
+    An envelope without ``remediation_generation`` refuses automatic execution
+    and does not refuse the turn: the submission is accepted and its rows have
+    no admitted generation, even though a policy was bound at admission.
+    """
+
+    remediation(monkeypatch, enabled=True)
+
+    async def scenario() -> None:
+        async with staged(ingress_broker, tmp_path, monkeypatch) as stage:
+            await stage.bind()
+            event = await stage.protected_event()
+            key = "protected:admission:binding:" + event
+            legacy = json.loads(ingress_broker.command("GET", key))
+            legacy.pop("remediation_generation", None)
+            ingress_broker.command(
+                "SET", key, json.dumps(legacy, sort_keys=True, separators=(",", ":"))
+            )
+
+            response = await stage.submit(event, block(entry()))
+
+            assert response.status_code == 200, response.text
+            (row,) = await rows(event)
+            assert row["admitted_generation"] is None
+            assert int(row["current_generation"]) == stage.generation
+
+    run(scenario)
+
+
+def test_the_binding_is_retained_through_and_after_the_submission(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-6: the binding outlives the turn, unchanged, no expiry.
+
+    The route reads the binding and never writes, expires or deletes it, so a
+    replay inside the window still resolves the same event.
+    """
+
+    remediation(monkeypatch, enabled=True)
+
+    async def scenario() -> None:
+        async with staged(ingress_broker, tmp_path, monkeypatch) as stage:
+            event = await stage.protected_event()
+            await stage.bind()
+            key = "protected:admission:binding:" + event
+            before = ingress_broker.command("GET", key)
+            text = block(entry())
+
+            first = await stage.submit(event, text)
+            replay = await stage.submit(event, text)
+
+            assert first.status_code == 200, first.text
+            assert replay.status_code == 200, replay.text
+            assert ingress_broker.command("GET", key) == before
+            assert ingress_broker.command("PTTL", key) == -1
+
+    run(scenario)
+
+
+# ---------------------------------------------------------------------------
 # Submission refusals: not_protected_event, remediation_disabled, auth, shape
 # ---------------------------------------------------------------------------
 
