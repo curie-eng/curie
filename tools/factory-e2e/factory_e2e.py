@@ -73,6 +73,7 @@ import dataclasses
 import datetime as dt
 import fcntl
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -330,6 +331,9 @@ class FactoryConfig:
     layer_registry: str | None = None
     # The operator's own GitHub login; None means ask gh at check time.
     operator_login: str | None = None
+    # Anthropic-compatible base URL injected into the worker. None keeps the
+    # chart's own model route.
+    model_base_url: str | None = None
 
 
 def _read_secret_file(path: Path) -> str | None:
@@ -666,6 +670,7 @@ def load_config(
         curie_bin=env.get("CURIE_FACTORY_CURIE_BIN") or "curie",
         layer_registry=layer_registry,
         operator_login=env.get("CURIE_FACTORY_OPERATOR_LOGIN") or None,
+        model_base_url=env.get("CURIE_FACTORY_MODEL_BASE_URL") or None,
     )
 
 
@@ -742,14 +747,36 @@ def app_jwt(app_id: str, key_file: Path, *, now: int | None = None) -> str:
     return f"{header}.{payload}.{_b64url(signed.stdout)}"
 
 
-def request_id_for(repository_id: int, issue_number: int, delivery_id: str) -> uuid.UUID:
+def request_id_for(repository_id: int, issue_number: int, admission_id: str) -> uuid.UUID:
     """The execution request id the api derives for a label admission.
 
-    Each labeled delivery is its own request, so the delivery id is part of it.
+    The admission id is the issue timeline event id when GitHub returned one,
+    which is the identity `FactoryNotice.request_id` uses. A delivery id is
+    only the fallback when that event id is absent.
     """
 
-    identity = f"https://github.com/factory/label/{repository_id}/{issue_number}/{delivery_id}"
+    identity = f"https://github.com/factory/label/{repository_id}/{issue_number}/{admission_id}"
     return uuid.uuid5(uuid.NAMESPACE_URL, identity)
+
+
+def last_label_event_id(events: list[Any], label: str) -> int | None:
+    """The newest ``labeled`` event id for ``label``, or None.
+
+    Same selection as the api's label-event admission identity: the last
+    matching event in the list GitHub returns.
+    """
+
+    found: int | None = None
+    for event in events:
+        if (
+            isinstance(event, dict)
+            and event.get("event") == "labeled"
+            and isinstance(event.get("label"), dict)
+            and event["label"].get("name") == label
+            and type(event.get("id")) is int
+        ):
+            found = event["id"]
+    return found
 
 
 def revision_request_id(repository_id: int, comment_id: int) -> uuid.UUID:
@@ -813,6 +840,32 @@ def delivery_api_status(delivery: dict[str, Any]) -> str | None:
     return status if isinstance(status, str) else None
 
 
+def model_proxy_egress(url: str) -> dict[str, Any]:
+    """The sandbox egress rule for a model proxy pod IP.
+
+    NetworkPolicy cannot name a DNS host. The base URL's host must already be
+    that pod's IP. The port is the URL port, or the scheme default.
+    """
+
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    if not host:
+        raise ConfigError("model base URL must include a host")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        raise ConfigError(
+            "model base URL host must be the proxy pod IP so sandbox egress can allow it"
+        ) from None
+    if parsed.port is not None:
+        port = parsed.port
+    elif parsed.scheme == "https":
+        port = 443
+    else:
+        port = 80
+    return {"cidr": f"{host}/32", "ports": [{"protocol": "TCP", "port": port}]}
+
+
 def install_values(
     config: FactoryConfig,
     *,
@@ -822,6 +875,7 @@ def install_values(
     egress_cidrs: Sequence[str] = (),
     sandbox_pod_quota: int | None = None,
     card_base_url: str = "",
+    local_images: bool = False,
 ) -> dict[str, Any]:
     """Helm values for the disposable install. Written to a 0600 file, never argv.
 
@@ -835,6 +889,17 @@ def install_values(
 
     tag = f"sha-{candidate}"
     values: dict[str, Any] = {component: {"image": {"tag": tag}} for component in CHART_COMPONENTS}
+    if local_images:
+        for component, repository in (
+            ("api", "curie-api"),
+            ("worker", "curie-worker"),
+            ("dispatcher", "curie-dispatcher"),
+            ("mailAdapter", "curie-mail-adapter"),
+            ("ui", "curie-ui"),
+        ):
+            values[component]["image"]["repository"] = repository
+            values[component]["image"]["tag"] = "local"
+            values[component]["image"]["pullPolicy"] = "Never"
     values["api"].update(
         {
             "githubWebhookSecret": config.webhook_secret,
@@ -848,8 +913,12 @@ def install_values(
     )
     if card_base_url:
         values["api"]["githubFactoryCardBaseUrl"] = card_base_url
+    runner_values: dict[str, Any] = {"tag": "latest" if local_images else tag}
+    if local_images:
+        runner_values["image"] = "curie-runner"
+        runner_values["imagePullPolicy"] = "IfNotPresent"
     values["agentSandbox"] = {
-        "runner": {"tag": tag},
+        "runner": runner_values,
         "controller": {"deploy": not consumer_controller},
     }
     # A disposable install proves the factory flow, not sandbox isolation, and
@@ -885,6 +954,24 @@ def install_values(
         # it. The runner ceiling must not exceed the delivery budget.
         values["worker"]["deliveryBudgetSeconds"] = EXECUTION_BOUND_SECONDS
         values["worker"]["runnerTotalTimeoutSeconds"] = EXECUTION_BOUND_SECONDS
+    if config.model_base_url:
+        if not config.model_api_key:
+            values["agentSandbox"]["runner"].update(
+                {
+                    "fakeModel": False,
+                    "model": config.model,
+                    "credentials": "not-needed",
+                }
+            )
+            values["worker"]["deliveryBudgetSeconds"] = EXECUTION_BOUND_SECONDS
+            values["worker"]["runnerTotalTimeoutSeconds"] = EXECUTION_BOUND_SECONDS
+        worker_env = list(values["worker"].get("extraEnv") or [])
+        worker_env.append({"name": "CURIE_MODEL_BASE_URL", "value": config.model_base_url})
+        worker_env.append({"name": "CURIE_MODEL", "value": config.model})
+        values["worker"]["extraEnv"] = worker_env
+        allowed = list(values["security"].get("networkPolicy", {}).get("allowedEgress") or [])
+        allowed.append(model_proxy_egress(config.model_base_url))
+        values["security"].setdefault("networkPolicy", {})["allowedEgress"] = allowed
     if sandbox_pod_quota is not None:
         values["resourceQuota"] = {"hard": {"sandboxPodCount": str(sandbox_pod_quota)}}
     if config.priority_classes is not None:
@@ -2422,6 +2509,23 @@ class Preflight:
         elif status != 200:
             raise PreflightFailed(f"reading the factory label failed (HTTP {status})")
 
+    def label_admission_event_id(self, issue_number: int) -> int:
+        """The timeline event id the api used as the admission identity."""
+
+        def probe() -> int | None:
+            status, body = self.as_actor(
+                "GET",
+                f"/repos/{self.config.repo}/issues/{issue_number}/events?per_page=100",
+            )
+            if status != 200 or not isinstance(body, list):
+                return None
+            return last_label_event_id(body, self.config.label)
+
+        found = _wait("the labelled timeline event", 60, probe, 2)
+        if type(found) is not int:
+            raise PreflightFailed("the labelled issue has no labeled timeline event")
+        return found
+
     def open_labelled_issue(self) -> int:
         if self.issue_spec is not None:
             title, body_text = self.issue_spec
@@ -2496,7 +2600,8 @@ class Preflight:
                 f"{delivery.get('status_code')}, api status {api_status!r}"
             )
         self.step("delivery accepted", delivery_id=delivery.get("guid"))
-        request_id = request_id_for(self.repository_id, issue_number, str(delivery.get("guid")))
+        event_id = self.label_admission_event_id(issue_number)
+        request_id = request_id_for(self.repository_id, issue_number, str(event_id))
         status, body = self.api(
             "GET",
             f"/v1/internal/work-items/requests/{request_id}",
@@ -4994,6 +5099,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="after a passing run, keep the install up until Ctrl-C or SIGTERM, then tear down",
     )
+    common.add_argument(
+        "--model-base-url",
+        help=(
+            "Anthropic-compatible base URL passed to the worker as "
+            "CURIE_MODEL_BASE_URL through worker.extraEnv. The host must be "
+            "the proxy pod IP; sandbox egress allows that IP."
+        ),
+    )
     sub = parser.add_subparsers(dest="mode", required=True)
     sub.add_parser(
         "preflight", parents=[common], help="install, deliver one labelled issue, assert admission"
@@ -5033,6 +5146,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=[],
         help="issue-to-pr: a case-insensitive regex the agent's stated reason must match",
     )
+    scripted = sub.add_parser(
+        "scripted",
+        help="kind-rung factory scenario with the GitHub stub and a scripted model",
+    )
+    scripted.add_argument("--context", required=True)
+    scripted.add_argument("--namespace", default="test-factory-scripted")
+    scripted.add_argument(
+        "--transcript",
+        type=Path,
+        default=Path("tools/model-script/transcripts/unitconv-issue.json"),
+    )
+    scripted.add_argument("--model-base-url")
     return parser.parse_args(argv)
 
 
@@ -5486,6 +5611,16 @@ def evaluation_exit_code(report: Mapping[str, Any]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.mode == "scripted":
+        import importlib.util
+
+        path = Path(__file__).with_name("scripted_kind.py")
+        spec = importlib.util.spec_from_file_location("scripted_kind", path)
+        if spec is None or spec.loader is None:
+            raise ConfigError("scripted kind driver is missing")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return int(module.main(args))
     driver: ScenarioDriver | None = None
     issue_spec: tuple[str, str] | None = None
     expect = "any"
@@ -5535,6 +5670,8 @@ def main(argv: list[str] | None = None) -> int:
                     else DEFAULT_CANCEL_RUNNING_ISSUE
                 )
         config = load_config(os.environ, context=args.context)
+        if args.model_base_url:
+            config = dataclasses.replace(config, model_base_url=args.model_base_url)
         if args.mode == "run" and args.scenario in (
             "revision",
             "cancel-running",

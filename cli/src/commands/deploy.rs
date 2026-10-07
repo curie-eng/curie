@@ -231,6 +231,9 @@ pub struct PreparedDeploy {
     client: ApiClient,
     outcome: crate::api::PreparedDeployOutcome,
     plugin_name: String,
+    /// Declarations from the packed manifest, carried so activation never reads
+    /// a source manifest that may have changed since upload.
+    cron_triggers: Vec<CronTriggerReceipt>,
     label: String,
     env: String,
     requested_repo: Option<String>,
@@ -747,12 +750,18 @@ pub(super) async fn prepare_deploy_with_commit_sha(
             return Err(err);
         }
     };
+    // Successful upload establishes the platform's manifest validation. Read
+    // receipts only now, from those packed bytes, without another preflight gate
+    // or an empty-receipt fallback for an unreadable manifest.
+    let (_, manifest_body) = packed_manifest.context("reading the uploaded bundle's manifest")?;
+    let cron_triggers = deploy_cron_triggers_from_manifest(&manifest_body)?;
 
     Ok(PreparedDeploy {
         delivery: opts.delivery,
         client,
         outcome,
         plugin_name,
+        cron_triggers,
         label,
         env,
         requested_repo: opts.repo,
@@ -839,6 +848,7 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         client,
         outcome,
         plugin_name,
+        cron_triggers,
         label,
         env,
         requested_repo,
@@ -862,6 +872,8 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
             return Err(err);
         }
     };
+
+    let warnings = deploy_cron_target_warnings(&cron_triggers, &outcome.agent);
 
     // A declined --repo is otherwise silent: the deploy succeeds, the agent
     // looks fine, and the operator believes the rebind took (#1064, #1212).
@@ -975,6 +987,8 @@ pub async fn deploy_prepared(prepared: PreparedDeploy) -> Result<DeployOutput> {
         deployment_id: outcome.deployment.id,
         deployment_environment: outcome.deployment.environment,
         deployment_status: outcome.deployment.status,
+        cron_triggers,
+        warnings,
     })
 }
 
@@ -991,6 +1005,15 @@ pub(crate) async fn deploy_with_commit_sha(
 ) -> Result<DeployOutput> {
     let prepared = prepare_deploy_with_commit_sha(opts, installer_commit_sha).await?;
     deploy_prepared(prepared).await
+}
+
+/// One cron declaration from the immutable bundle uploaded by a deploy.
+#[derive(Debug, Serialize)]
+pub struct CronTriggerReceipt {
+    pub name: String,
+    pub schedule: String,
+    pub zone: String,
+    pub target: Option<String>,
 }
 
 /// Output of `<tier> deploy`: the deployed agent/version/channel/bundle/deployment
@@ -1014,6 +1037,29 @@ pub struct DeployOutput {
     pub deployment_id: String,
     pub deployment_environment: String,
     pub deployment_status: String,
+    pub cron_triggers: Vec<CronTriggerReceipt>,
+    pub warnings: Vec<String>,
+}
+
+impl DeployOutput {
+    fn render_cron(&self, ui: &crate::ui::Ui) {
+        for trigger in &self.cron_triggers {
+            ui.kv(
+                "cron",
+                &format!(
+                    "{}: {} [{}] -> {} ({})",
+                    trigger.name,
+                    trigger.schedule,
+                    trigger.zone,
+                    trigger.target.as_deref().unwrap_or("targetless"),
+                    self.agent_name,
+                ),
+            );
+        }
+        for warning in &self.warnings {
+            ui.warn(warning);
+        }
+    }
 }
 
 /// One completed entry in a deploy across every declared target, retaining the
@@ -1051,7 +1097,10 @@ impl crate::ui::CliOutput for AllTargetsDeployOutput {
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
-        if let Some(last) = self.results.last() {
+        if let Some((last, earlier)) = self.results.split_last() {
+            for entry in earlier {
+                entry.result.render_cron(ui);
+            }
             <DeployOutput as crate::ui::CliOutput>::render(&last.result, ui);
         }
     }
@@ -1109,6 +1158,8 @@ impl crate::ui::CliOutput for DeployOutput {
                 "environment": self.deployment_environment,
                 "status": self.deployment_status,
             },
+            "cron_triggers": self.cron_triggers,
+            "warnings": self.warnings,
         })
     }
 
@@ -1140,5 +1191,78 @@ impl crate::ui::CliOutput for DeployOutput {
                 self.deployment_id, self.deployment_environment, self.deployment_status
             ),
         );
+        self.render_cron(ui);
     }
+}
+
+/// Read receipts without validating declarations again: the platform's bundle
+/// validator decides whether the uploaded manifest can be activated.
+fn deploy_cron_triggers_from_manifest(body: &str) -> Result<Vec<CronTriggerReceipt>> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(body).context("plugin manifest is not valid JSON")?;
+    let Some(triggers) = manifest.get("triggers").and_then(|value| value.as_array()) else {
+        return Ok(Vec::new());
+    };
+    Ok(triggers
+        .iter()
+        .filter_map(|trigger| {
+            if trigger.get("type").and_then(|value| value.as_str()) != Some("cron") {
+                return None;
+            }
+            Some(CronTriggerReceipt {
+                name: trigger.get("name")?.as_str()?.to_string(),
+                schedule: trigger.get("schedule")?.as_str()?.to_string(),
+                zone: trigger
+                    .get("timezone")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("UTC")
+                    .to_string(),
+                target: trigger
+                    .get("target")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+            })
+        })
+        .collect())
+}
+
+/// Match the selected hook-fire rule, using the resolved agent's API-normalized
+/// bindings. The worker's existing cron loop does not trim targets; changing
+/// that behavior is outside this deploy advisory (#4009).
+fn deploy_cron_target_warnings(
+    triggers: &[CronTriggerReceipt],
+    agent: &crate::api::Agent,
+) -> Vec<String> {
+    triggers
+        .iter()
+        .filter_map(|trigger| {
+            let target = trigger.target.as_deref()?.trim();
+            let candidates: Vec<_> = agent
+                .channels
+                .iter()
+                .filter(|binding| binding.address == target)
+                .collect();
+            // apps/api/src/curie_api/routers/hook_fire.py::fire_hook narrows only
+            // multiple all-Slack matches to the default identity, then requires
+            // exactly one. Mixed kinds and duplicate defaults stay ambiguous.
+            let matches = if candidates.len() > 1
+                && candidates.iter().all(|binding| binding.kind == "slack")
+            {
+                candidates
+                    .iter()
+                    .filter(|binding| binding.named_adapter().is_none())
+                    .count()
+            } else {
+                candidates.len()
+            };
+            if matches == 1 {
+                return None;
+            }
+            Some(format!(
+                "cron trigger `{}` targets `{target}`, which matches no single channel bound to \
+                 `{}`; every slot records failed until that address is bound.",
+                trigger.name, agent.name,
+            ))
+        })
+        .collect()
 }

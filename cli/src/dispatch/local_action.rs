@@ -344,16 +344,15 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             })
             .await?,
         ),
-        LocalAction::Hook { action } => {
-            let LocalHookAction::Fire {
+        LocalAction::Hook { action } => match action {
+            LocalHookAction::Fire {
                 agent,
                 name,
                 wait_secs,
                 api_url,
                 api_key,
                 dry_run,
-            } = action;
-            emit(
+            } => emit(
                 commands::hook_fire(commands::HookFireOpts {
                     api_url,
                     api_key,
@@ -361,10 +360,29 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     name,
                     dry_run,
                     wait_secs,
+                    tier: "local",
                 })
                 .await?,
-            )
-        }
+            ),
+            LocalHookAction::Record {
+                agent,
+                name,
+                id,
+                api_url,
+                api_key,
+                dry_run,
+            } => emit(
+                commands::hook_record(commands::HookRecordOpts {
+                    api_url,
+                    api_key,
+                    agent,
+                    name,
+                    run_id: id,
+                    dry_run,
+                })
+                .await?,
+            ),
+        },
         LocalAction::Memory {
             target,
             add,
@@ -439,6 +457,8 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             agent,
             model,
             clear_model,
+            reviewer_model,
+            clear_reviewer_model,
             thinking,
             clear_thinking,
             execution_deadline,
@@ -458,6 +478,11 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     dry_run,
                 },
                 commands::OverrideChange::resolve("model", model, clear_model)?,
+                commands::OverrideChange::resolve(
+                    "reviewer-model",
+                    reviewer_model,
+                    clear_reviewer_model,
+                )?,
                 commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
                 commands::OverrideChange::resolve_execution_deadline(
                     execution_deadline,

@@ -2179,3 +2179,23 @@ fn cluster_comms_parses_slack_disconnect_and_app_token() {
         _ => panic!("expected cluster comms command"),
     }
 }
+
+#[test]
+fn developer_model_script_passes_provider_flags_through() {
+    let cli = try_parse_from([
+        "curie",
+        "dev",
+        "model-script",
+        "serve",
+        "--transcript",
+        "transcript.json",
+    ])
+    .expect("dev model-script should pass its flags through");
+    match cli.command {
+        Some(Command::Dev {
+            action: DevAction::ModelScript { args },
+        }) => assert_eq!(args, ["serve", "--transcript", "transcript.json"]),
+        _ => panic!("dev model-script parsed as another command"),
+    }
+    assert!(try_parse_from(["curie", "dev", "model-script"]).is_err());
+}

@@ -2040,6 +2040,8 @@ jobs:
       cli_release: ${{ steps.filter.outputs.cli_release }}
       pytest: ${{ steps.filter.outputs.pytest }}
       version_only: ${{ steps.filter.outputs.version_only }}
+      factory: ${{ steps.filter.outputs.factory }}
+      approval_resume: ${{ steps.filter.outputs.approval_resume }}
       runtime_assertions: ${{ steps.runtime.outputs.runtime_assertions }}
     steps:
       - uses: actions/checkout@v7
@@ -2407,6 +2409,18 @@ jobs:
         env:
           CURIE_BIN: cli/target/release/curie
         run: bash cli/scripts/credential-free-redeploy-cluster.sh
+      # #3814: the dark factory on this kind cluster, only when a factory path
+      # changed. The GitHub stub and the scripted model replace github.com and
+      # the live provider. The ladder release above is left in place.
+      - name: Scripted factory scenario
+        if: needs.changes.outputs.factory == 'true'
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: |
+          set -euo pipefail
+          CURIE_FACTORY_SCRIPTED_PLAN=1 python3 tools/factory-e2e/factory_e2e.py scripted \
+            --context kind-curie-e2e \
+            --model-base-url http://10.1.2.3:8080
       # Surface why on any failure above: pod states, recent events, and the
       # worker/runner logs are what localize a reachability or scheduling break.
       - name: Dump cluster diagnostics on failure
@@ -2913,6 +2927,254 @@ jobs:
         if: always()
         run: |
           kubectl delete namespace curie \
+
+  # APPROVAL RESUME AFTER WORKER AND STORE RESTARTS (#4016). An approval
+  # resolved while the resume store (Valkey) and the worker restart must still
+  # resume the original turn within 300 s, running the gated tool exactly once.
+  # Unlike the rollout recovery job it runs on pull requests, because the
+  # resolve-to-resume path is only proven end to end on a real install. The
+  # selector picks it for worker and approval paths, and kind omission on next
+  # drops it like every other kind job.
+  e2e-cluster-approval-resume-restarts:
+    name: E2E approval resume after worker and store restarts (kind)
+    runs-on: ubuntu-latest
+    needs: [rust-build, changes, ci-images]
+    if: ${{ needs.changes.outputs.approval_resume == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Download the curie binary built by the Rust job
+        uses: actions/download-artifact@v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The images come from the ci-images job, which built them once for this
+      # run; they are loaded into the local daemon store so `kind load` picks
+      # them up with no registry round trip. The four product images drive the
+      # cluster round trip. The dispatcher is not deployed.
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.16.4
+      # The images come from the ci-images job, which built them once for this
+      # run; they are loaded into the local daemon store so `kind load` picks
+      # them up with no registry round trip. The four product images drive the
+      # cluster round trip. The dispatcher is not deployed.
+      - name: Load the images built by the ci-images job
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,worker,ui,runner}"
+      - name: Tag the images for the kind node store
+        run: |
+          set -euo pipefail
+          docker tag curie-ci/api:candidate curie-api:local
+          docker tag curie-ci/worker:candidate curie-worker:local
+          docker tag curie-ci/ui:candidate curie-ui:local
+          docker tag curie-ci/runner:candidate curie-runner:latest
+      # kind config: map the UI NodePort (chart default 30080) to the host so
+      # `cluster deploy`'s UI `/api` NodePort discovery -- which resolves the
+      # loopback kubeconfig host (127.0.0.1) -- reaches the in-cluster API.
+      #
+      # disableDefaultCNI is load-bearing (#1153). kind's default kindnet
+      # implements NO NetworkPolicy controller, so every policy the chart ships
+      # -- including Rail 1's default-deny egress for runner sandboxes
+      # (ADR-0067) -- is applied and then silently never evaluated. A totally
+      # broken policy is indistinguishable from a correct one, which is how an
+      # egress rule naming a Service ClusterIP (unmatchable: kube-proxy DNATs
+      # to a pod IP before policy runs) reached a real cluster. Calico is
+      # installed below so this cluster behaves like the k3s and EKS clusters
+      # Curie actually runs on.
+      - name: Write the kind cluster config
+        run: |
+          cat > kind-config.yaml <<'EOF'
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          networking:
+            disableDefaultCNI: true
+            podSubnet: "192.168.0.0/16"
+          nodes:
+            - role: control-plane
+              extraPortMappings:
+                - containerPort: 30080
+                  hostPort: 30080
+                  listenAddress: "127.0.0.1"
+                  protocol: TCP
+          EOF
+      # Disposable kind cluster. Pins both the action and the kind/node-image
+      # versions. The `kind` Docker network (created here) is the bridge every
+      # node container sits on; its gateway is the host address the in-cluster
+      # worker reaches the reply stub through, resolved below.
+      - name: Ensure kind-registry exists
+        run: bash cli/scripts/ensure-kind-registry.sh
+      - name: Create the kind cluster
+        id: create_kind_cluster
+        continue-on-error: true
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          cluster_name: curie-e2e
+          config: kind-config.yaml
+      # A first attempt that died partway can leave nodes behind, and
+      # `kind create cluster` refuses to run against a cluster name that
+      # already has any. Tear the partial cluster down so the retry starts
+      # clean. `kind` is absent from PATH when attempt 1 died before the
+      # action installed it, which is what the `|| true` covers.
+      - name: Back off before retrying Create the kind cluster
+        if: steps.create_kind_cluster.outcome == 'failure'
+        run: |
+          echo "Create the kind cluster failed on attempt 1 of 2, retrying in 15 seconds"
+          kind delete cluster --name curie-e2e 2>/dev/null || true
+          bash cli/scripts/ensure-kind-registry.sh
+          sleep 15
+      - name: Create the kind cluster (retry)
+        if: steps.create_kind_cluster.outcome == 'failure'
+        uses: helm/kind-action@06c1ae10762d3b9c1644e7fe69596ae519e015a2 # v1.15.0
+        with:
+          version: v0.24.0
+          node_image: kindest/node:v1.31.0
+          cluster_name: curie-e2e
+          config: kind-config.yaml
+      # The cluster has no CNI until this lands (disableDefaultCNI above), so
+      # every node stays NotReady and nothing schedules until Calico is up.
+      - name: Install Calico so NetworkPolicy is actually enforced
+        run: |
+          set -euo pipefail
+          calico_manifest="$RUNNER_TEMP/calico-v3.28.2.yaml"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "$calico_manifest" \
+            https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml
+          echo "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8  $calico_manifest" \
+            | sha256sum --check --strict
+          kubectl apply -f "$calico_manifest"
+          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
+          kubectl wait --for=condition=Ready node --all --timeout=300s
+      # Load the product images into the node store with no registry round trip.
+      - name: Load images into the kind cluster
+        run: |
+          set -euo pipefail
+          for img in \
+            curie-api:local \
+            curie-worker:local \
+            curie-ui:local \
+            curie-runner:latest; do
+            kind load docker-image "$img" --name curie-e2e
+          done
+      # The pod-reachable host for the reply stub: the kind Docker network
+      # gateway. Every node container sits on this bridge, so a pod egressing
+      # through its node reaches the host here; the stub binds 0.0.0.0 and answers
+      # on it. Auto-detection (the loopback API server) cannot produce this value
+      # on kind. Resolved before the install now that
+      # the install trusts the stub origin, and it only needs the kind node
+      # container, which is already running by here.
+      - name: Resolve the pod-reachable host for the reply stub
+        run: |
+          set -euo pipefail
+          # The kind bridge's IPv4 gateway is the host address every node -- and
+          # every pod egressing through its node -- can reach; the stub binds
+          # 0.0.0.0 and answers on it. The `kind` Docker network is frequently
+          # dual-stack, so IPAM.Config carries both an IPv4 and an IPv6 entry in
+          # an unspecified order (and an entry may omit Gateway) -- `index 0` is
+          # not reliably the IPv4 one, which is why it came back empty. Read the
+          # gateway the control-plane node container actually got first, then
+          # fall back to ranging the network's IPAM for a dotted-quad gateway.
+          node="curie-e2e-control-plane"
+          gw="$(docker inspect "$node" --format '{{ .NetworkSettings.Networks.kind.Gateway }}' 2>/dev/null || true)"
+          if [[ ! "$gw" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            gw="$(docker network inspect kind \
+                    --format '{{range .IPAM.Config}}{{println .Gateway}}{{end}}' 2>/dev/null \
+                  | grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1 || true)"
+          fi
+          if [[ ! "$gw" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "could not resolve the kind network IPv4 gateway" >&2
+            echo "--- docker network inspect kind ---" >&2
+            docker network inspect kind >&2 || true
+            echo "--- docker inspect $node (.NetworkSettings.Networks) ---" >&2
+            docker inspect "$node" --format '{{json .NetworkSettings.Networks}}' >&2 || true
+            exit 1
+          fi
+          echo "kind network gateway (worker->stub reply host): $gw"
+          echo "CURIE_E2E_LISTEN_HOST=$gw" >> "$GITHUB_ENV"
+      # Helm-install the platform through the operator wrapper. --dev pins the
+      # chart's deterministic published secrets (so `cluster message` can read
+      # them back); --fake-model seals the install credential-free. The --set
+      # overrides repoint every first-party image at the just-loaded local tags
+      # with pullPolicy Never (the runner AND its prewarm DaemonSet), force gVisor
+      # off (no runsc on kind nodes), and drop the dispatcher (no Slack; its
+      # presence would trip the `cluster message` reply-hijack guard).
+      - name: Install the platform (curie cluster up)
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: |
+          set -euo pipefail
+          "$CURIE_BIN" cluster up \
+            --chart charts/curie \
+            --dev \
+            --fake-model \
+            --set security.gvisor.mode=off \
+            --set dispatcher.deploy=false \
+            --set api.image.repository=curie-api --set api.image.tag=local --set api.image.pullPolicy=Never \
+            --set worker.image.repository=curie-worker --set worker.image.tag=local --set worker.image.pullPolicy=Never \
+            --set ui.image.repository=curie-ui --set ui.image.tag=local --set ui.image.pullPolicy=Never \
+            --set agentSandbox.runner.image=curie-runner --set agentSandbox.runner.tag=latest --set agentSandbox.runner.imagePullPolicy=Never \
+            --set agentSandbox.runner.prewarm.imagePullPolicy=Never
+      # `cluster up` does not `helm --wait` (the argv stays a thin wrapper), so
+      # wait for the rollouts the round trip depends on before driving it. The
+      # controller-ready preflight already gated the agent-sandbox controller
+      # during install; these cover the app tier and the prewarm cache. Langfuse
+      # and ClickHouse are intentionally NOT waited on -- a fake-model turn does
+      # not need traces to have flushed, and they are the slowest pods to settle.
+      - name: Wait for the platform to become ready
+        run: |
+          set -euo pipefail
+          kubectl rollout status deploy/curie-api -n curie --timeout=300s
+          kubectl rollout status deploy/curie-worker -n curie --timeout=300s
+          kubectl rollout status deploy/curie-ui -n curie --timeout=300s
+          kubectl rollout status daemonset/curie-runner-prewarm -n curie --timeout=300s
+      # #4016: resolve a pending Bash approval through an operator principal
+      # while Valkey and the worker restart, then require the original turn to
+      # finalize within 300 s with exactly one gated tool call. The script
+      # deletes only the resources it created.
+      - name: Approval resume after worker and store restarts
+        env:
+          CURIE_BIN: cli/target/release/curie
+        run: bash cli/scripts/e2e-cluster-approval-resume-restarts.sh
+      # Surface why on any failure above: pod states, recent events, and the
+      # worker, api, and runner logs. The api log carries the resolve and the
+      # resume enqueue or reconciler retry; the runner log carries the tool call.
+      - name: Dump cluster diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide || true
+          kubectl get events -n curie --sort-by=.lastTimestamp | tail -50 || true
+          kubectl describe pods -n curie -l app.kubernetes.io/component=runner-sandbox || true
+          kubectl logs -n curie -l app.kubernetes.io/component=worker --tail=100 || true
+          kubectl logs -n curie -l app.kubernetes.io/component=api --tail=200 || true
+          kubectl logs -n curie -l app.kubernetes.io/component=runner-sandbox --all-containers --prefix --tail=200 || true
+      # Delete only this job's namespaced release resources. Do not uninstall or
+      # delete the shared controller namespace: the pinned kind action owns final
+      # disposal of the whole single-use cluster. This still runs after failure.
+      - name: Tear down the disposable cluster release
+        if: always()
+        run: |
+          kubectl delete namespace curie \
+            --ignore-not-found --wait=false 2>/dev/null || true
 
   # RELEASED CHART UPGRADE REGRESSION (issues #2097 and #2194). This is separate
   # from the fresh install cluster rung because it starts from published charts
@@ -3722,7 +3984,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
+    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -3738,11 +4000,13 @@ jobs:
           CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
           RELEASED_UPGRADE_SELECTED: ${{ needs.changes.outputs.released_upgrade }}
           RELEASED_UPGRADE_FULL: ${{ needs.changes.outputs.released_upgrade_full }}
+          APPROVAL_RESUME_SELECTED: ${{ needs.changes.outputs.approval_resume }}
           SKILL_LOCAL_RESULT: ${{ needs.e2e-ladder.result }}
           LOCAL_RELEASE_RESULT: ${{ needs.e2e-ladder-release.result }}
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
           CLUSTER_CHART_RESULT: ${{ needs.e2e-cluster-chart-regressions.result }}
           ROLLOUT_RECOVERY_RESULT: ${{ needs.e2e-cluster-rollout-recovery.result }}
+          APPROVAL_RESUME_RESULT: ${{ needs.e2e-cluster-approval-resume-restarts.result }}
           RELEASED_UPGRADE_RESULT: ${{ needs.e2e-released-upgrade.result }}
           RELEASED_UPGRADE_NEGATIVE_RESULT: ${{ needs.e2e-released-upgrade-negative.result }}
           UPGRADE_MATRIX_SHARDS_RESULT: ${{ needs.e2e-cluster-upgrade-matrix-shards.result }}
@@ -3756,6 +4020,7 @@ jobs:
                   "$CLUSTER_RESULT" != "$cluster_expected" ||
                   "$CLUSTER_CHART_RESULT" != "$cluster_expected" ||
                   "$ROLLOUT_RECOVERY_RESULT" != "$rollout_recovery_expected" ||
+                  "$APPROVAL_RESUME_RESULT" != "$approval_resume_expected" ||
                   "$RELEASED_UPGRADE_RESULT" != "$released_upgrade_expected" ||
                   "$RELEASED_UPGRADE_NEGATIVE_RESULT" != "$released_upgrade_expected" ||
                   "$UPGRADE_MATRIX_RESULT" != "$upgrade_matrix_expected" ]]; then
@@ -3772,6 +4037,7 @@ jobs:
                 ( "$CLUSTER_SELECTED" != "true" && "$CLUSTER_SELECTED" != "false" ) ||
                 ( "$RELEASED_UPGRADE_SELECTED" != "true" && "$RELEASED_UPGRADE_SELECTED" != "false" ) ||
                 ( "$RELEASED_UPGRADE_FULL" != "true" && "$RELEASED_UPGRADE_FULL" != "false" ) ||
+                ( "$APPROVAL_RESUME_SELECTED" != "true" && "$APPROVAL_RESUME_SELECTED" != "false" ) ||
                 ( "$RELEASED_UPGRADE_FULL" == "true" && "$RELEASED_UPGRADE_SELECTED" != "true" ) ]]; then
             echo "E2E required failed" >&2
             exit 1
@@ -3794,6 +4060,11 @@ jobs:
           if [[ "$CLUSTER_SELECTED" == "true" && "$EVENT_NAME" != "pull_request" ]]; then
             rollout_recovery_expected="success"
           fi
+          # Mirrors the approval resume job's if (#4016), pull requests included.
+          approval_resume_expected="skipped"
+          if [[ "$APPROVAL_RESUME_SELECTED" == "true" ]]; then
+            approval_resume_expected="success"
+          fi
           # Full runs include pushes, dispatches, and PRs editing an upgrade
           # job. Ordinary PRs selecting released-upgrade run one smoke shard.
           # The matrix reports success only when all selected shards succeed.
@@ -3814,7 +4085,8 @@ jobs:
           # Flip every checked result in turn. Each flipped verdict must be
           # rejected, so no dependency can drop out of the validator unnoticed.
           for name in SKILL_LOCAL_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
-            CLUSTER_CHART_RESULT ROLLOUT_RECOVERY_RESULT RELEASED_UPGRADE_RESULT \
+            CLUSTER_CHART_RESULT ROLLOUT_RECOVERY_RESULT APPROVAL_RESUME_RESULT \
+            RELEASED_UPGRADE_RESULT \
             RELEASED_UPGRADE_NEGATIVE_RESULT UPGRADE_MATRIX_RESULT; do
             flipped="success"
             if [[ "${!name}" == "success" ]]; then

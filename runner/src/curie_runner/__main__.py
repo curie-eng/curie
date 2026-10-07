@@ -1128,6 +1128,7 @@ def build_runner(
         real_options = build_options(
             plugins=compiled.plugins,
             model=config.model,
+            reviewer_model=config.reviewer_model,
             system_prompt=system_prompt,
             max_turns=config.max_turns,
             max_budget_usd=config.max_usd_per_day,

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/model-credit/v1.json",
+  "title": "curie dev model-credit --json",
+  "description": "One OpenRouter credit class for CURIE_CREDENTIALS. The credential value is never a field.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "class": {
+      "type": "string",
+      "enum": [
+        "credential-missing",
+        "credential-rejected",
+        "credit-exhausted",
+        "credit-sufficient",
+        "credit-unknown",
+        "credit-unavailable"
+      ]
+    }
+  },
+  "required": ["class"]
+}

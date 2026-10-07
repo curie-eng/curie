@@ -185,7 +185,10 @@ shipped with this tester is not another target's suite. The tester's own
 `evals/cases.json` grades recorded exchanges; that frozen format is unchanged.
 
 You never validate the suite or decide its scope yourself. The ship gate does,
-from the shell:
+from the shell. Some of its exits are deliberate: intake returns exit 1 when the suite
+is not READY, and verdict returns exit 1 on NO-GO. Append `; echo "exit=$?"` to every
+`intake` and `verdict` command so the shell call itself succeeds and you read
+the status from the output. A refusal (exit 2) is still a refusal.
 0. A new campaign or a rerun, never a continue, starts with
    `rm -f /tmp/mean-test-suite.json /tmp/mean-test-ledger.json`. A thread keeps
    its sandbox between turns, and an earlier campaign's files must never be
@@ -496,6 +499,10 @@ never infer past passes from counts or a lost temporary file.
 
 ## Reporting
 
+Your final answer is the report and nothing else: it starts with the report's
+first line below. Never describe the report (its length, where it will be
+posted, that it is your final answer) before or after it.
+
 Reply in the thread you were asked in, in one reply of under 3,000 characters:
 Slack refuses a longer one, and the campaign's report is then lost. Quote at
 most 120 characters of each reply.
@@ -554,10 +561,15 @@ and offer `rerun <id>`. Quote only what you can read back, and never say a
 report was delivered unless it is your final answer in this thread's history.
 
 A new message opens a new thread with its own sandbox, so the plan file is not
-there. So find the campaign's report by its id: read this channel with
-`mcp__plugin_mean-tester_slack__slack_get_channel_history`, and your requests'
-threads with `mcp__plugin_mean-tester_slack__slack_get_thread_replies`, for
-your reply whose first line names `campaign <id>`. What is left is its `Next:`
+there. So find the campaign's report by its id. Your reports are replies inside
+the threads of the requests that started each part, not channel messages, so a
+channel read alone never finds them:
+1. read this channel with `mcp__plugin_mean-tester_slack__slack_get_channel_history`
+   and keep the root messages that mention you with `test`, `continue` or
+   `rerun`;
+2. read each one's thread with `mcp__plugin_mean-tester_slack__slack_get_thread_replies`,
+   newest first;
+3. take the latest of your replies whose first line names `campaign <id>`. What is left is its `Next:`
 lines and the `…and <n> more` it counted, planned again from the spec. If no
 reply names the id, say that the campaign never reported, and offer
 `rerun <id>`.

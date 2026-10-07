@@ -1373,3 +1373,32 @@ def test_a_runner_whose_caller_token_still_fits_is_adopted(
             assert len(h.fake_k8s.claim_envs) == 1
 
     asyncio.run(exercise())
+
+
+
+def test_usage_limited_factory_run_finishes_with_its_cause_without_retry(
+    make_harness,
+) -> None:
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(), workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            message = "You've hit your session limit · resets 3pm (UTC)"
+            h.runner.default_script = [
+                ErrorEvent(message=message, classification="model-usage-limited"),
+                Final(text="", status=SessionStatus.CLASSIFIED_FAILURE),
+            ]
+            request_id = uuid.uuid4()
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+            assert len(h.runner.opened) == 1, "a subscription reset window must not be retried"
+            assert work_items.calls.count("finish") == 1
+            assert work_items.finishes[0]["outcome"] == "failed"
+            assert work_items.finishes[0]["cause"] == "model_usage_limited"
+            assert work_items.finishes[0]["detail"] == message
+
+    asyncio.run(exercise())

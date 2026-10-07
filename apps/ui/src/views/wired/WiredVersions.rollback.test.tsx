@@ -66,6 +66,7 @@ const AGENT: AgentOut = {
   name: "deal-desk",
   channels: [{ kind: "slack", address: "#revenue-ops" }],
   model: null,
+  reviewer_model: null,
   approval_required_tools: null,
   approval_routes: null,
   behavior_packs: null,

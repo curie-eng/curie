@@ -5,6 +5,7 @@ storing a bundle. It returns a ValidationResult with actionable, path-qualified
 errors instead of raising, so the caller can surface every problem at once.
 """
 
+import enum
 import json
 import re
 from collections.abc import Callable, Mapping
@@ -966,13 +967,14 @@ _DOW_NAMES: dict[str, int] = {
     "fri": 5,
     "sat": 6,
 }
-# minute, hour, day of month, month, day of week. Names only on the last two.
-_CRON_FIELDS: tuple[tuple[int, int, Mapping[str, int] | None], ...] = (
-    (0, 59, None),
-    (0, 23, None),
-    (1, 31, None),
-    (1, 12, _MONTH_NAMES),
-    (0, 7, _DOW_NAMES),
+# name, low, high, value names. Fields run minute, hour, day of month, month, day
+# of week. Names only on the last two.
+_CRON_FIELDS: tuple[tuple[str, int, int, Mapping[str, int] | None], ...] = (
+    ("minute", 0, 59, None),
+    ("hour", 0, 23, None),
+    ("day-of-month", 1, 31, None),
+    ("month", 1, 12, _MONTH_NAMES),
+    ("day-of-week", 0, 7, _DOW_NAMES),
 )
 _CRON_PART_RE = re.compile(
     r"^(?:\*|(?P<start>[A-Za-z]+|[0-9]+)(?:-(?P<end>[A-Za-z]+|[0-9]+))?)(?:/(?P<step>[0-9]+))?$"
@@ -985,72 +987,99 @@ def _stripped(value: object) -> str:
     return value.strip()
 
 
-def _cron_bound(token: str, low: int, high: int, names: Mapping[str, int] | None) -> int | None:
+class _CronCheck(enum.Enum):
+    """Outcome of checking one cron part or field."""
+
+    OK = enum.auto()
+    OUT_OF_RANGE = enum.auto()
+    MALFORMED = enum.auto()
+
+
+def _cron_value(token: str, names: Mapping[str, int] | None) -> int | None:
+    """The number a bound token stands for, or None when it is not a number or known name."""
+
     if token.isdigit():
         # Cron fields are at most two digits. A longer digit string is not a
         # field, and int() raises ValueError past the interpreter digit cap.
         if len(token) > 4:
             return None
         try:
-            value = int(token)
+            return int(token)
         except ValueError:
             return None
-    elif names is None:
+    if names is None:
         return None
-    else:
-        found = names.get(token.lower())
-        if found is None:
-            return None
-        value = found
-    if value < low or value > high:
-        return None
-    return value
+    return names.get(token.lower())
 
 
-def _cron_part_ok(part: str, low: int, high: int, names: Mapping[str, int] | None) -> bool:
+def _cron_part_check(part: str, low: int, high: int, names: Mapping[str, int] | None) -> _CronCheck:
     match = _CRON_PART_RE.fullmatch(part)
     if match is None:
-        return False
+        return _CronCheck.MALFORMED
     step_text = match.group("step")
     if step_text is not None:
         if len(step_text) > 4:
-            return False
+            return _CronCheck.MALFORMED
         try:
             step = int(step_text)
         except ValueError:
-            return False
+            return _CronCheck.MALFORMED
         if step < 1:
-            return False
+            return _CronCheck.MALFORMED
     start_text = match.group("start")
     if start_text is None:
-        return True
-    start = _cron_bound(start_text, low, high, names)
-    if start is None:
-        return False
+        return _CronCheck.OK
+    bounds = [_cron_value(start_text, names)]
     end_text = match.group("end")
-    if end_text is None:
-        return True
-    end = _cron_bound(end_text, low, high, names)
-    return end is not None and start <= end
+    if end_text is not None:
+        bounds.append(_cron_value(end_text, names))
+    values = [value for value in bounds if value is not None]
+    if len(values) != len(bounds):
+        return _CronCheck.MALFORMED
+    if any(value < low or value > high for value in values):
+        return _CronCheck.OUT_OF_RANGE
+    if values != sorted(values):
+        return _CronCheck.MALFORMED
+    return _CronCheck.OK
 
 
-def _cron_field_ok(field: str, low: int, high: int, names: Mapping[str, int] | None) -> bool:
+def _cron_field_check(
+    field: str, low: int, high: int, names: Mapping[str, int] | None
+) -> _CronCheck:
     # Reject empty fields and leading, trailing, or doubled commas before parts.
     if not field or field.startswith(",") or field.endswith(",") or ",," in field:
-        return False
-    return all(_cron_part_ok(part, low, high, names) for part in field.split(","))
+        return _CronCheck.MALFORMED
+    checks = {_cron_part_check(part, low, high, names) for part in field.split(",")}
+    # A malformed part wins over an out-of-range one: fix the syntax first.
+    if _CronCheck.MALFORMED in checks:
+        return _CronCheck.MALFORMED
+    if _CronCheck.OUT_OF_RANGE in checks:
+        return _CronCheck.OUT_OF_RANGE
+    return _CronCheck.OK
 
 
-def _five_field_cron(expression: str) -> bool:
-    """True when ``expression`` is five cron fields, not an alias or quartz form."""
+def _cron_schedule_error(expression: str) -> str | None:
+    """Why ``expression`` is not a five-field cron schedule, or None when it is.
 
+    The field count is checked first, then each field in order (minute, hour,
+    day-of-month, month, day-of-week). Only the first failing field is reported,
+    as out of range when it is well formed but a number falls outside the field's
+    bounds, and as malformed for any other fault. Aliases and quartz forms fail
+    the count check.
+    """
+
+    prefix = "a 'cron' trigger 'schedule'"
     fields = expression.split()
     if len(fields) != len(_CRON_FIELDS):
-        return False
-    return all(
-        _cron_field_ok(field, low, high, names)
-        for field, (low, high, names) in zip(fields, _CRON_FIELDS, strict=True)
-    )
+        names = " ".join(name for name, *_ in _CRON_FIELDS)
+        return f"{prefix} must have five fields ({names}); got {len(fields)}"
+    for field, (name, low, high, value_names) in zip(fields, _CRON_FIELDS, strict=True):
+        check = _cron_field_check(field, low, high, value_names)
+        if check is _CronCheck.OUT_OF_RANGE:
+            return f"{prefix} field {name} `{field}` is outside {low}-{high}"
+        if check is _CronCheck.MALFORMED:
+            return f"{prefix} field {name} `{field}` is not a valid cron field"
+    return None
 
 
 def _target_acceptable(value: object) -> bool:
@@ -1138,12 +1167,8 @@ def _validate_triggers(manifest: PluginManifest, c: _Collector) -> None:
                     "a 'cron' trigger must define a non-empty 'schedule'",
                     loc,
                 )
-            elif not _five_field_cron(schedule_text):
-                c.error(
-                    "triggers.cron_invalid_schedule",
-                    "a 'cron' trigger 'schedule' must be a five-field cron expression",
-                    loc,
-                )
+            elif (schedule_error := _cron_schedule_error(schedule_text)) is not None:
+                c.error("triggers.cron_invalid_schedule", schedule_error, loc)
             if not name_text:
                 c.error(
                     "triggers.cron_missing_name",

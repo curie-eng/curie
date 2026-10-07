@@ -143,6 +143,7 @@ pub async fn install(update: bool) -> Result<()> {
         "runner/Dockerfile not found here or in any parent directory. Run `curie install` \
          from a curie source checkout -- a release binary has nothing to install.",
     )?;
+    configure_source_hooks(&root)?;
 
     // 1. Local config is user-owned. It is gitignored and only created once,
     // so pulling newer Curie sources and rerunning install cannot replace it.
@@ -220,6 +221,7 @@ pub async fn update(image: bool) -> Result<()> {
              released binary from the latest release is not built yet).",
         )
     })?;
+    configure_source_hooks(&root)?;
     require_tool("cargo", "cargo is not installed - https://rustup.rs/")?;
     run_step(
         &root,
@@ -255,14 +257,19 @@ pub(super) fn seed_env_if_missing(root: &Path) -> Result<EnvSeed> {
     Ok(EnvSeed::Created)
 }
 
-/// Install the primary checkout's tracked Git hooks for every linked worktree.
+/// Install this checkout's tracked Git hooks through the relative shared path.
 pub fn dev_hooks_install() -> Result<()> {
     let root = find_repo_root().ok_or_else(|| {
         crate::exit::usage("Run `curie dev hooks install` from a Curie source checkout.")
     })?;
+    configure_source_hooks(&root)
+}
+
+/// A relative hooks path lets every linked worktree run its own tracked hook.
+fn configure_source_hooks(root: &Path) -> Result<()> {
     let git_root = std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
-        .current_dir(&root)
+        .current_dir(root)
         .output()
         .context("Git is required to install hooks")?;
     if !git_root.status.success() {
@@ -274,58 +281,35 @@ pub fn dev_hooks_install() -> Result<()> {
         bail!("Run `curie dev hooks install` from the root Git checkout.");
     }
 
-    let worktrees = std::process::Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
-        .current_dir(&root)
-        .output()
-        .context("Could not find the primary Git checkout")?;
-    if !worktrees.status.success() {
-        bail!("Could not find the primary Git checkout.");
-    }
-    let listing = String::from_utf8(worktrees.stdout).context("Git returned an invalid path")?;
-    let primary = listing
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("Could not find the primary Git checkout."))?;
-    let hooks_dir = primary.join("hooks").canonicalize().map_err(|_| {
-        anyhow::anyhow!(
-            "The primary checkout has no tracked hooks directory. Update it to a revision containing hooks/pre-push, then retry."
-        )
-    })?;
-    let hook = hooks_dir.join("pre-push");
+    let hook = root.join(".githooks/pre-push");
     if !hook.is_file() {
         bail!(
-            "The tracked hook is missing from the primary checkout: {}",
+            "The tracked hook is missing from this source checkout: {}",
             hook.display()
         );
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if hook.metadata()?.permissions().mode() & 0o111 == 0 {
-            bail!(
-                "The primary checkout hook is not executable: {}",
-                hook.display()
-            );
-        }
+    if !is_executable(&hook) {
+        bail!(
+            "The tracked source checkout hook is not executable: {}",
+            hook.display()
+        );
     }
 
     let current = std::process::Command::new("git")
         .args(["config", "--get", "core.hooksPath"])
-        .current_dir(&root)
+        .current_dir(root)
         .output()
         .context("Could not read the local Git hook configuration")?;
     match current.status.code() {
         Some(0) => {
             let value = String::from_utf8(current.stdout)
                 .context("The local Git hook path is not valid UTF8")?;
-            if value.trim() != hooks_dir.to_string_lossy() {
-                bail!(
-                    "core.hooksPath is already set to `{}`. Keep that hook directory or clear the setting before installing Curie hooks.",
+            if value.trim() != ".githooks" {
+                crate::ui::ui().warn(&format!(
+                    "Warning: core.hooksPath is already set to `{}`; preserving it. To use the tracked Curie hooks, run `git config --local core.hooksPath .githooks`.",
                     value.trim()
-                );
+                ));
+                return Ok(());
             }
         }
         Some(1) if current.stdout.is_empty() => {}
@@ -333,17 +317,191 @@ pub fn dev_hooks_install() -> Result<()> {
     }
 
     let status = std::process::Command::new("git")
-        .args(["config", "--local", "core.hooksPath"])
-        .arg(&hooks_dir)
-        .current_dir(&root)
+        .args(["config", "--local", "core.hooksPath", ".githooks"])
+        .current_dir(root)
         .status()
         .context("Could not set the repository Git hook path")?;
     if !status.success() {
         bail!("Could not set the repository Git hook path.");
     }
 
-    crate::ui::ui().success("Git hooks installed for this checkout and its linked worktrees.");
+    crate::ui::ui().success("Git hooks configured with core.hooksPath=.githooks.");
     Ok(())
+}
+
+/// One selected preflight gate, including its mirrored CI command when present.
+#[derive(Deserialize, Serialize)]
+pub struct PreflightCheck {
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct PreflightFailure {
+    pub check: String,
+    pub output_tail: String,
+    pub exit_code: i32,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct PreflightBase {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub contains_tip: bool,
+    pub failing_required_checks: Vec<String>,
+}
+
+/// The source-owned report is shared by both tiers and their dry runs.
+#[derive(Deserialize, Serialize)]
+pub struct PreflightOutput {
+    pub checks: Vec<PreflightCheck>,
+    pub failures: Vec<PreflightFailure>,
+    pub passed: bool,
+    pub dry_run: bool,
+    pub tier: String,
+    pub base: PreflightBase,
+    pub ci_only: Vec<String>,
+    pub head: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PreflightSetupError {
+    error: String,
+    fix: String,
+}
+
+impl crate::ui::CliOutput for PreflightOutput {
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(self).expect("preflight report contains only serializable fields")
+    }
+
+    fn render(&self, ui: &crate::ui::Ui) {
+        for check in &self.checks {
+            ui.payload_plain(&format!(
+                "{}: {}\n{}",
+                check.name, check.status, check.detail
+            ));
+        }
+        for entry in &self.ci_only {
+            ui.payload_plain(&format!("{entry}: runs in CI only"));
+        }
+        if self.dry_run {
+            ui.note(&format!(
+                "{} preflight plan: {} checks.",
+                self.tier,
+                self.checks.len()
+            ));
+        } else if self.passed {
+            ui.success(&format!(
+                "{} preflight passed: {} checks.",
+                self.tier,
+                self.checks.len()
+            ));
+        }
+    }
+}
+
+/// Run the source-owned planner and preserve its single structured result.
+pub async fn dev_preflight(
+    fast: bool,
+    base: &str,
+    dry_run: bool,
+    pr_body: Option<&Path>,
+    title: Option<&str>,
+) -> Result<PreflightOutput> {
+    let root = find_repo_root().ok_or_else(|| {
+        crate::exit::CliError::usage("Preflight requires a Curie source checkout.")
+            .with_fix("Run `curie dev preflight` from a Curie source checkout.")
+    })?;
+    if !root.join("tools/preflight/preflight.py").is_file() {
+        return Err(crate::exit::CliError::usage(
+            "The source checkout has no preflight tool.",
+        )
+        .with_fix("Update this Curie source checkout to a revision containing the preflight tool.")
+        .into());
+    }
+    // Resolve the caller's file before changing the subprocess working directory.
+    let body_file = pr_body
+        .map(|path| std::env::current_dir().map(|cwd| cwd.join(path)))
+        .transpose()
+        .context("Could not resolve the proposed pull request body file")?;
+    let mut command = tokio::process::Command::new("uv");
+    command
+        .args([
+            "run",
+            "--no-project",
+            "--with",
+            "pyyaml==6.0.3",
+            "python3",
+            "tools/preflight/preflight.py",
+            "--base",
+            base,
+            "--json",
+        ])
+        .current_dir(&root)
+        .stderr(std::process::Stdio::inherit());
+    if fast {
+        command.arg("--fast");
+    }
+    if dry_run {
+        command.arg("--dry-run");
+    }
+    if let Some(path) = body_file {
+        command.arg("--pr-body").arg(path);
+    }
+    if let Some(title) = title {
+        command.arg("--title").arg(title);
+    }
+    let output = command.output().await.map_err(|error| {
+        crate::exit::CliError::transient(format!("Could not run the preflight tool: {error}"))
+            .with_fix("Install uv, then run `curie install` from this source checkout and retry.")
+    })?;
+    let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .context("The preflight tool did not return one JSON object")?;
+    if output.status.code() == Some(2) {
+        let error: PreflightSetupError = serde_json::from_value(payload)
+            .context("The preflight tool returned an invalid setup error")?;
+        return Err(crate::exit::CliError::usage(error.error)
+            .with_fix(error.fix)
+            .into());
+    }
+    let report: PreflightOutput =
+        serde_json::from_value(payload).context("The preflight tool returned an invalid report")?;
+    if !output.status.success() {
+        let message = report
+            .error
+            .as_deref()
+            .context("The failed preflight report omitted its error")?;
+        let fix = report
+            .fix
+            .as_deref()
+            .context("The failed preflight report omitted its fix")?;
+        let error = if output.status.code() == Some(3) {
+            crate::exit::CliError::transient(message)
+        } else {
+            crate::exit::CliError::failure(message)
+        }
+        .with_fix(fix);
+        return Err(crate::ui::ui().failed_report(&report, error.into()));
+    }
+    Ok(report)
 }
 
 /// `curie dev <script>`: run a repo dev script by relative path. Thin wrapper

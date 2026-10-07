@@ -9,14 +9,14 @@ from alembic import command
 from alembic.script import ScriptDirectory
 
 
-def test_0077_follows_released_0076() -> None:
+def test_0082_follows_released_0081() -> None:
     """@spec DEPLOY-NOTICE-RELEASE-1."""
-    revision = ScriptDirectory.from_config(alembic_config()).get_revision("0077")
+    revision = ScriptDirectory.from_config(alembic_config()).get_revision("0082")
     assert revision is not None
-    assert revision.down_revision == "0076"
+    assert revision.down_revision == "0081"
 
 
-def test_0077_preserves_released_state_through_upgrade_and_downgrade(
+def test_0082_preserves_released_state_through_upgrade_and_downgrade(
     isolated_migration_db: None,
 ) -> None:
     """@spec DEPLOY-NOTICE-RELEASE-1."""
@@ -62,7 +62,7 @@ def test_0077_preserves_released_state_through_upgrade_and_downgrade(
     released_cursor = sql_rows(cursor_query)
     assert len(released_item) == len(released_cursor) == 1
     try:
-        command.upgrade(config, "0077")
+        command.upgrade(config, "0082")
         assert sql_rows(work_item_query, {"id": item_id}) == released_item
         assert sql_rows(cursor_query) == released_cursor
         assert (

@@ -63,6 +63,7 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _reconcile_later,
     _request,
     _rows,
+    _set_base_ref,
     _start_running,
     admitted,
     check_run,
@@ -2351,3 +2352,62 @@ def test_managed_workspace_clones_the_tls_github_origin_through_real_api_and_sto
     finally:
         preparer.delete(prepared)
         assert list(workspace_objects.list_keys("")) == []
+
+
+# --- #4105: failures already failing on the base branch ---------------------------
+
+BASE_HEAD = "d4" * 20
+
+
+def _audit_failing() -> Any:
+    return ci_entry(
+        check_run("pip-audit", conclusion="failure", summary="multidict advisory"),
+        check_run("lint"),
+    )
+
+
+def test_an_unreadable_base_keeps_todays_fix_round(admitted: Any) -> None:
+    """AC4: a 502 on the base head's check runs counts every failure as caused."""
+
+    client, github, sink = admitted
+    number = 9760
+    sink.ci_scripts = {HEAD_A: [_audit_failing()], BASE_HEAD: [ci_entry(check_status=502)]}
+    sink.branches = {"main": BASE_HEAD}
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+    request_id = published["id"]
+
+    _reconcile()
+
+    # The base head was actually asked for, and its unreadable answer changed nothing.
+    assert ("GET", f"/repos/{REPO}/branches/main", None) in sink.requests
+    assert sink.ci_observations == [HEAD_A, BASE_HEAD]
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(request_id) == []
+    _assert_no_final_result(sink)
+    turns = _ci_turns(request_id)
+    assert [t["event_id"] for t in turns] == [f"work-item-{request_id}-ci-2"]
+    assert turns[0]["text"].split("\n")[1] == (
+        f"Curie wait_ci round 2 of 3: the checks on {published['pr_url']} failed at {HEAD_A}."
+    )
+    assert "pip-audit" in turns[0]["text"]
+
+
+def test_a_failure_also_failing_on_the_base_completes_the_request(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9761
+    sink.ci_scripts = {
+        HEAD_A: [_audit_failing()],
+        BASE_HEAD: [ci_entry(check_run("pip-audit", conclusion="failure"), check_run("lint"))],
+    }
+    sink.branches = {"main": BASE_HEAD}
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+    assert _ci_turns(published["id"]) == []
+    body = _body(sink, published["id"])
+    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert "Note: Also failing on the base branch, not caused by this change: pip-audit" in body

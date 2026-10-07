@@ -22,7 +22,13 @@ decides with the pure ``decide``:
 - a failure below the round cap enqueues ONE continuation turn for the same
   request (``work-item-{id}-ci-{round}``) carrying the failure report;
 - a failure on the last round, a timed-out wait, or unreadable CI ends the
-  request with a ``Could not complete:`` notice. Unreadable CI is never success.
+  request with a ``Could not complete:`` notice. Unreadable CI is never success;
+- a failing check run or commit status whose ``name`` or ``context`` is also
+  failing on the commit the PR's base branch points to now is pre-existing,
+  not caused by the change (#4105). Only caused failures fail the gate or
+  reach the fix turn; a green run names the pre-existing ones in its note. A
+  required Python or delegated check failing on the base too is unverified,
+  never green, and an unreadable base counts every failure as caused.
 
 No network call runs under a row lock. Every write is fenced to the observed
 publication and head (``workitems.lifecycle.settle_ci_verdict`` / ``hold_for_ci_fix``),
@@ -387,6 +393,9 @@ def decide(
     ``delegated_checks`` names required checks that unavailable sandbox
     verification delegated to; each must appear as a check run ``name`` (any
     app) or a commit status ``context`` and pass.
+
+    A failure also failing on the base branch head (``detail.base_check_runs``
+    / ``base_statuses``, #4105) is pre-existing and judged as not failing.
     """
 
     unselected_path = unselected_python_path(changed_paths, python_ci)
@@ -408,6 +417,7 @@ def decide(
                 return Verdict(kind="timed_out", reason=reason)
             return Verdict(kind="pending", reason=reason)
         return Verdict(kind="unverified", reason=reason)
+    base_failing_names, base_failing_contexts = _preexisting(detail)
     check_runs = detail.check_runs
     statuses = detail.statuses
     if fresh_after is not None:
@@ -421,17 +431,27 @@ def decide(
             context not in fresh_contexts for context in metadata_ci.statuses
         )
         effective = _metadata_revision_detail(detail, fresh_after, metadata_ci)
+        # Only caused failures may end the wait for the metadata rerun.
         fresh_failure = any(
-            run.get("status") == "completed" and run.get("conclusion") in _FAILING_CONCLUSIONS
+            run.get("status") == "completed"
+            and run.get("conclusion") in _FAILING_CONCLUSIONS
+            and run.get("name") not in base_failing_names
             for run in fresh_runs
-        ) or any(item.get("state") in _FAILING_STATES for item in fresh_statuses)
+        ) or any(
+            item.get("state") in _FAILING_STATES
+            and item.get("context") not in base_failing_contexts
+            for item in fresh_statuses
+        )
         unchanged_failure = any(
             run.get("name") not in metadata_ci.checks
             and run.get("status") == "completed"
             and run.get("conclusion") in _FAILING_CONCLUSIONS
+            and run.get("name") not in base_failing_names
             for run in effective.check_runs
         ) or any(
-            item.get("context") not in metadata_ci.statuses and item.get("state") in _FAILING_STATES
+            item.get("context") not in metadata_ci.statuses
+            and item.get("state") in _FAILING_STATES
+            and item.get("context") not in base_failing_contexts
             for item in effective.statuses
         )
         if (
@@ -483,10 +503,13 @@ def decide(
 
     failing: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
+    preexisting: list[dict[str, Any]] = []
     for run in check_runs:
         name, status, conclusion = _str(run.get("name")), run.get("status"), run.get("conclusion")
         if status != "completed":
             pending.append({"name": name, "status": _str(status)})
+        elif conclusion in _FAILING_CONCLUSIONS and run.get("name") in base_failing_names:
+            preexisting.append({"name": name, "conclusion": _str(conclusion)})
         elif conclusion in _FAILING_CONCLUSIONS:
             failing.append({"name": name, "conclusion": _str(conclusion)})
         elif conclusion not in _PASSING_CONCLUSIONS:
@@ -494,14 +517,18 @@ def decide(
             pending.append({"name": name, "status": _str(conclusion)})
     for status_item in statuses:
         context, state = _str(status_item.get("context")), status_item.get("state")
-        if state in _FAILING_STATES:
+        if state in _FAILING_STATES and status_item.get("context") in base_failing_contexts:
+            preexisting.append({"context": context, "state": _str(state)})
+        elif state in _FAILING_STATES:
             failing.append({"context": context, "state": _str(state)})
         elif state != "success":
             pending.append({"context": context, "state": _str(state)})
     if failing:
         # Fail fast: the whole budget is what remains of the execution deadline.
         required_python_failed = requires_python_ci and any(
-            run.get("status") == "completed" and run.get("conclusion") in _FAILING_CONCLUSIONS
+            run.get("status") == "completed"
+            and run.get("conclusion") in _FAILING_CONCLUSIONS
+            and run.get("name") not in base_failing_names
             for run in required_python_runs
         )
         return Verdict(
@@ -510,6 +537,22 @@ def decide(
             pending=pending,
             reason="required_python_ci_failed" if required_python_failed else None,
         )
+    # These checks are the proof of this change, so a red base means the change
+    # is unproven, never green.
+    if requires_python_ci and any(
+        run.get("status") == "completed"
+        and run.get("conclusion") in _FAILING_CONCLUSIONS
+        and run.get("name") in base_failing_names
+        for run in required_python_runs
+    ):
+        return Verdict(
+            kind="unverified", reason="required_python_ci_failed_on_base", pending=pending
+        )
+    if any(
+        item.get("name") in delegated_checks or item.get("context") in delegated_checks
+        for item in preexisting
+    ):
+        return Verdict(kind="unverified", reason="delegated_ci_failed_on_base", pending=pending)
 
     if requires_python_ci and not required_python_runs:
         has_unrelated_checks = bool(check_runs or statuses)
@@ -556,7 +599,39 @@ def decide(
         return Verdict(kind="no_ci", note=_NO_CI_NOTE)
     if pending:
         return Verdict(kind="timed_out" if expired else "pending", pending=pending)
+    if preexisting:
+        return Verdict(kind="green", note=_preexisting_note(preexisting))
     return Verdict(kind="green")
+
+
+def _preexisting(detail: CiDetail) -> tuple[frozenset[str], frozenset[str]]:
+    """Check run names and status contexts failing on the base branch head (#4105).
+
+    Both empty when the base head was not read, so every failure counts as caused.
+    """
+
+    if detail.base_check_runs is None or detail.base_statuses is None:
+        return frozenset(), frozenset()
+    names = frozenset(
+        run["name"]
+        for run in detail.base_check_runs
+        if isinstance(run.get("name"), str)
+        and run.get("status") == "completed"
+        and run.get("conclusion") in _FAILING_CONCLUSIONS
+    )
+    contexts = frozenset(
+        item["context"]
+        for item in detail.base_statuses
+        if isinstance(item.get("context"), str) and item.get("state") in _FAILING_STATES
+    )
+    return names, contexts
+
+
+def _preexisting_note(preexisting: Sequence[dict[str, Any]]) -> str:
+    names = [_str(item.get("name") or item.get("context")) for item in preexisting]
+    return "Also failing on the base branch, not caused by this change: " + _clip(
+        ", ".join(dict.fromkeys(names)), _CHECKS_LINE_MAX
+    )
 
 
 def _github_time(value: Any) -> datetime | None:
@@ -610,8 +685,11 @@ def continuation_text(
     annotations_left = _ANNOTATIONS_MAX
     entries: list[tuple[str, dict[str, Any]]] = []
     available_logs: list[tuple[dict[str, Any], str]] = []
+    base_failing_names, base_failing_contexts = _preexisting(detail)
     for run in detail.check_runs:
         if run.get("status") != "completed" or run.get("conclusion") not in _FAILING_CONCLUSIONS:
+            continue
+        if run.get("name") in base_failing_names:
             continue
         raw_output = run.get("output")
         output: dict[str, Any] = raw_output if isinstance(raw_output, dict) else {}
@@ -646,6 +724,8 @@ def continuation_text(
         entries.append(("failing_checks", entry))
     for status_item in detail.statuses:
         if status_item.get("state") not in _FAILING_STATES:
+            continue
+        if status_item.get("context") in base_failing_contexts:
             continue
         entries.append(
             (
