@@ -982,6 +982,142 @@ def test_an_early_stop_finish_defers_to_an_in_flight_publication(
     assert _request(number)["status"] == "running"
 
 
+def _requests(number: int) -> list[dict[str, Any]]:
+    return _rows(
+        "SELECT r.id, r.status, r.terminal_cause, w.id AS work_item_id "
+        "FROM curie.execution_requests r "
+        "JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "ORDER BY r.created_at",
+        {"repo": REPO_ID, "number": number},
+    )
+
+
+def _relabelled_after_publication(client: Any, github: GitHubAPI, number: int) -> dict[str, Any]:
+    """#4158: request 1 published a PR and was cancelled; request 2 is running."""
+
+    _label(client, github, number)
+    first = _request(number)
+    _start_running(first["id"])
+    _attach_publication(first["work_item_id"], status="succeeded", pr=number)
+    github.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.json()["status"] == "factory_cancellation_requested"
+    _observe_termination(client, first["id"])
+    github.labels = [LABEL]
+    _label(client, github, number)
+    first_row, second = _requests(number)
+    assert first_row["id"] == first["id"]
+    assert (first_row["status"], first_row["terminal_cause"]) == ("cancelled", "issue_cancelled")
+    _start_running(second["id"])
+    return second
+
+
+def _finish_unpublished(client: Any, request_id: uuid.UUID) -> Any:
+    epoch = _rows(
+        "SELECT runtime_epoch FROM curie.execution_requests WHERE id = :id", {"id": request_id}
+    )[0]["runtime_epoch"]
+    return client.post(
+        f"/v1/internal/work-items/requests/{request_id}/finish",
+        headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "no_pull_request",
+            "detail": "I read the issue and stopped.",
+        },
+    )
+
+
+def test_a_relabelled_request_without_its_own_publication_ends_failed(
+    admitted: Any,
+) -> None:
+    """#4158: an earlier request's settled PR does not own this request's terminus."""
+
+    client, github, sink = admitted
+    number = 9296
+    second = _relabelled_after_publication(client, github, number)
+
+    finished = _finish_unpublished(client, second["id"])
+
+    assert finished.status_code == 200, finished.text
+    rows = {row["id"]: row for row in _requests(number)}
+    assert (rows[second["id"]]["status"], rows[second["id"]]["terminal_cause"]) == (
+        "failed",
+        "no_pull_request",
+    )
+    notices = _notices(second["id"])
+    assert len(notices) == 1
+    assert notices[0]["terminal_cause"] == "no_pull_request"
+    assert "I read the issue and stopped." in notices[0]["detail"]
+
+
+def test_a_relabelled_request_defers_to_its_own_in_flight_publication(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9297
+    second = _relabelled_after_publication(client, github, number)
+    _attach_revision_publication(second["work_item_id"], second["id"], status="pending")
+
+    finished = _finish_unpublished(client, second["id"])
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    rows = {row["id"]: row for row in _requests(number)}
+    assert rows[second["id"]]["status"] == "running"
+
+
+def test_a_relabelled_request_defers_to_an_earlier_in_flight_publication_on_its_lineage(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9299
+    second = _relabelled_after_publication(client, github, number)
+    first_id = _requests(number)[0]["id"]
+
+    async def reopen() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                changed = await conn.execute(
+                    text(
+                        "UPDATE curie.publications SET status = 'running', terminal_at = NULL "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"id": first_id},
+                )
+                assert changed.rowcount == 1
+        finally:
+            await engine.dispose()
+
+    asyncio.run(reopen())
+
+    finished = _finish_unpublished(client, second["id"])
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    rows = {row["id"]: row for row in _requests(number)}
+    assert rows[second["id"]]["status"] == "running"
+
+
+def test_a_request_whose_own_publication_succeeded_defers_an_unpublished_finish(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9298
+    _label(client, github, number)
+    row = _request(number)
+    _start_running(row["id"])
+    _attach_publication(row["work_item_id"], status="succeeded", pr=number)
+
+    finished = _finish_unpublished(client, row["id"])
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    assert _request(number)["status"] == "running"
+
+
 def test_a_refused_post_leaves_the_terminal_row_unchanged(admitted: Any) -> None:
     client, github, sink = admitted
     number = 9204
@@ -1497,7 +1633,11 @@ def _insert_revision(work_item_id: uuid.UUID, number: int, objective: str) -> uu
 
 
 def _attach_revision_publication(
-    work_item_id: uuid.UUID, request_id: uuid.UUID, *, head_sha: str = HEAD_B
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    *,
+    head_sha: str = HEAD_B,
+    status: str = "succeeded",
 ) -> None:
     item = _work_item_row(work_item_id)
     approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
@@ -1532,7 +1672,7 @@ def _attach_revision_publication(
                         "status, base_sha, changed_paths, title, body, reply_kind, "
                         "reply_channel, result_url, terminal_at) "
                         "VALUES (:id, :approval, :deployment, :conversation, :lineage, "
-                        ":request_id, 2, :repo, 'succeeded', :base, "
+                        ":request_id, 2, :repo, :status, :base, "
                         "CAST('[\"README.md\"]' AS jsonb), "
                         "'Rename the helper', 'Approved platform publication.', 'github', "
                         ":channel, :result, clock_timestamp())"
@@ -1545,6 +1685,7 @@ def _attach_revision_publication(
                         "lineage": item["publication_lineage_id"],
                         "request_id": request_id,
                         "repo": REPO,
+                        "status": status,
                         "base": "0123456789abcdef0123456789abcdef01234567",
                         "channel": REPO,
                         "result": pr_url,
