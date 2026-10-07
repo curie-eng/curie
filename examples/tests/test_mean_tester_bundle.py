@@ -671,3 +671,9 @@ def test_a_spec_source_that_cannot_be_read_still_gets_a_report():
 def test_the_readme_names_the_models_the_tester_was_graded_on():
     readme = (BUNDLE / "README.md").read_text()
     assert "Models" in readme and "Claude" in readme
+
+
+def test_unshown_evidence_is_unclear_not_an_invented_fact():
+    verdicts = _section("Verdicts")
+    assert re.search(r"evidence (that )?the target could not have", verdicts, re.I)
+    assert re.search(r"not shown[^.]*UNCLEAR|UNCLEAR[^.]*not shown", " ".join(verdicts.split()))
