@@ -23,7 +23,7 @@ from ..behaviorpacks import (
     sample_tip,
 )
 from ..delivery_lease import DeliveryLease
-from ..hook_runs import HookRunOutcome
+from ..hook_runs import HookRunOutcome, HookRunReason
 from ..markers import CompletionRecord, DoneMarkerValue, MalformedCompletionError
 from ..reply_sink import (
     DeletedReplyTargetError,
@@ -52,6 +52,7 @@ async def _complete(
     telemetry_outcome: str,
     lease: DeliveryLease | None = None,
     hook_outcome: HookRunOutcome | None = None,
+    hook_reason: HookRunReason | None = None,
     turn: failures.TurnOutcome | None = None,
     successor: QueuedTurn | None = None,
 ) -> None:
@@ -216,7 +217,11 @@ async def _complete(
         and hook_carry.ref is not None
         and not (claim._is_fenced(lease) and lease is not None and lease.lost.is_set())
     ):
-        if await hook_carry.recorder.close(hook_carry.ref, hook_outcome):
+        if await hook_carry.recorder.close(
+            hook_carry.ref,
+            hook_outcome,
+            hook_reason or ("turn_error" if hook_outcome != "ran" else None),
+        ):
             # Computed now, posted only once the settle below is won. Kept on
             # the carry until then, so a settle that raises still leaves the
             # notice to the error close (#2878).

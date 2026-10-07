@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
+from typing import Any
 
 import pytest
 from curie_runner.adapter import build_options
@@ -97,3 +99,80 @@ def test_build_options_only_enables_sdk_title_with_configured_model(
     else:
         assert options.env[disable_key] == "1"
         assert len([record for record in caplog.records if "session title" in record.message]) == 1
+
+
+@pytest.mark.parametrize(
+    ("credential", "override", "expected"),
+    [
+        ("sk-ant-api03-PLACEHOLDER", None, "claude-opus-5-5"),
+        ("sk-ant-oat01-PLACEHOLDER", None, "claude-opus-5-5"),
+        ("sk-or-PLACEHOLDER", None, "anthropic/claude-opus-5.5"),
+        ("sk-ant-api03-PLACEHOLDER", "acme-reviewer-model", "acme-reviewer-model"),
+        ("sk-or-PLACEHOLDER", "acme-reviewer-model", "acme-reviewer-model"),
+    ],
+)
+def test_reviewer_model_reaches_sdk_options_from_the_runner_boot_env(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    credential: str,
+    override: str | None,
+    expected: str,
+) -> None:
+    # The SDK resolves model: opus through this documented environment key:
+    # https://code.claude.com/docs/en/model-config#environment-variables
+    from curie_runner import __main__ as boot
+    from curie_runner.config import RunnerConfig
+    from curie_runner.sdk_auth import resolve_sdk_env
+
+    for key in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "stale-provider-model")
+    (tmp_path / ".claude-plugin").mkdir()
+    (tmp_path / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "acme-reviewer-probe", "version": "0.1.0"}),
+        encoding="utf-8",
+    )
+    env = {
+        "CURIE_PLUGIN_DIR": str(tmp_path),
+        "CURIE_SESSION_ID": "reviewer-model-session",
+        "CURIE_SANDBOX_ID": "reviewer-model-sandbox",
+        "CURIE_BUDGET": '{"max_output_tokens_per_run":1000,"max_usd_per_day":1.0}',
+        "CURIE_CREDENTIALS": credential,
+        "CURIE_MODEL": "acme-implementer-model",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "acme-title-model",
+    }
+    if override is not None:
+        env["CURIE_REVIEWER_MODEL"] = override
+    config = RunnerConfig.from_env(env)
+    spawn_env = resolve_sdk_env(env) or env
+
+    class CapturedSession:
+        def __init__(self, options: Any) -> None:
+            self.options = options
+
+    monkeypatch.setattr(boot, "ClaudeAgentSession", CapturedSession)
+    session = boot.build_runner(config, sdk_env=spawn_env)._factory()
+
+    assert isinstance(session, CapturedSession)
+    assert session.options.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == expected
+    assert session.options.model == "acme-implementer-model"
+    assert session.options.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "acme-title-model"
+
+
+
+def test_reviewer_model_default_uses_the_effective_sdk_credential() -> None:
+    # sdk_auth's explicit SDK credential wins over CURIE_CREDENTIALS; reviewer
+    # model selection must agree with the credential the SDK will actually use.
+    from curie_runner.sdk_auth import resolve_sdk_env
+
+    env = {
+        "CURIE_CREDENTIALS": "sk-or-PLACEHOLDER",
+        "ANTHROPIC_API_KEY": "sk-ant-api03-PLACEHOLDER",
+    }
+    spawn_env = resolve_sdk_env(env) or env
+    options = build_options(
+        plugins=[], model="acme-implementer-model", system_prompt=None,
+        max_turns=20, max_budget_usd=1.0, resume=None, env=spawn_env,
+    )
+    assert options.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-opus-5-5"
+    assert options.model == "acme-implementer-model"

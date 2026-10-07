@@ -6,14 +6,17 @@ The vendored agent-sandbox controller runs a CLUSTER-scope NetworkPolicy
 informer; if its RBAC cannot satisfy that cluster LIST, the manager crash-loops
 and no SandboxClaim ever binds. The vendored Deployment has NO readiness probe,
 so `rollout status` passes while the manager still blocks on cache sync -- the
-load-bearing signal is the "Starting workers" log line, emitted only after all
-informer caches sync. This post-install/post-upgrade hook Job fails the Helm
-operation unless the controller reaches that state, so an RBAC regression fails
-at install, not at first turn.
+gate first rejects observed RBAC/lease failures and pod restarts, then requires
+the "Starting workers" log line or positive successful-reconcile metrics from
+the current Running controller pod. Both signals require synced informer
+caches, and the reconcile counter survives startup-log rotation. This
+post-install/post-upgrade hook Job fails the Helm operation unless the
+controller reaches that state, so an RBAC regression fails at install.
 
 The gate is read-only: its Role can only get/list/watch deployments + pods and
-read pod logs in agent-sandbox-system. Gated on agentSandbox.controller.deploy
-so it never runs against a BYO controller this release does not own.
+get pod logs + pod proxy metrics in agent-sandbox-system. Gated on
+agentSandbox.controller.deploy so it never runs against a BYO controller this
+release does not own.
 */}}
 apiVersion: v1
 kind: ServiceAccount
@@ -47,6 +50,9 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["pods/proxy"]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -140,10 +146,10 @@ spec:
               rc=$?
               echo "rollout status rc=${rc} (informative only)"
 
-              # The load-bearing assertion: poll the controller log for
-              # "Starting workers" (emitted only after all informer caches
-              # sync). Fail fast on a forbidden-networkpolicies log line or a
-              # restarting pod. A restart is NOT diagnostic on its own: the #350
+              # Poll failure signals before accepting "Starting workers" or
+              # positive successful-reconcile metrics, which both require
+              # synced informer caches. The counter survives startup-log
+              # rotation. A restart is NOT diagnostic on its own: the #350
               # crash-loop (RBAC) and a leader-election lease timeout (#507) both
               # restart the pod, so classify the CAUSE from the logs instead of
               # blaming NetworkPolicy RBAC unconditionally.
@@ -151,11 +157,6 @@ spec:
               elapsed=0
               while [ "${elapsed}" -lt "${TIMEOUT}" ]; do
                 logs=$(kubectl logs "deployment/${DEPLOY}" -n "${CONTROLLER_NS}" --tail=-1 2>/dev/null || true)
-
-                if echo "${logs}" | grep -q "Starting workers"; then
-                  echo "RESULT: PASS -- agent-sandbox-controller Available and informer caches synced ('Starting workers' observed)."
-                  exit 0
-                fi
 
                 restarts=$(kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller \
                   -o jsonpath='{.items[*].status.containerStatuses[*].restartCount}' 2>/dev/null || true)
@@ -195,6 +196,32 @@ spec:
                   cause=restart
                   echo "detected controller restart (restartCount>0) with no recognized failure signature."
                   break
+                fi
+
+                if echo "${logs}" | grep -q "Starting workers"; then
+                  echo "RESULT: PASS -- agent-sandbox-controller Available and informer caches synced ('Starting workers' observed)."
+                  exit 0
+                fi
+
+                # A current pod's successful reconciles prove cache sync even
+                # when its startup log has rotated away. Select the first
+                # Running controller pod and discard stdout from failed proxy
+                # requests so partial metrics cannot establish health.
+                pod=$(kubectl get pods -n "${CONTROLLER_NS}" -l app=agent-sandbox-controller \
+                  --field-selector=status.phase=Running \
+                  -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+                metrics=""
+                if [ -n "${pod}" ]; then
+                  metrics=$(kubectl get --raw "/api/v1/namespaces/${CONTROLLER_NS}/pods/${pod}:8080/proxy/metrics" \
+                    2>/dev/null) || metrics=""
+                fi
+                if printf '%s\n' "${metrics}" | awk '
+                  $1 ~ /^controller_runtime_reconcile_total[{].*[}]$/ &&
+                  $1 ~ /[,{]result="success"[,}]/ { successful += $2 }
+                  END { exit !(successful > 0) }
+                '; then
+                  echo "RESULT: PASS -- agent-sandbox-controller informer caches synced (positive controller_runtime_reconcile_total result=success observed)."
+                  exit 0
                 fi
 
                 sleep 5

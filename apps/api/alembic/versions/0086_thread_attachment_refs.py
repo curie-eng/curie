@@ -1,7 +1,7 @@
 """The thread attachment ledger (ADR 0205, #4079)
 
-Revision ID: 0082
-Revises: 0081
+Revision ID: 0086
+Revises: 0085
 Create Date: 2026-10-06
 
 Hand-written and additive. ``thread_attachment_refs`` holds one row per file a
@@ -22,8 +22,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0082"
-down_revision: str | None = "0081"
+revision: str = "0086"
+down_revision: str | None = "0085"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

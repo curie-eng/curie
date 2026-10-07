@@ -144,6 +144,8 @@ def _expected_output(
     cli_release_needed: bool = False,
     released_upgrade_full: bool = False,
     version_only: bool = False,
+    factory: bool = False,
+    approval_resume: bool = False,
 ) -> str:
     selected_tiers = set(selected)
     lines = [
@@ -159,6 +161,8 @@ def _expected_output(
         f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
     )
     lines.append(f"version_only={'true' if version_only else 'false'}")
+    lines.append(f"factory={'true' if factory else 'false'}")
+    lines.append(f"approval_resume={'true' if approval_resume else 'false'}")
     return "\n".join(lines) + "\n"
 
 
@@ -938,6 +942,8 @@ def test_push_selects_every_tier_without_a_repository(tmp_path: Path) -> None:
         images_needed=True,
         cli_release_needed=True,
         released_upgrade_full=True,
+        factory=True,
+        approval_resume=True,
     )
 
 
@@ -1329,11 +1335,15 @@ AGGREGATE_EXPRESSIONS = {
     "cluster_selected": "${{ needs.changes.outputs.cluster }}",
     "released_upgrade_selected": "${{ needs.changes.outputs.released_upgrade }}",
     "released_upgrade_full": "${{ needs.changes.outputs.released_upgrade_full }}",
+    "approval_resume_selected": "${{ needs.changes.outputs.approval_resume }}",
     "skill_local_result": "${{ needs.e2e-ladder.result }}",
     "local_release_result": "${{ needs.e2e-ladder-release.result }}",
     "cluster_result": "${{ needs.e2e-ladder-cluster.result }}",
     "cluster_chart_result": "${{ needs.e2e-cluster-chart-regressions.result }}",
     "rollout_recovery_result": "${{ needs.e2e-cluster-rollout-recovery.result }}",
+    "approval_resume_result": (
+        "${{ needs.e2e-cluster-approval-resume-restarts.result }}"
+    ),
     "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
     "released_upgrade_negative_result": (
         "${{ needs.e2e-released-upgrade-negative.result }}"
@@ -1391,6 +1401,8 @@ def test_workflow_consumes_each_selection_output_exactly() -> None:
         # #3858: python-pytest and rust-select read these two.
         "pytest": "${{ steps.filter.outputs.pytest }}",
         "version_only": "${{ steps.filter.outputs.version_only }}",
+        "factory": "${{ steps.filter.outputs.factory }}",
+        "approval_resume": "${{ steps.filter.outputs.approval_resume }}",
         "runtime_assertions": "${{ steps.runtime.outputs.runtime_assertions }}",
     }
 
@@ -1969,6 +1981,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-ladder-cluster",
         "e2e-cluster-chart-regressions",
         "e2e-cluster-rollout-recovery",
+        "e2e-cluster-approval-resume-restarts",
         "e2e-released-upgrade",
         "e2e-released-upgrade-negative",
         "e2e-cluster-upgrade-matrix-shards",
@@ -2013,11 +2026,13 @@ def _run_aggregate(
         "cluster_selected": "false",
         "released_upgrade_selected": "false",
         "released_upgrade_full": "false",
+        "approval_resume_selected": "false",
         "skill_local_result": "skipped",
         "local_release_result": "skipped",
         "cluster_result": "skipped",
         "cluster_chart_result": "skipped",
         "rollout_recovery_result": "skipped",
+        "approval_resume_result": "skipped",
         "released_upgrade_result": "skipped",
         "released_upgrade_negative_result": "skipped",
         "upgrade_matrix_shards_result": "success",
@@ -2420,3 +2435,171 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
         "needs.changes.outputs.cluster == 'true' }}"
     )
     assert "e2e-cluster-rollout-recovery" in jobs["e2e-required"]["needs"]
+
+
+# #4016: the approval resume kind scenario runs on pull requests whenever a
+# worker or approval path changes, and E2E required holds it to that selection.
+APPROVAL_RESUME_JOB = "e2e-cluster-approval-resume-restarts"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "apps/worker/src/curie_worker/consumer.py",
+        "apps/worker/src/curie_worker/kernel.py",
+        "apps/api/src/curie_api/resumequeue.py",
+        "apps/api/src/curie_api/resumereconciler.py",
+        "apps/api/src/curie_api/sweeper.py",
+        "apps/api/src/curie_api/routers/approvals.py",
+        "apps/api/src/curie_api/routers/approval_recovery.py",
+        "apps/api/src/curie_api/approval_policy.py",
+        "runner/src/curie_runner/approval.py",
+        "cli/scripts/e2e-cluster-approval-resume-restarts.sh",
+    ],
+)
+def test_approval_resume_selected_for_worker_and_approval_paths(
+    tmp_path: Path, path: str
+) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    outputs = _outputs_of(output)
+    assert outputs["approval_resume"] == "true"
+    # The job needs the images and binary the cluster tier builds.
+    assert outputs["cluster"] == "true"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "docs/guides/getting-started.md",
+        "apps/ui/src/main.tsx",
+        "apps/api/src/curie_api/routers/agents.py",
+        "apps/api/src/curie_api/resumequeue_helpers/notes.md",
+        "runner/src/curie_runner/session.py",
+        "cli/scripts/e2e-cluster-rollout-recovery.sh",
+        "charts/curie/values.yaml",
+    ],
+)
+def test_approval_resume_not_selected_for_unrelated_paths(
+    tmp_path: Path, path: str
+) -> None:
+    completed, output = _invoke_selector(tmp_path, path)
+    assert completed.returncode == 0, completed.stderr
+    assert _outputs_of(output)["approval_resume"] == "false"
+
+
+def test_approval_resume_follows_push_and_kind_omission(tmp_path: Path) -> None:
+    pushed, pushed_output = _invoke_selector(tmp_path, push=True)
+    assert pushed.returncode == 0, pushed.stderr
+    assert _outputs_of(pushed_output)["approval_resume"] == "true"
+
+    next_push, next_output = _invoke_selector(tmp_path, push=True, omit_kind=True)
+    assert next_push.returncode == 0, next_push.stderr
+    assert _outputs_of(next_output)["approval_resume"] == "false"
+
+    next_pr, next_pr_output = _invoke_selector(
+        tmp_path, "apps/api/src/curie_api/resumequeue.py", omit_kind=True
+    )
+    assert next_pr.returncode == 0, next_pr.stderr
+    assert _outputs_of(next_pr_output)["approval_resume"] == "false"
+
+
+@pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
+def test_aggregate_requires_approval_resume_success_when_selected(
+    event_name: str,
+) -> None:
+    state = {
+        "event_name": event_name,
+        "cluster_selected": "true",
+        "cluster_result": "success",
+        "cluster_chart_result": "success",
+        "rollout_recovery_result": (
+            "skipped" if event_name == "pull_request" else "success"
+        ),
+        "approval_resume_selected": "true",
+    }
+    ok = _run_aggregate(**state, approval_resume_result="success")
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    for result in ("skipped", "failure", "cancelled"):
+        rejected = _run_aggregate(**state, approval_resume_result=result)
+        assert rejected.returncode != 0, result
+
+
+@pytest.mark.parametrize("result", ["success", "failure", "cancelled"])
+def test_aggregate_requires_approval_resume_skip_when_not_selected(result: str) -> None:
+    ok = _run_aggregate(event_name="pull_request", approval_resume_result="skipped")
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+    rejected = _run_aggregate(event_name="pull_request", approval_resume_result=result)
+    assert rejected.returncode != 0, result
+
+
+@pytest.mark.parametrize("selected", ["", "yes"])
+def test_aggregate_rejects_malformed_approval_resume_selection(selected: str) -> None:
+    completed = _run_aggregate(approval_resume_selected=selected)
+    assert completed.returncode != 0
+
+
+def test_negative_control_covers_approval_resume_result() -> None:
+    state = {
+        "event_name": "pull_request",
+        "approval_resume_selected": "true",
+        "approval_resume_result": "success",
+    }
+    unmutated = _run_aggregate(**state)
+    assert unmutated.returncode == 0, unmutated.stdout + unmutated.stderr
+
+    check = '"$APPROVAL_RESUME_RESULT" != "$approval_resume_expected" ||'
+
+    def accept_drift(script: str) -> str:
+        assert script.count(check) == 1
+        return script.replace(check, "", 1)
+
+    completed = _run_aggregate(script_transform=accept_drift, **state)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+    assert "Selected and skipped negative control failed" in output
+
+
+def test_approval_resume_job_runs_on_pull_requests_and_gates_e2e_required() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    job = jobs[APPROVAL_RESUME_JOB]
+    assert job["name"] == "E2E approval resume after worker and store restarts (kind)"
+    assert job["if"] == "${{ needs.changes.outputs.approval_resume == 'true' }}"
+    assert "pull_request" not in job["if"]
+    assert job["needs"] == ["rust-build", "changes", "ci-images"]
+    assert APPROVAL_RESUME_JOB in jobs["e2e-required"]["needs"]
+
+    scenario = [
+        step
+        for step in job["steps"]
+        if step.get("run") == "bash cli/scripts/e2e-cluster-approval-resume-restarts.sh"
+    ]
+    assert len(scenario) == 1
+    assert scenario[0]["env"] == {"CURIE_BIN": "cli/target/release/curie"}
+    assert "if" not in scenario[0]
+    assert "continue-on-error" not in scenario[0]
+
+    diagnostics = next(
+        step for step in job["steps"] if step.get("name") == "Dump cluster diagnostics on failure"
+    )
+    assert diagnostics["if"] == "failure()"
+    assert "app.kubernetes.io/component=api" in diagnostics["run"]
+    assert "app.kubernetes.io/component=runner-sandbox" in diagnostics["run"]
+
+    teardown = next(
+        step
+        for step in job["steps"]
+        if step.get("name") == "Tear down the disposable cluster release"
+    )
+    assert teardown["if"] == "always()"
+    assert "kubectl delete namespace curie" in teardown["run"]
+    assert "--ignore-not-found" in teardown["run"]
+    assert "kind delete cluster" not in teardown["run"]
+
+    # Same pinned install surface as the rollout recovery sibling.
+    sibling = jobs["e2e-cluster-rollout-recovery"]
+
+    def uses(steps: list[dict[str, Any]]) -> list[str]:
+        return [step["uses"] for step in steps if "uses" in step]
+
+    assert uses(job["steps"]) == uses(sibling["steps"])

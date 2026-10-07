@@ -1,7 +1,7 @@
 """Action executions, restore ledger columns and connector capabilities (#4067)
 
-Revision ID: 0081
-Revises: 0079
+Revision ID: 0085
+Revises: 0084
 Create Date: 2026-10-06
 
 Hand-written and additive, like every action ledger migration: ADR 0117 found
@@ -30,8 +30,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0081"
-down_revision: str | None = "0079"
+revision: str = "0085"
+down_revision: str | None = "0084"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

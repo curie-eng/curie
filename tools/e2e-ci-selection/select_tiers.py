@@ -27,6 +27,32 @@ OUTPUT_KEYS = {
 # Jobs behind these tiers each boot a kind cluster. Callers omit them when
 # the run should not pay for that.
 KIND_TIERS = frozenset({"cluster", "released-upgrade"})
+# The kind-rung factory scenario runs only when one of these paths changes.
+FACTORY_PREFIXES = (
+    "apps/api/src/curie_api/factory_",
+    "apps/api/src/curie_api/routers/publications",
+    "apps/worker/src/curie_worker/factory",
+    "runner/src/curie_runner/verification.py",
+    "runner/src/curie_runner/preflight",
+    "examples/dark-factory",
+    "tools/factory-e2e",
+    "tools/model-script",
+    "tools/github-stub",
+)
+# The kind approval resume scenario (#4016) runs only when a worker or approval
+# path changes. Prefixes without a .py suffix match by raw string prefix, so
+# "curie_api/approval" covers every approval*.py module.
+APPROVAL_RESUME_PREFIXES = (
+    "apps/worker/src/curie_worker",
+    "apps/api/src/curie_api/resumequeue.py",
+    "apps/api/src/curie_api/resumereconciler.py",
+    "apps/api/src/curie_api/sweeper.py",
+    "apps/api/src/curie_api/routers/approvals.py",
+    "apps/api/src/curie_api/routers/approval_recovery.py",
+    "apps/api/src/curie_api/approval",
+    "runner/src/curie_runner/approval.py",
+    "cli/scripts/e2e-cluster-approval-resume-restarts.sh",
+)
 UPGRADE_WORKFLOW_JOBS = frozenset(
     {
         "e2e-released-upgrade",
@@ -182,6 +208,27 @@ RUNTIME_ASSERTION_DIR = "charts/curie/ci/runtime"
 def _is_runtime_assertion(path: str) -> bool:
     parent, _, name = path.rpartition("/")
     return parent == RUNTIME_ASSERTION_DIR and name.endswith(".sh")
+
+
+def _matches_scenario(path: str, prefixes: tuple[str, ...]) -> bool:
+    for prefix in prefixes:
+        if path == prefix or path.startswith(f"{prefix}/"):
+            return True
+        if not prefix.endswith((".py", ".sh")) and path.startswith(prefix):
+            return True
+    return False
+
+
+def _needs_factory(paths: list[str]) -> bool:
+    if not paths:
+        return True
+    return any(_matches_scenario(path, FACTORY_PREFIXES) for path in paths)
+
+
+def _needs_approval_resume(paths: list[str]) -> bool:
+    if not paths:
+        return True
+    return any(_matches_scenario(path, APPROVAL_RESUME_PREFIXES) for path in paths)
 
 
 def _needs_cli_release(paths: list[str]) -> bool:
@@ -450,6 +497,8 @@ def _render(
     cli_release_needed: bool,
     released_upgrade_full: bool,
     version_only: bool,
+    factory_needed: bool,
+    approval_resume_needed: bool,
 ) -> str:
     lines = [f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}" for tier in TIERS]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
@@ -461,6 +510,10 @@ def _render(
         f"released_upgrade_full={'true' if released_upgrade_full else 'false'}"
     )
     lines.append(f"version_only={'true' if version_only else 'false'}")
+    lines.append(f"factory={'true' if factory_needed else 'false'}")
+    lines.append(
+        f"approval_resume={'true' if approval_resume_needed else 'false'}"
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -486,6 +539,8 @@ def _run() -> None:
     paths: list[str] = []
     workflow_upgrade_changed = False
     version_only = False
+    factory_needed = False
+    approval_resume_needed = False
     if args.push:
         if args.path or args.base or args.head:
             raise RegistryError("push cannot be combined with paths or revisions")
@@ -493,6 +548,8 @@ def _run() -> None:
         pytest_needed = True
         images_needed = True
         cli_release_needed = True
+        factory_needed = True
+        approval_resume_needed = True
     else:
         if args.path and (args.base or args.head):
             raise RegistryError("paths cannot be combined with revisions")
@@ -511,6 +568,12 @@ def _run() -> None:
         images_needed = _needs_images(paths)
         cli_release_needed = _needs_cli_release(paths)
         version_only = _is_version_only(paths, args.head if not args.path else None)
+        factory_needed = _needs_factory(paths)
+        if factory_needed:
+            selected.add("cluster")
+        approval_resume_needed = _needs_approval_resume(paths)
+        if approval_resume_needed:
+            selected.add("cluster")
 
     if args.omit_kind:
         selected.difference_update(KIND_TIERS)
@@ -519,6 +582,8 @@ def _run() -> None:
         # never drops the tier that proves it.
         if any(_is_runtime_assertion(path) for path in paths):
             selected.add("cluster")
+        factory_needed = False
+        approval_resume_needed = False
     if workflow_upgrade_changed:
         selected.add("released-upgrade")
     if version_only:
@@ -547,6 +612,8 @@ def _run() -> None:
                 cli_release_needed,
                 released_upgrade_full,
                 version_only,
+                factory_needed,
+                approval_resume_needed,
             )
         )
 

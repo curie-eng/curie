@@ -303,6 +303,28 @@ fn process_skill_help_distinguishes_tier_from_bundle_artifact() {
     );
 }
 
+/// `hooks` manages webhook partitions and source bindings, which its old help
+/// ("hook configuration") let a reader mistake for cron hooks (#4012). The help
+/// must disown cron triggers and point at the verbs that do read them.
+#[test]
+fn hooks_help_says_not_cron_triggers() {
+    for tier in ["local", "cluster"] {
+        let output = run_help(&[tier, "hooks"]);
+        assert!(
+            output.status.success(),
+            "expected success for {tier} hooks help\n{}",
+            output_text(&output)
+        );
+        let text = String::from_utf8_lossy(&output.stdout);
+        for needle in ["Not cron triggers", "schedules", "hook fire"] {
+            assert!(
+                text.contains(needle),
+                "{tier} hooks help missing `{needle}`\n{text}"
+            );
+        }
+    }
+}
+
 /// `curie dev plugin-compat` is the operator-facing name of the outbound
 /// Claude-Code-compatibility gate (see the bundle-format seam doc). If the verb
 /// stops being reachable, the gate is still in CI but nobody can run it locally
@@ -1022,5 +1044,45 @@ fn help_never_discloses_the_curie_api_key_value() {
             text.contains("--api-key") && text.contains("CURIE_API_KEY"),
             "{path:?} help lost the --api-key flag or its env name\n{text}"
         );
+    }
+}
+
+#[test]
+fn hook_record_is_available_on_local_and_cluster_with_three_positionals() {
+    let manifest = live_command_manifest();
+    for tier in ["local", "cluster"] {
+        let tier_command = manifest["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == tier)
+            .unwrap();
+        let hook = tier_command["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "hook")
+            .unwrap();
+        let record = hook["subcommands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == "record")
+            .unwrap_or_else(|| panic!("{tier} hook must expose record"));
+        let positionals: Vec<_> = record["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|arg| arg["positional"] == true)
+            .collect();
+        assert_eq!(positionals.len(), 3, "{tier}: {positionals:?}");
+        assert!(
+            positionals.iter().all(|arg| arg["required"] == true),
+            "{tier}: {positionals:?}"
+        );
+        let output = run_help(&[tier, "hook", "record"]);
+        assert!(output.status.success(), "{tier}: {}", output_text(&output));
+        let text = output_text(&output);
+        assert!(text.contains("--dry-run"), "{tier}: {text}");
     }
 }

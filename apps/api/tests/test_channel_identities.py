@@ -1,6 +1,6 @@
 """Channel identities: table, admin CRUD and the static Slack bootstrap (#2909).
 
-Migration 0078 adds ``channel_identities``: one row per channel identity --
+Migration 0083 adds ``channel_identities``: one row per channel identity --
 one bot speaking through one connected account (ADR 0168 decision 1), not the
 connected account itself, which is ``provider_installations`` (ADR 0193
 decision 3; see ``test_provider_installations.py``). ``name`` is unique with
@@ -1159,7 +1159,7 @@ def _regclass(name: str) -> str | None:
 
 def test_bootstrap_tolerates_missing_table(isolated_migration_db: None) -> None:
     config = _alembic_config()
-    command.upgrade(config, "0077")
+    command.upgrade(config, "0082")
     try:
         # A rolling upgrade can boot this image before this migration is applied.
         assert asyncio.run(_bootstrap_once(CANARY)) is False
@@ -1175,10 +1175,9 @@ def test_lifespan_retries_until_table_appears(
     isolated_migration_db: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
 ) -> None:
     config = _alembic_config()
-    # 0077, not further below: schema_min has since risen to 0077 (the v0.12.1
-    # release), so a real boot can only be one migration behind this one,
-    # never at an arbitrary earlier revision.
-    command.upgrade(config, "0077")
+    # 0082 is the candidate schema minimum and immediately precedes the
+    # channel identity migration, so this models a supported rolling boot.
+    command.upgrade(config, "0082")
     try:
         with _app(env, CANARY):
             # Boot succeeded below this migration; it now lands while the API runs.

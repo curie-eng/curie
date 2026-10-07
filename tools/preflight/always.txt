@@ -1,0 +1,2 @@
+# Protect nullable override parity whenever workspace Python tests are selected (#3332).
+apps/api/tests/test_nullable_override_parity.py

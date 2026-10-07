@@ -154,6 +154,39 @@ def test_empty_snapshot_requires_matching_base_and_empty_patch() -> None:
             )
 
 
+def test_base_mismatch_names_both_commits_by_twelve_characters() -> None:
+    # #4121: the refusal names both commits so the factory run is actionable.
+    validation = importlib.import_module("curie_worker.publication_validation")
+    snapshot_sha = "0123456789abcdef0123456789abcdef01234567"
+    prepared_sha = "fedcba9876543210fedcba9876543210fedcba98"
+    prepared = SimpleNamespace(repo_full_name="acme-corp/acme-bot", base_sha=prepared_sha)
+    coordinator = SimpleNamespace(current=lambda _thread: prepared)
+    snapshot = RunnerWorkspaceSnapshot(
+        repo_full_name=prepared.repo_full_name,
+        base_sha=snapshot_sha,
+        patch=b"",
+        changed_paths=(),
+        contains_workflow_files=False,
+        publication_title="Correct the pull request",
+        publication_body="Correct the body for CI.",
+    )
+
+    with pytest.raises(validation.WorkspacePreparationError) as raised:
+        validation.validate_snapshot_against_base(
+            coordinator,
+            thread_key="example-thread",
+            snapshot=snapshot,
+            protected_paths=(),
+        )
+
+    message = str(raised.value)
+    assert snapshot_sha[:12] in message
+    assert prepared_sha[:12] in message
+    assert snapshot_sha not in message
+    assert prepared_sha not in message
+    assert "snapshot commit 0123456789ab does not match sanitized base fedcba987654" in message
+
+
 def _prepared_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "patch-source"
     repo.mkdir()

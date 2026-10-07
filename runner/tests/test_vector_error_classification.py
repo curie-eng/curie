@@ -25,6 +25,7 @@ _PLATFORM = (
     "ledger-error",
     "model-credential-rejected",
     "model-credit-exhausted",
+    "model-usage-limited",
     "approval-not-acted",
     "false-completion",
     "publication-unrecorded",

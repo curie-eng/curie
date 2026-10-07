@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import threading
+import time
 import uuid
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +19,7 @@ from ..approvals import (
     VerifiedReviewFeedback,
 )
 from ..attachments import (
+    AttachmentResolutionError,
     PreparedAttachments,
 )
 from ..behaviorpacks import (
@@ -367,6 +371,87 @@ async def _discard_prepared_attachments(
         )
 
 
+async def _carried_attachment_env(
+    self: Kernel, thread_key: str, agent_id: uuid.UUID
+) -> dict[str, str]:
+    """The thread's retained files for a text-only turn, or nothing (#4079).
+
+    Best effort: a ledger or presign failure boots the runner without the
+    carried files, which is what every text-only turn did before, rather
+    than failing a turn that carries nothing of its own. The same holds for
+    a slow store: the lookup runs on every text-only turn, steers included,
+    so it is bounded by ``constants._ATTACHMENT_CARRY_TIMEOUT_S`` and abandoned past it.
+    Waiting for a free slot counts against the same bound, and an abandoned
+    lookup keeps its slot until the store answers.
+
+    The warning names the failure's class and stage, never its message: a
+    presign error can quote a signed URL, and ``redact_text`` does not
+    recognize every store's signature parameter.
+    """
+
+    lane = self._attachments
+    assert lane is not None  # guarded by the caller
+    deadline = time.monotonic() + constants._ATTACHMENT_CARRY_TIMEOUT_S
+    try:
+        await asyncio.wait_for(
+            self._carry_slots.acquire(), timeout=constants._ATTACHMENT_CARRY_TIMEOUT_S
+        )
+    except Exception:  # noqa: BLE001 -- a timeout, or anything else, skips carry
+        logger.warning("retained attachment carry skipped for thread %s: lookups busy", thread_key)
+        return {}
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        self._carry_slots.release()
+        logger.warning("retained attachment carry skipped for thread %s: lookups busy", thread_key)
+        return {}
+    loop = asyncio.get_running_loop()
+    done: asyncio.Future[dict[str, str]] = loop.create_future()
+
+    def settle(result: dict[str, str] | None, error: BaseException | None) -> None:
+        if done.done():
+            return
+        if error is not None:
+            done.set_exception(error)
+        else:
+            done.set_result(result or {})
+
+    def deliver(result: dict[str, str] | None, error: BaseException | None) -> None:
+        # The turn may have given up and its loop may be gone; either way
+        # there is nobody left to hand the answer to.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(settle, result, error)
+
+    def lookup() -> None:
+        try:
+            result = lane.carry(thread_key, agent_id=str(agent_id))
+        except BaseException as exc:  # noqa: BLE001 -- handed to the awaiting turn
+            deliver(None, exc)
+        else:
+            deliver(result, None)
+        finally:
+            # The semaphore belongs to the loop, so the slot goes back there.
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._carry_slots.release)
+
+    try:
+        try:
+            threading.Thread(target=lookup, name="attachment-carry", daemon=True).start()
+        except BaseException:
+            # The thread never ran, so its ``finally`` never will.
+            self._carry_slots.release()
+            raise
+        return await asyncio.wait_for(done, timeout=remaining)
+    except Exception as exc:  # noqa: BLE001
+        stage = exc.stage if isinstance(exc, AttachmentResolutionError) else None
+        logger.warning(
+            "retained attachment carry failed for thread %s: %s stage=%s",
+            thread_key,
+            type(exc).__name__,
+            stage,
+        )
+        return {}
+
+
 async def _resolve_attachments(
     self: Kernel,
     qevent: QueuedTurn,
@@ -375,10 +460,12 @@ async def _resolve_attachments(
 ) -> tuple[dict[str, str], PreparedAttachments]:
     """Merge this turn's resolved attachment capability into the claim env.
 
-    A turn carrying no attachments -- the overwhelming majority -- does not
-    consult the lane at all: no channel round trip, no object, and no key on
-    the claim. Not even an empty-valued one, which an init container would
-    read as "there is work here".
+    A turn carrying no attachments -- the overwhelming majority -- never
+    reaches here: no channel round trip and no new object. It only asks the
+    lane to re-mint the thread's retained set (``_carried_attachment_env``),
+    which adds no key to the claim when there is none. Not even an
+    empty-valued one, which an init container would read as "there is work
+    here".
     """
 
     lane = self._attachments

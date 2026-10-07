@@ -47,7 +47,7 @@ from curie_api.workitem_dispatch import (
     record_termination,
     start,
 )
-from curie_api.workitem_outcomes import derive_outcome
+from curie_api.workitem_outcomes import CiDetail, derive_outcome
 from curie_api.workitems import lifecycle as workitems
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
@@ -2053,6 +2053,96 @@ def test_ci_detail_reads_check_runs_statuses_and_failing_annotations(
         assert request.headers["authorization"].lower() == f"bearer {SECRET_SENTINEL}".lower()
 
 
+BASE_SHA = "b" * 40
+
+
+def _observe_detail_with_base(
+    monkeypatch: pytest.MonkeyPatch,
+    base_branch: Callable[[], Awaitable[httpx.Response]],
+    base_runs: list[dict[str, Any]],
+) -> tuple[Any, list[str]]:
+    from curie_api import workitem_outcomes
+
+    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: _FakeCreds())
+    head = _detail_handler()
+    paths: list[str] = []
+
+    async def record(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        paths.append(path)
+        if path.endswith(f"/repos/{REPO}/branches/main"):
+            return await base_branch()
+        if path.endswith(f"/repos/{REPO}/commits/{BASE_SHA}/check-runs"):
+            return httpx.Response(
+                200, json={"total_count": len(base_runs), "check_runs": base_runs}
+            )
+        if path.endswith(f"/repos/{REPO}/commits/{BASE_SHA}/status"):
+            return httpx.Response(
+                200, json={"state": "success", "statuses": [], "total_count": 0}
+            )
+        return head(request)
+
+    lineage, work_item = _ci_inputs()
+    lineage.base_ref = "main"
+
+    async def run() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
+            return await workitem_outcomes.observe_ci_detail(
+                lineage, work_item, get_settings(), client
+            )
+
+    return asyncio.run(run()), paths
+
+
+def test_ci_detail_slow_base_read_keeps_the_observed_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from curie_api import workitem_outcomes
+
+    monkeypatch.setattr(workitem_outcomes, "CI_BASE_READ_TIMEOUT_SECONDS", 0.2)
+
+    async def never_answers() -> httpx.Response:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    detail, paths = _observe_detail_with_base(monkeypatch, never_answers, [])
+
+    assert detail.state == "observed"
+    assert detail.reason is None
+    assert FAILING_RUN_ID in {run["id"] for run in detail.check_runs}
+    assert _annotation_messages(detail.annotations) == ["AssertionError: expected 2, got 1"]
+    assert detail.base_check_runs is None and detail.base_statuses is None
+    annotations_at = next(
+        i for i, p in enumerate(paths)
+        if p.endswith(f"/repos/{REPO}/check-runs/{FAILING_RUN_ID}/annotations")
+    )
+    branches_at = next(
+        i for i, p in enumerate(paths) if p.endswith(f"/repos/{REPO}/branches/main")
+    )
+    # The base read runs last, so it can never eat the head's annotation budget.
+    assert annotations_at < branches_at
+
+
+def test_ci_detail_reads_the_base_branch_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_failure = {
+        "id": 90,
+        "name": "unit-tests",
+        "status": "completed",
+        "conclusion": "failure",
+    }
+
+    async def answers() -> httpx.Response:
+        return httpx.Response(200, json={"name": "main", "commit": {"sha": BASE_SHA}})
+
+    detail, _paths = _observe_detail_with_base(monkeypatch, answers, [base_failure])
+
+    assert detail.state == "observed"
+    assert detail.base_check_runs == [base_failure]
+    assert detail.base_statuses == []
+
+
 def _actions_check_run(
     run_id: int, name: str, conclusion: str, *, app_slug: str = "github-actions"
 ) -> dict[str, Any]:
@@ -2103,8 +2193,8 @@ def _factory_ci_detail(
     runs: list[dict[str, Any]] | None = None,
     state: str = "observed",
     reason: str | None = None,
-) -> Any:
-    return SimpleNamespace(
+) -> CiDetail:
+    return CiDetail(
         state=state,
         reason=reason,
         head_sha=HEAD_SHA,

@@ -256,6 +256,10 @@ fn locked_schedule_list() -> serde_json::Value {
                         "zone": "UTC",
                         "last_fire_at": "2026-09-25T02:30:00Z",
                         "last_outcome": "failed",
+                        "last_reason": null,
+                        "last_manual_fire_at": null,
+                        "last_manual_outcome": null,
+                        "last_manual_reason": null,
                         "paused": false
                     }
                 ]
@@ -319,6 +323,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Done" => OverridesOutput::Done {
                 agent: "a".to_string(),
                 model: Some("kimi-k2".to_string()),
+                reviewer_model: Some("claude-opus-5-5".to_string()),
                 thinking: Some("adaptive".to_string()),
                 execution_deadline_seconds: Some(90),
                 runner_resources: None,
@@ -534,20 +539,22 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
         "HookFireOutput",
         samples![
             "DryRun" => HookFireOutput::DryRun(plan()),
-            "Record" => HookFireOutput::Record(
+            "Record" => HookFireOutput::Record(Box::new(
                 serde_json::from_value::<HookFireRecord>(serde_json::json!({
                     "id": "22222222-2222-4222-8222-222222222222",
                     "agent_id": "11111111-1111-4111-8111-111111111111",
                     "agent": "acme-bot",
                     "name": "nightly-cleanup",
                     "trigger": "cron",
+                    "source": "manual",
+                    "reason": null,
                     "slot_utc": "2026-09-26T12:00:00Z",
                     "outcome": "ran",
                     "started_at": "2026-09-26T12:00:00Z",
                     "ended_at": "2026-09-26T12:00:01Z"
                 }))
                 .unwrap(),
-            ),
+            )),
         ],
     );
     m.insert(

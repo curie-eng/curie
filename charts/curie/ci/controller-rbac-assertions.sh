@@ -8,7 +8,7 @@
 # informer by confining cluster LIST/WATCH to a namespaced Role (the #350
 # crash-loop). See docs/adr/0023-controller-networkpolicy-rbac-cluster-read-namespace-mutate.md.
 #
-# Six assertions. (a)-(e) scan the FULL multi-doc render (ClusterRoles come from
+# Seven assertions. (a)-(e) scan the FULL multi-doc render (ClusterRoles come from
 # BOTH templates/agent-sandbox.yaml and the vendored
 # files/agent-sandbox/controller.yaml, so no --show-only); (f) EXECUTES the
 # rendered preflight script against a stub kubectl:
@@ -23,13 +23,17 @@
 #       bound to the same SA.
 #   (d) The controller-ready preflight gate renders with defaults and suppresses
 #       correctly under agentSandbox.controller.deploy=false and
-#       preflights.controllerReady.enabled=false.
+#       preflights.controllerReady.enabled=false. Its Role grants only the
+#       deployment/pod/log reads plus get on pods/proxy needed for metrics.
 #   (e) The gate's FAIL diagnostic has a lease-specific branch (issue #507).
 #   (f) The gate's classifier BEHAVES: run the rendered script under sh with a
 #       stub kubectl serving crafted logs. It must not fabricate an RBAC match
 #       from two concatenated logs, and cause-specific remediation must print
 #       only under its own branch (issue #611). (e) is presence-only and cannot
 #       see either bug.
+#   (g) Startup logs and positive successful-reconcile metrics both pass, zero
+#       success counters and failed metrics requests refuse, and every failure
+#       takes precedence over either success signal (issue #4005).
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the
 # violated assertion.
@@ -245,6 +249,28 @@ nogate_role = [n for n in names_by_kind(nogate_docs, "Role") if n == NP_ROLE]
 if not nogate_role:
     die("(d) RBAC split independent of gate — with controllerReady.enabled=false Role %r must still render" % NP_ROLE)
 print("  ok: (d.3) controllerReady.enabled=false suppresses only the Job; the RBAC split still renders")
+
+# (d.4) Metrics use the API-server pod proxy, with no additional write or
+# cluster-scoped grant. Compare complete rules so a wildcard cannot hide here.
+preflight_roles = [
+    role for role in docs_of_kind(default_docs, "Role")
+    if ((role.get("metadata") or {}).get("name") or "").endswith(PREFLIGHT_SUFFIX)
+]
+if len(preflight_roles) != 1:
+    die("(d.4) preflight RBAC: expected exactly one controller-ready Role, got %d" % len(preflight_roles))
+preflight_role = preflight_roles[0]
+if (preflight_role.get("metadata") or {}).get("namespace") != CONTROLLER_SA[1]:
+    die("(d.4) preflight RBAC: controller-ready Role must stay in agent-sandbox-system")
+expected_rules = [
+    {"apiGroups": ["apps"], "resources": ["deployments"], "verbs": ["get", "list", "watch"]},
+    {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch"]},
+    {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+    {"apiGroups": [""], "resources": ["pods/proxy"], "verbs": ["get"]},
+]
+actual_rules = preflight_role.get("rules") or []
+if len(actual_rules) != len(expected_rules) or any(rule not in actual_rules for rule in expected_rules):
+    die("(d.4) preflight RBAC: expected only deployment/pod/log reads and pods/proxy get, got %r" % actual_rules)
+print("  ok: (d.4) preflight Role adds only pods/proxy get to its existing read grants")
 PY
 
 if ! out="$(python3 "$ASSERT_PY" "$DEFAULT" "$NOCTRL" "$NOGATE" "$NS" 2>&1)"; then
@@ -272,6 +298,7 @@ echo "  ok: (e) the controller-ready gate distinguishes a lease timeout from an 
 # branches. So actually RUN the rendered script under `sh` with a stub kubectl
 # that serves crafted logs per scenario, and assert on its stdout (issue #611).
 FDIR="$TMP/f"
+export FDIR
 mkdir -p "$FDIR/bin"
 
 # Pull the inline /bin/sh -c script body out of the preflight Job's container.
@@ -309,12 +336,47 @@ PY
 cat > "$FDIR/bin/kubectl" <<'STUB'
 #!/bin/sh
 case "$*" in
+  *get*--raw*)
+    case "$*" in
+      */api/v1/namespaces/agent-sandbox-system/pods/agent-sandbox-controller-0:8080/proxy/metrics*) ;;
+      *) echo "unexpected controller metrics proxy path: $*" >&2; exit 2 ;;
+    esac
+    printf '%s\n' "$*" >> "$FDIR/metrics-calls"
+    # agent-sandbox v0.5.0 pins controller-runtime v0.23.3:
+    # https://github.com/kubernetes-sigs/agent-sandbox/blob/v0.5.0/go.mod
+    # Its CounterVec has controller/result labels, and successful reconciles
+    # increment result="success"; error/requeue outcomes must not count:
+    # https://github.com/kubernetes-sigs/controller-runtime/blob/v0.23.3/pkg/internal/controller/metrics/metrics.go
+    # https://github.com/kubernetes-sigs/controller-runtime/blob/v0.23.3/pkg/internal/controller/controller.go
+    if [ "$SCENARIO" = metrics_zero ]; then
+      printf '# controller_runtime_reconcile_total{controller="comment",result="success"} 99\n'
+      printf 'controller_runtime_reconcile_total{controller="sandbox",result="success"} 0\n'
+      printf 'controller_runtime_reconcile_total{controller="sandboxwarmpool",result="success"} 0\n'
+      printf 'controller_runtime_reconcile_total{controller="sandbox",result="error"} 12\n'
+      printf 'controller_runtime_reconcile_total{controller="sandbox",result="requeue"} 8\n'
+      printf 'controller_runtime_reconcile_errors_total{controller="sandbox",result="success"} 4\n'
+    else
+      printf '# HELP controller_runtime_reconcile_total Total number of reconciliations per controller\n'
+      printf '# TYPE controller_runtime_reconcile_total counter\n'
+      printf 'controller_runtime_reconcile_total{controller="sandbox",result="success"} 0\n'
+      printf 'controller_runtime_reconcile_total{result="success",controller="sandboxwarmpool"} 2e+00\n'
+      printf 'controller_runtime_reconcile_total{controller="sandbox",result="error"} 7\n'
+    fi
+    # Even a failed proxy command whose partial stdout contains a positive
+    # success sample cannot establish controller health.
+    [ "$SCENARIO" != metrics_error ] || exit 1
+    ;;
   *rollout*status*)
     exit 0
     ;;
+  *get*pods*jsonpath*restartCount*)
+    case "$SCENARIO" in
+      lease_glue|rbac|rbac_*|lease_*|restart_*) printf '1' ;;
+      *) printf '0' ;;
+    esac
+    ;;
   *get*pods*jsonpath*)
-    # Nonzero restartCount, so the script fetches the --previous log at all.
-    printf '1'
+    printf 'agent-sandbox-controller-0'
     ;;
   *get*pods*)
     printf 'agent-sandbox-controller-0   0/1   Error   1   30s\n'
@@ -328,19 +390,33 @@ case "$*" in
     fi
     ;;
   *logs*)
-    if [ "${SCENARIO}" = "lease_glue" ]; then
-      printf 'I0717 12:00:00 starting manager\n'
-      # LAST line mentions networkpolicies but carries no "forbidden".
-      printf 'I0717 12:00:00 reflector starting for networkpolicies\n'
-    else
-      printf 'I0717 12:00:00 starting manager\n'
-      printf 'E0717 12:00:00 reflector: failed to list *v1.NetworkPolicy: networkpolicies.networking.k8s.io is forbidden: User "system:serviceaccount:agent-sandbox-system:agent-sandbox-controller" cannot list resource "networkpolicies" at the cluster scope\n'
-    fi
+    printf 'I0717 12:00:00 starting manager\n'
+    case "$SCENARIO" in
+      startup|*_startup) printf 'I0717 12:00:00 Starting workers\n' ;;
+    esac
+    case "$SCENARIO" in
+      lease_glue)
+        # LAST line mentions networkpolicies but carries no "forbidden".
+        printf 'I0717 12:00:00 reflector starting for networkpolicies\n'
+        ;;
+      rbac|rbac_*)
+        printf 'E0717 12:00:00 reflector: failed to list *v1.NetworkPolicy: networkpolicies.networking.k8s.io is forbidden: User "system:serviceaccount:agent-sandbox-system:agent-sandbox-controller" cannot list resource "networkpolicies" at the cluster scope\n'
+        ;;
+      lease_*)
+        printf 'E0717 12:00:00 failed to renew lease agent-sandbox-system/agent-sandbox-controller: context deadline exceeded\n'
+        ;;
+    esac
     ;;
+  *) echo "unexpected kubectl request: $*" >&2; exit 2 ;;
 esac
 exit 0
 STUB
 chmod +x "$FDIR/bin/kubectl"
+
+# The rendered script owns its logical TIMEOUT; avoid wall-clock delays in the
+# zero/error metrics cases while still executing every iteration and refusal.
+printf '#!/bin/sh\nexit 0\n' > "$FDIR/bin/sleep"
+chmod +x "$FDIR/bin/sleep"
 
 # TIMEOUT is small so the poll loop cannot linger; every scenario breaks out on
 # the first iteration anyway. The FAIL path is expected to exit 1, so the
@@ -348,10 +424,16 @@ chmod +x "$FDIR/bin/kubectl"
 # script) -- it stashes the exit code in $FDIR/rc for the caller to assert on
 # instead.
 run_preflight() {
-  PATH="$FDIR/bin:$PATH" SCENARIO="$1" \
-    CONTROLLER_NS=agent-sandbox-system DEPLOY=agent-sandbox-controller TIMEOUT=5 \
-    sh "$FDIR/preflight.sh" 2>&1
-  echo $? > "$FDIR/rc"
+  rm -f "$FDIR/metrics-calls"
+  local rc=0
+  if PATH="$FDIR/bin:$PATH" SCENARIO="$1" \
+      CONTROLLER_NS=agent-sandbox-system DEPLOY=agent-sandbox-controller TIMEOUT=5 \
+      sh "$FDIR/preflight.sh" 2>&1; then
+    rc=0
+  else
+    rc=$?
+  fi
+  echo "$rc" > "$FDIR/rc"
 }
 
 # (f.1) The glue regression (AC1): a lease failure whose current log also
@@ -399,5 +481,62 @@ echo "$rbac_out" | grep -q "delete the controller" \
 $rbac_out"
 echo "  ok: (f.3) a genuine RBAC failure classifies as rbac, keeps its crash-loop hint, and exits 1"
 
+# --- (g) Durable health and failure precedence (issue #4005) ---
+startup_out="$(run_preflight startup)"
+startup_rc="$(cat "$FDIR/rc")"
+[ "$startup_rc" -eq 0 ] && echo "$startup_out" | grep -q "RESULT: PASS.*Starting workers" \
+  || fail "(g.1) healthy startup logs must pass, got rc=$startup_rc:
+$startup_out"
+[ ! -s "$FDIR/metrics-calls" ] \
+  || fail "(g.1) Starting workers must retain its fast path without fetching metrics"
+echo "  ok: (g.1) healthy startup logs pass without requesting metrics"
+
+metrics_out="$(run_preflight metrics_positive)"
+metrics_rc="$(cat "$FDIR/rc")"
+[ "$metrics_rc" -eq 0 ] && echo "$metrics_out" | grep -qi "RESULT: PASS.*reconcile" \
+  || fail "(g.2) successful reconcile metrics without startup logs must pass, got rc=$metrics_rc:
+$metrics_out"
+[ -s "$FDIR/metrics-calls" ] \
+  || fail "(g.2) the metrics success path must fetch the selected controller pod through :8080/proxy/metrics"
+echo "  ok: (g.2) positive successful-reconcile metrics pass with no startup log"
+
+for scenario in metrics_zero metrics_error; do
+  scenario_out="$(run_preflight "$scenario")"
+  scenario_rc="$(cat "$FDIR/rc")"
+  [ "$scenario_rc" -eq 1 ] && echo "$scenario_out" | grep -q "RESULT: FAIL" \
+    || fail "(g.3) $scenario must refuse, got rc=$scenario_rc:
+$scenario_out"
+  [ -s "$FDIR/metrics-calls" ] \
+    || fail "(g.3) $scenario must exercise the metrics request"
+  echo "$scenario_out" | grep -q "RESULT: PASS" \
+    && fail "(g.3) $scenario emitted a false PASS:
+$scenario_out"
+done
+echo "  ok: (g.3) zero successful reconciles and failed metrics requests refuse"
+
+for cause in rbac lease restart; do
+  for signal in startup metrics; do
+    scenario_out="$(run_preflight "${cause}_${signal}")"
+    scenario_rc="$(cat "$FDIR/rc")"
+    [ "$scenario_rc" -eq 1 ] && echo "$scenario_out" | grep -q "RESULT: FAIL" \
+      || fail "(g.4) $cause must take precedence over $signal, got rc=$scenario_rc:
+$scenario_out"
+    echo "$scenario_out" | grep -q "RESULT: PASS" \
+      && fail "(g.4) $cause emitted a false PASS with misleading $signal:
+$scenario_out"
+    [ ! -s "$FDIR/metrics-calls" ] \
+      || fail "(g.4) $cause must be classified before requesting positive metrics"
+    case "$cause" in
+      rbac) expected="forbidden-networkpolicies logged" ;;
+      lease) expected="lost its leader-election lease" ;;
+      restart) expected="restartCount>0" ;;
+    esac
+    echo "$scenario_out" | grep -q "$expected" \
+      || fail "(g.4) $cause classification was lost with misleading $signal:
+$scenario_out"
+  done
+done
+echo "  ok: (g.4) RBAC, lease, and restart failures take precedence over startup logs and positive metrics"
+
 echo
-echo "PASS: exactly one read-only cluster networkpolicies grant (get/list/watch, bound to the controller SA); no cluster-wide mutate anywhere; namespaced Role keeps mutate and drops list/watch; the controller-ready gate renders on defaults, suppresses correctly under both flags, classifies a lease timeout distinctly from an RBAC failure, and -- executed against a stub kubectl -- neither fabricates an RBAC match from two concatenated logs nor leaks the RBAC crash-loop hint into the lease branch."
+echo "PASS: controller RBAC stays read-only at cluster scope and mutate stays namespaced; preflight RBAC adds only pods/proxy get; the gate renders and suppresses correctly, preserves cause-specific diagnostics, passes healthy startup logs or positive successful-reconcile metrics, and refuses every failure before either success signal."
