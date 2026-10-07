@@ -252,6 +252,10 @@ async def request_remediation_approval(
         raise RemediationApprovalUnavailable("the protected delivery has no reply handle")
 
     await _lock_identity(session, nomination)
+    if nomination.current_generation is None:
+        # The generation the approval is bound under, so a later change to the
+        # action is judged ``policy_changed`` against it (AUTOMATED-REMEDIATION-16).
+        nomination.current_generation = generation_number
     pending = await _pending_identical(session, nomination)
     if pending is not None:
         approval_id = pending.approval_id
