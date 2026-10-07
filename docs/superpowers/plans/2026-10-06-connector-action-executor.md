@@ -73,6 +73,21 @@ identifiers.
   `SandboxSubstrate.pressure_candidates` keeps them out of
   `apps/worker/src/curie_worker/kernel/capacity.py::_reclaim_idle_route`, and
   observe the substrate's quota refusal for an executor claim.
+* **M3, M4 and M6, observed 2026-10-07** on a disposable cluster at `9313d753e`
+  with worker and runner images built from it. M3: `SandboxSubstrate.claim` has
+  no thread lock precondition for an `action-exec:` key, and pool, labels and
+  network reach match an ordinary turn; but the pool template injects every
+  connector secret and, with a real model credential, `CURIE_CREDENTIALS`, so
+  the executor pod received a non-target secret and the runner refused to boot
+  in executor mode. ACTION-EXECUTOR-5 now requires a stripped per-claim template,
+  and task 11 touches `apps/worker/src/curie_worker/sandbox/k8s.py` and
+  `apps/worker/src/curie_worker/sandbox/claim_tokens.py`. M4: at a real caller
+  proxy with `restore` gated, no grant and a replayed grant were refused, one
+  matching grant was accepted, and the connector saw one restore. M6: the kernel
+  takes reclaim candidates only from `pressure_candidates`, so the substrate
+  filter suffices; today executor routes are skipped only incidentally. An
+  executor claim over quota raised `CapacityExhaustedError` in about 0.1 s with
+  no route left behind.
 
 ### Parity seam entry added in task 2
 
