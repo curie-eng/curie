@@ -62,11 +62,13 @@ from _receipt_capture import (
     stage_of,
     whole,
 )
-from _sealed_actions import executor_enabled  # noqa: F401 - fixture, requested by name
+from _sealed_actions import (
+    executor_enabled,  # noqa: F401 - fixture, requested by name
+    worker_headers,
+)
 from test_remediation_escalation import (
     NOT_VERIFIED,
     _approval_scenario,
-    _claim_dispatch,
     _drive,
     _one_escalation,
     _resolve,
@@ -78,11 +80,14 @@ from test_remediation_verifier import (
     ACTION_NAME,
     EVENT_ID,
     HOOK,
+    POST_VERSION,
     _agent,
     _bind_policy,
+    _claim,
     _dispatched,
     _document,
     _end,
+    _fence,
 )
 
 pytestmark = pytest.mark.usefixtures("clean_db", "executor_enabled", "runs_stream")
@@ -213,7 +218,21 @@ def test_an_approved_undo_that_confirms_posts_undone_under_the_approval_authorit
     assert _resolve(client, undo_approval, "approved").status_code == 200
     assert deliver_receipts() == []  # an unexecuted restore is not yet an undo
     (restore,) = _restores(action_id)
-    fence = _claim_dispatch(client, restore["id"])
+    # AE-17 call order: claim, observation of the version the action left, dispatch.
+    claimed = _claim(client)
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["id"] == str(restore["id"])
+    fence = _fence(claimed.json())
+    observed = client.post(
+        f"/action-executions/{restore['id']}/observation",
+        json={**fence, "version": POST_VERSION},
+        headers=worker_headers(),
+    )
+    assert observed.status_code == 200, observed.text
+    dispatched = client.post(
+        f"/action-executions/{restore['id']}/dispatch", json=fence, headers=worker_headers()
+    )
+    assert dispatched.status_code == 200, dispatched.text
     assert _end(client, restore["id"], fence).status_code == 200
 
     posts = deliver_receipts()

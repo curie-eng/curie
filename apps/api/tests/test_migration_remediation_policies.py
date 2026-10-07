@@ -37,7 +37,7 @@ BELOW = "0086"
 # revision (task 8), the read executions revision (task 7), the execution code
 # revision (task 11) and the remediation approvals revision (task 10) follow the
 # policy one.
-HEAD = "0096"
+HEAD = "0097"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}
 GENERATION_COLUMNS = {
