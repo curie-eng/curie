@@ -205,10 +205,18 @@ class ProbeTrigger:
             connector = _proxy_connector(obj)
             if connector is None:
                 continue
-            if self._release is not None and name != object_name(
-                self._release, agent_name, connector
-            ):
-                continue
+            if self._release is not None:
+                try:
+                    rendered_name = object_name(self._release, agent_name, connector)
+                except ValueError:
+                    # A name the render refuses (one that could forge its join)
+                    # is no probe target; the agent's other connectors still are.
+                    logger.warning(
+                        "capability probe skipped a connector whose name the render refuses"
+                    )
+                    continue
+                if name != rendered_name:
+                    continue
             seen = observe(obj)
             if not seen.rolled_out or seen.digest is None:
                 continue
