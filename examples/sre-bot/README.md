@@ -4,6 +4,12 @@ This bundle combines Grafana, Tempo, and one pinned upstream Kubernetes MCP
 server. The Kubernetes connector runs only the `core` toolset, has config and
 multi-cluster disabled, is stateless, and reads one file-mounted kubeconfig.
 
+The optional read-only startability observer has a separate
+[observation contract](docs/STARTABILITY.md), explicit installation inputs, and
+a real Kubernetes/Postgres verification gate. It observes configuration;
+credential validity, successful sandbox claims, and execution need their own
+evidence. The default bundle and installer do not install the observer.
+
 Installations whose alert provider delivers email into Slack can opt into the
 per-message, source-thread intake described in
 [`docs/SLACK-EMAIL-INTAKE.md`](docs/SLACK-EMAIL-INTAKE.md). It is deliberately
@@ -261,6 +267,12 @@ denial, RBAC ceiling, coding-agent pull request), the Slack app and GitHub
 prerequisites, and the expected evidence for each are in [DEMO.md](DEMO.md).
 
 ## Alert source (opt-in)
+
+The optional [CloudWatch source](observability/cloudwatch-alarms/INSTALL.md)
+reads metric and composite alarms for an operator-owned SNS topic. It requires
+separate read-only web identity configuration and a Prometheus overlay; the
+default installer does not enable it. Its [contract](docs/CLOUDWATCH-ALARMS.md)
+distinguishes retained alarm evidence from current provider state.
 
 Alertmanager stays off in the default observability overlay. The optional source
 uses the signer in `observability/alert-signer.yaml` because Alertmanager cannot
