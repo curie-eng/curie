@@ -51,6 +51,7 @@ from ..models import Agent, AgentChannel
 from ..publication_policy import PublicationPolicyConflict
 from ..runner_resources import RunnerResourcesError, quota_refusal
 
+
 def _carries_secret_input(error: dict[str, Any]) -> bool:
     """Whether a validation error's ``input`` can hold connector secret values.
 
