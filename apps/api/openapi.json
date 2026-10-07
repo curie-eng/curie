@@ -685,20 +685,17 @@
             "title": "Agent Id",
             "type": "string"
           },
-          "github_installation_id": {
-            "exclusiveMinimum": 0.0,
-            "title": "Github Installation Id",
-            "type": "integer"
-          },
-          "github_issue_number": {
-            "exclusiveMinimum": 0.0,
-            "title": "Github Issue Number",
-            "type": "integer"
-          },
-          "github_repository_id": {
-            "exclusiveMinimum": 0.0,
-            "title": "Github Repository Id",
-            "type": "integer"
+          "code_host_installation_id": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code Host Installation Id"
           },
           "kind": {
             "minLength": 1,
@@ -716,10 +713,8 @@
             "title": "Reply Conversation Id",
             "type": "string"
           },
-          "repo_full_name": {
-            "minLength": 1,
-            "title": "Repo Full Name",
-            "type": "string"
+          "repository": {
+            "$ref": "#/components/schemas/RepositoryIn"
           },
           "request_id": {
             "format": "uuid",
@@ -730,6 +725,9 @@
             "minLength": 1,
             "title": "Requester",
             "type": "string"
+          },
+          "tracker": {
+            "$ref": "#/components/schemas/TrackerIssueIn"
           }
         },
         "required": [
@@ -737,10 +735,8 @@
           "kind",
           "address",
           "reply_conversation_id",
-          "repo_full_name",
-          "github_repository_id",
-          "github_issue_number",
-          "github_installation_id",
+          "tracker",
+          "repository",
           "objective",
           "requester",
           "request_id"
@@ -4425,6 +4421,16 @@
         "title": "CostReport",
         "type": "object"
       },
+      "CredentialHeader": {
+        "description": "The header form git accepts on a forge. GitLab refuses a Bearer header.",
+        "enum": [
+          "authorization_basic",
+          "authorization_bearer",
+          "private_token"
+        ],
+        "title": "CredentialHeader",
+        "type": "string"
+      },
       "Declaration": {
         "additionalProperties": false,
         "properties": {
@@ -7437,6 +7443,27 @@
         "title": "ProviderInstallationUpdate",
         "type": "object"
       },
+      "PublicationBranchHeadOut": {
+        "description": "The head of a publication's branch; ``None`` when the branch does not exist.",
+        "properties": {
+          "head_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Head Sha"
+          }
+        },
+        "required": [
+          "head_sha"
+        ],
+        "title": "PublicationBranchHeadOut",
+        "type": "object"
+      },
       "PublicationContext": {
         "description": "API issued authority and observation for one execution's publication read.\n\nThe capability authorizes only the publication precheck endpoint. It must\nstay outside model text, transcripts, workspace files and logs. The queued\nevent identifier is a correlation value, not proof of an active turn.\nObservation metadata records the API read at dispatch; consumers must make\na fresh comparison before handling an empty publication proposal.",
         "properties": {
@@ -8385,6 +8412,113 @@
         "title": "PublicationPrecheckResult",
         "type": "object"
       },
+      "PublicationPullRecover": {
+        "description": "Adopt the publication branch's pull request, or open it when the branch\nholds exactly ``expected_head_sha``.",
+        "properties": {
+          "expected_head_sha": {
+            "pattern": "^[0-9a-f]{40,64}$",
+            "title": "Expected Head Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_head_sha"
+        ],
+        "title": "PublicationPullRecover",
+        "type": "object"
+      },
+      "PublicationPullRequestOut": {
+        "description": "One pull request, read through the code host for the worker (ADR 0197, item 6).\n\nThe worker holds no forge code: it receives the pull request's number,\nURL, state and head as data and never a provider payload.",
+        "properties": {
+          "head_ref": {
+            "title": "Head Ref",
+            "type": "string"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "number": {
+            "exclusiveMinimum": 0.0,
+            "title": "Number",
+            "type": "integer"
+          },
+          "state": {
+            "enum": [
+              "open",
+              "closed",
+              "merged"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "number",
+          "url",
+          "state",
+          "head_sha",
+          "head_ref"
+        ],
+        "title": "PublicationPullRequestOut",
+        "type": "object"
+      },
+      "PublicationRevisionOut": {
+        "properties": {
+          "commit_sha": {
+            "title": "Commit Sha",
+            "type": "string"
+          }
+        },
+        "required": [
+          "commit_sha"
+        ],
+        "title": "PublicationRevisionOut",
+        "type": "object"
+      },
+      "PublicationRevisionVerify": {
+        "description": "A remote commit the worker asks the API to prove is this revision's.\n\n``revision_id`` and ``expected_parent`` must equal the stored publication's\nown; the API derives both and refuses any other.",
+        "properties": {
+          "commit_sha": {
+            "pattern": "^[0-9a-f]{40,64}$",
+            "title": "Commit Sha",
+            "type": "string"
+          },
+          "expected_parent": {
+            "pattern": "^[0-9a-f]{40,64}$",
+            "title": "Expected Parent",
+            "type": "string"
+          },
+          "revision_id": {
+            "format": "uuid",
+            "title": "Revision Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "commit_sha",
+          "revision_id",
+          "expected_parent"
+        ],
+        "title": "PublicationRevisionVerify",
+        "type": "object"
+      },
       "QueuedTurn": {
         "description": "A normalized inbound turn ready for the worker to route and run.\n\nThe channel-neutral promotion of the dispatcher's former ``QueuedSlackEvent``.\nThe Valkey Stream carries this model as a single ``payload`` JSON field; the\nstream-encoding helpers live with the producer (the dispatcher), not on this\nfrozen model, so the contract stays transport-agnostic.\n\n``source`` defaults to ``SLACK`` so a pre-upgrade producer that does not set\nit still decodes, which is what makes this addition a PATCH under this\npackage's change-class table rather than a breaking minor. The default is a\ncompatibility affordance and not a licence to omit it: every first-party mint\nsite sets it explicitly, exactly as ``ReplyHandle.adapter`` does. Defaulting\nto the non-job value is also the safe direction -- an unset ``source`` reads\nas a person's message, so a job can never be created by omission.\n\n``attachments`` defaults to the EMPTY LIST for the same reason and with the\nsame consequence: a pre-upgrade producer that omits the key still decodes,\nwhich is what makes adding it a PATCH under this package's change-class table\nrather than a breaking minor. The default is a compatibility affordance and\nnot a licence to omit it -- every first-party mint site that can see files\npasses them explicitly, exactly as ``source`` and ``ReplyHandle.adapter`` are\nset explicitly. The default is the empty collection and not ``None`` so a\nconsumer can write ``for ref in turn.attachments`` with no guard; \"this\nchannel reported no files\" and \"this producer predates the field\" are\ndeliberately the same value, because nothing downstream acts differently on\nthe two.\n\n``hook_run`` carries the scheduled hook identity when a hook produced the\nturn. It defaults to ``None`` so ordinary turns and pre-upgrade producers keep\ndecoding unchanged.\n\n``reply_handle`` is absent only for a targetless cron turn. That turn must\ncarry a complete, nonblank ``hook_run`` so the worker has explicit agent and\nscheduled run identity without inventing a reply route. Every targeted turn,\nincluding cron, keeps the existing reply handle contract unchanged.\n\n``tool_access`` asks for this one turn to be restricted (TOOL-ACCESS-1);\na worker implementing TOOL-ACCESS-6 forwards it as ``Event.tool_access``,\nand one that does not drops it. It defaults to ``None``, today's\nunrestricted turn, so a pre-upgrade producer keeps decoding unchanged. No\nfirst-party ingress sets it.",
         "properties": {
@@ -8757,14 +8891,33 @@
         "type": "object"
       },
       "RepositoryCredentialOut": {
-        "description": "One server-derived Git credential returned only to the trusted worker.",
+        "description": "One server-derived Git credential returned only to the trusted worker.\n\n``origin``, ``header_form`` and ``ca_bundle_ref`` are the code host\ntransport facts (ADR 0197), issued by the code host with the credential:\nthe origin the header is scoped to (the clone URL is the origin plus the\nrepository path), the header git sends it in, and the path of the CA\nbundle mounted where git runs. The worker derives none of them.",
         "properties": {
           "authorization_header": {
             "title": "Authorization Header",
             "type": "string"
           },
+          "ca_bundle_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ca Bundle Ref"
+          },
           "clone_url": {
             "title": "Clone Url",
+            "type": "string"
+          },
+          "header_form": {
+            "$ref": "#/components/schemas/CredentialHeader",
+            "default": "authorization_basic"
+          },
+          "origin": {
+            "title": "Origin",
             "type": "string"
           },
           "repo_full_name": {
@@ -8786,9 +8939,43 @@
         "required": [
           "repo_full_name",
           "clone_url",
-          "authorization_header"
+          "authorization_header",
+          "origin"
         ],
         "title": "RepositoryCredentialOut",
+        "type": "object"
+      },
+      "RepositoryIn": {
+        "description": "The repository frozen on the WorkItem (ADR 0197 identity rules 2 and 3).",
+        "properties": {
+          "code_host_kind": {
+            "minLength": 1,
+            "title": "Code Host Kind",
+            "type": "string"
+          },
+          "host": {
+            "minLength": 1,
+            "title": "Host",
+            "type": "string"
+          },
+          "path": {
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "project_id": {
+            "minLength": 1,
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code_host_kind",
+          "host",
+          "project_id",
+          "path"
+        ],
+        "title": "RepositoryIn",
         "type": "object"
       },
       "ResolveTargetRequest": {
@@ -10233,6 +10420,51 @@
         "title": "TraceTree",
         "type": "object"
       },
+      "TrackerIssueIn": {
+        "description": "The tracker issue that keys the WorkItem (ADR 0197 identity rule 1).",
+        "properties": {
+          "display_key": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Key"
+          },
+          "host": {
+            "minLength": 1,
+            "title": "Host",
+            "type": "string"
+          },
+          "issue_id": {
+            "minLength": 1,
+            "title": "Issue Id",
+            "type": "string"
+          },
+          "kind": {
+            "minLength": 1,
+            "title": "Kind",
+            "type": "string"
+          },
+          "scope_id": {
+            "minLength": 1,
+            "title": "Scope Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "host",
+          "scope_id",
+          "issue_id"
+        ],
+        "title": "TrackerIssueIn",
+        "type": "object"
+      },
       "TurnAccepted": {
         "description": "The ingress receipt. `duplicate` says whether THIS request enqueued.\n\n`stream_id` is None only while another request holds the claim and has not\nenqueued yet (the 202 case): there is no id to hand back yet, and the\nadapter's retry loop already knows what \"come back\" means.",
         "properties": {
@@ -10846,17 +11078,9 @@
             "title": "Created At",
             "type": "string"
           },
-          "github_issue_number": {
-            "title": "Github Issue Number",
-            "type": "integer"
-          },
           "id": {
             "format": "uuid",
             "title": "Id",
-            "type": "string"
-          },
-          "issue_url": {
-            "title": "Issue Url",
             "type": "string"
           },
           "objective": {
@@ -10904,9 +11128,8 @@
               }
             ]
           },
-          "repo_full_name": {
-            "title": "Repo Full Name",
-            "type": "string"
+          "repository": {
+            "$ref": "#/components/schemas/WorkItemRepositoryOut"
           },
           "requester": {
             "anyOf": [
@@ -10954,6 +11177,9 @@
             ],
             "title": "Title"
           },
+          "tracker": {
+            "$ref": "#/components/schemas/WorkItemTrackerOut"
+          },
           "updated_at": {
             "format": "date-time",
             "title": "Updated At",
@@ -10963,9 +11189,8 @@
         "required": [
           "id",
           "agent_id",
-          "repo_full_name",
-          "github_issue_number",
-          "issue_url",
+          "tracker",
+          "repository",
           "cancelled_at",
           "created_at",
           "updated_at",
@@ -11082,6 +11307,35 @@
           "approval_status"
         ],
         "title": "WorkItemPublicationOut",
+        "type": "object"
+      },
+      "WorkItemRepositoryOut": {
+        "description": "The repository frozen on the WorkItem at admission; ``path`` is display.",
+        "properties": {
+          "code_host_kind": {
+            "title": "Code Host Kind",
+            "type": "string"
+          },
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code_host_kind",
+          "host",
+          "project_id",
+          "path"
+        ],
+        "title": "WorkItemRepositoryOut",
         "type": "object"
       },
       "WorkItemRequestOut": {
@@ -11243,6 +11497,52 @@
           "round_label"
         ],
         "title": "WorkItemStageOut",
+        "type": "object"
+      },
+      "WorkItemTrackerOut": {
+        "description": "The tracker issue that keys the WorkItem (ADR 0197).\n\n``scope_id`` and ``issue_id`` are the tracker's immutable ids as text;\n``display_key`` (a Jira key) is for display only. ``url`` is the tracker's\nown link to the issue.",
+        "properties": {
+          "display_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Key"
+          },
+          "host": {
+            "title": "Host",
+            "type": "string"
+          },
+          "issue_id": {
+            "title": "Issue Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "scope_id": {
+            "title": "Scope Id",
+            "type": "string"
+          },
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "host",
+          "scope_id",
+          "issue_id",
+          "display_key",
+          "url"
+        ],
+        "title": "WorkItemTrackerOut",
         "type": "object"
       },
       "WorkItemUsageModel": {
@@ -11504,8 +11804,27 @@
             ],
             "title": "Base Commit"
           },
+          "ca_bundle_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ca Bundle Ref"
+          },
           "clone_url": {
             "title": "Clone Url",
+            "type": "string"
+          },
+          "header_form": {
+            "$ref": "#/components/schemas/CredentialHeader",
+            "default": "authorization_basic"
+          },
+          "origin": {
+            "title": "Origin",
             "type": "string"
           },
           "repo_full_name": {
@@ -11527,7 +11846,8 @@
         "required": [
           "repo_full_name",
           "clone_url",
-          "authorization_header"
+          "authorization_header",
+          "origin"
         ],
         "title": "WorkspaceCredentialOut",
         "type": "object"
@@ -11599,6 +11919,17 @@
               }
             ],
             "title": "Repo Full Name"
+          },
+          "repository_kind": {
+            "default": "github",
+            "enum": [
+              "github",
+              "gitlab",
+              "bitbucket_cloud",
+              "bitbucket_dc"
+            ],
+            "title": "Repository Kind",
+            "type": "string"
           }
         },
         "required": [
@@ -21966,6 +22297,66 @@
         ]
       }
     },
+    "/v1/internal/publications/{publication_id}/branch-head": {
+      "get": {
+        "description": "The deterministic lineage branch's head, creating nothing.",
+        "operationId": "read_publication_branch_head_v1_internal_publications__publication_id__branch_head_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationBranchHeadOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Publication Branch Head",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
     "/v1/internal/publications/{publication_id}/credential": {
       "post": {
         "operationId": "redeem_publication_credential_v1_internal_publications__publication_id__credential_post",
@@ -22089,6 +22480,277 @@
           }
         },
         "summary": "Advance Publication Lineage",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/pull-request": {
+      "get": {
+        "description": "The stored pull request, read now by its number and nothing else.",
+        "operationId": "read_publication_pull_request_v1_internal_publications__publication_id__pull_request_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "pr_number",
+            "required": true,
+            "schema": {
+              "exclusiveMinimum": 0,
+              "title": "Pr Number",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationPullRequestOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read Publication Pull Request",
+        "tags": [
+          "internal-publications"
+        ]
+      },
+      "post": {
+        "description": "Adopt the branch's pull request, or open it when the branch exists.\n\nThe contract is the stored publication's title, body and draft flag, the\nlineage branch, and the admitted WorkItem's base or else the repository's\ndefault branch (`curie_api.publication_pulls.adopt_or_open`).",
+        "operationId": "recover_publication_pull_request_v1_internal_publications__publication_id__pull_request_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicationPullRecover"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationPullRequestOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "204": {
+            "description": "The publication branch does not exist"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Recover Publication Pull Request",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/pull-request/metadata": {
+      "post": {
+        "description": "Apply a metadata-only revision's title and body to its stored pull request.\n\nA metadata-only revision has nothing to push, so no publication Job runs\nand this update is its whole effect (ADR 0197, \"Two ports\" item 6). The\ncontract and the observed digests come from the stored publication. A\nmerged or closed pull request is answered unchanged, with its state, so\nthe worker records the lineage terminal.",
+        "operationId": "update_publication_pull_request_metadata_v1_internal_publications__publication_id__pull_request_metadata_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationPullRequestOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Publication Pull Request Metadata",
+        "tags": [
+          "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/publications/{publication_id}/revision-commit": {
+      "post": {
+        "description": "Prove a remote commit is this revision's marked commit on its expected parent.",
+        "operationId": "verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "publication_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Publication Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PublicationRevisionVerify"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicationRevisionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify Publication Revision",
         "tags": [
           "internal-publications"
         ]

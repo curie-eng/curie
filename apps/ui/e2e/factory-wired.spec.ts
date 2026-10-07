@@ -46,13 +46,18 @@ function request(status: string, sequence = 1) {
   };
 }
 
-function item(overrides: Record<string, unknown>) {
-  const repo = (overrides.repo_full_name as string | undefined) ?? "acme/payments";
-  const number = overrides.github_issue_number as number;
+function item({ repo = "acme/payments", issue, ...overrides }: Record<string, unknown> & { repo?: string; issue: number }) {
   return {
     agent_id: AGENT.id,
-    repo_full_name: repo,
-    issue_url: `https://github.com/${repo}/issues/${number}`,
+    tracker: {
+      kind: "github",
+      host: "github.com",
+      scope_id: "4401",
+      issue_id: String(issue),
+      display_key: null,
+      url: `https://github.com/${repo}/issues/${issue}`,
+    },
+    repository: { code_host_kind: "github", host: "github.com", project_id: "4401", path: repo },
     cancelled_at: null,
     created_at: iso(4 * HOUR),
     updated_at: iso(HOUR),
@@ -73,7 +78,7 @@ function item(overrides: Record<string, unknown>) {
 
 const RUNNING = item({
   id: "wi-398",
-  github_issue_number: 398,
+  issue: 398,
   state: "running",
   title: "Retry webhook delivery with exponential backoff",
   progress: {
@@ -88,16 +93,16 @@ const RUNNING = item({
 const ITEMS = [
   item({
     id: "wi-401",
-    repo_full_name: "acme/ledger",
-    github_issue_number: 401,
+    repo: "acme/ledger",
+    issue: 401,
     state: "queued",
     title: "Add idempotency keys to ledger writes",
     requests: [request("queued")],
   }),
   item({
     id: "wi-402",
-    repo_full_name: "acme/web",
-    github_issue_number: 402,
+    repo: "acme/web",
+    issue: 402,
     state: "waiting",
     title: "Paginate the invoices table",
     actionable_cause: "Waiting for runner capacity",
@@ -106,15 +111,15 @@ const ITEMS = [
   RUNNING,
   item({
     id: "wi-405",
-    repo_full_name: "acme/web",
-    github_issue_number: 405,
+    repo: "acme/web",
+    issue: 405,
     state: "publishing",
     title: "Dark mode for the settings page",
     progress: { current: "publish", note: null, stages: stages(["done", "done", "done", "done", "current"]) },
   }),
   item({
     id: "wi-387",
-    github_issue_number: 387,
+    issue: 387,
     state: "failed",
     title: "Migrate refunds to the v2 processor API",
     actionable_cause: "Run failed: tests could not reach the sandbox database",
@@ -123,8 +128,8 @@ const ITEMS = [
   }),
   item({
     id: "wi-390",
-    repo_full_name: "acme/ledger",
-    github_issue_number: 390,
+    repo: "acme/ledger",
+    issue: 390,
     state: "awaiting_approval",
     title: "Rotate the ledger signing key",
     actionable_cause: "Publication awaits approval",
@@ -134,8 +139,8 @@ const ITEMS = [
   ...[371, 368, 362].map((n, i) =>
     item({
       id: `wi-${n}`,
-      repo_full_name: i === 1 ? "acme/web" : "acme/payments",
-      github_issue_number: n,
+      repo: i === 1 ? "acme/web" : "acme/payments",
+      issue: n,
       state: "published",
       title: ["Cache exchange rates for 60 seconds", "Fix focus trap in the checkout modal", "Log webhook signature failures"][i],
       actionable_cause: "PR opened",
@@ -145,7 +150,7 @@ const ITEMS = [
       requests: [request("completed")],
     }),
   ),
-  item({ id: "wi-355", github_issue_number: 355, state: "cancelled", cancelled_at: iso(20 * HOUR), requests: [request("completed")] }),
+  item({ id: "wi-355", issue: 355, state: "cancelled", cancelled_at: iso(20 * HOUR), requests: [request("completed")] }),
 ];
 
 function usageFor(id: string) {

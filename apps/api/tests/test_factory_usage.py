@@ -54,15 +54,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from curie_api.config import get_settings
 from curie_api.factory_notices import FINAL_MARKER
 from curie_api.factory_usage import OpenRouterPriceBook, Price, get_price_book, match_price
+from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401  (fixtures)
 from test_factory_status_comment import _admit, _execute, _finish_failed, _marked
-from test_factory_terminus import (  # noqa: F401  (fixtures)
-    _reconcile,
-    _request,
-    _rows,
-    _start_running,
-    admitted,
-    comments,
-)
+from test_factory_terminus import _reconcile, _request, _start_running  # noqa: F401  (fixtures)
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 

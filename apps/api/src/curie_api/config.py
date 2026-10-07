@@ -40,7 +40,9 @@ from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .e2e_connector import E2EInstall
-from .workspace_policy import valid_allowlist_entry, valid_repository_name
+from .forges import types as forge_types
+from .forges.paths import valid_repository_path
+from .workspace_policy import valid_allowlist_entry
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
 # these is still in place under ENVIRONMENT=prod.
@@ -246,6 +248,10 @@ class Settings(BaseSettings):
     # seconds; 45 sits in the 30 to 60 second band.
     github_factory_intake: Literal["poll", "webhook"] = "poll"
     github_factory_poll_interval_s: float = Field(default=45, gt=0, allow_inf_nan=False)
+    # How often the API reads each factory pull request still open on its
+    # lineage, to record one merged or closed outside a publication (#3831).
+    # Runs with the work item reconciler and factory ingress; 0 disables it.
+    factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
     # Public origin GitHub's image proxy fetches the live status card from
     # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
     # status comment still carries the checklist and the result.
@@ -342,6 +348,16 @@ class Settings(BaseSettings):
     # ever reach this host (#1122). Point it at a GitHub Enterprise Server base
     # to deploy from GHE, exactly as with `github_api_url` above.
     github_clone_base: str = "https://github.com"
+    # A PEM CA bundle for a code host whose certificate no public root covers
+    # (ADR 0197, #3831): the path the chart mounts the operator's
+    # codeHostTrust.caBundle at. The API's code host HTTP clients trust it in
+    # addition to the public roots, and it is returned as ``ca_bundle_ref``
+    # with every repository credential so the worker, the sandbox and the
+    # publication Job trust the same file. Empty trusts the public roots only.
+    code_host_ca_bundle: str = Field(
+        default="",
+        validation_alias=AliasChoices("CURIE_CODE_HOST_CA_BUNDLE", "code_host_ca_bundle"),
+    )
     # Upper bound on the GitHub webhook request body, enforced before the body is
     # fully buffered, parsed, or HMAC-authenticated (#633) so an unauthenticated
     # oversized request cannot exhaust memory. GitHub caps webhook payloads at
@@ -938,7 +954,7 @@ class Settings(BaseSettings):
             raise ValueError("GITHUB_FACTORY_PYTHON_CI must be a JSON object")
         policies: dict[str, dict[str, Any]] = {}
         for repo, policy in value.items():
-            if not isinstance(repo, str) or not valid_repository_name(repo):
+            if not isinstance(repo, str) or not valid_repository_path(forge_types.GITHUB, repo):
                 raise ValueError(f"GITHUB_FACTORY_PYTHON_CI key {repo!r} is not owner/name")
             if not isinstance(policy, dict) or set(policy) - {
                 "check",
@@ -983,7 +999,7 @@ class Settings(BaseSettings):
             raise ValueError("GITHUB_FACTORY_METADATA_CI must be a JSON object")
         policies: dict[str, dict[str, Any]] = {}
         for repo, policy in value.items():
-            if not isinstance(repo, str) or not valid_repository_name(repo):
+            if not isinstance(repo, str) or not valid_repository_path(forge_types.GITHUB, repo):
                 raise ValueError(f"GITHUB_FACTORY_METADATA_CI key {repo!r} is not owner/name")
             if not isinstance(policy, dict) or set(policy) - {"checks", "statuses"}:
                 raise ValueError(f"GITHUB_FACTORY_METADATA_CI[{repo!r}] has an invalid shape")
@@ -1014,7 +1030,7 @@ class Settings(BaseSettings):
             raise ValueError("GITHUB_FACTORY_BASES must be a JSON object")
         entries: dict[str, dict[str, Any]] = {}
         for repo, entry in value.items():
-            if not isinstance(repo, str) or not valid_repository_name(repo):
+            if not isinstance(repo, str) or not valid_repository_path(forge_types.GITHUB, repo):
                 raise ValueError(f"GITHUB_FACTORY_BASES key {repo!r} is not owner/name")
             if not isinstance(entry, dict) or set(entry) - {"bases", "default_base"}:
                 raise ValueError(f"GITHUB_FACTORY_BASES[{repo!r}] has an invalid shape")

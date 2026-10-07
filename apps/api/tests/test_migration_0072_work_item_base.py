@@ -140,7 +140,7 @@ def test_0072_adds_nullable_base_columns_and_downgrade_drops_them(
 def test_0072_refuses_a_partial_or_unknown_base(
     isolated_migration_db: None, partial: dict[str, str]
 ) -> None:
-    command.upgrade(_config(), "head")
+    command.upgrade(_config(), REVISION)
 
     with pytest.raises(IntegrityError):
         _insert_work_item(**partial)

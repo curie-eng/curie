@@ -42,8 +42,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 CONTRACT = "0041"
 # @spec PROTECTED-HOOK-SOURCE-2 and DEPLOY-NOTICE-RELEASE-1.
-# Agent reads require deploy notifications after the published source-control ledger.
-APP_SCHEMA_MIN = "0082"
+# Agent reads require deploy notifications after the published source-control ledger,
+# factory status replies read the typed reply target columns (0089, #3831), and
+# WorkItems are keyed by their tracker issue (0090 contract, #3831).
+APP_SCHEMA_MIN = "0090"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -78,7 +80,9 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert window.schema_head == HEAD
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
-    assert kinds[APP_SCHEMA_MIN] == KIND_EXPAND
+    # 0090 drops the GitHub identity columns (ADR 0197), so the floor is a contract.
+    assert kinds[APP_SCHEMA_MIN] == KIND_CONTRACT
+    assert kinds["0089"] == KIND_EXPAND
     assert kinds["0070"] == KIND_CONTRACT
     assert kinds[REVIEW_SCHEMA_MIN] == KIND_CONTRACT
     if HEAD != APP_SCHEMA_MIN:
@@ -137,9 +141,17 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
         "0079",
         "0080",
         "0081",
+        "0082",
+        "0083",
+        "0084",
+        "0085",
+        "0086",
+        "0087",
+        "0088",
+        "0089",
     ):
         assert can_serve(released, window, known) is False
-    assert can_serve("0082", window, known) is True
+    assert can_serve("0090", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

@@ -1,8 +1,8 @@
 """Migration 0058 widens the factory state label check (#3221).
 
 Runs against a private database (``isolated_migration_db``), never the shared
-one, per apps/api/CLAUDE.md. Upgrade to head before seeding, because later
-revisions add columns.
+one, per apps/api/CLAUDE.md. Seed at 0089, after the later revisions that add
+columns and before 0090 replaces the GitHub WorkItem columns the seeds write.
 """
 
 from __future__ import annotations
@@ -98,7 +98,7 @@ def test_0058_accepts_legacy_and_new_labels_and_downgrades_clean_rows(
     """N-1 can still write a legacy name, and the new name is a successful write."""
 
     config = alembic_config()
-    isolated_migration_db.at("head")
+    isolated_migration_db.at("0089")
     try:
         work_item_id, legacy_id = _seed_request(9101)
         _seed_notice(work_item_id, legacy_id, LEGACY)

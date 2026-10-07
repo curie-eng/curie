@@ -36,6 +36,7 @@ from curie_api.config import get_settings
 from curie_api.factory_card import CardInput, render_card
 from curie_api.factory_progress import phase_view, record_wait_ci
 from curie_api.models import ExecutionRequestPhaseReport
+from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401  (fixtures)
 from test_factory_progress import (
     ACTIVITY,
     DECLARATION,
@@ -50,10 +51,7 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _label,
     _reconcile,
     _request,
-    _rows,
     _start_running,
-    admitted,
-    comments,
 )
 
 pytestmark = pytest.mark.usefixtures("clean_db")

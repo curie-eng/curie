@@ -18,8 +18,9 @@ from starlette.concurrency import run_in_threadpool
 from curie_api.crud import lineages as crud_lineages
 
 from .config import Settings
+from .forges.github.transport import github_headers, repository_identity_matches
+from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubCredentials
-from .github_review_truth import github_headers, repository_identity_matches
 from .models import Deployment, ExecutionRequest, ThreadPublicationLineage, WorkItem
 from .repo_full_name import repo_url_path
 
@@ -87,7 +88,7 @@ async def read_publication_authority(
         .where(
             other_lineage.agent_id == WorkItem.agent_id,
             other_lineage.conversation_id == WorkItem.conversation_id,
-            func.lower(other_lineage.repo_full_name) == func.lower(WorkItem.repo_full_name),
+            func.lower(other_lineage.repo_full_name) == func.lower(WorkItem.repository_path),
             other_lineage.pr_number.is_not(None),
         )
         .correlate(WorkItem)
@@ -130,7 +131,7 @@ async def read_publication_authority(
     if lineage is not None and (
         lineage.agent_id != item.agent_id
         or item.conversation_id != lineage.conversation_id
-        or item.repo_full_name.casefold() != lineage.repo_full_name.casefold()
+        or item.repository_path.casefold() != lineage.repo_full_name.casefold()
         or lineage.status != "open"
     ):
         raise PublicationPrecheckRefused
@@ -145,15 +146,16 @@ async def read_publication_authority(
         or lineage.pr_url != f"{github_html_base}/{lineage.repo_full_name}/pull/{lineage.pr_number}"
         or lineage.head_sha is None
         or re.fullmatch(r"[0-9a-f]{40}", lineage.head_sha) is None
-        or lineage.github_repository_id is None
-        or lineage.github_installation_id is None
-        or not lineage.github_pr_node_id
+        or lineage.code_host_kind != GITHUB
+        or lineage.repository_project_id is None
+        or lineage.code_host_installation_id is None
+        or not lineage.code_host_pr_id
         or not lineage.base_ref
     ):
         raise PublicationPrecheckUnavailable
     if (
-        item.github_repository_id != lineage.github_repository_id
-        or item.github_installation_id != lineage.github_installation_id
+        lineage.repository != item.repository
+        or item.code_host_installation_id != lineage.code_host_installation_id
     ):
         raise PublicationPrecheckRefused
     return PublicationReadAuthority(
@@ -170,9 +172,9 @@ async def read_publication_authority(
         repo_full_name=lineage.repo_full_name,
         pr_number=lineage.pr_number,
         branch=lineage.branch,
-        repository_id=lineage.github_repository_id,
-        installation_id=lineage.github_installation_id,
-        pr_node_id=lineage.github_pr_node_id,
+        repository_id=int(lineage.repository_project_id),
+        installation_id=lineage.code_host_installation_id,
+        pr_node_id=lineage.code_host_pr_id,
         base_ref=lineage.base_ref,
         has_inflight_push=await crud_lineages.publication_lineage_has_inflight_push(
             session, lineage

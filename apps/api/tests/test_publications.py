@@ -64,6 +64,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from forge_fakes.github import REPO as FACTORY_REPO
+from forge_fakes.github_comments import _rows as _factory_rows
+from forge_fakes.github_comments import admitted, comments  # noqa: F401
 from test_factory_terminus import (  # noqa: F401
     _label as _factory_label,
 )
@@ -71,13 +74,8 @@ from test_factory_terminus import (
     _request as _factory_request,
 )
 from test_factory_terminus import (
-    _rows as _factory_rows,
-)
-from test_factory_terminus import (
     _start_running as _start_factory_request,
 )
-from test_factory_terminus import admitted, comments  # noqa: F401
-from test_github_factory_ingress import REPO as FACTORY_REPO
 
 REPO = "acme-corp/acme-bot"
 WORKER_TOKEN = "remote-dev-publication-worker-token"
@@ -204,6 +202,12 @@ def _workspace_identity(payload: Mapping[str, Any]) -> str:
         str(payload["conversation_id"]),
     )
 
+
+
+def _worker_request() -> Any:
+    """A request for a direct route call; the GitHub credential reads no HTTP client."""
+
+    return SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(http_client=None)))
 
 def test_publication_schema_refuses_github_workflow_changes() -> None:
     payload = _publication_payload(str(uuid.uuid4()))
@@ -1141,10 +1145,10 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
         # failed 1 in 20 under `pytest -n 4` on 4 vCPU (run 34542518036).
         if not loop_progressed.wait(timeout=10):
             raise AssertionError("credential resolver blocked the event loop")
-        return "https://github.com/acme-corp/acme-bot.git", "Basic test"
+        return "https://github.com/acme-corp/acme-bot.git", "Basic eC1hY2Nlc3MtdG9rZW46dGVzdA=="
 
     monkeypatch.setattr(
-        "curie_api.routers.publications.resolve_repository_credential", blocking_resolver
+        "curie_api.forges.github.code_host.resolve_repository_credential", blocking_resolver
     )
 
     async def exercise() -> str:
@@ -1153,7 +1157,9 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
         try:
             async with sessionmaker() as session:
                 call = asyncio.create_task(
-                    redeem_publication_credential(uuid.UUID(publication["id"]), session, Response())
+                    redeem_publication_credential(
+                        uuid.UUID(publication["id"]), _worker_request(), session, Response()
+                    )
                 )
 
                 async def prove_progress() -> None:
@@ -1168,7 +1174,7 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
         finally:
             await engine.dispose()
 
-    assert asyncio.run(exercise()) == "Basic test"
+    assert asyncio.run(exercise()) == "Basic eC1hY2Nlc3MtdG9rZW46dGVzdA=="
 
 
 def test_publication_repo_must_match_the_thread_selection(
@@ -1526,7 +1532,7 @@ def test_cluster_message_publication_card_consumer_is_delivered_or_bounded(
             ),
             credentials=None,
             cluster=None,
-            github=None,
+            code_host=None,
             lineage=None,
             replies=sink,
             job_settings=None,  # type: ignore[arg-type]
@@ -2008,7 +2014,7 @@ def test_publication_resolved_before_card_registration_settles_the_card_once(
             ),
             credentials=None,
             cluster=None,
-            github=None,
+            code_host=None,
             lineage=None,
             replies=sink,
             job_settings=None,  # type: ignore[arg-type]
@@ -2104,8 +2110,10 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
             sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 data = PublicationCreate.model_validate(request.to_json())
+
                 async def metadata_check() -> None:
                     return
+
                 publication, _ = await crud_publications.create_publication(
                     session, data, patch=data.decoded_patch(), metadata_check=metadata_check
                 )
@@ -2569,7 +2577,6 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                 )
                 credentials = WorkspaceCredentialClient(
                     api_url="https://api.example.test",
-                    github_api_url=get_settings().github_api_url,
                     worker_token=WORKER_TOKEN,
                     transport=_testclient_transport(client),
                 )
@@ -2585,6 +2592,9 @@ def test_coder_path_reaches_the_publication_boundary_through_real_runner_and_api
                         snapshotter=lambda: capture_workspace_snapshot(
                             repo,
                             expected_repo=REPO,
+                            # The boot env's CURIE_REPO_ORIGIN and CURIE_REPO_PATH.
+                            trusted_origin="https://github.com",
+                            repository_path=REPO,
                             publication_title="Update README",
                             publication_body="Prepared by coder.",
                         ),
@@ -2961,7 +2971,6 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
                 )
                 credentials = WorkspaceCredentialClient(
                     api_url="https://api.example.test",
-                    github_api_url=get_settings().github_api_url,
                     worker_token=WORKER_TOKEN,
                     transport=_testclient_transport(client),
                 )
@@ -3456,6 +3465,9 @@ def test_publication_credential_is_approved_only_server_derived_and_audited(
         "authorization_header": "Basic "
         + base64.b64encode(b"x-access-token:ghp_publication_operator").decode(),
         "revision": None,
+        "origin": "https://github.com",
+        "header_form": "authorization_basic",
+        "ca_bundle_ref": None,
     }
 
     audit = _rows(
@@ -4120,7 +4132,7 @@ def test_terminal_lineage_refuses_revision_and_credential_before_resolution(
         raise AssertionError("terminal lineage reached credential resolution")
 
     monkeypatch.setattr(
-        "curie_api.routers.publications.resolve_repository_credential",
+        "curie_api.forges.github.code_host.resolve_repository_credential",
         forbidden_resolver,
     )
     credential = client.post(
@@ -5064,9 +5076,11 @@ def test_policy_revocation_and_cancellation_block_credential_redemption(
     _, cancelled = _create_publication(client, payload)
     _execute(
         "INSERT INTO curie.work_items "
-        "(id, github_repository_id, github_issue_number, github_installation_id, "
-        "agent_id, repo_full_name, conversation_id, cancelled_at) "
-        "VALUES (:id, 1, 2575, 1, :agent_id, :repo, :conversation_id, now())",
+        "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+        "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
+        "agent_id, repository_path, conversation_id, cancelled_at) "
+        "VALUES (:id, 'github', 'github.com', '1', '2575', 'github', 'github.com', '1', 1, "
+        ":agent_id, :repo, :conversation_id, now())",
         {
             "id": uuid.uuid4(),
             "agent_id": uuid.UUID(deployment["agent_id"]),
@@ -5380,9 +5394,9 @@ def test_review_reservation_refuses_legacy_unproved_lineage(
     assert _rows("SELECT count(*) AS n FROM curie.publication_review_reservations")[0]["n"] == 0
     assert (
         _rows(
-            "SELECT github_repository_id FROM curie.thread_publication_lineages WHERE id=:id",
+            "SELECT repository_project_id FROM curie.thread_publication_lineages WHERE id=:id",
             {"id": publication["lineage_id"]},
-        )[0]["github_repository_id"]
+        )[0]["repository_project_id"]
         is None
     )
     valkey = connect_or_skip(decode_responses=True)
@@ -5519,7 +5533,8 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
     captured = _rows(
         "SELECT l.binding_id, l.binding_generation, l.reply_conversation_id, "
         "l.conversation_id, c.id AS current_binding_id, c.generation AS current_generation, "
-        "l.github_repository_id, l.github_installation_id, l.github_pr_node_id, l.base_ref "
+        "l.code_host_kind, l.code_host_host, l.repository_project_id, "
+        "l.code_host_installation_id, l.code_host_pr_id, l.base_ref "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.agent_channels c ON c.id = l.binding_id "
         "WHERE l.id = :id",
@@ -5533,9 +5548,11 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
             "conversation_id": scoped_conversation,
             "current_binding_id": captured[0]["current_binding_id"],
             "current_generation": captured[0]["current_generation"],
-            "github_repository_id": None,
-            "github_installation_id": None,
-            "github_pr_node_id": None,
+            "code_host_kind": None,
+            "code_host_host": None,
+            "repository_project_id": None,
+            "code_host_installation_id": None,
+            "code_host_pr_id": None,
             "base_ref": None,
         }
     ]
@@ -5553,14 +5570,17 @@ def test_post_capture_publication_binds_route_then_first_advance_binds_github_id
     )
     assert advanced.status_code == 200, advanced.text
     assert _rows(
-        "SELECT github_repository_id, github_installation_id, github_pr_node_id, base_ref, "
+        "SELECT code_host_kind, code_host_host, repository_project_id, "
+        "code_host_installation_id, code_host_pr_id, base_ref, "
         "head_sha, version FROM curie.thread_publication_lineages WHERE id = :id",
         {"id": publication["lineage_id"]},
     ) == [
         {
-            "github_repository_id": 9001,
-            "github_installation_id": 41,
-            "github_pr_node_id": "PR_example_123",
+            "code_host_kind": "github",
+            "code_host_host": "github.com",
+            "repository_project_id": "9001",
+            "code_host_installation_id": 41,
+            "code_host_pr_id": "PR_example_123",
             "base_ref": "main",
             "head_sha": FIRST_REVISION_SHA,
             "version": 2,
@@ -5620,9 +5640,11 @@ def test_enterprise_publication_advances_and_refreshes_the_same_lineage(
         "pr_url": ENTERPRISE_PR_URL,
         "head_sha": FIRST_REVISION_SHA,
         "version": 2,
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
+        "code_host_kind": "github",
+        "code_host_host": "github.example.com",
+        "repository_project_id": "9001",
+        "code_host_installation_id": 41,
+        "code_host_pr_id": "PR_example_123",
         "base_ref": "main",
     }
 
@@ -5951,14 +5973,17 @@ def test_review_identity_cannot_change_on_existing_pr_advance(
     )
     assert refused.status_code == (503 if mutation == "status" else 409), refused.text
     stored = _rows(
-        "SELECT github_repository_id, github_installation_id, github_pr_node_id, "
+        "SELECT code_host_kind, code_host_host, repository_project_id, "
+        "code_host_installation_id, code_host_pr_id, "
         "head_sha, version FROM curie.thread_publication_lineages WHERE id=:id",
         {"id": lineage["id"]},
     )[0]
     assert stored == {
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
+        "code_host_kind": "github",
+        "code_host_host": "github.com",
+        "repository_project_id": "9001",
+        "code_host_installation_id": 41,
+        "code_host_pr_id": "PR_example_123",
         "head_sha": FIRST_REVISION_SHA,
         "version": lineage["version"],
     }
@@ -5970,9 +5995,11 @@ def test_review_identity_constraints_reject_partial_authority(
     client, truth, _ = review_lineage_app
     _, _, lineage = _verified_lineage(client, truth, auth_headers)
     for assignment in (
-        "github_repository_id=NULL",
-        "github_installation_id=NULL",
-        "github_pr_node_id=NULL",
+        "code_host_kind=NULL",
+        "code_host_host=NULL",
+        "repository_project_id=NULL",
+        "code_host_installation_id=NULL",
+        "code_host_pr_id=NULL",
         "base_ref=NULL",
     ):
         with pytest.raises(IntegrityError):
@@ -5982,10 +6009,10 @@ def test_review_identity_constraints_reject_partial_authority(
             )
     assert (
         _rows(
-            "SELECT github_repository_id FROM curie.thread_publication_lineages WHERE id=:id",
+            "SELECT repository_project_id FROM curie.thread_publication_lineages WHERE id=:id",
             {"id": lineage["id"]},
-        )[0]["github_repository_id"]
-        == 9001
+        )[0]["repository_project_id"]
+        == "9001"
     )
 
 
@@ -6115,14 +6142,14 @@ def test_verified_github_pr_has_only_one_conversation_owner(
     )
     owners = _rows(
         "SELECT id FROM curie.thread_publication_lineages "
-        "WHERE github_repository_id=9001 AND pr_number=:number",
+        "WHERE repository_project_id='9001' AND pr_number=:number",
         {"number": PR_NUMBER},
     )
     assert owners == [{"id": uuid.UUID(lineage["id"])}]
     assert _rows(
-        "SELECT github_repository_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
+        "SELECT repository_project_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
         {"id": other["lineage_id"]},
-    ) == [{"github_repository_id": None, "head_sha": None}]
+    ) == [{"repository_project_id": None, "head_sha": None}]
 
 
 def test_adding_app_after_pat_publication_does_not_backfill_legacy_identity(
@@ -6159,9 +6186,9 @@ def test_adding_app_after_pat_publication_does_not_backfill_legacy_identity(
     assert advanced.status_code == 200, advanced.text
     assert truth["calls"] == []
     assert _rows(
-        "SELECT github_repository_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
+        "SELECT repository_project_id,head_sha FROM curie.thread_publication_lineages WHERE id=:id",
         {"id": publication["lineage_id"]},
-    ) == [{"github_repository_id": None, "head_sha": SECOND_REVISION_SHA}]
+    ) == [{"repository_project_id": None, "head_sha": SECOND_REVISION_SHA}]
     assert _reserve_review(client, advanced.json(), "review:legacy-replay").status_code == 409
 
 
@@ -6259,7 +6286,8 @@ def test_review_reservation_refreshes_authority_already_loaded_by_its_caller(
 def _lineage_identity(lineage_id: str) -> dict[str, Any]:
     return _rows(
         "SELECT status, pr_number, pr_url, head_sha, version, "
-        "github_repository_id, github_installation_id, github_pr_node_id, base_ref "
+        "code_host_kind, code_host_host, repository_project_id, code_host_installation_id, "
+        "code_host_pr_id, base_ref "
         "FROM curie.thread_publication_lineages WHERE id = :id",
         {"id": uuid.UUID(lineage_id)},
     )[0]
@@ -6299,14 +6327,20 @@ class _TerminalObservationCluster:
         self.terminal_cleanups = 0
 
     def observe(self, _job_name: str) -> Any:
+        from curie_worker.publication_k8s import PublicationTransport
         from curie_worker.publication_loop import PublicationJobObservation
 
+        # The Job reports only its pushed commit and the transport it was
+        # built with; the pull request comes from the API afterwards.
         return PublicationJobObservation(
             phase="succeeded",
-            pr_url=PR_URL,
-            pr_number=PR_NUMBER,
             commit_sha=FIRST_REVISION_SHA,
             logs="",
+            transport=PublicationTransport(
+                origin="https://github.com",
+                header_form="authorization_basic",
+                ca_bundle_ref=None,
+            ),
         )
 
     def validate_existing(self, _resources: Any) -> None:
@@ -6320,6 +6354,38 @@ class _TerminalObservationCluster:
 
     def cleanup_terminal(self, _names: Any) -> None:
         self.terminal_cleanups += 1
+
+
+class _PushedPullCodeHost:
+    """The API's answers after the push: the marked commit and its open PR."""
+
+    def __init__(self, branch: str) -> None:
+        self.branch = branch
+        self.calls: list[str] = []
+
+    def verify_revision_commit(
+        self,
+        _publication_id: uuid.UUID,
+        commit_sha: str,
+        *,
+        revision_id: uuid.UUID,
+        expected_parent: str,
+    ) -> str:
+        del revision_id, expected_parent
+        self.calls.append("verify_revision_commit")
+        return commit_sha
+
+    def recover_pull_request(self, _publication_id: uuid.UUID, *, expected_head_sha: str) -> Any:
+        from curie_worker.publication_loop import PublicationPullState
+
+        self.calls.append("recover_pull_request")
+        return PublicationPullState(
+            number=PR_NUMBER,
+            url=PR_URL,
+            state="open",
+            head_sha=expected_head_sha,
+            head_ref=self.branch,
+        )
 
 
 class _UnexpectedPublicationCredentials:
@@ -6396,7 +6462,7 @@ async def _reconcile_through_lineage_patch(
                 store=store,
                 credentials=_UnexpectedPublicationCredentials(),
                 cluster=cluster,
-                github=SimpleNamespace(),
+                code_host=_PushedPullCodeHost(work.branch),
                 lineage=PublicationLineageClient(
                     api_base_url="http://api.example.test",
                     worker_token=WORKER_TOKEN,
@@ -6449,9 +6515,11 @@ def test_worker_lineage_patch_captures_immutable_identity_in_real_postgres(
         "pr_url": PR_URL,
         "head_sha": FIRST_REVISION_SHA,
         "version": work.lineage_version + 1,
-        "github_repository_id": 9001,
-        "github_installation_id": 41,
-        "github_pr_node_id": "PR_example_123",
+        "code_host_kind": "github",
+        "code_host_host": "github.com",
+        "repository_project_id": "9001",
+        "code_host_installation_id": 41,
+        "code_host_pr_id": "PR_example_123",
         "base_ref": "main",
     }
     assert _rows(
@@ -6612,9 +6680,11 @@ def test_stale_worker_lease_refuses_before_terminal_provider_and_leaves_rows_unc
         "pr_url": None,
         "head_sha": None,
         "version": 1,
-        "github_repository_id": None,
-        "github_installation_id": None,
-        "github_pr_node_id": None,
+        "code_host_kind": None,
+        "code_host_host": None,
+        "repository_project_id": None,
+        "code_host_installation_id": None,
+        "code_host_pr_id": None,
         "base_ref": None,
     }
 
@@ -6656,9 +6726,11 @@ def test_terminal_patch_response_maps_to_the_worker_terminal_cas(
         "pr_url": PR_URL,
         "head_sha": FIRST_REVISION_SHA,
         "version": work.lineage_version + 1,
-        "github_repository_id": None,
-        "github_installation_id": None,
-        "github_pr_node_id": None,
+        "code_host_kind": None,
+        "code_host_host": None,
+        "repository_project_id": None,
+        "code_host_installation_id": None,
+        "code_host_pr_id": None,
         "base_ref": None,
     }
 

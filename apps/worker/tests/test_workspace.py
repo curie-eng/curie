@@ -152,7 +152,8 @@ class _FakeCredentialClient:
             repo_full_name="acme-corp/acme-bot",
             clone_url=CLEAN_URL,
             authorization_header=GIT_CREDENTIAL,
-            github_html_base="https://github.com",
+            origin="https://github.com",
+            header_form="authorization_basic",
         )
 
 
@@ -306,7 +307,14 @@ def test_clone_credential_is_absent_from_argv_archive_config_and_claim_env(
     assert all("redeemed-credential-value" not in value for value in claim_env.values())
     assert "redeemed-credential-value" not in "\n".join(commands.events)
     assert "redeemed-credential-value" not in caplog.text
-    assert set(claim_env) == {"CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256"}
+    # The capability plus the code host facts the sandbox checks the checkout
+    # against (ADR 0197); never a credential.
+    assert claim_env == {
+        "CURIE_WORKSPACE_REF": claim_env["CURIE_WORKSPACE_REF"],
+        "CURIE_WORKSPACE_SHA256": claim_env["CURIE_WORKSPACE_SHA256"],
+        "CURIE_REPO_ORIGIN": "https://github.com",
+        "CURIE_REPO_PATH": "acme-corp/acme-bot",
+    }
 
 
 def test_clone_is_private_full_blob_shallow_and_refuses_redirects(
@@ -429,13 +437,14 @@ def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
                     "repo_full_name": "acme-corp/acme-bot",
                     "clone_url": CLEAN_URL,
                     "authorization_header": GIT_CREDENTIAL,
+                    "origin": "https://github.com",
+                    "header_form": "authorization_basic",
                 }
             ).encode(),
         )
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
-        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -457,45 +466,53 @@ def test_internal_workspace_redemption_uses_only_worker_auth_and_deployment_id(
     assert redeemed.authorization_header == GIT_CREDENTIAL
 
 
-@pytest.mark.parametrize(
-    ("github_api_url", "html_base"),
-    [
-        ("https://api.github.com", "https://github.com"),
-        ("https://github.example.com/api/v3", "https://github.example.com"),
-        ("https://github.example.com/forge/api/v3", "https://github.example.com/forge"),
-    ],
-)
-def test_workspace_redemption_accepts_only_the_configured_github_html_base(
-    workspace: Any, github_api_url: str, html_base: str
-) -> None:
-    # GHES documents its REST base as https://HOSTNAME/api/v3:
-    # https://docs.github.com/en/enterprise-server@3.15/rest/using-the-rest-api/getting-started-with-the-rest-api
-    clone_url = f"{html_base}/acme-corp/acme-bot.git"
+def _redemption_body(**overrides: Any) -> bytes:
+    body: dict[str, Any] = {
+        "repo_full_name": "acme-corp/acme-bot",
+        "clone_url": "https://github.example.com/forge/acme-corp/acme-bot.git",
+        "authorization_header": GIT_CREDENTIAL,
+        "origin": "https://github.example.com/forge",
+        "header_form": "authorization_basic",
+    }
+    body.update(overrides)
+    return json.dumps(body).encode()
 
-    def transport(**_request: Any) -> Any:
-        return SimpleNamespace(
-            status=200,
-            headers={"Cache-Control": "no-store"},
-            body=json.dumps(
-                {
-                    "repo_full_name": "acme-corp/acme-bot",
-                    "clone_url": clone_url,
-                    "authorization_header": GIT_CREDENTIAL,
-                }
-            ).encode(),
-        )
 
+def _redeem_with(workspace: Any, body: bytes) -> Any:
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
-        github_api_url=github_api_url,
         worker_token=WORKER_AUTH,
-        transport=transport,
+        transport=lambda **_request: SimpleNamespace(
+            status=200, headers={"Cache-Control": "no-store"}, body=body
+        ),
+    )
+    return client.redeem(DEPLOYMENT_ID, "1700000000.000100")
+
+
+@pytest.mark.parametrize(
+    ("origin", "repo"),
+    [
+        ("https://github.com", "acme-corp/acme-bot"),
+        ("https://github.example.com/forge", "acme-corp/acme-bot"),
+        # A code host that nests groups (ADR 0197): any depth, as the API named it.
+        ("https://gitlab.example.com", "group/sub/project"),
+    ],
+)
+def test_workspace_redemption_takes_the_origin_and_path_the_api_names(
+    workspace: Any, origin: str, repo: str
+) -> None:
+    clone_url = f"{origin}/{repo}.git"
+
+    redeemed = _redeem_with(
+        workspace,
+        _redemption_body(
+            repo_full_name=repo, clone_url=clone_url, origin=origin, ca_bundle_ref="/etc/ca.crt"
+        ),
     )
 
-    redeemed = client.redeem(DEPLOYMENT_ID, "1700000000.000100")
-
     assert redeemed.clone_url == clone_url
-    assert redeemed.github_html_base == html_base
+    assert redeemed.origin == origin
+    assert redeemed.ca_bundle_ref == "/etc/ca.crt"
 
 
 @pytest.mark.parametrize(
@@ -517,28 +534,31 @@ def test_workspace_redemption_accepts_only_the_configured_github_html_base(
 def test_workspace_redemption_refuses_noncanonical_or_foreign_clone_urls(
     workspace: Any, clone_url: str
 ) -> None:
-    def transport(**_request: Any) -> Any:
-        return SimpleNamespace(
-            status=200,
-            headers={"Cache-Control": "no-store"},
-            body=json.dumps(
-                {
-                    "repo_full_name": "acme-corp/acme-bot",
-                    "clone_url": clone_url,
-                    "authorization_header": GIT_CREDENTIAL,
-                }
-            ).encode(),
-        )
-
-    client = workspace.WorkspaceCredentialClient(
-        api_url="https://api.example.com",
-        github_api_url="https://github.example.com/forge/api/v3",
-        worker_token=WORKER_AUTH,
-        transport=transport,
-    )
-
     with pytest.raises(workspace.WorkspacePreparationError, match="invalid credential response"):
-        client.redeem(DEPLOYMENT_ID, "1700000000.000100")
+        _redeem_with(workspace, _redemption_body(clone_url=clone_url))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"origin": "https://token@github.example.com/forge"},
+        {"origin": "http://github.example.com/forge"},
+        {"origin": "https://github.example.com/forge/"},
+        {"header_form": "cookie"},
+        # The header must be in the form the API named.
+        {"header_form": "authorization_bearer"},
+        {"ca_bundle_ref": "relative/ca.crt"},
+        {
+            "repo_full_name": "../acme-bot",
+            "clone_url": "https://github.example.com/forge/../acme-bot.git",
+        },
+    ],
+)
+def test_workspace_redemption_refuses_an_unclean_transport(
+    workspace: Any, overrides: dict[str, Any]
+) -> None:
+    with pytest.raises(workspace.WorkspacePreparationError, match="invalid credential response"):
+        _redeem_with(workspace, _redemption_body(**overrides))
 
 
 def test_ghes_clone_auth_is_host_scoped_and_removed_from_the_archive(
@@ -550,7 +570,8 @@ def test_ghes_clone_auth_is_host_scoped_and_removed_from_the_archive(
         repo_full_name="acme-corp/acme-bot",
         clone_url=clone_url,
         authorization_header=GIT_CREDENTIAL,
-        github_html_base=html_base,
+        origin=html_base,
+        header_form="authorization_basic",
     )
     commands = _FakeCommands(clone_url=clone_url)
     objects = _StreamingObjectStore()
@@ -566,7 +587,8 @@ def test_ghes_clone_auth_is_host_scoped_and_removed_from_the_archive(
     clone = next(call for call in commands.calls if "clone" in call.get("argv", []))
     env = clone["env"]
     assert clone_url in clone["argv"]
-    assert env["GIT_CONFIG_KEY_1"] == "http.https://github.example.com/.extraHeader"
+    # Scoped to the origin the API named, base path included (ADR 0197).
+    assert env["GIT_CONFIG_KEY_1"] == "http.https://github.example.com/forge/.extraHeader"
     assert env["GIT_CONFIG_VALUE_1"] == f"Authorization: {GIT_CREDENTIAL}"
     # Ask real Git to resolve the ephemeral URL scope; the recorded header
     # must never match a request to public GitHub or another HTTPS authority.
@@ -589,6 +611,67 @@ def test_ghes_clone_auth_is_host_scoped_and_removed_from_the_archive(
     assert archive_config.count(clone_url.encode()) == 1
     assert b"redeemed-credential-value" not in archive_config
     assert prepared.clean_clone_url == clone_url
+
+
+@pytest.mark.parametrize(
+    ("header_form", "authorization", "expected_header"),
+    [
+        ("authorization_basic", GIT_CREDENTIAL, f"Authorization: {GIT_CREDENTIAL}"),
+        (
+            "authorization_bearer",
+            "Bearer redeemed-credential-value",
+            "Authorization: Bearer redeemed-credential-value",
+        ),
+        ("private_token", "redeemed-credential-value", "PRIVATE-TOKEN: redeemed-credential-value"),
+    ],
+)
+def test_clone_sends_the_credential_in_the_header_form_the_api_named(
+    workspace: Any, tmp_path: Path, header_form: str, authorization: str, expected_header: str
+) -> None:
+    origin = "https://gitlab.example.com"
+    clone_url = f"{origin}/group/sub/project.git"
+    credential = workspace.WorkspaceCredential(
+        repo_full_name="group/sub/project",
+        clone_url=clone_url,
+        authorization_header=authorization,
+        origin=origin,
+        header_form=header_form,
+        ca_bundle_ref="/etc/curie/code-host-trust/ca.crt",
+    )
+    commands = _FakeCommands(clone_url=clone_url)
+    preparer = workspace.WorkspacePreparer(
+        credentials=SimpleNamespace(redeem=lambda *_args: credential),
+        commands=commands,
+        objects=_StreamingObjectStore(),
+        scratch_root=tmp_path / "clone-scratch",
+        limits=_limits(workspace),
+    )
+
+    prepared = _prepare(preparer)
+    env = next(call for call in commands.calls if "clone" in call.get("argv", []))["env"]
+
+    assert env["GIT_CONFIG_KEY_1"] == f"http.{origin}/.extraHeader"
+    assert env["GIT_CONFIG_VALUE_1"] == expected_header
+    # The one trust bundle, at the path the credential named.
+    assert env["GIT_CONFIG_COUNT"] == "3"
+    assert env["GIT_CONFIG_KEY_2"] == "http.sslCAInfo"
+    assert env["GIT_CONFIG_VALUE_2"] == "/etc/curie/code-host-trust/ca.crt"
+    claim_env = prepared.claim_env()
+    assert claim_env["CURIE_REPO_ORIGIN"] == origin
+    assert claim_env["CURIE_REPO_PATH"] == "group/sub/project"
+    assert claim_env["CURIE_REPO_CA_BUNDLE"] == "/etc/curie/code-host-trust/ca.crt"
+    assert all("redeemed-credential-value" not in value for value in claim_env.values())
+
+
+def test_a_public_trust_store_clone_names_no_ca_bundle(workspace: Any, tmp_path: Path) -> None:
+    preparer, commands, _objects = _preparer(workspace, tmp_path)
+
+    prepared = _prepare(preparer)
+    env = next(call for call in commands.calls if "clone" in call.get("argv", []))["env"]
+
+    assert env["GIT_CONFIG_COUNT"] == "2"
+    assert "GIT_CONFIG_KEY_2" not in env
+    assert "CURIE_REPO_CA_BUNDLE" not in prepared.claim_env()
 
 
 def test_runtime_repo_parser_accepts_one_root_url_and_rejects_ambiguous(
@@ -855,7 +938,6 @@ def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
-        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -885,7 +967,6 @@ def test_unallowlisted_selection_names_the_chart_allowlist(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
-        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -912,7 +993,6 @@ def test_internal_workspace_selection_accepts_explicit_unselected_response(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
-        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -934,7 +1014,6 @@ def test_workspace_coordinator_propagates_absent_repository_selection(
 
     credentials = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
-        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -978,7 +1057,6 @@ def test_internal_workspace_selection_409_maps_machine_code_not_detail_prose(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
-        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -1023,7 +1101,6 @@ def test_internal_workspace_selection_409_unmapped_code_is_invalid_response(
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
-        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -1327,6 +1404,8 @@ def test_workspace_ownership_is_durable_before_the_sandbox_claim_is_exposed(
             assert self.observed.claim_env() == {
                 "CURIE_WORKSPACE_REF": env["CURIE_WORKSPACE_REF"],
                 "CURIE_WORKSPACE_SHA256": env["CURIE_WORKSPACE_SHA256"],
+                "CURIE_REPO_ORIGIN": env["CURIE_REPO_ORIGIN"],
+                "CURIE_REPO_PATH": env["CURIE_REPO_PATH"],
             }
             raise SimulatedWorkerCrash
 
@@ -2113,7 +2192,6 @@ def test_unallowlisted_selection_is_the_allowlist_refusal_type(workspace: Any) -
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
-        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )

@@ -110,6 +110,27 @@
         }
       }
     },
+    "codeHostTrust": {
+      "type": "object",
+      "description": "One PEM CA bundle for a self-managed code host (ADR 0197, issue #3831), mounted at /etc/curie/code-host-trust/ca.crt in the api, worker, agent sandboxes and publication Jobs. An empty ConfigMap name mounts nothing.",
+      "additionalProperties": false,
+      "properties": {
+        "caBundle": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "configMapRef": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "name": {"type": "string", "pattern": "^([a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?)?$"},
+                "key": {"type": "string", "pattern": "^[-._a-zA-Z0-9]+$"}
+              }
+            }
+          }
+        }
+      }
+    },
     "api": {
       "type": "object",
       "properties": {

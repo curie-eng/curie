@@ -2388,6 +2388,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/internal/publications/{publication_id}/branch-head": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Publication Branch Head
+         * @description The deterministic lineage branch's head, creating nothing.
+         */
+        get: operations["read_publication_branch_head_v1_internal_publications__publication_id__branch_head_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/internal/publications/{publication_id}/credential": {
         parameters: {
             query?: never;
@@ -2420,6 +2440,80 @@ export interface paths {
         head?: never;
         /** Advance Publication Lineage */
         patch: operations["advance_publication_lineage_v1_internal_publications__publication_id__lineage_patch"];
+        trace?: never;
+    };
+    "/v1/internal/publications/{publication_id}/pull-request": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read Publication Pull Request
+         * @description The stored pull request, read now by its number and nothing else.
+         */
+        get: operations["read_publication_pull_request_v1_internal_publications__publication_id__pull_request_get"];
+        put?: never;
+        /**
+         * Recover Publication Pull Request
+         * @description Adopt the branch's pull request, or open it when the branch exists.
+         *
+         *     The contract is the stored publication's title, body and draft flag, the
+         *     lineage branch, and the admitted WorkItem's base or else the repository's
+         *     default branch (`curie_api.publication_pulls.adopt_or_open`).
+         */
+        post: operations["recover_publication_pull_request_v1_internal_publications__publication_id__pull_request_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publications/{publication_id}/pull-request/metadata": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Update Publication Pull Request Metadata
+         * @description Apply a metadata-only revision's title and body to its stored pull request.
+         *
+         *     A metadata-only revision has nothing to push, so no publication Job runs
+         *     and this update is its whole effect (ADR 0197, "Two ports" item 6). The
+         *     contract and the observed digests come from the stored publication. A
+         *     merged or closed pull request is answered unchanged, with its state, so
+         *     the worker records the lineage terminal.
+         */
+        post: operations["update_publication_pull_request_metadata_v1_internal_publications__publication_id__pull_request_metadata_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/internal/publications/{publication_id}/revision-commit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Verify Publication Revision
+         * @description Prove a remote commit is this revision's marked commit on its expected parent.
+         */
+        post: operations["verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/v1/internal/remediation/nominations": {
@@ -3220,20 +3314,15 @@ export interface components {
              * Format: uuid
              */
             agent_id: string;
-            /** Github Installation Id */
-            github_installation_id: number;
-            /** Github Issue Number */
-            github_issue_number: number;
-            /** Github Repository Id */
-            github_repository_id: number;
+            /** Code Host Installation Id */
+            code_host_installation_id?: number | null;
             /** Kind */
             kind: string;
             /** Objective */
             objective: string;
             /** Reply Conversation Id */
             reply_conversation_id: string;
-            /** Repo Full Name */
-            repo_full_name: string;
+            repository: components["schemas"]["RepositoryIn"];
             /**
              * Request Id
              * Format: uuid
@@ -3241,6 +3330,7 @@ export interface components {
             request_id: string;
             /** Requester */
             requester: string;
+            tracker: components["schemas"]["TrackerIssueIn"];
         };
         /**
          * AdmissionIn
@@ -4771,6 +4861,12 @@ export interface components {
             /** Total Usd */
             total_usd: number;
         };
+        /**
+         * CredentialHeader
+         * @description The header form git accepts on a forge. GitLab refuses a Bearer header.
+         * @enum {string}
+         */
+        CredentialHeader: "authorization_basic" | "authorization_bearer" | "private_token";
         /** Declaration */
         Declaration: {
             /** Loops */
@@ -6160,6 +6256,14 @@ export interface components {
             status?: ("connected" | "disconnected") | null;
         };
         /**
+         * PublicationBranchHeadOut
+         * @description The head of a publication's branch; ``None`` when the branch does not exist.
+         */
+        PublicationBranchHeadOut: {
+            /** Head Sha */
+            head_sha: string | null;
+        };
+        /**
          * PublicationContext
          * @description API issued authority and observation for one execution's publication read.
          *
@@ -6506,6 +6610,62 @@ export interface components {
             result: "unchanged" | "metadata_changed";
         };
         /**
+         * PublicationPullRecover
+         * @description Adopt the publication branch's pull request, or open it when the branch
+         *     holds exactly ``expected_head_sha``.
+         */
+        PublicationPullRecover: {
+            /** Expected Head Sha */
+            expected_head_sha: string;
+        };
+        /**
+         * PublicationPullRequestOut
+         * @description One pull request, read through the code host for the worker (ADR 0197, item 6).
+         *
+         *     The worker holds no forge code: it receives the pull request's number,
+         *     URL, state and head as data and never a provider payload.
+         */
+        PublicationPullRequestOut: {
+            /** Head Ref */
+            head_ref: string;
+            /** Head Sha */
+            head_sha: string;
+            /** Number */
+            number: number;
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "open" | "closed" | "merged";
+            /** Updated At */
+            updated_at?: string | null;
+            /** Url */
+            url: string;
+        };
+        /** PublicationRevisionOut */
+        PublicationRevisionOut: {
+            /** Commit Sha */
+            commit_sha: string;
+        };
+        /**
+         * PublicationRevisionVerify
+         * @description A remote commit the worker asks the API to prove is this revision's.
+         *
+         *     ``revision_id`` and ``expected_parent`` must equal the stored publication's
+         *     own; the API derives both and refuses any other.
+         */
+        PublicationRevisionVerify: {
+            /** Commit Sha */
+            commit_sha: string;
+            /** Expected Parent */
+            expected_parent: string;
+            /**
+             * Revision Id
+             * Format: uuid
+             */
+            revision_id: string;
+        };
+        /**
          * QueuedTurn
          * @description A normalized inbound turn ready for the worker to route and run.
          *
@@ -6759,16 +6919,42 @@ export interface components {
         /**
          * RepositoryCredentialOut
          * @description One server-derived Git credential returned only to the trusted worker.
+         *
+         *     ``origin``, ``header_form`` and ``ca_bundle_ref`` are the code host
+         *     transport facts (ADR 0197), issued by the code host with the credential:
+         *     the origin the header is scoped to (the clone URL is the origin plus the
+         *     repository path), the header git sends it in, and the path of the CA
+         *     bundle mounted where git runs. The worker derives none of them.
          */
         RepositoryCredentialOut: {
             /** Authorization Header */
             authorization_header: string;
+            /** Ca Bundle Ref */
+            ca_bundle_ref?: string | null;
             /** Clone Url */
             clone_url: string;
+            /** @default authorization_basic */
+            header_form?: components["schemas"]["CredentialHeader"];
+            /** Origin */
+            origin: string;
             /** Repo Full Name */
             repo_full_name: string;
             /** Revision */
             revision?: string | null;
+        };
+        /**
+         * RepositoryIn
+         * @description The repository frozen on the WorkItem (ADR 0197 identity rules 2 and 3).
+         */
+        RepositoryIn: {
+            /** Code Host Kind */
+            code_host_kind: string;
+            /** Host */
+            host: string;
+            /** Path */
+            path: string;
+            /** Project Id */
+            project_id: string;
         };
         /**
          * ResolveTargetRequest
@@ -7437,6 +7623,22 @@ export interface components {
             tree: components["schemas"]["ObservationNode"][];
         };
         /**
+         * TrackerIssueIn
+         * @description The tracker issue that keys the WorkItem (ADR 0197 identity rule 1).
+         */
+        TrackerIssueIn: {
+            /** Display Key */
+            display_key?: string | null;
+            /** Host */
+            host: string;
+            /** Issue Id */
+            issue_id: string;
+            /** Kind */
+            kind: string;
+            /** Scope Id */
+            scope_id: string;
+        };
+        /**
          * TurnAccepted
          * @description The ingress receipt. `duplicate` says whether THIS request enqueued.
          *
@@ -7681,15 +7883,11 @@ export interface components {
              * Format: date-time
              */
             created_at: string;
-            /** Github Issue Number */
-            github_issue_number: number;
             /**
              * Id
              * Format: uuid
              */
             id: string;
-            /** Issue Url */
-            issue_url: string;
             /** Objective */
             objective: string | null;
             /** Objective Truncated */
@@ -7697,8 +7895,7 @@ export interface components {
             pr: components["schemas"]["WorkItemPrOut"] | null;
             progress?: components["schemas"]["WorkItemProgressOut"] | null;
             publication: components["schemas"]["WorkItemPublicationOut"] | null;
-            /** Repo Full Name */
-            repo_full_name: string;
+            repository: components["schemas"]["WorkItemRepositoryOut"];
             /** Requester */
             requester: string | null;
             /** Requests */
@@ -7710,6 +7907,7 @@ export interface components {
             state: "queued" | "waiting" | "running" | "cancellation_requested" | "cancelled" | "expired" | "failed" | "awaiting_approval" | "publishing" | "published" | "completed_unpublished";
             /** Title */
             title?: string | null;
+            tracker: components["schemas"]["WorkItemTrackerOut"];
             /**
              * Updated At
              * Format: date-time
@@ -7745,6 +7943,20 @@ export interface components {
             revision_number: number | null;
             /** Status */
             status: string;
+        };
+        /**
+         * WorkItemRepositoryOut
+         * @description The repository frozen on the WorkItem at admission; ``path`` is display.
+         */
+        WorkItemRepositoryOut: {
+            /** Code Host Kind */
+            code_host_kind: string;
+            /** Host */
+            host: string;
+            /** Path */
+            path: string;
+            /** Project Id */
+            project_id: string;
         };
         /**
          * WorkItemRequestOut
@@ -7794,6 +8006,28 @@ export interface components {
              * @enum {string}
              */
             state: "done" | "current" | "redo" | "blocked" | "pending";
+        };
+        /**
+         * WorkItemTrackerOut
+         * @description The tracker issue that keys the WorkItem (ADR 0197).
+         *
+         *     ``scope_id`` and ``issue_id`` are the tracker's immutable ids as text;
+         *     ``display_key`` (a Jira key) is for display only. ``url`` is the tracker's
+         *     own link to the issue.
+         */
+        WorkItemTrackerOut: {
+            /** Display Key */
+            display_key: string | null;
+            /** Host */
+            host: string;
+            /** Issue Id */
+            issue_id: string;
+            /** Kind */
+            kind: string;
+            /** Scope Id */
+            scope_id: string;
+            /** Url */
+            url: string;
         };
         /** WorkItemUsageModel */
         WorkItemUsageModel: {
@@ -7924,8 +8158,14 @@ export interface components {
             base_branch?: string | null;
             /** Base Commit */
             base_commit?: string | null;
+            /** Ca Bundle Ref */
+            ca_bundle_ref?: string | null;
             /** Clone Url */
             clone_url: string;
+            /** @default authorization_basic */
+            header_form?: components["schemas"]["CredentialHeader"];
+            /** Origin */
+            origin: string;
             /** Repo Full Name */
             repo_full_name: string;
             /** Revision */
@@ -7951,6 +8191,12 @@ export interface components {
             conversation_id: string;
             /** Repo Full Name */
             repo_full_name?: string | null;
+            /**
+             * Repository Kind
+             * @default github
+             * @enum {string}
+             */
+            repository_kind?: "github" | "gitlab" | "bitbucket_cloud" | "bitbucket_dc";
         };
     };
     responses: never;
@@ -13222,6 +13468,39 @@ export interface operations {
             };
         };
     };
+    read_publication_branch_head_v1_internal_publications__publication_id__branch_head_get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationBranchHeadOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     redeem_publication_credential_v1_internal_publications__publication_id__credential_post: {
         parameters: {
             query?: never;
@@ -13279,6 +13558,155 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["PublicationLineageOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_publication_pull_request_v1_internal_publications__publication_id__pull_request_get: {
+        parameters: {
+            query: {
+                pr_number: number;
+            };
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationPullRequestOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    recover_publication_pull_request_v1_internal_publications__publication_id__pull_request_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PublicationPullRecover"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationPullRequestOut"];
+                };
+            };
+            /** @description The publication branch does not exist */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_publication_pull_request_metadata_v1_internal_publications__publication_id__pull_request_metadata_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationPullRequestOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    verify_publication_revision_v1_internal_publications__publication_id__revision_commit_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                publication_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PublicationRevisionVerify"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicationRevisionOut"];
                 };
             };
             /** @description Validation Error */

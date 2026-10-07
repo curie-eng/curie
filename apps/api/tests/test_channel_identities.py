@@ -1175,13 +1175,15 @@ def test_lifespan_retries_until_table_appears(
     isolated_migration_db: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
 ) -> None:
     config = _alembic_config()
-    # 0082 is the candidate schema minimum and immediately precedes the
-    # channel identity migration, so this models a supported rolling boot.
-    command.upgrade(config, "0082")
+    # schema_min has since risen past 0083 (#3831 raised it to 0090), so boot
+    # can no longer land below this migration. Hide the table at head instead,
+    # so boot still finds it missing, then restore it while the API runs.
+    command.upgrade(config, "head")
+    _sql("ALTER TABLE curie.channel_identities RENAME TO channel_identities_pending")
     try:
         with _app(env, CANARY):
-            # Boot succeeded below this migration; it now lands while the API runs.
-            command.upgrade(config, "head")
+            # Boot succeeded without the table; it now appears while the API runs.
+            _sql("ALTER TABLE curie.channel_identities_pending RENAME TO channel_identities")
             deadline = time.monotonic() + 15
             rows: list[dict[str, Any]] = []
             while time.monotonic() < deadline:
@@ -1190,7 +1192,7 @@ def test_lifespan_retries_until_table_appears(
                     break
                 time.sleep(0.25)
     finally:
-        command.upgrade(config, "head")
+        _sql("ALTER TABLE IF EXISTS curie.channel_identities_pending RENAME TO channel_identities")
     assert [str(r["id"]) for r in rows] == [STATIC_ID]
 
 

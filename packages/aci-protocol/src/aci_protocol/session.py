@@ -538,6 +538,31 @@ class BootEnv(_AciModel):
     channel_kind: str | None = Field(
         default=None, json_schema_extra=_env("CURIE_CHANNEL_KIND", "worker")
     )
+    # The managed workspace's code host (ADR 0197, #3831). The runner's
+    # snapshot check today trusts only the configured GitHub host and an
+    # ``owner/name`` path; these let it check a workspace on any code host.
+    # All three are absent on a GitHub boot, which keeps today's check exactly.
+    #
+    # ``repo_origin`` is the allowed clone origin (scheme, host and optional
+    # base path, no credentials), e.g. ``https://gitlab.example.com``. When
+    # set, the runner trusts it instead of its configured GitHub host and
+    # refuses a workspace whose git origin is anywhere else.
+    repo_origin: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_REPO_ORIGIN", "worker")
+    )
+    # The repository path under ``repo_origin``, of any depth (``owner/name``
+    # on GitHub, ``group/sub/project`` on GitLab). The worker sends a path
+    # deeper than two segments only for a kind that declares one; the runner
+    # then accepts exactly this path and no other.
+    repo_path: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_REPO_PATH", "worker")
+    )
+    # A path inside the sandbox to a PEM CA bundle for a self-managed code
+    # host whose certificate a public trust store does not cover. A reference,
+    # never the certificate bytes: the substrate mounts the file.
+    repo_ca_bundle: str | None = Field(
+        default=None, json_schema_extra=_env("CURIE_REPO_CA_BUNDLE", "worker")
+    )
     # Which env var(s) carry the model credential (#514): a bare name or a JSON
     # array of them, walked in order. Unset, the runner falls back to
     # CURIE_CREDENTIALS, which is today's behavior.
@@ -680,6 +705,9 @@ class BootEnv(_AciModel):
         connector_caller_token: str | None = None,
         channel_bound: bool | None = None,
         channel_kind: str | None = None,
+        repo_origin: str | None = None,
+        repo_path: str | None = None,
+        repo_ca_bundle: str | None = None,
     ) -> dict[str, str]:
         """Render the worker binding's boot-env subset.
 
@@ -761,6 +789,12 @@ class BootEnv(_AciModel):
             env[cls.env_key("channel_bound")] = "1"
         if channel_kind:
             env[cls.env_key("channel_kind")] = channel_kind
+        if repo_origin:
+            env[cls.env_key("repo_origin")] = repo_origin
+        if repo_path:
+            env[cls.env_key("repo_path")] = repo_path
+        if repo_ca_bundle:
+            env[cls.env_key("repo_ca_bundle")] = repo_ca_bundle
         return env
 
     def to_env(self) -> dict[str, str]:
@@ -851,6 +885,12 @@ class BootEnv(_AciModel):
             env[self.env_key("channel_bound")] = "1" if self.channel_bound else "0"
         if self.channel_kind:
             env[self.env_key("channel_kind")] = self.channel_kind
+        if self.repo_origin is not None:
+            env[self.env_key("repo_origin")] = self.repo_origin
+        if self.repo_path is not None:
+            env[self.env_key("repo_path")] = self.repo_path
+        if self.repo_ca_bundle is not None:
+            env[self.env_key("repo_ca_bundle")] = self.repo_ca_bundle
         if self.model_env_key is not None:
             env[self.env_key("model_env_key")] = self.model_env_key
         if self.metrics_temporality_preference is not None:
@@ -928,6 +968,9 @@ class BootEnv(_AciModel):
             deployment_environment=_str_or_none(env.get("CURIE_DEPLOYMENT_ENVIRONMENT")),
             channel_bound=_fake_model_or_none(env.get("CURIE_CHANNEL_BOUND")),
             channel_kind=_str_or_none(env.get("CURIE_CHANNEL_KIND")),
+            repo_origin=_str_or_none(env.get("CURIE_REPO_ORIGIN")),
+            repo_path=_str_or_none(env.get("CURIE_REPO_PATH")),
+            repo_ca_bundle=_str_or_none(env.get("CURIE_REPO_CA_BUNDLE")),
             model_env_key=_str_or_none(env.get("CURIE_MODEL_ENV_KEY")),
             metrics_temporality_preference=_str_or_none(
                 env.get("OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE")

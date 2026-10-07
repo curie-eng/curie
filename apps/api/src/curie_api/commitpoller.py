@@ -57,6 +57,7 @@ from opentelemetry.trace import SpanKind, StatusCode
 
 from curie_api.schemas.deployments import WebhookResult
 
+from .code_host_trust import code_host_verify
 from .config import Settings
 from .models import GIT_FLOW_CREATED_BY
 from .repo_full_name import InvalidRepoFullName, repo_url_path
@@ -227,7 +228,9 @@ class GitHubBranchTip:
             f"{self._settings.github_api_url.rstrip('/')}"
             f"/repos/{repository_path}/commits/{branch}"
         )
-        with httpx.Client(timeout=self._timeout) as client:
+        with httpx.Client(
+            timeout=self._timeout, verify=code_host_verify(self._settings)
+        ) as client:
             response = client.get(url, headers=headers)
         if response.status_code in (403, 429):
             # Not `or 60.0`: `Retry-After: 0` is a legitimate "ask again now"

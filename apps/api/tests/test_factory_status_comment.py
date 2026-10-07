@@ -26,14 +26,25 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
-from curie_api.factory_notices import FINAL_MARKER, marker_for
+from curie_api.factory_comment_text import marker_for
+from curie_api.factory_notices import FINAL_MARKER
+from forge_fakes.github import LABEL, _issue_event, _post
+from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
+    _LABELS,
+    HEAD_A,
+    _rows,
+    admitted,
+    check_run,
+    ci_entry,
+    comments,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 from test_factory_progress import DECLARATION, STAGED_DECLARATION, report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
-    _LABELS,
-    HEAD_A,
     REPO,
+    REVISION_REPLY_COLUMNS,
+    REVISION_REPLY_VALUES,
     _attach_publication,
     _attach_revision_publication,
     _insert_revision,
@@ -44,15 +55,10 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _reconcile,
     _request,
     _revision_objective,
-    _rows,
+    _revision_reply,
     _set_base_ref,
     _start_running,
-    admitted,
-    check_run,
-    ci_entry,
-    comments,
 )
-from test_github_factory_ingress import LABEL, _issue_event, _post
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -617,8 +623,8 @@ def test_relabel_while_waiting_finalizes_the_old_comment_and_opens_a_new_one(
     assert again.json()["status"] == "factory_admitted"
     rows = _rows(
         "SELECT r.id FROM curie.execution_requests r JOIN curie.work_items w "
-        "ON w.id = r.work_item_id WHERE w.github_issue_number = :n ORDER BY r.sequence",
-        {"n": number},
+        "ON w.id = r.work_item_id WHERE w.tracker_issue_id = :n ORDER BY r.sequence",
+        {"n": str(number)},
     )
     new_id = rows[1]["id"]
     _reconcile()
@@ -767,9 +773,7 @@ def test_queued_review_revision_replies_that_it_waits_for_the_current_run(
     client, github, sink = admitted
     sink.by_path = True
     number, pr, first = _published_issue(client, github, sink)
-    running = _insert_revision(
-        first["work_item_id"], number, _revision_objective(pr, "discussion_r88203")
-    )
+    running = _insert_revision(first["work_item_id"], number, pr, "discussion_r88203")
     _start_running(running)
     assert report(client, running, "implement", round=1).status_code == 201
     _reconcile()
@@ -778,15 +782,16 @@ def test_queued_review_revision_replies_that_it_waits_for_the_current_run(
     _execute(
         "INSERT INTO curie.execution_requests "
         "(id, work_item_id, sequence, status, wait_deadline, objective, requester, reply_kind, "
-        "reply_address, reply_conversation_id) VALUES "
+        f"reply_address, reply_conversation_id, {REVISION_REPLY_COLUMNS}) VALUES "
         "(:id, :work_item, 3, 'queued', NULL, :objective, "
-        "'github:6601:octocat', 'github', :repo, :conversation)",
+        f"'github:6601:octocat', 'github', :repo, :conversation, {REVISION_REPLY_VALUES})",
         {
             "id": queued,
             "work_item": first["work_item_id"],
             "objective": _revision_objective(pr, "discussion_r88204"),
             "repo": REPO,
             "conversation": f"issue-{number}",
+            **_revision_reply(pr, "discussion_r88204"),
         },
     )
     _execute(
@@ -838,15 +843,16 @@ def test_closed_lineage_queue_keeps_the_completed_runs_pr_open_label(
     _execute(
         "INSERT INTO curie.execution_requests "
         "(id, work_item_id, sequence, status, wait_deadline, objective, requester, reply_kind, "
-        "reply_address, reply_conversation_id) VALUES "
+        f"reply_address, reply_conversation_id, {REVISION_REPLY_COLUMNS}) VALUES "
         "(:id, :work_item, 2, 'queued', NULL, :objective, "
-        "'github:6601:octocat', 'github', :repo, :conversation)",
+        f"'github:6601:octocat', 'github', :repo, :conversation, {REVISION_REPLY_VALUES})",
         {
             "id": queued,
             "work_item": first["work_item_id"],
             "objective": _revision_objective(pr, "issuecomment-88205"),
             "repo": REPO,
             "conversation": f"issue-{number}",
+            **_revision_reply(pr, "issuecomment-88205"),
         },
     )
     _execute(
@@ -882,7 +888,7 @@ def _live_revision(
 ) -> tuple[int, int, uuid.UUID, Any]:
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
-    revision = _insert_revision(first["work_item_id"], number, _revision_objective(pr, fragment))
+    revision = _insert_revision(first["work_item_id"], number, pr, fragment)
     _start_running(revision)
     # A revision inserted without a status row gets one from its first report.
     assert report(client, revision, "implement", round=1).status_code == 201

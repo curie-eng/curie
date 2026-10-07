@@ -103,30 +103,29 @@ def test_create_claim_argv_carries_boot_env() -> None:
     assert argv[-1] == "curie-runner"
 
 
-@pytest.mark.parametrize(
-    "github_api_url",
-    ["https://github.example.com/api/v3", "https://github.example.com/forge/api/v3"],
-)
-@pytest.mark.parametrize("override", [None, "https://other.example.com/api/v3"])
-def test_create_claim_preserves_operator_github_url_over_claim_environment(
-    github_api_url: str, override: str | None
-) -> None:
-    client = _RecordingDocker(
-        image="curie-runner",
-        bundle_store=_FakeBundleStore(),
-        github_api_url=github_api_url,
+def test_create_claim_forwards_the_claims_code_host_origin_and_no_github_url() -> None:
+    """ADR 0197: the runner checks its checkout against the claim's origin and path.
+
+    The worker sets them from the API's credential; the substrate injects no
+    GitHub URL of its own.
+    """
+
+    client = _RecordingDocker(image="curie-runner", bundle_store=_FakeBundleStore())
+
+    client.create_claim(
+        "thread-code-host",
+        pool="pool",
+        env={
+            "CURIE_FAKE_MODEL": "1",
+            "CURIE_REPO_ORIGIN": "https://gitlab.example.com",
+            "CURIE_REPO_PATH": "group/sub/project",
+        },
     )
-    claim_env = {"CURIE_FAKE_MODEL": "1"}
-    if override is not None:
-        claim_env["CURIE_GITHUB_API_URL"] = override
 
-    client.create_claim("thread-ghes", pool="pool", env=claim_env)
-
-    assignments = [
-        item for item in _flag_values(client.calls[0], "-e")
-        if item.startswith("CURIE_GITHUB_API_URL=")
-    ]
-    assert assignments == [f"CURIE_GITHUB_API_URL={github_api_url}"]
+    envs = _flag_values(client.calls[0], "-e")
+    assert "CURIE_REPO_ORIGIN=https://gitlab.example.com" in envs
+    assert "CURIE_REPO_PATH=group/sub/project" in envs
+    assert not any(item.startswith("CURIE_GITHUB_API_URL=") for item in envs)
 
 
 def test_create_claim_excludes_host_credentials_from_child_env(
@@ -648,7 +647,6 @@ def test_get_sandbox_dials_container_ip_on_shared_network() -> None:
     client = _NetworkAwareDocker(
         image="curie-runner",
         bundle_store=_FakeBundleStore(),
-        github_api_url="https://api.github.com",
         network="curie_default",
         networks_json='{"curie_default": {"IPAddress": "172.20.0.11"}}',
     )
@@ -665,7 +663,6 @@ def test_get_sandbox_falls_back_to_published_port_without_network_ip() -> None:
     client = _NetworkAwareDocker(
         image="curie-runner",
         bundle_store=_FakeBundleStore(),
-        github_api_url="https://api.github.com",
         network="curie_default",
         networks_json="{}",
     )
@@ -943,7 +940,6 @@ def test_ensure_image_is_best_effort_on_pull_failure(caplog) -> None:
     client = _PullFailsDocker(
         image="curie-runner",
         bundle_store=_FakeBundleStore(),
-        github_api_url="https://api.github.com",
     )
     with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.docker"):
         client.ensure_image()  # must return normally, no exception propagates
@@ -982,7 +978,6 @@ def test_ensure_image_is_best_effort_when_docker_unavailable(caplog) -> None:
     client = _DockerUnavailable(
         image="curie-runner",
         bundle_store=_FakeBundleStore(),
-        github_api_url="https://api.github.com",
     )
     with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.docker"):
         client.ensure_image()  # must return normally, no exception propagates
@@ -1012,7 +1007,6 @@ def test_missing_runner_network_error_carries_a_remediation_hint(monkeypatch) ->
     client = DockerSandboxClient(
         image="curie-runner",
         bundle_store=_FakeBundleStore(),
-        github_api_url="https://api.github.com",
         network="curie_runner",
     )
     try:
@@ -1033,7 +1027,6 @@ def test_docker_error_without_a_matching_network_name_carries_no_hint() -> None:
     client = DockerSandboxClient(
         image="curie-runner",
         bundle_store=_FakeBundleStore(),
-        github_api_url="https://api.github.com",
         network="curie_runner",
     )
     hint = client._network_remediation_hint("Error: No such image: curie-runner:latest")

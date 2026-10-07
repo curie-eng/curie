@@ -6,7 +6,6 @@ import asyncio
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timedelta
-from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
@@ -14,9 +13,11 @@ import pytest
 from channel_protocol import scoped_conversation_id
 from curie_api import workitem_dispatch
 from curie_api.config import get_settings
+from curie_api.forges.types import GITHUB, RepositoryRef, TrackerIssueRef
 from curie_api.main import create_app
 from curie_api.routers import work_items
 from curie_api.workitem_dispatch import (
+    Admission,
     acquire,
     admit,
     cancel,
@@ -114,29 +115,52 @@ async def _agent_with_channel(
     return agent_id
 
 
-def _facts(agent_id: uuid.UUID, **overrides: Any) -> SimpleNamespace:
+def _facts(
+    agent_id: uuid.UUID,
+    *,
+    issue_number: int = 2573,
+    repository_path: str = REPO,
+    **overrides: Any,
+) -> Admission:
     values: dict[str, Any] = {
         "agent_id": agent_id,
         "kind": "slack",
         "address": ADDRESS,
         "reply_conversation_id": WIRE_CONVERSATION,
-        "repo_full_name": REPO,
-        "github_repository_id": 101,
-        "github_issue_number": 2573,
-        "github_installation_id": 202,
+        "issue": TrackerIssueRef(GITHUB, "github.com", "101", str(issue_number)),
+        "repository": RepositoryRef(GITHUB, "github.com", "101", repository_path),
+        "code_host_installation_id": 202,
         "objective": OBJECTIVE,
         "requester": REQUESTER,
         "request_id": uuid.uuid4(),
     }
     values.update(overrides)
-    return SimpleNamespace(**values)
+    return Admission(**values)
 
 
-def _facts_json(facts: SimpleNamespace) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    for key, value in vars(facts).items():
-        payload[key] = str(value) if isinstance(value, UUID) else value
-    return payload
+def _facts_json(facts: Admission) -> dict[str, Any]:
+    return {
+        "agent_id": str(facts.agent_id),
+        "kind": facts.kind,
+        "address": facts.address,
+        "reply_conversation_id": facts.reply_conversation_id,
+        "tracker": {
+            "kind": facts.issue.kind,
+            "host": facts.issue.host,
+            "scope_id": facts.issue.scope_id,
+            "issue_id": facts.issue.issue_id,
+        },
+        "repository": {
+            "code_host_kind": facts.repository.kind,
+            "host": facts.repository.host,
+            "project_id": facts.repository.project_id,
+            "path": facts.repository.path,
+        },
+        "code_host_installation_id": facts.code_host_installation_id,
+        "objective": facts.objective,
+        "requester": facts.requester,
+        "request_id": str(facts.request_id),
+    }
 
 
 async def _request_row(session: AsyncSession, request_id: uuid.UUID) -> Any:
@@ -278,7 +302,7 @@ def test_admit_refuses_active_request_unknown_binding_and_disallowed_repo(
             session,
             _facts(
                 unbound,
-                github_issue_number=2574,
+                issue_number=2574,
                 address=ADDRESS,
                 request_id=uuid.uuid4(),
             ),
@@ -291,8 +315,8 @@ def test_admit_refuses_active_request_unknown_binding_and_disallowed_repo(
             session,
             _facts(
                 agent_id,
-                github_issue_number=2575,
-                repo_full_name=OTHER_REPO,
+                issue_number=2575,
+                repository_path=OTHER_REPO,
                 request_id=uuid.uuid4(),
             ),
         )
@@ -318,7 +342,7 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
             "slack", ADDRESS, WIRE_CONVERSATION
         )
         assert unpublished.wait_deadline == admitted.request.wait_deadline
-        assert unpublished.repo_full_name == facts.repo_full_name
+        assert unpublished.repository_path == facts.repository.path
 
         stale = await acquire(
             session, facts.request_id, owner=OWNER, generation=0
@@ -520,7 +544,7 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
         )
         assert claimed.runtime_epoch == 2
 
-        owner_lost_facts = _facts(agent_id, github_issue_number=2574)
+        owner_lost_facts = _facts(agent_id, issue_number=2574)
         owner_lost = await admit(session, owner_lost_facts)
         await acquire(
             session, owner_lost_facts.request_id, owner=OWNER, generation=1
@@ -709,7 +733,7 @@ def test_http_admit_replay_acquire_start_heartbeat_and_stale_finish(
         headers=WORKER_HEADERS,
     )
     assert acquired.status_code == 200, acquired.text
-    assert acquired.json()["repo_full_name"] == facts.repo_full_name
+    assert acquired.json()["repository_path"] == facts.repository.path
     started = dispatch_client.post(
         f"{INTERNAL_PREFIX}/requests/{request_id}/start",
         json={
@@ -774,8 +798,8 @@ def short_runtime_ttl(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 async def _running(
     session: AsyncSession, agent_id: uuid.UUID, *, issue: int = 2573
-) -> SimpleNamespace:
-    facts = _facts(agent_id, github_issue_number=issue)
+) -> Admission:
+    facts = _facts(agent_id, issue_number=issue)
     await admit(session, facts)
     await acquire(session, facts.request_id, owner=OWNER, generation=1)
     await start(

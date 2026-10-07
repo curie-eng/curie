@@ -34,6 +34,7 @@ from sqlalchemy.orm import aliased
 from curie_api.workitems import lifecycle
 
 from . import factory_ci, factory_label_reconcile, factory_notices, factory_poll_intake
+from .code_host_trust import code_host_verify
 from .config import Settings
 from .models import ExecutionRequest, Publication, WorkItem
 from .workitem_dispatch import (
@@ -444,7 +445,8 @@ class WorkItemReconciler:
             for settlement in gated:
                 if client is None:
                     client = httpx.AsyncClient(
-                        timeout=self._settings.github_app_timeout_seconds
+                        timeout=self._settings.github_app_timeout_seconds,
+                        verify=code_host_verify(self._settings),
                     )
                 result = await factory_ci.gate(
                     self._sessionmaker,
@@ -523,7 +525,9 @@ class WorkItemReconciler:
         if clock < self._labels_due:
             return
         self._labels_due = clock + interval
-        async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
+        async with httpx.AsyncClient(
+            timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+        ) as client:
             if settings.github_factory_intake == "poll":
                 await factory_poll_intake.poll_once(self._sessionmaker, settings, client)
             else:

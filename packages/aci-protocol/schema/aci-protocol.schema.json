@@ -801,6 +801,54 @@
           ],
           "title": "Progress Url"
         },
+        "repo_ca_bundle": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_REPO_CA_BUNDLE",
+          "producer": [
+            "worker"
+          ],
+          "title": "Repo Ca Bundle"
+        },
+        "repo_origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_REPO_ORIGIN",
+          "producer": [
+            "worker"
+          ],
+          "title": "Repo Origin"
+        },
+        "repo_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_REPO_PATH",
+          "producer": [
+            "worker"
+          ],
+          "title": "Repo Path"
+        },
         "reviewer_model": {
           "anyOf": [
             {
@@ -1978,6 +2026,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.19",
-  "title": "ACI Protocol v0.5.19"
+  "protocolVersion": "0.5.20",
+  "title": "ACI Protocol v0.5.20"
 }

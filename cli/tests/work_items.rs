@@ -92,9 +92,20 @@ fn item(state: &str) -> Value {
     json!({
         "id": ITEM_ID,
         "agent_id": AGENT_ID,
-        "repo_full_name": "acme-corp/acme-bot",
-        "github_issue_number": 2577,
-        "issue_url": "https://github.com/acme-corp/acme-bot/issues/2577",
+        "tracker": {
+            "kind": "github",
+            "host": "github.com",
+            "scope_id": "4401",
+            "issue_id": "2577",
+            "display_key": null,
+            "url": "https://github.com/acme-corp/acme-bot/issues/2577"
+        },
+        "repository": {
+            "code_host_kind": "github",
+            "host": "github.com",
+            "project_id": "4401",
+            "path": "acme-corp/acme-bot"
+        },
         "cancelled_at": null,
         "created_at": "2026-09-22T10:00:00Z",
         "updated_at": "2026-09-22T10:05:00Z",
@@ -189,6 +200,10 @@ fn list_renders_api_state_and_cause_verbatim() {
     assert!(
         text.contains(&format!("acme-corp/acme-bot#{}", 2577)),
         "repo#issue missing: {text}"
+    );
+    assert!(
+        text.contains("https://github.com/acme-corp/acme-bot/issues/2577"),
+        "the tracker's issue link is missing: {text}"
     );
     assert!(text.contains("123"), "PR missing: {text}");
 }
@@ -355,12 +370,24 @@ fn detail_shows_ci_state_and_reason() {
     assert!(text.contains("published"), "{text}");
     assert!(text.contains("unavailable"), "{text}");
     assert!(text.contains("github_forbidden"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "acme-corp/acme-bot#{} https://github.com/acme-corp/acme-bot/issues/2577",
+            2577
+        )),
+        "the detail must name the issue and render the tracker's link: {text}"
+    );
 
     let machine = local(&[ITEM_ID], &server.base_url, true);
     assert_eq!(machine.status.code(), Some(0), "{}", describe(&machine));
     let value = one_object(&machine);
     assert_eq!(value["item"]["id"], ITEM_ID);
     assert_eq!(value["item"]["ci"]["reason"], "github_forbidden");
+    assert_eq!(
+        value["item"]["tracker"]["url"],
+        "https://github.com/acme-corp/acme-bot/issues/2577"
+    );
+    assert_eq!(value["item"]["repository"]["path"], "acme-corp/acme-bot");
     assert_schema(&value);
 }
 

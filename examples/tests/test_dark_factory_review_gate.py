@@ -30,7 +30,8 @@ import pytest
 import yaml
 from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND
 from curie_api import factory_ci
-from curie_api.workitem_outcomes import CiDetail
+from curie_api.forges.github.ci import CiDetail
+from curie_api.forges.github.code_host import diagnostics_of, normalize_checks
 from curie_runner.__main__ import _format_check_data, format_workspace_preamble
 from curie_runner.verification import (
     load_verification_declaration,
@@ -733,7 +734,8 @@ def test_the_bundle_ci_marker_follows_the_platform_round_bound(
             "https://github.com/acme-corp/acme-bot/pull/77",
             "a1" * 20,
             round_,
-            detail,
+            _view(detail),
+            diagnostics=True,
         )
         matched = module._CI_ROUND.match(text.split("\n")[1])
         assert matched is not None, f"bundle marker misses round {round_}"
@@ -2075,9 +2077,16 @@ def _ci_detail(head: str, *runs: dict[str, Any]) -> CiDetail:
     )
 
 
+def _view(detail: CiDetail) -> factory_ci.CiView:
+    """The GitHub read as the gate sees it through the code host."""
+
+    head = detail.head_sha or ""
+    return factory_ci.CiView(head, normalize_checks(detail, head), diagnostics_of(detail))
+
+
 def _decide(detail: CiDetail, seconds: float, delegated: list[str]) -> Any:
     return factory_ci.decide(
-        detail,
+        _view(detail),
         now=PUBLISHED + timedelta(seconds=seconds),
         published_at=PUBLISHED,
         execution_deadline=PUBLISHED + timedelta(hours=3),
@@ -2140,7 +2149,9 @@ def test_the_implementer_and_both_reviewers_get_the_same_contract_bytes(tmp_path
 
     # A CI fix round puts the contract back in front of the implementer.
     detail = _ci_detail(CI_SHA, _ci_run("unit-tests", "failure"))
-    ci_text = factory_ci.continuation_text(ISSUE, PR, CI_SHA, CI_FIRST_FIX_ROUND, detail)
+    ci_text = factory_ci.continuation_text(
+        ISSUE, PR, CI_SHA, CI_FIRST_FIX_ROUND, _view(detail), diagnostics=True
+    )
     ci = context_of(run.dispatch("UserPromptSubmit", prompt=ci_text)[0])
     assert ci.startswith("CI fix round")
     assert ci.endswith(text)
@@ -2472,7 +2483,9 @@ def test_an_available_failing_check_returns_to_implement_and_a_failing_ci_run_re
     assert verdict.kind == "failing"
     assert delegated in _failing_names(verdict)
     assert detail.head_sha == head
-    ci_text = factory_ci.continuation_text(ISSUE, PR, head, CI_FIRST_FIX_ROUND, detail)
+    ci_text = factory_ci.continuation_text(
+        ISSUE, PR, head, CI_FIRST_FIX_ROUND, _view(detail), diagnostics=True
+    )
     ci = context_of(run.dispatch("UserPromptSubmit", prompt=ci_text)[0])
     assert ci.startswith("CI fix round")
     assert ci.endswith(contract())

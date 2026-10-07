@@ -207,7 +207,6 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS",
         "CURIE_PUBLICATION_JOB_ACTIVE_DEADLINE_SECONDS",
         "CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS",
-        "CURIE_PUBLICATION_GITHUB_API_URL",
         "CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS",
         "CURIE_PUBLICATION_LEASE_SECONDS",
         "CURIE_PUBLICATION_IMAGE_PULL_POLICY",
@@ -218,6 +217,10 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_PUBLICATION_OWNER_NAME",
         "CURIE_PUBLICATION_GIT_USER_NAME",
         "CURIE_PUBLICATION_GIT_USER_EMAIL",
+        # The code host CA bundle ConfigMap (chart codeHostTrust, ADR 0197)
+        # the publication Job builder mounts. Worker config, not a boot key.
+        "CURIE_CODE_HOST_CA_CONFIGMAP",
+        "CURIE_CODE_HOST_CA_CONFIGMAP_KEY",
         "CURIE_PUBLICATION_CPU_REQUEST",
         "CURIE_PUBLICATION_CPU_LIMIT",
         "CURIE_PUBLICATION_MEMORY_REQUEST",
@@ -391,13 +394,6 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # runner-local false-completion knob; read by the runner from its own env,
         # not a boot contract key.
         "CURIE_FALSE_COMPLETION_CHECK",
-        # Install-owned GitHub origin policy from the operator's api.githubApiUrl,
-        # read by workspace-init and runner workspace_snapshot.py. Docker's
-        # worker emits the same policy from WorkerConfig. It carries no ACI
-        # session payload and is not a frozen BootEnv field. The chart reserves
-        # it against agent extraEnv; Docker's _WORKER_OWNED_ENV drops claim
-        # overrides. Kubernetes claims use the closed BootEnv-rendered set.
-        "CURIE_GITHUB_API_URL",
         # ADR 0130 deliberately keeps ACI frozen. This direct worker-to-runner
         # sandbox boot fact is instead frozen across both declaration sites by
         # tests/vectors/turn-progress-capability.json.

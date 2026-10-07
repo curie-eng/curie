@@ -14,6 +14,8 @@ worker:
   CURIE_ATTACHMENT_THREAD_MAX_BYTES: worker.attachments.threadMaxBytes
   CURIE_ATTACHMENT_THREAD_MAX_FILES: worker.attachments.threadMaxFiles
   CURIE_CLAIM_TIMEOUT_SECONDS: worker.claimTimeoutSeconds
+  CURIE_CODE_HOST_CA_CONFIGMAP: codeHostTrust.caBundle.configMapRef.name
+  CURIE_CODE_HOST_CA_CONFIGMAP_KEY: codeHostTrust.caBundle.configMapRef.key
   CURIE_CONNECTOR_APP_NAME: nameOverride
   CURIE_CONNECTOR_CALLER_SIGNING_KEY: connectorCaller.signingKey
   CURIE_CONNECTOR_RECONCILE: worker.connectorReconciler.enabled
@@ -41,7 +43,6 @@ worker:
   CURIE_PUBLICATION_ENABLED: worker.publication.enabled
   CURIE_PUBLICATION_EPHEMERAL_LIMIT: worker.publication.resources.limits.ephemeral-storage
   CURIE_PUBLICATION_EPHEMERAL_REQUEST: worker.publication.resources.requests.ephemeral-storage
-  CURIE_PUBLICATION_GITHUB_API_URL: api.githubApiUrl
   CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS: worker.publication.gitCommandTimeoutSeconds
   CURIE_PUBLICATION_GIT_USER_EMAIL: worker.publication.gitUserEmail
   CURIE_PUBLICATION_GIT_USER_NAME: worker.publication.gitUserName
@@ -117,6 +118,7 @@ api:
   CURIE_ACTION_EXECUTOR_ENABLED: actionExecutor.enabled
   CURIE_APPROVAL_CHAT_ATTESTER_SECRET: api.approvalChatAttesterSecret
   CURIE_APPROVAL_RECOVERY_ENABLED: api.approvalRecovery.enabled
+  CURIE_CODE_HOST_CA_BUNDLE: codeHostTrust.caBundle.configMapRef.name
   CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY: connectorCaller.previousVerifyKey
   CURIE_CONNECTOR_CALLER_PUBLIC_KEY: connectorCaller.verifyKey
   CURIE_CONNECTOR_PROXY_IMAGE: worker.image
@@ -174,6 +176,7 @@ api:
   GITHUB_REVIEW_RECONCILER_INTERVAL_S: api.githubReviewReconcilerIntervalSeconds
   GITHUB_TOKEN: api.githubTokenExistingSecret
   GITHUB_WEBHOOK_SECRET: api.githubWebhookSecret
+  GIT_SSL_CAINFO: codeHostTrust.caBundle.configMapRef.name
   LANGFUSE_HOST: langfuse.host / langfuse.web.service.port
   LANGFUSE_PUBLIC_KEY: langfuse.init.projectPublicKey
   LANGFUSE_SECRET_KEY: langfuse.existingSecret
@@ -217,9 +220,9 @@ agentSandbox.runner:
   CURIE_BUDGET: agentSandbox.runner.budget.maxOutputTokensPerRun
   CURIE_CREDENTIALS: agentSandbox.runner.credentialsExistingSecret
   CURIE_FAKE_MODEL: agentSandbox.runner.fakeModel
-  CURIE_GITHUB_API_URL: api.githubApiUrl
   CURIE_MODEL: agentSandbox.runner.model
   CURIE_PLUGIN_DIR: agentSandbox.runner.pluginDir
+  CURIE_REPO_CA_BUNDLE: codeHostTrust.caBundle.configMapRef.name
   CURIE_RUNNER_ALLOW_TOKENLESS: nothing; a cluster runner always serves a bearer (remove this override)
   CURIE_RUNNER_PORT: agentSandbox.runner.port
   CURIE_RUNNER_TOKEN: the chart-managed runner token Secret (remove this override)
@@ -228,6 +231,9 @@ agentSandbox.runner:
   GIT_CONFIG_COUNT: agentSandbox.runner.workspace.enabled
   GIT_CONFIG_KEY_0: agentSandbox.runner.workspace.mountPath
   GIT_CONFIG_VALUE_0: agentSandbox.runner.workspace.mountPath
+  GIT_SSL_CAINFO: codeHostTrust.caBundle.configMapRef.name
   HOME: agentSandbox.runner.hardening.home
+  REQUESTS_CA_BUNDLE: codeHostTrust.caBundle.configMapRef.name
+  SSL_CERT_FILE: codeHostTrust.caBundle.configMapRef.name
 otelCollector:
   LANGFUSE_OTLP_AUTH_HEADER: otelCollector.otlpAuthHeader / langfuse.existingSecret

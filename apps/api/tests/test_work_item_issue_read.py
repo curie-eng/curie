@@ -82,13 +82,15 @@ def _insert_execution(
     now = datetime.now(UTC)
     _execute(
         "INSERT INTO curie.work_items "
-        "(id, github_repository_id, github_issue_number, github_installation_id, "
-        "agent_id, repo_full_name, conversation_id) "
-        "VALUES (:id, :repository, :issue, :installation, :agent, :repo, :conversation)",
+        "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+        "code_host_kind, code_host_host, repository_project_id, repository_path, "
+        "code_host_installation_id, agent_id, conversation_id) "
+        "VALUES (:id, 'github', 'github.com', :repository, :issue, 'github', "
+        "'github.com', :repository, :repo, :installation, :agent, :conversation)",
         {
             "id": work_item_id,
-            "repository": repository_id,
-            "issue": issue,
+            "repository": str(repository_id),
+            "issue": str(issue),
             "installation": INSTALLATION_ID,
             "agent": agent_id,
             "repo": repo,

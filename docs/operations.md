@@ -1347,9 +1347,12 @@ Each refusal is a `factory_ignored` code (`ordinary_comment`,
 `lineage_unbound`, `lineage_closed`, `installation_mismatch`,
 `sender_permission_refused`, `terminal_pull_request`, `active_request`, and
 others). An accepted mention becomes the work item's next execution request.
-The first line of that request's objective is the same-repository feedback
-URL, which keeps the existing issue, pull request, or review thread as the
-reply target.
+The request stores its reply target when it is admitted: the review thread
+for an inline review comment, the pull request conversation for a PR comment
+or a submitted review, and the tracker issue for every other request. The
+objective still opens with the feedback URL for the agent, but nothing routes
+on it. Upgrading to schema 0089 backfills the stored target of existing
+requests from that first line.
 A revision's status comment lives where its reply lives, on the pull
 request: in the review thread for an inline comment, otherwise as a PR comment
 that links the feedback. If GitHub refuses the thread reply with 422, the
@@ -2276,6 +2279,44 @@ Run that command with its trailing `up -d --wait` replaced by
 `curie local up` again. If the local data is disposable, `curie local down
 --wipe` followed by `curie local up` starts from an empty database, which
 applies every migration without the flag.
+
+### Tracker issue identity migration (Alembic revision 0080)
+
+Revision 0080 is a contract migration (ADR 0197, "Identity"). A factory work
+item is keyed by its tracker issue, as (tracker kind, tracker host, scope id,
+issue id), and the repository chosen at admission is stored on it as (code host
+kind, code host host, project id) with its path. The GitHub repository id,
+issue number and installation columns are replaced, not kept beside the new
+ones, so an application from before 0080 cannot serve against the migrated
+schema and a rollback below it is refused once it has run. Upgrade with
+`curie cluster upgrade --forward-only`, or set `api.migrate.forwardOnly=true`
+on a direct `helm upgrade`.
+
+Every existing work item, publication lineage and poll cursor is GitHub, and
+the migration fills in the GitHub host. It takes it from the
+`GITHUB_API_URL` the chart passes to the migrate Job from
+`api.githubApiUrl`, the way the API derives its GitHub web host
+(`api.github.com` is `github.com`). A migration run outside the chart, on a
+GitHub Enterprise install, must set `GITHUB_API_URL` or
+`CURIE_MIGRATION_GITHUB_HOST` (the bare host, which wins); otherwise it
+assumes `github.com` and the stored rows will not match the host the GitHub
+adapter reports.
+
+Primary keys, execution request ids and advisory lock keys are unchanged, so
+a label, mention or review that is replayed after the upgrade still matches
+the request it admitted before. A poll cursor that never recorded its
+repository id is dropped, and of two cursors for one repository (it was
+renamed) only the newer is kept; the next poll reads back over the lookback
+window and admission discards what it has already seen.
+
+The work items API and `curie <tier> work-items --json` (schema
+`work-items/v2`) replace `repo_full_name`, `github_issue_number` and
+`issue_url` with a `tracker` object (`kind`, `host`, `scope_id`, `issue_id`,
+`display_key`, `url`) and a `repository` object (`code_host_kind`, `host`,
+`project_id`, `path`). `tracker.url` is the tracker's own link to the issue.
+
+A downgrade restores the GitHub columns and refuses while any row names a
+tracker or code host other than GitHub.
 
 ### Before you upgrade, check what would be removed
 

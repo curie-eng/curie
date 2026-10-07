@@ -934,6 +934,8 @@ def build_runner(
             os.environ.get(BootEnv.env_key("state_url"))
             or os.environ.get(BootEnv.env_key("progress_url")),
             network_enabled=not fake_model,
+            repo_origin=config.repo_origin,
+            repo_path=config.repo_path,
         )
         approval_gate.memory_tools_mounted = memory_tools_mounted
     workspace_cwd = str(mounted_workspace) if mounted_workspace is not None else None
@@ -1763,6 +1765,8 @@ def _serve() -> None:
         gate = runner._approval_gate  # noqa: SLF001 - same package wiring
         return capture_workspace_snapshot(
             workspace_path,
+            trusted_origin=config.repo_origin,
+            repository_path=config.repo_path,
             publication_title=gate.publication_title if gate is not None else None,
             publication_body=gate.publication_body if gate is not None else None,
         )

@@ -125,7 +125,7 @@ class _WorkItems:
             work_item_id=request_id,
             conversation_id=f"work-item-{request_id}",
             wait_deadline=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-            repo_full_name=WORK_ITEM_REPO,
+            repository_path=WORK_ITEM_REPO,
         )
 
     async def start(self, request_id: uuid.UUID, **_: object) -> WorkItemStartGrant:

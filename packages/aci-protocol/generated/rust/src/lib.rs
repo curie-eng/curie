@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: &str = "0.5.19";
+pub const PROTOCOL_VERSION: &str = "0.5.20";
 
 pub const RUNS_STREAM_DEFAULT: &str = "curie:runs";
 
@@ -225,6 +225,12 @@ pub struct BootEnv {
     #[serde(default)]
     pub channel_kind: Option<String>,
     #[serde(default)]
+    pub repo_origin: Option<String>,
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    #[serde(default)]
+    pub repo_ca_bundle: Option<String>,
+    #[serde(default)]
     pub model_env_key: Option<String>,
     #[serde(default)]
     pub metrics_temporality_preference: Option<String>,
@@ -280,6 +286,9 @@ pub mod env_keys {
     pub const CURIE_PLUGIN_DIR: &str = "CURIE_PLUGIN_DIR";
     pub const CURIE_PROGRESS_TOKEN: &str = "CURIE_PROGRESS_TOKEN";
     pub const CURIE_PROGRESS_URL: &str = "CURIE_PROGRESS_URL";
+    pub const CURIE_REPO_CA_BUNDLE: &str = "CURIE_REPO_CA_BUNDLE";
+    pub const CURIE_REPO_ORIGIN: &str = "CURIE_REPO_ORIGIN";
+    pub const CURIE_REPO_PATH: &str = "CURIE_REPO_PATH";
     pub const CURIE_REVIEWER_MODEL: &str = "CURIE_REVIEWER_MODEL";
     pub const CURIE_RUNNER_PORT: &str = "CURIE_RUNNER_PORT";
     pub const CURIE_RUNNER_TOKEN: &str = "CURIE_RUNNER_TOKEN";
@@ -732,13 +741,13 @@ mod tests {
 
     #[test]
     fn accepts_compatible_patch() {
-        let raw = r#"{"type":"final","version":"0.5.20","text":"x","status":"done"}"#;
+        let raw = r#"{"type":"final","version":"0.5.21","text":"x","status":"done"}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 
     #[test]
     fn accepts_unknown_fields() {
-        let raw = r#"{"type":"final","version":"0.5.19","text":"x","status":"done","extra":1}"#;
+        let raw = r#"{"type":"final","version":"0.5.20","text":"x","status":"done","extra":1}"#;
         assert!(serde_json::from_str::<OutboundEvent>(raw).is_ok());
     }
 }

@@ -23,6 +23,7 @@ from aci_protocol import (
 )
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
 from curie_api.config import get_settings
+from curie_api.forges.hosts import github_issue_ref, repository_ref
 from curie_api.workitem_dispatch import admit, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_telemetry import build_resource, configure_meter_provider
@@ -370,16 +371,18 @@ async def _agent_with_channel(session: AsyncSession) -> uuid.UUID:
     return agent_id
 
 
-def _facts(agent_id: uuid.UUID, **overrides: Any) -> SimpleNamespace:
+def _facts(
+    agent_id: uuid.UUID, *, issue_number: int = 2573, **overrides: Any
+) -> SimpleNamespace:
+    settings = get_settings()
     values: dict[str, Any] = {
         "agent_id": agent_id,
         "kind": "slack",
         "address": ADDRESS,
         "reply_conversation_id": WIRE_CONVERSATION,
-        "repo_full_name": REPO,
-        "github_repository_id": 101,
-        "github_issue_number": 2573,
-        "github_installation_id": 202,
+        "issue": github_issue_ref(settings, repository_id=101, issue_number=issue_number),
+        "repository": repository_ref(settings, path=REPO, project_id=101),
+        "code_host_installation_id": 202,
         "objective": OBJECTIVE,
         "requester": REQUESTER,
         "request_id": uuid.uuid4(),
@@ -811,7 +814,7 @@ def test_deadline_and_owner_lost_cancellation_are_requested(
         async with maker() as session:
             agent_id = await _agent_with_channel(session)
             deadline_facts = _facts(agent_id)
-            owner_facts = _facts(agent_id, github_issue_number=2574)
+            owner_facts = _facts(agent_id, issue_number=2574)
             await admit(session, deadline_facts)
             await admit(session, owner_facts)
             await session.execute(

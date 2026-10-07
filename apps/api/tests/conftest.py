@@ -33,6 +33,9 @@ from sqlalchemy.sql import text
 
 # Test modules import shared helpers from this directory; see _migration_support.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# The shared forge fakes hold fixtures and asserts that lived in test modules;
+# keep pytest's assertion detail for them.
+pytest.register_assert_rewrite("forge_fakes")
 
 from _migration_support import (  # noqa: E402
     IsolatedMigrationDb,

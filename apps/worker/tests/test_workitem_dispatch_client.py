@@ -36,16 +36,16 @@ BASE = {
 
 
 def test_acquire_grant_carries_the_work_item_repository() -> None:
-    grant = _acquire({**BASE, "repo_full_name": "acme-corp/widgets"})
-    assert grant.repo_full_name == "acme-corp/widgets"  # type: ignore[attr-defined]
+    grant = _acquire({**BASE, "repository_path": "acme-corp/widgets"})
+    assert grant.repository_path == "acme-corp/widgets"  # type: ignore[attr-defined]
 
 
-@pytest.mark.parametrize("body", [BASE, {**BASE, "repo_full_name": None}])
+@pytest.mark.parametrize("body", [BASE, {**BASE, "repository_path": None}])
 def test_acquire_from_an_api_without_the_field_still_grants(body: dict[str, object]) -> None:
     # A worker rolled out ahead of its API replica must not fail an acquisition
     # the API has already committed.
     grant = _acquire(body)
-    assert grant.repo_full_name is None  # type: ignore[attr-defined]
+    assert grant.repository_path is None  # type: ignore[attr-defined]
 
 
 # --- #3076 orphan recovery verbs -------------------------------------------

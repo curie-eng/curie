@@ -6,7 +6,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,6 +33,8 @@ from curie_api.workitems.lifecycle import (
 )
 
 from .config import get_settings
+from .factory_reply_target import reply_columns
+from .forges.types import ReplyTarget, RepositoryRef, TrackerIssueRef
 from .models import Agent, AgentChannel, ExecutionRequest, Publication, WorkItem
 from .threadkeys import (
     legacy_route_adapter_of,
@@ -64,6 +66,37 @@ RefusalCode = Literal[
 DispatchResult = WorkItemOutcome | WorkItemConflict
 
 
+if TYPE_CHECKING:
+    from .factory_base import ResolvedBase
+
+
+@dataclass(frozen=True)
+class Admission:
+    """Trusted, normalized facts that admit or revise one WorkItem (ADR 0162).
+
+    ``issue`` keys the WorkItem and ``repository`` is the binding frozen on it
+    (ADR 0197). ``code_host_installation_id`` is the GitHub installation that
+    verified the work; other code hosts leave it None.
+    """
+
+    agent_id: uuid.UUID
+    kind: str
+    address: str
+    reply_conversation_id: str
+    issue: TrackerIssueRef
+    repository: RepositoryRef
+    code_host_installation_id: int | None
+    objective: str
+    requester: str
+    request_id: uuid.UUID
+    # The base a fresh admission resolved (ADR 0186), written on a new WorkItem.
+    base: ResolvedBase | None = None
+    # Where the request's status reply lands, and the feedback URL it answers.
+    # None is the tracker issue; review feedback sets its pull request target.
+    reply_target: ReplyTarget | None = None
+    reply_url: str | None = None
+
+
 @dataclass(frozen=True)
 class DispatchConflict:
     code: RefusalCode
@@ -78,7 +111,7 @@ class AcquireGrant:
     work_item_id: uuid.UUID
     conversation_id: str
     wait_deadline: datetime
-    repo_full_name: str
+    repository_path: str
 
 
 @dataclass(frozen=True)
@@ -161,33 +194,35 @@ def _facts_conversation(facts: Any, adapter: str | None) -> str:
     )
 
 
-def _snapshot_values(facts: Any) -> dict[str, str]:
+def _snapshot_values(facts: Any) -> dict[str, str | None]:
+    # Only factory review feedback names a pull request reply target; every
+    # other admission (an issue label or mention, the work-items API) answers
+    # on the tracker issue.
+    reply = reply_columns(
+        getattr(facts, "reply_target", None), getattr(facts, "reply_url", None)
+    )
     return {
         "objective": facts.objective,
         "requester": facts.requester,
         "reply_kind": facts.kind,
         "reply_address": facts.address,
         "reply_conversation_id": facts.reply_conversation_id,
+        **reply,
     }
 
 
 def _snapshot_matches(row: ExecutionRequest, facts: Any) -> bool:
-    return bool(
-        row.objective == facts.objective
-        and row.requester == facts.requester
-        and row.reply_kind == facts.kind
-        and row.reply_address == facts.address
-        and row.reply_conversation_id == facts.reply_conversation_id
+    return all(
+        getattr(row, column) == value for column, value in _snapshot_values(facts).items()
     )
 
 
 def _work_item_matches(item: WorkItem, facts: Any, adapter: str | None) -> bool:
     return (
         item.agent_id == facts.agent_id
-        and item.repo_full_name == facts.repo_full_name
-        and item.github_repository_id == facts.github_repository_id
-        and item.github_issue_number == facts.github_issue_number
-        and item.github_installation_id == facts.github_installation_id
+        and item.tracker_issue == facts.issue
+        and lifecycle.same_repository(item.repository, facts.repository)
+        and item.code_host_installation_id == facts.code_host_installation_id
         and route_thread_key_matches(
             facts.kind,
             adapter,
@@ -287,7 +322,7 @@ async def _admission_refusal(
     if binding is None or binding.agent_id != facts.agent_id:
         return await _refuse(session, "binding_missing")
     if not repository_is_allowed(
-        facts.repo_full_name, get_settings().github_repo_allowlist
+        facts.repository.path, get_settings().github_repo_allowlist
     ):
         return await _refuse(session, "repository_not_allowed")
     objective = facts.objective
@@ -331,10 +366,7 @@ async def admit_revision(
     if existing is not None:
         return await _replay_existing(session, existing, facts, resolved.adapter)
     work_item = await session.scalar(
-        select(WorkItem).where(
-            WorkItem.github_repository_id == facts.github_repository_id,
-            WorkItem.github_issue_number == facts.github_issue_number,
-        )
+        select(WorkItem).where(*lifecycle.for_tracker_issue(facts.issue))
         .with_for_update()
         .execution_options(populate_existing=True)
     )
@@ -384,10 +416,7 @@ async def readmit(
     if existing is not None:
         return await _replay_existing(session, existing, facts, resolved.adapter)
     work_item = await session.scalar(
-        select(WorkItem).where(
-            WorkItem.github_repository_id == facts.github_repository_id,
-            WorkItem.github_issue_number == facts.github_issue_number,
-        )
+        select(WorkItem).where(*lifecycle.for_tracker_issue(facts.issue))
     )
     if work_item is None:
         return await _admit_new(session, facts, resolved.adapter)
@@ -423,11 +452,10 @@ async def _admit_new(
 ) -> WorkItemOutcome | WorkItemConflict | DispatchConflict:
     created = await lifecycle.create_or_get_work_item(
         session,
-        github_repository_id=facts.github_repository_id,
-        github_issue_number=facts.github_issue_number,
-        github_installation_id=facts.github_installation_id,
+        issue=facts.issue,
+        repository=facts.repository,
+        code_host_installation_id=facts.code_host_installation_id,
         agent_id=facts.agent_id,
-        repo_full_name=facts.repo_full_name,
         conversation_id=_facts_conversation(facts, adapter),
         # Factory admission resolves a base (ADR 0186); other callers do not.
         base=getattr(facts, "base", None),
@@ -635,7 +663,7 @@ async def acquire(
             work_item_id=work_item.id,
             conversation_id=work_item.conversation_id,
             wait_deadline=deadline,
-            repo_full_name=work_item.repo_full_name,
+            repository_path=work_item.repository_path,
         )
         await session.execute(
             update(ExecutionRequest)
@@ -678,7 +706,7 @@ async def acquire(
         work_item_id=work_item.id,
         conversation_id=work_item.conversation_id,
         wait_deadline=deadline,
-        repo_full_name=work_item.repo_full_name,
+        repository_path=work_item.repository_path,
     )
     await session.commit()
     return grant
@@ -1572,14 +1600,32 @@ def request_view(row: ExecutionRequest) -> dict[str, Any]:
     }
 
 
+def tracker_view(issue: TrackerIssueRef) -> dict[str, Any]:
+    return {
+        "kind": issue.kind,
+        "host": issue.host,
+        "scope_id": issue.scope_id,
+        "issue_id": issue.issue_id,
+        "display_key": issue.display_key,
+    }
+
+
+def repository_view(repository: RepositoryRef) -> dict[str, Any]:
+    return {
+        "code_host_kind": repository.kind,
+        "host": repository.host,
+        "project_id": repository.project_id,
+        "path": repository.path,
+    }
+
+
 def work_item_view(row: WorkItemSnapshot) -> dict[str, Any]:
     return {
         "id": row.id,
-        "github_repository_id": row.github_repository_id,
-        "github_issue_number": row.github_issue_number,
-        "github_installation_id": row.github_installation_id,
+        "tracker": tracker_view(row.tracker_issue),
+        "repository": repository_view(row.repository),
+        "code_host_installation_id": row.code_host_installation_id,
         "agent_id": row.agent_id,
-        "repo_full_name": row.repo_full_name,
         "conversation_id": row.conversation_id,
         "publication_lineage_id": row.publication_lineage_id,
         "cancelled_at": row.cancelled_at,

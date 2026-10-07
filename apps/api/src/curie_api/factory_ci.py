@@ -2,23 +2,24 @@
 
 A succeeded publication does not end the request. The reconciler hands each
 ``completed`` settlement to ``gate``, which observes the checks and commit
-statuses on the published head (``workitem_outcomes.observe_ci_detail``) and
-decides with the pure ``decide``:
+statuses on the published head through the code host port (``observe_ci``,
+or ``ci_diagnostics`` when the code host declares it) and decides with the
+pure ``decide``:
 
 - green, or no checks after the grace period when no required check applies,
   completes the request;
 - Python changes require valid preflight evidence; when the repository has a
   required Python CI policy (``GITHUB_FACTORY_PYTHON_CI``, #3617), they must
-  also fall under its paths and pass its GitHub Actions check;
+  also fall under its paths and pass that check, run by the code host's own CI;
 - a declared check that could not run in the sandbox and delegates its proof
   to a named required check (``delegated_to``, #3873) holds the request until
   that check run or commit status has run and passed. Missing waits until the
   CI deadline and is then unverified; skipped or neutral is unverified; a
   failure takes the failing path below. It is never green or no CI;
-- a failure of GitHub Actions jobs is rerun once at that same head before
-  anyone is asked to fix it (#3741). The rerun does not consume a round. Only
-  a failure that is still present after the rerun, or a rerun GitHub refuses,
-  continues below;
+- a failure of jobs the code host's own CI ran is rerun once at that same head
+  before anyone is asked to fix it (#3741), when the code host supports it.
+  The rerun does not consume a round. Only a failure that is still present
+  after the rerun, or a rerun the code host refuses, continues below;
 - a failure below the round cap enqueues ONE continuation turn for the same
   request (``work-item-{id}-ci-{round}``) carrying the failure report;
 - a failure on the last round, a timed-out wait, or unreadable CI ends the
@@ -41,7 +42,7 @@ import asyncio
 import json
 import re
 import uuid
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -61,11 +62,28 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from curie_api.workitems import lifecycle
 
-from . import factory_progress, workitem_outcomes
+from . import factory_progress
 from .config import Settings
+from .forges.capabilities import Operation, Support, supports
+from .forges.config import CiPolicyConfig, RequiredCheckConfig
+from .forges.errors import ForgeError
+from .forges.hosts import code_host_for, issue_url, repository_ref
+from .forges.ports import CodeHost
+from .forges.types import (
+    STATUS_KEY_PREFIX,
+    CheckSource,
+    CheckState,
+    CiDiagnostic,
+    NormalizedCheck,
+    RepositoryRef,
+    RerunJob,
+    RerunOutcome,
+    RerunRecord,
+    check_run_key,
+    status_key,
+)
 from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
-from .repo_full_name import entry_for_repo, repo_url_path
-from .workitem_outcomes import CiDetail
+from .repo_full_name import entry_for_repo
 
 CI_GRACE_SECONDS = 120
 CI_POLL_SECONDS = 20
@@ -96,11 +114,15 @@ TRANSIENT = frozenset({"timeout", "observation_busy", "github_rate_limited", "gi
 _MARKER_ROUNDS = "|".join(str(r) for r in range(CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS + 1))
 MARKER = re.compile(rf"^Curie wait_ci round ({_MARKER_ROUNDS}) of {CI_MAX_ROUNDS}: ")
 
-_FAILING_CONCLUSIONS = frozenset(
-    {"failure", "timed_out", "cancelled", "action_required", "startup_failure"}
-)
-_PASSING_CONCLUSIONS = frozenset({"success", "neutral", "skipped"})
-_FAILING_STATES = frozenset({"error", "failure"})
+_FAILING = frozenset({CheckState.FAILURE, CheckState.CANCELLED})
+_PASSING = frozenset({CheckState.SUCCESS, CheckState.NEUTRAL, CheckState.SKIPPED})
+_UNPROVEN = frozenset({CheckState.SKIPPED, CheckState.NEUTRAL})
+_SHA = re.compile(r"[0-9a-fA-F]{7,64}")
+# A job log in the continuation keeps its last lines, as the code host tails it.
+_LOG_TAIL_LINES = 80
+_LOG_TAIL_CHARS = 6_000
+# One bounded pass of rerun requests, as long as a diagnostics read may take.
+_RERUN_DEADLINE_SECONDS = 20.0
 _REPORT_MAX = 16000
 _SUMMARY_MAX = 2000
 _ANNOTATIONS_MAX = 10
@@ -111,7 +133,7 @@ RERUN_REQUESTED_NOTE = "Reran failed Actions jobs once at this head."
 
 
 def rerun_refused_note(reason: str) -> str:
-    """Fixed phase-report text for a rerun GitHub would not accept."""
+    """Fixed phase-report text for a rerun the code host would not accept."""
 
     return f"CI rerun refused: {reason}."
 
@@ -122,54 +144,109 @@ def ci_rerun_key(request_id: uuid.UUID, head_sha: str) -> str:
     return f"{WORK_ITEM_CI_RERUN_PREFIX}:{request_id}:{head_sha}"
 
 
-def failing_actions_jobs(detail: CiDetail) -> list[dict[str, Any]]:
-    """Failed GitHub Actions jobs on this observation, in check-run order.
+@dataclass(frozen=True)
+class CiView:
+    """One read of a published head's CI, never persisted.
 
-    The check run id is the Actions job id. Other apps cannot be rerun through
-    the Actions API, so they are omitted and the gate keeps today's path.
+    ``checks`` are the normalized checks on ``head_sha`` and ``diagnostics``
+    what the failing ones said, when the code host offers that.
+    ``base_failing`` holds the keys of checks failing on the base branch head
+    (#4105); it is empty when the base was not read, so every failure counts
+    as caused by the change. ``reason`` is
+    set, with nothing observed, when the code host could not answer; it is a
+    fixed reason code and never carries a response body, header, URL or token.
+    """
+
+    head_sha: str | None
+    checks: tuple[NormalizedCheck, ...] = ()
+    diagnostics: tuple[CiDiagnostic, ...] = ()
+    reason: str | None = None
+    base_failing: frozenset[str] = frozenset()
+
+    @property
+    def runs(self) -> list[NormalizedCheck]:
+        return [check for check in self.checks if check.source is CheckSource.RUN]
+
+    @property
+    def statuses(self) -> list[NormalizedCheck]:
+        return [check for check in self.checks if check.source is CheckSource.STATUS]
+
+
+async def observe(
+    code_host: CodeHost,
+    repository: RepositoryRef,
+    head_sha: str | None,
+    *,
+    diagnostics: bool,
+    base_ref: str | None = None,
+) -> CiView:
+    """Read the checks on ``head_sha`` once, with diagnostics when asked.
+
+    With diagnostics, a failing head also has the checks on ``base_ref``'s
+    current head read, so a failure the change did not cause is known (#4105).
+    """
+
+    if not isinstance(head_sha, str) or not _SHA.fullmatch(head_sha):
+        return CiView(None, reason="no_head_sha")
+    try:
+        if diagnostics:
+            report = await code_host.ci_diagnostics(repository, head_sha, base_ref=base_ref)
+            return CiView(
+                head_sha,
+                report.rollup.checks,
+                report.diagnostics,
+                base_failing=report.base.failing_keys if report.base is not None else frozenset(),
+            )
+        rollup = await code_host.observe_ci(repository, head_sha)
+    except ForgeError as failure:
+        return CiView(head_sha, reason=str(failure) or type(failure).__name__.lower())
+    return CiView(head_sha, rollup.checks)
+
+
+def _stamp(moment: datetime | None) -> str | None:
+    return moment.astimezone(UTC).isoformat().replace("+00:00", "Z") if moment else None
+
+
+def _job_id(check: NormalizedCheck) -> int | None:
+    return int(check.check_id) if check.check_id and check.check_id.isdigit() else None
+
+
+def failing_actions_jobs(view: CiView) -> list[dict[str, Any]]:
+    """Failed jobs of the code host's own CI on this observation, in check order.
+
+    The check id is the job id. Checks other apps report cannot be rerun, so
+    they are omitted and the gate keeps today's path.
     """
 
     jobs: list[dict[str, Any]] = []
     seen: set[int] = set()
-    for run in detail.check_runs:
-        job_id = run.get("id")
-        if (
-            run.get("status") != "completed"
-            or run.get("conclusion") not in _FAILING_CONCLUSIONS
-            or not isinstance(job_id, int)
-            or isinstance(job_id, bool)
-            or job_id < 1
-            or job_id in seen
-            or not isinstance(run.get("app"), dict)
-            or run["app"].get("slug") != "github-actions"
-        ):
+    for run in view.runs:
+        job_id = _job_id(run)
+        if run.state not in _FAILING or not run.native or job_id is None or job_id in seen:
             continue
         seen.add(job_id)
-        started = run.get("started_at")
-        name = run.get("name")
-        details_url = run.get("details_url")
         jobs.append(
             {
                 "id": job_id,
-                "name": name if isinstance(name, str) else "",
-                "started_at": started if isinstance(started, str) else None,
-                "details_url": details_url if isinstance(details_url, str) else None,
+                "name": run.name,
+                "started_at": _stamp(run.started_at),
+                "details_url": run.url,
             }
         )
     return jobs
 
 
 def rerun_still_outstanding(
-    detail: CiDetail,
+    view: CiView,
     jobs: Sequence[dict[str, Any]],
     refused_runs: Sequence[int] = (),
 ) -> bool:
     """True while a requested rerun has not produced a new completed attempt.
 
-    The same completed failure GitHub was already showing is not a post-rerun
-    result. A pending replacement, a missing job, or that same ``started_at``
-    keeps the gate waiting. A completed attempt with a new ``started_at``, or
-    a different conclusion, has landed.
+    The same completed failure the code host was already showing is not a
+    post-rerun result. A pending replacement, a missing job, or that same
+    ``started_at`` keeps the gate waiting. A completed attempt with a new
+    ``started_at``, or a different outcome, has landed.
     """
 
     refused = {
@@ -188,15 +265,13 @@ def rerun_still_outstanding(
     ]
     if not jobs:
         return False
-    by_id: dict[int, dict[str, Any]] = {}
-    by_name: dict[str, list[dict[str, Any]]] = {}
-    for run in detail.check_runs:
-        run_id = run.get("id")
-        if isinstance(run_id, int) and not isinstance(run_id, bool):
+    by_id: dict[int, NormalizedCheck] = {}
+    by_name: dict[str, list[NormalizedCheck]] = {}
+    for run in view.runs:
+        run_id = _job_id(run)
+        if run_id is not None:
             by_id[run_id] = run
-        name = run.get("name")
-        if isinstance(name, str):
-            by_name.setdefault(name, []).append(run)
+        by_name.setdefault(run.name, []).append(run)
     for job in jobs:
         job_id = job.get("id")
         started = job.get("started_at")
@@ -204,28 +279,27 @@ def rerun_still_outstanding(
         name = raw_name if isinstance(raw_name, str) else ""
         current = by_id.get(job_id) if isinstance(job_id, int) else None
         if current is None:
-            replacements = [item for item in by_name.get(name, []) if item.get("id") != job_id]
+            replacements = [item for item in by_name.get(name, []) if _job_id(item) != job_id]
             if not replacements:
                 return True
             current = replacements[-1]
-        if current.get("status") != "completed":
+        if current.state is CheckState.PENDING:
             return True
-        if (
-            current.get("started_at") == started
-            and current.get("conclusion") in _FAILING_CONCLUSIONS
-        ):
+        if _stamp(current.started_at) == started and current.state in _FAILING:
             return True
     return False
 
 
 @dataclass(frozen=True)
 class PythonCiPolicy:
-    """A repository's required Python CI (#3617), from ``GITHUB_FACTORY_PYTHON_CI``.
+    """A repository's required Python CI (#3617), keyed on normalized check keys.
 
-    ``check`` is the github-actions check run a Python change must pass;
-    ``paths`` are the path prefixes that check selects (an unselected Python
-    path fails closed); ``pending_check_prefix`` names shard jobs that precede
-    the aggregate check, so their presence keeps the verdict waiting for it.
+    ``check`` is the key of the check a Python change must pass, produced by
+    the code host's own CI (GitHub Actions on GitHub); ``paths`` are the path
+    prefixes that check selects (an unselected Python path fails closed);
+    ``pending_check_prefix`` is the key prefix of shard jobs that precede the
+    aggregate check, so their presence keeps the verdict waiting for it. A
+    check run's key is its name (ADR 0197 consequence 7).
     """
 
     check: str
@@ -233,34 +307,109 @@ class PythonCiPolicy:
     pending_check_prefix: str | None = None
 
 
-def python_ci_policy(settings: Settings, repo_full_name: str) -> PythonCiPolicy | None:
-    """The configured policy for ``owner/name``, matched case-insensitively."""
-
-    value = entry_for_repo(settings.github_factory_python_ci, repo_full_name)
-    if value is None:
-        return None
-    return PythonCiPolicy(
-        check=value["check"],
-        paths=tuple(value["paths"]),
-        pending_check_prefix=value.get("pendingCheckPrefix"),
-    )
-
-
 @dataclass(frozen=True)
 class MetadataCiPolicy:
-    """Repository checks and statuses that must rerun after a metadata edit."""
+    """Checks that must rerun after a metadata edit, as normalized keys.
+
+    ``checks`` are check run keys and ``statuses`` commit status contexts,
+    whose keys are ``status:<context>``; ``keys`` is the one set the verdict
+    reads.
+    """
 
     checks: tuple[str, ...]
     statuses: tuple[str, ...]
+
+    @property
+    def keys(self) -> frozenset[str]:
+        return frozenset(self.checks) | {status_key(context) for context in self.statuses}
+
+    @classmethod
+    def from_keys(cls, keys: Iterable[str]) -> MetadataCiPolicy:
+        ordered = tuple(keys)
+        prefix = STATUS_KEY_PREFIX
+        return cls(
+            checks=tuple(key for key in ordered if not key.startswith(prefix)),
+            statuses=tuple(key[len(prefix) :] for key in ordered if key.startswith(prefix)),
+        )
+
+
+def ci_policies(config: CiPolicyConfig) -> tuple[PythonCiPolicy | None, MetadataCiPolicy | None]:
+    """The verdict's policies from a repository binding's CI config."""
+
+    required = config.required
+    python_ci = (
+        PythonCiPolicy(
+            check=required.key,
+            paths=required.paths,
+            pending_check_prefix=required.pending_key_prefix,
+        )
+        if required is not None
+        else None
+    )
+    keys = config.metadata_rerun_keys
+    return python_ci, (MetadataCiPolicy.from_keys(keys) if keys else None)
+
+
+def ci_policy_config(settings: Settings, repo_full_name: str) -> CiPolicyConfig:
+    """Today's per-repository settings as key-based CI config.
+
+    ``GITHUB_FACTORY_PYTHON_CI`` and ``GITHUB_FACTORY_METADATA_CI`` name check
+    runs and commit status contexts; this is the one place they become keys.
+    """
+
+    python = entry_for_repo(settings.github_factory_python_ci, repo_full_name)
+    metadata = entry_for_repo(settings.github_factory_metadata_ci, repo_full_name)
+    prefix = python.get("pendingCheckPrefix") if python is not None else None
+    return CiPolicyConfig(
+        required=(
+            RequiredCheckConfig(
+                key=check_run_key(python["check"]),
+                paths=tuple(python["paths"]),
+                pending_key_prefix=check_run_key(prefix) if prefix is not None else None,
+            )
+            if python is not None
+            else None
+        ),
+        metadata_rerun_keys=(
+            tuple(
+                dict.fromkeys(
+                    [check_run_key(name) for name in metadata["checks"]]
+                    + [status_key(context) for context in metadata["statuses"]]
+                )
+            )
+            if metadata is not None
+            else ()
+        ),
+    )
+
+
+def python_ci_policy(settings: Settings, repo_full_name: str) -> PythonCiPolicy | None:
+    """The configured policy for ``owner/name``, matched case-insensitively."""
+
+    return ci_policies(ci_policy_config(settings, repo_full_name))[0]
 
 
 def metadata_ci_policy(settings: Settings, repo_full_name: str) -> MetadataCiPolicy | None:
     """The configured metadata policy, matched case insensitively."""
 
-    value = entry_for_repo(settings.github_factory_metadata_ci, repo_full_name)
-    if value is None:
-        return None
-    return MetadataCiPolicy(checks=tuple(value["checks"]), statuses=tuple(value["statuses"]))
+    return ci_policies(ci_policy_config(settings, repo_full_name))[1]
+
+
+@dataclass(frozen=True)
+class CiCapabilities:
+    """What the code host offers beyond names, states and links (ADR 0197 consequence 5)."""
+
+    diagnostics: bool
+    rerun: bool
+
+
+def ci_capabilities(capabilities: Mapping[Operation, Support]) -> CiCapabilities:
+    """A no-op rerun has nothing to wait for, so only a supported one is tried."""
+
+    return CiCapabilities(
+        diagnostics=supports(capabilities, Operation.CI_DIAGNOSTICS),
+        rerun=supports(capabilities, Operation.RERUN_FAILED),
+    )
 
 
 VerdictKind = Literal["green", "no_ci", "failing", "pending", "timed_out", "unverified"]
@@ -289,10 +438,6 @@ def ci_key(request_id: uuid.UUID, round_: int) -> str:
 
 
 # --- verdict (pure) -----------------------------------------------------------------
-
-
-def _str(value: Any) -> str:
-    return value if isinstance(value, str) else ""
 
 
 def _matches_path_prefix(path: str, prefix: str) -> bool:
@@ -327,52 +472,39 @@ def _publication_changed_paths(publications: Sequence[Publication]) -> list[str]
     return [path for publication in publications for path in publication.changed_paths]
 
 
-def _fresh_ci_detail(detail: CiDetail, fresh_after: datetime) -> CiDetail:
-    """Keep only checks and statuses created for the metadata revision."""
+def _fresh_view(view: CiView, fresh_after: datetime) -> CiView:
+    """Keep only checks started, and statuses posted, for the metadata revision."""
 
     return replace(
-        detail,
-        check_runs=[
-            run
-            for run in detail.check_runs
-            if (started := _github_time(run.get("started_at"))) is not None
-            and started > fresh_after
-        ],
-        statuses=[
-            item
-            for item in detail.statuses
-            if (created := _github_time(item.get("created_at"))) is not None
-            and created > fresh_after
-        ],
+        view,
+        checks=tuple(
+            check
+            for check in view.checks
+            if check.started_at is not None and check.started_at > fresh_after
+        ),
     )
 
 
 def _metadata_revision_detail(
-    detail: CiDetail, fresh_after: datetime, metadata_ci: MetadataCiPolicy
-) -> CiDetail:
-    fresh = _fresh_ci_detail(detail, fresh_after)
-    fresh_names = {run.get("name") for run in fresh.check_runs}
-    fresh_contexts = {item.get("context") for item in fresh.statuses}
+    view: CiView, fresh_after: datetime, metadata_ci: MetadataCiPolicy
+) -> CiView:
+    fresh = _fresh_view(view, fresh_after)
+    rerun = metadata_ci.keys
+    fresh_keys = {check.key for check in fresh.checks}
+    kept = [check for check in view.checks if check.key not in fresh_keys | rerun]
     return replace(
-        detail,
-        check_runs=fresh.check_runs
-        + [
-            run
-            for run in detail.check_runs
-            if run.get("name") not in fresh_names and run.get("name") not in metadata_ci.checks
-        ],
-        statuses=fresh.statuses
-        + [
-            item
-            for item in detail.statuses
-            if item.get("context") not in fresh_contexts
-            and item.get("context") not in metadata_ci.statuses
-        ],
+        view,
+        checks=(
+            *fresh.runs,
+            *(check for check in kept if check.source is CheckSource.RUN),
+            *fresh.statuses,
+            *(check for check in kept if check.source is CheckSource.STATUS),
+        ),
     )
 
 
 def decide(
-    detail: CiDetail,
+    view: CiView,
     *,
     now: datetime,
     published_at: datetime,
@@ -394,8 +526,12 @@ def decide(
     verification delegated to; each must appear as a check run ``name`` (any
     app) or a commit status ``context`` and pass.
 
-    A failure also failing on the base branch head (``detail.base_check_runs``
-    / ``base_statuses``, #4105) is pre-existing and judged as not failing.
+    A failing or pending check is reported by the state the code host gave:
+    a run as ``name`` with ``conclusion`` or ``status``, a commit status as
+    ``context`` with ``state``.
+
+    A failure whose check key also fails on the base branch head
+    (``view.base_failing``, #4105) is pre-existing and judged as not failing.
     """
 
     unselected_path = unselected_python_path(changed_paths, python_ci)
@@ -410,49 +546,33 @@ def decide(
     expired = now >= ci_deadline
     if fresh_after is not None and metadata_ci is None:
         return Verdict(kind="unverified", reason="metadata_ci_not_configured")
-    if detail.state != "observed" or detail.reason is not None:
-        reason = detail.reason or "github_error"
+    if view.reason is not None:
+        reason = view.reason
         if reason in TRANSIENT:
             if expired:
                 return Verdict(kind="timed_out", reason=reason)
             return Verdict(kind="pending", reason=reason)
         return Verdict(kind="unverified", reason=reason)
-    base_failing_names, base_failing_contexts = _preexisting(detail)
-    check_runs = detail.check_runs
-    statuses = detail.statuses
+    base_failing = view.base_failing
+    check_runs = view.runs
+    statuses = view.statuses
     if fresh_after is not None:
         assert metadata_ci is not None
-        fresh = _fresh_ci_detail(detail, fresh_after)
-        fresh_runs, fresh_statuses = fresh.check_runs, fresh.statuses
-        fresh_names = {run.get("name") for run in fresh_runs}
-        missing_rerun = any(name not in fresh_names for name in metadata_ci.checks)
-        fresh_contexts = {item.get("context") for item in fresh_statuses}
-        missing_rerun = missing_rerun or any(
-            context not in fresh_contexts for context in metadata_ci.statuses
-        )
-        effective = _metadata_revision_detail(detail, fresh_after, metadata_ci)
+        fresh = _fresh_view(view, fresh_after)
+        fresh_runs, fresh_statuses = fresh.runs, fresh.statuses
+        rerun_keys = metadata_ci.keys
+        fresh_keys = {check.key for check in fresh.checks}
+        missing_rerun = any(key not in fresh_keys for key in rerun_keys)
+        effective = _metadata_revision_detail(view, fresh_after, metadata_ci)
         # Only caused failures may end the wait for the metadata rerun.
         fresh_failure = any(
-            run.get("status") == "completed"
-            and run.get("conclusion") in _FAILING_CONCLUSIONS
-            and run.get("name") not in base_failing_names
-            for run in fresh_runs
-        ) or any(
-            item.get("state") in _FAILING_STATES
-            and item.get("context") not in base_failing_contexts
-            for item in fresh_statuses
+            check.state in _FAILING and check.key not in base_failing for check in fresh.checks
         )
         unchanged_failure = any(
-            run.get("name") not in metadata_ci.checks
-            and run.get("status") == "completed"
-            and run.get("conclusion") in _FAILING_CONCLUSIONS
-            and run.get("name") not in base_failing_names
-            for run in effective.check_runs
-        ) or any(
-            item.get("context") not in metadata_ci.statuses
-            and item.get("state") in _FAILING_STATES
-            and item.get("context") not in base_failing_contexts
-            for item in effective.statuses
+            check.key not in rerun_keys
+            and check.state in _FAILING
+            and check.key not in base_failing
+            for check in effective.checks
         )
         if (
             not fresh_failure
@@ -465,37 +585,25 @@ def decide(
             )
         # A PR metadata edit reruns body checks, but it does not rerun the main
         # suite on the unchanged commit. Keep its passing or pending evidence.
-        check_runs, statuses = effective.check_runs, effective.statuses
+        check_runs, statuses = effective.runs, effective.statuses
 
     required_python_runs = [
         run
         for run in check_runs
-        if python_ci is not None
-        and run.get("name") == python_ci.check
-        and isinstance(run.get("app"), dict)
-        and run["app"].get("slug") == "github-actions"
+        if python_ci is not None and run.key == python_ci.check and run.native
     ]
-    if requires_python_ci and any(
-        run.get("status") == "completed" and run.get("conclusion") in {"skipped", "neutral"}
-        for run in required_python_runs
-    ):
+    if requires_python_ci and any(run.state in _UNPROVEN for run in required_python_runs):
         conclusion = next(
-            run.get("conclusion")
-            for run in required_python_runs
-            if run.get("status") == "completed" and run.get("conclusion") in {"skipped", "neutral"}
+            run.reported_state for run in required_python_runs if run.state in _UNPROVEN
         )
         return Verdict(
             kind="unverified",
             reason=f"required_python_ci_{conclusion}",
         )
 
-    delegated_runs = [run for run in check_runs if run.get("name") in delegated_checks]
+    delegated_runs = [run for run in check_runs if run.name in delegated_checks]
     delegated_unproven = next(
-        (
-            run.get("conclusion")
-            for run in delegated_runs
-            if run.get("status") == "completed" and run.get("conclusion") in {"skipped", "neutral"}
-        ),
+        (run.reported_state for run in delegated_runs if run.state in _UNPROVEN),
         None,
     )
     if delegated_unproven is not None:
@@ -505,31 +613,25 @@ def decide(
     pending: list[dict[str, Any]] = []
     preexisting: list[dict[str, Any]] = []
     for run in check_runs:
-        name, status, conclusion = _str(run.get("name")), run.get("status"), run.get("conclusion")
-        if status != "completed":
-            pending.append({"name": name, "status": _str(status)})
-        elif conclusion in _FAILING_CONCLUSIONS and run.get("name") in base_failing_names:
-            preexisting.append({"name": name, "conclusion": _str(conclusion)})
-        elif conclusion in _FAILING_CONCLUSIONS:
-            failing.append({"name": name, "conclusion": _str(conclusion)})
-        elif conclusion not in _PASSING_CONCLUSIONS:
-            # ``stale`` (and anything unrecognised) waits for a fresh conclusion.
-            pending.append({"name": name, "status": _str(conclusion)})
+        # A pending run reports its status, or a conclusion (``stale``) that
+        # waits for a fresh one.
+        if run.state in _FAILING and run.key in base_failing:
+            preexisting.append({"name": run.name, "conclusion": run.reported_state})
+        elif run.state in _FAILING:
+            failing.append({"name": run.name, "conclusion": run.reported_state})
+        elif run.state not in _PASSING:
+            pending.append({"name": run.name, "status": run.reported_state})
     for status_item in statuses:
-        context, state = _str(status_item.get("context")), status_item.get("state")
-        if state in _FAILING_STATES and status_item.get("context") in base_failing_contexts:
-            preexisting.append({"context": context, "state": _str(state)})
-        elif state in _FAILING_STATES:
-            failing.append({"context": context, "state": _str(state)})
-        elif state != "success":
-            pending.append({"context": context, "state": _str(state)})
+        if status_item.state in _FAILING and status_item.key in base_failing:
+            preexisting.append({"context": status_item.name, "state": status_item.reported_state})
+        elif status_item.state in _FAILING:
+            failing.append({"context": status_item.name, "state": status_item.reported_state})
+        elif status_item.state is not CheckState.SUCCESS:
+            pending.append({"context": status_item.name, "state": status_item.reported_state})
     if failing:
         # Fail fast: the whole budget is what remains of the execution deadline.
         required_python_failed = requires_python_ci and any(
-            run.get("status") == "completed"
-            and run.get("conclusion") in _FAILING_CONCLUSIONS
-            and run.get("name") not in base_failing_names
-            for run in required_python_runs
+            run.state in _FAILING and run.key not in base_failing for run in required_python_runs
         )
         return Verdict(
             kind="failing",
@@ -540,10 +642,7 @@ def decide(
     # These checks are the proof of this change, so a red base means the change
     # is unproven, never green.
     if requires_python_ci and any(
-        run.get("status") == "completed"
-        and run.get("conclusion") in _FAILING_CONCLUSIONS
-        and run.get("name") in base_failing_names
-        for run in required_python_runs
+        run.state in _FAILING and run.key in base_failing for run in required_python_runs
     ):
         return Verdict(
             kind="unverified", reason="required_python_ci_failed_on_base", pending=pending
@@ -561,7 +660,7 @@ def decide(
         # still appear, so keep waiting until the CI deadline.
         shard_prefix = python_ci.pending_check_prefix if python_ci is not None else None
         shards_expect_aggregate = shard_prefix is not None and any(
-            _str(run.get("name")).startswith(shard_prefix) for run in check_runs
+            run.key.startswith(shard_prefix) for run in check_runs
         )
         if not expired and (pending or shards_expect_aggregate):
             return Verdict(
@@ -577,9 +676,7 @@ def decide(
         )
         return Verdict(kind="unverified", reason=reason, pending=pending)
 
-    observed_names = {run.get("name") for run in delegated_runs} | {
-        item.get("context") for item in statuses
-    }
+    observed_names = {run.name for run in delegated_runs} | {item.name for item in statuses}
     if any(check not in observed_names for check in delegated_checks):
         return Verdict(
             kind="unverified" if expired else "pending",
@@ -604,44 +701,11 @@ def decide(
     return Verdict(kind="green")
 
 
-def _preexisting(detail: CiDetail) -> tuple[frozenset[str], frozenset[str]]:
-    """Check run names and status contexts failing on the base branch head (#4105).
-
-    Both empty when the base head was not read, so every failure counts as caused.
-    """
-
-    if detail.base_check_runs is None or detail.base_statuses is None:
-        return frozenset(), frozenset()
-    names = frozenset(
-        run["name"]
-        for run in detail.base_check_runs
-        if isinstance(run.get("name"), str)
-        and run.get("status") == "completed"
-        and run.get("conclusion") in _FAILING_CONCLUSIONS
-    )
-    contexts = frozenset(
-        item["context"]
-        for item in detail.base_statuses
-        if isinstance(item.get("context"), str) and item.get("state") in _FAILING_STATES
-    )
-    return names, contexts
-
-
 def _preexisting_note(preexisting: Sequence[dict[str, Any]]) -> str:
-    names = [_str(item.get("name") or item.get("context")) for item in preexisting]
+    names = [str(item.get("name") or item.get("context")) for item in preexisting]
     return "Also failing on the base branch, not caused by this change: " + _clip(
         ", ".join(dict.fromkeys(names)), _CHECKS_LINE_MAX
     )
-
-
-def _github_time(value: Any) -> datetime | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
 
 
 # --- text -----------------------------------------------------------------------------
@@ -659,17 +723,25 @@ def _clean(value: Any, limit: int) -> str | None:
 
 def _job_log_tail(value: str) -> str:
     redacted = redact_text(value)
-    lines = redacted.splitlines()[-workitem_outcomes.CI_JOB_LOG_MAX_LINES :]
-    return "\n".join(lines)[-workitem_outcomes.CI_JOB_LOG_MAX_CHARS :]
+    lines = redacted.splitlines()[-_LOG_TAIL_LINES:]
+    return "\n".join(lines)[-_LOG_TAIL_CHARS:]
 
 
 def continuation_text(
-    issue_url: str, pr_url: str, head_sha: str, round_: int, detail: CiDetail
+    issue_url: str,
+    pr_url: str,
+    head_sha: str,
+    round_: int,
+    view: CiView,
+    *,
+    diagnostics: bool,
 ) -> str:
     """The continuation turn: a platform frame around untrusted CI data.
 
     Line 2 is the marker the bundle matches; the report is one line of JSON, so
-    CI text can never forge a marker line.
+    CI text can never forge a marker line. Without ``diagnostics`` (a code host
+    that declares no CI diagnostics, ADR 0197 consequence 5) each failing check
+    is reported by name, state and link only.
     """
 
     header = "\n".join(
@@ -685,55 +757,77 @@ def continuation_text(
     annotations_left = _ANNOTATIONS_MAX
     entries: list[tuple[str, dict[str, Any]]] = []
     available_logs: list[tuple[dict[str, Any], str]] = []
-    base_failing_names, base_failing_contexts = _preexisting(detail)
-    for run in detail.check_runs:
-        if run.get("status") != "completed" or run.get("conclusion") not in _FAILING_CONCLUSIONS:
+    by_id = {said.check_id: said for said in view.diagnostics if said.check_id is not None}
+    by_key = {said.check_key: said for said in view.diagnostics}
+
+    def said_by(check: NormalizedCheck) -> CiDiagnostic | None:
+        if check.check_id is not None and check.check_id in by_id:
+            return by_id[check.check_id]
+        return by_key.get(check.key) if check.check_id is None else None
+
+    for run in view.runs:
+        if run.state not in _FAILING or run.key in view.base_failing:
             continue
-        if run.get("name") in base_failing_names:
+        if not diagnostics:
+            entries.append(
+                (
+                    "failing_checks",
+                    {
+                        "name": _clean(run.name, 200),
+                        "conclusion": _clean(run.reported_state, 50),
+                        "url": _clean(run.url, 500),
+                    },
+                )
+            )
             continue
-        raw_output = run.get("output")
-        output: dict[str, Any] = raw_output if isinstance(raw_output, dict) else {}
+        said = said_by(run)
         notes: list[dict[str, Any]] = []
-        run_id = run.get("id")
-        for item in detail.annotations.get(run_id, []) if isinstance(run_id, int) else []:
+        for item in said.annotations if said is not None else ():
             if annotations_left <= 0:
                 break
             notes.append(
                 {
-                    "path": _clean(item.get("path"), 300),
-                    "start_line": item.get("start_line")
-                    if isinstance(item.get("start_line"), int)
-                    else None,
-                    "message": _clean(item.get("message"), 1000),
+                    "path": _clean(item.path, 300),
+                    "start_line": item.line,
+                    "message": _clean(item.message, 1000),
                 }
             )
             annotations_left -= 1
         entry: dict[str, Any] = {
-            "name": _clean(run.get("name"), 200),
-            "conclusion": _clean(run.get("conclusion"), 50),
-            "title": _clean(output.get("title"), 300),
-            "summary": _clean(output.get("summary"), _SUMMARY_MAX),
+            "name": _clean(run.name, 200),
+            "conclusion": _clean(run.reported_state, 50),
+            "title": _clean(said.title if said is not None else None, 300),
+            "summary": _clean(said.summary if said is not None else None, _SUMMARY_MAX),
             "annotations": notes,
         }
-        if isinstance(run_id, int) and not isinstance(run_id, bool):
-            log = detail.job_logs.get(run_id)
-            if isinstance(log, str):
-                available_logs.append((entry, _job_log_tail(log)))
-            elif run_id in detail.job_log_unavailable:
-                entry["job_log"] = "Job log unavailable."
+        if said is not None and said.log is not None:
+            available_logs.append((entry, _job_log_tail(said.log)))
+        elif said is not None and said.log_unavailable:
+            entry["job_log"] = "Job log unavailable."
         entries.append(("failing_checks", entry))
-    for status_item in detail.statuses:
-        if status_item.get("state") not in _FAILING_STATES:
+    for status_item in view.statuses:
+        if status_item.state not in _FAILING or status_item.key in view.base_failing:
             continue
-        if status_item.get("context") in base_failing_contexts:
+        if not diagnostics:
+            entries.append(
+                (
+                    "failing_statuses",
+                    {
+                        "context": _clean(status_item.name, 200),
+                        "state": _clean(status_item.reported_state, 50),
+                        "url": _clean(status_item.url, 500),
+                    },
+                )
+            )
             continue
+        said = said_by(status_item)
         entries.append(
             (
                 "failing_statuses",
                 {
-                    "context": _clean(status_item.get("context"), 200),
-                    "state": _clean(status_item.get("state"), 50),
-                    "description": _clean(status_item.get("description"), 1000),
+                    "context": _clean(status_item.name, 200),
+                    "state": _clean(status_item.reported_state, 50),
+                    "description": _clean(said.summary if said is not None else None, 1000),
                 },
             )
         )
@@ -924,6 +1018,8 @@ async def gate(
     takes a later request's slot.
     """
 
+    code_host = code_host_for(settings, client)
+    capabilities = ci_capabilities(code_host.capabilities)
     async with sessionmaker() as session:
         facts = await _load(session, settlement)
         now = await lifecycle.database_now(session)
@@ -946,8 +1042,10 @@ async def gate(
     observed_sha = lineage.head_sha
     changed_paths = _publication_changed_paths(facts.publications)
     changed_python_paths = python_paths(changed_paths)
-    python_ci = python_ci_policy(settings, lineage.repo_full_name or work_item.repo_full_name)
-    metadata_ci = metadata_ci_policy(settings, lineage.repo_full_name or work_item.repo_full_name)
+    python_ci = python_ci_policy(settings, lineage.repo_full_name or work_item.repository_path)
+    metadata_ci = metadata_ci_policy(
+        settings, lineage.repo_full_name or work_item.repository_path
+    )
     unselected_path = unselected_python_path(changed_paths, python_ci)
     preflight_verdict: Verdict | None = None
     delegated_checks: tuple[str, ...] = ()
@@ -992,26 +1090,37 @@ async def gate(
                     reason=(f"python_preflight_failed_exit_status_{failed.exit_status}"),
                 )
 
-    detail: CiDetail | None = None
+    view: CiView | None = None
     fresh_after: datetime | None = None
+    repository = repository_ref(
+        settings,
+        path=lineage.repo_full_name or work_item.repository_path,
+        project_id=lineage.repository_project_id,
+    )
     if preflight_verdict is not None:
         verdict = preflight_verdict
         head_sha = observed_sha or ""
     else:
         if not may_observe(request.id):
             return "waiting"
-        detail = await workitem_outcomes.observe_ci_detail(lineage, work_item, settings, client)
+        view = await observe(
+            code_host,
+            repository,
+            observed_sha,
+            diagnostics=capabilities.diagnostics,
+            base_ref=lineage.base_ref,
+        )
         metadata_only = not latest.changed_paths and latest.base_sha == observed_sha
         fresh_after = latest.metadata_updated_at if metadata_only else None
         async with sessionmaker() as session:
             now = await lifecycle.database_now(session)
             await session.rollback()
-        head_sha = detail.head_sha or observed_sha or ""
+        head_sha = view.head_sha or observed_sha or ""
         if metadata_only and fresh_after is None:
             verdict = Verdict(kind="unverified", reason="metadata_update_unverified")
         else:
             verdict = decide(
-                detail,
+                view,
                 now=now,
                 published_at=facts.published_at,
                 execution_deadline=request.execution_deadline,
@@ -1026,16 +1135,21 @@ async def gate(
     if verdict.kind == "pending":
         next_poll[request.id] = now + timedelta(seconds=CI_POLL_SECONDS)
         return "waiting"
-    if verdict.kind == "failing" and detail is not None and detail.state == "observed" and head_sha:
+    if (
+        verdict.kind == "failing"
+        and capabilities.rerun
+        and view is not None
+        and view.reason is None
+        and head_sha
+    ):
         decision = await _consider_flake_rerun(
             sessionmaker,
             valkey,
             settings,
-            client,
+            code_host,
+            repository,
             request=request,
-            work_item=work_item,
-            lineage=lineage,
-            detail=detail,
+            view=view,
             head_sha=head_sha,
             published_at=facts.published_at,
             now=now,
@@ -1053,10 +1167,10 @@ async def gate(
     next_poll.pop(request.id, None)
     pr_url = lineage.pr_url
     if verdict.kind == "failing" and round_ < CI_MAX_ROUNDS:
-        assert detail is not None
+        assert view is not None
         if fresh_after is not None:
             assert metadata_ci is not None
-            detail = _metadata_revision_detail(detail, fresh_after, metadata_ci)
+            view = _metadata_revision_detail(view, fresh_after, metadata_ci)
         return await _continue(
             sessionmaker,
             valkey,
@@ -1071,7 +1185,8 @@ async def gate(
                 pr_url or "",
                 head_sha,
                 round_ + 1,
-                detail,
+                view,
+                diagnostics=capabilities.diagnostics,
             ),
             owner=owner,
             now=now,
@@ -1104,29 +1219,8 @@ async def gate(
     return "settled" if isinstance(result, lifecycle.WorkItemOutcome) else "waiting"
 
 
-@dataclass(frozen=True)
-class _ActionsRerun:
-    """One GitHub answer for a rerun request.
-
-    ``retry`` is a transport or rate-limit failure and is not the one allowed
-    attempt. ``refused`` is a definitive client response. The response body is
-    never copied.
-    """
-
-    outcome: str
-    reason: str | None = None
-    run_id: int | None = None
-
-
-_RERUN_REFUSED = {
-    401: "github_unauthorized",
-    403: "github_forbidden",
-    404: "github_not_found",
-    422: "rerun_rejected",
-}
-_ACTIONS_RUN_ID = re.compile(r"/actions/runs/([1-9][0-9]{0,18})(?:/|$)")
 # The lock outlives one bounded mint-and-post pass so a slow owner cannot be
-# replaced while its request is still the one GitHub will answer.
+# replaced while its request is still the one the code host will answer.
 _RERUN_LOCK_SECONDS = 60
 _STORE_RERUN = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -1166,22 +1260,13 @@ def _accepted_runs(record: dict[str, Any]) -> list[int]:
     ]
 
 
-def _stored_jobs(record: dict[str, Any] | None, detail: CiDetail) -> list[dict[str, Any]]:
+def _stored_jobs(record: dict[str, Any] | None, view: CiView) -> list[dict[str, Any]]:
     if record is None:
-        return failing_actions_jobs(detail)
+        return failing_actions_jobs(view)
     jobs = record.get("jobs")
     if isinstance(jobs, list) and all(isinstance(job, dict) for job in jobs):
         return jobs
     return []
-
-
-def _run_id_from_details(details_url: Any) -> int | None:
-    if not isinstance(details_url, str):
-        return None
-    matched = _ACTIONS_RUN_ID.search(details_url)
-    if matched is None:
-        return None
-    return int(matched.group(1))
 
 
 def _rerun_body(record: dict[str, Any]) -> str:
@@ -1234,7 +1319,7 @@ async def _ensure_record_notes(
 
 
 def _terminal_rerun_decision(
-    record: dict[str, Any], detail: CiDetail, now: datetime, deadline: datetime
+    record: dict[str, Any], view: CiView, now: datetime, deadline: datetime
 ) -> Literal["wait", "proceed", "timeout"] | None:
     if record.get("outcome") == "refused":
         return "proceed"
@@ -1244,249 +1329,164 @@ def _terminal_rerun_decision(
     if (
         isinstance(jobs, list)
         and jobs
-        and rerun_still_outstanding(detail, jobs, _refused_run_ids(record))
+        and rerun_still_outstanding(view, jobs, _refused_run_ids(record))
     ):
         return "timeout" if now >= deadline else "wait"
     return "proceed"
 
 
-def _rerun_headers(token: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+@dataclass(frozen=True)
+class _Unrequested:
+    """A pass that ended without the rerun being requested.
 
-
-async def _github_send(
-    client: httpx.AsyncClient,
-    method: str,
-    url: str,
-    headers: dict[str, str],
-    timeout: float,
-) -> httpx.Response | _ActionsRerun:
-    try:
-        # build_request inherits client auth. send(..., auth=None) strips it so
-        # the installation token is the only credential on the wire.
-        request = client.build_request(method, url, headers=headers, timeout=timeout)
-        return await client.send(request, auth=None, follow_redirects=False)
-    except httpx.TimeoutException:
-        # The server may already have accepted the request.
-        return _ActionsRerun("unconfirmed", "timeout")
-    except httpx.HTTPError:
-        return _ActionsRerun("unconfirmed", "github_error")
-
-
-def _status_rerun(status_code: int, *, ok: int) -> _ActionsRerun | None:
-    if status_code == ok:
-        return None
-    if status_code == 429 or status_code >= 500:
-        reason = "github_rate_limited" if status_code == 429 else "github_error"
-        return _ActionsRerun("retry", reason)
-    return _ActionsRerun("refused", _RERUN_REFUSED.get(status_code, "rerun_rejected"))
-
-
-async def _lookup_run_id(
-    client: httpx.AsyncClient,
-    base: str,
-    headers: dict[str, str],
-    timeout: float,
-    job_id: int,
-) -> _ActionsRerun:
-    """Read ``run_id`` when the check run did not carry an Actions URL.
-
-    ``GET /repos/{owner}/{repo}/actions/jobs/{job_id}`` returns the workflow
-    run id. Only that integer is kept.
-    https://docs.github.com/en/rest/actions/workflow-jobs#get-a-job-for-a-workflow-run
+    ``retry`` is a transport or rate-limit failure and is not the one allowed
+    attempt; anything else is a definitive answer, as ``reason`` says.
     """
 
-    sent = await _github_send(client, "GET", f"{base}/actions/jobs/{job_id}", headers, timeout)
-    if isinstance(sent, _ActionsRerun):
-        return sent
-    refused = _status_rerun(sent.status_code, ok=200)
-    if refused is not None:
-        return refused
-    try:
-        payload = sent.json()
-    except ValueError:
-        return _ActionsRerun("refused", "rerun_rejected")
-    run_id = payload.get("run_id") if isinstance(payload, dict) else None
-    if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id < 1:
-        return _ActionsRerun("refused", "rerun_rejected")
-    return _ActionsRerun("requested", run_id=run_id)
+    outcome: Literal["retry", "refused"]
+    reason: str
 
 
-async def _post_failed_run(
-    client: httpx.AsyncClient,
-    base: str,
-    headers: dict[str, str],
-    timeout: float,
-    run_id: int,
-) -> _ActionsRerun:
-    """Ask GitHub to rerun every failed job in one workflow run.
-
-    ``POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun-failed-jobs``
-    answers 201 Created. A missing Actions permission is 403. The body is
-    never read.
-    https://docs.github.com/en/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run
-    """
-
-    sent = await _github_send(
-        client,
-        "POST",
-        f"{base}/actions/runs/{run_id}/rerun-failed-jobs",
-        headers,
-        timeout,
-    )
-    if isinstance(sent, _ActionsRerun):
-        return sent
-    refused = _status_rerun(sent.status_code, ok=201)
-    if refused is not None:
-        return refused
-    return _ActionsRerun("requested", run_id=run_id)
+def _unrequested(outcome: RerunOutcome | None, reason: str | None) -> _Unrequested:
+    kind: Literal["retry", "refused"] = "retry" if outcome is RerunOutcome.RETRY else "refused"
+    return _Unrequested(kind, reason or "rerun_rejected")
 
 
-async def _post_missing_runs(
+def _int_unit(unit: str | None) -> int | None:
+    return int(unit) if unit is not None and unit.isdigit() else None
+
+
+def _rerun_jobs(record: dict[str, Any]) -> list[RerunJob]:
+    jobs: list[RerunJob] = []
+    for job in record.get("jobs", []):
+        if not isinstance(job, dict):
+            continue
+        job_id, run_id = job.get("id"), job.get("run_id")
+        url, name = job.get("details_url"), job.get("name")
+        jobs.append(
+            RerunJob(
+                check_id=str(job_id) if type(job_id) is int else "",
+                name=name if isinstance(name, str) else "",
+                url=url if isinstance(url, str) else None,
+                unit=str(run_id) if type(run_id) is int else None,
+            )
+        )
+    return jobs
+
+
+def _stamped(record: dict[str, Any], progress: RerunRecord) -> list[dict[str, Any]]:
+    """The stored jobs, each with the rerun unit the code host resolved."""
+
+    jobs = [job for job in record.get("jobs", []) if isinstance(job, dict)]
+    return [
+        {**job, "run_id": _int_unit(rerun.unit)}
+        for job, rerun in zip(jobs, progress.jobs, strict=True)
+    ]
+
+
+def _with_attempt(record: dict[str, Any], progress: RerunRecord) -> dict[str, Any]:
+    """The stored record after the newest answer in ``progress``."""
+
+    record = {**record, "jobs": _stamped(record, progress)}
+    attempt = progress.attempts[-1]
+    unit = _int_unit(attempt.unit)
+    if attempt.outcome is RerunOutcome.RETRY or unit is None:
+        return record
+    accepted = set(_accepted_runs(record))
+    refused = set(_refused_run_ids(record))
+    updated: dict[str, Any] = {**record, "outcome": "claimed"}
+    if attempt.outcome is RerunOutcome.REFUSED:
+        refused.add(unit)
+        updated["reason"] = attempt.reason
+    else:
+        # A dropped response is not proof of rejection. Do not ask for this
+        # unit again; wait to see whether the attempt appears.
+        accepted.add(unit)
+    return {**updated, "accepted_runs": sorted(accepted), "refused_runs": sorted(refused)}
+
+
+async def _rerun_missing_units(
     valkey: redis.Redis,
-    settings: Settings,
-    client: httpx.AsyncClient,
-    lineage: ThreadPublicationLineage,
-    work_item: WorkItem,
+    code_host: CodeHost,
+    repository: RepositoryRef,
+    head_sha: str,
     *,
     lock_key: str,
     record_key: str,
     token: str,
     record: dict[str, Any],
     ttl: int,
-) -> dict[str, Any] | _ActionsRerun:
-    """POST each workflow run that this head has not already had accepted.
+) -> dict[str, Any] | _Unrequested:
+    """Ask for each rerun unit this head has not already had accepted or refused.
 
-    An accepted run is stored before the next request, so a later timeout or
-    refusal cannot forget it or post it again.
+    The code host reports every answer before it sends the next request, and
+    the answer is stored then, so a later timeout or refusal cannot forget an
+    accepted unit or ask for it again.
     """
 
-    head_sha = lineage.head_sha
-    if not isinstance(head_sha, str) or not workitem_outcomes.SHA_RE.fullmatch(head_sha):
-        return _ActionsRerun("refused", "no_head_sha")
-    minted, refused = await workitem_outcomes.mint_ci_token(
-        lineage, work_item, settings, head_sha
-    )
-    if refused is not None:
-        reason = refused.reason or "github_error"
-        if reason in {"timeout", "observation_busy", "github_rate_limited", "github_error"}:
-            return _ActionsRerun("retry", reason)
-        return _ActionsRerun("refused", reason)
-    assert minted is not None
-    headers = _rerun_headers(minted)
+    if not _SHA.fullmatch(head_sha):
+        return _Unrequested("refused", "no_head_sha")
+    settled = {str(unit) for unit in [*_accepted_runs(record), *_refused_run_ids(record)]}
+    current = record
+    lost = False
+
+    async def store(progress: RerunRecord) -> bool:
+        nonlocal current, lost
+        current = _with_attempt(current, progress)
+        if not await _store_rerun(valkey, lock_key, record_key, token, current, ttl):
+            lost = True
+        return not lost
+
     try:
-        try:
-            base = (
-                f"{settings.github_api_url.rstrip('/')}/repos/"
-                f"{repo_url_path(lineage.repo_full_name or '')}"
-            )
-        except ValueError:
-            return _ActionsRerun("refused", "github_error")
-        accepted = set(_accepted_runs(record))
-        refused_runs = set(_accepted_runs({"accepted_runs": record.get("refused_runs")}))
-        jobs = [job for job in record.get("jobs", []) if isinstance(job, dict)]
-        run_ids: list[int] = []
-        stamped: list[dict[str, Any]] = []
-        for job in jobs:
-            run_id = job.get("run_id")
-            if not isinstance(run_id, int) or isinstance(run_id, bool):
-                run_id = _run_id_from_details(job.get("details_url"))
-            if run_id is None:
-                job_id = job.get("id")
-                if not isinstance(job_id, int) or isinstance(job_id, bool):
-                    return _ActionsRerun("refused", "rerun_rejected")
-                looked = await _lookup_run_id(
-                    client, base, headers, settings.github_app_timeout_seconds, job_id
-                )
-                if looked.outcome != "requested" or looked.run_id is None:
-                    return looked
-                run_id = looked.run_id
-            stamped.append({**job, "run_id": run_id})
-            if run_id not in accepted and run_id not in refused_runs and run_id not in run_ids:
-                run_ids.append(run_id)
-        record = {**record, "jobs": stamped}
-        if not run_ids and not accepted:
-            stored_reason = record.get("reason")
-            return _ActionsRerun(
-                "refused",
-                stored_reason if isinstance(stored_reason, str) else "rerun_rejected",
-            )
-        last_refusal: _ActionsRerun | None = None
-        for run_id in run_ids:
-            posted = await _post_failed_run(
-                client, base, headers, settings.github_app_timeout_seconds, run_id
-            )
-            if posted.outcome in {"retry", "unconfirmed"}:
-                if posted.outcome == "unconfirmed":
-                    # A dropped response is not proof of rejection. Do not POST
-                    # this run again; wait to see whether the attempt appears.
-                    accepted.add(run_id)
-                    record = {
-                        **record,
-                        "outcome": "claimed",
-                        "accepted_runs": sorted(accepted),
-                        "refused_runs": sorted(refused_runs),
-                    }
-                if not await _store_rerun(valkey, lock_key, record_key, token, record, ttl):
-                    return _ActionsRerun("retry", "rerun_lock_lost")
-                return _ActionsRerun("retry", posted.reason)
-            if posted.outcome != "requested":
-                refused_runs.add(run_id)
-                last_refusal = posted
-                record = {
-                    **record,
-                    "outcome": "claimed",
-                    "accepted_runs": sorted(accepted),
-                    "refused_runs": sorted(refused_runs),
-                    "reason": posted.reason,
-                }
-                if not await _store_rerun(valkey, lock_key, record_key, token, record, ttl):
-                    return _ActionsRerun("retry", "rerun_lock_lost")
-                continue
-            accepted.add(run_id)
-            record = {
-                **record,
-                "outcome": "claimed",
-                "accepted_runs": sorted(accepted),
-                "refused_runs": sorted(refused_runs),
-            }
-            if not await _store_rerun(valkey, lock_key, record_key, token, record, ttl):
-                return _ActionsRerun("retry", "rerun_lock_lost")
-        if not accepted and last_refusal is not None:
-            return last_refusal
-        record = {
-            **record,
-            "outcome": "requested",
-            "accepted_runs": sorted(accepted),
-            "refused_runs": sorted(refused_runs),
-        }
-        if not await _store_rerun(valkey, lock_key, record_key, token, record, ttl):
-            return _ActionsRerun("retry", "rerun_lock_lost")
-        return record
-    finally:
-        del minted
-        headers.clear()
+        done = await code_host.rerun_failed(
+            repository, _rerun_jobs(record), settled=settled, on_attempt=store
+        )
+    except ForgeError as failure:
+        return _Unrequested("refused", str(failure) or "rerun_rejected")
+    if lost:
+        return _Unrequested("retry", "rerun_lock_lost")
+    if done.stopped is not None:
+        return _unrequested(done.stopped, done.reason)
+    last = done.attempts[-1] if done.attempts else None
+    if last is not None and last.outcome in {RerunOutcome.RETRY, RerunOutcome.UNCONFIRMED}:
+        # Already stored with its answer; the units not asked yet go next pass.
+        return _Unrequested("retry", last.reason or "rerun_rejected")
+    accepted = _accepted_runs(current)
+    if not done.attempts and not accepted:
+        stored_reason = current.get("reason")
+        return _Unrequested(
+            "refused", stored_reason if isinstance(stored_reason, str) else "rerun_rejected"
+        )
+    refusals = [a for a in done.attempts if a.outcome is RerunOutcome.REFUSED]
+    if not accepted and refusals:
+        return _unrequested(RerunOutcome.REFUSED, refusals[-1].reason)
+    current = {
+        **current,
+        "jobs": _stamped(current, done),
+        "outcome": "requested",
+        "accepted_runs": sorted(accepted),
+        "refused_runs": sorted(_refused_run_ids(current)),
+    }
+    if not await _store_rerun(valkey, lock_key, record_key, token, current, ttl):
+        return _Unrequested("retry", "rerun_lock_lost")
+    return current
 
 
 async def _consider_flake_rerun(
     sessionmaker: async_sessionmaker[AsyncSession],
     valkey: redis.Redis,
     settings: Settings,
-    client: httpx.AsyncClient,
+    code_host: CodeHost,
+    repository: RepositoryRef,
     *,
     request: ExecutionRequest,
-    work_item: WorkItem,
-    lineage: ThreadPublicationLineage,
-    detail: CiDetail,
+    view: CiView,
     head_sha: str,
     published_at: datetime,
     now: datetime,
 ) -> Literal["wait", "proceed", "timeout"]:
-    """Rerun failed Actions jobs once per head, or proceed when that cannot help.
+    """Rerun the failed jobs of the code host's own CI once per head, or proceed
+    when that cannot help.
 
     A recorded request waits until those jobs show a new completed attempt.
     If that attempt never arrives before the CI deadline, the wait times out
@@ -1501,11 +1501,11 @@ async def _consider_flake_rerun(
     record = _rerun_record(await valkey.get(key))
     if record is not None and record.get("outcome") in {"requested", "refused"}:
         await _ensure_record_notes(sessionmaker, request.id, record)
-        decision = _terminal_rerun_decision(record, detail, now, deadline)
+        decision = _terminal_rerun_decision(record, view, now, deadline)
         if decision is not None:
             return decision
 
-    jobs = _stored_jobs(record, detail)
+    jobs = _stored_jobs(record, view)
     if not jobs:
         return "proceed"
     if now >= deadline and not _accepted_runs(record or {}):
@@ -1524,7 +1524,7 @@ async def _consider_flake_rerun(
             record = fresh
         if record is not None and record.get("outcome") in {"requested", "refused"}:
             await _ensure_record_notes(sessionmaker, request.id, record)
-            decision = _terminal_rerun_decision(record, detail, now, deadline)
+            decision = _terminal_rerun_decision(record, view, now, deadline)
             if decision is not None:
                 return decision
         if record is None:
@@ -1533,26 +1533,25 @@ async def _consider_flake_rerun(
                 return "wait"
         try:
             posted = await asyncio.wait_for(
-                _post_missing_runs(
+                _rerun_missing_units(
                     valkey,
-                    settings,
-                    client,
-                    lineage,
-                    work_item,
+                    code_host,
+                    repository,
+                    head_sha,
                     lock_key=lock_key,
                     record_key=key,
                     token=token,
                     record=record,
                     ttl=ttl,
                 ),
-                timeout=workitem_outcomes.CI_DETAIL_DEADLINE_SECONDS,
+                timeout=_RERUN_DEADLINE_SECONDS,
             )
         except TimeoutError:
             latest = _rerun_record(await valkey.get(key)) or record
             if _accepted_runs(latest) and now >= deadline:
                 return "timeout"
             return "wait" if now < deadline else "proceed"
-        if isinstance(posted, _ActionsRerun):
+        if isinstance(posted, _Unrequested):
             if posted.outcome == "retry":
                 latest = _rerun_record(await valkey.get(key)) or record
                 if _accepted_runs(latest):
@@ -1562,7 +1561,7 @@ async def _consider_flake_rerun(
             latest = _rerun_record(await valkey.get(key)) or record
             if _accepted_runs(latest):
                 # Some runs were already accepted. Wait for those results.
-                # The runs GitHub refused stay failed and reach the
+                # The runs the code host refused stay failed and reach the
                 # implementer only after the accepted reruns settle.
                 await _ensure_record_notes(sessionmaker, request.id, latest)
                 return "timeout" if now >= deadline else "wait"
@@ -1582,8 +1581,7 @@ async def _consider_flake_rerun(
 
 
 def _issue_url(settings: Settings, work_item: WorkItem) -> str:
-    base = settings.github_clone_base.rstrip("/")
-    return f"{base}/{work_item.repo_full_name}/issues/{work_item.github_issue_number}"
+    return issue_url(settings, work_item.tracker_issue, work_item.repository)
 
 
 async def _continue(

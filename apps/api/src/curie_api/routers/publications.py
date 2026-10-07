@@ -11,13 +11,11 @@ import time
 import uuid
 from typing import Any, Literal, cast
 
-import httpx
 from aci_protocol import PublicationContext
 from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from starlette.concurrency import run_in_threadpool
 
 from curie_api.crud import agents as crud_agents
 from curie_api.crud import approvals as crud_approvals
@@ -46,6 +44,9 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
+from ..forges.errors import ForgeError, Unauthorized, Unavailable
+from ..forges.hosts import code_host_for, pull_request_ref
+from ..forges.types import GITHUB, CredentialScope
 from ..models import (
     ExecutionRequest,
     Publication,
@@ -67,8 +68,7 @@ from ..publication_truth import (
     read_publication_authority,
     read_publication_metadata,
 )
-from ..repo_full_name import repo_url_path
-from ..repository_auth import resolve_repository_credential
+from ..repository_access import issue_repository_credential
 from ..workspace_policy import credential_mode, repository_is_allowed
 from .publication_precheck import precheck_error
 
@@ -81,7 +81,8 @@ router = APIRouter(
 )
 internal_router = APIRouter(prefix="/v1/internal/publications", tags=["internal-publications"])
 
-_GITHUB_API_VERSION = "2022-11-28"
+# Code host reasons for a pull request whose facts do not match the request.
+_INVALID_PULL_REASONS = frozenset({"malformed_response", "pull_request_mismatch"})
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}")
 _GITHUB_UNAVAILABLE_DETAIL = {
     "code": "publication.github_unavailable",
@@ -206,52 +207,12 @@ async def _publication_lineage_out(
     )
 
 
-def _validated_github_pr_truth(
-    payload: Any,
-    *,
-    github_html_base: str,
-    repo_full_name: str,
-    pr_number: int,
-    pr_url: str,
-    branch: str,
-) -> tuple[str, str]:
-    """Validate identity-bound GitHub fields and return state plus head SHA."""
-
-    if not isinstance(payload, dict):
-        raise ValueError("GitHub returned an invalid pull request body")
-    number = payload.get("number")
-    html_url = payload.get("html_url")
-    remote_state = payload.get("state")
-    merged = payload.get("merged")
-    head = payload.get("head")
-    expected_url = f"{github_html_base}/{repo_full_name}/pull/{pr_number}"
-    if (
-        not isinstance(number, int)
-        or isinstance(number, bool)
-        or number != pr_number
-        or html_url != pr_url
-        or pr_url != expected_url
-        or not isinstance(head, dict)
-        or head.get("ref") != branch
-    ):
-        raise ValueError("GitHub pull request identity differs from the stored lineage")
-    actual_head_sha = head.get("sha")
-    if not isinstance(actual_head_sha, str) or _FULL_COMMIT_SHA.fullmatch(actual_head_sha) is None:
-        raise ValueError("GitHub returned an invalid pull request head")
-    if remote_state not in ("open", "closed") or not isinstance(merged, bool):
-        raise ValueError("GitHub returned an invalid pull request state")
-    if merged and remote_state != "closed":
-        raise ValueError("GitHub returned an inconsistent pull request state")
-    state = "merged" if merged else ("closed" if remote_state == "closed" else "open")
-    return state, actual_head_sha.lower()
-
-
 async def _refresh_publication_lineage_from_github(
     request: Request,
     session: SessionDep,
     lineage: ThreadPublicationLineage,
 ) -> ThreadPublicationLineage:
-    """Refresh a stored PR by number while keeping credentials API-private."""
+    """Refresh a stored PR by number through the code host; credentials stay API-private."""
 
     if lineage.pr_number is None and lineage.pr_url is None:
         return lineage
@@ -265,66 +226,57 @@ async def _refresh_publication_lineage_from_github(
         )
 
     settings = get_settings()
+    code_host = code_host_for(settings, request.app.state.http_client)
     try:
-        _, authorization_header = await run_in_threadpool(
-            resolve_repository_credential, lineage.repo_full_name, settings
+        pull = await code_host.read_pull_request(
+            pull_request_ref(
+                settings,
+                path=lineage.repo_full_name,
+                project_id=lineage.repository_project_id,
+                number=lineage.pr_number,
+            )
         )
-    except Exception as exc:
+    except Unauthorized as exc:
+        if str(exc) == "credential_unresolved":
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                {
+                    "code": "publication.github_unavailable",
+                    "message": "operator repository credential could not be resolved",
+                },
+            ) from None
         raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY,
-            {
-                "code": "publication.github_unavailable",
-                "message": "operator repository credential could not be resolved",
-            },
-        ) from exc
-
-    url = (
-        f"{settings.github_api_url.rstrip('/')}"
-        f"/repos/{repo_url_path(lineage.repo_full_name)}/pulls/{lineage.pr_number}"
-    )
-    try:
-        response = await request.app.state.http_client.get(
-            url,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": authorization_header,
-                "X-GitHub-Api-Version": _GITHUB_API_VERSION,
-            },
-            # This request carries operator authority. Refuse every redirect at
-            # this callsite even when the shared client follows redirects for a
-            # different API consumer.
-            follow_redirects=False,
-        )
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            _GITHUB_UNAVAILABLE_DETAIL,
-        ) from exc
-    if response.status_code != status.HTTP_200_OK:
+            status.HTTP_503_SERVICE_UNAVAILABLE, _GITHUB_UNAVAILABLE_DETAIL
+        ) from None
+    except Unavailable as exc:
+        if str(exc) not in _INVALID_PULL_REASONS:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, _GITHUB_UNAVAILABLE_DETAIL
+            ) from None
+        pull = None
+    except ForgeError:
         # A missing PR, rejected credential, rate limit, redirect, or upstream
         # failure is not verified-open lineage. Keep the durable row unchanged
         # and make the caller refuse this turn before route adoption/model use.
         raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            _GITHUB_UNAVAILABLE_DETAIL,
-        )
-    try:
-        remote_state, actual_head_sha = _validated_github_pr_truth(
-            response.json(),
-            github_html_base=settings.github_html_base,
-            repo_full_name=lineage.repo_full_name,
-            pr_number=lineage.pr_number,
-            pr_url=lineage.pr_url,
-            branch=lineage.branch,
-        )
-    except (ValueError, TypeError) as exc:
+            status.HTTP_503_SERVICE_UNAVAILABLE, _GITHUB_UNAVAILABLE_DETAIL
+        ) from None
+    expected_url = f"{settings.github_html_base}/{lineage.repo_full_name}/pull/{lineage.pr_number}"
+    if (
+        pull is None
+        or pull.url != lineage.pr_url
+        or lineage.pr_url != expected_url
+        or pull.head_ref != lineage.branch
+        or _FULL_COMMIT_SHA.fullmatch(pull.head_sha) is None
+    ):
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             {
                 "code": "publication.github_invalid_response",
                 "message": "GitHub returned pull request facts that do not match the lineage",
             },
-        ) from exc
+        )
+    remote_state, actual_head_sha = pull.state.value, pull.head_sha.lower()
 
     if actual_head_sha != lineage.head_sha and (
         await crud_lineages.publication_lineage_has_inflight_push(session, lineage)
@@ -709,14 +661,15 @@ async def _replay_held_review_feedback(
     if (
         not get_settings().github_review_ingress_enabled
         or lineage.status != "open"
-        or lineage.github_repository_id is None
+        or lineage.code_host_kind != GITHUB
+        or lineage.repository_project_id is None
         or lineage.pr_number is None
     ):
         return
     try:
         async with asyncio.timeout(10):
             await request.app.state.github_review_reconciler.replay_held(
-                repository_id=lineage.github_repository_id,
+                repository_id=int(lineage.repository_project_id),
                 pr_number=lineage.pr_number,
             )
     except Exception:  # noqa: BLE001 - existing broad catch retained
@@ -758,6 +711,7 @@ def _credential_issue_detail(settings: Any, approval: Any) -> str:
 )
 async def redeem_publication_credential(
     publication_id: uuid.UUID,
+    request: Request,
     session: SessionDep,
     response: Response,
 ) -> RepositoryCredentialOut:
@@ -850,8 +804,16 @@ async def redeem_publication_credential(
             {"code": cancelled.code, "message": cancelled.message},
         )
     try:
-        clone_url, authorization_header = await run_in_threadpool(
-            resolve_repository_credential, repo, settings
+        issued = await issue_repository_credential(
+            settings,
+            request.app.state.http_client,
+            repo_full_name=repo,
+            project_id=(
+                publication.lineage.repository_project_id
+                if publication.lineage is not None
+                else None
+            ),
+            scope=CredentialScope.PUSH,
         )
     except Exception as exc:
         await crud_publications.append_credential_redemption_audit(
@@ -879,8 +841,11 @@ async def redeem_publication_credential(
     )
     return RepositoryCredentialOut(
         repo_full_name=repo,
-        clone_url=clone_url,
-        authorization_header=authorization_header,
+        clone_url=issued.clone_url,
+        authorization_header=issued.authorization_header,
+        origin=issued.origin,
+        header_form=issued.header_form,
+        ca_bundle_ref=issued.ca_bundle_ref,
     )
 
 
@@ -889,9 +854,9 @@ def _review_revision_out(
     lineage: ThreadPublicationLineage,
 ) -> ReviewRevisionOut:
     assert lineage.reply_conversation_id is not None
-    assert lineage.github_repository_id is not None
-    assert lineage.github_installation_id is not None
-    assert lineage.github_pr_node_id is not None
+    assert lineage.repository_project_id is not None
+    assert lineage.code_host_installation_id is not None
+    assert lineage.code_host_pr_id is not None
     assert lineage.pr_number is not None
     assert lineage.base_ref is not None
     return ReviewRevisionOut(
@@ -902,9 +867,9 @@ def _review_revision_out(
         reply_conversation_id=lineage.reply_conversation_id,
         binding_id=row.binding_id,
         binding_generation=row.binding_generation,
-        repository_id=lineage.github_repository_id,
-        installation_id=lineage.github_installation_id,
-        pr_node_id=lineage.github_pr_node_id,
+        repository_id=int(lineage.repository_project_id),
+        installation_id=lineage.code_host_installation_id,
+        pr_node_id=lineage.code_host_pr_id,
         base_ref=lineage.base_ref,
         repo_full_name=lineage.repo_full_name,
         pr_number=lineage.pr_number,
@@ -980,3 +945,4 @@ async def cancel_review_revision(
             {"code": exc.code, "message": exc.message},
         ) from None
     return _review_revision_out(row, lineage)
+

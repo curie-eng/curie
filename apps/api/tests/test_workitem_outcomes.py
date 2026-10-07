@@ -23,10 +23,22 @@ import channel_protocol
 import httpx
 import pytest
 from aci_protocol import ApprovalRequest
-from curie_api import approval_principal, factory_ci
+from curie_api import approval_principal, factory_ci, workitem_outcomes
 from curie_api.config import get_settings
 from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import lineages as crud_lineages
+from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
+from curie_api.forges.github.ci import CiDetail
+from curie_api.forges.hosts import github_issue_ref, repository_ref
+from curie_api.forges.types import (
+    GITHUB,
+    CheckState,
+    CiRollup,
+    NormalizedCheck,
+    PullRequestRef,
+    ReplyTarget,
+    RepositoryRef,
+)
 from curie_api.github_app import (
     _RESOLVERS,
     GitHubAppError,
@@ -47,10 +59,11 @@ from curie_api.workitem_dispatch import (
     record_termination,
     start,
 )
-from curie_api.workitem_outcomes import CiDetail, derive_outcome
+from curie_api.workitem_outcomes import derive_outcome
 from curie_api.workitems import lifecycle as workitems
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
+from forge_fakes.github import ci_view
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -113,8 +126,7 @@ FORBIDDEN_KEYS = {
     "traceparent",
     "summary",
     "token",
-    "github_installation_id",
-    "github_repository_id",
+    "code_host_installation_id",
     "version",
 }
 CORRECTNESS_VERDICT_KEYS = {"verdict", "passed", "correct"}
@@ -223,16 +235,24 @@ def _agent(
     }
 
 
-def _facts(agent_id: str, **overrides: Any) -> SimpleNamespace:
+def _facts(
+    agent_id: str,
+    *,
+    repository_id: int = 101,
+    issue_number: int = 2577,
+    **overrides: Any,
+) -> SimpleNamespace:
+    settings = get_settings()
     values: dict[str, Any] = {
         "agent_id": uuid.UUID(agent_id),
         "kind": "slack",
         "address": ADDRESS,
         "reply_conversation_id": WIRE_CONVERSATION,
-        "repo_full_name": REPO,
-        "github_repository_id": 101,
-        "github_issue_number": 2577,
-        "github_installation_id": 202,
+        "issue": github_issue_ref(
+            settings, repository_id=repository_id, issue_number=issue_number
+        ),
+        "repository": repository_ref(settings, path=REPO, project_id=repository_id),
+        "code_host_installation_id": 202,
         "objective": OBJECTIVE,
         "requester": REQUESTER,
         "request_id": uuid.uuid4(),
@@ -475,7 +495,14 @@ def _assert_common(body: Mapping[str, Any]) -> None:
     assert body["correctness"] == {"asserted": False, "owner": "bundle"}
     assert not CORRECTNESS_VERDICT_KEYS & set(_keys(body))
     assert isinstance(body["actionable_cause"], str) and body["actionable_cause"]
-    assert body["issue_url"] == f"https://github.com/{REPO}/issues/2577"
+    assert body["tracker"] == {
+        "kind": "github",
+        "host": "github.com",
+        "scope_id": "101",
+        "issue_id": "2577",
+        "display_key": None,
+        "url": f"https://github.com/{REPO}/issues/2577",
+    }
 
 
 # --- one test per state -----------------------------------------------------
@@ -493,8 +520,13 @@ def test_fresh_admission_is_waiting_with_issue_and_no_pr(
     _assert_common(body)
     assert body["id"] == str(seeded.work_item_id)
     assert body["agent_id"] == agent["agent_id"]
-    assert body["repo_full_name"] == REPO
-    assert body["github_issue_number"] == 2577
+    assert body["repository"] == {
+        "code_host_kind": "github",
+        "host": "github.com",
+        "project_id": "101",
+        "path": REPO,
+    }
+    assert body["tracker"]["issue_id"] == "2577"
     assert body["pr"] is None
     assert body["publication"] is None
     assert body["objective"] == OBJECTIVE
@@ -888,7 +920,7 @@ def test_opened_pr_binds_only_the_publication_request(
     agent = _agent(stack, auth_headers)
     owner = _completed(stack, agent)
     publication = _publish(stack, agent["deployment_id"])
-    other_facts = _facts(agent["agent_id"], github_issue_number=2578)
+    other_facts = _facts(agent["agent_id"], issue_number=2578)
     other = _admit(other_facts)
     _start(other_facts.request_id)
     assert _bound_lineage(owner.work_item_id) is None
@@ -905,7 +937,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:
     agent = _agent(stack, auth_headers)
-    facts = _facts(agent["agent_id"], github_repository_id=102)
+    facts = _facts(agent["agent_id"], repository_id=102)
     seeded = _admit(facts)
     _start(facts.request_id)
     publication = _publish(stack, agent["deployment_id"])
@@ -939,6 +971,7 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
                 metadata_updated_at=None,
             ),
             identity=VerifiedPublicationIdentity(
+                host="github.com",
                 repository_id=101,
                 installation_id=202,
                 pr_node_id="PR_example_123",
@@ -948,12 +981,12 @@ def test_verified_repository_identity_must_match_work_item_to_bind(
         )
         opened = await session.execute(
             text(
-                "SELECT github_repository_id, pr_url FROM "
+                "SELECT repository_project_id, pr_url FROM "
                 "curie.thread_publication_lineages WHERE id = :id"
             ),
             {"id": uuid.UUID(publication["lineage_id"])},
         )
-        assert opened.one() == (101, PR_URL)
+        assert opened.one() == ("101", PR_URL)
 
     async def run_advance() -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -1015,12 +1048,7 @@ def test_closed_lineage_cancellation_names_the_closed_lineage(
     publication = _publish(stack, agent["deployment_id"])
     _resolve(stack, auth_headers, publication["approval_id"])
     _open_pr(stack, publication["id"])
-    revision = _admit_revision(
-        _facts(
-            agent["agent_id"],
-            objective=f"{PR_URL}#issuecomment-1\nRevise after review feedback",
-        )
-    )
+    revision = _admit_revision(_revision_facts(agent["agent_id"], PR_NUMBER))
     assert revision.work_item_id == active.work_item_id
     _complete(active)
     _execute(
@@ -1057,16 +1085,88 @@ def test_closed_lineage_cancellation_names_the_closed_lineage(
     _assert_common(body)
 
 
+def _revision_facts(agent_id: str, pr: int) -> SimpleNamespace:
+    """Review feedback facts: the reply target is typed, the objective is prose.
+
+    The objective deliberately carries no feedback URL, so promotion can only
+    learn the pull request from the stored reply target (#3831).
+    """
+
+    pull = PullRequestRef(RepositoryRef(GITHUB, "github.com", "101", REPO), str(pr))
+    return _facts(
+        agent_id,
+        objective="Revise after review feedback",
+        reply_target=ReplyTarget.on_pull_request(pull),
+        reply_url=f"https://github.com/{REPO}/pull/{pr}#issuecomment-1",
+    )
+
+
+@pytest.mark.parametrize(
+    ("lineage_status", "reply_pr", "status", "cause"),
+    [
+        ("closed", PR_NUMBER, "cancelled", "lineage_closed"),
+        ("open", PR_NUMBER + 1, "cancelled", "lineage_closed"),
+        ("open", PR_NUMBER, "waiting", None),
+    ],
+    ids=["closed-lineage", "other-pull-request", "open-lineage"],
+)
+def test_queued_revision_promotion_reads_the_stored_reply_target(
+    stack: TestClient,
+    auth_headers: dict[str, str],
+    lineage_status: str,
+    reply_pr: int,
+    status: str,
+    cause: str | None,
+) -> None:
+    agent = _agent(stack, auth_headers)
+    active = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+    revision = _admit_revision(_revision_facts(agent["agent_id"], reply_pr))
+
+    async def stored(session: AsyncSession) -> Any:
+        row = await session.get(ExecutionRequest, revision.request_id)
+        assert row is not None
+        return (row.reply_target_kind, row.reply_target_pr_number, row.reply_target_comment_id)
+
+    assert with_session(stored) == ("pull_request", str(reply_pr), None)
+    _complete(active)
+    _execute(
+        "UPDATE curie.thread_publication_lineages SET status = :status, "
+        "version = version + 1 WHERE id = :id",
+        {"status": lineage_status, "id": uuid.UUID(publication["lineage_id"])},
+    )
+
+    async def promote(session: AsyncSession) -> None:
+        outcome = await workitems.admit_next_revision(
+            session,
+            work_item_id=active.work_item_id,
+            wait_deadline=datetime.now(UTC) + timedelta(minutes=10),
+        )
+        assert isinstance(outcome, workitems.WorkItemOutcome), outcome
+        assert outcome.request is not None
+        assert outcome.request.id == revision.request_id
+        assert (outcome.request.status, outcome.request.terminal_cause) == (status, cause)
+
+    with_session(promote)
+
+
 def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
     now = datetime.now(UTC)
     work_item_id = uuid.uuid4()
     item = WorkItem(
         id=work_item_id,
-        github_repository_id=101,
-        github_issue_number=2577,
-        github_installation_id=202,
+        tracker_kind="github",
+        tracker_host="github.com",
+        tracker_scope_id="101",
+        tracker_issue_id="2577",
+        code_host_kind="github",
+        code_host_host="github.com",
+        repository_project_id="101",
+        repository_path=REPO,
+        code_host_installation_id=202,
         agent_id=uuid.uuid4(),
-        repo_full_name=REPO,
         conversation_id=WIRE_CONVERSATION,
         cancelled_at=None,
         created_at=now,
@@ -1098,10 +1198,11 @@ def test_only_closed_lineage_request_names_the_cancellation_cause() -> None:
         approval=None,
         pending_turn_approval=False,
         now=now,
-        issue_base="https://github.com",
+        issue_url=f"https://github.com/{REPO}/issues/2577",
     )
 
     assert outcome.state == "cancelled"
+    assert outcome.tracker.url == f"https://github.com/{REPO}/issues/2577"
     assert "pull request closed" in outcome.actionable_cause
     assert "issue label" not in outcome.actionable_cause
     assert outcome.requests[0].terminal_cause == "lineage_closed"
@@ -1176,11 +1277,11 @@ def test_no_runtime_owner_or_secret_material_reaches_list_or_detail(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:
     agent = _agent(stack, auth_headers)
-    running = _facts(agent["agent_id"], github_issue_number=1)
+    running = _facts(agent["agent_id"], issue_number=1)
     running_item = _admit(running)
     _start(running.request_id)
     published = _completed(
-        stack, agent, github_issue_number=2, reply_conversation_id="1700000000.000200"
+        stack, agent, issue_number=2, reply_conversation_id="1700000000.000200"
     )
     publication = _publish(
         stack, agent["deployment_id"], conversation_id="1700000000.000200"
@@ -1249,7 +1350,7 @@ def test_list_items_carry_state_and_null_ci_and_filter_by_agent(
     mine_item = _admit(_facts(mine["agent_id"], address=mine["address"]))
     _admit(
         _facts(
-            theirs["agent_id"], address=theirs["address"], github_issue_number=2578
+            theirs["agent_id"], address=theirs["address"], issue_number=2578
         )
     )
 
@@ -1272,7 +1373,7 @@ def test_list_truncation_flag(
 ) -> None:
     agent = _agent(stack, auth_headers)
     for issue in (1, 2, 3):
-        _admit(_facts(agent["agent_id"], github_issue_number=issue))
+        _admit(_facts(agent["agent_id"], issue_number=issue))
 
     body = stack.get("/work-items", params={"limit": 2}, headers=auth_headers).json()
 
@@ -1339,9 +1440,9 @@ def _ci_inputs(*, pr: bool = True, head_sha: str | None = HEAD_SHA) -> tuple[Any
         pr_number=PR_NUMBER if pr else None,
         pr_url=PR_URL if pr else None,
         head_sha=head_sha,
-        github_installation_id=None,
+        code_host_installation_id=None,
     )
-    work_item = SimpleNamespace(repo_full_name=REPO, github_installation_id=202)
+    work_item = SimpleNamespace(repository_path=REPO, code_host_installation_id=202)
     return lineage, work_item
 
 
@@ -1370,10 +1471,10 @@ def _observe(
     pr: bool = True,
     head_sha: str | None = HEAD_SHA,
 ) -> tuple[Any, list[httpx.Request]]:
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
     fake = creds or _FakeCreds()
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: fake)
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: fake)
     seen: list[httpx.Request] = []
 
     def record(request: httpx.Request) -> httpx.Response:
@@ -1384,7 +1485,7 @@ def _observe(
 
     async def run() -> Any:
         async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
-            return await workitem_outcomes.observe_ci(
+            return await ci.observe_ci(
                 lineage, work_item, get_settings(), client
             )
 
@@ -1657,7 +1758,7 @@ def test_hung_credential_acquisition_still_answers_the_detail_promptly(
 ) -> None:
     import threading
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
@@ -1668,10 +1769,10 @@ def test_hung_credential_acquisition_still_answers_the_detail_promptly(
 
     release = threading.Event()
     hanging = _HangingCreds(release, hang_seconds=8.0)
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: hanging)
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: hanging)
     # One overall deadline bounds credential acquisition and the check request.
     monkeypatch.setattr(
-        workitem_outcomes, "CI_OBSERVATION_DEADLINE_SECONDS", 0.5, raising=False
+        ci, "CI_OBSERVATION_DEADLINE_SECONDS", 0.5, raising=False
     )
     try:
         started = time.monotonic()
@@ -1705,7 +1806,7 @@ def test_repeated_timeouts_do_not_accumulate_credential_work(
 
     import threading
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
@@ -1716,11 +1817,11 @@ def test_repeated_timeouts_do_not_accumulate_credential_work(
 
     release = threading.Event()
     hanging = _HangingCreds(release, hang_seconds=20.0)
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: hanging)
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: hanging)
     monkeypatch.setattr(
-        workitem_outcomes, "CI_OBSERVATION_DEADLINE_SECONDS", 0.5, raising=False
+        ci, "CI_OBSERVATION_DEADLINE_SECONDS", 0.5, raising=False
     )
-    bound = workitem_outcomes.CI_CREDENTIAL_SLOTS
+    bound = ci.CI_CREDENTIAL_SLOTS
     try:
         started = time.monotonic()
         for _ in range(bound + 3):
@@ -1787,15 +1888,15 @@ def test_second_publication_revision_after_a_pr_does_not_deny_the_pr(
 def _observe_once(monkeypatch: pytest.MonkeyPatch, creds: Any) -> Any:
     """One live observation against ``creds`` and an always-passing CI."""
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: creds)
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: creds)
     lineage, work_item = _ci_inputs()
 
     async def run() -> Any:
         transport = httpx.MockTransport(lambda r: _runs(("completed", "success")))
         async with httpx.AsyncClient(transport=transport) as client:
-            return await workitem_outcomes.observe_ci(
+            return await ci.observe_ci(
                 lineage, work_item, get_settings(), client
             )
 
@@ -1814,10 +1915,10 @@ def test_ci_cancellation_before_the_mint_starts_releases_the_permit(
     """
 
     import anyio.to_thread
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
     monkeypatch.setattr(
-        workitem_outcomes, "CI_OBSERVATION_DEADLINE_SECONDS", 0.2, raising=False
+        ci, "CI_OBSERVATION_DEADLINE_SECONDS", 0.2, raising=False
     )
 
     async def never_starts(func: Any, *args: Any, **kwargs: Any) -> Any:
@@ -1825,7 +1926,7 @@ def test_ci_cancellation_before_the_mint_starts_releases_the_permit(
         raise AssertionError("the worker must never run in this test")
 
     monkeypatch.setattr(anyio.to_thread, "run_sync", never_starts)
-    for _ in range(workitem_outcomes.CI_CREDENTIAL_SLOTS):
+    for _ in range(ci.CI_CREDENTIAL_SLOTS):
         observation = _observe_once(monkeypatch, _FakeCreds())
         assert (observation.state, observation.reason) == ("unavailable", "timeout")
 
@@ -1836,9 +1937,9 @@ def test_ci_cancellation_before_the_mint_starts_releases_the_permit(
 
 
 def test_ci_mint_exception_releases_its_permit(monkeypatch: pytest.MonkeyPatch) -> None:
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    for _ in range(workitem_outcomes.CI_CREDENTIAL_SLOTS + 1):
+    for _ in range(ci.CI_CREDENTIAL_SLOTS + 1):
         failed = _observe_once(monkeypatch, _FakeCreds(error=GitHubAppError("boom")))
         assert failed.state == "unavailable"
         assert failed.reason != "observation_busy"
@@ -1997,10 +2098,10 @@ def _observe_detail(
     creds: Any = None,
     client_options: dict[str, Any] | None = None,
 ) -> tuple[Any, list[httpx.Request]]:
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
     fake = creds or _FakeCreds()
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: fake)
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: fake)
     seen: list[httpx.Request] = []
 
     def record(request: httpx.Request) -> httpx.Response:
@@ -2013,7 +2114,7 @@ def _observe_detail(
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(record), **(client_options or {})
         ) as client:
-            return await workitem_outcomes.observe_ci_detail(
+            return await ci.observe_ci_detail(
                 lineage, work_item, get_settings(), client
             )
 
@@ -2061,9 +2162,9 @@ def _observe_detail_with_base(
     base_branch: Callable[[], Awaitable[httpx.Response]],
     base_runs: list[dict[str, Any]],
 ) -> tuple[Any, list[str]]:
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    monkeypatch.setattr(workitem_outcomes, "credentials_for", lambda _s: _FakeCreds())
+    monkeypatch.setattr(ci, "credentials_for", lambda _s: _FakeCreds())
     head = _detail_handler()
     paths: list[str] = []
 
@@ -2087,7 +2188,7 @@ def _observe_detail_with_base(
 
     async def run() -> Any:
         async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
-            return await workitem_outcomes.observe_ci_detail(
+            return await ci.observe_ci_detail(
                 lineage, work_item, get_settings(), client
             )
 
@@ -2097,9 +2198,9 @@ def _observe_detail_with_base(
 def test_ci_detail_slow_base_read_keeps_the_observed_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    monkeypatch.setattr(workitem_outcomes, "CI_BASE_READ_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(ci, "CI_BASE_READ_TIMEOUT_SECONDS", 0.2)
 
     async def never_answers() -> httpx.Response:
         await asyncio.Event().wait()
@@ -2208,7 +2309,7 @@ def _decide_factory_ci(
     changed_path: str,
 ) -> Any:
     return factory_ci.decide(
-        detail,
+        ci_view(detail),
         now=datetime(2026, 9, 24, 12, 5, tzinfo=UTC),
         published_at=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
         execution_deadline=datetime(2026, 9, 24, 12, 30, tzinfo=UTC),
@@ -2346,8 +2447,8 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
     expected: tuple[str, str],
     reason: str | None,
 ) -> None:
-    from curie_api import workitem_outcomes
     from curie_api.factory_progress import record_verification
+    from curie_api.forges.github import ci
 
     monkeypatch.setenv("GITHUB_FACTORY_PYTHON_CI", CONVERSION_PYTHON_CI_ENV)
     get_settings.cache_clear()
@@ -2384,14 +2485,15 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
         {"id": uuid.UUID(publication["id"])},
     )
 
-    async def green_ci(*args: Any, **kwargs: Any) -> SimpleNamespace:
+    async def green_ci(*args: Any, **kwargs: Any) -> CiDetail:
         return _factory_ci_detail(
             runs=[]
             if python_check is None
             else [_actions_check_run(7002, PYTHON_CI_CHECK, python_check)]
         )
 
-    monkeypatch.setattr(workitem_outcomes, "observe_ci_detail", green_ci)
+    # The gate reads CI through the code host, which reads it here.
+    monkeypatch.setattr(ci, "read_ci_detail", green_ci)
 
     async def settlement(session: AsyncSession) -> Any:
         return await workitems.claim_publication_settlement(
@@ -2519,7 +2621,7 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
     assert len(excerpt.splitlines()) <= 80
     assert token not in excerpt
     assert factory_ci.decide(
-        detail,
+        ci_view(detail),
         python_ci=None,
         metadata_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
@@ -2529,7 +2631,12 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
         changed_paths=[],
     ).kind == "failing"
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     lines = prompt.splitlines()
     assert len(lines) == 4
@@ -2606,7 +2713,12 @@ def test_actions_log_failure_keeps_the_failing_ci_observation(
     assert detail.job_logs == {}
     assert detail.job_log_unavailable == {FAILING_RUN_ID}
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     report = json.loads(prompt.splitlines()[3])
     assert report["failing_checks"] == [
@@ -2665,7 +2777,7 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
     assert "early failure context" not in excerpt
     assert token not in excerpt
     assert factory_ci.decide(
-        detail,
+        ci_view(detail),
         python_ci=None,
         metadata_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
@@ -2675,7 +2787,12 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
         changed_paths=[],
     ).kind == "failing"
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
     assert diagnostic in entry["job_log"]
@@ -2712,7 +2829,12 @@ def test_actions_log_redacts_generic_key_assignments_in_observation_and_prompt(
     assert (detail.state, detail.reason) == ("observed", None)
     excerpt = detail.job_logs[FAILING_RUN_ID]
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
     assert diagnostic in excerpt
@@ -2750,7 +2872,7 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
     assert detail.job_logs == {}
     assert detail.job_log_unavailable == {FAILING_RUN_ID}
     assert factory_ci.decide(
-        detail,
+        ci_view(detail),
         python_ci=None,
         metadata_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
@@ -2760,7 +2882,12 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
         changed_paths=[],
     ).kind == "failing"
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
     assert entry["name"] == "unit-tests"
@@ -2798,7 +2925,12 @@ def test_ci_detail_notes_every_failing_actions_job_when_downloads_are_capped(
     job_requests = [request for request in seen if "/actions/jobs/" in request.url.path]
     assert len(job_requests) == 5
     prompt = factory_ci.continuation_text(
-        f"https://github.com/{REPO}/issues/9101", PR_URL, HEAD_SHA, 2, detail
+        f"https://github.com/{REPO}/issues/9101",
+        PR_URL,
+        HEAD_SHA,
+        2,
+        ci_view(detail),
+        diagnostics=True,
     )
     checks = json.loads(prompt.splitlines()[3])["failing_checks"]
     assert [entry["name"] for entry in checks] == [f"job-{i}" for i in range(6)]
@@ -2849,9 +2981,9 @@ def test_ci_detail_stalled_mint_releases_the_caller_with_timeout(
 
     import anyio
     import anyio.to_thread
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    monkeypatch.setattr(workitem_outcomes, "CI_DETAIL_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(ci, "CI_DETAIL_DEADLINE_SECONDS", 0.05)
 
     async def never_returns(func: Any, *args: Any, **kwargs: Any) -> Any:
         await anyio.Event().wait()
@@ -2869,10 +3001,10 @@ def test_ci_detail_shares_the_bounded_credential_slots(
 ) -> None:
     """The detail observer mints through the same guard as observe_ci."""
 
-    from curie_api import workitem_outcomes
+    from curie_api.forges.github import ci
 
-    assert workitem_outcomes.mint_ci_token is not None
-    for _ in range(workitem_outcomes.CI_CREDENTIAL_SLOTS + 1):
+    assert ci.mint_ci_token is not None
+    for _ in range(ci.CI_CREDENTIAL_SLOTS + 1):
         failed, _ = _observe_detail(
             monkeypatch, _detail_handler(), creds=_FakeCreds(error=GitHubAppError("boom"))
         )
@@ -2880,3 +3012,88 @@ def test_ci_detail_shares_the_bounded_credential_slots(
         assert failed.reason != "observation_busy"
     healthy, _ = _observe_detail(monkeypatch, _detail_handler())
     assert healthy.reason is None
+
+
+# --- the CI view reads through the code host port (#3831) ---------------------
+
+
+class _RollupHost:
+    def __init__(self, answer: Any) -> None:
+        self.answer = answer
+        self.calls: list[tuple[RepositoryRef, str]] = []
+
+    async def observe_ci(self, repository: RepositoryRef, head_sha: str) -> Any:
+        self.calls.append((repository, head_sha))
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return CiRollup.on_head(head_sha, self.answer)
+
+
+def _check(key: str, state: CheckState) -> NormalizedCheck:
+    return NormalizedCheck(key=key, state=state, head_sha=HEAD_SHA, name=key)
+
+
+def _ci_view(host: _RollupHost, **lineage: Any) -> Any:
+    values: dict[str, Any] = {
+        "pr_number": PR_NUMBER,
+        "head_sha": HEAD_SHA,
+        "repo_full_name": REPO,
+        "repository_project_id": None,
+    }
+    values.update(lineage)
+    return asyncio.run(
+        workitem_outcomes.observe_ci(
+            host,  # type: ignore[arg-type]
+            get_settings(),
+            SimpleNamespace(**values),  # type: ignore[arg-type]
+            SimpleNamespace(repository_project_id="101"),  # type: ignore[arg-type]
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("checks", "state"),
+    [
+        ((), "none"),
+        ((_check("unit", CheckState.PENDING),), "pending"),
+        (
+            (_check("unit", CheckState.SUCCESS), _check("status:lint", CheckState.SUCCESS)),
+            "passing",
+        ),
+        (
+            (_check("unit", CheckState.SUCCESS), _check("status:lint", CheckState.FAILURE)),
+            "failing",
+        ),
+    ],
+)
+def test_ci_view_maps_the_code_host_rollup(checks: tuple[NormalizedCheck, ...], state: str) -> None:
+    host = _RollupHost(checks)
+
+    view = _ci_view(host)
+
+    assert (view.state, view.reason, view.head_sha) == (state, None, HEAD_SHA)
+    [(repository, head)] = host.calls
+    assert (repository.project_id, repository.path, head) == ("101", REPO, HEAD_SHA)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        Unauthorized("app_not_configured"),
+        Unavailable("github_rate_limited"),
+        NotFound("github_not_found"),
+    ],
+)
+def test_ci_view_failures_are_unavailable_with_the_fixed_reason(error: Exception) -> None:
+    view = _ci_view(_RollupHost(error))
+
+    assert (view.state, view.reason, view.head_sha) == ("unavailable", str(error), HEAD_SHA)
+
+
+def test_ci_view_without_a_pull_request_or_head_reads_nothing() -> None:
+    host = _RollupHost(())
+
+    assert _ci_view(host, pr_number=None).state == "not_applicable"
+    unread = _ci_view(host, head_sha=None)
+    assert (unread.state, unread.reason) == ("unavailable", "no_head_sha")
+    assert host.calls == []

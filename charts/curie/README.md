@@ -1809,6 +1809,36 @@ the changed files with the repository's Actions secrets before a person
 reviews the pull request. Keep those secrets in GitHub environments that
 require reviewers.
 
+The publication Job only pushes. It takes the repository origin, the
+credential's header form and the optional CA bundle path from the API's push
+credential, and makes no code host API call. The API finds or opens the pull
+request after the push, and updates the title and body for a metadata only
+revision without any Job (ADR 0197).
+
+### Code host CA bundle
+
+A self-managed code host whose certificate no public root covers needs one PEM
+bundle, supplied as a ConfigMap you create:
+
+```yaml
+codeHostTrust:
+  caBundle:
+    configMapRef:
+      name: corp-code-host-ca   # empty (the default) changes nothing
+      key: ca.crt
+```
+
+The chart mounts that key read-only at `/etc/curie/code-host-trust/ca.crt` in
+the api, the worker and every sandbox runner, and the worker mounts the same
+ConfigMap into every publication Job. The api trusts it beside the public roots
+for its code host HTTP clients (`CURIE_CODE_HOST_CA_BUNDLE`) and names it in
+every repository credential. The runner and the publication Job point
+`GIT_SSL_CAINFO`, `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` at it and receive
+`CURIE_REPO_CA_BUNDLE`. Create the ConfigMap in the publication namespace too
+when `worker.publication.namespace` names a different one. The worker's own
+workspace clone uses `http.sslCAInfo` with the same path, so the worker pod
+needs the mount the chart already gives it.
+
 One allowed root `https://github.com/owner/repository` URL in the initial
 message establishes the thread's selection and causes the worker to acquire its
 managed workspace at claim time. An initial message without a repository URL

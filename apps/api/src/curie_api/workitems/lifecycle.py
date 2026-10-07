@@ -22,7 +22,8 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from .. import transcripts
 from ..config import get_settings
-from ..factory_reply_target import parse_reply_target
+from ..forges.github.binding import github_reply_route
+from ..forges.types import RepositoryRef, TrackerIssueRef
 from ..models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     Agent,
@@ -109,14 +110,48 @@ def _pending_readmit_base(work_item: WorkItem) -> ResolvedBase | None:
     return ResolvedBase(branch, cast(Literal["label", "default"], source), commit)
 
 
+def work_item_identity_values(
+    issue: TrackerIssueRef, repository: RepositoryRef
+) -> dict[str, str | None]:
+    """The WorkItem identity columns for one tracker issue and its repository."""
+
+    return {
+        "tracker_kind": issue.kind,
+        "tracker_host": issue.host,
+        "tracker_scope_id": issue.scope_id,
+        "tracker_issue_id": issue.issue_id,
+        "tracker_display_key": issue.display_key,
+        "code_host_kind": repository.kind,
+        "code_host_host": repository.host,
+        "repository_project_id": repository.project_id,
+        "repository_path": repository.path,
+    }
+
+
+def for_tracker_issue(issue: TrackerIssueRef) -> tuple[ColumnElement[bool], ...]:
+    """The predicates selecting the one WorkItem keyed by ``issue``."""
+
+    return (
+        WorkItem.tracker_kind == issue.kind,
+        WorkItem.tracker_host == issue.host,
+        WorkItem.tracker_scope_id == issue.scope_id,
+        WorkItem.tracker_issue_id == issue.issue_id,
+    )
+
+
+def same_repository(stored: RepositoryRef, other: RepositoryRef) -> bool:
+    """Identity and path both match. `RepositoryRef` equality ignores the path."""
+
+    return stored == other and stored.path == other.path
+
+
 @dataclass(frozen=True)
 class WorkItemSnapshot:
     id: uuid.UUID
-    github_repository_id: int
-    github_issue_number: int
-    github_installation_id: int
+    tracker_issue: TrackerIssueRef
+    repository: RepositoryRef
+    code_host_installation_id: int | None
     agent_id: uuid.UUID
-    repo_full_name: str
     conversation_id: str
     publication_lineage_id: uuid.UUID | None
     cancelled_at: datetime | None
@@ -161,11 +196,10 @@ WorkItemResult = WorkItemOutcome | WorkItemConflict
 def _work_item_snapshot(row: WorkItem) -> WorkItemSnapshot:
     return WorkItemSnapshot(
         id=row.id,
-        github_repository_id=row.github_repository_id,
-        github_issue_number=row.github_issue_number,
-        github_installation_id=row.github_installation_id,
+        tracker_issue=row.tracker_issue,
+        repository=row.repository,
+        code_host_installation_id=row.code_host_installation_id,
         agent_id=row.agent_id,
-        repo_full_name=row.repo_full_name,
         conversation_id=row.conversation_id,
         publication_lineage_id=row.publication_lineage_id,
         cancelled_at=row.cancelled_at,
@@ -224,15 +258,6 @@ async def _conflict(
     )
     await session.commit()
     return result
-
-
-GITHUB_CHANNEL_KIND = "github"
-
-
-def github_reply_route(repo_full_name: str, issue_number: int) -> tuple[str, str, str]:
-    """The reply kind, address, and conversation id a GitHub issue replies on."""
-
-    return GITHUB_CHANNEL_KIND, repo_full_name, f"issue-{issue_number}"
 
 
 async def database_now(session: AsyncSession) -> datetime:
@@ -446,18 +471,19 @@ async def reload_request(session: AsyncSession, request_id: uuid.UUID) -> Execut
 async def create_or_get_work_item(
     session: AsyncSession,
     *,
-    github_repository_id: int,
-    github_issue_number: int,
-    github_installation_id: int,
+    issue: TrackerIssueRef,
+    repository: RepositoryRef,
+    code_host_installation_id: int | None,
     agent_id: uuid.UUID,
-    repo_full_name: str,
     conversation_id: str,
     base: ResolvedBase | None = None,
 ) -> WorkItemResult:
     """Insert the WorkItem, or return the existing one for the same issue.
 
-    The base fields (ADR 0186) are written on insert only. A replay does not
-    compare them: the base an existing WorkItem recorded is the one it keeps.
+    The issue is the key (ADR 0197). The repository and installation are
+    frozen on insert; a replay must name the same ones. The base fields (ADR
+    0186) are written on insert only. A replay does not compare them: the base
+    an existing WorkItem recorded is the one it keeps.
     """
 
     new_id = uuid.uuid4()
@@ -465,11 +491,9 @@ async def create_or_get_work_item(
         insert(WorkItem)
         .values(
             id=new_id,
-            github_repository_id=github_repository_id,
-            github_issue_number=github_issue_number,
-            github_installation_id=github_installation_id,
+            **work_item_identity_values(issue, repository),
+            code_host_installation_id=code_host_installation_id,
             agent_id=agent_id,
-            repo_full_name=repo_full_name,
             conversation_id=conversation_id,
             base_branch=None if base is None else base.branch,
             base_source=None if base is None else base.source,
@@ -478,7 +502,12 @@ async def create_or_get_work_item(
             next_sequence=1,
         )
         .on_conflict_do_nothing(
-            index_elements=[WorkItem.github_repository_id, WorkItem.github_issue_number]
+            index_elements=[
+                WorkItem.tracker_kind,
+                WorkItem.tracker_host,
+                WorkItem.tracker_scope_id,
+                WorkItem.tracker_issue_id,
+            ]
         )
         .returning(WorkItem.id)
     )
@@ -490,19 +519,16 @@ async def create_or_get_work_item(
 
     work_item = await session.scalar(
         select(WorkItem)
-        .where(
-            WorkItem.github_repository_id == github_repository_id,
-            WorkItem.github_issue_number == github_issue_number,
-        )
+        .where(*for_tracker_issue(issue))
         .with_for_update()
         .execution_options(populate_existing=True)
     )
     if work_item is None:
         return await _conflict(session, "identity_mismatch")
     exact_replay = (
-        work_item.github_installation_id == github_installation_id
+        work_item.code_host_installation_id == code_host_installation_id
         and work_item.agent_id == agent_id
-        and work_item.repo_full_name == repo_full_name
+        and same_repository(work_item.repository, repository)
         and work_item.conversation_id == conversation_id
     )
     if not exact_replay:
@@ -610,7 +636,7 @@ async def create_revision_request(
     request_id: uuid.UUID,
     wait_deadline: datetime,
     expected_work_item_version: int,
-    snapshot: Mapping[str, str],
+    snapshot: Mapping[str, str | None],
 ) -> WorkItemResult:
     """Store a mention in sequence without interrupting the live request."""
 
@@ -719,22 +745,18 @@ async def admit_next_revision(
     cause: str | None = None
     if work_item.cancelled_at is not None:
         cause = "issue_cancelled"
-    elif request.objective is not None:
-        target = parse_reply_target(
-            request.objective,
-            repo_full_name=work_item.repo_full_name,
-            clone_base=get_settings().github_clone_base,
-        )
-        if target.pr_number is not None:
-            lineage = await session.get(
-                ThreadPublicationLineage, work_item.publication_lineage_id
-            ) if work_item.publication_lineage_id is not None else None
-            if (
-                lineage is None
-                or lineage.status != "open"
-                or lineage.pr_number != target.pr_number
-            ):
-                cause = "lineage_closed"
+    elif request.reply_target_pr_number is not None:
+        # A revision answers on its pull request: it runs only while that
+        # pull request is still the WorkItem's open lineage.
+        lineage = await session.get(
+            ThreadPublicationLineage, work_item.publication_lineage_id
+        ) if work_item.publication_lineage_id is not None else None
+        if (
+            lineage is None
+            or lineage.status != "open"
+            or str(lineage.pr_number) != request.reply_target_pr_number
+        ):
+            cause = "lineage_closed"
     if cause is not None:
         status = "cancelled"
         values: dict[str, Any] = {"terminal_at": now, "terminal_cause": cause}
@@ -1008,14 +1030,11 @@ async def link_publication_lineage(
     if lineage is None or (
         lineage.agent_id != work_item.agent_id
         or lineage.conversation_id != work_item.conversation_id
-        or lineage.repo_full_name.casefold() != work_item.repo_full_name.casefold()
+        or lineage.repo_full_name.casefold() != work_item.repository_path.casefold()
+        or (lineage.repository is not None and lineage.repository != work_item.repository)
         or (
-            lineage.github_repository_id is not None
-            and lineage.github_repository_id != work_item.github_repository_id
-        )
-        or (
-            lineage.github_installation_id is not None
-            and lineage.github_installation_id != work_item.github_installation_id
+            lineage.code_host_installation_id is not None
+            and lineage.code_host_installation_id != work_item.code_host_installation_id
         )
     ):
         return await _conflict(
@@ -1688,7 +1707,7 @@ async def admit_pending_readmit(
         return None
     request_id = work_item.readmit_request_id
     reply_kind, reply_address, reply_conversation_id = github_reply_route(
-        work_item.repo_full_name, work_item.github_issue_number
+        work_item.repository_path, int(work_item.tracker_issue_id)
     )
     snapshot: dict[str, Any] = {
         "objective": work_item.readmit_objective,

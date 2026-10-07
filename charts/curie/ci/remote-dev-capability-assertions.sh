@@ -294,14 +294,17 @@ if not any(m.get("name") == "workspace" and m.get("mountPath") == "/workspace"
            for m in runner.get("volumeMounts", [])):
     fail("runner must share workspace at /workspace")
 
+# The signed object facts plus the trusted origin and repository path the
+# worker's claim fills from the API credential (ADR 0197). The template only
+# declares them, empty, so the claim can target this init container.
 signed_workspace_facts = {
-    "CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256", "CURIE_GITHUB_API_URL",
+    "CURIE_WORKSPACE_REF", "CURIE_WORKSPACE_SHA256", "CURIE_REPO_ORIGIN", "CURIE_REPO_PATH",
 }
 fetch_env = set(env_map(workspace_init))
 if fetch_env != signed_workspace_facts:
     fail(
-        "workspace-init must carry the signed object facts and configured GitHub API URL; "
-        f"rendered env was {sorted(fetch_env)}"
+        "workspace-init must carry the signed object facts and the claim's repository "
+        f"origin and path; rendered env was {sorted(fetch_env)}"
     )
 
 names = set(env_map(workspace_init))
@@ -322,9 +325,12 @@ if leaked:
     )
 
 runner_env = env_map(runner)
+for name in ("CURIE_REPO_ORIGIN", "CURIE_REPO_PATH"):
+    if env_map(workspace_init)[name].get("value") != "":
+        fail(f"workspace-init must declare {name} empty; only the claim may fill it")
 for consumer in (workspace_init, runner):
-    if env_map(consumer).get("CURIE_GITHUB_API_URL", {}).get("value") != "https://api.github.com":
-        fail(f"{consumer['name']} must receive the configured GitHub API URL")
+    if "CURIE_GITHUB_API_URL" in env_map(consumer):
+        fail(f"{consumer['name']} must not derive the repository origin from a GitHub API URL")
 forbidden_runner = {
     "S3_ACCESS_KEY", "S3_SECRET_KEY", "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "GH_TOKEN", "GITHUB_APP_ID",
@@ -417,19 +423,21 @@ server = http.server.ThreadingHTTPServer(
 thread = threading.Thread(target=server.serve_forever, daemon=True)
 thread.start()
 try:
-    for html_base in ("https://github.example.com", "https://github.example.com/forge"):
-        api_url = f"{html_base}/api/v3"
-        rendered = subprocess.run(
-            [
-                "helm", "template", "remote-dev", str(chart),
-                "-f", str(chart / "values-dev.yaml"),
-                "--show-only", "templates/agent-sandbox.yaml",
-                "--set", "agentSandbox.deploy=true",
-                "--set", "agentSandbox.controller.deploy=false",
-                "--set", f"api.githubApiUrl={api_url}",
-            ],
-            check=True, capture_output=True, text=True,
-        )
+    rendered = subprocess.run(
+        [
+            "helm", "template", "remote-dev", str(chart),
+            "-f", str(chart / "values-dev.yaml"),
+            "--show-only", "templates/agent-sandbox.yaml",
+            "--set", "agentSandbox.deploy=true",
+            "--set", "agentSandbox.controller.deploy=false",
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    for html_base, repo_path in (
+        ("https://github.example.com", "acme-corp/acme-bot"),
+        ("https://github.example.com/forge", "acme-corp/acme-bot"),
+        ("https://gitlab.example.com/scm", "platform/team/acme-bot"),
+    ):
         sandbox = next(
             doc for doc in yaml.safe_load_all(rendered.stdout)
             if doc and doc.get("kind") == "SandboxTemplate"
@@ -445,25 +453,25 @@ try:
         init_script = init_script.replace(
             production_root, f"root = pathlib.Path({str(root)!r})", 1
         )
-        for container in (init, runner):
-            env = {entry["name"]: entry.get("value") for entry in container["env"]}
-            assert env["CURIE_GITHUB_API_URL"] == api_url, container["name"]
         init_env = {entry["name"]: entry["value"] for entry in init["env"]}
-        clean_origin = f"{html_base}/acme-corp/acme-bot.git"
+        # What the worker's claim injects from the API credential.
+        claim_env = {"CURIE_REPO_ORIGIN": html_base, "CURIE_REPO_PATH": repo_path}
+        clean_origin = f"{html_base}/{repo_path}.git"
         cases = [
             (clean_origin, True),
-            ("https://github.com/acme-corp/acme-bot.git", False),
-            ("https://other.example.com/acme-corp/acme-bot.git", False),
+            (f"https://github.com/{repo_path}.git", False),
+            (f"https://other.example.com/{repo_path}.git", False),
+            (f"{html_base}/acme-corp/other.git", False),
             (clean_origin.replace("https://", "http://", 1), False),
             (clean_origin.replace("https://", "https://token@", 1), False),
             (f"{clean_origin}/", False),
             (clean_origin.removesuffix(".git"), False),
             (f"{clean_origin}?download=1", False),
             (f"{clean_origin}#HEAD", False),
-            (f"{html_base}/acme-corp//acme-bot.git", False),
+            (f"{html_base}/{repo_path.replace('/', '//', 1)}.git", False),
         ]
-        if html_base.endswith("/forge"):
-            cases.append(("https://github.example.com/acme-corp/acme-bot.git", False))
+        if html_base.endswith(("/forge", "/scm")):
+            cases.append((f"https://{html_base.split('/')[2]}/{repo_path}.git", False))
         for origin, accepted in cases:
             subprocess.run(
                 ["git", "-C", str(fixture), "remote", "set-url", "origin", origin],
@@ -481,6 +489,7 @@ try:
             env = {
                 "PATH": os.environ["PATH"],
                 **init_env,
+                **claim_env,
                 "CURIE_WORKSPACE_REF": reference,
                 "CURIE_WORKSPACE_SHA256": digest,
             }
@@ -506,5 +515,5 @@ finally:
     thread.join(timeout=5)
     assert not thread.is_alive(), "workspace object server did not stop"
 
-print("workspace-init configured GitHub host behavior assertions passed")
+print("workspace-init claim origin and path behavior assertions passed")
 PY

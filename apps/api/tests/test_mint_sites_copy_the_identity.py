@@ -254,8 +254,8 @@ def test_github_review_copies_the_binding_identity(clean_db) -> None:
                 endpoint=endpoint,
                 adapter=adapter,
             )
-            # The lineage's own GitHub identity columns are left NULL (the
-            # all-or-nothing half of `thread_publication_lineages_github_identity_ck`)
+            # The lineage's own code host identity columns are left NULL (the
+            # all-or-nothing half of `thread_publication_lineages_code_host_identity_ck`)
             # -- `review_turn` never reads them, only `context.binding` and
             # `context.conversation_id`.
             lineage = ThreadPublicationLineage(

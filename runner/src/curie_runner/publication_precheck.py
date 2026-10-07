@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -66,9 +67,19 @@ class PublicationPrecheck:
     """
 
     def __init__(
-        self, workspace: Path | None, trusted_url: str | None, *, network_enabled: bool
+        self,
+        workspace: Path | None,
+        trusted_url: str | None,
+        *,
+        network_enabled: bool,
+        repo_origin: str | None,
+        repo_path: str | None,
     ) -> None:
         self._workspace = workspace
+        # The boot env's code host origin and repository path (ADR 0197); the
+        # snapshot check trusts them exactly as the publication snapshot does.
+        self._repo_origin = repo_origin
+        self._repo_path = repo_path
         self._trusted_origin = _origin(trusted_url)
         self._network_enabled = network_enabled
         self._context: PublicationContext | None = None
@@ -154,7 +165,13 @@ class PublicationPrecheck:
             return "precheck_unavailable: The managed workspace is unavailable."
         try:
             snapshot = await anyio.to_thread.run_sync(
-                capture_workspace_snapshot, self._workspace, abandon_on_cancel=True
+                partial(
+                    capture_workspace_snapshot,
+                    self._workspace,
+                    trusted_origin=self._repo_origin,
+                    repository_path=self._repo_path,
+                ),
+                abandon_on_cancel=True,
             )
         except Exception:  # noqa: BLE001 - existing broad catch retained
             return (
