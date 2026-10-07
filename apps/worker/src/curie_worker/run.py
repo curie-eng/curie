@@ -48,6 +48,7 @@ from .binding import BindingResolver
 from .bundle_store import BundleStore
 from .config import WorkerConfig
 from .connector_loop import ConnectorReconcileLoop, HttpManifestSource
+from .connector_probe import DbCapabilityRows, HttpProbeRequester, ProbeTrigger
 from .consumer import Consumer
 from .consumer_liveness import ConsumerLivenessStore, ThreadLockOwnerLiveness
 from .cron_loop import BundleTriggerSource, CronSchedulerLoop, TriggerSource
@@ -775,7 +776,7 @@ def build(
             if work_items is not None
             else None
         ),
-        connector_loop=_build_connector_loop(config, engine),
+        connector_loop=_build_connector_loop(config, engine, client=eval_http),
         action_executor=_build_action_executor(
             config,
             engine,
@@ -1144,7 +1145,10 @@ def _build_action_executor(
 
 
 def _build_connector_loop(
-    config: WorkerConfig, engine: AsyncEngine
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    *,
+    client: httpx.AsyncClient | None = None,
 ) -> ConnectorReconcileLoop | None:
     """The connector reconcile loop, or None when it is switched off.
 
@@ -1170,6 +1174,34 @@ def _build_connector_loop(
         namespace=config.connector_namespace,
         db_schema=config.db_schema,
         interval_seconds=config.connector_reconcile_interval_s,
+        probe_trigger=_build_probe_trigger(config, engine, client=client),
+    )
+
+
+def _build_probe_trigger(
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    *,
+    client: httpx.AsyncClient | None,
+) -> ProbeTrigger | None:
+    """The capability probe trigger, or None when no executor could run a probe.
+
+    @spec ACTION-EXECUTOR-13. The probe route takes only the internal worker
+    token, and only an enabled executor claims what it creates, so without
+    both the reconcile runs exactly as before.
+    """
+
+    if not (config.action_executor_enabled and config.internal_worker_token):
+        return None
+    return ProbeTrigger(
+        requester=HttpProbeRequester(
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            worker_token=config.internal_worker_token,
+            client=client if client is not None else httpx.AsyncClient(),
+        ),
+        capabilities=DbCapabilityRows(engine, db_schema=config.db_schema),
+        release=config.connector_release,
     )
 
 
