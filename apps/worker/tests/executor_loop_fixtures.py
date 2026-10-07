@@ -152,7 +152,9 @@ class Execution:
             "dispatched_at": None,
             "finished_at": None,
             "created_at": now.isoformat(),
-            # The additive claim fields the loop needs (plan: AE-14 and AE-7).
+            # The additive claim fields the loop needs (AE-14 and AE-7), pinned on
+            # the real route by apps/api/tests/test_action_execution_routes.py:
+            # both on every execution, ``arguments_sha256`` null for a probe.
             "connector_digest": self.connector_digest,
             "arguments_sha256": self.arguments_sha256,
         }
