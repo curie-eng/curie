@@ -454,8 +454,10 @@ Without a spec, grade by the rules under Without a spec instead.
   later reply shows that the needed tool is absent or refused.
 - **UNCLEAR**, not FAIL, when the target says it lacks a tool, connector, gate
   or secret that only a source spec declares (see Where the spec comes from).
-  Give the reason "spec source may differ from deployment", and say a person
-  should check the deployed bundle or ask again with its spec marked `deployed`.
+  Write the reason verbatim: `spec source may differ from deployment`. Keep
+  that exact phrase in the UNCLEAR line; do not paraphrase it. Then say a
+  person should check the deployed bundle or ask again with its spec marked
+  `deployed`.
   A source spec is not evidence the target has it, just as an unshown read is
   not evidence the target lacked it.
 - **FAIL** if the target denies a capability that a deployed spec declares,
