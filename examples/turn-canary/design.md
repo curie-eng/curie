@@ -41,6 +41,11 @@ adapter is connected.
 - **TURN-CANARY-4: owned cleanup.** After every enqueued probe, including
   timeout and error paths, the checker computes the worker thread key with
   `channel_protocol.scoped_conversation_id` and the selected binding identity.
+  Before the stream enqueue can begin, it durably records the exact selected
+  agent ID and owned thread key in its persistent state. A crash or cancellation
+  leaves this intent in place; a fresh invocation refuses another enqueue until
+  an operator has confirmed the old route's release. The intent clears only
+  after the matching reset is confirmed, never merely after a reset request.
   It submits that key to `POST /agents/{agent_id}/threads/{thread_key}/reset`
   and polls the matching reset status endpoint until `requested` is false and
   `route_existed` is true. It never resets an unowned or guessed conversation.
