@@ -15,9 +15,11 @@ from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 # The connector name grammar of ``plugin_format.connectors`` (an RFC 1123
-# label), and the only digest form a pinned connector renders at.
-_CONNECTOR = r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
-_DIGEST = r"^sha256:[0-9a-f]{64}$"
+# label), and the only digest form a pinned connector renders at. Public because
+# the action completion (``schemas/actions.py``) stores the same pair.
+CONNECTOR_PATTERN = r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$"
+CONNECTOR_MAX_LENGTH = 63
+DIGEST_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 
 class _Closed(BaseModel):
@@ -28,8 +30,8 @@ class ProbeCreate(_Closed):
     """@spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13: exactly these three keys."""
 
     agent_id: uuid.UUID
-    connector: str = Field(min_length=1, max_length=63, pattern=_CONNECTOR)
-    digest: str = Field(pattern=_DIGEST)
+    connector: str = Field(min_length=1, max_length=CONNECTOR_MAX_LENGTH, pattern=CONNECTOR_PATTERN)
+    digest: str = Field(pattern=DIGEST_PATTERN)
 
 
 class ExecutionCreated(BaseModel):

@@ -24,6 +24,7 @@ which writes ``undone_at`` only when the restore is confirmed.
 import hashlib
 import json
 import logging
+import re
 import uuid
 from collections.abc import Sequence
 from typing import Annotated, NoReturn
@@ -53,7 +54,7 @@ from ..approval_auth import (
     authenticate_principal,
     principal_credentials_presented,
 )
-from ..auth import CONSOLE_SESSION_COOKIE, require_api_key
+from ..auth import CONSOLE_SESSION_COOKIE, require_api_key, verify_internal_worker_token
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, SessionDep, StoreDep, get_store
 from ..models import (
@@ -141,20 +142,52 @@ async def get_action(action_id: uuid.UUID, session: SessionDep, store: StoreDep)
     return (await _outs(session, store, [action]))[0]
 
 
+# A hosted connector's tool as the runner names it, ``mcp__<connector>__<tool>``,
+# with the connector half in the connector grammar (so ``mcp__plugin_*`` servers
+# name no connector).
+_HOSTED_TOOL = re.compile(r"^mcp__([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)__.+$")
+
+
+def _tool_connector(tool: str) -> str | None:
+    match = _HOSTED_TOOL.match(tool)
+    return match.group(1) if match else None
+
+
 @router.post("/{action_id}/complete", response_model=ActionOut)
 async def complete_action(
-    action_id: uuid.UUID, data: ActionComplete, session: SessionDep, store: StoreDep
+    action_id: uuid.UUID,
+    data: ActionComplete,
+    session: SessionDep,
+    store: StoreDep,
+    x_curie_worker_token: Annotated[str | None, Header(alias="X-Curie-Worker-Token")] = None,
 ) -> ActionOut:
     """Record what the tool answered.
 
     ``prior_state`` and ``target`` are what a restore replays. A completion that
     carries neither produces a record that is not undoable, which is the honest
     answer for a connector that replied in prose -- nothing has to declare it.
+
+    @spec ACTION-EXECUTOR-11 @spec ACTION-EXECUTOR-12: ``connector`` and
+    ``connector_digest`` are the worker's attribution, so a completion carrying
+    them also needs the internal worker token (403 otherwise), and the connector
+    must be the one the stored tool names (422 otherwise). Either refusal stores
+    nothing. A completion without them still takes the platform key alone.
     """
 
+    if data.connector is not None and not verify_internal_worker_token(x_curie_worker_token):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "connector attribution requires the internal worker token",
+            headers={"Cache-Control": "no-store"},
+        )
     action = await crud_actions.get_action(session, action_id)
     if action is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "action not found")
+    if data.connector is not None and _tool_connector(action.tool) != data.connector:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "connector is not the connector the action's tool names",
+        )
     completed = await crud_actions.complete_action(session, action, data)
     return (await _outs(session, store, [completed]))[0]
 

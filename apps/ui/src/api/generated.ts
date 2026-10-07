@@ -212,6 +212,12 @@ export interface paths {
          *     ``prior_state`` and ``target`` are what a restore replays. A completion that
          *     carries neither produces a record that is not undoable, which is the honest
          *     answer for a connector that replied in prose -- nothing has to declare it.
+         *
+         *     @spec ACTION-EXECUTOR-11 @spec ACTION-EXECUTOR-12: ``connector`` and
+         *     ``connector_digest`` are the worker's attribution, so a completion carrying
+         *     them also needs the internal worker token (403 otherwise), and the connector
+         *     must be the one the stored tool names (422 otherwise). Either refusal stores
+         *     nothing. A completion without them still takes the platform key alone.
          */
         post: operations["complete_action_actions__action_id__complete_post"];
         delete?: never;
@@ -2995,6 +3001,10 @@ export interface components {
          *     missing one.
          */
         ActionComplete: {
+            /** Connector */
+            connector?: string | null;
+            /** Connector Digest */
+            connector_digest?: string | null;
             /** Detail */
             detail?: string | null;
             /**
@@ -8267,6 +8277,7 @@ export interface operations {
         parameters: {
             query?: never;
             header?: {
+                "X-Curie-Worker-Token"?: string | null;
                 "x-api-key"?: string | null;
             };
             path: {

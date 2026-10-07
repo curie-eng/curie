@@ -295,7 +295,7 @@ the substrate the way `apps/worker/src/curie_worker/sandbox/claim_tokens.py::cla
 writes one for token-bearing claims: a copy of the agent's pool template with
 `CURIE_CREDENTIALS` and the model env-key declaration removed and the connector
 secret `secretKeyRef`s limited to the target connector's header set. Labels and
-the pool source stay the agent's, so reach is unchanged. Executor routes
+the pool source stay the agent's, so reach is unchanged. The template also drops every other model credential the runner's executor mode refuses (the SDK credential variables and the variable `CURIE_MODEL_ENV_KEY` names), from `env` and `envFrom`; a target connector secret that shares such a name is dropped too, which fails closed, and a `valueFrom` model env-key declaration refuses the claim. `resume` and `handoff` refuse an `action-exec:` route. Executor routes
 are excluded from `SandboxSubstrate.pressure_candidates`, so idle reclamation
 never selects one, and a quota rejection maps to `sandbox_unavailable`. The
 sandbox is released after the outcome is reported and on every error path.
@@ -506,7 +506,13 @@ a `restore_capable` capability row for that agent, connector and digest
 (ACTION-EXECUTOR-13), sealing key custody computed from the agent's in-force
 version at read and ruling time (ACTION-EXECUTOR-16), and no restore execution
 that is not `refused`. `undone_at` and `undone_by` are written
-only when a restore is confirmed. Rows written before this change, including
+only when a restore is confirmed. The completion route takes `connector` and `connector_digest` only
+together, only under the internal worker token (`403` otherwise), and only when
+`connector` is the `mcp__<connector>__` prefix of the action's stored tool
+(`422` otherwise); a refusal stores nothing. Every other completion field keeps
+the platform key, an accepted existing trust: a key holder can already write
+`prior_state`, `target` and `post_version`, but cannot attribute a digest.
+Rows written before this change, including
 any with a cleartext `prior_state`, are not undoable and are not migrated or
 purged. Audit evidence never stores a state or an envelope; refusals name
 versions. Ruling refusal codes for missing ingredients: `refused_unsealed`,
@@ -541,7 +547,10 @@ equal `spec.replicas`. The last condition is not redundant: during a surge
 rollout the first three can hold while an old pod still serves, which leaves
 `status.replicas` above `spec.replicas` (measurement M5). A failed read never
 fails the record or the turn. The local tier has no reconciled Deployment and
-records null.
+records null. The wrapper sends the pair on the completion under the internal
+worker token (ACTION-EXECUTOR-11); the worker composes it only when that token
+is configured. Each read makes one attempt, with no client retries, so an
+abandoned read does not outlive its bound.
 
 Acceptance (cluster): a call during a completed rollout records the digest; a
 call that straddles a rollout, a tag-referenced `image:` connector, a plugin

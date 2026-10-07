@@ -331,6 +331,12 @@ pub(super) async fn prepare_deploy_with_commit_sha(
         .with_context(|| format!("plugin dir not found: {}", opts.plugin_dir.display()))?;
     let (plugin_name, manifest_version) = read_manifest(&plugin_dir)?;
 
+    // Sealing key custody (ACTION-EXECUTOR-23), the API's refusal mirrored:
+    // first, before the unbound-secret gate (a plain-declared key would
+    // otherwise be answered as an unbound secret), before the Bearer secret
+    // lookup reads any value, and before any network call.
+    crate::sealing_key::refuse_sealing_key_custody(&plugin_dir)?;
+
     // Connector lock preflight (ADR 0113), before the bundle is packed so the
     // failure names the operator's own directory rather than a temp path, and
     // long before anything is applied. `opts.plugin_dir` (not the canonicalized
