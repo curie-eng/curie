@@ -42,6 +42,7 @@ from .graveyardwatcher import GraveyardWatcher
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
+from .protected_reconciler import ProtectedAdmissionReconciler
 from .resumequeue import ResumeQueue
 from .resumereconciler import ResumeReconciler
 from .routers import (
@@ -291,9 +292,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         source_gate_engine = create_source_gate_engine()
         source_resources.push_async_callback(source_gate_engine.dispose)
         app.state.source_gate = SourceGate(source_gate_engine)
+        # @spec PROTECTED-HOOK-LANE-4: one admission reconciler per process, inside
+        # the source resource scope, stopped before Valkey and the engines close.
+        protected_reconciler = ProtectedAdmissionReconciler(
+            lambda: get_settings().protected_runtime_dir
+        )
+        app.state.protected_admission_reconciler = protected_reconciler
+        protected_reconciler.start()
         try:
             yield
         finally:
+            await protected_reconciler.stop()
             notice_task = app.state.deploy_notice_reconciler_task
             if notice_task is not None:
                 notice_task.cancel()

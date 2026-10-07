@@ -203,6 +203,73 @@ if ! helm template curie "$CHART" \
   fail "legitimate connector-secret name GITHUB_PERSONAL_ACCESS_TOKEN failed to render"
 fi
 
+# @spec ACTION-EXECUTOR-16: key custody. The snapshot sealing key reaches only
+# the hosted connector, as a SecretRef. Under agentSandbox.connectorSecrets it
+# would land in the per-agent Secret the runner sandbox reads, so the render
+# fails and names the key -- a `fail`, not the silent skip the E2E names get,
+# because a skipped key would deploy a connector that cannot seal. Rendered
+# output and errors go to temp files, never through process arguments.
+custody_work="$(mktemp -d)"
+trap 'rm -rf "$custody_work"' EXIT
+
+for key in SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED; do
+  if helm template curie "$CHART" \
+    --set-string "agentSandbox.connectorSecrets.demo.${key}=seal-sentinel" \
+    >"$custody_work/out.yaml" 2>"$custody_work/err.txt"; then
+    fail "sealing key '${key}' under agentSandbox.connectorSecrets rendered instead of failing"
+  fi
+  # The custody refusal specifically (review L5): the path it was set under,
+  # the key, and the sealing-key wording. Any other guard that happens to name
+  # the key (the boot-env reserved guard, a schema error) does not satisfy it.
+  grep -qF "agentSandbox.connectorSecrets.demo.${key} is a reserved snapshot sealing key" \
+    "$custody_work/err.txt" \
+    || fail "sealing key '${key}' render failed without the custody refusal: $(head -c 400 "$custody_work/err.txt")"
+  grep -qF "SecretRef" "$custody_work/err.txt" \
+    || fail "sealing key '${key}' refusal does not say to declare it as a SecretRef"
+  if grep -qF "seal-sentinel" "$custody_work/err.txt"; then
+    fail "sealing key '${key}' refusal echoes the submitted value"
+  fi
+done
+
+# @spec ACTION-EXECUTOR-16 (review L4): agentSandbox.runner.extraEnv puts a
+# variable into every runner sandbox, so the sealing key there would reach
+# every agent's sandbox (and, outside the connector-secret marker, unredacted).
+# The render fails, naming the key, and never echoes the value.
+for key in SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED; do
+  if helm template curie "$CHART" \
+    --set-string "agentSandbox.runner.extraEnv[0].name=${key}" \
+    --set-string "agentSandbox.runner.extraEnv[0].value=seal-sentinel" \
+    >"$custody_work/out.yaml" 2>"$custody_work/err.txt"; then
+    fail "sealing key '${key}' under agentSandbox.runner.extraEnv rendered instead of failing"
+  fi
+  grep -qF "$key" "$custody_work/err.txt" \
+    || fail "sealing key '${key}' extraEnv render failed without naming it: $(head -c 400 "$custody_work/err.txt")"
+  grep -qi "sealing key" "$custody_work/err.txt" \
+    || fail "sealing key '${key}' extraEnv render failed without saying it is the sealing key: $(head -c 400 "$custody_work/err.txt")"
+  if grep -qF "seal-sentinel" "$custody_work/err.txt"; then
+    fail "sealing key '${key}' extraEnv refusal echoes the submitted value"
+  fi
+done
+
+# Paired control: an unreserved runner extraEnv name renders into the runner env.
+helm template curie "$CHART" \
+  --set-string 'agentSandbox.runner.extraEnv[0].name=MY_SEAL_KEY' \
+  --set-string 'agentSandbox.runner.extraEnv[0].value=seal-control' \
+  >"$custody_work/extra-control.yaml" 2>"$custody_work/extra-control-err.txt" \
+  || fail "unreserved runner extraEnv MY_SEAL_KEY failed to render: $(head -c 400 "$custody_work/extra-control-err.txt")"
+grep -Eq '^ +- name: MY_SEAL_KEY$' "$custody_work/extra-control.yaml" \
+  || fail "MY_SEAL_KEY did not render into the runner env via agentSandbox.runner.extraEnv"
+
+# Paired control: an unreserved name of the same shape renders and lands in the
+# per-agent Secret, so the refusal above cannot pass because connector Secrets
+# stopped rendering. (A plain MY_SEAL_KEY fails custody at the API instead.)
+helm template curie "$CHART" \
+  --set-string 'agentSandbox.connectorSecrets.demo.MY_SEAL_KEY=seal-control' \
+  >"$custody_work/control.yaml" 2>"$custody_work/control-err.txt" \
+  || fail "unreserved connector-secret name MY_SEAL_KEY failed to render: $(head -c 400 "$custody_work/control-err.txt")"
+grep -Eq '^  MY_SEAL_KEY: "seal-control"$' "$custody_work/control.yaml" \
+  || fail "MY_SEAL_KEY did not render into the per-agent connector Secret"
+
 # Per-agent egress (#1488): two agents with distinct connector CIDRs render
 # policies that select only that agent's pods. Cross-agent selection is the
 # leak this exists to prevent. The shared runner-allow-egress policy stays

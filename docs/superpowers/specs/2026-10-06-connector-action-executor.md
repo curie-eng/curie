@@ -286,14 +286,27 @@ boot env minus everything ACTION-EXECUTOR-4 excludes, minus every connector
 secret except those the target connector's derived MCP entry headers expand,
 plus the caller token and the runner-private `CURIE_RUNNER_MODE=execute`
 (not a `BootEnv` field; it joins the non-boot allowlist beside
-`CURIE_CONNECTOR_TOOL_GRANT`). The grant never rides claim env. Executor routes
+`CURIE_CONNECTOR_TOOL_GRANT`). The grant never rides claim env. Claim env
+cannot remove what the pool template already carries: the chart renders every
+`agentSandbox.connectorSecrets` name onto the runner as a `secretKeyRef` and
+bakes `CURIE_CREDENTIALS` into every non-fake runner template (measurement M3).
+The executor claim therefore runs from its own per-claim template, written by
+the substrate the way `apps/worker/src/curie_worker/sandbox/claim_tokens.py::claim_template_spec` already
+writes one for token-bearing claims: a copy of the agent's pool template with
+`CURIE_CREDENTIALS` and the model env-key declaration removed and the connector
+secret `secretKeyRef`s limited to the target connector's header set. Labels and
+the pool source stay the agent's, so reach is unchanged. Executor routes
 are excluded from `SandboxSubstrate.pressure_candidates`, so idle reclamation
 never selects one, and a quota rejection maps to `sandbox_unavailable`. The
 sandbox is released after the outcome is reported and on every error path.
 
 Acceptance (cluster): the executor sandbox reaches the agent's own connector
-and is refused at the network layer toward another agent's connector; its pool
-and labels equal an ordinary turn sandbox's for the same agent; under quota
+and is refused at the network layer toward another agent's connector; its
+labels and pool source equal an ordinary turn sandbox's for the same agent, and
+on an install with a real model credential (fake model off) the executor pod
+spec lists no `CURIE_CREDENTIALS`, no model env-key declaration and no
+connector secret outside the target's header set, while an ordinary turn's pod
+still lists them; under quota
 pressure an ordinary turn never reclaims a live executor sandbox and an
 executor claim over quota refuses `sandbox_unavailable`; the claim object
 carries no grant, envelope or secret value.
@@ -337,6 +350,15 @@ refusal with no call observed; `/v1/event` returns `409` in executor mode.
 
 ## Exact arguments and the paired verbs
 
+Each executor sandbox serves exactly one `call`. A `call` refused by a
+preflight check still consumes the sequence: any later `call` in the same
+sandbox is refused `phase_out_of_order` and dials nothing. A forward tool
+call follows `list` then `call`; the `observe` phase is accepted only before a
+restore. A `call` whose connector grant cannot be attached (for example a
+connector the executor cannot reach by URL) is refused before dispatch. `list`
+pagination and a `call` result are bounded (100 pages and 1 MiB), and exceeding
+either refuses or fails the execution without retrying.
+
 <!-- @spec ACTION-EXECUTOR-7 -->
 **ACTION-EXECUTOR-7. Exact canonical arguments, bound at the edge.** Canonical
 form is the proxy's: sorted keys, separators `,` and `:`, `ensure_ascii=False`.
@@ -355,6 +377,10 @@ canonicalizer and the proxy's production parser and asserts identical bytes,
 including non-ASCII strings and nested objects; at the real proxy, a replayed
 grant, a grant for other arguments and a call without a grant are refused; a
 forward request naming an ungated tool is refused before any sandbox claim.
+
+Canonicalization refuses values JSON cannot represent exactly, including
+NaN and infinities, on every side; the worker and the proxy share one
+canonicalizer implementation rather than copies.
 
 <!-- @spec ACTION-EXECUTOR-8 -->
 **ACTION-EXECUTOR-8. The paired verbs are the deploy-time capability rule.**
@@ -463,6 +489,12 @@ undoable; a secret in `result.summary` is scrubbed, the valid envelope beside it
 crosses unaltered, the frame is `redacted` and the record is not undoable; the
 existing redaction suites still pass.
 
+The held-literal check applies to the decoded ciphertext bytes as well as to
+the envelope text, so a plaintext secret wrapped in base64 withholds the replay
+inputs exactly as an unwrapped one does. `post_version` is at most 256 characters of
+printable ASCII without placeholders; the worker and the API both refuse a
+longer or malformed value rather than truncating it.
+
 <!-- @spec ACTION-EXECUTOR-11 -->
 **ACTION-EXECUTOR-11. The ledger records what a restore needs.** Additive
 columns on `agent_actions`: `post_version`, `connector`, `connector_digest`,
@@ -474,7 +506,13 @@ a `restore_capable` capability row for that agent, connector and digest
 (ACTION-EXECUTOR-13), sealing key custody computed from the agent's in-force
 version at read and ruling time (ACTION-EXECUTOR-16), and no restore execution
 that is not `refused`. `undone_at` and `undone_by` are written
-only when a restore is confirmed. Rows written before this change, including
+only when a restore is confirmed. The completion route takes `connector` and `connector_digest` only
+together, only under the internal worker token (`403` otherwise), and only when
+`connector` is the `mcp__<connector>__` prefix of the action's stored tool
+(`422` otherwise); a refusal stores nothing. Every other completion field keeps
+the platform key, an accepted existing trust: a key holder can already write
+`prior_state`, `target` and `post_version`, but cannot attribute a digest.
+Rows written before this change, including
 any with a cleartext `prior_state`, are not undoable and are not migrated or
 purged. Audit evidence never stores a state or an envelope; refusals name
 versions. Ruling refusal codes for missing ingredients: `refused_unsealed`,
@@ -502,8 +540,17 @@ connector's owned Deployment by name (a new single-object `get`, never
 seconds, so the wrapper adds at most four seconds per action, and a timeout or
 error records null. It records `connector` and `connector_digest` only when both
 reads show the same generation, a completed rollout and an image reference
-pinned by `@sha256:`. A failed read never fails the record or the turn. The
-local tier has no reconciled Deployment and records null.
+pinned by `@sha256:`. A read shows a completed rollout only when all four
+hold: `status.observedGeneration` is at least `metadata.generation`, and
+`status.updatedReplicas`, `status.availableReplicas` and `status.replicas` each
+equal `spec.replicas`. The last condition is not redundant: during a surge
+rollout the first three can hold while an old pod still serves, which leaves
+`status.replicas` above `spec.replicas` (measurement M5). A failed read never
+fails the record or the turn. The local tier has no reconciled Deployment and
+records null. The wrapper sends the pair on the completion under the internal
+worker token (ACTION-EXECUTOR-11); the worker composes it only when that token
+is configured. Each read makes one attempt, with no client retries, so an
+abandoned read does not outlive its bound.
 
 Acceptance (cluster): a call during a completed rollout records the digest; a
 call that straddles a rollout, a tag-referenced `image:` connector, a plugin
@@ -514,7 +561,9 @@ The worker's `get` on Deployments is granted only when the executor is enabled
 and the connector reconciler that already manages those Deployments is
 enabled; with the executor off, the worker Role is unchanged and actions record
 no digest, so they are not undoable. Least privilege outweighs recording digests
-for an executor that is not running.
+for an executor that is not running. The gate narrows the single-object read
+path rather than creating a read capability: the reconciler's existing `list`
+grant already returns the same Deployment objects (measurement M5).
 
 <!-- @spec ACTION-EXECUTOR-13 -->
 **ACTION-EXECUTOR-13. Restore capability from the advertised list.** When the

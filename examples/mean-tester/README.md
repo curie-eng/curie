@@ -295,6 +295,15 @@ target; the tester's own grading regressions remain in `evals/cases.json`.
 Human and campaign findings become permanent case drafts for a maintainer to
 commit. The shipped tool permissions and read-or-ask rule remain unchanged.
 
+## Models
+
+The recorded-exchange evals in `evals/cases.json` have been graded on Claude
+only. On another model, the tester's verdicts and its use of the gate are
+unverified. In one campaign on `z-ai/glm-5.3-flash`, the tester ended with an
+empty reply after its GitHub reads failed (#4130). Pin the tester to a Claude
+model (`curie cluster overrides <agent> --model …`) unless you have run the
+evals on the model you use.
+
 ## Evals
 
 Each case in [`evals/cases.json`](evals/cases.json) hands the tester a recorded

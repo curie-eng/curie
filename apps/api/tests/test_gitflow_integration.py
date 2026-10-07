@@ -43,6 +43,7 @@ from curie_api.db import create_sessionmaker
 from curie_api.deps import get_eval_queue
 from curie_api.github_review_audit import claim_push_delivery, settle_push_delivery
 from curie_api.routers import github as github_router
+from curie_api.storage import BundleStore
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_test_support.scaffold import scaffolded_deploy_yaml
 from opentelemetry.sdk.metrics import MeterProvider
@@ -3366,3 +3367,108 @@ def test_a_live_sibling_attach_whose_stored_object_exceeds_the_current_cap_repor
             "/deployments", params={"agent_id": dev_id}, headers=auth_headers
         ).json()
     ] == [activated.json()["id"]]
+
+
+# --------------------------------------------------------------------------- #
+# @spec ACTION-EXECUTOR-16: a prod promote re-checks sealing key custody
+# --------------------------------------------------------------------------- #
+
+_SEAL_IMAGE = "ghcr.io/example/k8s-restorer@sha256:" + "ab" * 32
+_SEAL_PLAIN = (
+    f"connectors:\n  k8s:\n    image: {_SEAL_IMAGE}\n    secrets:\n      - SNAPSHOT_SEALING_KEY\n"
+)
+_SEAL_SECRET_REF = (
+    f"connectors:\n  k8s:\n    image: {_SEAL_IMAGE}\n"
+    "    secrets:\n      - name: SNAPSHOT_SEALING_KEY\n        from_secret: k8s-restorer-seal\n"
+)
+
+
+def _replace_stored_bundle_with(agent_id: str, version_id: str, connectors_yaml: str) -> None:
+    """Point a stored version at bytes that never passed intake.
+
+    Simulates a bundle stored before the custody check existed: the bytes go
+    straight to the object store under a fresh key (keys are write-once) and
+    the version row is repointed with SQL.
+    """
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for rel, content in {**VALID_FILES, "connectors.yaml": connectors_yaml}.items():
+            data = content.encode()
+            info = tarfile.TarInfo(f"demo-plugin/{rel}")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    archive = buf.getvalue()
+
+    async def _run() -> None:
+        settings = get_settings()
+        store = BundleStore(settings)
+        key = f"bundles/{agent_id}/{version_id}-legacy-{uuid.uuid4().hex[:6]}.tar.gz"
+        await store.put(key, archive, "application/gzip")
+        engine = create_async_engine(settings.database_url)
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE curie.agent_versions SET bundle_ref = :ref, bundle_sha256 = :sha "
+                    "WHERE id = :id"
+                ),
+                {
+                    "ref": key,
+                    "sha": hashlib.sha256(archive).hexdigest(),
+                    "id": uuid.UUID(version_id),
+                },
+            )
+        await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def test_a_prod_promote_of_a_stored_bundle_declaring_the_sealing_key_plainly_is_refused(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """@spec ACTION-EXECUTOR-16: the promote reuses stored bytes without revalidating them.
+
+    `_read_stored_targets` deliberately skips `validate_bundle`, and
+    `revalidate_stored_bundle` re-checks only the caps. A version stored before
+    intake refused a plain `SNAPSHOT_SEALING_KEY` must not reach prod through
+    the reuse path either.
+    """
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    _replace_stored_bundle_with(agent_id, dev["version_id"], _SEAL_PLAIN)
+
+    body = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert body["status"] == "rejected", body
+    messages = [str(e.get("message", "")) for e in body.get("errors", [])]
+    assert any("SNAPSHOT_SEALING_KEY" in m and "SecretRef" in m for m in messages), body
+    deployments = client.get(
+        "/deployments", params={"agent_id": agent_id}, headers=auth_headers
+    ).json()
+    assert [d["environment"] for d in deployments] == ["dev"], deployments
+
+
+def test_a_prod_promote_of_a_stored_bundle_with_the_sealing_key_secret_ref_is_promoted(
+    client: Any,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    trusted_clone_base: Path,
+) -> None:
+    """@spec ACTION-EXECUTOR-16: the paired control; the repointed version still promotes."""
+
+    agent_id = _register_agent(client, auth_headers)
+    clone_url, sha = _build_bare_repo(trusted_clone_base, REPO, VALID_FILES)
+    dev = _post(client, "push", _push_payload("refs/heads/dev", sha, clone_url)).json()
+    assert dev["status"] == "deployed", dev
+    _replace_stored_bundle_with(agent_id, dev["version_id"], _SEAL_SECRET_REF)
+
+    body = _post(client, "push", _push_payload("refs/heads/main", sha, clone_url)).json()
+
+    assert body["status"] == "promoted", body
+    assert body["version_id"] == dev["version_id"], body

@@ -168,6 +168,17 @@ affinity:
 ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS ANTHROPIC_CUSTOM_HEADERS
 {{- end -}}
 
+{{/* @spec ACTION-EXECUTOR-16: the reserved snapshot sealing key names. The
+     source of truth is packages/curie-internal (module sealing_key); Helm
+     cannot import Python, so this is the second copy. Kept apart from
+     curie.reservedConnectorSecretNames because these are not boot-env names:
+     they are refused for a different reason (key custody) with a different
+     message, and the boot-env drift pin scans that define exactly. Emitted
+     space-separated for consumption via `splitList " "`. */}}
+{{- define "curie.sealingKeyNames" -}}
+SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED
+{{- end -}}
+
 {{/* ---- Backing-store hosts (in-cluster Service name, or BYO host) ---- */}}
 
 {{- define "curie.postgres.host" -}}

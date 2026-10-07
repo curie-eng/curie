@@ -1295,7 +1295,8 @@
           "reset",
           "status",
           "timeout",
-          "turn-admit"
+          "turn-admit",
+          "execute"
         ],
         "outcome": [
           "success",
@@ -1310,7 +1311,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 28,
+      "cardinality_bound": 32,
       "description": "Runner RPC request duration.",
       "monotonic": false,
       "type": "histogram",
@@ -1325,7 +1326,8 @@
           "reset",
           "status",
           "timeout",
-          "turn-admit"
+          "turn-admit",
+          "execute"
         ],
         "outcome": [
           "success",
@@ -1340,7 +1342,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 28,
+      "cardinality_bound": 32,
       "description": "Runner RPC outcomes.",
       "monotonic": true,
       "type": "counter",

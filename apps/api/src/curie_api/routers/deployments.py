@@ -45,6 +45,12 @@ async def create_deployment(
         await deploy.revalidate_stored_bundle(store, version)
     except deploy.BundleTooLarge as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    # @spec ACTION-EXECUTOR-16: a bundle stored before intake refused a
+    # non-SecretRef sealing key declaration is refused here too, before any row.
+    try:
+        await deploy.check_stored_sealing_key_custody(store, version)
+    except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     # The declared/bound approval-route join (#2436): this is the first moment
     # both halves are known for a specific agent, and the moment the version
     # becomes the thing that boots. AFTER the bounds check above, so an over-cap

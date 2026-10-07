@@ -396,6 +396,43 @@
       "struct": "ApprovalRecoveryOutcome",
       "schema": "ApprovalRecoveryOut",
       "omissions": []
+    },
+    {
+      "struct": "ActionRecord",
+      "schema": "ActionOut",
+      "omissions": [
+        {
+          "field": "prior_state",
+          "why": "The sealed snapshot envelope. ACTION-EXECUTOR-23: the actions verbs never print snapshot material, so the mirror drops it on decode and no output can carry it."
+        },
+        {
+          "field": "post_state",
+          "why": "The sealed post-action envelope; dropped on decode for the same reason as prior_state, so no actions output can carry snapshot material."
+        },
+        {
+          "field": "dedupe_key",
+          "why": "The recorder's idempotency key; the actions list and show verbs identify an action by its id and never resend a record."
+        }
+      ]
+    },
+    {
+      "struct": "ActionUndoReceipt",
+      "schema": "ActionUndoOut",
+      "omissions": []
+    },
+    {
+      "struct": "ActionExecution",
+      "schema": "ExecutionOut",
+      "omissions": [
+        {
+          "field": "lease_owner",
+          "why": "Worker lease bookkeeping; the actions execution receipt names what ran and how it ended (state and code), not which worker holds it."
+        },
+        {
+          "field": "lease_expires_at",
+          "why": "Worker lease bookkeeping; the actions execution receipt names state and code, not the lease."
+        }
+      ]
     }
   ],
   "non_mirrors": [
@@ -587,6 +624,16 @@
           "why": "The CLI triggers the agent's active dev deployment and scopes results by the returned sha; it never pins a version id."
         }
       ]
+    },
+    {
+      "struct": "ActionUndo",
+      "schema": "ActionUndo",
+      "omissions": [
+        {
+          "field": "actor",
+          "why": "ACTION-EXECUTOR-3: the actor is the authenticated principal from CURIE_APPROVAL_PRINCIPAL_TOKEN; the body's actor is only a cross-check, so actions undo never asserts one and sends {}."
+        }
+      ]
     }
   ],
   "requests": [
@@ -715,6 +762,12 @@
       "struct": "EvalTriggerRequest",
       "method": "post",
       "path": "/evals/trigger"
+    },
+    {
+      "function": "undo_action",
+      "struct": "ActionUndo",
+      "method": "post",
+      "path": "/actions/{action_id}/undo"
     }
   ],
   "_emits_comment": "The second, emit-hop gate (#699): a CliOutput::to_json can hand-project one of the mirror structs above into a serde_json::json! literal and drop a field the struct-level gate already proved it carries (the named drift was VersionsOutput dropping Version.id, fixed in #691). Each entry below declares that a specific `output` type's to_json projects a specific mirror `struct`, and every allowlisted omission needs a consumer-derived justification just like the mirrors list above. Check with: curie dev emit-parity. This is a narrower gate than the struct-level one: it verifies every DECLARED (output, struct) pair stays honest, but (unlike mirrors' UndeclaredStruct check) it cannot discover a NEW projection on its own -- see cli/tests/support/emit_parity.rs's module doc for why that reach is out of scope for a syntax-only check.",
@@ -845,6 +898,24 @@
         {
           "field": "source_bindings",
           "why": "Hook configuration has its own operator command. The overrides command changes model behavior only."
+        }
+      ]
+    },
+    {
+      "output": "ActionsOutput",
+      "struct": "ActionExecution",
+      "omissions": [
+        {
+          "field": "id",
+          "why": "The receipt names the execution as execution_id, the same key actions undo prints, so a script reads one key from the ruling and its receipt."
+        },
+        {
+          "field": "refusal_code",
+          "why": "Folded into the receipt's code (ACTION-EXECUTOR-18): a refused execution's code is its refusal code. At most one of refusal_code and failure_code is set, so code names it without a second key."
+        },
+        {
+          "field": "failure_code",
+          "why": "Folded into the receipt's code (ACTION-EXECUTOR-18): a failed or indeterminate execution's code is its failure code; code is null only for a confirmed one."
         }
       ]
     }

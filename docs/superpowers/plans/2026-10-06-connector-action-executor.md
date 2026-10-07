@@ -61,10 +61,33 @@ identifiers.
 * **M5.** Read a connector Deployment by name with the new `get` grant across a
   rollout and confirm the AE-12 bracket rule distinguishes a completed rollout
   from one in progress, and measure read latency against the two second bound.
+  Observed 2026-10-06 on a disposable single-node cluster at `346e21ba3`:
+  generation and availability alone called every one of 214 in-progress reads
+  completed, and updated plus available replicas still called 69 of them
+  completed while an old pod served; adding `status.replicas == spec.replicas`
+  misclassified none, so ACTION-EXECUTOR-12 now names all four conditions.
+  Over 727 reads p50 was 9.8 ms, p95 12.4 ms and max 20.0 ms against the two
+  second bound. Enabling the executor added only `get` on Deployments in the
+  release namespace; the reconciler's `list` already returns the same objects.
 * **M6.** Confirm that filtering `action-exec:` routes out of
   `SandboxSubstrate.pressure_candidates` keeps them out of
   `apps/worker/src/curie_worker/kernel/capacity.py::_reclaim_idle_route`, and
   observe the substrate's quota refusal for an executor claim.
+* **M3, M4 and M6, observed 2026-10-07** on a disposable cluster at `9313d753e`
+  with worker and runner images built from it. M3: `SandboxSubstrate.claim` has
+  no thread lock precondition for an `action-exec:` key, and pool, labels and
+  network reach match an ordinary turn; but the pool template injects every
+  connector secret and, with a real model credential, `CURIE_CREDENTIALS`, so
+  the executor pod received a non-target secret and the runner refused to boot
+  in executor mode. ACTION-EXECUTOR-5 now requires a stripped per-claim template,
+  and task 11 touches `apps/worker/src/curie_worker/sandbox/k8s.py` and
+  `apps/worker/src/curie_worker/sandbox/claim_tokens.py`. M4: at a real caller
+  proxy with `restore` gated, no grant and a replayed grant were refused, one
+  matching grant was accepted, and the connector saw one restore. M6: the kernel
+  takes reclaim candidates only from `pressure_candidates`, so the substrate
+  filter suffices; today executor routes are skipped only incidentally. An
+  executor claim over quota raised `CapacityExhaustedError` in about 0.1 s with
+  no route left behind.
 
 ### Parity seam entry added in task 2
 

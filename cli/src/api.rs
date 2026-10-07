@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::api_requests::{
-    AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
+    ActionUndo, AgentCreate, AgentUpdate, ApprovalPrincipalMint, ApprovalRecover, ApprovalResolve,
     ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
     DeploymentCreate, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
     ResolveTargetRequest, RoutingCheckRequest, VersionCreate,
@@ -1149,6 +1149,65 @@ pub struct WorkItemList {
     pub truncated: bool,
 }
 
+// @spec ACTION-EXECUTOR-23
+/// One ledger action as `GET /actions` and `GET /actions/{id}` serialize it
+/// (`ActionOut`), hand-mirrored the way [`WorkItemOutcome`] is. The sealed
+/// `prior_state` and `post_state` envelopes are deliberately NOT mirrored:
+/// serde drops them on decode, so no operator surface can print snapshot
+/// material. `undoable` is the API's derived answer, never recomputed here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionRecord {
+    pub id: String,
+    pub agent_id: Option<String>,
+    pub conversation_id: String,
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: Option<serde_json::Value>,
+    pub result: Option<serde_json::Value>,
+    pub target: Option<serde_json::Value>,
+    pub detail: Option<String>,
+    pub gate_approval_id: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+    pub undone_at: Option<String>,
+    pub undone_by: Option<String>,
+    pub undoable: bool,
+}
+
+// @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-3
+/// The undo ruling's `202` answer (`ActionUndoOut`): the execution it created
+/// and that execution's state. Only these two fields are mirrored, so any
+/// other field a response carries (a `target`, a `prior_state`) is dropped on
+/// decode and never reaches the terminal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionUndoReceipt {
+    pub execution_id: String,
+    pub state: String,
+}
+
+// @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-18
+/// One execution as `GET /action-executions/{id}` serializes it
+/// (`ExecutionOut`): what ran and how it ended, never a version, an argument
+/// or a state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionExecution {
+    pub id: String,
+    pub kind: String,
+    pub state: String,
+    pub agent_id: String,
+    pub connector: String,
+    pub tool: Option<String>,
+    pub subject_action_id: Option<String>,
+    pub requested_by: Option<String>,
+    pub attempt: i64,
+    pub refusal_code: Option<String>,
+    pub failure_code: Option<String>,
+    pub dispatched_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub created_at: String,
+}
+
 /// One factory work item outcome (`WorkItemOutcomeOut`, #2577). `state` and
 /// `actionable_cause` are API-derived strings the CLI renders verbatim.
 /// Unknown API fields are dropped on decode, so the `--json` envelope cannot
@@ -1829,12 +1888,16 @@ fn named_identity<'a>(kind: &str, adapter: Option<&'a str>) -> Option<&'a str> {
     adapter.filter(|adapter| !(kind == "slack" && *adapter == DEFAULT_SLACK_IDENTITY))
 }
 
-/// A binding write the platform refused over the identity it names.
-///
-/// @spec ADR-0168 d8. The refusal's own text is the answer (an undeclared
-/// identity, for instance), so it is carried verbatim rather than restated.
-fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> anyhow::Error {
-    let detail = serde_json::from_str::<serde_json::Value>(body)
+// @spec ACTION-EXECUTOR-23
+/// The undo ruling's `503` reason when the executor is switched off
+/// (`_EXECUTOR_DISABLED_REASON` in `apps/api/src/curie_api/routers/actions.py`).
+const ACTION_EXECUTOR_DISABLED_REASON: &str =
+    "the action executor is not enabled on this installation";
+
+/// The reason a FastAPI error body states: its `detail` string, or the joined
+/// `msg`s of a validation error's `detail` list. `None` for any other body.
+fn api_detail_reason(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|value| match &value["detail"] {
             serde_json::Value::String(text) => Some(text.clone()),
@@ -1847,7 +1910,14 @@ fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> an
             ),
             _ => None,
         })
-        .unwrap_or_else(|| body.trim().to_string());
+}
+
+/// A binding write the platform refused over the identity it names.
+///
+/// @spec ADR-0168 d8. The refusal's own text is the answer (an undeclared
+/// identity, for instance), so it is carried verbatim rather than restated.
+fn identity_refusal(kind: &str, address: &str, identity: &str, body: &str) -> anyhow::Error {
+    let detail = api_detail_reason(body).unwrap_or_else(|| body.trim().to_string());
     crate::exit::CliError::usage(format!(
         "the platform refused the {kind} binding on {address} under identity `{identity}`: {detail}"
     ))
@@ -3725,6 +3795,158 @@ impl ApiClient {
                 .with_fix("pass a work item id and --agent as UUIDs or a known agent name")
             }
             _ => return Self::expect_ok(resp, what).await,
+        };
+        Err(anyhow::Error::from(error))
+    }
+
+    /// The server's max page for `GET /actions` (`limit` is clamped to 200 by
+    /// the route), requested explicitly so a full page reads as truncated.
+    pub const ACTIONS_LIST_LIMIT: usize = 200;
+
+    // @spec ACTION-EXECUTOR-23
+    /// Ledger actions: `GET /actions[?agent_id=..][&conversation_id=..]&limit=..`,
+    /// on the platform key.
+    /// The API answers oldest first, so a full page is the oldest actions.
+    pub async fn list_actions(
+        &self,
+        agent_id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<Vec<ActionRecord>> {
+        let limit = Self::ACTIONS_LIST_LIMIT.to_string();
+        let mut query: Vec<(&str, &str)> = Vec::new();
+        if let Some(agent_id) = agent_id {
+            query.push(("agent_id", agent_id));
+        }
+        if let Some(conversation_id) = conversation_id {
+            query.push(("conversation_id", conversation_id));
+        }
+        query.push(("limit", limit.as_str()));
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/actions", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(&query),
+                "GET /actions",
+            )
+            .await?;
+        Self::expect_actions_ok(resp, "listing actions")
+            .await?
+            .json()
+            .await
+            .context("decoding actions")
+    }
+
+    // @spec ACTION-EXECUTOR-23
+    /// One ledger action: `GET /actions/{id}`, on the platform key.
+    pub async fn get_action(&self, action_id: &str) -> Result<ActionRecord> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/actions/{action_id}", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /actions/{id}",
+            )
+            .await?;
+        Self::expect_actions_ok(resp, "reading the action")
+            .await?
+            .json()
+            .await
+            .context("decoding the action")
+    }
+
+    // @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-3
+    /// Ask for an undo: `POST /actions/{id}/undo`. The ruling is authenticated
+    /// by the ADR-0106 principal alone (the route is deliberately not on the
+    /// platform key), and the body is `{}`: the actor is the principal, never
+    /// a claim in the body, and the platform observes the live state itself.
+    pub async fn undo_action(
+        &self,
+        action_id: &str,
+        principal_token: &str,
+    ) -> Result<ActionUndoReceipt> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!("{}/actions/{action_id}/undo", self.base_url))
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<ActionUndo>(&ActionUndo {}),
+                "POST /actions/{id}/undo",
+            )
+            .await?;
+        Self::expect_actions_ok(resp, "undo refused")
+            .await?
+            .json()
+            .await
+            .context("decoding the undo ruling")
+    }
+
+    // @spec ACTION-EXECUTOR-23 @spec ACTION-EXECUTOR-18
+    /// The receipt: `GET /action-executions/{id}`, on the platform key.
+    pub async fn get_action_execution(&self, execution_id: &str) -> Result<ActionExecution> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/action-executions/{execution_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /action-executions/{id}",
+            )
+            .await?;
+        Self::expect_actions_ok(resp, "reading the execution")
+            .await?
+            .json()
+            .await
+            .context("decoding the execution")
+    }
+
+    // @spec ACTION-EXECUTOR-23
+    /// ADR-0021 status classes for the action routes. A refusal's `detail` is
+    /// the API's stated reason and is carried verbatim, because the reason
+    /// (a restore in flight, an unauthorized principal, a missing record) is
+    /// the whole answer to the operator: 401/403/404/409 are failures (exit
+    /// 1), 400/422 usage (exit 2), 5xx transient (exit 3). An unrouted 404
+    /// still reads as a platform older than this CLI.
+    async fn expect_actions_ok(resp: reqwest::Response, what: &str) -> Result<reqwest::Response> {
+        use crate::exit::CliError;
+        use reqwest::StatusCode;
+        let status = resp.status();
+        if status.is_success() || status.is_redirection() {
+            return Self::expect_ok(resp, what).await;
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if is_unrouted(status, &body) {
+            bail!(
+                "{what} failed: this platform release does not have that endpoint, so it is \
+                 older than this CLI. Upgrade the release, or use a CLI matching it."
+            );
+        }
+        let reason = api_detail_reason(&body).unwrap_or_else(|| status.to_string());
+        let message = format!("{what}: {reason}");
+        let error = match status {
+            StatusCode::NOT_FOUND => CliError::failure(message)
+                .with_fix("check the id with `actions list`; an undo's execution id is printed by `actions undo`"),
+            StatusCode::UNAUTHORIZED => CliError::failure(message).with_fix(
+                "verify --api-key or CURIE_API_KEY, and for undo CURIE_APPROVAL_PRINCIPAL_TOKEN, \
+                 match the selected platform API",
+            ),
+            StatusCode::FORBIDDEN | StatusCode::CONFLICT => CliError::failure(message),
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+                CliError::usage(message).with_fix("pass the action or execution id as a UUID")
+            }
+            // A disabled executor is a configuration refusal, not an outage:
+            // retrying cannot change the answer, only the operator can.
+            StatusCode::SERVICE_UNAVAILABLE if reason == ACTION_EXECUTOR_DISABLED_REASON => {
+                CliError::failure(message).with_fix(
+                    "enable the action executor: set the chart value actionExecutor.enabled=true \
+                     on the release (cluster), or CURIE_ACTION_EXECUTOR_ENABLED=true for the API \
+                     and worker (local), then ask for the undo again",
+                )
+            }
+            s if s.is_server_error() => CliError::transient(message),
+            _ => CliError::failure(message),
         };
         Err(anyhow::Error::from(error))
     }
