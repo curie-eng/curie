@@ -788,6 +788,74 @@ def test_a_forward_refused_after_admission_finishes_not_recovered_with_its_code(
     assert _restores() == []
 
 
+def _expire_lease(execution_id: Any) -> None:
+    sql_rows(
+        "UPDATE curie.action_executions SET lease_expires_at = now() - interval '1 second' "
+        "WHERE id = :id",
+        {"id": execution_id},
+    )
+
+
+def test_a_forward_whose_dispatch_lease_expires_finishes_not_recovered(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-18 @spec ACTION-EXECUTOR-17: the claim route ends
+    a dispatched forward whose lease expired ``indeterminate`` (``response_lost``);
+    its nomination finishes ``not-recovered`` with that code, on the ledger record
+    too, and no verifier runs.
+    """
+
+    agent_id = _agent(client, auth_headers, tmp_path)
+    _bind_policy(agent_id, _document())
+    nomination_id = _nominate(agent_id)
+    execution_id, _ = _dispatched(client, nomination_id)
+    _expire_lease(execution_id)
+
+    assert _claim(client).status_code == 204
+
+    row = _execution(execution_id)
+    assert row["state"] == "indeterminate"
+    assert row["failure_code"] == "response_lost"
+    assert _outcome(execution_id, nomination_id) == "not-recovered"
+    nomination = _nomination(nomination_id)
+    assert nomination["state"] == "finished"
+    assert nomination["execution_code"] == "response_lost"
+    assert _samples(nomination_id) == []
+
+
+def test_a_forward_whose_claim_attempts_are_exhausted_finishes_not_recovered(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-18 @spec ACTION-EXECUTOR-17: a claimed forward
+    whose lease expires on every attempt is refused ``runner_unavailable`` by the
+    claim route once its attempts are spent; no ledger row exists, and its
+    nomination finishes ``not-recovered`` with that code and no verifier.
+    """
+
+    agent_id = _agent(client, auth_headers, tmp_path)
+    _bind_policy(agent_id, _document())
+    nomination_id = _nominate(agent_id)
+    created = _create_forward(nomination_id)
+    for attempt in (1, 2, 3):
+        claimed = _claim(client)
+        assert claimed.status_code == 200, claimed.text
+        assert claimed.json()["id"] == str(created.execution_id)
+        assert claimed.json()["attempt"] == attempt
+        _expire_lease(created.execution_id)
+
+    assert _claim(client).status_code == 204
+
+    row = _execution(created.execution_id)
+    assert row["state"] == "refused"
+    assert row["refusal_code"] == "runner_unavailable"
+    nomination = _nomination(nomination_id)
+    assert nomination["state"] == "finished"
+    assert nomination["verification_outcome"] == "not-recovered"
+    assert nomination["execution_code"] == "runner_unavailable"
+    assert sql_dicts("SELECT id FROM curie.agent_actions") == []
+    assert _samples(nomination_id) == []
+
+
 def test_a_not_reversible_now_refusal_goes_back_to_approval_not_to_an_outcome(
     client: Any, auth_headers: dict[str, str], tmp_path: Path
 ) -> None:
