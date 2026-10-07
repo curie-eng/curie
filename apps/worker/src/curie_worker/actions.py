@@ -37,6 +37,13 @@ TARGET_KEY = "target"
 VERSION_KEY = "version"
 
 
+# What the completion route answers when it refuses ``connector`` and
+# ``connector_digest`` and stores nothing: 403 (no or wrong worker token) and
+# 422 (the pair does not validate or names another connector than the tool's).
+# ACTION-EXECUTOR-12.
+_ATTRIBUTION_REFUSALS = frozenset({403, 422})
+
+
 class ActionBackendError(RuntimeError):
     """The ledger could not be written."""
 
@@ -186,10 +193,10 @@ class ActionClient:
 
         ``connector`` and ``connector_digest`` are the digest-attributing
         wrapper's verdict (``action_digest``, @spec ACTION-EXECUTOR-12). They
-        travel as a pair, under the internal worker token, or not at all; the
-        API refuses half of one, and a refused completion would fail the turn,
-        so half a pair is dropped here. ``run.py`` composes the attributing
-        wrapper only when a worker token is configured.
+        travel as a pair, under the internal worker token, or not at all; half
+        a pair is dropped here. If the API refuses the pair (403 or 422, nothing
+        stored), the completion is posted once more without it, so a refused
+        digest costs only the digest, never the turn.
         """
 
         snapshot = _snapshot(frame)
@@ -202,34 +209,49 @@ class ActionClient:
             "target": snapshot.target,
             "detail": frame.detail,
         }
-        headers = self._headers
+        url = f"{self._url}/{action_id}/complete"
         if connector is not None and connector_digest is not None:
-            body["connector"] = connector
-            body["connector_digest"] = connector_digest
-            headers = {**self._headers, **self._worker_headers}
-        elif connector is not None or connector_digest is not None:
-            logger.warning(
-                "action %s: half a connector attribution dropped",
-                action_id,
+            attributed = {**body, "connector": connector, "connector_digest": connector_digest}
+            response = await self._send(
+                url,
+                attributed,
+                "action complete",
+                {**self._headers, **self._worker_headers},
             )
-        return await self._post(
-            f"{self._url}/{action_id}/complete", body, "action complete", headers=headers
-        )
+            if response.status_code not in _ATTRIBUTION_REFUSALS:
+                return self._accepted(response, "action complete")
+            # The API refused the attribution and stored nothing (a worker
+            # token mismatch, a tool-prefix mismatch). The digest is optional;
+            # the account of the call is not, so the same completion goes once
+            # more without the pair. A refusal of that is the ledger failing.
+            logger.warning(
+                "action %s: connector attribution refused (HTTP %d); completing without it",
+                action_id,
+                response.status_code,
+            )
+        elif connector is not None or connector_digest is not None:
+            logger.warning("action %s: half a connector attribution dropped", action_id)
+        return await self._post(url, body, "action complete")
+
+    async def _send(
+        self, url: str, body: dict[str, Any], what: str, headers: dict[str, str]
+    ) -> httpx.Response:
+        try:
+            return await self._client.post(url, json=body, headers=headers)
+        except httpx.HTTPError as exc:
+            raise ActionBackendError(f"{what} failed: {exc}") from exc
 
     async def _post(
         self,
         url: str,
         body: dict[str, Any],
         what: str,
-        *,
-        headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        try:
-            response = await self._client.post(
-                url, json=body, headers=self._headers if headers is None else headers
-            )
-        except httpx.HTTPError as exc:
-            raise ActionBackendError(f"{what} failed: {exc}") from exc
+        response = await self._send(url, body, what, self._headers)
+        return self._accepted(response, what)
+
+    @staticmethod
+    def _accepted(response: httpx.Response, what: str) -> dict[str, Any]:
         # 201 is a fresh record; 200 is the idempotent replay of either call.
         if response.status_code not in (200, 201):
             raise ActionBackendError(
