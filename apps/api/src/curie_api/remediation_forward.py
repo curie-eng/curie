@@ -13,9 +13,11 @@ tool, connector or arguments from a caller:
   the agent's in-force version, and the canonical arguments and their digest
   from the nomination row;
 * a ``policy`` authority is an ``admitted`` nomination, with ``authority_ref``
-  ``policy:<agent_id>:<hook>:<generation>:<nomination id>``;
+  ``policy:<agent_id>:<hook>:<generation>:<nomination id>`` naming the
+  generation it was admitted under;
 * an ``approval`` authority is an ``approved`` nomination whose recorded
-  approval is the one named, with ``authority_ref`` the approval id;
+  approval is the one named, with ``authority_ref`` the approval id; its action
+  is read from the current generation (``authority_generation``);
 * the idempotency key is ``remediation:<nomination id>``, so a replayed
   admission or approval adopts the one execution and creates nothing.
 
@@ -49,6 +51,7 @@ from .models import (
     ActionExecution,
     ExecutionKind,
     RemediationNomination,
+    RemediationPolicy,
     RemediationPolicyGeneration,
 )
 from .schemas.action_executions import DIGEST_PATTERN
@@ -192,20 +195,21 @@ async def create_remediation_forward(
     )
     if nomination is None or nomination.action is None or nomination.arguments is None:
         raise await _refuse(session, _UNAVAILABLE, "no nomination names this call")
-    generation_number = nomination.admitted_generation
+    kind = POLICY_AUTHORITY if approval_id is None else APPROVAL_AUTHORITY
+    if kind == APPROVAL_AUTHORITY and nomination.approval_id != approval_id:
+        raise await _refuse(
+            session, _UNAVAILABLE, "the approval named did not approve this nomination"
+        )
+    generation_number = await authority_generation(session, nomination, kind)
     if generation_number is None:
-        raise await _refuse(session, _UNAVAILABLE, "the nomination was never admitted")
-
-    if approval_id is None:
-        kind = POLICY_AUTHORITY
-        ref = policy_ref(nomination.agent_id, nomination.hook, generation_number, nomination.id)
-    else:
-        kind = APPROVAL_AUTHORITY
-        ref = str(approval_id)
-        if nomination.approval_id != approval_id:
-            raise await _refuse(
-                session, _UNAVAILABLE, "the approval named did not approve this nomination"
-            )
+        raise await _refuse(
+            session, _UNAVAILABLE, "no policy generation authorizes this nomination"
+        )
+    ref = (
+        policy_ref(nomination.agent_id, nomination.hook, generation_number, nomination.id)
+        if kind == POLICY_AUTHORITY
+        else str(approval_id)
+    )
 
     adopted = await _adopted(session, nomination, kind, ref)
     if adopted is not None:
@@ -300,14 +304,42 @@ async def nomination_for_execution(
     return nomination
 
 
-async def policy_generation(
-    session: AsyncSession, nomination: RemediationNomination
-) -> RemediationPolicyGeneration | None:
-    """The generation the nomination was admitted under, or None."""
+async def authority_generation(
+    session: AsyncSession, nomination: RemediationNomination, kind: str
+) -> int | None:
+    """The policy generation whose declaration an authority executes, or None.
 
-    if nomination.admitted_generation is None:
+    @spec AUTOMATED-REMEDIATION-13. A ``policy`` authority is the generation the
+    nomination was admitted under (admission requires it to be current and
+    armed). An ``approval`` authority is the current generation, the one the
+    approval card and AUTOMATED-REMEDIATION-16's ``policy_changed`` judge: a
+    nomination sent to approval may have no admitted generation (a delivery
+    admitted before any policy existed, an envelope without the field) or an
+    older one. The nomination's recorded current generation, else the hook's
+    live one.
+    """
+
+    if kind == POLICY_AUTHORITY:
+        return nomination.admitted_generation
+    if nomination.current_generation is not None:
+        return nomination.current_generation
+    live: int | None = await session.scalar(
+        select(RemediationPolicy.generation).where(
+            RemediationPolicy.agent_id == nomination.agent_id,
+            RemediationPolicy.hook == nomination.hook,
+        )
+    )
+    return live
+
+
+async def policy_generation(
+    session: AsyncSession, nomination: RemediationNomination, kind: str
+) -> RemediationPolicyGeneration | None:
+    """The generation ``authority_generation`` names, or None."""
+
+    number = await authority_generation(session, nomination, kind)
+    if number is None:
         return None
     return await session.get(
-        RemediationPolicyGeneration,
-        (nomination.agent_id, nomination.hook, nomination.admitted_generation),
+        RemediationPolicyGeneration, (nomination.agent_id, nomination.hook, number)
     )

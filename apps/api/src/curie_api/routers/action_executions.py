@@ -623,7 +623,7 @@ async def _remediation_audit(
     is ``approval`` with the approval as ``actor``. Never an empty human field.
     """
 
-    generation = await policy_generation(session, nomination)
+    generation = await policy_generation(session, nomination, execution.authority_kind)
     approval = execution.authority_kind == APPROVAL_AUTHORITY
     return ActionAuditEntry(
         action_id=action_id,
@@ -643,7 +643,7 @@ async def _remediation_audit(
             "nomination_id": str(nomination.id),
             "delivery_event_id": nomination.event_id,
             "policy": f"{nomination.agent_id}:{nomination.hook}",
-            "generation": nomination.admitted_generation,
+            "generation": generation.generation if generation is not None else None,
             "bound_by": generation.bound_by if generation is not None else None,
         },
         created_at=func.clock_timestamp(),
