@@ -169,3 +169,9 @@ def test_reintroducing_curie_path_prefixes_fails_the_scenario() -> None:
     filtered = scenario.legacy_3617_paths(scenario.FIXTURE_CHANGED_PATHS)
     with pytest.raises(scenario.ScenarioAssertionError, match="unitconv"):
         scenario.assert_publication_paths(filtered)
+
+
+def test_scripted_release_cannot_take_ownership_of_the_ladder_policy() -> None:
+    kind = _load_kind()
+    assert kind.ScriptedPreflight.release == "curie-factory-scripted"
+    assert kind.ScriptedPreflight.release != kind.fe.Preflight.release

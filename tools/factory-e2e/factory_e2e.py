@@ -1593,6 +1593,7 @@ def _stop(process: subprocess.Popen[Any]) -> bool:
 
 
 class Preflight:
+    release = RELEASE
     github_html_base = "https://github.com"
 
     def __init__(
@@ -1635,7 +1636,7 @@ class Preflight:
             "image_tag": f"sha-{candidate}",
             "kube_context": config.kube_context,
             "namespace": namespace,
-            "release": RELEASE,
+            "release": self.release,
             "run_id": "",
             "started_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
             "steps": [],
@@ -1687,7 +1688,7 @@ class Preflight:
                 self.namespace,
                 "exec",
                 "-i",
-                f"statefulset/{RELEASE}-postgres",
+                f"statefulset/{self.release}-postgres",
                 "--",
                 "sh",
                 "-c",
@@ -1861,7 +1862,7 @@ class Preflight:
         self.step("namespace created", namespace=self.namespace)
 
     def publication_namespace(self) -> str:
-        return f"{self.namespace}-{RELEASE}-publication"
+        return f"{self.namespace}-{self.release}-publication"
 
     def _owned(self, name: str) -> bool:
         raw = self.kubectl("get", "namespace", name, "--ignore-not-found", "-o", "json")
@@ -1918,7 +1919,7 @@ class Preflight:
                 "--kube-context",
                 self.config.kube_context,
                 "uninstall",
-                RELEASE,
+                self.release,
                 "-n",
                 name,
                 "--no-hooks",
@@ -1936,7 +1937,7 @@ class Preflight:
                 f"{uninstall.stderr.strip()[-500:]}"
             )
         names = [name]
-        publication = f"{name}-{RELEASE}-publication"
+        publication = f"{name}-{self.release}-publication"
         raw = self.kubectl("get", "namespace", publication, "--ignore-not-found", "-o", "json")
         if raw.strip():
             annotations = json.loads(raw)["metadata"].get("annotations") or {}
@@ -1944,7 +1945,10 @@ class Preflight:
                 names.append(publication)
         for target in names:
             self.kubectl("delete", "namespace", target, "--ignore-not-found", "--wait=false")
-        kinds = "clusterroles,clusterrolebindings,priorityclasses"
+        kinds = (
+            "clusterroles,clusterrolebindings,priorityclasses,"
+            "validatingadmissionpolicies,validatingadmissionpolicybindings"
+        )
         for item in json.loads(self.kubectl("get", kinds, "-o", "json"))["items"]:
             meta = item["metadata"]
             if (meta.get("annotations") or {}).get("meta.helm.sh/release-namespace") == name:
@@ -1968,7 +1972,7 @@ class Preflight:
                     "--kube-context",
                     self.config.kube_context,
                     "uninstall",
-                    RELEASE,
+                    self.release,
                     "-n",
                     self.namespace,
                     "--no-hooks",
@@ -1996,7 +2000,10 @@ class Preflight:
         if leftover:
             raise PreflightFailed(f"CRDs this run created are still present: {leftover}")
         # Cluster-scoped release objects outlive the namespace; verify them.
-        kinds = "clusterroles,clusterrolebindings,priorityclasses"
+        kinds = (
+            "clusterroles,clusterrolebindings,priorityclasses,"
+            "validatingadmissionpolicies,validatingadmissionpolicybindings"
+        )
         cluster_left = [
             item["metadata"]["name"]
             for item in json.loads(self.kubectl("get", kinds, "-o", "json"))["items"]
@@ -2083,7 +2090,7 @@ class Preflight:
                 "--kube-context",
                 self.config.kube_context,
                 "install",
-                RELEASE,
+                self.release,
                 str(chart),
                 "-n",
                 self.namespace,
@@ -2143,7 +2150,7 @@ class Preflight:
                 "-n",
                 self.namespace,
                 "port-forward",
-                f"svc/{RELEASE}-api",
+                f"svc/{self.release}-api",
                 f"{port}:8000",
                 "--address",
                 "127.0.0.1",
@@ -2164,7 +2171,9 @@ class Preflight:
 
         _wait("the api through port-forward", 120, healthy)
         secret = json.loads(
-            self.kubectl("-n", self.namespace, "get", "secret", f"{RELEASE}-secrets", "-o", "json")
+            self.kubectl(
+                "-n", self.namespace, "get", "secret", f"{self.release}-secrets", "-o", "json"
+            )
         )
         data = secret["data"]
         self.api_key = base64.b64decode(data["apiKey"]).decode()
@@ -2320,7 +2329,9 @@ class Preflight:
         self.issue_token = token
         self._issue_token_minted = time.time()
         secrets = [token, self.api_key, self.config.model_api_key, self.worker_token]
-        common = ["--namespace", self.namespace, "--release", RELEASE, "--api-url", self.api_url]
+        common = [
+            "--namespace", self.namespace, "--release", self.release, "--api-url", self.api_url
+        ]
         log("curie cluster deploy (the default dark-factory bundle)")
         self._curie(
             [
@@ -2662,7 +2673,7 @@ class Preflight:
         run(
             helm_upgrade_command(
                 context=self.config.kube_context,
-                release=RELEASE,
+                release=self.release,
                 chart=str(self.chart_dir),
                 namespace=self.namespace,
                 values_file=str(values_file),
@@ -2690,7 +2701,7 @@ class Preflight:
         it, deploy the bundle again; that is what creates the pool.
         """
 
-        name = agent_warm_pool_name(RELEASE, FACTORY_AGENT)
+        name = agent_warm_pool_name(self.release, FACTORY_AGENT)
         if self._pool_exists(name):
             return
         log(f"sandbox warm pool {name} is missing; deploying the bundle again")
@@ -3045,7 +3056,7 @@ class Preflight:
             "--namespace",
             self.namespace,
             "--release",
-            RELEASE,
+            self.release,
             "--api-url",
             self.api_url,
         ]
@@ -3133,7 +3144,7 @@ class Preflight:
         return {
             "kube_context": self.config.kube_context,
             "namespace": self.namespace,
-            "release": RELEASE,
+            "release": self.release,
             "api_url": self.api_url,
             "tunnel_url": self.tunnel_url,
             "webhook_url": f"{self.tunnel_url}/github/webhook" if self.tunnel_url else "",

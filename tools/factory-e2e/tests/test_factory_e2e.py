@@ -2897,3 +2897,62 @@ def test_failed_layer_build_fails_the_preflight(
     )
     with pytest.raises(fe.PreflightFailed, match="push denied"):
         preflight.build_runner_layer(fe.DEFAULT_BUNDLE)
+
+
+@pytest.mark.parametrize("release", ["curie", "curie-factory-scripted"])
+def test_owned_release_names_match_actual_chart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, release: str
+) -> None:
+    # Both releases contain the chart name, so canonical curie.fullname is the
+    # release itself (charts/curie/templates/_helpers.tpl), without another suffix.
+    config = _config(tmp_path)
+    values_file = tmp_path / "values.json"
+    values_file.write_text(json.dumps(_values(config)))
+    rendered = subprocess.run(
+        ["helm", "template", release, str(REPO_ROOT / "charts/curie"),
+         "--namespace", "test-factory-unit", "-f", str(values_file)],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    import yaml
+    documents = [row for row in yaml.safe_load_all(rendered) if row]
+    names = {(row["kind"], row["metadata"]["name"]) for row in documents}
+    for kind, suffix in [("ValidatingAdmissionPolicy", "runner-resources"),
+                         ("ValidatingAdmissionPolicyBinding", "runner-resources"),
+                         ("Service", "api"), ("Secret", "secrets"),
+                         ("StatefulSet", "postgres")]:
+        assert (kind, f"{release}-{suffix}") in names
+    p = object.__new__(fe.Preflight)
+    p.release = release
+    p.config = config
+    p.namespace = "test-factory-unit"
+    seen = []
+    monkeypatch.setattr(fe, "run", lambda args, **_kwargs: seen.append(args) or "")
+    p.sql("SELECT 1")
+    assert f"statefulset/{release}-postgres" in seen[0]
+    assert p.publication_namespace() == f"test-factory-unit-{release}-publication"
+
+
+@pytest.mark.parametrize("owned_policy", [False, True])
+def test_cleanup_checks_owned_admission_policy_and_preserves_other_release(
+    monkeypatch: pytest.MonkeyPatch, owned_policy: bool
+) -> None:
+    p = object.__new__(fe.Preflight)
+    p.release = "curie-factory-scripted"
+    p.namespace = "test-factory-unit"
+    p.created_crds = []
+    monkeypatch.setattr(p, "_owned", lambda _name: False)
+    def list_resources(*args: str, **_kwargs: Any) -> str:
+        assert "validatingadmissionpolicies" in args[1]
+        assert "validatingadmissionpolicybindings" in args[1]
+        return json.dumps({"items": [{"metadata": {
+            "name": "curie-factory-scripted-runner-resources" if owned_policy
+                    else "curie-runner-resources",
+            "annotations": {"meta.helm.sh/release-namespace": p.namespace if owned_policy
+                            else "curie"},
+        }}]})
+    monkeypatch.setattr(p, "kubectl", list_resources)
+    if owned_policy:
+        with pytest.raises(fe.PreflightFailed, match="release objects remain"):
+            p.delete_namespaces()
+    else:
+        assert p.delete_namespaces()["verified_absent"] is True

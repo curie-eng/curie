@@ -1358,7 +1358,20 @@ AGGREGATE_EXPRESSIONS = {
 def test_next_omits_kind_and_dispatch_keeps_it() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     trigger = workflow[True]
-    assert trigger["workflow_dispatch"] is None
+    assert trigger["workflow_dispatch"]["inputs"] == {
+        "factory_record": {
+            "description": "Record the actual scripted factory fixture through the model provider",
+            "type": "boolean",
+            "default": False,
+        },
+        "factory_recording_recipient": {
+            "description": (
+                "Public PEM certificate for encrypting the recording before artifact upload"
+            ),
+            "type": "string",
+            "default": "",
+        },
+    }
     group = workflow["concurrency"]["group"]
     assert group == (
         "${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}"

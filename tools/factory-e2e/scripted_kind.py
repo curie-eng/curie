@@ -121,6 +121,9 @@ def fixture_module(name: str, path: Path) -> Any:
 class ScriptedPreflight(fe.Preflight):
     """The existing driver, with only its external fixture endpoints adapted."""
 
+    # Contains the chart name: canonical curie.fullname equals this release.
+    release = "curie-factory-scripted"
+
     def __init__(self, *args: Any, github_stub: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.github_stub = github_stub

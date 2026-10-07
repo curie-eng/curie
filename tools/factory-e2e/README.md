@@ -2,7 +2,8 @@
 
 `curie dev factory-e2e scripted --context kind-curie-e2e --listen-host <gateway-ip>`
 runs the existing factory driver against the candidate images already loaded
-into a disposable kind cluster. It owns a fresh `test-factory-*` namespace;
+into a disposable kind cluster. It owns a fresh `test-factory-*` namespace and a distinct
+`curie-factory-scripted` release;
 the existing ladder release, controller, priority classes and CRDs remain in
 place. The driver uses actual API admission, Postgres, worker execution,
 sandbox runner, Git clone/push, publication, CI reconciliation and terminal
