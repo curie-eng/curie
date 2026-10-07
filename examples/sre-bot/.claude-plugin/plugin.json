@@ -1,6 +1,6 @@
 {
   "name": "sre-bot",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "SRE triage assistant for plain-English production health and Kubernetes questions in Slack. One pinned upstream Kubernetes MCP connector exposes the core toolset: reads execute immediately, six mutations require a fresh human approval, and unmatched tools fail closed. Kubernetes RBAC limits writes to disposable demo-namespace workloads and independently excludes credentials, identity, RBAC, cluster-scoped mutation, and platform upgrades.",
   "license": "Apache-2.0",
   "author": {
