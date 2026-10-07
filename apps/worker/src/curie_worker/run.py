@@ -1031,8 +1031,10 @@ def _build_action_recorder(
 
 
 # The executor loop's timing (ACTION-EXECUTOR-17). The dispatch deadline bounds
-# the one ``call`` and the grant's expiry. The lease outlasts a whole run: the
-# sandbox claim budget, three runner phases and the deadline, with headroom.
+# the one ``call`` and the grant's expiry. The lease is sized for the sandbox
+# claim budget, the runner phases and the deadline, with headroom; the loop
+# bounds each phase by what is left of it and refuses before dispatch when the
+# rest cannot carry the call.
 _ACTION_EXECUTOR_DISPATCH_DEADLINE_S = 60.0
 _ACTION_EXECUTOR_INTERVAL_S = 5.0
 _ACTION_EXECUTOR_LEASE_HEADROOM_S = 240

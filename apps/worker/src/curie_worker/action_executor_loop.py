@@ -91,6 +91,12 @@ _API_TIMEOUT_S: Final = 10.0
 # refused the dispatch commit. The same code the claim sweep uses when a holder
 # vanished before dispatch.
 _PLATFORM_UNAVAILABLE: Final = "runner_unavailable"
+# A pre-dispatch run whose lease can no longer carry it ends with the code the
+# route decisions give an expired ``claimed`` lease (ACTION-EXECUTOR-20).
+_LEASE_SPENT: Final = "runner_unavailable"
+# Headroom the lease must keep beyond the dispatch deadline when the commit is
+# made, for the outcome report after the call.
+_LEASE_MARGIN_S: Final = 1.0
 _LOST: Final = "response_lost"
 _DEADLINE: Final = "deadline_exceeded"
 
@@ -306,6 +312,9 @@ class _Run:
     code: str | None = None
     # Set once a sandbox claim was attempted, so release runs only when needed.
     sandbox: bool = False
+    # Monotonic time the lease expires, measured from before the claim request
+    # so it never runs later than the API's own clock would.
+    lease_deadline: float = 0.0
 
 
 def executor_env(boot: ExecutorBoot) -> dict[str, str]:
@@ -498,13 +507,14 @@ class ActionExecutorLoop:
     async def run_once(self) -> bool:
         """Claim and run one execution. True when one was claimed."""
 
+        lease_started = time.monotonic()
         body = await self._api.claim(
             lease_owner=self._lease_owner, lease_seconds=self._lease_seconds
         )
         if body is None:
             return False
         execution = Execution.from_claim(body, self._lease_owner)
-        run = _Run()
+        run = _Run(lease_deadline=lease_started + self._lease_seconds)
         with operation_span(
             "curie.action_executor.execution",
             kind=SpanKind.INTERNAL,
@@ -574,7 +584,7 @@ class ActionExecutorLoop:
         run.sandbox = True
         handle, agent_name = await self._claim_sandbox(execution)
         run.stage = "list"
-        tools = await self._list(execution, handle)
+        tools = await self._list(execution, run, handle)
         names = {t.get("name") for t in tools if isinstance(t, Mapping)}
         if not {RESTORE_TOOL, OBSERVE_TOOL} <= names:
             raise _Refuse("restore_not_advertised", "list")
@@ -588,7 +598,7 @@ class ActionExecutorLoop:
         run.stage = "digest"
         await self._require_serving(execution)
         run.stage = "observe"
-        version = await self._observe(execution, handle, target)
+        version = await self._observe(execution, run, handle, target)
         await self._post_observation(execution, run, version)
         if run.state == "refused":
             return
@@ -609,10 +619,15 @@ class ActionExecutorLoop:
             raise _Refuse(refusal.code, "arguments") from None
         except ValueError:
             raise _Refuse("arguments_mismatch", "arguments") from None
+        run.stage = "lease"
+        if self._lease_left(run, "lease") < self._dispatch_deadline_s + _LEASE_MARGIN_S:
+            # The call could outlive the lease, and the sweep would end the row
+            # ``indeterminate`` while a restore landed. Refuse while provable.
+            raise _Refuse(_LEASE_SPENT, "lease")
         run.stage = "dispatch"
         await self._dispatch(execution)
         run.stage = "call"
-        state, code = await self._call(execution, handle, agent_name, arguments)
+        state, code = await self._call(execution, run, handle, agent_name, arguments)
         run.stage = "report"
         await self._report(execution, run, state, code)
 
@@ -625,7 +640,7 @@ class ActionExecutorLoop:
         run.sandbox = True
         handle, _agent_name = await self._claim_sandbox(execution)
         run.stage = "list"
-        tools = await self._list(execution, handle)
+        tools = await self._list(execution, run, handle)
         run.stage = "digest"
         await self._require_serving(execution)
         run.stage = "report"
@@ -802,10 +817,22 @@ class ActionExecutorLoop:
             "target": dict(target) if target is not None else None,
         }
 
-    async def _list(self, execution: Execution, handle: SandboxHandle) -> list[Any]:
+    def _lease_left(self, run: _Run, stage: str) -> float:
+        """@spec ACTION-EXECUTOR-17: the lease still held; none left refuses."""
+
+        left = run.lease_deadline - time.monotonic()
+        if left <= 0:
+            raise _Refuse(_LEASE_SPENT, stage)
+        return left
+
+    async def _list(self, execution: Execution, run: _Run, handle: SandboxHandle) -> list[Any]:
+        remaining = self._lease_left(run, "list")
         try:
             reply = await self._runner.execute(
-                handle.base_url, self._request(execution, "list"), token=handle.token
+                handle.base_url,
+                self._request(execution, "list"),
+                token=handle.token,
+                remaining_s=remaining,
             )
         except ExecuteRefused as refused:
             raise _Refuse(refused.code, "list") from None
@@ -815,15 +842,21 @@ class ActionExecutorLoop:
         return list(tools) if isinstance(tools, list) else []
 
     async def _observe(
-        self, execution: Execution, handle: SandboxHandle, target: Mapping[str, Any]
+        self,
+        execution: Execution,
+        run: _Run,
+        handle: SandboxHandle,
+        target: Mapping[str, Any],
     ) -> str | None:
         """@spec ACTION-EXECUTOR-15: the version observed now, passed on unjudged."""
 
+        remaining = self._lease_left(run, "observe")
         try:
             reply = await self._runner.execute(
                 handle.base_url,
                 self._request(execution, "observe", target=target),
                 token=handle.token,
+                remaining_s=remaining,
             )
         except ExecuteRefused as refused:
             raise _Refuse(refused.code, "observe") from None
@@ -833,7 +866,12 @@ class ActionExecutorLoop:
         return version if isinstance(version, str) else None
 
     async def _call(
-        self, execution: Execution, handle: SandboxHandle, agent_name: str, arguments: str
+        self,
+        execution: Execution,
+        run: _Run,
+        handle: SandboxHandle,
+        agent_name: str,
+        arguments: str,
     ) -> tuple[str, str | None]:
         """One grant, one ``call``. @spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-17.
 
@@ -843,6 +881,9 @@ class ActionExecutorLoop:
         """
 
         started = time.monotonic()
+        # Bounded by the deadline and by the lease, whichever ends first; the
+        # pre-dispatch check left the lease at least the deadline plus margin.
+        budget = max(0.0, min(self._dispatch_deadline_s, run.lease_deadline - started))
         # The module attribute, so one mint per call is observable and the
         # proxy's byte equality is the shared vector's.
         grant = connector_grant.mint(
@@ -861,10 +902,10 @@ class ActionExecutorLoop:
                     execution, "call", tool=RESTORE_TOOL, arguments=arguments, grant=grant
                 ),
                 token=handle.token,
-                remaining_s=self._dispatch_deadline_s,
+                remaining_s=budget,
             )
         except Exception:  # noqa: BLE001 -- ExecuteRefused included: never refused here
-            if time.monotonic() - started >= self._dispatch_deadline_s:
+            if time.monotonic() - started >= budget:
                 return "indeterminate", _DEADLINE
             return "indeterminate", _LOST
         return call_outcome(
