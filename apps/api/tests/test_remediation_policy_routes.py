@@ -33,19 +33,23 @@ touch.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import os
+import threading
 import time
 import uuid
 from collections.abc import Iterator
 from typing import Any
 
+import asyncpg
 import pytest
 from _migration_support import sql_dicts, sql_rows
 from curie_api import approval_principal, hook_signing, hook_source_signing
 from curie_api.config import get_settings
 from fastapi.testclient import TestClient
+from sqlalchemy import make_url
 from sqlalchemy.exc import DBAPIError
 
 pytestmark = pytest.mark.usefixtures("clean_db")
@@ -950,3 +954,266 @@ def test_a_replay_with_reordered_keys_is_the_same_intent(
     digest = _generation_rows(agent_id)[0]["intent_sha256"]
     assert len(digest) == 64 and digest == digest.lower()
     int(digest, 16)
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (C2): a non-finite number is a named refusal, never a 500
+# ---------------------------------------------------------------------------
+
+
+def _number_range(minimum: Any, maximum: Any) -> dict[str, Any]:
+    arguments = copy.deepcopy(SCALE_ACTION["arguments"])
+    arguments["replicas"] = {"type": "number", "minimum": minimum, "maximum": maximum}
+    return arguments
+
+
+def _string_allowed(*values: Any) -> dict[str, Any]:
+    arguments = copy.deepcopy(SCALE_ACTION["arguments"])
+    arguments["namespace"] = {"type": "string", "allowed": list(values)}
+    return arguments
+
+
+NON_FINITE: list[Any] = [
+    pytest.param(
+        _policy(actions=[_action(arguments=_number_range(float("nan"), 6))]),
+        id="range-minimum-nan",
+    ),
+    pytest.param(
+        _policy(actions=[_action(arguments=_number_range(2, float("inf")))]),
+        id="range-maximum-infinity",
+    ),
+    pytest.param(
+        _policy(actions=[_action(arguments=_string_allowed("app", float("nan")))]),
+        id="allowed-item-nan",
+    ),
+    pytest.param(
+        _policy(actions=[_action(target={"argument": "deployment", "allowed": [float("inf")]})]),
+        id="target-allowed-infinity",
+    ),
+    pytest.param(
+        _policy(actions=[_action(precondition={**PRECONDITION, "value": float("nan")})]),
+        id="precondition-value-nan",
+    ),
+    pytest.param(
+        _policy(actions=[_action(verifier={**VERIFIER, "value": float("-inf")})]),
+        id="verifier-value-negative-infinity",
+    ),
+    pytest.param(
+        _policy(
+            actions=[
+                _action(
+                    precondition={
+                        **PRECONDITION,
+                        "comparator": "in",
+                        "value": [0.5, float("nan")],
+                    }
+                )
+            ]
+        ),
+        id="precondition-in-list-nan",
+    ),
+    pytest.param(
+        _policy(
+            actions=[
+                _action(
+                    verifier={**VERIFIER, "arguments": {"query": "up", "step": float("inf")}}
+                )
+            ]
+        ),
+        id="read-arguments-infinity",
+    ),
+    pytest.param(
+        _policy(limits={**LIMITS, "per_policy_per_hour": float("nan")}),
+        id="limit-nan",
+    ),
+]
+
+
+@pytest.mark.parametrize("policy", NON_FINITE)
+def test_a_non_finite_number_anywhere_is_a_named_refusal_not_a_500(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, policy: dict[str, Any]
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-2: the document is canonical JSON, which has no
+    NaN or Infinity. Starlette's ``json.loads`` accepts those tokens, so the
+    validator must refuse them with a named code (``policy_document_invalid``)
+    before anything digests the document; nothing is written.
+    """
+
+    body = {
+        "expected_generation": "0",
+        "operation_id": str(uuid.uuid4()),
+        "policy": policy,
+    }
+    raw = json.dumps(body)  # allow_nan: emits the NaN / Infinity tokens
+    assert "NaN" in raw or "Infinity" in raw
+
+    response = client.put(
+        _url(agent_id),
+        content=raw.encode(),
+        headers={**_admin(auth_headers), "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 422, response.text
+    assert _code(response) == "policy_document_invalid"
+    assert response.headers.get("cache-control") == "no-store"
+    assert _policy_row(agent_id) is None
+    assert _all_generation_rows() == []
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (C3): arming re-checks the approval route
+# ---------------------------------------------------------------------------
+
+
+def _replace_routes(
+    client: TestClient, auth_headers: dict[str, str], agent: str, routes: dict[str, Any]
+) -> None:
+    response = client.patch(
+        f"/agents/{agent}", json={"approval_routes": routes}, headers=auth_headers
+    )
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize(
+    ("users_route", "code"),
+    [
+        pytest.param(
+            {"resolution": {"kind": "slack", "address": CHANNEL}},
+            "route_approvers_not_explicit",
+            id="route-now-channel-members",
+        ),
+        pytest.param(None, "route_unknown", id="route-now-absent"),
+    ],
+)
+def test_arm_refuses_a_route_that_no_longer_has_explicit_approvers(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    agent_id: str,
+    users_route: dict[str, Any] | None,
+    code: str,
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+
+    Arming writes a generation whose route must still satisfy the bind rule: if
+    the agent's route now falls back to channel members (or is gone), arm is
+    refused with the bind's code and writes nothing.
+    """
+
+    generation = _bind(client, agent_id, auth_headers)
+    routes: dict[str, Any] = {
+        GROUP_ROUTE: {
+            "resolution": {"kind": "slack", "address": CHANNEL},
+            "approvers": {"group": "S0EXAMPLE1"},
+        },
+        CHANNEL_ROUTE: {"resolution": {"kind": "slack", "address": CHANNEL}},
+    }
+    if users_route is not None:
+        routes[USERS_ROUTE] = users_route
+    _replace_routes(client, auth_headers, agent_id, routes)
+    before = _generation_rows(agent_id)
+
+    armed = _post(client, agent_id, "arm", _admin(auth_headers), expected=str(generation))
+
+    assert armed.status_code in (409, 422), armed.text
+    assert _code(armed) == code
+    assert armed.headers.get("cache-control") == "no-store"
+    assert _generation_rows(agent_id) == before
+    row = _policy_row(agent_id)
+    assert row is not None and row["armed"] is False and row["generation"] == generation
+
+
+# ---------------------------------------------------------------------------
+# Review round 1 (C4): the protected-hook check holds against a concurrent switch
+# ---------------------------------------------------------------------------
+
+
+def _hold_source_switch_to_ordinary(
+    agent: str,
+    hook: str,
+    started: threading.Event,
+    hold_seconds: float,
+    errors: list[BaseException],
+) -> None:
+    """Switch the source policy to ordinary in a transaction held open, then commit.
+
+    Plays the source mutation coordinator's row write: the row is locked and
+    rewritten before the remediation write starts, and commits while the
+    remediation write is (or should be) waiting on it.
+    """
+
+    async def run() -> None:
+        url = make_url(get_settings().database_url).set(drivername="postgresql")
+        connection = await asyncpg.connect(url.render_as_string(hide_password=False))
+        try:
+            transaction = connection.transaction()
+            await transaction.start()
+            await connection.execute(
+                "UPDATE curie.hook_source_policies SET mode = 'ordinary', tool_access = NULL, "
+                "runtime_id = NULL, qualification_id = NULL, bundle_digest = NULL, "
+                "generation = generation + 1, updated_at = now() "
+                "WHERE agent_id = $1 AND hook = $2",
+                uuid.UUID(agent),
+                hook,
+            )
+            started.set()
+            await asyncio.sleep(hold_seconds)
+            await transaction.commit()
+        finally:
+            await connection.close()
+
+    try:
+        asyncio.run(run())
+    except Exception as error:  # noqa: BLE001 - surfaced by the test
+        errors.append(error)
+        started.set()
+
+
+@pytest.mark.parametrize("verb", ["bind", "arm"])
+def test_a_concurrent_switch_to_ordinary_never_leaves_a_policy_on_an_ordinary_hook(
+    client: TestClient, auth_headers: dict[str, str], agent_id: str, verb: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-1
+
+    The source policy is switched to ordinary in a transaction that is open when
+    the remediation write starts and commits shortly after. The write must not
+    decide on the pre-switch row: it waits for the switch (a share lock on the
+    source row, or an equivalent re-read under the write transaction) and is
+    refused ``hook_not_protected``, so no bound or armed generation sits on a
+    hook that is ordinary.
+    """
+
+    generation = _bind(client, agent_id, auth_headers) if verb == "arm" else 0
+    before = _generation_rows(agent_id)
+    started = threading.Event()
+    errors: list[BaseException] = []
+    switch = threading.Thread(
+        target=_hold_source_switch_to_ordinary,
+        args=(agent_id, HOOK, started, 1.5, errors),
+    )
+    switch.start()
+    try:
+        assert started.wait(10), "the source switch did not start"
+        assert not errors, errors
+        if verb == "bind":
+            response = _put(client, agent_id, _admin(auth_headers))
+        else:
+            response = _post(
+                client, agent_id, "arm", _admin(auth_headers), expected=str(generation)
+            )
+    finally:
+        switch.join(15)
+    assert not errors, errors
+
+    mode = sql_rows(
+        "SELECT mode FROM curie.hook_source_policies WHERE agent_id = :a AND hook = :h",
+        {"a": uuid.UUID(agent_id), "h": HOOK},
+    )
+    assert mode == [("ordinary",)]
+    assert response.status_code == 409, response.text
+    assert _code(response) == "hook_not_protected"
+    assert _generation_rows(agent_id) == before
+    row = _policy_row(agent_id)
+    if verb == "bind":
+        assert row is None
+    else:
+        assert row is not None and row["armed"] is False and row["generation"] == generation
