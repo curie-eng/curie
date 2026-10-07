@@ -60,6 +60,7 @@ from ..models import (
     RemediationNomination,
 )
 from ..remediation_forward import (
+    ADMITTED,
     APPROVAL_AUTHORITY,
     APPROVAL_REQUESTED,
     POLICY_AUTHORITY,
@@ -530,7 +531,16 @@ async def dispatch_execution(
             session, store, execution, nomination
         ):
             _finish(session, execution, ExecutionState.refused, NOT_REVERSIBLE_NOW_CODE, now)
-            nomination.state = APPROVAL_REQUESTED
+            # Only a nomination still ``admitted`` goes back to approval; one
+            # already rejected, expired or finished keeps its state.
+            await session.execute(
+                update(RemediationNomination)
+                .where(
+                    RemediationNomination.id == nomination.id,
+                    RemediationNomination.state == ADMITTED,
+                )
+                .values(state=APPROVAL_REQUESTED)
+            )
             await session.commit()
             await session.refresh(execution)
             return _out(execution)

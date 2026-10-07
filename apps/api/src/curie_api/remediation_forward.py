@@ -393,6 +393,7 @@ async def policy_generation(
 # @spec AUTOMATED-REMEDIATION-13: the nomination state a ``not_reversible_now``
 # refusal returns a policy remediation to.
 APPROVAL_REQUESTED: Final = "approval_requested"
+ADMITTED: Final = "admitted"
 
 
 async def not_reversible_now(
