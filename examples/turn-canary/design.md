@@ -51,6 +51,13 @@ adapter is connected.
   An existing empty or corrupt state file fails closed; only a genuinely absent
   state file is a first-run empty state. An interrupted write cannot turn a
   recorded cleanup intent into a healthy empty state.
+  `cleanup_blocked` must be a JSON boolean; numeric 0 or 1 is corrupt state,
+  even though Python compares them equal to false or true. A journaled cycle
+  honors a true cleanup hold directly, without relying on a caller to copy it
+  into the platform. Persisted capacity skips must be a nonnegative JSON
+  integer, and persisted success timestamps must be finite positive JSON
+  numbers, never booleans. Invalid types or values fail before enqueue or
+  metric export.
   It submits that key to `POST /agents/{agent_id}/threads/{thread_key}/reset`
   and polls the matching reset status endpoint until `requested` is false and
   `route_existed` is true. It never resets an unowned or guessed conversation.
