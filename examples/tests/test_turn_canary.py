@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -130,9 +131,19 @@ def test_success_requires_delivered_completion_and_exact_nonce(events, expected)
 def test_owned_reset_key_matches_named_worker_route() -> None:
     """@spec TURN-CANARY-4"""
     from channel_protocol import scoped_conversation_id
+    from curie_worker.kernel.routing import _thread_key_for
 
     canary = _canary()
     key = canary.scoped_reset_key(_binding(), "eval:probe-1")
+    turn = canary.build_turn(
+        _binding(),
+        nonce="nonce",
+        conversation_id="eval:probe-1",
+        reply_ref=REPLY_REF,
+        event_id="EvCANARY-key",
+        received_at="2026-01-01T00:00:00Z",
+    )
+    assert key == _thread_key_for(turn)
     assert key == scoped_conversation_id("slack", "C-EXAMPLE-1", "eval:probe-1", identity="blue")
     assert key != scoped_conversation_id("slack", "C-EXAMPLE-1", "eval:probe-1")
 
@@ -281,3 +292,70 @@ def test_network_error_diagnostic_omits_raw_secret_and_reply():
     assert "private-content" not in rendered
     assert "RuntimeError" in rendered
     assert any(call[0] == "reset" for call in platform.calls if isinstance(call, tuple))
+
+
+@pytest.mark.parametrize("crash_phase", ["before_enqueue", "after_enqueue"])
+def test_crash_keeps_durable_owned_cleanup_intent_and_fresh_run_refuses(tmp_path, crash_phase):
+    """@spec TURN-CANARY-4"""
+    canary = _canary()
+    state_file = tmp_path / "canary-state.json"
+
+    class CrashingPlatform(CyclePlatform):
+        async def enqueue(self, turn):
+            if crash_phase == "before_enqueue":
+                raise SystemExit("crash before stream write")
+            await super().enqueue(turn)
+
+        async def replies(self, reply_ref, after):
+            raise SystemExit("crash after stream write")
+
+    first = CrashingPlatform()
+    with canary.StateJournal(state_file) as journal:
+        with pytest.raises(SystemExit):
+            asyncio.run(
+                canary.run_cycle(
+                    first,
+                    _routes()[:1],
+                    journal=journal,
+                    turn_deadline=0.02,
+                    cleanup_deadline=0.02,
+                    poll_period=0.005,
+                )
+            )
+    saved = json.loads(state_file.read_text())
+    assert saved["pending"]["agent_id"] == _binding()["agent_id"]
+    assert saved["pending"]["thread_key"].startswith("slack:")
+    second = CyclePlatform()
+    with canary.StateJournal(state_file) as journal:
+        result = asyncio.run(
+            canary.run_cycle(
+                second,
+                _routes()[:1],
+                journal=journal,
+                turn_deadline=0.02,
+                cleanup_deadline=0.02,
+                poll_period=0.005,
+            )
+        )
+    assert result.cleanup_degraded is True
+    assert not any(call[0] == "enqueue" for call in second.calls if isinstance(call, tuple))
+
+
+def test_durable_intent_clears_only_after_confirmed_reset(tmp_path):
+    """@spec TURN-CANARY-4"""
+    canary = _canary()
+    state_file = tmp_path / "canary-state.json"
+    first = CyclePlatform(reset_state={"requested": False, "route_existed": False})
+    with canary.StateJournal(state_file) as journal:
+        result = asyncio.run(
+            canary.run_cycle(
+                first,
+                _routes()[:1],
+                journal=journal,
+                turn_deadline=0.02,
+                cleanup_deadline=0.02,
+                poll_period=0.005,
+            )
+        )
+    assert result.cleanup_degraded is True
+    assert json.loads(state_file.read_text())["pending"] is not None
