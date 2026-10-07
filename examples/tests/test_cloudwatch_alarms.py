@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -259,6 +260,7 @@ def test_missing_description_and_disabled_composite_are_handled(reader):
     "failure",
     [
         (503, b"provider error body"),
+        (302, b"redirect body with private material"),
         (200, b"<bad"),
         (200, b"<root/>"),
         TimeoutError("private message"),
@@ -470,6 +472,85 @@ def test_occupied_listener_exits_with_safe_configuration_error(reader):
     assert result.stdout == ""
     assert result.stderr == "cloudwatch-alarms: invalid configuration\n"
     assert "Traceback" not in result.stderr and ROLE not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "region",
+    [
+        "us-east-1.amazonaws.com@evil.example/path?",
+        "us-east-1/elsewhere",
+        "us-east-1?next=bad",
+        "cn-north-1",
+        " us-east-1 ",
+    ],
+)
+def test_invalid_region_is_refused_before_credential_or_listener(reader, monkeypatch, capsys, region):
+    # @spec SRE-CW-1 SRE-CW-5. Reject a hostile endpoint before any token access.
+    required = {
+        "TOPIC_ARN": TOPIC,
+        "AWS_REGION": region,
+        "AWS_ROLE_ARN": ROLE,
+        "AWS_WEB_IDENTITY_TOKEN_FILE": "/does-not-exist",
+    }
+    for key, value in required.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(reader, "install_signal_handlers", lambda: None)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("invalid region reached credential or listener construction")
+
+    monkeypatch.setattr(reader, "Poller", unexpected)
+    monkeypatch.setattr(reader, "make_server", unexpected)
+    assert reader.main() == 2
+    assert capsys.readouterr().err == "cloudwatch-alarms: invalid configuration\n"
+
+
+def test_provider_redirect_does_not_replay_request_to_another_origin(reader):
+    # @spec SRE-CW-2 SRE-CW-5. Exercise urllib transport, not a fake AWS response.
+    received = []
+
+    class Destination(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            received.append((self.path, self.headers.get("Authorization")))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Destination) as destination:
+        destination_thread = threading.Thread(target=destination.serve_forever, daemon=True)
+        destination_thread.start()
+
+        class Redirect(BaseHTTPRequestHandler):
+            def do_POST(self):  # noqa: N802
+                self.send_response(302)
+                self.send_header(
+                    "Location", f"http://127.0.0.1:{destination.server_address[1]}/receiver"
+                )
+                self.end_headers()
+                self.wfile.write(b"private response body")
+
+            def log_message(self, *args):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Redirect) as redirect:
+            redirect_thread = threading.Thread(target=redirect.serve_forever, daemon=True)
+            redirect_thread.start()
+            try:
+                status, _ = reader._http(
+                    "POST",
+                    f"http://127.0.0.1:{redirect.server_address[1]}/provider",
+                    {"Authorization": "Example secret header"},
+                    b"Example projected token",
+                )
+                assert status == 302
+                assert received == []
+            finally:
+                redirect.shutdown()
+                redirect_thread.join(timeout=3)
+        destination.shutdown()
+        destination_thread.join(timeout=3)
 
 
 def test_program_imports_with_stdlib_and_sigterm_exits_zero(reader):
