@@ -42,13 +42,17 @@ of an existing per-agent pool in the snapshot, using the actual
 choice; a connector-secret refusal remains a refusal. Never copy the helpers'
 routing, derivation, or secret-name policy into the observer. A worker refusal,
 missing selected pool, missing selected template, missing or ambiguous named
-runner container in the selected template, or missing connector secret reference
-fails only affected bindings. Check reference presence only;
-do not claim that referenced sandbox Secrets exist or are usable.
+  runner container in the selected template, or missing connector secret reference
+  fails only affected bindings. Check reference presence only;
+  do not claim that referenced sandbox Secrets exist or are usable.
+  Worker pool selection variables may themselves come from Kubernetes Secrets.
+  Failure reasons identify the missing pool, template, runner or connector
+  reference by fixed category; they never echo selected pool or template names,
+  worker variable values, or connector key names.
 
 ### STARTABILITY-3: Dispatcher identity declarations
 
-`identity_lanes` maps the literal or resolved `CURIE_SLACK_IDENTITIES` JSON
+  `identity_lanes` maps the literal or resolved `CURIE_SLACK_IDENTITIES` JSON
 declaration's `name`, `app_token_env`, and `bot_token_env` fields. Parse with the
 actual protocol `SlackIdentities` parser used by the dispatcher. Absent, blank, and empty-list
 declarations use the platform's default `SLACK_APP_TOKEN` and `SLACK_BOT_TOKEN`.
@@ -57,10 +61,12 @@ named identity fails rather than deriving an indexed credential name from its
 identity. Reject every declaration the actual dispatcher rejects, including
 invalid or unbounded identity names, invalid credential variable names, missing default
 identity, shared credential variables, extra fields, and duplicate identities.
-Non-Slack bindings do not depend on Slack credentials. Retain the optional
-legacy identity-name lane derivation for callers that explicitly omit the
-`identity_lanes` argument to the pure judge; the live collector always passes
-the resolved declaration.
+  Non-Slack bindings do not depend on Slack credentials. Retain the optional
+  legacy identity-name lane derivation for callers that explicitly omit the
+  `identity_lanes` argument to the pure judge; the live collector always passes
+  the resolved declaration. The declaration can be Secret-backed: a failed
+  credential lane reports its fixed app or bot position, never the declared
+  environment variable name or value.
 
 ### STARTABILITY-4: Value-free credential observations
 
