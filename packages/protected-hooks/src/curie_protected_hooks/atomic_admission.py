@@ -528,8 +528,12 @@ class AtomicAdmission:
                     event_id=turn.event_id,
                     conversation_id=turn.conversation_id,
                     payload_sha256=hashlib.sha256(payload).hexdigest(),
-                    remediation_generation=request.remediation_generation,
                 )
+                # Only a bound generation is written: with none bound the intent,
+                # binding and receipt keep the released key sets, so a rollback
+                # still reads them (AUTOMATED-REMEDIATION-4).
+                if request.remediation_generation is not None:
+                    original[REMEDIATION_GENERATION] = request.remediation_generation
                 envelope_raw = self._envelope(original, manifest).canonical_bytes
                 original["envelope_sha256"] = hashlib.sha256(envelope_raw).hexdigest()
                 params.update(mode="new", intent=original)
