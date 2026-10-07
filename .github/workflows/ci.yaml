@@ -2637,8 +2637,7 @@ jobs:
       - name: Controller preflight accepts a serving upgrade and refuses broken RBAC
         run: |
           set -euo pipefail
-          bash tools/runtime-assertion-gate/run.sh \
-            charts/curie/ci/scenarios/controller-preflight-kind.sh
+          uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |

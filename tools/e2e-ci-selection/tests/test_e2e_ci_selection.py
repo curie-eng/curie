@@ -2614,6 +2614,8 @@ def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> 
     step = steps[0]
     assert "if" not in step
     assert "continue-on-error" not in step
-    assert "bash tools/runtime-assertion-gate/run.sh" in step["run"]
-    assert "charts/curie/ci/scenarios/controller-preflight-kind.sh" in step["run"]
+    # This scenario owns its kind cluster; the runtime receipt runner accepts
+    # only ci/runtime scripts and would refuse it before executing any proof.
+    assert "uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh" in step["run"]
+    assert "tools/runtime-assertion-gate/run.sh" not in step["run"]
     assert "e2e-cluster-chart-regressions" in jobs["e2e-required"]["needs"]
