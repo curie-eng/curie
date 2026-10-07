@@ -2298,6 +2298,17 @@ predates it does not carry under --reuse-values (#3505, #3544).
 {{- end -}}
 
 {{/*
+The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12, executor
+amendment E9): one value, rendered as the same integer literal into both the
+API (whose claim route enforces it) and the worker (whose executor loop runs up
+to that many at once). values.schema.json keeps it an integer of at least 1.
+*/}}
+{{- define "curie.actionExecutorMaxConcurrentSandboxes" -}}
+{{- $cap := get (.Values.actionExecutor | default dict) "maxConcurrentSandboxes" -}}
+{{- if kindIs "invalid" $cap -}}2{{- else -}}{{ int $cap }}{{- end -}}
+{{- end -}}
+
+{{/*
 The automated remediation switch (AUTOMATED-REMEDIATION-1): one value, rendered
 as "true" or "false" into both the API and the worker. Enabling it requires the
 action executor, so a render with remediation on and the executor off fails

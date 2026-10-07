@@ -791,8 +791,17 @@ connectorCaller:
 # `get` on Deployments so it can read the digest a connector ran at
 # (ACTION-EXECUTOR-12, -14); with the executor off that grant is absent and
 # actions record no digest, so they are not undoable.
+#
+# maxConcurrentSandboxes (AUTOMATED-REMEDIATION-12, executor amendment E9) is the
+# most executions live (claimed or dispatched) across the installation at once,
+# rendered as CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES into both the API,
+# whose claim route enforces it across worker replicas, and the worker, whose
+# executor loop runs up to that many at once. While two or more slots exist one
+# is kept for write-kind executions, so remediation samples never starve a
+# write. It leaves sandbox quota to ordinary turns; an integer of at least 1.
 actionExecutor:
   enabled: false
+  maxConcurrentSandboxes: 2
 
 # Automated remediation (AUTOMATED-REMEDIATION-1). One switch, rendered as
 # CURIE_REMEDIATION_ENABLED into both the API and the worker. Closed by default.
