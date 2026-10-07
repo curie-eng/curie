@@ -371,6 +371,50 @@ def test_existing_empty_state_fails_closed(tmp_path):
             pass
 
 
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        {"cleanup_blocked": 1},
+        {"cleanup_blocked": 0},
+        {"capacity_skips_total": True},
+        {"capacity_skips_total": -1},
+        {"last_success": True},
+        {"last_success": float("nan")},
+        {"target_last_success": {"slack:example": False}},
+        {"target_last_success": {"slack:example": float("inf")}},
+    ],
+)
+def test_corrupt_boolean_or_numeric_state_refuses_before_cycle(tmp_path, corrupt):
+    """@spec TURN-CANARY-4 TURN-CANARY-6"""
+    canary = _canary()
+    state_file = tmp_path / "canary-state.json"
+    state_file.write_text(json.dumps({"pending": None, **corrupt}))
+    with pytest.raises(ValueError, match="state"):
+        with canary.StateJournal(state_file):
+            pass
+
+
+def test_journal_cleanup_hold_blocks_enqueue_without_platform_flag(tmp_path):
+    """@spec TURN-CANARY-4"""
+    canary = _canary()
+    state_file = tmp_path / "canary-state.json"
+    state_file.write_text(json.dumps({"pending": None, "cleanup_blocked": True}))
+    platform = CyclePlatform()
+    with canary.StateJournal(state_file) as journal:
+        result = asyncio.run(
+            canary.run_cycle(
+                platform,
+                _routes()[:1],
+                journal=journal,
+                turn_deadline=0.02,
+                cleanup_deadline=0.02,
+                poll_period=0.005,
+            )
+        )
+    assert result.cleanup_degraded is True
+    assert not any(call[0] == "enqueue" for call in platform.calls if isinstance(call, tuple))
+
+
 @pytest.mark.parametrize("operation", ["clear", "save"])
 def test_interrupted_state_replacement_preserves_pending_and_blocks_next_run(
     tmp_path, monkeypatch, operation
