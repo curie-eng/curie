@@ -1,19 +1,20 @@
 //! CLI half of the frozen remediation policy and codes vectors.
 //!
-//! @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-20
-//! @spec AUTOMATED-REMEDIATION-26. The API validates a remediation policy and
+//! @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-26. The API validates a remediation policy and
 //! the `remediation-policy` verbs mirror that validation, so a document the
 //! API refuses is refused here first with the API's code and path
 //! (`tests/vectors/remediation-policy.json`, read on the API side by
-//! `apps/api/tests/test_remediation_policy_vector.py`). The `remediation` verbs
-//! render the closed states, refusal codes and outcomes the API stores
-//! (`tests/vectors/remediation-codes.json`).
+//! `apps/api/tests/test_remediation_policy_vector.py`). The policy verbs
+//! render the API's closed policy refusal codes
+//! (`policy_refusals` in `tests/vectors/remediation-codes.json`); the
+//! nomination vocabularies there are rendered by the receipt verbs, which land
+//! with a nomination read route (task 13), so they are not read here yet.
 //!
 //! The readers are `curie::remediation_policy::validate_policy_document`
 //! (`&serde_json::Value` to `Result<(), PolicyRefusal>`, whose `code` and `path`
 //! are the API's), `curie::remediation_policy::parse_policy_text` (a strict
 //! parse whose failure is a `policy_document_invalid` refusal), and the closed
-//! code lists in `curie::remediation`.
+//! policy refusal list `curie::remediation::POLICY_REFUSALS`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -57,6 +58,9 @@ struct PolicyVector {
     invalid_texts: Vec<InvalidText>,
 }
 
+/// Every key is declared so an unknown key still fails; only `policy_refusals`
+/// is compared until the receipt verbs land.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CodesVector {
@@ -156,46 +160,4 @@ fn the_document_codes_are_policy_refusals() {
         set_of(remediation::POLICY_REFUSALS),
         set(&codes.policy_refusals)
     );
-}
-
-/// @spec AUTOMATED-REMEDIATION-20: the CLI renders exactly the API's vocabularies.
-#[test]
-fn the_cli_closes_the_frozen_code_sets() {
-    let codes = codes_vector();
-    assert_eq!(
-        set_of(remediation::NOMINATION_STATES),
-        set(&codes.nomination_states)
-    );
-    assert_eq!(
-        set_of(remediation::NOMINATION_REFUSALS),
-        set(&codes.nomination_refusals)
-    );
-    assert_eq!(
-        set_of(remediation::SUBMISSION_REFUSALS),
-        set(&codes.submission_refusals)
-    );
-    assert_eq!(
-        set_of(remediation::APPROVAL_REASONS),
-        set(&codes.approval_reasons)
-    );
-    assert_eq!(
-        set_of(remediation::APPROVAL_RESOLUTION_REFUSALS),
-        set(&codes.approval_resolution_refusals)
-    );
-    assert_eq!(
-        set_of(remediation::VERIFICATION_OUTCOMES),
-        set(&codes.verification_outcomes)
-    );
-    assert_eq!(
-        set_of(remediation::RECEIPT_STAGES),
-        set(&codes.receipt_stages)
-    );
-    assert_eq!(set_of(remediation::KINDS), set(&codes.kinds));
-    assert_eq!(set_of(remediation::AUTHORITIES), set(&codes.authorities));
-    assert_eq!(
-        set_of(remediation::AUTHORITY_KINDS),
-        set(&codes.authority_kinds)
-    );
-    assert_eq!(set_of(remediation::ACTOR_KINDS), set(&codes.actor_kinds));
-    assert!(!codes.admission_checks.is_empty());
 }

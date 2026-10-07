@@ -196,11 +196,6 @@ fn cluster_cases() -> Vec<ClusterCase> {
             name: "remediation-policy",
             args: &["remediation-policy", "show", "acme-bot", "alerts"],
         },
-        // @spec AUTOMATED-REMEDIATION-20: the operator receipt read.
-        ClusterCase {
-            name: "remediation",
-            args: &["remediation", "list"],
-        },
     ]
 }
 
@@ -304,7 +299,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 35);
+    assert_eq!(covered_names.len(), 34);
 }
 
 #[test]

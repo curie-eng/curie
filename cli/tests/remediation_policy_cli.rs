@@ -1,9 +1,8 @@
-//! The remediation operator surface at the CLI boundary
-//! (AUTOMATED-REMEDIATION-3, AUTOMATED-REMEDIATION-20).
+//! The remediation policy operator surface at the CLI boundary
+//! (AUTOMATED-REMEDIATION-3).
 //!
-//! Two verb groups under BOTH `curie local` and `curie cluster`:
-//!
-//! `remediation-policy` (AUTOMATED-REMEDIATION-3), `<agent>` a name or id:
+//! The `remediation-policy` verb group under BOTH `curie local` and
+//! `curie cluster`, `<agent>` a name or id:
 //!
 //! - `show <agent> <hook>`
 //!   -> `GET    /agents/{id}/hooks/{hook}/remediation-policy`
@@ -15,8 +14,6 @@
 //!   `{"expected_generation": "<n>", "operation_id": "<uuid>"}`
 //! - `remove <agent> <hook> --expected-generation <n> [--operation-id <uuid>]`
 //!   -> `DELETE .../remediation-policy?expected_generation=<n>&operation_id=<uuid>`
-//! - `close-breaker <agent> <hook> <breaker id>`
-//!   -> `POST   .../remediation-policy/breakers/{breaker id}/close`
 //!
 //! Every write sends the ADR 0106 operator principal from
 //! `CURIE_APPROVAL_PRINCIPAL_TOKEN` in `X-Curie-Approval-Principal`, and is a
@@ -24,9 +21,9 @@
 //! document with the mirrored validator first and refuses with the API's code
 //! and path (`tests/vectors/remediation-policy.json`) before any request.
 //!
-//! `remediation` (AUTOMATED-REMEDIATION-20): `list` and `show <nomination id>`,
-//! the operator receipt. The API has no nomination read route yet, so only the
-//! surface and the local id check are pinned here.
+//! `close-breaker` lands with its route (task 9) and the `remediation`
+//! receipt group (AUTOMATED-REMEDIATION-20) with a nomination read route
+//! (task 13): a CLI verb with no API route behind it is out of scope here.
 //!
 //! These drive the compiled binary against a wire-level stub of the platform
 //! API, as `actions_cli.rs` does. Every error is the ADR-0021 `{"error","fix"}`
@@ -54,9 +51,6 @@ const STALE_HOOK: &str = "stale";
 const ROUTE_HOOK: &str = "badroute";
 
 const OPERATION_ID: &str = "11111111-1111-4111-8111-111111111111";
-const BREAKER_ID: &str = "22222222-2222-4222-8222-222222222222";
-const NOMINATION_ID: &str = "33333333-3333-4333-8333-333333333333";
-const MALFORMED_ID: &str = "not-a-uuid";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -161,12 +155,6 @@ fn api() -> MockServer {
             }
             ("DELETE", p) if p == base(HOOK) => {
                 Response::json(200, &policy_out(HOOK, "5", false, false).to_string())
-            }
-            ("POST", p) if p == format!("{}/breakers/{BREAKER_ID}/close", base(HOOK)) => {
-                Response::json(
-                    200,
-                    &json!({"breaker_id": BREAKER_ID, "state": "closed"}).to_string(),
-                )
             }
             _ => Response::json(405, r#"{"detail":"unexpected request"}"#),
         }
@@ -285,22 +273,21 @@ fn query_pairs(path: &str) -> Vec<(String, String)> {
 }
 
 // --------------------------------------------------------------------------
-// Surface: both tiers expose both groups, and the manifest records them
+// Surface: both tiers expose the group, and the manifest records it
 // --------------------------------------------------------------------------
 
-const POLICY_VERBS: [&str; 6] = ["show", "apply", "arm", "disarm", "remove", "close-breaker"];
-const RECEIPT_VERBS: [&str; 2] = ["list", "show"];
+const POLICY_VERBS: [&str; 5] = ["show", "apply", "arm", "disarm", "remove"];
 
-// @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-20
+// @spec AUTOMATED-REMEDIATION-3
 #[test]
-fn local_and_cluster_expose_the_remediation_groups() {
+fn local_and_cluster_expose_the_remediation_policy_group() {
     for tier in ["local", "cluster"] {
         let parent = Command::new(bin())
             .args([tier, "--help"])
             .output()
             .unwrap_or_else(|err| panic!("run {tier} --help: {err}"));
         let parent_help = text(&parent);
-        for group in ["remediation-policy", "remediation"] {
+        for group in ["remediation-policy"] {
             assert!(
                 parent_help
                     .lines()
@@ -308,10 +295,7 @@ fn local_and_cluster_expose_the_remediation_groups() {
                 "{tier} --help must list the {group} group:\n{parent_help}"
             );
         }
-        for (group, verbs) in [
-            ("remediation-policy", &POLICY_VERBS[..]),
-            ("remediation", &RECEIPT_VERBS[..]),
-        ] {
+        for (group, verbs) in [("remediation-policy", &POLICY_VERBS[..])] {
             let output = Command::new(bin())
                 .args([tier, group, "--help"])
                 .output()
@@ -333,10 +317,10 @@ fn local_and_cluster_expose_the_remediation_groups() {
     }
 }
 
-// @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-20
-/// The committed CLI manifest is regenerated with both groups under both tiers.
+// @spec AUTOMATED-REMEDIATION-3
+/// The committed CLI manifest is regenerated with the group under both tiers.
 #[test]
-fn committed_manifest_records_the_remediation_groups_under_both_tiers() {
+fn committed_manifest_records_the_remediation_policy_group_under_both_tiers() {
     let manifest: Value = serde_json::from_str(include_str!("../command-manifest.json"))
         .expect("cli/command-manifest.json parses");
     let child = |node: &Value, name: &str| -> Option<Value> {
@@ -348,10 +332,7 @@ fn committed_manifest_records_the_remediation_groups_under_both_tiers() {
     };
     for tier in ["local", "cluster"] {
         let tier_node = child(&manifest, tier).unwrap_or_else(|| panic!("manifest has {tier}"));
-        for (group, verbs) in [
-            ("remediation-policy", &POLICY_VERBS[..]),
-            ("remediation", &RECEIPT_VERBS[..]),
-        ] {
+        for (group, verbs) in [("remediation-policy", &POLICY_VERBS[..])] {
             let node = child(&tier_node, group)
                 .unwrap_or_else(|| panic!("manifest must record `{tier} {group}`"));
             for verb in verbs {
@@ -570,35 +551,6 @@ fn a_write_without_an_operation_id_mints_a_uuid() {
     assert!(is_uuid(id), "a minted operation_id is a UUID: {body}");
 }
 
-// @spec AUTOMATED-REMEDIATION-3
-#[test]
-fn close_breaker_posts_with_the_principal() {
-    for tier in ["local", "cluster"] {
-        let server = api();
-        let output = run(
-            tier,
-            &["close-breaker", AGENT_NAME, HOOK, BREAKER_ID],
-            &server,
-            Some(OPERATOR_PRINCIPAL),
-        );
-        let what = format!("{tier} remediation-policy close-breaker");
-        assert_eq!(output.status.code(), Some(0), "{what}:\n{}", text(&output));
-        one_object(&output, &what);
-        let sent = writes(&server);
-        assert_eq!(sent.len(), 1, "{what}: one write");
-        assert_eq!(sent[0].method, "POST");
-        assert_eq!(
-            sent[0].path,
-            format!("{}/breakers/{BREAKER_ID}/close", base(HOOK))
-        );
-        assert_eq!(
-            sent[0].header("X-Curie-Approval-Principal"),
-            Some(OPERATOR_PRINCIPAL),
-            "{what}"
-        );
-    }
-}
-
 fn write_argv<'a>(verb: &'a str, file: &'a str) -> Vec<&'a str> {
     match verb {
         "apply" => vec![
@@ -610,7 +562,6 @@ fn write_argv<'a>(verb: &'a str, file: &'a str) -> Vec<&'a str> {
             "--expected-generation",
             "4",
         ],
-        "close-breaker" => vec!["close-breaker", AGENT_NAME, HOOK, BREAKER_ID],
         _ => vec![verb, AGENT_NAME, HOOK, "--expected-generation", "4"],
     }
 }
@@ -623,7 +574,7 @@ fn every_write_without_a_principal_is_refused_before_any_request() {
     let dir = tempfile::tempdir().expect("tempdir");
     let file = write_file(dir.path(), "policy.json", &base_document().to_string());
     for tier in ["local", "cluster"] {
-        for verb in ["apply", "arm", "disarm", "remove", "close-breaker"] {
+        for verb in ["apply", "arm", "disarm", "remove"] {
             for principal in [None, Some("   ")] {
                 let server = api();
                 let output = run(tier, &write_argv(verb, &file), &server, principal);
@@ -901,46 +852,4 @@ fn cluster_tier_refuses_input_errors_before_discovering_the_connection() {
         assert!(value.to_string().contains(needle), "{what}: {value}");
         assert_no_connection_discovery(output, &what);
     }
-}
-
-// --------------------------------------------------------------------------
-// remediation: the operator receipt (AUTOMATED-REMEDIATION-20)
-// --------------------------------------------------------------------------
-
-// @spec AUTOMATED-REMEDIATION-20
-/// A malformed nomination id is a usage error naming the id, one error object,
-/// before any request, at both tiers.
-#[test]
-fn remediation_show_refuses_a_malformed_nomination_id_before_any_request() {
-    for tier in ["local", "cluster"] {
-        let server = api();
-        let output = run_group(
-            tier,
-            "remediation",
-            &["show", MALFORMED_ID],
-            &server,
-            None,
-            true,
-        );
-        let what = format!("{tier} remediation show {MALFORMED_ID}");
-        assert_eq!(output.status.code(), Some(2), "{what}:\n{}", text(&output));
-        let value = one_object(&output, &what);
-        assert_error_object(&value, &what);
-        assert!(
-            value["error"].as_str().unwrap().contains(MALFORMED_ID),
-            "{what}: {value}"
-        );
-        assert!(server.recorded().is_empty(), "{what}: no request");
-    }
-    // A well-formed id parses (the route behind it is not pinned here).
-    let server = api();
-    let output = run_group(
-        "local",
-        "remediation",
-        &["show", NOMINATION_ID],
-        &server,
-        None,
-        true,
-    );
-    one_object(&output, "local remediation show <uuid>");
 }
