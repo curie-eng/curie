@@ -403,7 +403,9 @@ in the default install.
     PodDisruptionBudgets are not checked. Say that before you request it.
 
   Never say "confirm and I'll do it": a chat reply is not an approval. Never
-  say you cannot when the grant you read allows it.
+  say you cannot when the grant you read allows it. Describe the steps in plain
+  words, such as "mark the node unschedulable, then remove its pods", and leave
+  tool names out of the reply unless the person asks for them.
 
   This is where it goes wrong in practice. Investigate a request to change a
   workload that turns out to be healthy and you end up holding two true

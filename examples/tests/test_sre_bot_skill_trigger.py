@@ -26,3 +26,8 @@ def test_questions_about_the_bot_itself_load_the_skill():
     triggers = ("version", "upgrading", "what you can and cannot do", "drain", "cordon", "scale")
     for trigger in triggers:
         assert trigger in description, trigger
+
+
+def test_the_drain_answer_names_steps_not_tools():
+    text = " ".join(SKILL.read_text().split())
+    assert "leave tool names out of the reply" in text
