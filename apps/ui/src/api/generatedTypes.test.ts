@@ -10,7 +10,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 const generator = fileURLToPath(new URL("../../scripts/gen-api-types.mjs", import.meta.url));
 const source = fileURLToPath(new URL("../../../api/openapi.json", import.meta.url));
 
-describe("generated API type gate", () => {
+// Each case runs the generator over the whole OpenAPI document up to four times.
+describe("generated API type gate", { timeout: 30_000 }, () => {
   let directory: string;
   let schemaPath: string;
   let outputPath: string;
