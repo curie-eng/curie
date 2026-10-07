@@ -33,6 +33,8 @@ from sqlalchemy.exc import DBAPIError
 
 # The head of next when the tests were written; the new revision revises it.
 BELOW = "0086"
+# The single head now: the nomination revision (task 6) follows the policy one.
+HEAD = "0088"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}
 GENERATION_COLUMNS = {
@@ -141,7 +143,8 @@ def test_one_hand_written_revision_on_the_next_head() -> None:
     revision, down = _revision()
     assert down == BELOW, f"revision {revision} revises {down}, expected {BELOW}"
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == [revision]
+    assert script.get_heads() == [HEAD]
+    assert revision in {rev.revision for rev in script.iterate_revisions(HEAD, BELOW)}
 
 
 def test_the_upgrade_creates_both_tables_with_their_keys(
