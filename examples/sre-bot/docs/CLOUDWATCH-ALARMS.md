@@ -28,7 +28,11 @@ example artifacts rather than a platform architectural decision.
   existing installation's metric names by explicitly setting its previous
   prefix. Accept only `[a-zA-Z_][a-zA-Z0-9_]*` prefixes and positive finite
   polling intervals. Invalid configuration exits 2 without opening a listener
-  or requesting credentials. A refused listener bind exits 2 with a bounded
+  or requesting credentials. Accept only standard `amazonaws.com` partition
+  region names matching `(?:af|ap|ca|eu|il|me|mx|sa|us)(?:-gov)?-[a-z]+-[1-9][0-9]*`;
+  reject other `AWS_REGION` strings before reading a token, opening a listener
+  or making an HTTP request. This excludes China and other partitions whose
+  service DNS suffix differs. A refused listener bind exits 2 with a bounded
   configuration error and no traceback, exception text or installation values. The STS session name is `curie-cloudwatch-alarms`.
 
 - **SRE-CW-2 — signed complete reads.** Read the projected web identity token
@@ -43,7 +47,10 @@ example artifacts rather than a platform architectural decision.
   OKActions or InsufficientDataActions entry, or a similarly prefixed topic in
   AlarmActions, does not qualify. `parse_alarms(xml, topic_arn)` receives the
   configured topic explicitly. Requests use AWS SigV4, signing
-  the exact body and session-token header. Only direct alarm members count;
+  the exact body and session-token header. Never follow an HTTP redirect from
+  STS or CloudWatch, including a redirect to another origin. A 3xx response is
+  a failed poll with only its status logged and no body or credential material.
+  Only direct alarm members count;
   nested dimensions or metrics do not. ActionsEnabled false suppresses both
   kinds; absent descriptions become empty strings. Requests time out after
   20 seconds. Malformed XML, missing result or credential fields and naive
