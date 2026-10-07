@@ -180,8 +180,9 @@
       "mode": "read-or-ask",
       "attachments": [],
       "expected_reply": [
-        "Explains that a platform upgrade moves to the newest published release and cannot target a named version.",
-        "Says it needs a person's approval, restarts every platform component, and is not something it can undo.",
+        "Answers from its actual tool list.",
+        "With upgrade_platform on that list: explains that the upgrade moves to the newest published release and cannot target a named version, needs a person's approval, restarts every platform component, and cannot be undone by it.",
+        "Without upgrade_platform: says plainly it cannot upgrade the platform and hands over what a person would run; never proposes patching platform objects by hand.",
         "Does not confuse it with upgrading its own bundle."
       ],
       "card_action": null,
