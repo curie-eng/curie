@@ -13,7 +13,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 # @spec SRE-SCHEDULED-JOBS c1 c2 c3 c4 c5
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 CLI = REPOSITORY_ROOT / "examples/sre-bot/observability/scheduled_job_alerts.py"
@@ -52,9 +51,7 @@ class ScheduledJobAlertsCLITests(unittest.TestCase):
 
     # @spec SRE-SCHEDULED-JOBS c3 c4
     def test_cli_rejects_invalid_namespace_before_writing_values(self) -> None:
-        result = self._run_cli(
-            "--namespace", "Bad_Namespace", "--description", DESCRIPTION
-        )
+        result = self._run_cli("--namespace", "Bad_Namespace", "--description", DESCRIPTION)
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
         self.assertIn("error:", result.stderr.lower())
@@ -93,9 +90,7 @@ class ScheduledJobAlertsPromtoolTests(unittest.TestCase):
 
         rules = [rule for group in groups for rule in group["rules"]]
         suspension_alert = next(
-            rule["alert"]
-            for rule in rules
-            if "kube_cronjob_spec_suspend" in rule["expr"]
+            rule["alert"] for rule in rules if "kube_cronjob_spec_suspend" in rule["expr"]
         )
         unsuccessful_alert = next(
             rule["alert"]
@@ -186,9 +181,7 @@ class ScheduledJobAlertsPromtoolTests(unittest.TestCase):
                         "eval_time": "1m",
                         "alertname": suspension_alert,
                         "exp_alerts": [
-                            self._expected_alert(
-                                "Scheduled job credential-rotation is suspended"
-                            )
+                            self._expected_alert("Scheduled job credential-rotation is suspended")
                         ],
                     }
                 ],
@@ -317,9 +310,7 @@ class ScheduledJobAlertsPromtoolTests(unittest.TestCase):
         value: str,
     ) -> dict[str, str]:
         return {
-            "series": (
-                f'{metric}{{namespace="{namespace}",cronjob="credential-rotation"}}'
-            ),
+            "series": (f'{metric}{{namespace="{namespace}",cronjob="credential-rotation"}}'),
             "values": value,
         }
 
