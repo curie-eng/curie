@@ -402,6 +402,34 @@
       "schema": "ActionOut",
       "omissions": [
         {
+          "field": "authority_kind",
+          "why": "AUTOMATED-REMEDIATION-13/-14 authority of a forward execution. The actions verbs print what was done and whether it is undoable; authority and actor attribution belong to the remediation receipts (task 13), so the mirror drops them on decode."
+        },
+        {
+          "field": "authority_ref",
+          "why": "The policy generation or approval behind a forward execution; dropped on decode for the same reason as authority_kind."
+        },
+        {
+          "field": "actor_kind",
+          "why": "AUTOMATED-REMEDIATION-14 actor attribution; dropped on decode for the same reason as authority_kind."
+        },
+        {
+          "field": "delivery_event_id",
+          "why": "The protected delivery a remediation came from; dropped on decode for the same reason as authority_kind."
+        },
+        {
+          "field": "nomination_id",
+          "why": "The remediation nomination behind a forward execution; dropped on decode for the same reason as authority_kind."
+        },
+        {
+          "field": "verification_outcome",
+          "why": "The remediation verifier's outcome (AUTOMATED-REMEDIATION-18), shown by the remediation receipts rather than the actions verbs."
+        },
+        {
+          "field": "verified_at",
+          "why": "When the remediation verifier settled; dropped on decode for the same reason as verification_outcome."
+        },
+        {
           "field": "prior_state",
           "why": "The sealed snapshot envelope. ACTION-EXECUTOR-23: the actions verbs never print snapshot material, so the mirror drops it on decode and no output can carry it."
         },
