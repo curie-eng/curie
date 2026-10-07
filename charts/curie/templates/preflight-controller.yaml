@@ -33,7 +33,10 @@ never runs against a BYO controller this release does not own.
 {{- /* Defaulted here, not only in values.yaml: `helm upgrade --reuse-values`
 renders these templates against the PREVIOUS chart's values, which predate
 this key (#3813). */}}
-{{- $stableLeaderSeconds := int (default 180 .Values.preflights.controllerReady.stableLeaderSeconds) }}
+{{- $stableLeaderSeconds := 180 }}
+{{- if not (kindIs "invalid" .Values.preflights.controllerReady.stableLeaderSeconds) }}
+{{- $stableLeaderSeconds = int .Values.preflights.controllerReady.stableLeaderSeconds }}
+{{- end }}
 {{- if lt $stableLeaderSeconds 150 }}
 {{- fail (printf "preflights.controllerReady.stableLeaderSeconds must be at least 150 (the controller's 120s cache-sync timeout plus lease and scheduling margin); got %d" $stableLeaderSeconds) }}
 {{- end }}

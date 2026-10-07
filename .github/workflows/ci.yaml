@@ -2630,6 +2630,15 @@ jobs:
       # namespace, so it neither reads nor disturbs the release above.
       - name: Runner BYO egress enforces (not just rendered)
         run: bash scripts/check-runner-byo-egress.sh charts/curie
+      # The actual packaged-chart hooks must judge a no-restart upgrade and
+      # still reject an informer RBAC failure (#4197). The scenario owns and
+      # tears down its separate kind cluster; render assertions alone cannot
+      # prove Helm leaves a serving release deployed.
+      - name: Controller preflight accepts a serving upgrade and refuses broken RBAC
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/scenarios/controller-preflight-kind.sh
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |

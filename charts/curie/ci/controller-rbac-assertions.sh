@@ -718,12 +718,14 @@ echo "  ok: (h.4) a restarted controller passes on its startup log, a crashing o
 # The bound must stay above the controller's 120s cache-sync timeout, and a
 # release whose stored values predate the key (helm upgrade --reuse-values)
 # must still render the default.
-if helm template "$RELEASE" "$CHART" --namespace "$NS" \
-    --set preflights.controllerReady.stableLeaderSeconds=149 > "$TMP/short.yaml" 2> "$TMP/short.err"; then
-  fail "(h.5) stableLeaderSeconds=149 must be refused at render"
-fi
-grep -q "stableLeaderSeconds must be at least 150" "$TMP/short.err" \
-  || fail "(h.5) the refusal must name stableLeaderSeconds, got: $(cat "$TMP/short.err")"
+for bound in 0 149; do
+  if helm template "$RELEASE" "$CHART" --namespace "$NS" \
+      --set "preflights.controllerReady.stableLeaderSeconds=$bound" > "$TMP/short.yaml" 2> "$TMP/short.err"; then
+    fail "(h.5) stableLeaderSeconds=$bound must be refused at render"
+  fi
+  grep -q "stableLeaderSeconds must be at least 150" "$TMP/short.err" \
+    || fail "(h.5) the refusal must name stableLeaderSeconds, got: $(cat "$TMP/short.err")"
+done
 helm template "$RELEASE" "$CHART" --namespace "$NS" \
   --set preflights.controllerReady.stableLeaderSeconds=null > "$TMP/unset.yaml" \
   || fail "(h.5) a values set without stableLeaderSeconds must still render"

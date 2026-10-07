@@ -2603,3 +2603,17 @@ def test_approval_resume_job_runs_on_pull_requests_and_gates_e2e_required() -> N
         return [step["uses"] for step in steps if "uses" in step]
 
     assert uses(job["steps"]) == uses(sibling["steps"])
+
+
+def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    job = jobs["e2e-cluster-chart-regressions"]
+    name = "Controller preflight accepts a serving upgrade and refuses broken RBAC"
+    steps = [step for step in job["steps"] if step.get("name") == name]
+    assert len(steps) == 1, "The controller upgrade proof must execute in required PR CI"
+    step = steps[0]
+    assert "if" not in step
+    assert "continue-on-error" not in step
+    assert "bash tools/runtime-assertion-gate/run.sh" in step["run"]
+    assert "charts/curie/ci/scenarios/controller-preflight-kind.sh" in step["run"]
+    assert "e2e-cluster-chart-regressions" in jobs["e2e-required"]["needs"]
