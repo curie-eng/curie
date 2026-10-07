@@ -131,6 +131,7 @@ _ENV_SETTINGS = {
     "CURIE_TEST_READ_ERROR": ("read_error", lambda raw: raw == "1"),
     "CURIE_TEST_READ_CONTENT": ("read_content", json.loads),
     "CURIE_TEST_READ_TEXT_BYTES": ("read_text_bytes", int),
+    "CURIE_TEST_READ_STRUCTURED_BYTES": ("read_structured_bytes", int),
 }
 
 
@@ -875,6 +876,39 @@ def test_a_text_only_result_past_the_result_bound_is_unstructured(tmp_path: Path
         drive,
     )
     assert len(_calls(tmp_path)) == 1
+
+
+def test_a_structured_result_past_the_result_bound_is_unstructured(tmp_path: Path) -> None:
+    """@spec AUTOMATED-REMEDIATION-12: the result bound holds for structured content too.
+
+    A result whose structured content makes it larger than
+    ``bounds.call_result_bytes`` (``CALL_RESULT_MAX_BYTES``) is
+    ``result_unstructured``, as the ``call`` phase bounds its whole result,
+    even though the pointer would reach a scalar.
+    """
+
+    bound = _ROUTE["bounds"]["call_result_bytes"]
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _read_list()))[0] == 200
+        status, body = await _post(client, _READ_REQUEST)
+        assert status == 200, body
+        assert body == {"phase": "read", "sample": "result_unstructured", "value": None}
+
+    _drive(_read_connector(tmp_path, CURIE_TEST_READ_STRUCTURED_BYTES=str(bound)), drive)
+    assert len(_calls(tmp_path)) == 1
+
+
+def test_a_structured_result_within_the_bound_is_read(tmp_path: Path) -> None:
+    """@spec AUTOMATED-REMEDIATION-12: the control for the bound, just under it."""
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _read_list()))[0] == 200
+        status, body = await _post(client, _READ_REQUEST)
+        assert status == 200, body
+        assert body == {"phase": "read", "sample": "value", "value": 1}
+
+    _drive(_read_connector(tmp_path, CURIE_TEST_READ_STRUCTURED_BYTES="1024"), drive)
 
 
 @pytest.mark.parametrize("pointer", _READ["invalid_pointers"])

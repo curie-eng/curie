@@ -710,7 +710,7 @@ contract"). Concretely:
   documented guidance;
 * the sandbox carries only the read connector's credentials, which requires the
   executor's per-claim stripped template ([#4204](https://github.com/curie-eng/curie/issues/4204),
-  unmerged); without it the pool template would put the acting connector's
+  merged); without it the pool template would put the acting connector's
   credential in the verifier's sandbox and defeat REMEDIATION-15.
 
 Acceptance: against a read fixture, one `read` returns the pointed scalar and the
@@ -1179,7 +1179,7 @@ executor spec text in the same change.
   `not_reversible_now` and `policy_changed`; `pointer_absent`, `result_unstructured`
   and a skipped sample are sample results, not refusals. The `runner-execute` vector carries all of them.
 * **E7, AE-5 (sandbox credentials).** Read executions require the per-claim
-  stripped template proposed by #4204 (unmerged); this contract does not ship
+  stripped template of #4204 (merged); this contract does not ship
   verification on the pool template.
 * **E8, AE-17 and AE-21 (claim-time authority re-check).** AE-21 leaves limits,
   the breaker and disarm to admission. For a `policy`-authorized forward

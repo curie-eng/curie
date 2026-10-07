@@ -91,6 +91,9 @@ READ_TEXT: str = _READ_REQUEST["arguments"]
 READ_ARGUMENTS: dict[str, Any] = json.loads(READ_TEXT)
 READ_POINTER: str = _READ_REQUEST["pointer"]
 READ_SECRET = "EXAMPLE_METRICS_TOKEN"
+# The digest the read producer binds over the canonical argument text, as a
+# forward's authority does (ACTION-EXECUTOR-7).
+READ_SHA256: str = connector_grant.arguments_sha256(READ_TEXT)
 
 
 def read_list_tools() -> list[dict[str, Any]]:
@@ -281,7 +284,7 @@ class FakeApi:
 
         fields.setdefault("connector", READ_CONNECTOR)
         fields.setdefault("tool", READ_TOOL)
-        fields.setdefault("arguments_sha256", None)
+        fields.setdefault("arguments_sha256", READ_SHA256)
         fields.setdefault("requested_by", None)
         execution = Execution(id=str(uuid.uuid4()), kind="read", **fields)
         self.executions[execution.id] = execution

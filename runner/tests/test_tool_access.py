@@ -455,9 +455,7 @@ def test_the_same_gated_write_on_an_ordinary_turn_still_asks_for_approval() -> N
 
 def test_a_read_only_turn_ignores_the_models_approval_request() -> None:
     # @spec RUNNER-TOOL-ACCESS-3 RUNNER-TOOL-ACCESS-8
-    gate = build_approval_gate(
-        operator_tools=None, policy_routes={"mcp__acme__close_issue": "ops"}
-    )
+    gate = build_approval_gate(operator_tools=None, policy_routes={"mcp__acme__close_issue": "ops"})
     assert gate is not None
     runner, _ = _fake_runner(
         lambda: approval_turn("deploy the fix", route="ops"), gate=gate, access=_access()
@@ -473,9 +471,7 @@ def test_a_read_only_turn_ignores_the_models_approval_request() -> None:
 
 def test_the_same_approval_request_on_an_ordinary_turn_is_a_card() -> None:
     # @spec RUNNER-TOOL-ACCESS-7: the control for the test above.
-    gate = build_approval_gate(
-        operator_tools=None, policy_routes={"mcp__acme__close_issue": "ops"}
-    )
+    gate = build_approval_gate(operator_tools=None, policy_routes={"mcp__acme__close_issue": "ops"})
     assert gate is not None
     runner, _ = _fake_runner(
         lambda: approval_turn("deploy the fix", route="ops"), gate=gate, access=_access()
@@ -657,9 +653,7 @@ def test_a_reset_session_runs_a_read_only_turn_again() -> None:
             await runner.reset()
             lines = [
                 line
-                async for line in runner.run_turn(
-                    _event("probe", tool_access=ToolAccess.READ_ONLY)
-                )
+                async for line in runner.run_turn(_event("probe", tool_access=ToolAccess.READ_ONLY))
             ]
         finally:
             await runner.close()
@@ -738,9 +732,7 @@ def test_a_read_only_tool_an_operator_gated_is_refused_on_the_booted_runner(
 ) -> None:
     # @spec RUNNER-TOOL-ACCESS-1 RUNNER-TOOL-ACCESS-3: Read is read-only, but a
     # gate names it, and the approval it needs cannot be asked for.
-    runner = build_runner(
-        _config(tmp_path, CURIE_APPROVAL_REQUIRED_TOOLS="Read"), fake_model=True
-    )
+    runner = build_runner(_config(tmp_path, CURIE_APPROVAL_REQUIRED_TOOLS="Read"), fake_model=True)
     script = [
         _assistant(ToolUseBlock(id="t1", name="Read", input={"file_path": "/tmp/x"})),
         _tool_result("t1", "contents"),
@@ -980,9 +972,7 @@ def test_turns_under_one_access_keep_their_session() -> None:
         _event("probe", tool_access=ToolAccess.READ_ONLY),
         _event("probe again", tool_access=ToolAccess.READ_ONLY),
     )
-    assert [s.queries for s in restricted_sessions] == [
-        [_sent("probe"), _sent("probe again")]
-    ]
+    assert [s.queries for s in restricted_sessions] == [[_sent("probe"), _sent("probe again")]]
 
 
 def test_a_refused_progress_demo_call_gets_only_its_refusal(

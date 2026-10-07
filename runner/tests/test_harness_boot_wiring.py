@@ -45,9 +45,7 @@ def _harness(**overrides) -> HarnessContribution:
         name="test-harness",
         readonly_tools=frozenset({"CustomReadOnly"}),
         build_spawn_env=lambda env: None,
-        compile_bundle=lambda plugin_dir: BundleCompileResult(
-            plugins=[], system_prompt=None
-        ),
+        compile_bundle=lambda plugin_dir: BundleCompileResult(plugins=[], system_prompt=None),
     )
     defaults.update(overrides)
     return HarnessContribution(**defaults)
@@ -129,9 +127,7 @@ def test_claude_runner_offers_provider_web_search_by_default(tmp_path) -> None:
 
 def test_claude_runner_bundle_opt_out_suppresses_provider_web_search(tmp_path) -> None:
     config = _config(tmp_path)
-    (tmp_path / "curie.bundle.json").write_text(
-        json.dumps({"webSearch": False}), encoding="utf-8"
-    )
+    (tmp_path / "curie.bundle.json").write_text(json.dumps({"webSearch": False}), encoding="utf-8")
 
     runner = build_runner(config)
     options = runner._factory()._options
@@ -143,9 +139,7 @@ def test_claude_runner_bundle_opt_out_suppresses_provider_web_search(tmp_path) -
 
 def test_claude_runner_refuses_a_misspelled_bundle_opt_out(tmp_path) -> None:
     config = _config(tmp_path)
-    (tmp_path / "curie.bundle.json").write_text(
-        json.dumps({"websearch": False}), encoding="utf-8"
-    )
+    (tmp_path / "curie.bundle.json").write_text(json.dumps({"websearch": False}), encoding="utf-8")
 
     with pytest.raises(PluginBundleError, match="unknown key.*websearch"):
         build_runner(config)

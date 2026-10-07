@@ -137,13 +137,10 @@ def test_live_policy_refusal_does_not_call_or_page_the_connector(
     assert len(finals) == 1
     assert finals[0].status is SessionStatus.DONE
     assert not calls.exists(), "the refused call unexpectedly reached the connector"
-    assert [point["outcome"] for point in observed if point["origin"] == "connector"] == [
-        "refused"
-    ]
+    assert [point["outcome"] for point in observed if point["origin"] == "connector"] == ["refused"]
 
-_WORKSPACE_REQUIRED_TOOLS = frozenset(
-    {"Read", "Edit", "Bash", "mcp__curie__publish_changes"}
-)
+
+_WORKSPACE_REQUIRED_TOOLS = frozenset({"Read", "Edit", "Bash", "mcp__curie__publish_changes"})
 
 
 class _LiveTranscriptStore:
@@ -188,18 +185,14 @@ def _production_sre_bundle(tmp_path: Path) -> Path:
         "    url: http://127.0.0.1:9/self-upgrade\n",
         encoding="utf-8",
     )
-    manifest = json.loads(
-        (bundle / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
-    )
+    manifest = json.loads((bundle / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
     assert manifest["name"] == "sre-bot"
     assert manifest["toolPolicy"]["enforcement"] == "curie/mcp-tool-policy@1"
     assert manifest["approvalPolicy"]["gates"]
     return bundle
 
 
-def _assert_production_workspace_init(
-    init: dict[str, Any], *, bundle: Path
-) -> None:
+def _assert_production_workspace_init(init: dict[str, Any], *, bundle: Path) -> None:
     """Require the real mounted catalogue, not an options-only substitute."""
 
     source = _production_sre_source()
@@ -214,9 +207,7 @@ def _assert_production_workspace_init(
         == (source / "skills" / "sre-bot" / "SKILL.md").read_text(encoding="utf-8")
         and (bundle / "connectors.yaml").is_file()
         and not (bundle / ".mcp.json").exists()
-    ), (
-        "generic or plugin-less bundle cannot satisfy SRE workspace acceptance"
-    )
+    ), "generic or plugin-less bundle cannot satisfy SRE workspace acceptance"
     raw_tools = init.get("tools")
     assert isinstance(raw_tools, list), "SDK init carried no concrete tools catalogue"
     tools = {str(tool) for tool in raw_tools}
@@ -234,9 +225,7 @@ def _catalog_config(bundle: Path, session_id: str):
         "CURIE_PLUGIN_DIR": str(bundle),
         "CURIE_SESSION_ID": session_id,
         "CURIE_SANDBOX_ID": f"sandbox-{session_id}",
-        "CURIE_BUDGET": (
-            '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
-        ),
+        "CURIE_BUDGET": ('{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'),
     }
     if model := os.environ.get("CURIE_MODEL"):
         env["CURIE_MODEL"] = model
@@ -350,9 +339,7 @@ def test_workspace_catalog_assertion_rejects_missing_and_pluginless_init(
     generic = tmp_path / "generic-plugin"
     generic.mkdir()
     with pytest.raises(AssertionError, match="generic or plugin-less bundle"):
-        _assert_production_workspace_init(
-            {"tools": complete, "cwd": "/workspace"}, bundle=generic
-        )
+        _assert_production_workspace_init({"tools": complete, "cwd": "/workspace"}, bundle=generic)
 
 
 @pytest.mark.skipif(
@@ -360,14 +347,14 @@ def test_workspace_catalog_assertion_rejects_missing_and_pluginless_init(
     reason="set CURIE_E2E_LIVE=1 for real SDK mounted workspace catalogue evidence",
 )
 def test_live_claim_time_workspace_init_catalogue(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from curie_runner import __main__ as boot
 
     workspace = Path("/workspace")
     assert workspace.is_dir() and (workspace / ".git").exists(), (
-        "CURIE_E2E_LIVE=1 workspace catalogue proof requires a mounted "
-        "/workspace checkout"
+        "CURIE_E2E_LIVE=1 workspace catalogue proof requires a mounted /workspace checkout"
     )
     bundle = _production_sre_bundle(tmp_path)
     init_messages = _install_init_observer(monkeypatch)
@@ -415,7 +402,8 @@ def test_live_claim_time_workspace_init_catalogue(
     reason="set CURIE_E2E_LIVE=1 for real SDK late workspace catalogue evidence",
 )
 def test_live_late_workspace_replacement_init_catalogue(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from aci_protocol import BootEnv
     from curie_runner import __main__ as boot
@@ -423,15 +411,11 @@ def test_live_late_workspace_replacement_init_catalogue(
 
     workspace = Path("/workspace")
     assert workspace.is_dir() and (workspace / ".git").exists(), (
-        "CURIE_E2E_LIVE=1 workspace catalogue proof requires a mounted "
-        "/workspace checkout"
+        "CURIE_E2E_LIVE=1 workspace catalogue proof requires a mounted /workspace checkout"
     )
     bundle = _production_sre_bundle(tmp_path)
     logical_session_id = f"agent-acme-thread-{uuid4()}"
-    history_ref = (
-        "http://api.example.com/agents/acme-agent/state/transcript/"
-        f"thread-{uuid4()}"
-    )
+    history_ref = f"http://api.example.com/agents/acme-agent/state/transcript/thread-{uuid4()}"
     base_config = _catalog_config(bundle, logical_session_id)
 
     # SandboxSubstrate.handoff carries the standing claim's exact logical
@@ -494,9 +478,7 @@ def test_live_late_workspace_replacement_init_catalogue(
     async def seed_durable_replay() -> ConversationReplay:
         await store.append(prior_turn)
         records = await store.load()
-        replay, summary = build_conversation_replay(
-            records, max_turns=None, max_bytes=None
-        )
+        replay, summary = build_conversation_replay(records, max_turns=None, max_bytes=None)
         assert summary is None
         return replay
 
@@ -553,9 +535,7 @@ def test_live_late_workspace_replacement_init_catalogue(
         sentinel_read = read_by_path.get(str(sentinel_path))
         assert instruction_read is not None, read_by_path
         assert sentinel_read is not None, read_by_path
-        assert verification_command in _successful_tool_result_text(
-            instruction_read, results
-        )
+        assert verification_command in _successful_tool_result_text(instruction_read, results)
         assert old_sentinel in _successful_tool_result_text(sentinel_read, results)
         assert sentinel_path.read_text(encoding="utf-8") == f"{new_sentinel}\n"
         edit_text = _successful_tool_result_text(uses["Edit"][0], results)
@@ -605,9 +585,12 @@ def test_live_late_workspace_replacement_init_catalogue(
 )
 def test_live_runner_answers_trivial_message() -> None:
     options = build_options(
-        plugins=[], model=None,
+        plugins=[],
+        model=None,
         system_prompt="You are a terse test agent.",
-        max_turns=2, max_budget_usd=1.0, resume=None,
+        max_turns=2,
+        max_budget_usd=1.0,
+        resume=None,
     )
     runner = SessionRunner(
         max_usd_per_day=None,
@@ -695,9 +678,7 @@ def test_live_steer_and_cache_reuse() -> None:
                     if isinstance(msg.usage, dict):
                         usages.append(msg.usage)
                     break
-            out["turn2_cache_read"] = int(
-                (usages[-1] or {}).get("cache_read_input_tokens") or 0
-            )
+            out["turn2_cache_read"] = int((usages[-1] or {}).get("cache_read_input_tokens") or 0)
         return out
 
     result = anyio.run(go)
@@ -766,8 +747,7 @@ def test_live_permission_gate_pauses_awaiting_approval() -> None:
         plugins=[],
         model=None,
         system_prompt=(
-            "You are a terse test agent. When asked to run a command, use the"
-            " Bash tool."
+            "You are a terse test agent. When asked to run a command, use the Bash tool."
         ),
         max_turns=4,
         max_budget_usd=1.0,
@@ -848,18 +828,14 @@ def test_live_provider_web_search_default_and_bundle_opt_out(tmp_path: Path) -> 
         manifest.parent.mkdir(parents=True)
         manifest.write_text('{"name": "acme-web-search"}', encoding="utf-8")
         if not enabled:
-            (bundle / "curie.bundle.json").write_text(
-                '{"webSearch": false}', encoding="utf-8"
-            )
+            (bundle / "curie.bundle.json").write_text('{"webSearch": false}', encoding="utf-8")
         run_id = str(uuid4())
         config = RunnerConfig.from_env(
             {
                 "CURIE_PLUGIN_DIR": str(bundle),
                 "CURIE_SESSION_ID": run_id,
                 "CURIE_SANDBOX_ID": run_id,
-                "CURIE_BUDGET": (
-                    '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
-                ),
+                "CURIE_BUDGET": ('{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'),
             }
         )
         return build_runner(config)._factory()._options
@@ -939,9 +915,7 @@ def test_live_structured_replay_cache_hit_and_changed_prefix_negative(tmp_path) 
         "answer tersely and do not repeat a tool call."
     )
 
-    async def source_checkpoint() -> tuple[
-        tuple[ConversationMessage, ...], HarnessReplayState
-    ]:
+    async def source_checkpoint() -> tuple[tuple[ConversationMessage, ...], HarnessReplayState]:
         seeded = build_structured_resume(
             (), curie_session_id="live-cache-prefix-1902", cwd=str(tmp_path)
         )
@@ -1083,9 +1057,7 @@ def test_live_mcp_policy_catalog_approval_exact_once_and_cache_observable(
     monkeypatch.setattr(session_module, "record_metric", observe_metric)
 
     marker_file = tmp_path / "approval-executions.txt"
-    fixture = (
-        Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py"
-    ).resolve()
+    fixture = (Path(__file__).parent / "fixtures" / "mcp_tool_capability_server.py").resolve()
     bundle = tmp_path / "approval-catalog"
     (bundle / ".claude-plugin").mkdir(parents=True)
     (bundle / ".claude-plugin" / "plugin.json").write_text(
@@ -1138,9 +1110,7 @@ def test_live_mcp_policy_catalog_approval_exact_once_and_cache_observable(
             "CURIE_PLUGIN_DIR": str(bundle),
             "CURIE_SESSION_ID": session_id,
             "CURIE_SANDBOX_ID": f"sandbox-{session_id}",
-            "CURIE_BUDGET": (
-                '{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'
-            ),
+            "CURIE_BUDGET": ('{"max_output_tokens_per_run": 10000, "max_usd_per_day": 1.0}'),
         }
         if model := os.environ.get("CURIE_MODEL"):
             env["CURIE_MODEL"] = model
@@ -1252,13 +1222,9 @@ def test_live_mcp_policy_catalog_approval_exact_once_and_cache_observable(
 
     approved, duplicate = anyio.run(drive_resumed_turns)
     assert approved.status is SessionStatus.DONE
-    assert marker_file.read_text(encoding="utf-8").splitlines() == [
-        "write_approval"
-    ]
+    assert marker_file.read_text(encoding="utf-8").splitlines() == ["write_approval"]
 
-    cache_calls = [
-        call for call in metric_calls if call[0] == "curie.history.resume.cache_read"
-    ]
+    cache_calls = [call for call in metric_calls if call[0] == "curie.history.resume.cache_read"]
     assert len(cache_calls) == 1
     assert cache_calls[0][1] > 0
     assert cache_calls[0][2] == {
@@ -1273,18 +1239,14 @@ def test_live_mcp_policy_catalog_approval_exact_once_and_cache_observable(
     assert duplicate.approval_summary is not None
     assert write_approval in duplicate.approval_summary
     assert "duplicate" in duplicate.approval_summary
-    assert marker_file.read_text(encoding="utf-8").splitlines() == [
-        "write_approval"
-    ]
+    assert marker_file.read_text(encoding="utf-8").splitlines() == ["write_approval"]
 
 
 @pytest.mark.skipif(
     not _LIVE_REQUESTED,
     reason="set CURIE_E2E_LIVE=1 for disposable structured-replay provider evidence",
 )
-def test_live_cross_runner_approval_exact_once_and_cache_observable(
-    tmp_path, monkeypatch
-) -> None:
+def test_live_cross_runner_approval_exact_once_and_cache_observable(tmp_path, monkeypatch) -> None:
     """A suspended real tool call resumes once, then its one-shot grant expires."""
     from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
     from curie_runner import session as session_module
@@ -1296,6 +1258,7 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
 
     metric_calls: list[tuple[str, float, dict[str, str] | None]] = []
     real_record_metric = session_module.record_metric
+
     def observe_metric(
         name: str,
         value: float = 1,
@@ -1313,6 +1276,7 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
         "command, call Bash with that exact command once and then stop."
     )
     store = _LiveTranscriptStore()
+
     def options_for(
         gate: ApprovalGate,
         replay: tuple[ConversationMessage, ...],
@@ -1337,6 +1301,7 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
             can_use_tool=build_can_use_tool(gate),
             cwd=str(tmp_path),
         )
+
     async def drive(runner: SessionRunner, text: str) -> Final:
         await runner.start()
         final: Final | None = None
@@ -1351,6 +1316,7 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
             await runner.close()
         assert final is not None
         return final
+
     blocked_gate = ApprovalGate(required=frozenset({"Bash"}))
     blocked = SessionRunner(
         max_usd_per_day=None,
@@ -1377,15 +1343,15 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
     allowed_commands: list[str] = []
     resumed_gate = ApprovalGate(required=frozenset({"Bash"}), grant_tool="Bash")
     permission_callback = build_can_use_tool(resumed_gate)
+
     async def observe_permission(tool_name, tool_input, context):
         decision = await permission_callback(tool_name, tool_input, context)
         if isinstance(decision, PermissionResultAllow):
             allowed_commands.append(str(tool_input.get("command") or ""))
         assert isinstance(decision, (PermissionResultAllow, PermissionResultDeny))
         return decision
-    resumed_options = options_for(
-        resumed_gate, replay.messages, replay.harness_replay
-    )
+
+    resumed_options = options_for(resumed_gate, replay.messages, replay.harness_replay)
     # Production's PreToolUse hook spends the grant. Keep can_use_tool as an
     # observation-only wrapper for any SDK path that reaches it.
     resumed_options.can_use_tool = observe_permission
@@ -1402,6 +1368,7 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
         approval_decision="approved",
         history_resumed=True,
     )
+
     async def drive_resumed_turns() -> tuple[Final, Final]:
         await resumed.start()
         finals: list[Final] = []
@@ -1422,6 +1389,7 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
         finally:
             await resumed.close()
         return finals[0], finals[1]
+
     approved, duplicate = anyio.run(drive_resumed_turns)
     assert approved.status is SessionStatus.DONE
     assert marker_file.read_text().splitlines() == ["approved-once"]
@@ -1430,9 +1398,7 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
     assert duplicate.status is SessionStatus.AWAITING_APPROVAL
     assert marker_file.read_text().splitlines() == ["approved-once"]
     assert allowed_commands == []  # hook allow skips can_use_tool in the pinned SDK
-    cache_calls = [
-        call for call in metric_calls if call[0] == "curie.history.resume.cache_read"
-    ]
+    cache_calls = [call for call in metric_calls if call[0] == "curie.history.resume.cache_read"]
     assert len(cache_calls) == 1
     assert cache_calls[0][1] > 0
     assert cache_calls[0][2] == {
@@ -1440,6 +1406,7 @@ def test_live_cross_runner_approval_exact_once_and_cache_observable(
         "source": "runner",
         "cache_hit": "true",
     }
+
 
 # --- the managed-workspace publication gate on a real model (#2294) --------------
 #
@@ -1491,9 +1458,7 @@ def _publish_runner(trace_name: str, *, gated: bool) -> tuple[SessionRunner, App
         max_budget_usd=1.0,
         resume=None,
         env=env,
-        mcp_servers={
-            APPROVAL_SERVER_NAME: build_approval_server(gate, managed_workspace=True)
-        },
+        mcp_servers={APPROVAL_SERVER_NAME: build_approval_server(gate, managed_workspace=True)},
         # The production shape wires both SDK gate layers; the second test omits
         # them so the tool body actually executes (permission_mode falls back to
         # bypassPermissions), which is the live shape that lost its record.
@@ -1563,9 +1528,9 @@ def test_live_publish_with_both_gate_layers_pauses_awaiting_approval(
     # BEFORE dispatching the PreToolUse hook, so the stream observer writes the
     # record first even here -- "who wrote it first" must NOT be what the warning
     # keys on, or it fires on the fully-gated production path (observed live).
-    assert not any(
-        "fallback" in record.getMessage().lower() for record in caplog.records
-    ), caplog.text
+    assert not any("fallback" in record.getMessage().lower() for record in caplog.records), (
+        caplog.text
+    )
 
 
 @pytest.mark.skipif(
@@ -1604,8 +1569,7 @@ def test_live_publish_without_gate_layers_still_pauses_via_the_stream(
     # So the operator-visible warning MUST fire here: a layer that was supposed
     # to decide did not.
     assert any(
-        "publication" in record.getMessage().lower()
-        and "fallback" in record.getMessage().lower()
+        "publication" in record.getMessage().lower() and "fallback" in record.getMessage().lower()
         for record in caplog.records
     ), caplog.text
 
@@ -1892,9 +1856,7 @@ def _channel_read_token(turn: str) -> str:
         "exp": now + 900,
     }
     payload = (
-        base64.urlsafe_b64encode(json.dumps(claims, sort_keys=True).encode())
-        .rstrip(b"=")
-        .decode()
+        base64.urlsafe_b64encode(json.dumps(claims, sort_keys=True).encode()).rstrip(b"=").decode()
     )
     return f"chr.{payload}.live-channel-read-signature"
 
@@ -1913,9 +1875,7 @@ def _channel_read_bundle(
         manifest["channelRead"] = True
     if policy is not None:
         manifest["toolPolicy"] = {"enforcement": TOOL_POLICY_ENFORCEMENT, **policy}
-    (bundle / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps(manifest), encoding="utf-8"
-    )
+    (bundle / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
     return bundle
 
 

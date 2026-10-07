@@ -159,7 +159,6 @@ def test_reviewer_model_reaches_sdk_options_from_the_runner_boot_env(
     assert session.options.env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "acme-title-model"
 
 
-
 def test_reviewer_model_default_uses_the_effective_sdk_credential() -> None:
     # sdk_auth's explicit SDK credential wins over CURIE_CREDENTIALS; reviewer
     # model selection must agree with the credential the SDK will actually use.
@@ -171,8 +170,13 @@ def test_reviewer_model_default_uses_the_effective_sdk_credential() -> None:
     }
     spawn_env = resolve_sdk_env(env) or env
     options = build_options(
-        plugins=[], model="acme-implementer-model", system_prompt=None,
-        max_turns=20, max_budget_usd=1.0, resume=None, env=spawn_env,
+        plugins=[],
+        model="acme-implementer-model",
+        system_prompt=None,
+        max_turns=20,
+        max_budget_usd=1.0,
+        resume=None,
+        env=spawn_env,
     )
     assert options.env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "claude-opus-5-5"
     assert options.model == "acme-implementer-model"

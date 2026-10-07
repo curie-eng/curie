@@ -54,10 +54,7 @@ def _otlp_value(value: str | int) -> dict[str, object]:
 
 
 def _otlp_attributes(attributes: dict[str, str | int]) -> list[dict[str, object]]:
-    return [
-        {"key": key, "value": _otlp_value(value)}
-        for key, value in attributes.items()
-    ]
+    return [{"key": key, "value": _otlp_value(value)} for key, value in attributes.items()]
 
 
 def _span(
@@ -143,14 +140,11 @@ def _canonical_trace_spans() -> list[tuple[dict[str, object], dict[str, object]]
         },
     )
     return [
-        (span, dict(_RUNNER_RESOURCE))
-        for span in (root, first_generation, tool, second_generation)
+        (span, dict(_RUNNER_RESOURCE)) for span in (root, first_generation, tool, second_generation)
     ]
 
 
-def _single_round_tool_free_trace_spans() -> list[
-    tuple[dict[str, object], dict[str, object]]
-]:
+def _single_round_tool_free_trace_spans() -> list[tuple[dict[str, object], dict[str, object]]]:
     root = _span(
         "agent.run",
         _ROOT_SPAN_ID,
@@ -249,8 +243,7 @@ def _set_otel_status(span: dict[str, object], code: int) -> None:
 def _mentions(violations: list[str], *fragments: str) -> bool:
     wanted = tuple(fragment.casefold() for fragment in fragments)
     return any(
-        all(fragment in violation.casefold() for fragment in wanted)
-        for violation in violations
+        all(fragment in violation.casefold() for fragment in wanted) for violation in violations
     )
 
 
@@ -258,10 +251,13 @@ def test_canonical_runner_otlp_json_shape_has_no_violations() -> None:
     trace_spans = _canonical_trace_spans()
 
     assert canonical_runner_shape_violations(trace_spans) == []
-    assert canonical_runner_shape_violations(
-        trace_spans,
-        require_multi_round_tool=True,
-    ) == []
+    assert (
+        canonical_runner_shape_violations(
+            trace_spans,
+            require_multi_round_tool=True,
+        )
+        == []
+    )
 
 
 @pytest.mark.parametrize(

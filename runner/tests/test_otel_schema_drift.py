@@ -48,12 +48,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 _SCHEMA_PATH = Path(__file__).parent.parent / "schema" / "otel-attributes.schema.json"
 _REPO_ROOT = Path(__file__).parents[2]
 _ENUM_SOURCE = (
-    _REPO_ROOT
-    / "packages"
-    / "telemetry-schema"
-    / "src"
-    / "curie_telemetry_schema"
-    / "__init__.py"
+    _REPO_ROOT / "packages" / "telemetry-schema" / "src" / "curie_telemetry_schema" / "__init__.py"
 )
 
 
@@ -135,6 +130,7 @@ def test_literal_scan_reports_the_exact_enum_key_in_an_injected_module(tmp_path:
         (module, 1, "curie.sandbox_id", "CURIE_SANDBOX_ID")
     ]
 
+
 _ADR_0076_V1_KEYS = {
     "curie.sandbox_id": "str",
     "curie.session_id": "str",
@@ -210,12 +206,8 @@ def test_phase_keys_are_an_additive_typed_v1_extension() -> None:
     committed_keys = committed["keys"]
 
     assert committed["schema_version"] == "v1"
-    assert {
-        key: committed_keys.get(key) for key in _ADR_0076_V1_KEYS
-    } == _ADR_0076_V1_KEYS
-    assert {
-        key: committed_keys.get(key) for key in _PHASE_V1_ADDITIONS
-    } == _PHASE_V1_ADDITIONS
+    assert {key: committed_keys.get(key) for key in _ADR_0076_V1_KEYS} == _ADR_0076_V1_KEYS
+    assert {key: committed_keys.get(key) for key in _PHASE_V1_ADDITIONS} == _PHASE_V1_ADDITIONS
     assert committed_keys == _ADR_0076_V1_KEYS | _PHASE_V1_ADDITIONS
     assert set(committed_keys.values()) == {"str", "int"}
 
@@ -231,8 +223,7 @@ def test_production_consumers_resolve_span_attribute_keys_through_the_enum() -> 
         "Production consumers must resolve OTel span attribute keys through "
         "SpanAttributeKey instead of restating its values:\n"
         + "\n".join(
-            f"{path}:{line}: {literal!r} must use "
-            f"SpanAttributeKey.{member}.value"
+            f"{path}:{line}: {literal!r} must use SpanAttributeKey.{member}.value"
             for path, line, literal, member in violations
         )
     )
@@ -376,9 +367,7 @@ def test_every_declared_key_emits_its_committed_value_type() -> None:
         held_secrets=frozenset(),
         session_factory=lambda: FakeModelSession(
             script_factory=lambda: [
-                AssistantMessage(
-                    content=[TextBlock(text="hi")], model="fake-model", usage=None
-                ),
+                AssistantMessage(content=[TextBlock(text="hi")], model="fake-model", usage=None),
                 ResultMessage(
                     subtype="success",
                     duration_ms=1,

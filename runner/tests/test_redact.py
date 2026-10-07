@@ -85,9 +85,7 @@ FAKE_SANDBOX_TOKEN = "sbx." + "ZXhhbXBsZXNhbmRib3hwYXlsb2Fk." + "FAKEFAKEFAKESIG
 FAKE_CONNECTOR_CALLER_TOKEN = "cct." + "ZXhhbXBsZWNhbGxlcnBheWxvYWQ." + "FAKEFAKEFAKESIG0000"
 FAKE_CHANNEL_READ_TOKEN = "chr." + "ZXhhbXBsZWNoYW5uZWxyZWFkcGF5bG9hZA." + "FAKEFAKEFAKESIG0000"
 FAKE_X_API_KEY_HEADER = "X-API-Key: " + "FAKEFAKEFAKEHEADERVALUE0000"
-_FAKE_DISCORD_BOT_TOKEN = (
-    "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
-)
+_FAKE_DISCORD_BOT_TOKEN = "FAKEFAKEFAKEFAKEFAKE0000." + "FAKE00." + "FAKEFAKEFAKEFAKEFAKEFAKE000"
 FAKE_DISCORD_BOT_AUTHORIZATION = "Authorization: Bot " + _FAKE_DISCORD_BOT_TOKEN
 FAKE_DISCORD_BOT_TOKEN_ASSIGNMENT = "DISCORD_BOT_TOKEN=" + _FAKE_DISCORD_BOT_TOKEN
 # Shape-valid bot token (id segment starts with M) carried with no context.
@@ -220,9 +218,7 @@ def _span_attributes(vector: str) -> dict[str, dict[str, object]]:
                 content=[ToolUseBlock(id="t1", name=vector, input={"command": "echo hi"})],
                 model=vector,
             ),
-            UserMessage(
-                content=[ToolResultBlock(tool_use_id="t1", content="command completed")]
-            ),
+            UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="command completed")]),
             AssistantMessage(content=[TextBlock(text="done")], model=vector, usage=usage),
             ResultMessage(
                 subtype="success",
@@ -532,12 +528,16 @@ def test_boot_http_scrubs_held_secrets_from_replies_and_tool_results(
         monkeypatch.setenv(name, value)
     secrets = [
         *config_env.values(),
-        *(value for name, value in process_env.items() if name not in (
-            "CURIE_MODEL_ENV_KEY", "CURIE_CONNECTOR_SECRET_KEYS"
-        )),
-        *(value for name, value in sdk_env.items() if name not in (
-            "CURIE_MODEL_ENV_KEY", "CURIE_CONNECTOR_SECRET_KEYS"
-        )),
+        *(
+            value
+            for name, value in process_env.items()
+            if name not in ("CURIE_MODEL_ENV_KEY", "CURIE_CONNECTOR_SECRET_KEYS")
+        ),
+        *(
+            value
+            for name, value in sdk_env.items()
+            if name not in ("CURIE_MODEL_ENV_KEY", "CURIE_CONNECTOR_SECRET_KEYS")
+        ),
         literal_header,
         literal_mcp_env,
     ]
@@ -704,18 +704,14 @@ def test_http_reply_keeps_the_authoritative_result_unchanged(
     assert frames[-1]["text"] == "Done."
 
 
-def _redacted_turn(
-    held: frozenset[str], blocks: list[str], final_text: str
-) -> tuple[str, str]:
+def _redacted_turn(held: frozenset[str], blocks: list[str], final_text: str) -> tuple[str, str]:
     """The streamed text and the final text one turn's redactor emits."""
 
     redactor = OutboundRedactor(held)
     lines: list[str] = []
     for block in blocks:
         lines.extend(redactor.push(json.dumps({"type": "text_delta", "text": block})))
-    lines.extend(
-        redactor.push(json.dumps({"type": "final", "status": "done", "text": final_text}))
-    )
+    lines.extend(redactor.push(json.dumps({"type": "final", "status": "done", "text": final_text})))
     frames = [json.loads(line) for line in lines]
     return _assistant_text(frames), frames[-1]["text"]
 
@@ -1026,10 +1022,7 @@ def test_http_hides_overlapping_secret_spans_across_buffered_text_deltas(
     messages: list[object] = [
         AssistantMessage(content=[TextBlock(text="Before " + chunks[0])], model="fake"),
         AssistantMessage(content=[ToolUseBlock(id="read", name="Read", input={})], model="fake"),
-        *(
-            AssistantMessage(content=[TextBlock(text=chunk)], model="fake")
-            for chunk in chunks[1:]
-        ),
+        *(AssistantMessage(content=[TextBlock(text=chunk)], model="fake") for chunk in chunks[1:]),
         AssistantMessage(content=[TextBlock(text=" after.")], model="fake"),
         _result(""),
     ]
@@ -1074,7 +1067,10 @@ def test_http_preserves_protocol_metadata_when_short_secrets_match_it(
         )
     )
     assert {frame["type"] for frame in frames} == {
-        "text_delta", "tool_note", "side_effect_flag", "final"
+        "text_delta",
+        "tool_note",
+        "side_effect_flag",
+        "final",
     }
     assert all(frame["version"] == PROTOCOL_VERSION for frame in frames)
     assert frames[-1]["type"] == "final"
@@ -1202,12 +1198,10 @@ def test_http_collects_otel_auth_headers_and_preserves_benign_header_and_marker_
             monkeypatch,
             _reply_script(text),
             config_env={
-                "OTEL_EXPORTER_OTLP_HEADERS":
-                    f"Authorization=Bearer%20{config_secret},X-Request-Label=ordinary-label"
+                "OTEL_EXPORTER_OTLP_HEADERS": f"Authorization=Bearer%20{config_secret},X-Request-Label=ordinary-label"
             },
             sdk_env={
-                "OTEL_EXPORTER_OTLP_HEADERS":
-                    f"X-API-Key={sdk_secret},X-Request-Label=ordinary-label"
+                "OTEL_EXPORTER_OTLP_HEADERS": f"X-API-Key={sdk_secret},X-Request-Label=ordinary-label"
             },
         )
     )
@@ -1433,11 +1427,14 @@ def test_turn_close_drops_pending_secret_text_and_followup_is_independent(
             assert first["text"] == "Visible prefix. "
             await stream.aclose()
             release.set()
-            raw = "".join([
-                line async for line in runner.run_turn(
-                    Event(type="message", text="followup", user="U", ts="2")
-                )
-            ])
+            raw = "".join(
+                [
+                    line
+                    async for line in runner.run_turn(
+                        Event(type="message", text="followup", user="U", ts="2")
+                    )
+                ]
+            )
             frames = [json.loads(line) for line in raw.splitlines()]
             assert _assistant_text(frames) == _SPLIT_SECRET[3:] + " clean followup"
             assert frames[-1]["status"] == "done"

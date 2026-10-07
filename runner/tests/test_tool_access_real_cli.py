@@ -65,6 +65,7 @@ def _user_message(prompt: str) -> str:
     body = prompt[start : prompt.index(end_marker)]
     return body[:-1] if body.endswith("\n") else body
 
+
 _SERVER = Path(__file__).parent / "fixtures" / "mcp_tool_result_server.py"
 _TOOL = web.AppKey("tool", str)
 _INPUT = web.AppKey("input", dict[str, Any])
@@ -660,9 +661,7 @@ def test_a_read_only_prompt_a_bundle_hook_delayed_never_runs_unrestricted(
                                 )
                             )
                         ]
-                        finals += [
-                            e for e in parse_ndjson("".join(lines)) if isinstance(e, Final)
-                        ]
+                        finals += [e for e in parse_ndjson("".join(lines)) if isinstance(e, Final)]
                         await anyio.sleep(pause)
             finally:
                 await runner.close()

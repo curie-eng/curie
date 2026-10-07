@@ -51,8 +51,7 @@ def _kubectl(
 
 def _assert_ok(result: subprocess.CompletedProcess[str], command: str) -> str:
     assert result.returncode == 0, (
-        f"{command} exited {result.returncode}:\n"
-        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        f"{command} exited {result.returncode}:\nstdout: {result.stdout}\nstderr: {result.stderr}"
     )
     return result.stdout.strip()
 
@@ -158,9 +157,7 @@ def _network_policies(cidrs: list[str]) -> list[dict[str, Any]]:
                         "to": [
                             {
                                 "namespaceSelector": {
-                                    "matchLabels": {
-                                        "kubernetes.io/metadata.name": "kube-system"
-                                    }
+                                    "matchLabels": {"kubernetes.io/metadata.name": "kube-system"}
                                 }
                             }
                         ],
@@ -232,7 +229,16 @@ def _copy_checkout() -> None:
 
 def _exec(script: str, *, timeout: int = 900) -> str:
     result = _kubectl(
-        "-n", NAMESPACE, "exec", POD, "-c", "runner", "--", "sh", "-ec", script,
+        "-n",
+        NAMESPACE,
+        "exec",
+        POD,
+        "-c",
+        "runner",
+        "--",
+        "sh",
+        "-ec",
+        script,
         timeout=timeout,
     )
     return _assert_ok(result, script)
@@ -252,9 +258,7 @@ def _delete_namespace() -> None:
 
 def test_factory_skill_allows_locked_installs_and_reports_service_gaps() -> None:
     skill = SKILL.read_text(encoding="utf-8")
-    step = skill.split("## 6. Implement and check", 1)[1].split(
-        "## 7. Diff review", 1
-    )[0]
+    step = skill.split("## 6. Implement and check", 1)[1].split("## 7. Diff review", 1)[0]
     for command in (
         "uv sync --frozen",
         "cargo fetch --locked",
@@ -270,9 +274,7 @@ def test_factory_skill_allows_locked_installs_and_reports_service_gaps() -> None
 def test_factory_skill_names_registry_egress_cause_with_guidance() -> None:
     """#3761: an unreachable registry is reported as a named environment cause."""
     skill = SKILL.read_text(encoding="utf-8")
-    step = skill.split("## 6. Implement and check", 1)[1].split(
-        "## 7. Diff review", 1
-    )[0]
+    step = skill.split("## 6. Implement and check", 1)[1].split("## 7. Diff review", 1)[0]
     assert "registry_egress_unreachable" in step
     # The probe distinguishes per-address reachability, which is what makes a
     # partial CIDR allowlist visible.
@@ -299,22 +301,35 @@ def test_factory_runner_pod_resolves_repository_lockfiles() -> None:
         for policy in _network_policies(cidrs):
             _assert_ok(
                 _kubectl(
-                    "-n", NAMESPACE, "create", "-f", "-",
+                    "-n",
+                    NAMESPACE,
+                    "create",
+                    "-f",
+                    "-",
                     input_text=json.dumps(policy),
                 ),
                 f"create network policy {policy['metadata']['name']}",
             )
         _assert_ok(
             _kubectl(
-                "-n", NAMESPACE, "create", "-f", "-",
+                "-n",
+                NAMESPACE,
+                "create",
+                "-f",
+                "-",
                 input_text=json.dumps(_pod_manifest(image)),
             ),
             "create factory runner pod",
         )
         _assert_ok(
             _kubectl(
-                "-n", NAMESPACE, "wait", f"pod/{POD}",
-                "--for=condition=Ready", "--timeout=300s", timeout=330,
+                "-n",
+                NAMESPACE,
+                "wait",
+                f"pod/{POD}",
+                "--for=condition=Ready",
+                "--timeout=300s",
+                timeout=330,
             ),
             "wait for factory runner pod",
         )
@@ -324,10 +339,7 @@ def test_factory_runner_pod_resolves_repository_lockfiles() -> None:
                 "inspect factory runner pod",
             )
         )
-        image_ids = [
-            status.get("imageID")
-            for status in pod["status"].get("containerStatuses", [])
-        ]
+        image_ids = [status.get("imageID") for status in pod["status"].get("containerStatuses", [])]
         assert len(image_ids) == 2 and all(image_ids), image_ids
         print(f"factory runner pod image IDs: {image_ids}")
 
@@ -356,8 +368,6 @@ def test_factory_runner_pod_resolves_repository_lockfiles() -> None:
             "cargo test --no-run --locked",
             timeout=1800,
         )
-        _exec(
-            "cd /workspace/apps/ui && CI=true pnpm install --frozen-lockfile"
-        )
+        _exec("cd /workspace/apps/ui && CI=true pnpm install --frozen-lockfile")
     finally:
         _delete_namespace()

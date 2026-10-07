@@ -1048,9 +1048,7 @@ def test_spend_credit_and_openrouter_limits_keep_the_credit_remedy(text: str) ->
 
 def test_subscription_usage_refusal_is_sticky_after_later_recoverable_errors() -> None:
     state = TurnState()
-    events = _translate(
-        AssistantMessage(content=[], model="m", error="rate_limit"), state
-    )
+    events = _translate(AssistantMessage(content=[], model="m", error="rate_limit"), state)
     events += _translate(_later_rate_limit(), state)
     events += _translate(_later_overloaded(), state)
     events += _translate(_success_result(), state)
@@ -1062,8 +1060,13 @@ def test_subscription_usage_refusal_is_sticky_after_later_recoverable_errors() -
 @pytest.mark.parametrize("text", _SUBSCRIPTION_USAGE_LIMIT_MESSAGES)
 def test_terminal_sdk_result_usage_limit_is_classified(text: str) -> None:
     result = ResultMessage(
-        subtype="error_during_execution", duration_ms=1, duration_api_ms=1,
-        is_error=True, num_turns=1, session_id="s", result=text,
+        subtype="error_during_execution",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=1,
+        session_id="s",
+        result=text,
     )
     events = _translate(result)
     assert events[0].classification == "model-usage-limited"
@@ -1075,8 +1078,10 @@ def test_finance_text_without_existing_credit_match_is_not_a_subscription_limit(
     text: str,
 ) -> None:
     errors = [
-        event for event in _translate(
+        event
+        for event in _translate(
             AssistantMessage(content=[TextBlock(text=text)], model="m", error="unknown")
-        ) if isinstance(event, ErrorEvent)
+        )
+        if isinstance(event, ErrorEvent)
     ]
     assert [event.classification for event in errors] == ["unclassified"]

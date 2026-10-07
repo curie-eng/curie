@@ -30,6 +30,9 @@ Settings (env name in parentheses for stdio):
   ``query_*`` tool answers no structured content and one text block holding a
   JSON object ``{"data": {"value": 1}, "padding": ...}`` padded past that many
   bytes.
+* ``read_structured_bytes`` (``CURIE_TEST_READ_STRUCTURED_BYTES``): when set,
+  every ``query_*`` tool answers structured content
+  ``{"data": {"value": 1}, "padding": ...}`` padded past that many bytes.
 * ``read_error`` (``CURIE_TEST_READ_ERROR``, ``1``): every ``query_*`` tool
   answers ``isError`` with ``read_reply`` and ``read_content``.
 * ``observe_reply`` (``CURIE_TEST_OBSERVE_REPLY``, JSON): the
@@ -151,6 +154,15 @@ def _content_block(block: dict[str, Any]) -> TextContent | ImageContent:
 def _read_result(settings: dict[str, Any]) -> CallToolResult:
     """A ``query_*`` tool's answer. @spec AUTOMATED-REMEDIATION-12."""
 
+    structured_padding = settings.get("read_structured_bytes")
+    if structured_padding:
+        return CallToolResult(
+            content=[TextContent(type="text", text="example summary")],
+            structuredContent={
+                "data": {"value": 1},
+                "padding": "x" * (int(structured_padding) + 1),
+            },
+        )
     padding = settings.get("read_text_bytes")
     if padding:
         text = json.dumps({"data": {"value": 1}, "padding": "x" * (int(padding) + 1)})
@@ -275,6 +287,7 @@ def _env_settings() -> dict[str, Any]:
         "read_reply": loaded("CURIE_TEST_READ_REPLY"),
         "read_content": loaded("CURIE_TEST_READ_CONTENT"),
         "read_text_bytes": os.environ.get("CURIE_TEST_READ_TEXT_BYTES"),
+        "read_structured_bytes": os.environ.get("CURIE_TEST_READ_STRUCTURED_BYTES"),
         "read_error": os.environ.get("CURIE_TEST_READ_ERROR") == "1",
     }
 

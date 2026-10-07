@@ -739,15 +739,15 @@ def test_runner_image_uses_bundled_claude_cli_and_does_not_bless_bundle_mcp() ->
 
 
 def test_bundle_layers_pin_the_mcp_servers_they_moved() -> None:
-    github_issues = (
-        _REPO_ROOT / "examples" / "github-issues" / "runner.Dockerfile"
-    ).read_text(encoding="utf-8")
-    dark_factory = (
-        _REPO_ROOT / "examples" / "dark-factory" / "runner.Dockerfile"
-    ).read_text(encoding="utf-8")
-    mean_tester = (
-        _REPO_ROOT / "examples" / "mean-tester" / "runner.Dockerfile"
-    ).read_text(encoding="utf-8")
+    github_issues = (_REPO_ROOT / "examples" / "github-issues" / "runner.Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    dark_factory = (_REPO_ROOT / "examples" / "dark-factory" / "runner.Dockerfile").read_text(
+        encoding="utf-8"
+    )
+    mean_tester = (_REPO_ROOT / "examples" / "mean-tester" / "runner.Dockerfile").read_text(
+        encoding="utf-8"
+    )
     for text in (github_issues, dark_factory, mean_tester):
         assert _npm_violations(logical_instructions(text)) == []
     assert _dockerfile_global_npm_operands(github_issues) == [
@@ -763,13 +763,10 @@ def test_bundle_layers_pin_the_mcp_servers_they_moved() -> None:
         "@modelcontextprotocol/server-github@2025.4.8",
         "@modelcontextprotocol/server-github",
     )
-    assert (
-        Violation(
-            "@modelcontextprotocol/server-github",
-            "global npm install is missing an exact version",
-        )
-        in _npm_violations(logical_instructions(unpinned))
-    )
+    assert Violation(
+        "@modelcontextprotocol/server-github",
+        "global npm install is missing an exact version",
+    ) in _npm_violations(logical_instructions(unpinned))
 
 
 @pytest.mark.parametrize("command", sorted(_NPM_INSTALL_ALIASES))

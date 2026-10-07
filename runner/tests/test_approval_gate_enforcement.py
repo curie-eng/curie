@@ -525,7 +525,6 @@ def test_ungated_error_result_still_ends_classified_failure() -> None:
     assert not events[-1].approval_summary
 
 
-
 def _gated_bash_then_model_error_result() -> list[Any]:
     """A gated Bash call, then a REAL model failure, then the error result.
 
@@ -601,9 +600,9 @@ def test_gated_turn_that_also_hit_a_model_error_ends_classified_failure() -> Non
     assert error_events, "the model's own error frame must survive"
     assert any(e.classification == "unclassified" for e in error_events)
     assert all(e.classification != "server_error" for e in error_events)
-    assert any(
-        "server_error" in getattr(e, "message", "") for e in error_events
-    ), "the raw token must survive in the ErrorEvent message"
+    assert any("server_error" in getattr(e, "message", "") for e in error_events), (
+        "the raw token must survive in the ErrorEvent message"
+    )
 
 
 def test_gated_turn_with_model_error_and_no_result_ends_classified_failure() -> None:
@@ -634,10 +633,7 @@ def test_gated_turn_with_model_error_and_no_result_ends_classified_failure() -> 
 
     assert gate.pending_summary is not None
     assert gate.pending_halt is True
-    assert any(
-        event.type == "error" and event.classification == "unclassified"
-        for event in events
-    )
+    assert any(event.type == "error" and event.classification == "unclassified" for event in events)
     final = events[-1]
     assert final.type == "final"
     assert final.status == SessionStatus.CLASSIFIED_FAILURE
@@ -1099,9 +1095,7 @@ def test_explicit_gate_keeps_pager_and_annotations_classify_receipt_actions(
         read_only_runner._classifier,
         None,
     )
-    assert [event.tool for event in events if event.type == "side_effect_flag"] == [
-        unadvertised
-    ]
+    assert [event.tool for event in events if event.type == "side_effect_flag"] == [unadvertised]
 
 
 def test_explicit_tool_gate_overrides_its_read_only_annotation(
@@ -1119,9 +1113,7 @@ def test_explicit_tool_gate_overrides_its_read_only_annotation(
     for directory, gated_tool, expected_flags in cases:
         plugin_dir = _bundle(tmp_path / directory)
         _add_capability_server(plugin_dir, "read-only")
-        runner = build_runner(
-            _config(plugin_dir, CURIE_APPROVAL_REQUIRED_TOOLS=gated_tool)
-        )
+        runner = build_runner(_config(plugin_dir, CURIE_APPROVAL_REQUIRED_TOOLS=gated_tool))
         session = runner._factory()
         assert isinstance(session, _CapturedSession)
         names = anyio.run(
@@ -1160,9 +1152,10 @@ def test_publish_only_gate_does_not_recreate_the_generic_pager(
         workspace_path=workspace,
     )
 
-    assert anyio.run(
-        _mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME]
-    ) == {"publish_changes", "progress"}
+    assert anyio.run(_mcp_tool_names, options.mcp_servers[APPROVAL_SERVER_NAME]) == {
+        "publish_changes",
+        "progress",
+    }
 
 
 # --- J. fake-tier parity: a deny with interrupt=True stops the replay ------------
@@ -1469,8 +1462,7 @@ def test_publish_call_neither_gate_layer_saw_still_pauses_awaiting_approval(
     # decide did not: silently papering over that is how the next regression goes
     # unnoticed for a whole release.
     assert any(
-        "publication" in record.getMessage().lower()
-        and "fallback" in record.getMessage().lower()
+        "publication" in record.getMessage().lower() and "fallback" in record.getMessage().lower()
         for record in caplog.records
     ), caplog.text
 
@@ -1504,17 +1496,17 @@ def test_hook_recorded_publish_is_not_recorded_twice_by_the_stream(
     assert gate.publication_title == "Hook recorded"
     assert gate.publication_body == "hook body"
     assert final.approval_summary == gate.pending_summary
-    assert anyio.run(
-        gate.observe_publication, "publish-2", {"title": "another", "body": "x"}
-    ) is False
+    assert (
+        anyio.run(gate.observe_publication, "publish-2", {"title": "another", "body": "x"}) is False
+    )
     assert gate.publication_title == "Hook recorded"
     # A gate layer DID deny this call and asked the CLI to stop, which is exactly
     # what distinguishes this path from the fallback one -- and why no warning
     # about a missed layer may fire here.
     assert gate.pending_halt is True
-    assert not any(
-        "fallback" in record.getMessage().lower() for record in caplog.records
-    ), caplog.text
+    assert not any("fallback" in record.getMessage().lower() for record in caplog.records), (
+        caplog.text
+    )
 
 
 def test_malformed_publish_proposal_fails_the_turn_closed() -> None:
@@ -1753,9 +1745,7 @@ def test_another_gated_tools_approval_is_kept_when_a_publish_call_cannot_take_th
     # as a log line, not by discarding the card.
     from curie_runner.session import PUBLICATION_UNRECORDED_CLASSIFICATION
 
-    gate = build_approval_gate(
-        operator_tools=["Bash"], policy_routes={}, managed_workspace=True
-    )
+    gate = build_approval_gate(operator_tools=["Bash"], policy_routes={}, managed_workspace=True)
     assert gate is not None
     assert gate.required == frozenset({"Bash", PLATFORM_PUBLISH_TOOL_NAME})
     script = [

@@ -282,9 +282,7 @@ def _capped_history_app(
     app = web.Application()
 
     async def get_memory(_request: web.Request) -> web.Response:
-        return web.json_response(
-            {"namespace": "memory", "key": "log", "value": [], "version": 1}
-        )
+        return web.json_response({"namespace": "memory", "key": "log", "value": [], "version": 1})
 
     async def get_history(_request: web.Request) -> web.Response:
         return web.json_response(
@@ -350,9 +348,7 @@ def test_boot_summary_capacity_failure_serves_the_append_path_refusal(
         "private transcript text token-PLACEHOLDER"
     )
     append_attempts: list[dict[str, Any]] = []
-    app = _capped_history_app(
-        records, append_attempts, append_status=413, body=sensitive_body
-    )
+    app = _capped_history_app(records, append_attempts, append_status=413, body=sensitive_body)
 
     async def reject_probe(*args: object, **kwargs: object) -> object:
         raise AssertionError("fake model boot must not start connector tools")
@@ -416,8 +412,7 @@ def test_boot_summary_capacity_failure_serves_the_append_path_refusal(
     assert append_attempts[0]["item"]["type"] == "summary"
     messages = [record.getMessage() for record in caplog.records]
     assert any(
-        "history capacity exceeded at boot" in message and "413" in message
-        for message in messages
+        "history capacity exceeded at boot" in message and "413" in message for message in messages
     )
     assert all(sensitive_body not in message for message in messages)
     assert all("question 0" not in message for message in messages)
@@ -448,9 +443,7 @@ def test_boot_summary_non_capacity_failure_stays_fatal(
             )
             with pytest.raises(BaseExceptionGroup) as caught:
                 await boot._load_boot_fetches(config, True, None)
-            assert "configured structured history could not be loaded" in repr(
-                caught.value
-            )
+            assert "configured structured history could not be loaded" in repr(caught.value)
 
     anyio.run(go)
     assert len(append_attempts) == 1

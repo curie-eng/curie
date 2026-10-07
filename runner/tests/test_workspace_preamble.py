@@ -19,9 +19,7 @@ def _plugin_config(tmp_path) -> RunnerConfig:
             "CURIE_PLUGIN_DIR": str(tmp_path),
             "CURIE_SESSION_ID": "s-workspace",
             "CURIE_SANDBOX_ID": "b-workspace",
-            "CURIE_BUDGET": (
-                '{"max_output_tokens_per_run": 1000, "max_usd_per_day": 1.0}'
-            ),
+            "CURIE_BUDGET": ('{"max_output_tokens_per_run": 1000, "max_usd_per_day": 1.0}'),
             "CURIE_MODEL": "z-ai/glm-5.2",
         }
     )
@@ -180,9 +178,7 @@ def _preamble(verification: dict[str, object]) -> str:
 
 
 def _check_line(preamble: str, check_id: str, command: str) -> str:
-    lines = [
-        line for line in preamble.splitlines() if check_id in line and command in line
-    ]
+    lines = [line for line in preamble.splitlines() if check_id in line and command in line]
     assert lines, preamble
     return "\n".join(lines)
 
@@ -198,9 +194,7 @@ def test_preamble_with_no_declared_check_says_so_and_names_no_suite() -> None:
 
 
 def test_preamble_names_an_unreadable_repository_declaration() -> None:
-    preamble = _preamble(
-        _verification(unreadable=".curie/verification.json is not valid JSON")
-    )
+    preamble = _preamble(_verification(unreadable=".curie/verification.json is not valid JSON"))
 
     assert "No verification check was declared" in preamble
     assert "unreadable" in preamble.casefold()
@@ -238,9 +232,9 @@ def test_python_only_declaration_does_not_present_python_as_the_check_for_rust()
 
     _check_line(preamble, "python", _PYTHON_COMMAND)
     assert "no check was declared for that area" in preamble
-    assert re.search(
-        r"do\s+not\s+run\s+an\s+unrelated\s+check", preamble, flags=re.IGNORECASE
-    ), preamble
+    assert re.search(r"do\s+not\s+run\s+an\s+unrelated\s+check", preamble, flags=re.IGNORECASE), (
+        preamble
+    )
     assert "Run only the repository's documented focused check command" not in preamble
     assert "Verification command:" not in preamble
 
@@ -263,9 +257,7 @@ def test_unavailable_check_result_is_scoped_to_that_check() -> None:
     python_line = _check_line(preamble, "python", _PYTHON_COMMAND)
     assert "unavailable" in python_line
     assert "unavailable" not in _check_line(preamble, "rust", _RUST_COMMAND)
-    instruction = next(
-        line for line in preamble.splitlines() if line.startswith("- Check python:")
-    )
+    instruction = next(line for line in preamble.splitlines() if line.startswith("- Check python:"))
     assert "delegat" in instruction.casefold()
     assert "CI is pending proof" in instruction
     assert "do not publish and the work item cannot succeed" not in preamble

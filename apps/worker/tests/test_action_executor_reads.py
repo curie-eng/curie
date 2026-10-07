@@ -341,6 +341,32 @@ async def test_an_unrecognized_read_failure_is_a_refusal_never_a_lost_response(
         rig.assert_released()
 
 
+@pytest.mark.parametrize(
+    "digest",
+    [None, "", "0" * 64],
+    ids=["no_digest", "empty_digest", "another_digest"],
+)
+async def test_a_read_whose_arguments_digest_does_not_hold_is_refused_before_any_sandbox(
+    valkey: tuple[redis.Redis, str], digest: str | None
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-12 @spec ACTION-EXECUTOR-7: fail closed like a forward.
+
+    The bound arguments are checked against the execution's ``arguments_sha256``;
+    a missing or empty digest is not a pass, it is ``arguments_mismatch``.
+    """
+
+    async with _rig(valkey) as rig:
+        _reading(rig)
+        execution = rig.api.add_read(arguments_sha256=digest)
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "arguments_mismatch")
+        assert rig.sandboxes.created == []
+        assert rig.runner.requests == []
+        assert rig.api.calls_to("samples") == []
+
+
 async def test_a_read_without_a_sandbox_is_refused_sandbox_unavailable(
     valkey: tuple[redis.Redis, str],
 ) -> None:

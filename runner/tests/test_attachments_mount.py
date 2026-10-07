@@ -189,9 +189,7 @@ def test_the_agent_is_told_each_attachment_by_a_path_it_can_open(
     # disk, the agent is never told, and it reports it cannot see them.
     plugin_dir = _bundle(tmp_path / "plugin")
     workspace = _workspace(tmp_path)
-    mount = _attachments(
-        tmp_path, {"report.csv": b"a,b\n1,2\n", "notes.txt": b"hello"}
-    )
+    mount = _attachments(tmp_path, {"report.csv": b"a,b\n1,2\n", "notes.txt": b"hello"})
 
     options = _options(
         monkeypatch,
@@ -242,9 +240,7 @@ def test_attachments_arrive_without_a_managed_workspace_too(
     plugin_dir = _bundle(tmp_path / "plugin")
     mount = _attachments(tmp_path, {"report.csv": b"a,b\n"})
 
-    options = _options(
-        monkeypatch, _config(plugin_dir), attachments_path=mount
-    )
+    options = _options(monkeypatch, _config(plugin_dir), attachments_path=mount)
 
     assert str(mount / "report.csv") in (options.system_prompt or "")
     assert options.cwd is None
@@ -343,9 +339,7 @@ def _serve_kwargs(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr(RunnerConfig, "from_env", lambda _env: config)
     monkeypatch.setattr(boot, "_resolve_harness", lambda _name: object())
 
-    async def _fake_fetches(
-        _config: object, _fake_model: bool, _sdk_env: object
-    ) -> Any:
+    async def _fake_fetches(_config: object, _fake_model: bool, _sdk_env: object) -> Any:
         return boot._BootFetches(  # noqa: SLF001 -- the module's own boot record
             memory_store=object(),  # type: ignore[arg-type]
             memory_preamble=None,

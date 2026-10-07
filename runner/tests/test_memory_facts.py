@@ -494,9 +494,7 @@ def _boot_options(
 
     async def go() -> None:
         async with TestServer(api.app()) as server:
-            env = _env(
-                monkeypatch, tmp_path, server, channel=channel, writes=writes, extra=extra
-            )
+            env = _env(monkeypatch, tmp_path, server, channel=channel, writes=writes, extra=extra)
             if not token:
                 env.pop("CURIE_MEMORY_TOKEN", None)
                 monkeypatch.delenv("CURIE_MEMORY_TOKEN", raising=False)
