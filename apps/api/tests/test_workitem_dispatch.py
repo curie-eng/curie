@@ -1164,3 +1164,266 @@ def test_list_runtime_owners_pages_by_request_id(clean_db: None, allowlisted: No
         assert [row.request_id for row in tail] == expected[3:]
 
     with_session(body)
+
+
+# --- #4170: a request whose sandbox never starts stops being retried --------
+
+START_REASONS = [f"not_started:classified_failure-{n}" for n in range(1, 6)]
+START_CURVE = [10, 20, 40, 80]
+
+
+async def _start_row(session: AsyncSession, request_id: uuid.UUID) -> Any:
+    return (
+        (
+            await session.execute(
+                text(
+                    "SELECT status, start_deferrals, capacity_deferrals, "
+                    "dispatch_generation, dispatch_not_before, started_at, "
+                    "execution_deadline, terminal_at, terminal_cause, "
+                    "last_deferral_reason, execution_attempts "
+                    "FROM curie.execution_requests WHERE id = :id"
+                ),
+                {"id": request_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+
+
+async def _acquire_and_defer(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    *,
+    reason: str,
+    capacity: bool,
+) -> tuple[Any, datetime, datetime]:
+    """Acquire the current generation, defer it, and bracket the defer's clock."""
+
+    row = await _start_row(session, request_id)
+    granted = await acquire(session, request_id, owner=OWNER, generation=row.dispatch_generation)
+    assert getattr(granted, "code", None) is None, granted
+    before = await _now(session)
+    result = await defer(
+        session,
+        request_id,
+        owner=OWNER,
+        generation=row.dispatch_generation,
+        reason=reason,
+        capacity=capacity,
+    )
+    after = await _now(session)
+    assert getattr(result, "code", None) is None, result
+    return result, before, after
+
+
+def _assert_delay(not_before: datetime, before: datetime, after: datetime, seconds: int) -> None:
+    delay = timedelta(seconds=seconds)
+    assert before + delay <= not_before <= after + delay, (not_before, before, after, seconds)
+
+
+def test_start_deferrals_back_off_exponentially_and_keep_the_request_waiting(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        for count, (reason, seconds) in enumerate(
+            zip(START_REASONS[:4], START_CURVE, strict=True), start=1
+        ):
+            result, before, after = await _acquire_and_defer(
+                session, facts.request_id, reason=reason, capacity=False
+            )
+            row = await _start_row(session, facts.request_id)
+            assert row.status == "waiting"
+            assert row.start_deferrals == count
+            assert row.capacity_deferrals == 0
+            assert row.last_deferral_reason == reason
+            assert row.started_at is None
+            assert row.terminal_cause is None
+            assert row.terminal_at is None
+            _assert_delay(row.dispatch_not_before, before, after, seconds)
+            assert result.not_before == row.dispatch_not_before
+            assert result.terminal_cause is None
+            assert result.dispatch_generation == row.dispatch_generation
+
+    with_session(body)
+
+
+def test_fifth_start_deferral_fails_the_request_as_start_failed(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        for reason in START_REASONS[:4]:
+            await _acquire_and_defer(session, facts.request_id, reason=reason, capacity=False)
+        result, before, after = await _acquire_and_defer(
+            session, facts.request_id, reason=START_REASONS[4], capacity=False
+        )
+        assert result.not_before is None
+        assert result.terminal_cause == "start_failed"
+        row = await _start_row(session, facts.request_id)
+        assert row.status == "failed"
+        assert row.terminal_cause == "start_failed"
+        assert row.start_deferrals == 5
+        assert row.capacity_deferrals == 0
+        assert row.execution_attempts == 0
+        assert row.started_at is None
+        assert row.execution_deadline is None
+        assert row.terminal_at is not None
+        assert before <= row.terminal_at <= after
+        assert row.last_deferral_reason == START_REASONS[4]
+
+        again = await defer(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=row.dispatch_generation,
+            reason="not_started:classified_failure",
+            capacity=False,
+        )
+        assert _code(again) == "not_dispatchable"
+        reacquired = await acquire(
+            session, facts.request_id, owner=OWNER, generation=row.dispatch_generation
+        )
+        assert _code(reacquired) == "not_dispatchable"
+        unchanged = await _start_row(session, facts.request_id)
+        assert unchanged.status == "failed"
+        assert unchanged.start_deferrals == 5
+
+    with_session(body)
+
+
+def test_capacity_defers_never_count_toward_the_start_deferral_cap(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        for reason in START_REASONS[:4]:
+            await _acquire_and_defer(session, facts.request_id, reason=reason, capacity=False)
+        for count, seconds in enumerate([10, 20, 40, 80, 120, 120], start=1):
+            result, before, after = await _acquire_and_defer(
+                session, facts.request_id, reason="capacity", capacity=True
+            )
+            row = await _start_row(session, facts.request_id)
+            assert row.status == "waiting"
+            assert row.start_deferrals == 4
+            assert row.capacity_deferrals == count
+            assert row.terminal_cause is None
+            _assert_delay(row.dispatch_not_before, before, after, seconds)
+            assert result.terminal_cause is None
+
+        fresh = _facts(agent_id, github_issue_number=4170)
+        await admit(session, fresh)
+        for count in range(1, 7):
+            await _acquire_and_defer(session, fresh.request_id, reason="capacity", capacity=True)
+            row = await _start_row(session, fresh.request_id)
+            assert row.status == "waiting"
+            assert row.start_deferrals == 0
+            assert row.capacity_deferrals == count
+
+    with_session(body)
+
+
+def test_start_deferral_limit_is_read_from_settings(
+    clean_db: None, allowlisted: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_WORK_ITEM_START_DEFERRAL_LIMIT", "2")
+    get_settings.cache_clear()
+    assert get_settings().work_item_start_deferral_limit == 2
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        first, _, _ = await _acquire_and_defer(
+            session, facts.request_id, reason=START_REASONS[0], capacity=False
+        )
+        assert first.terminal_cause is None
+        assert (await _start_row(session, facts.request_id)).status == "waiting"
+        second, _, _ = await _acquire_and_defer(
+            session, facts.request_id, reason=START_REASONS[1], capacity=False
+        )
+        assert second.terminal_cause == "start_failed"
+        assert second.not_before is None
+        row = await _start_row(session, facts.request_id)
+        assert (row.status, row.terminal_cause) == ("failed", "start_failed")
+        assert row.start_deferrals == 2
+        assert row.last_deferral_reason == START_REASONS[1]
+
+    with_session(body)
+
+
+def test_http_defer_reports_start_failed_on_the_fifth_start_deferral(
+    dispatch_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    created = dispatch_client.post(
+        "/agents",
+        json={
+            "name": f"acme-bot-{uuid.uuid4().hex[:8]}",
+            "channel": {"kind": "slack", "address": ADDRESS},
+            "repo_full_name": REPO,
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    facts = _facts(UUID(created.json()["id"]))
+    admitted = dispatch_client.post(
+        f"{INTERNAL_PREFIX}/admissions",
+        json=_facts_json(facts),
+        headers=WORKER_HEADERS,
+    )
+    assert admitted.status_code == 200, admitted.text
+    request_id = admitted.json()["request"]["id"]
+
+    generation = 1
+    bodies: list[dict[str, Any]] = []
+    for reason in START_REASONS:
+        acquired = dispatch_client.post(
+            f"{INTERNAL_PREFIX}/requests/{request_id}/acquire",
+            json={"owner": OWNER, "generation": generation},
+            headers=WORKER_HEADERS,
+        )
+        assert acquired.status_code == 200, acquired.text
+        deferred = dispatch_client.post(
+            f"{INTERNAL_PREFIX}/requests/{request_id}/defer",
+            json={
+                "owner": OWNER,
+                "generation": generation,
+                "reason": reason,
+                "capacity": False,
+            },
+            headers=WORKER_HEADERS,
+        )
+        assert deferred.status_code == 200, deferred.text
+        bodies.append(deferred.json())
+        generation = deferred.json()["dispatch_generation"]
+
+    for body in bodies[:4]:
+        assert body["terminal_cause"] is None
+        assert body["not_before"] is not None
+    assert bodies[4]["terminal_cause"] == "start_failed"
+    assert bodies[4]["not_before"] is None
+
+    viewed = dispatch_client.get(f"{INTERNAL_PREFIX}/requests/{request_id}", headers=WORKER_HEADERS)
+    assert viewed.status_code == 200, viewed.text
+    view = viewed.json()
+    assert view["status"] == "failed"
+    assert view["terminal_cause"] == "start_failed"
+    assert view["started_at"] is None
+    assert view["execution_deadline"] is None
+    assert view["terminal_at"] is not None
+    assert view["last_deferral_reason"] == START_REASONS[4]
+
+    refused = dispatch_client.post(
+        f"{INTERNAL_PREFIX}/requests/{request_id}/acquire",
+        json={"owner": OWNER, "generation": generation},
+        headers=WORKER_HEADERS,
+    )
+    assert refused.status_code == 409, refused.text
+    assert _http_code(refused) == "not_dispatchable"
