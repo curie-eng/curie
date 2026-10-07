@@ -1147,8 +1147,8 @@ pub(crate) enum ClusterAction {
         verb: ActionsCommand<ClusterConn>,
     },
     /// A protected hook's remediation policy: show it, apply a document, arm,
-    /// disarm or remove it. Writes run as the operator principal in
-    /// CURIE_APPROVAL_PRINCIPAL_TOKEN.
+    /// disarm or remove it, or close an open circuit breaker. Writes run as the
+    /// operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN.
     RemediationPolicy {
         #[command(subcommand)]
         verb: RemediationPolicyCommand<ClusterConn>,

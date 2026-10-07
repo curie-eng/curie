@@ -226,3 +226,12 @@ pub struct RemediationPolicyWrite {
     pub operation_id: String,
     pub policy: serde_json::Map<String, serde_json::Value>,
 }
+
+// @spec AUTOMATED-REMEDIATION-11
+/// `POST .../remediation-policy/breakers/{breaker_id}/close`
+/// (`RemediationBreakerClose`): why the operator closes the breaker. Never
+/// blank: the CLI refuses a blank reason before any request.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemediationBreakerClose {
+    pub reason: String,
+}

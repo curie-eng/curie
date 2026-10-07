@@ -540,6 +540,24 @@ pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
         #[command(flatten)]
         conn: C,
     },
+    // @spec AUTOMATED-REMEDIATION-11
+    /// Close an open circuit breaker so automatic remediation of its target may
+    /// resume (`POST .../remediation-policy/breakers/{id}/close`).
+    CloseBreaker {
+        /// Agent name or id.
+        agent: String,
+        /// Protected hook name.
+        hook: String,
+        /// The breaker's id (a UUID).
+        breaker_id: String,
+        /// Why the breaker may close, recorded with the closing operator.
+        /// Required and never blank; checked by the verb so its absence is
+        /// one ADR-0021 error object like every other input refusal.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        #[command(flatten)]
+        conn: C,
+    },
 }
 
 impl<C: clap::Args> RemediationPolicyCommand<C> {
@@ -604,6 +622,21 @@ impl<C: clap::Args> RemediationPolicyCommand<C> {
                 },
                 conn,
             ),
+            RemediationPolicyCommand::CloseBreaker {
+                agent,
+                hook,
+                breaker_id,
+                reason,
+                conn,
+            } => (
+                Verb::CloseBreaker {
+                    agent,
+                    hook,
+                    breaker_id,
+                    reason,
+                },
+                conn,
+            ),
         }
     }
 
@@ -614,7 +647,8 @@ impl<C: clap::Args> RemediationPolicyCommand<C> {
             | RemediationPolicyCommand::Apply { conn, .. }
             | RemediationPolicyCommand::Arm { conn, .. }
             | RemediationPolicyCommand::Disarm { conn, .. }
-            | RemediationPolicyCommand::Remove { conn, .. } => conn,
+            | RemediationPolicyCommand::Remove { conn, .. }
+            | RemediationPolicyCommand::CloseBreaker { conn, .. } => conn,
         }
     }
 
@@ -625,7 +659,8 @@ impl<C: clap::Args> RemediationPolicyCommand<C> {
             | RemediationPolicyCommand::Apply { conn, .. }
             | RemediationPolicyCommand::Arm { conn, .. }
             | RemediationPolicyCommand::Disarm { conn, .. }
-            | RemediationPolicyCommand::Remove { conn, .. } => conn,
+            | RemediationPolicyCommand::Remove { conn, .. }
+            | RemediationPolicyCommand::CloseBreaker { conn, .. } => conn,
         }
     }
 }

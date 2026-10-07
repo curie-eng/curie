@@ -84,7 +84,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   `SkillApprovalsOutput`, `OverridesOutput`, `PublicationPolicyOutput`, `WorkItemsOutput`,
   `SchedulesOutput`, `HookFireOutput`, `ChannelsOutput`, `CallersOutput`,
   `ActionsOutput` (the `local`/`cluster actions` verbs and the action executor receipt),
-  `RemediationPolicyOutput` (the `local`/`cluster remediation-policy` verbs: one policy generation),
+  `RemediationPolicyOutput` (the `local`/`cluster remediation-policy` verbs: one policy generation, or the breaker `close-breaker` closed),
   `ConnectorBuildOutput`. The last is
   the `curie build --plugin-dir` receipt for connector source builds (ADR-0113):
   it emits one object even when the bundle declares nothing to build, because
