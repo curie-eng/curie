@@ -2066,10 +2066,13 @@ fn retained_manifest_fix(common: &CommonOpts, revision: u32, published_head: &st
 
 /// After the catalog window refuses an unambiguous target, admit it only when
 /// its retained manifest carries the build's own ADR 0142 schema-compat
-/// metadata, that declared head is strictly later than the catalog head, and
-/// the declared window contains the live revision. Requiring a later head keeps
-/// every published release judged by its catalog window. Any failure keeps the
-/// original refusal.
+/// metadata, that declared head is strictly later than the catalog head and no
+/// later than the next catalogued release's head, and the declared window
+/// contains the live revision. Requiring a later head keeps every published
+/// release judged by its catalog window. The upper bound admits only a build
+/// cut between its release and the next one, so a chart packaged from a newer
+/// tree under an older version keeps the catalog refusal. Any failure keeps
+/// the original refusal.
 async fn declared_window_admits_rollback(
     common: &CommonOpts,
     ui: &crate::ui::Ui,
@@ -2097,7 +2100,12 @@ async fn declared_window_admits_rollback(
     // candidate_window refuses a min after its head, so this orders the heads.
     let later_head = declared.schema_head != catalog_head
         && crate::schema_window::candidate_window(catalog_head, &declared.schema_head).is_ok();
+    let before_next_release =
+        crate::schema_window::next_release_head(target_app).is_none_or(|next_head| {
+            crate::schema_window::candidate_window(&declared.schema_head, &next_head).is_ok()
+        });
     later_head
+        && before_next_release
         && crate::schema_window::check_target_schema(target_app, &declared, live, history_apps)
             .is_ok()
 }
