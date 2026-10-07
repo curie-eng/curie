@@ -398,6 +398,10 @@ spec:
             # the same value from the same helper; the two must never differ.
             - name: CURIE_ACTION_EXECUTOR_ENABLED
               value: {{ include "curie.actionExecutorEnabled" . | quote }}
+            # The automated remediation switch (AUTOMATED-REMEDIATION-1). The API
+            # renders the same value from the same helper; the two must never differ.
+            - name: CURIE_REMEDIATION_ENABLED
+              value: {{ include "curie.remediationEnabled" . | quote }}
             # Substrate wiring: which namespace to claim sandboxes in, the warm
             # pool to claim from, and the ACI port on each claimed sandbox.
             - name: CURIE_NAMESPACE

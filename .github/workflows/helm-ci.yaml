@@ -613,6 +613,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/action-executor-config-assertions.sh
 
+      # Prove the automated remediation switch (AUTOMATED-REMEDIATION-1): one
+      # value renders CURIE_REMEDIATION_ENABLED identically into the API and the
+      # worker, default off, typed boolean, and a render with remediation on and
+      # the executor off fails naming actionExecutor.enabled.
+      - name: helm render assertions (remediation config)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/remediation-config-assertions.sh
+
       # Pin the end to end connector's test cluster identity (ADR 0176
       # decision 4, #3243): off by default, no cluster scoped write beyond
       # namespace create and delete, the per namespace role never bound cluster

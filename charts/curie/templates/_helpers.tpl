@@ -2296,3 +2296,19 @@ predates it does not carry under --reuse-values (#3505, #3544).
 {{- define "curie.actionExecutorEnabled" -}}
 {{- if (get (.Values.actionExecutor | default dict) "enabled") -}}true{{- else -}}false{{- end -}}
 {{- end -}}
+
+{{/*
+The automated remediation switch (AUTOMATED-REMEDIATION-1): one value, rendered
+as "true" or "false" into both the API and the worker. Enabling it requires the
+action executor, so a render with remediation on and the executor off fails
+here, in the one helper both workloads include. Read through `default dict`
+for --reuse-values from a release that predates the key.
+*/}}
+{{- define "curie.remediationEnabled" -}}
+{{- if (get (.Values.remediation | default dict) "enabled") -}}
+{{- if ne (include "curie.actionExecutorEnabled" .) "true" -}}
+{{- fail "remediation.enabled=true requires actionExecutor.enabled=true (AUTOMATED-REMEDIATION-1): automated remediation executes through the connector action executor" -}}
+{{- end -}}
+true
+{{- else -}}false{{- end -}}
+{{- end -}}
