@@ -79,6 +79,7 @@ from .routers import (
     remediation_nominations,
     remediation_policy,
     remediation_qualifications,
+    remediation_receipts,
     runs,
     schedules,
     state,
@@ -488,6 +489,7 @@ def create_app() -> FastAPI:
     app.include_router(remediation_policy.router)
     app.include_router(remediation_nominations.router)
     app.include_router(remediation_qualifications.router)
+    app.include_router(remediation_receipts.router)
     app.include_router(deployments.router)
     app.include_router(bundles.router)
     app.include_router(deploy_targets.router)

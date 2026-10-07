@@ -1,8 +1,9 @@
 """Remediation policy administration routes, @spec AUTOMATED-REMEDIATION-3.
 
 ``GET``, ``PUT`` and ``DELETE`` on ``/agents/{agent_id}/hooks/{hook}/remediation-policy``,
-``POST .../arm`` and ``POST .../disarm``, and
-``POST .../breakers/{breaker_id}/close`` (AUTOMATED-REMEDIATION-11). Authentication is the same
+``POST .../arm`` and ``POST .../disarm``,
+``GET .../breakers`` and ``POST .../breakers/{breaker_id}/close``
+(AUTOMATED-REMEDIATION-11). Authentication is the same
 ``require_api_key`` dependency as the source policy routes; a hook signature or
 the hook's scoped key never authenticates, so the hook ingress, the support
 probe and the delivery body have no path to these tables.
@@ -22,7 +23,7 @@ activation (AUTOMATED-REMEDIATION-1).
 from __future__ import annotations
 
 import uuid
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query
 from fastapi.responses import JSONResponse
@@ -34,7 +35,7 @@ from ..auth import require_api_key
 from ..config import get_settings
 from ..deps import SessionDep, StoreDep
 from ..hook_source_policy_schemas import SourceHook, SourceUuid
-from ..models import RemediationPolicyGeneration
+from ..models import Agent, RemediationBreaker, RemediationPolicyGeneration
 from ..remediation_limits import close_breaker
 from ..remediation_policy_document import PolicyRefused, validate_document
 from ..remediation_policy_store import PolicyGeneration, Verb, read_policy, write_policy
@@ -321,6 +322,59 @@ async def _declared_pairs(
     return frozenset(pairs)
 
 
+def _breaker_out(breaker: RemediationBreaker) -> RemediationBreakerOut:
+    return RemediationBreakerOut(
+        id=str(breaker.id),
+        agent_id=str(breaker.agent_id),
+        connector=breaker.connector,
+        tool=breaker.tool,
+        target=breaker.target,
+        opened_at=breaker.opened_at,
+        closed_at=breaker.closed_at,
+        closed_by=breaker.closed_by,
+        close_reason=breaker.close_reason,
+    )
+
+
+@router.get(
+    f"{_BASE}/breakers",
+    response_model=list[RemediationBreakerOut],
+    responses=_READ_REFUSALS,
+)
+async def list_remediation_breakers(
+    agent_id: AgentPath,
+    hook: HookPath,
+    session: SessionDep,
+    state: Annotated[Literal["open", "closed", "all"], Query()] = "open",
+) -> JSONResponse:
+    """The hook's breakers, newest opened first: how an operator finds an id to close.
+
+    Scoped as the close route is: only breakers on a connector and tool the
+    hook's policy declares. A read needs the platform key and no operator
+    principal.
+    \f
+    @spec AUTOMATED-REMEDIATION-11 @spec AUTOMATED-REMEDIATION-3.
+    """
+    agent = uuid.UUID(agent_id)
+    if await session.get(Agent, agent) is None:
+        return _refusal(PolicyRefused("agent_not_found", status_code=404))
+    pairs = await _declared_pairs(session, agent, hook)
+    query = select(RemediationBreaker).where(RemediationBreaker.agent_id == agent)
+    if state == "open":
+        query = query.where(RemediationBreaker.closed_at.is_(None))
+    elif state == "closed":
+        query = query.where(RemediationBreaker.closed_at.is_not(None))
+    rows = await session.scalars(
+        query.order_by(RemediationBreaker.opened_at.desc(), RemediationBreaker.id)
+    )
+    body = [
+        _breaker_out(row).model_dump(mode="json")
+        for row in rows
+        if (row.connector, row.tool) in pairs
+    ]
+    return JSONResponse(content=body, headers=_NO_STORE)
+
+
 @router.post(
     f"{_BASE}/breakers/{{breaker_id}}/close",
     response_model=RemediationBreakerOut,
@@ -355,16 +409,6 @@ async def close_remediation_breaker(
     if breaker is None:
         await session.rollback()
         raise HTTPException(status_code=404, detail="breaker not found", headers=_NO_STORE)
-    out = RemediationBreakerOut(
-        id=str(breaker.id),
-        agent_id=str(breaker.agent_id),
-        connector=breaker.connector,
-        tool=breaker.tool,
-        target=breaker.target,
-        opened_at=breaker.opened_at,
-        closed_at=breaker.closed_at,
-        closed_by=breaker.closed_by,
-        close_reason=breaker.close_reason,
-    )
+    out = _breaker_out(breaker)
     await session.commit()
     return JSONResponse(content=out.model_dump(mode="json"), headers=_NO_STORE)

@@ -12,6 +12,7 @@ policy routes.
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -60,3 +61,30 @@ class RemediationNominationRefusal(_NominationModel):
     """@spec AUTOMATED-REMEDIATION-6."""
 
     detail: RemediationNominationRefusalDetail
+
+
+class RemediationNominationOut(_NominationModel):
+    """One nomination as the operator receipt: its stage, authority and code.
+
+    @spec AUTOMATED-REMEDIATION-20. Exactly these fields; the arguments (past
+    the target key), the model's reason, any read result and the alert body are
+    never part of it. ``stage``, ``authority`` and ``code`` are derived from the
+    row by ``curie_api.remediation_receipts``, the one derivation the worker's
+    thread receipts and the CLI share.
+    """
+
+    id: uuid.UUID
+    agent_id: uuid.UUID
+    hook: str
+    kind: str | None
+    action: str | None
+    target: str | None
+    state: str
+    stage: str
+    authority: str
+    code: str | None
+    verification_outcome: str | None
+    approval_id: uuid.UUID | None
+    execution_id: uuid.UUID | None
+    created_at: datetime
+    decided_at: datetime | None
