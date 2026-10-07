@@ -1,0 +1,352 @@
+{
+  "comment": "ACTION-EXECUTOR-16 and -23: the reserved snapshot sealing key names and the custody refusal, mirrored by the CLI bundle check. The API side (packages/curie-internal/src/curie_internal/sealing_key.py, apps/api/src/curie_api/bundles.py::sealing_key_custody_issues) and the CLI side (cli/src/sealing_key.rs) cannot share code across Python and Rust, so both read this file. `reason` is the refusal with `{name}` substituted; `reasons` is it formatted for each name. `references` are texts the MCP client expands from the sandbox environment and the reserved names each references, in sorted order. Each `bundles` case is a bundle whose `.claude-plugin/plugin.json` declares `plugin_secrets` (when present) and whose `connectors.yaml` is `connectors_yaml` (when present); `refused` is every refusal in order, each naming the reserved name (the message is `reasons[name]`) and the location. An empty `refused` is an accepted bundle. Placeholder values only.",
+  "names": [
+    "SNAPSHOT_SEALING_KEY",
+    "SNAPSHOT_SEALING_KEYS_RETAINED"
+  ],
+  "reason": "{name} is a reserved snapshot sealing key: it must reach only the hosted connector, so it may be declared only as a SecretRef (`- name: {name}` with `from_secret:`) on that connector",
+  "reasons": {
+    "SNAPSHOT_SEALING_KEY": "SNAPSHOT_SEALING_KEY is a reserved snapshot sealing key: it must reach only the hosted connector, so it may be declared only as a SecretRef (`- name: SNAPSHOT_SEALING_KEY` with `from_secret:`) on that connector",
+    "SNAPSHOT_SEALING_KEYS_RETAINED": "SNAPSHOT_SEALING_KEYS_RETAINED is a reserved snapshot sealing key: it must reach only the hosted connector, so it may be declared only as a SecretRef (`- name: SNAPSHOT_SEALING_KEYS_RETAINED` with `from_secret:`) on that connector"
+  },
+  "references": [
+    {
+      "text": "$SNAPSHOT_SEALING_KEY",
+      "names": [
+        "SNAPSHOT_SEALING_KEY"
+      ]
+    },
+    {
+      "text": "${SNAPSHOT_SEALING_KEY}",
+      "names": [
+        "SNAPSHOT_SEALING_KEY"
+      ]
+    },
+    {
+      "text": "${ SNAPSHOT_SEALING_KEY }",
+      "names": [
+        "SNAPSHOT_SEALING_KEY"
+      ]
+    },
+    {
+      "text": "${SNAPSHOT_SEALING_KEY:-fallback}",
+      "names": [
+        "SNAPSHOT_SEALING_KEY"
+      ]
+    },
+    {
+      "text": "${SNAPSHOT_SEALING_KEY-fallback}",
+      "names": [
+        "SNAPSHOT_SEALING_KEY"
+      ]
+    },
+    {
+      "text": "Bearer ${OTHER:-${SNAPSHOT_SEALING_KEYS_RETAINED}}",
+      "names": [
+        "SNAPSHOT_SEALING_KEYS_RETAINED"
+      ]
+    },
+    {
+      "text": "$SNAPSHOT_SEALING_KEYS_RETAINED and $SNAPSHOT_SEALING_KEY",
+      "names": [
+        "SNAPSHOT_SEALING_KEY",
+        "SNAPSHOT_SEALING_KEYS_RETAINED"
+      ]
+    },
+    {
+      "text": "$SNAPSHOT_SEALING_KEYRING",
+      "names": []
+    },
+    {
+      "text": "${SNAPSHOT_SEALING_KEYRING}",
+      "names": []
+    },
+    {
+      "text": "SNAPSHOT_SEALING_KEY",
+      "names": []
+    },
+    {
+      "text": "$MY_SEAL_KEY",
+      "names": []
+    }
+  ],
+  "bundles": [
+    {
+      "name": "plain_secret.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secrets:\n      - SNAPSHOT_SEALING_KEY\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.k8s.secrets)"
+        }
+      ]
+    },
+    {
+      "name": "plain_secret_remote.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  remote:\n    url: https://mcp.example.com/mcp\n    secrets:\n      - SNAPSHOT_SEALING_KEY\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.remote.secrets)"
+        }
+      ]
+    },
+    {
+      "name": "env.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    env:\n      SNAPSHOT_SEALING_KEY: SEALVALUE-placeholder-7f3c9e1b\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.k8s.env)"
+        }
+      ]
+    },
+    {
+      "name": "secret_files.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secret_files:\n      SNAPSHOT_SEALING_KEY: /run/secrets/seal\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.k8s.secret_files)"
+        }
+      ]
+    },
+    {
+      "name": "sealed_secrets.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    sealed_secrets:\n      SNAPSHOT_SEALING_KEY: AgB-placeholder-blob\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.k8s.sealed_secrets)"
+        }
+      ]
+    },
+    {
+      "name": "plugin_json_secrets.SNAPSHOT_SEALING_KEY",
+      "plugin_secrets": [
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "SNAPSHOT_SEALING_KEY"
+      ],
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "plugin.json (secrets[1])"
+        }
+      ]
+    },
+    {
+      "name": "bearer_secret.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secrets:\n      - name: SNAPSHOT_SEALING_KEY\n        from_secret: curie-seal\n    bearer_secret: SNAPSHOT_SEALING_KEY\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.k8s.bearer_secret)"
+        }
+      ]
+    },
+    {
+      "name": "bearer_secret_reference.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  remote:\n    url: https://mcp.example.com/mcp\n    bearer_secret: \"${SNAPSHOT_SEALING_KEY}\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.remote.bearer_secret)"
+        }
+      ]
+    },
+    {
+      "name": "header_reference.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  remote:\n    url: https://mcp.example.com/mcp\n    headers:\n      X-Seal: \"Key ${SNAPSHOT_SEALING_KEY}\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.remote.headers.X-Seal)"
+        }
+      ]
+    },
+    {
+      "name": "url_reference.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  remote:\n    url: \"https://mcp.example.com/mcp?k=$SNAPSHOT_SEALING_KEY\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.remote.url)"
+        }
+      ]
+    },
+    {
+      "name": "unhosted_url_reference.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    unhosted_url: \"http://localhost:9000/${SNAPSHOT_SEALING_KEY:-x}\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.k8s.unhosted_url)"
+        }
+      ]
+    },
+    {
+      "name": "secret_ref_accepted.SNAPSHOT_SEALING_KEY",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secrets:\n      - name: SNAPSHOT_SEALING_KEY\n        from_secret: curie-seal\n        key: seal\n",
+      "refused": []
+    },
+    {
+      "name": "plain_secret.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secrets:\n      - SNAPSHOT_SEALING_KEYS_RETAINED\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.k8s.secrets)"
+        }
+      ]
+    },
+    {
+      "name": "plain_secret_remote.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  remote:\n    url: https://mcp.example.com/mcp\n    secrets:\n      - SNAPSHOT_SEALING_KEYS_RETAINED\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.remote.secrets)"
+        }
+      ]
+    },
+    {
+      "name": "env.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    env:\n      SNAPSHOT_SEALING_KEYS_RETAINED: SEALVALUE-placeholder-7f3c9e1b\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.k8s.env)"
+        }
+      ]
+    },
+    {
+      "name": "secret_files.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secret_files:\n      SNAPSHOT_SEALING_KEYS_RETAINED: /run/secrets/seal\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.k8s.secret_files)"
+        }
+      ]
+    },
+    {
+      "name": "sealed_secrets.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    sealed_secrets:\n      SNAPSHOT_SEALING_KEYS_RETAINED: AgB-placeholder-blob\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.k8s.sealed_secrets)"
+        }
+      ]
+    },
+    {
+      "name": "plugin_json_secrets.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "plugin_secrets": [
+        "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "SNAPSHOT_SEALING_KEYS_RETAINED"
+      ],
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "plugin.json (secrets[1])"
+        }
+      ]
+    },
+    {
+      "name": "bearer_secret.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secrets:\n      - name: SNAPSHOT_SEALING_KEYS_RETAINED\n        from_secret: curie-seal\n    bearer_secret: SNAPSHOT_SEALING_KEYS_RETAINED\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.k8s.bearer_secret)"
+        }
+      ]
+    },
+    {
+      "name": "bearer_secret_reference.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  remote:\n    url: https://mcp.example.com/mcp\n    bearer_secret: \"${SNAPSHOT_SEALING_KEYS_RETAINED}\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.remote.bearer_secret)"
+        }
+      ]
+    },
+    {
+      "name": "header_reference.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  remote:\n    url: https://mcp.example.com/mcp\n    headers:\n      X-Seal: \"Key ${SNAPSHOT_SEALING_KEYS_RETAINED}\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.remote.headers.X-Seal)"
+        }
+      ]
+    },
+    {
+      "name": "url_reference.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  remote:\n    url: \"https://mcp.example.com/mcp?k=$SNAPSHOT_SEALING_KEYS_RETAINED\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.remote.url)"
+        }
+      ]
+    },
+    {
+      "name": "unhosted_url_reference.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    unhosted_url: \"http://localhost:9000/${SNAPSHOT_SEALING_KEYS_RETAINED:-x}\"\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.k8s.unhosted_url)"
+        }
+      ]
+    },
+    {
+      "name": "secret_ref_accepted.SNAPSHOT_SEALING_KEYS_RETAINED",
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secrets:\n      - name: SNAPSHOT_SEALING_KEYS_RETAINED\n        from_secret: curie-seal\n        key: seal\n",
+      "refused": []
+    },
+    {
+      "name": "control.my_seal_key",
+      "plugin_secrets": [
+        "MY_SEAL_KEY"
+      ],
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secrets:\n      - MY_SEAL_KEY\n    env:\n      MY_SEAL_KEY: SEALVALUE-placeholder-7f3c9e1b\n    secret_files:\n      MY_SEAL_KEY: /run/secrets/seal\n",
+      "refused": []
+    },
+    {
+      "name": "control.longer_name_keyring",
+      "plugin_secrets": [
+        "SNAPSHOT_SEALING_KEYRING"
+      ],
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secrets:\n      - SNAPSHOT_SEALING_KEYRING\n    env:\n      SNAPSHOT_SEALING_KEYRING: SEALVALUE-placeholder-7f3c9e1b\n    unhosted_url: \"http://localhost:9000/${SNAPSHOT_SEALING_KEYRING}\"\n  remote:\n    url: \"https://mcp.example.com/mcp?k=$SNAPSHOT_SEALING_KEYRING\"\n    headers:\n      X-Seal: \"${SNAPSHOT_SEALING_KEYRING}\"\n    bearer_secret: SNAPSHOT_SEALING_KEYRING\n",
+      "refused": []
+    },
+    {
+      "name": "every_form_at_once",
+      "plugin_secrets": [
+        "SNAPSHOT_SEALING_KEYS_RETAINED"
+      ],
+      "connectors_yaml": "connectors:\n  k8s:\n    image: ghcr.io/example/k8s-restorer@sha256:abababababababababababababababababababababababababababababababab\n    secrets:\n      - SNAPSHOT_SEALING_KEY\n    env:\n      SNAPSHOT_SEALING_KEY: SEALVALUE-placeholder-7f3c9e1b\n    secret_files:\n      SNAPSHOT_SEALING_KEYS_RETAINED: /run/secrets/retained\n",
+      "refused": [
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "plugin.json (secrets[0])"
+        },
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.k8s.secrets)"
+        },
+        {
+          "name": "SNAPSHOT_SEALING_KEY",
+          "location": "connectors.yaml (connectors.k8s.env)"
+        },
+        {
+          "name": "SNAPSHOT_SEALING_KEYS_RETAINED",
+          "location": "connectors.yaml (connectors.k8s.secret_files)"
+        }
+      ]
+    }
+  ]
+}
