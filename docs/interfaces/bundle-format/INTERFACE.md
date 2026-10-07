@@ -24,10 +24,12 @@ The frozen bundle/plugin manifest format: the **Claude Code plugin shape verbati
 distribution wedge. What is swappable is the harness that consumes a bundle; what stays fixed is
 the shape a bundle must have to be accepted. The base is the Claude Code plugin shape, and the
 models are lenient (`extra="allow"`) rather than strict so any bundle written for Claude Code
-validates unchanged. On top of that base the package **does add ten Curie authoring
-extensions**: `systemPrompt`, `starterPrompts`, `secrets`, `triggers`, `approvalPolicy`,
+validates unchanged. On top of that base the package **does add eleven Curie authoring
+extensions**: `systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`, `approvalPolicy`,
 `toolPolicy`, `channelRead`, `canvasList`, `canvasRead` and `canvasEdit` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
-fields Claude Code does not define. Leniency is what lets the Claude Code base and these
+fields Claude Code does not define. `secrets` names the secrets a deploy must bind;
+`optionalSecrets` (ADR 0209) names the ones it may leave unbound, validated the same
+way, and a name may not appear in both (`secrets.optional_overlap`). Leniency is what lets the Claude Code base and these
 extensions coexist; the earlier "does not invent format extensions" framing was wrong.
 
 The manifest is not the whole bundle either. Three **Curie-only root files** sit beside the Claude

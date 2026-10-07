@@ -24,9 +24,9 @@ string rather than a `const`. Artifact sync is enforced by the
 schema-compat gate (`tests/test_schema_compat.py`); an unbumped wire change is
 caught by the wire-lock gate (`tests/test_wire_lock.py`).
 
-## Contract surface (v0.5.17)
+## Contract surface (v0.5.19)
 
-`PROTOCOL_VERSION = "0.5.17"` is embedded in the schema and in every outbound
+`PROTOCOL_VERSION = "0.5.19"` is embedded in the schema and in every outbound
 event.
 
 `QueuedTurn.reply_handle` may be absent only when `source` is `cron` and

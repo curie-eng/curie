@@ -38,6 +38,14 @@ Several identities probe concurrently against the one shared deadline, so the
 startup envelope the chart checks is unchanged. An identity whose probe refuses
 is logged and skipped while the others connect; startup refuses only when
 discovery fails or no identity passes. A lone identity refuses exactly as before.
+
+On a test installation (ADR 0202 decision 1) every identity also asks
+``auth.test``, and the preflight keeps each listed driver identity to its own
+agent: it refuses a driver that is the installation's authorized identity
+(``default``), a sibling identity's driver that names no agent, and a sibling
+identity bound to any agent other than the one its entry names. It fails closed
+when an identity's ids are unknown, since a sibling could then pass as an
+outside bot.
 """
 
 from __future__ import annotations
@@ -54,6 +62,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
+from curie_internal.driver_declaration import DeclaredDriver
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web import WebClient
 
@@ -138,6 +147,32 @@ class ApiUnreachableError(RuntimeError):
 
 class SlackChannelPreflightError(RuntimeError):
     """Configured Slack destinations could not be safely capability-checked."""
+
+
+class DriverPreflightError(SlackChannelPreflightError):
+    """A test installation's driver list would let an agent post as a driver (ADR 0202)."""
+
+
+_DRIVER_IS_AUTHORIZED_IDENTITY = (
+    "Test installation preflight failed: {where} is this installation's authorized "
+    "Slack identity (default, as auth.test reports it). A driver must be another "
+    "bot: an outside installation's, or a sibling identity bound to its own agent."
+)
+_SIBLING_DRIVER_NAMES_NO_AGENT = (
+    "Test installation preflight failed: {where} is the sibling Slack identity "
+    "{identity} and names no agent. A sibling driver's entry must name the one "
+    "agent that identity serves."
+)
+_SIBLING_DRIVER_SERVES_OTHER_AGENTS = (
+    "Test installation preflight failed: {where} is the sibling Slack identity "
+    "{identity}, which is bound to {count} agent(s) other than {agent}. Bind that "
+    "identity to {agent} alone, so no other agent can post as the driver."
+)
+_DRIVER_IDS_UNKNOWN = (
+    "Test installation preflight failed: Slack identity {identity} did not pass "
+    "preflight or report its bot ids (auth.test), so the drivers cannot be checked "
+    "against it."
+)
 
 
 class SlackChannelClient(Protocol):
@@ -496,6 +531,7 @@ def check_slack_channel_capabilities(
     deadline = monotonic() + timeout_s
     attempt = 0
     destinations: dict[str, set[str]] | None = None
+    identity_agents: dict[str, set[str]] = {}
     discovery_failure_message = _AGENT_DISCOVERY_FAILURE_MESSAGE
     try:
         while True:
@@ -515,10 +551,15 @@ def check_slack_channel_capabilities(
                     ) from None
                 if response.status_code == 200:
                     try:
+                        agents_payload = response.json()
+                        declared_names = frozenset(identity.name for identity in declared)
                         destinations = _collect_slack_destinations(
-                            response.json(),
-                            frozenset(identity.name for identity in declared),
+                            agents_payload, declared_names
                         )
+                        if config.test_installation_enabled:
+                            identity_agents = _collect_identity_agents(
+                                agents_payload, declared_names
+                            )
                     except Exception:  # noqa: BLE001 - existing broad catch retained
                         raise SlackChannelPreflightError(
                             _AGENT_DISCOVERY_RESPONSE_SHAPE_MESSAGE
@@ -561,10 +602,34 @@ def check_slack_channel_capabilities(
             logger=logger,
             monotonic=monotonic,
             several=several,
+            ask_ids=several or config.test_installation_enabled,
         )
 
     if not several:
-        return (probe(declared[0]),)
+        admitted: tuple[PreflightedIdentity, ...] = (probe(declared[0]),)
+    else:
+        admitted = _probe_several(
+            declared, probe, deadline=deadline, logger=logger, monotonic=monotonic
+        )
+    if config.test_installation_enabled:
+        check_test_installation_drivers(
+            config.test_installation_drivers,
+            declared=[identity.name for identity in declared],
+            admitted=admitted,
+            identity_agents=identity_agents,
+        )
+    return admitted
+
+
+def _probe_several(
+    declared: Sequence[SlackIdentityCredentials],
+    probe: Callable[[SlackIdentityCredentials], PreflightedIdentity],
+    *,
+    deadline: float,
+    logger: logging.Logger,
+    monotonic: Callable[[], float],
+) -> tuple[PreflightedIdentity, ...]:
+    """Probe several identities at once; return those that passed, in declared order."""
 
     # One thread per identity against the ONE deadline: the chart's startup
     # envelope (charts/curie/templates/dispatcher.yaml) is sized for a single
@@ -608,6 +673,82 @@ def check_slack_channel_capabilities(
     return admitted
 
 
+def _collect_identity_agents(
+    payload: object, declared: frozenset[str]
+) -> dict[str, set[str]]:
+    """The agents each identity is bound to through a Slack channel binding.
+
+    Ownership is read exactly as ``_collect_slack_destinations`` reads it: a
+    binding belongs to the identity its ``adapter`` names, and a name this
+    installation does not declare is ``default``'s. Runs after that function
+    has accepted the payload's shape.
+    """
+    bound: dict[str, set[str]] = {}
+    if not isinstance(payload, list):
+        raise ValueError("agent list is not an array")
+    for agent in payload:
+        name = agent.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("agent name is malformed")
+        for target in agent.get("channels") or ():
+            if target.get("kind") != SLACK_KIND:
+                continue
+            adapter = target.get("adapter")
+            identity = route_identity(SLACK_KIND, adapter if isinstance(adapter, str) else None)
+            owner = identity if identity is not None and identity in declared else DEFAULT_IDENTITY
+            bound.setdefault(owner, set()).add(name)
+    return bound
+
+
+def check_test_installation_drivers(
+    drivers: Sequence[DeclaredDriver],
+    *,
+    declared: Sequence[str],
+    admitted: Sequence[PreflightedIdentity],
+    identity_agents: Mapping[str, set[str]],
+) -> None:
+    """Keep each driver identity to its own agent (ADR 0202 decision 1).
+
+    The risk is an agent under test posting as a driver and answering its own
+    approval cards. ``default`` posts for every agent its bindings and
+    non-Slack turns reach, so it may never be a driver. A sibling identity may,
+    if its entry names the one agent it serves and it is bound to no other.
+    A driver matching no identity here runs in another installation.
+
+    Raises ``DriverPreflightError``. Messages name the entry's position and
+    the identity, never a Slack id or another agent's name.
+    """
+    ids = {identity.name: identity.bot_ids for identity in admitted}
+    known: dict[str, SlackBotIds] = {}
+    for name in declared:
+        bot_ids = ids.get(name)
+        if bot_ids is None or not bot_ids.bot_id or not bot_ids.bot_user_id:
+            raise DriverPreflightError(_DRIVER_IDS_UNKNOWN.format(identity=name))
+        known[name] = bot_ids
+
+    for index, driver in enumerate(drivers):
+        where = f"testInstallation.drivers[{index}]"
+        matched = [
+            name
+            for name, bot_ids in known.items()
+            if driver.bot_id == bot_ids.bot_id or driver.bot_user_id == bot_ids.bot_user_id
+        ]
+        if DEFAULT_IDENTITY in matched:
+            raise DriverPreflightError(_DRIVER_IS_AUTHORIZED_IDENTITY.format(where=where))
+        for identity in matched:
+            if driver.agent is None:
+                raise DriverPreflightError(
+                    _SIBLING_DRIVER_NAMES_NO_AGENT.format(where=where, identity=identity)
+                )
+            others = identity_agents.get(identity, set()) - {driver.agent}
+            if others:
+                raise DriverPreflightError(
+                    _SIBLING_DRIVER_SERVES_OTHER_AGENTS.format(
+                        where=where, identity=identity, count=len(others), agent=driver.agent
+                    )
+                )
+
+
 def _probe_identity(
     identity: SlackIdentityCredentials,
     addresses: Iterable[str],
@@ -617,6 +758,7 @@ def _probe_identity(
     logger: logging.Logger,
     monotonic: Callable[[], float],
     several: bool,
+    ask_ids: bool = False,
 ) -> PreflightedIdentity:
     """Probe one identity's scopes and destinations with its own token.
 
@@ -734,14 +876,15 @@ def _probe_identity(
 
         checked += 1
 
-    # The ids decision 6 needs to admit a sibling identity's bot (ADR-0168).
-    # Asked only with several identities, on the client this identity already
+    # The ids decision 6 needs to admit a sibling identity's bot (ADR-0168),
+    # and that a test installation's driver check needs (ADR 0202). Asked only
+    # with several identities or on a test installation, on the client this identity already
     # opened, and last, so it cannot spend the budget a destination needs.
     # Under the same deadline, but it refuses nothing: an expired deadline or an
     # unanswered call records no ids and skips nothing, as an invalid token does
     # not refuse boot either (the capability probe counts it unverified).
     bot_ids: SlackBotIds | None = None
-    if several:
+    if several or ask_ids:
         if deadline - monotonic() > 0:
             try:
                 bot_ids = bot_ids_from_auth_test(capability_client.auth_test())

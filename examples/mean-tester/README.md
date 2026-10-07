@@ -49,6 +49,15 @@ to know what the target is for. It takes the first of these the request gives:
 The report's first line names the source: `<owner/repo>@<commit>`,
 `request spec`, or `(no spec)`.
 
+A repository spec is the source the target was rendered from, not proof of
+what is deployed: an installer may drop connectors, gates and secrets before
+deploying. Add `, rendered` or `, deployed` after naming the spec to say which,
+for example `spec from acme-corp/acme-bot@main examples/acme-bot, rendered`.
+Without either, a repository spec counts as a source and a spec in the request
+counts as deployed. When the target says it lacks something only a source spec
+declares, the tester grades it UNCLEAR ("spec source may differ from
+deployment"), not FAIL. See [docs/VALIDATOR.md](docs/VALIDATOR.md#deployed-and-source-specs).
+
 ## A round without a spec
 
 Without a spec, the only thing to hold a reply against is ordinary use. The
@@ -312,8 +321,9 @@ good replies PASS, with a spec and without one. The recorded exchanges include
 contradictions between a claimed capability and the target's own tool inventory,
 misleading tool-call
 inventories presented as changes, replies that leave their Slack thread,
-settled approval cards that still look pending, and approval messages in the
-wrong order. Approval cases are recorded exchanges only. The tester never
+settled approval cards that still look pending, approval messages in the
+wrong order, and a capability the target denies that only a source spec
+declares (UNCLEAR) against one a deployed spec declares (FAIL). Approval cases are recorded exchanges only. The tester never
 creates a card to exercise them. Run the cases with a model credential:
 
 ```bash

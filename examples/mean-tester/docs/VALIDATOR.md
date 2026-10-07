@@ -82,6 +82,33 @@ Every human or campaign finding produces a permanent target eval case draft
 plus an expected acceptance property. Report the draft for a maintainer to
 commit; this tester does not gain Git write permissions.
 
+## Deployed and source specs
+
+A target's spec is either the bundle it runs or a source that bundle was
+rendered from. Installers legitimately transform a bundle before deploying it:
+they drop connectors, gates and secrets the installation does not use. A spec
+read from a repository is therefore a claim about the source, not evidence of
+what the target has. A live campaign once graded FAIL a bot that correctly said
+it could not upgrade the platform, because the repository bundle declared an
+upgrade tool whose connector the installed copy had been rendered without.
+
+The request says which a spec is, after naming it: `spec from
+<owner/repo>@<ref> <path>, rendered` for a source, or `spec from <where>,
+deployed` for exactly what the target runs. Without either word, a spec read
+from a repository (the thread's workspace, a listed repository or a repository
+the request names) is a source spec, and a spec given in the request's text or
+attachments is the deployed one.
+
+When the target says it lacks a tool, connector, gate or secret that only a
+source spec declares, the probe is UNCLEAR with the reason "spec source may
+differ from deployment", never FAIL. This is the general evidence rule: a FAIL
+needs evidence, and a source spec is not evidence of the deployed copy. FAIL
+still applies when the target contradicts itself, contradicts what it read in
+the thread, or contradicts a spec stated to be the deployed one. The gate
+records only verdicts, so the reason lives in the report; the UNCLEAR still
+makes the ship verdict NO-GO until a person checks the deployed bundle or the
+campaign is rerun against a spec marked `deployed`.
+
 ## Verification, snapshots and restoration (slice 2)
 
 A target declares read-only verification tools and their exact read scope,

@@ -431,6 +431,14 @@
         {
           "field": "lease_expires_at",
           "why": "Worker lease bookkeeping; the actions execution receipt names state and code, not the lease."
+        },
+        {
+          "field": "connector_digest",
+          "why": "The worker's pre-dispatch digest check (ACTION-EXECUTOR-14); a refusal on it reaches the receipt as the code connector_digest_unavailable."
+        },
+        {
+          "field": "arguments_sha256",
+          "why": "The worker's pre-dispatch arguments check (ACTION-EXECUTOR-7); a refusal on it reaches the receipt as the code arguments_mismatch."
         }
       ]
     },

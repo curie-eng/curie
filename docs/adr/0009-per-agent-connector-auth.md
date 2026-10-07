@@ -3,6 +3,8 @@
 Date: 2026-07-09
 Status: Accepted
 
+Superseded in part by [ADR 0209](0209-a-bundle-may-declare-a-secret-optional.md): a bundle may also declare secrets as optional, and a deploy no longer refuses one it leaves unbound. Every name in `secrets` stays required.
+
 ## Context
 
 An agent's usefulness comes largely from connectors: MCP servers that reach
