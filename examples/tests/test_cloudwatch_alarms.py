@@ -497,13 +497,36 @@ def test_optional_prometheus_rules_execute_real_consumer_vectors(tmp_path):
     vector = Path(__file__).with_name("cloudwatch-alarms.test.yaml")
     (tmp_path / vector.name).write_text(vector.read_text())
     executable = os.environ.get("PROMTOOL") or shutil.which("promtool")
-    assert executable, "promtool is required to prove production CloudWatch rule behavior"
+    if executable:
+        command = [executable, "test", "rules", vector.name]
+    else:
+        # @spec SRE-CW-7. Root pytest CI has Docker without a host promtool.
+        # Run the same production evaluator as the focused workflow, never skip.
+        docker = shutil.which("docker")
+        assert docker, "promtool or Docker is required to prove production CloudWatch rules"
+        command = [
+            docker,
+            "run",
+            "--rm",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+            "--entrypoint",
+            "/bin/promtool",
+            "-v",
+            f"{tmp_path}:/rules:ro",
+            "-w",
+            "/rules",
+            "prom/prometheus:v3.5.0",
+            "test",
+            "rules",
+            vector.name,
+        ]
     result = subprocess.run(
-        [executable, "test", "rules", vector.name],
+        command,
         cwd=tmp_path,
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=120,
     )
     assert result.returncode == 0, result.stdout + result.stderr
 

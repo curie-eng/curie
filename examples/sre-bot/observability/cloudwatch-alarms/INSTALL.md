@@ -1,7 +1,8 @@
 # Optional CloudWatch source
 
 Contract: [SRE-CW-1 through SRE-CW-8](../../docs/CLOUDWATCH-ALARMS.md).
-This source reads alarms for an existing SNS topic. The default example installer
+This source reads ALARM entries whose AlarmActions contains the existing SNS
+topic exactly; OK/InsufficientData actions and similarly prefixed topics are excluded. The default example installer
 starts no reader and loads no CloudWatch rules. Keep installation identities and
 all AWS values in private operator configuration.
 

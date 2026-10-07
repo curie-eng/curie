@@ -32,6 +32,7 @@ permissions:
   contents: read
 jobs:
   cloudwatch:
+    name: CloudWatch reader and optional rules
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -55,7 +56,7 @@ jobs:
           docker pull prom/prometheus:v3.5.0
           cat > "$RUNNER_TEMP/promtool-cloudwatch" <<'SH'
           #!/bin/sh
-          exec docker run --rm --entrypoint /bin/promtool -v "$PWD:/rules:ro" -w /rules prom/prometheus:v3.5.0 "$@"
+          exec docker run --rm --user "$(id -u):$(id -g)" --entrypoint /bin/promtool -v "$PWD:/rules:ro" -w /rules prom/prometheus:v3.5.0 "$@"
           SH
           chmod +x "$RUNNER_TEMP/promtool-cloudwatch"
           PROMTOOL="$RUNNER_TEMP/promtool-cloudwatch" python -m pytest examples/tests/test_cloudwatch_alarms.py -q

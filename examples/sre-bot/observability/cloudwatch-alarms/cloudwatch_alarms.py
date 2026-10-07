@@ -140,7 +140,7 @@ def parse_credentials(xml: bytes) -> Credentials:
     )
 
 
-def parse_alarms(xml: bytes) -> tuple[list[tuple[str, str, str]], str | None]:
+def parse_alarms(xml: bytes, topic_arn: str) -> tuple[list[tuple[str, str, str]], str | None]:
     """@spec SRE-CW-2 SRE-CW-4."""
     result = ET.fromstring(xml).find("cw:DescribeAlarmsResult", MONITORING_NS)
     if result is None:
@@ -159,6 +159,11 @@ def parse_alarms(xml: bytes) -> tuple[list[tuple[str, str, str]], str | None]:
         )
         for m in members
         if (m.findtext("cw:ActionsEnabled", "", MONITORING_NS) or "").strip().lower() != "false"
+        and m.findtext("cw:StateValue", "", MONITORING_NS) == "ALARM"
+        and any(
+            action.text == topic_arn
+            for action in m.findall("cw:AlarmActions/cw:member", MONITORING_NS)
+        )
     ]
     return alarms, result.findtext("cw:NextToken", None, MONITORING_NS) or None
 
@@ -321,7 +326,7 @@ class Poller:
             status, answer = self.http("POST", url, headers, body)
             if status != 200:
                 raise Refused(status)
-            page, next_token = parse_alarms(answer)
+            page, next_token = parse_alarms(answer, self.topic_arn)
             alarms += page
             if next_token is None:
                 return alarms
@@ -411,7 +416,11 @@ def main() -> int:
         clock=lambda: datetime.datetime.now(datetime.UTC),
         metric_prefix=metric_prefix,
     )
-    server = make_server(listen_addr, poller)
+    try:
+        server = make_server(listen_addr, poller)
+    except (OSError, ValueError):
+        print("cloudwatch-alarms: invalid configuration", file=sys.stderr)
+        return 2
     # Serving before the first poll, so poll_ok 0 is what a reader that never reads shows.
     threading.Thread(target=server.serve_forever, daemon=True).start()
     while True:
