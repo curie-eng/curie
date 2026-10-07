@@ -464,6 +464,24 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                 .await?,
             )
         }
+        // @spec AUTOMATED-REMEDIATION-3
+        LocalAction::RemediationPolicy { verb } => {
+            let (verb, conn) = verb.into_parts();
+            // Validated before the connection is resolved, so a refused
+            // document or a missing principal never reaches the API.
+            let verb = verb.validate()?;
+            emit(
+                commands::remediation_policy(
+                    commands::RemediationPolicyOpts {
+                        api_url: conn.api_url,
+                        api_key: conn.api_key,
+                        tier: "local",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
         LocalAction::Observability { query, open } => match query {
             None => emit(commands::observability(open).await?),
             Some(_) if open => Err(curie::exit::usage(

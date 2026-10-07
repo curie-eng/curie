@@ -505,6 +505,13 @@ pub(crate) enum LocalAction {
         #[command(subcommand)]
         verb: ActionsCommand<LocalObservabilityConn>,
     },
+    /// A protected hook's remediation policy: show it, apply a document, arm,
+    /// disarm or remove it. Writes run as the operator principal in
+    /// CURIE_APPROVAL_PRINCIPAL_TOKEN.
+    RemediationPolicy {
+        #[command(subcommand)]
+        verb: RemediationPolicyCommand<LocalObservabilityConn>,
+    },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
     /// approval posts to, and who may resolve it, come from the agent's approval

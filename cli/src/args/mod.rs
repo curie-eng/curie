@@ -453,6 +453,183 @@ impl<C: clap::Args> ActionsCommand<C> {
     }
 }
 
+/// The CAS flags every remediation policy write carries.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct RemediationPolicyWriteArgs {
+    /// The generation this write replaces, as `show` prints it (`0` binds a
+    /// hook with no policy). A stale generation is refused.
+    #[arg(long, value_name = "N")]
+    pub(crate) expected_generation: String,
+    /// Idempotency key (a UUID): a retry with the same id is the same intent.
+    /// Omitted, a fresh one is minted.
+    #[arg(long, value_name = "UUID")]
+    pub(crate) operation_id: Option<String>,
+}
+
+impl From<RemediationPolicyWriteArgs> for commands::PolicyWriteArgs {
+    fn from(args: RemediationPolicyWriteArgs) -> Self {
+        commands::PolicyWriteArgs {
+            expected_generation: args.expected_generation,
+            operation_id: args.operation_id,
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-3
+/// The `remediation-policy` verbs, shared by `local` and `cluster` so the two
+/// tiers cannot drift. `C` is the tier's connection flags, carried on each
+/// leaf so they parse after the verb's own arguments. Writes authenticate
+/// their operator with CURIE_APPROVAL_PRINCIPAL_TOKEN.
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
+    /// Read a hook's current remediation policy generation
+    /// (`GET /agents/{id}/hooks/{hook}/remediation-policy`).
+    Show {
+        /// Agent name or id.
+        agent: String,
+        /// Protected hook name.
+        hook: String,
+        #[command(flatten)]
+        conn: C,
+    },
+    /// Bind or replace a hook's policy from a JSON document (`PUT`). The
+    /// document is validated with the platform's rules before any request.
+    Apply {
+        /// Agent name or id.
+        agent: String,
+        /// Protected hook name.
+        hook: String,
+        /// The policy document: route, limits and actions.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+        #[command(flatten)]
+        write: RemediationPolicyWriteArgs,
+        #[command(flatten)]
+        conn: C,
+    },
+    /// Arm the current policy so its automatic actions may run (`POST .../arm`).
+    Arm {
+        /// Agent name or id.
+        agent: String,
+        /// Protected hook name.
+        hook: String,
+        #[command(flatten)]
+        write: RemediationPolicyWriteArgs,
+        #[command(flatten)]
+        conn: C,
+    },
+    /// Disarm the current policy (`POST .../disarm`).
+    Disarm {
+        /// Agent name or id.
+        agent: String,
+        /// Protected hook name.
+        hook: String,
+        #[command(flatten)]
+        write: RemediationPolicyWriteArgs,
+        #[command(flatten)]
+        conn: C,
+    },
+    /// Remove the policy (`DELETE`): a new generation, inactive and disarmed.
+    Remove {
+        /// Agent name or id.
+        agent: String,
+        /// Protected hook name.
+        hook: String,
+        #[command(flatten)]
+        write: RemediationPolicyWriteArgs,
+        #[command(flatten)]
+        conn: C,
+    },
+}
+
+impl<C: clap::Args> RemediationPolicyCommand<C> {
+    /// Split the verb from its connection flags.
+    pub(crate) fn into_parts(self) -> (commands::RemediationPolicyVerb, C) {
+        use commands::RemediationPolicyVerb as Verb;
+        match self {
+            RemediationPolicyCommand::Show { agent, hook, conn } => {
+                (Verb::Show { agent, hook }, conn)
+            }
+            RemediationPolicyCommand::Apply {
+                agent,
+                hook,
+                file,
+                write,
+                conn,
+            } => (
+                Verb::Apply {
+                    agent,
+                    hook,
+                    file,
+                    write: write.into(),
+                },
+                conn,
+            ),
+            RemediationPolicyCommand::Arm {
+                agent,
+                hook,
+                write,
+                conn,
+            } => (
+                Verb::Arm {
+                    agent,
+                    hook,
+                    write: write.into(),
+                },
+                conn,
+            ),
+            RemediationPolicyCommand::Disarm {
+                agent,
+                hook,
+                write,
+                conn,
+            } => (
+                Verb::Disarm {
+                    agent,
+                    hook,
+                    write: write.into(),
+                },
+                conn,
+            ),
+            RemediationPolicyCommand::Remove {
+                agent,
+                hook,
+                write,
+                conn,
+            } => (
+                Verb::Remove {
+                    agent,
+                    hook,
+                    write: write.into(),
+                },
+                conn,
+            ),
+        }
+    }
+
+    /// The leaf's connection flags.
+    pub(crate) fn conn(&self) -> &C {
+        match self {
+            RemediationPolicyCommand::Show { conn, .. }
+            | RemediationPolicyCommand::Apply { conn, .. }
+            | RemediationPolicyCommand::Arm { conn, .. }
+            | RemediationPolicyCommand::Disarm { conn, .. }
+            | RemediationPolicyCommand::Remove { conn, .. } => conn,
+        }
+    }
+
+    /// The leaf's connection flags, mutably.
+    pub(crate) fn conn_mut(&mut self) -> &mut C {
+        match self {
+            RemediationPolicyCommand::Show { conn, .. }
+            | RemediationPolicyCommand::Apply { conn, .. }
+            | RemediationPolicyCommand::Arm { conn, .. }
+            | RemediationPolicyCommand::Disarm { conn, .. }
+            | RemediationPolicyCommand::Remove { conn, .. } => conn,
+        }
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum LocalHooksAction {
     /// Show an agent's hook partition and source binding maps.

@@ -1500,6 +1500,27 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 .await?,
             )
         }
+        // @spec AUTOMATED-REMEDIATION-3
+        ClusterAction::RemediationPolicy { verb } => {
+            let (verb, conn) = verb.into_parts();
+            // Validated before the connection is resolved, so a refused
+            // document or a missing principal never reaches discovery or the API.
+            let verb = verb.validate()?;
+            // `_cluster_api_pf` is the port-forward guard; it must live for
+            // the whole call.
+            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, false).await?;
+            emit(
+                commands::remediation_policy(
+                    commands::RemediationPolicyOpts {
+                        api_url,
+                        api_key,
+                        tier: "cluster",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
         ClusterAction::Approvals {
             target,
             gate,
