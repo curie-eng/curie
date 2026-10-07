@@ -82,6 +82,8 @@ def run() -> None:
                     "docker",
                     "run",
                     "--detach",
+                    "--tmpfs",
+                    "/prometheus:rw,size=256m,uid=65534,gid=65534",
                     "--label",
                     "curie.verification=scheduled-job-alerts",
                     "--publish",
@@ -153,7 +155,9 @@ def run() -> None:
             ).strip()
             assert label == "scheduled-job-alerts", "refusing cleanup of an unowned container"
             subprocess.run(
-                ["docker", "rm", "--force", container_id], check=True, capture_output=True
+                ["docker", "rm", "--force", "--volumes", container_id],
+                check=True,
+                capture_output=True,
             )
             remaining = subprocess.check_output(
                 ["docker", "ps", "--all", "--quiet", "--filter", f"id={container_id}"], text=True
