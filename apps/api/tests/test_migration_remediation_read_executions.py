@@ -106,8 +106,10 @@ def test_one_hand_written_revision_on_the_ledger_fields_head() -> None:
     revision, down = _revision()
     assert down == BELOW, f"revision {revision} revises {down}, expected {BELOW}"
     assert revision == HEAD
+    # The remediation approvals revision (task 10, 0091) now follows this one; the
+    # head pin lives in test_migration_remediation_approvals.py.
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == [HEAD]
+    assert HEAD in {rev.revision for rev in script.iterate_revisions(script.get_heads()[0], BELOW)}
 
 
 def test_the_upgrade_adds_not_before_and_the_sample(
