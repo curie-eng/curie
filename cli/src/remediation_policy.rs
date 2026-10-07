@@ -18,8 +18,8 @@
 //! [`parse_policy_text`], as the API's pre-check refuses it. One deliberate
 //! difference, unreachable by a document the API accepts: the CLI's JSON
 //! objects iterate keys in sorted order rather than document order, so when
-//! several keys of one `limits` or `arguments` object are each invalid the
-//! CLI may name a different one first.
+//! several keys of one `limits`, `arguments`, `rules`, `change` or tune read
+//! map are each invalid the CLI may name a different one first.
 
 use std::fmt;
 
