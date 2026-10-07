@@ -1,5 +1,5 @@
 {
-  "comment": "@spec ACTION-EXECUTOR-6 @spec ACTION-EXECUTOR-24. The worker's `execute` client and the runner's `/v1/execute` route ship in different images, as do the writer and reader of the mode variable, so the whole route is frozen here. `mode_variable` is the runner-private boot variable (outside `BootEnv`) the worker sets on an executor claim. Every request carries exactly `request_keys`; a key a phase does not use is null. `phases` gives one request and response per phase; `arguments` is the canonical text (action-canonical-arguments.json), never an object. `sequences` lists the only accepted phase orders within one sandbox (a prefix of one is accepted; any other order, including a second `call`, is refused `phase_out_of_order` without dialing). `refusals` is the closed set of route refusals: HTTP status, body, whether the connector may have been dialed, and the pre-dispatch code the worker reports for it. `refused_tool_sequences` are orders refused for a given `call` tool (a forward tool never follows `observe`; a restore always does). `refused_call_consumes`: a `call` refused by preflight still spends the sandbox's one call, so a later `call` is refused without dialing. `connector_not_hosted` refuses a `call` whose connector the grant header cannot ride to (no URL). `bounds`: `list` pagination past `list_pages` is refused, and a `call` result past `call_result_bytes` is answered as an error with no structure (the worker fails it; it is never retried). `absent_route` is a runner image without the route. `status_body` is the executor mode body of `GET /status` and `GET /v1/status`; `other_routes` are refused in executor mode. Read by apps/worker/tests/test_runner_execute_vector.py and runner/tests/test_runner_execute_vector.py, each of which rejects an unknown key.",
+  "comment": "@spec ACTION-EXECUTOR-6 @spec ACTION-EXECUTOR-24. The worker's `execute` client and the runner's `/v1/execute` route ship in different images, as do the writer and reader of the mode variable, so the whole route is frozen here. `mode_variable` is the runner-private boot variable (outside `BootEnv`) the worker sets on an executor claim. Every request carries exactly `request_keys`; a key a phase does not use is null. `phases` gives one request and response per phase; `arguments` is the canonical text (action-canonical-arguments.json), never an object. `sequences` lists the only accepted phase orders within one sandbox (a prefix of one is accepted; any other order, including a second `call`, is refused `phase_out_of_order` without dialing). `refusals` is the closed set of route refusals: HTTP status, body, whether the connector may have been dialed, and the pre-dispatch code the worker reports for it. `refused_tool_sequences` are orders refused for a given `call` tool (a forward tool never follows `observe`; a restore always does). `refused_call_consumes`: a `call` refused by preflight still spends the sandbox's one call, so a later `call` is refused without dialing. `connector_not_hosted` refuses a `call` whose connector the grant header cannot ride to (no URL). `bounds`: `list` pagination past `list_pages` is refused, and a `call` result past `call_result_bytes` is answered as an error with no structure (the worker fails it; it is never retried). `absent_route` is a runner image without the route. `status_body` is the executor mode body of `GET /status` and `GET /v1/status`; `other_routes` are refused in executor mode. Read by apps/worker/tests/test_runner_execute_vector.py and runner/tests/test_runner_execute_vector.py, each of which rejects an unknown key. Remediation reads (@spec AUTOMATED-REMEDIATION-12, executor amendments E3, E4 and E6): every request also carries `pointer`, non-null on a `read` only. A `read` is `list` then one or more `read`s of one tool with the same canonical arguments and pointer on the read connector, each calling `tools/call` once and answering only the sample at the pointer (`sample` and `value`, kinds and extraction cases in remediation-predicate.json), never the result; no grant rides it. `read.list_response` is the read fixture connector's catalogue; a read whose tool is not advertised with `readOnlyHint: true` in the sandbox's own `list` (`read.not_read_only`) is refused `tool_not_read_only` without dialing. A later read changing any of `read.same_call_fields` is refused `read.changed_call_refusal` (the order check precedes the tool check). An observe-only execution (`list` then repeated `observe`, no `call`) watches a forward action's target for `superseded`; after a second `observe` no `call` is accepted. A sandbox serves at most `read.samples_max` reads or observes, then refuses `read.over_samples_refusal`. A pointer in `read.invalid_pointers` (from remediation-predicate.json) is refused `invalid_request`. A read can never write, so any unrecognized refusal of a read maps to `read.unknown_refusal_worker_code`, never `response_lost`. `remediation_codes.pre_dispatch_added` join the API's closed pre-dispatch codes; `remediation_codes.not_refusals` are sample results, never refusal codes. Also read, for `remediation_codes` only, by apps/api/tests/test_runner_execute_remediation_codes.py.",
   "mode_variable": {
     "name": "CURIE_RUNNER_MODE",
     "value": "execute"
@@ -23,7 +23,8 @@
     "tool",
     "arguments",
     "grant",
-    "target"
+    "target",
+    "pointer"
   ],
   "phases": {
     "list": {
@@ -34,7 +35,8 @@
         "tool": null,
         "arguments": null,
         "grant": null,
-        "target": null
+        "target": null,
+        "pointer": null
       },
       "response": {
         "phase": "list",
@@ -113,7 +115,8 @@
           "kind": "Deployment",
           "namespace": "example-ns",
           "name": "example-web"
-        }
+        },
+        "pointer": null
       },
       "response": {
         "phase": "observe",
@@ -132,7 +135,8 @@
         "tool": "restore",
         "arguments": "{\"expected_version\":\"rv-1041\",\"prior_state\":{\"ciphertext\":\"ZXhhbXBsZSBzZWFsZWQgc25hcHNob3QgYnl0ZXMgMDE=\",\"kid\":\"example-key-2026-10\",\"sealed\":\"curie.snapshot.v1\"},\"target\":{\"kind\":\"Deployment\",\"name\":\"example-web\",\"namespace\":\"example-ns\"}}",
         "grant": "ccg.eyJleGFtcGxlIjoidHJ1ZSJ9.ZXhhbXBsZS1zaWduYXR1cmU",
-        "target": null
+        "target": null,
+        "pointer": null
       },
       "response": {
         "phase": "call",
@@ -152,6 +156,28 @@
         "is_error",
         "structured"
       ]
+    },
+    "read": {
+      "request": {
+        "execution_id": "00000000-0000-4000-8000-000000000002",
+        "phase": "read",
+        "connector": "example-metrics",
+        "tool": "query_value",
+        "arguments": "{\"query\":\"example_error_ratio\"}",
+        "grant": null,
+        "target": null,
+        "pointer": "/data/value"
+      },
+      "response": {
+        "phase": "read",
+        "sample": "value",
+        "value": 0.02
+      },
+      "response_keys": [
+        "phase",
+        "sample",
+        "value"
+      ]
     }
   },
   "sequences": [
@@ -166,6 +192,20 @@
     [
       "list",
       "call"
+    ],
+    [
+      "list",
+      "observe",
+      "observe"
+    ],
+    [
+      "list",
+      "read"
+    ],
+    [
+      "list",
+      "read",
+      "read"
     ]
   ],
   "refused_sequences": [
@@ -186,11 +226,6 @@
     ],
     [
       "list",
-      "observe",
-      "observe"
-    ],
-    [
-      "list",
       "call",
       "observe"
     ],
@@ -198,6 +233,35 @@
       "list",
       "observe",
       "call",
+      "call"
+    ],
+    [
+      "read"
+    ],
+    [
+      "list",
+      "read",
+      "call"
+    ],
+    [
+      "list",
+      "read",
+      "observe"
+    ],
+    [
+      "list",
+      "observe",
+      "read"
+    ],
+    [
+      "list",
+      "call",
+      "read"
+    ],
+    [
+      "list",
+      "observe",
+      "observe",
       "call"
     ]
   ],
@@ -263,7 +327,8 @@
       "phases": [
         "list",
         "observe",
-        "call"
+        "call",
+        "read"
       ],
       "dialed": false,
       "worker_code": "runner_unavailable"
@@ -274,7 +339,8 @@
       "phases": [
         "list",
         "observe",
-        "call"
+        "call",
+        "read"
       ],
       "dialed": false,
       "worker_code": "runner_unavailable"
@@ -325,11 +391,21 @@
       "worker_code": "connector_not_hosted"
     },
     {
+      "code": "tool_not_read_only",
+      "status": 409,
+      "phases": [
+        "read"
+      ],
+      "dialed": false,
+      "worker_code": "tool_not_read_only"
+    },
+    {
       "code": "connector_unreachable",
       "status": 502,
       "phases": [
         "list",
-        "observe"
+        "observe",
+        "read"
       ],
       "dialed": true,
       "worker_code": "connector_unreachable"
@@ -389,6 +465,140 @@
       "POST /v1/turn-admit",
       "POST /v1/reset",
       "POST /v1/snapshot"
+    ]
+  },
+  "read": {
+    "list_response": {
+      "phase": "list",
+      "tools": [
+        {
+          "name": "query_value",
+          "annotations": {
+            "readOnlyHint": true
+          }
+        },
+        {
+          "name": "query_unhinted",
+          "annotations": {}
+        },
+        {
+          "name": "scale",
+          "annotations": {
+            "readOnlyHint": false
+          }
+        }
+      ]
+    },
+    "structured_reply": {
+      "data": {
+        "value": 0.02
+      }
+    },
+    "not_read_only": [
+      {
+        "name": "write_tool",
+        "tool": "scale"
+      },
+      {
+        "name": "tool_without_the_hint",
+        "tool": "query_unhinted"
+      },
+      {
+        "name": "unadvertised_tool",
+        "tool": "example_unadvertised"
+      }
+    ],
+    "not_read_only_refusal": "tool_not_read_only",
+    "same_call_fields": [
+      "tool",
+      "arguments",
+      "pointer"
+    ],
+    "changed_calls": [
+      {
+        "name": "other_arguments",
+        "field": "arguments",
+        "value": "{\"query\":\"example_other_ratio\"}"
+      },
+      {
+        "name": "other_pointer",
+        "field": "pointer",
+        "value": "/data/other"
+      },
+      {
+        "name": "other_tool",
+        "field": "tool",
+        "value": "query_unhinted"
+      }
+    ],
+    "changed_call_refusal": "phase_out_of_order",
+    "invalid_requests": [
+      {
+        "name": "read_without_pointer",
+        "phase": "read",
+        "field": "pointer",
+        "value": null
+      },
+      {
+        "name": "read_with_a_grant",
+        "phase": "read",
+        "field": "grant",
+        "value": "ccg.eyJleGFtcGxlIjoidHJ1ZSJ9.ZXhhbXBsZS1zaWduYXR1cmU"
+      },
+      {
+        "name": "read_with_a_target",
+        "phase": "read",
+        "field": "target",
+        "value": {
+          "kind": "Deployment",
+          "namespace": "example-ns",
+          "name": "example-web"
+        }
+      },
+      {
+        "name": "read_without_arguments",
+        "phase": "read",
+        "field": "arguments",
+        "value": null
+      },
+      {
+        "name": "pointer_on_list",
+        "phase": "list",
+        "field": "pointer",
+        "value": "/data/value"
+      },
+      {
+        "name": "pointer_on_observe",
+        "phase": "observe",
+        "field": "pointer",
+        "value": "/data/value"
+      },
+      {
+        "name": "pointer_on_call",
+        "phase": "call",
+        "field": "pointer",
+        "value": "/data/value"
+      }
+    ],
+    "invalid_pointers": [
+      "data/value",
+      "/a~2",
+      "/a~",
+      "~0",
+      "#/data/value"
+    ],
+    "samples_max": 60,
+    "over_samples_refusal": "phase_out_of_order",
+    "unknown_refusal_worker_code": "runner_unavailable"
+  },
+  "remediation_codes": {
+    "pre_dispatch_added": [
+      "tool_not_read_only",
+      "not_reversible_now",
+      "policy_changed"
+    ],
+    "not_refusals": [
+      "pointer_absent"
     ]
   }
 }

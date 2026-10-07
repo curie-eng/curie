@@ -1,0 +1,5362 @@
+{
+  "comment": "@spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-17 @spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-26. The closed remediation policy document, frozen between the API validator and the CLI's mirrored validation (Python and Rust cannot share code). These are the document-only checks; the checks that need the agent or the store (route_unknown, route_approvers_not_explicit, hook_not_protected, operator_principal_required, stale_policy_generation, policy_operation_conflict and the rest in remediation-codes.json `policy_refusals`) are not here. Each `valid` document is accepted unchanged. Each `invalid` document is refused with `code` and `path`, the RFC 6901 pointer of the offending member (`\"\"` is the document root), which is the first refusal in the validator's order: non-finite numbers, then top-level keys, `route`, `limits`, then each action in order (closed keys, required keys, name, kind, connector, tool, reversibility, automatic, argument schemas, target, precondition, verifier, the kind's read requirement, the kind's automatic rule, qualification), then duplicate names. `invalid_texts` are document texts with a token standard JSON forbids (NaN, Infinity); a reader that parses permissively refuses them with `code` and `path`, and a strict reader refuses the text with `code`. Read by apps/api/tests/test_remediation_policy_vector.py and cli/tests/remediation_vectors.rs, each of which rejects an unknown key.",
+  "refusal_codes": [
+    "delta_bound_unsupported",
+    "kind_not_automatic",
+    "policy_document_invalid",
+    "policy_limit_out_of_bounds",
+    "policy_unknown_key",
+    "precondition_and_verifier_required"
+  ],
+  "valid": [
+    {
+      "name": "base_document",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "limits_omitted_take_the_defaults",
+      "document": {
+        "route": "example-oncall",
+        "limits": {},
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "tightened_and_lengthened_limits",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 2,
+          "per_incident_per_target": 1,
+          "per_action_per_hour": 1,
+          "incident_window_seconds": 7200,
+          "approval_ttl_seconds": 3600
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "approval_ttl_at_ceiling",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 86400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "idempotent_action_without_qualification_reference",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "idempotent",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "prevent_action_with_both_reads",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "prevent",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "tune_action_without_reads",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "tune",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "verifier_absent_comparator",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "absent",
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "in_list_of_sixteen",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "in",
+              "value": [
+                "s0",
+                "s1",
+                "s2",
+                "s3",
+                "s4",
+                "s5",
+                "s6",
+                "s7",
+                "s8",
+                "s9",
+                "s10",
+                "s11",
+                "s12",
+                "s13",
+                "s14",
+                "s15"
+              ]
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "verifier_at_sixty_intervals",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 10,
+              "deadline_seconds": 600,
+              "interval_seconds": 10,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "verifier_deadline_at_3600",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 3600,
+              "interval_seconds": 60,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "consecutive_omitted",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_actions",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          },
+          {
+            "name": "scale-out-web",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-web"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "unknown_top_level_key",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ],
+        "armed": true
+      },
+      "code": "policy_unknown_key",
+      "path": "/armed"
+    },
+    {
+      "name": "unknown_limit_key",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400,
+          "per_day": 1
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_unknown_key",
+      "path": "/limits/per_day"
+    },
+    {
+      "name": "unknown_action_key",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null,
+            "expression": "x > 1"
+          }
+        ]
+      },
+      "code": "policy_unknown_key",
+      "path": "/actions/0/expression"
+    },
+    {
+      "name": "unknown_read_key",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5,
+              "function": "rate"
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_unknown_key",
+      "path": "/actions/0/precondition/function"
+    },
+    {
+      "name": "timing_key_on_a_precondition",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5,
+              "settle_seconds": 60
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_unknown_key",
+      "path": "/actions/0/precondition/settle_seconds"
+    },
+    {
+      "name": "unknown_argument_schema_key",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6,
+                "pattern": "x"
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_unknown_key",
+      "path": "/actions/0/arguments/replicas/pattern"
+    },
+    {
+      "name": "missing_route",
+      "document": {
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/route"
+    },
+    {
+      "name": "empty_route",
+      "document": {
+        "route": " ",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/route"
+    },
+    {
+      "name": "missing_actions",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        }
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions"
+    },
+    {
+      "name": "empty_actions",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": []
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions"
+    },
+    {
+      "name": "document_not_an_object",
+      "document": [
+        "route"
+      ],
+      "code": "policy_document_invalid",
+      "path": ""
+    },
+    {
+      "name": "duplicate_action_name",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          },
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/1/name"
+    },
+    {
+      "name": "action_name_with_uppercase",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "Scale-out",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/name"
+    },
+    {
+      "name": "action_name_too_long",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/name"
+    },
+    {
+      "name": "unknown_kind",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "repair",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/kind"
+    },
+    {
+      "name": "unknown_reversibility",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "compensating",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/reversibility"
+    },
+    {
+      "name": "automatic_not_a_boolean",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": "false",
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/automatic"
+    },
+    {
+      "name": "missing_target",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/target"
+    },
+    {
+      "name": "target_argument_undeclared",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "cluster",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/target/argument"
+    },
+    {
+      "name": "target_outside_the_argument_allowed_set",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-db"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/target/allowed"
+    },
+    {
+      "name": "empty_target_list",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": []
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/target/allowed"
+    },
+    {
+      "name": "argument_with_allowed_and_range",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6,
+                "allowed": [
+                  3
+                ]
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/arguments/replicas"
+    },
+    {
+      "name": "argument_with_neither_allowed_nor_range",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer"
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/arguments/replicas"
+    },
+    {
+      "name": "range_on_a_string",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "minimum": 1,
+                "maximum": 2
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/arguments/namespace"
+    },
+    {
+      "name": "minimum_above_maximum",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 7,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/arguments/replicas"
+    },
+    {
+      "name": "unknown_argument_type",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "decimal",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/arguments/replicas/type"
+    },
+    {
+      "name": "per_policy_per_hour_above_ceiling",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 4,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_limit_out_of_bounds",
+      "path": "/limits/per_policy_per_hour"
+    },
+    {
+      "name": "per_policy_per_hour_zero",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 0,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_limit_out_of_bounds",
+      "path": "/limits/per_policy_per_hour"
+    },
+    {
+      "name": "per_incident_per_target_above_ceiling",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 2,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_limit_out_of_bounds",
+      "path": "/limits/per_incident_per_target"
+    },
+    {
+      "name": "per_action_per_hour_above_the_policy_limit",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 2,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400,
+          "per_action_per_hour": 3
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_limit_out_of_bounds",
+      "path": "/limits/per_action_per_hour"
+    },
+    {
+      "name": "incident_window_shortened",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 1800,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_limit_out_of_bounds",
+      "path": "/limits/incident_window_seconds"
+    },
+    {
+      "name": "approval_ttl_above_ceiling",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 86401
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_limit_out_of_bounds",
+      "path": "/limits/approval_ttl_seconds"
+    },
+    {
+      "name": "limit_as_a_string",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": "3",
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/limits/per_policy_per_hour"
+    },
+    {
+      "name": "remediate_without_verifier",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "precondition_and_verifier_required",
+      "path": "/actions/0"
+    },
+    {
+      "name": "remediate_with_null_precondition",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": null,
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "precondition_and_verifier_required",
+      "path": "/actions/0"
+    },
+    {
+      "name": "prevent_without_precondition",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "prevent",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "precondition_and_verifier_required",
+      "path": "/actions/0"
+    },
+    {
+      "name": "max_delta_bound",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6,
+                "max_delta": 2
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "delta_bound_unsupported",
+      "path": "/actions/0/arguments/replicas/max_delta"
+    },
+    {
+      "name": "delta_bound",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6,
+                "delta": 1
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "delta_bound_unsupported",
+      "path": "/actions/0/arguments/replicas/delta"
+    },
+    {
+      "name": "automatic_prevent",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "prevent",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": true,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "kind_not_automatic",
+      "path": "/actions/0/automatic"
+    },
+    {
+      "name": "automatic_tune",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "tune",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "automatic": true,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "kind_not_automatic",
+      "path": "/actions/0/automatic"
+    },
+    {
+      "name": "unknown_comparator",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "matches",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/comparator"
+    },
+    {
+      "name": "missing_comparator_value",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/value"
+    },
+    {
+      "name": "absent_with_a_value",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "absent",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/value"
+    },
+    {
+      "name": "nested_value",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": {
+                "lt": 0.05
+              },
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/value"
+    },
+    {
+      "name": "list_value_for_eq",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": [
+                0.05
+              ],
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/value"
+    },
+    {
+      "name": "in_list_of_seventeen",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "in",
+              "value": [
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                9,
+                10,
+                11,
+                12,
+                13,
+                14,
+                15,
+                16
+              ]
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/precondition/value"
+    },
+    {
+      "name": "in_list_with_a_nested_entry",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "in",
+              "value": [
+                1,
+                [
+                  2
+                ]
+              ]
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/precondition/value"
+    },
+    {
+      "name": "empty_in_list",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "in",
+              "value": []
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/precondition/value"
+    },
+    {
+      "name": "pointer_without_leading_slash",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/pointer"
+    },
+    {
+      "name": "pointer_with_bad_escape",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/a~2",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/pointer"
+    },
+    {
+      "name": "missing_pointer",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/pointer"
+    },
+    {
+      "name": "interval_below_ten",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 5,
+              "deadline_seconds": 600,
+              "interval_seconds": 5,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/interval_seconds"
+    },
+    {
+      "name": "settle_below_interval",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 20,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/settle_seconds"
+    },
+    {
+      "name": "deadline_equal_to_settle",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 60,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/deadline_seconds"
+    },
+    {
+      "name": "deadline_over_sixty_intervals",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 10,
+              "deadline_seconds": 610,
+              "interval_seconds": 10,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/deadline_seconds"
+    },
+    {
+      "name": "deadline_over_3600",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 120,
+              "deadline_seconds": 3720,
+              "interval_seconds": 120,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/deadline_seconds"
+    },
+    {
+      "name": "consecutive_zero",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 0
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/consecutive"
+    },
+    {
+      "name": "missing_verifier_timing",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/deadline_seconds"
+    },
+    {
+      "name": "timing_as_a_float",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30.0,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": null
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/interval_seconds"
+    },
+    {
+      "name": "qualification_empty_string",
+      "document": {
+        "route": "example-oncall",
+        "limits": {
+          "per_policy_per_hour": 3,
+          "per_incident_per_target": 1,
+          "incident_window_seconds": 3600,
+          "approval_ttl_seconds": 14400
+        },
+        "actions": [
+          {
+            "name": "scale-out-api",
+            "kind": "remediate",
+            "connector": "example-scale",
+            "tool": "scale",
+            "arguments": {
+              "namespace": {
+                "type": "string",
+                "allowed": [
+                  "example-ns"
+                ]
+              },
+              "deployment": {
+                "type": "string",
+                "allowed": [
+                  "example-api",
+                  "example-web"
+                ]
+              },
+              "replicas": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 6
+              }
+            },
+            "target": {
+              "argument": "deployment",
+              "allowed": [
+                "example-api"
+              ]
+            },
+            "reversibility": "reversible",
+            "precondition": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "gt",
+              "value": 0.5
+            },
+            "verifier": {
+              "connector": "example-metrics",
+              "tool": "query_value",
+              "arguments": {
+                "query": "example_error_ratio"
+              },
+              "pointer": "/data/value",
+              "comparator": "lt",
+              "value": 0.05,
+              "settle_seconds": 60,
+              "deadline_seconds": 600,
+              "interval_seconds": 30,
+              "consecutive": 2
+            },
+            "automatic": false,
+            "qualification": ""
+          }
+        ]
+      },
+      "code": "policy_document_invalid",
+      "path": "/actions/0/qualification"
+    }
+  ],
+  "invalid_texts": [
+    {
+      "name": "nan_in_a_range",
+      "text": "{\"route\": \"example-oncall\", \"limits\": {\"per_policy_per_hour\": 3, \"per_incident_per_target\": 1, \"incident_window_seconds\": 3600, \"approval_ttl_seconds\": 14400}, \"actions\": [{\"name\": \"scale-out-api\", \"kind\": \"remediate\", \"connector\": \"example-scale\", \"tool\": \"scale\", \"arguments\": {\"namespace\": {\"type\": \"string\", \"allowed\": [\"example-ns\"]}, \"deployment\": {\"type\": \"string\", \"allowed\": [\"example-api\", \"example-web\"]}, \"replicas\": {\"type\": \"integer\", \"minimum\": 2, \"maximum\": NaN}}, \"target\": {\"argument\": \"deployment\", \"allowed\": [\"example-api\"]}, \"reversibility\": \"reversible\", \"precondition\": {\"connector\": \"example-metrics\", \"tool\": \"query_value\", \"arguments\": {\"query\": \"example_error_ratio\"}, \"pointer\": \"/data/value\", \"comparator\": \"gt\", \"value\": 0.5}, \"verifier\": {\"connector\": \"example-metrics\", \"tool\": \"query_value\", \"arguments\": {\"query\": \"example_error_ratio\"}, \"pointer\": \"/data/value\", \"comparator\": \"lt\", \"value\": 0.05, \"settle_seconds\": 60, \"deadline_seconds\": 600, \"interval_seconds\": 30, \"consecutive\": 2}, \"automatic\": false, \"qualification\": null}]}",
+      "code": "policy_document_invalid",
+      "path": "/actions/0/arguments/replicas/maximum"
+    },
+    {
+      "name": "infinity_in_a_comparator_value",
+      "text": "{\"route\": \"example-oncall\", \"limits\": {\"per_policy_per_hour\": 3, \"per_incident_per_target\": 1, \"incident_window_seconds\": 3600, \"approval_ttl_seconds\": 14400}, \"actions\": [{\"name\": \"scale-out-api\", \"kind\": \"remediate\", \"connector\": \"example-scale\", \"tool\": \"scale\", \"arguments\": {\"namespace\": {\"type\": \"string\", \"allowed\": [\"example-ns\"]}, \"deployment\": {\"type\": \"string\", \"allowed\": [\"example-api\", \"example-web\"]}, \"replicas\": {\"type\": \"integer\", \"minimum\": 2, \"maximum\": 6}}, \"target\": {\"argument\": \"deployment\", \"allowed\": [\"example-api\"]}, \"reversibility\": \"reversible\", \"precondition\": {\"connector\": \"example-metrics\", \"tool\": \"query_value\", \"arguments\": {\"query\": \"example_error_ratio\"}, \"pointer\": \"/data/value\", \"comparator\": \"gt\", \"value\": 0.5}, \"verifier\": {\"connector\": \"example-metrics\", \"tool\": \"query_value\", \"arguments\": {\"query\": \"example_error_ratio\"}, \"pointer\": \"/data/value\", \"comparator\": \"lt\", \"value\": Infinity, \"settle_seconds\": 60, \"deadline_seconds\": 600, \"interval_seconds\": 30, \"consecutive\": 2}, \"automatic\": false, \"qualification\": null}]}",
+      "code": "policy_document_invalid",
+      "path": "/actions/0/verifier/value"
+    }
+  ]
+}

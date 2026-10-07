@@ -1,0 +1,157 @@
+{
+  "comment": "@spec AUTOMATED-REMEDIATION-7 @spec AUTOMATED-REMEDIATION-8 @spec AUTOMATED-REMEDIATION-14 @spec AUTOMATED-REMEDIATION-18 @spec AUTOMATED-REMEDIATION-20 @spec AUTOMATED-REMEDIATION-21 @spec AUTOMATED-REMEDIATION-26. The closed remediation vocabularies, frozen between the API (which stores and returns them), the worker's receipt renderer and the CLI (which render them), in three images and two languages. Every list is a closed set: a reader's set equals it, so a code added or renamed on one side fails that side. `nomination_states` are the nomination row's states (AUTOMATED-REMEDIATION-8). `nomination_refusals` end a nomination with no approval (nothing bounded to approve, AUTOMATED-REMEDIATION-7, or a stopped agent, AUTOMATED-REMEDIATION-8 check 2). `submission_refusals` are the nomination route's refusals, which write no row (AUTOMATED-REMEDIATION-1, -6). `approval_reasons` name the admission check that sent a well-formed nomination to an approval request, one per check of AUTOMATED-REMEDIATION-8 (`admission_checks` maps each check number to its reasons; `admission_unreadable` is the fail-closed reason for an unreadable policy, breaker, limit or capability row; `policy_changed` is the reason when a policy-authorized execution is refused at claim, AUTOMATED-REMEDIATION-11 and executor amendment E8). `approval_resolution_refusals` refuse an approved remediation without an execution (AUTOMATED-REMEDIATION-16, -25). `verification_outcomes` are written once on the nomination and the ledger record (AUTOMATED-REMEDIATION-14, -18). `receipt_stages` are the thread receipt and telemetry `stage` domain (AUTOMATED-REMEDIATION-20, -21). `kinds`, `authorities`, `authority_kinds` and `actor_kinds` are the remaining closed domains. `policy_refusals` are every policy administration refusal code, including the document codes of remediation-policy.json. Read by apps/api/tests/test_remediation_codes_vector.py, apps/worker/tests/test_remediation_codes_vector.py and cli/tests/remediation_vectors.rs, each of which rejects an unknown key.",
+  "nomination_states": [
+    "received",
+    "refused",
+    "precondition_pending",
+    "admitted",
+    "approval_requested",
+    "approved",
+    "rejected",
+    "expired",
+    "executing",
+    "verifying",
+    "finished"
+  ],
+  "nomination_refusals": [
+    "nomination_malformed",
+    "unknown_action",
+    "nomination_duplicate",
+    "arguments_schema_mismatch",
+    "agent_stopped"
+  ],
+  "submission_refusals": [
+    "remediation_disabled",
+    "not_protected_event",
+    "nomination_conflict"
+  ],
+  "admission_checks": {
+    "1": [
+      "remediation_disabled"
+    ],
+    "2": [
+      "agent_stopped"
+    ],
+    "3": [
+      "generation_not_current"
+    ],
+    "4": [
+      "policy_disarmed"
+    ],
+    "5": [
+      "not_automatic"
+    ],
+    "6": [
+      "qualification_missing",
+      "qualification_stale"
+    ],
+    "7": [
+      "verifier_not_independent"
+    ],
+    "8": [
+      "out_of_bounds"
+    ],
+    "9": [
+      "not_reversible_now"
+    ],
+    "10": [
+      "breaker_open"
+    ],
+    "11": [
+      "policy_rate_limit",
+      "action_rate_limit",
+      "incident_limit",
+      "turn_limit",
+      "target_live"
+    ],
+    "12": [
+      "precondition_not_met",
+      "precondition_unavailable"
+    ]
+  },
+  "approval_reasons": [
+    "generation_not_current",
+    "policy_disarmed",
+    "not_automatic",
+    "qualification_missing",
+    "qualification_stale",
+    "verifier_not_independent",
+    "out_of_bounds",
+    "not_reversible_now",
+    "breaker_open",
+    "policy_rate_limit",
+    "action_rate_limit",
+    "incident_limit",
+    "turn_limit",
+    "target_live",
+    "precondition_not_met",
+    "precondition_unavailable",
+    "admission_unreadable",
+    "policy_changed"
+  ],
+  "approval_resolution_refusals": [
+    "arguments_mismatch",
+    "policy_changed",
+    "tune_execution_not_automated"
+  ],
+  "verification_outcomes": [
+    "verified",
+    "not-recovered",
+    "verifier-unavailable",
+    "superseded"
+  ],
+  "receipt_stages": [
+    "nominated",
+    "refused",
+    "approval_requested",
+    "executed",
+    "verified",
+    "not-recovered",
+    "verifier-unavailable",
+    "superseded",
+    "undo_requested",
+    "undone",
+    "escalated"
+  ],
+  "kinds": [
+    "remediate",
+    "prevent",
+    "tune"
+  ],
+  "authorities": [
+    "policy",
+    "approval",
+    "none"
+  ],
+  "authority_kinds": [
+    "undo_ruling",
+    "capability_probe",
+    "policy",
+    "approval",
+    "qualification"
+  ],
+  "actor_kinds": [
+    "model_turn",
+    "policy",
+    "approval",
+    "undo_ruling"
+  ],
+  "policy_refusals": [
+    "agent_not_found",
+    "remediation_policy_absent",
+    "hook_not_protected",
+    "operator_principal_required",
+    "stale_policy_generation",
+    "policy_operation_conflict",
+    "route_unknown",
+    "route_approvers_not_explicit",
+    "policy_document_invalid",
+    "policy_unknown_key",
+    "policy_limit_out_of_bounds",
+    "precondition_and_verifier_required",
+    "delta_bound_unsupported",
+    "kind_not_automatic",
+    "qualification_required",
+    "verifier_not_independent"
+  ]
+}

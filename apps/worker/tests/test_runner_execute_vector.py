@@ -15,6 +15,12 @@ claim is ``RUNNER_MODE_ENV`` = ``EXECUTOR_MODE`` in the same module.
 
 Each test serves the frozen runner answer from a real aiohttp server, so the
 client's real HTTP path is what is read.
+
+@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-26. The remediation
+``read`` phase (executor amendments E3, E4 and E6): every request carries
+``pointer``, the client posts and reads the ``read`` phase, maps
+``tool_not_read_only`` to its pre-dispatch code, and never reports a read as
+``response_lost``, because a read cannot write.
 """
 
 from __future__ import annotations
@@ -56,6 +62,8 @@ _KEYS = {
     "unauthenticated",
     "status_body",
     "other_routes",
+    "read",
+    "remediation_codes",
 }
 
 
@@ -190,3 +198,39 @@ def test_an_oversized_call_result_fails_the_execution() -> None:
     assert response == over["response"]
     state, code = call_outcome(is_error=response["is_error"], structured=response["structured"])
     assert (state, code) == (over["worker_state"], over["worker_code"])
+
+
+def test_the_client_sends_exactly_the_frozen_request_keys() -> None:
+    """@spec AUTOMATED-REMEDIATION-12: ``pointer`` joins the one request shape."""
+
+    assert set(runner_client.EXECUTE_REQUEST_KEYS) == set(_VECTOR["request_keys"])
+    assert set(runner_client.EXECUTE_PHASES) == set(_VECTOR["phases"])
+
+
+def test_an_unrecognized_read_refusal_is_never_response_lost() -> None:
+    """@spec AUTOMATED-REMEDIATION-12: a read never writes, so it is a pre-dispatch code."""
+
+    read = _VECTOR["read"]
+    failure = _VECTOR["call_transport_failure"]
+
+    async def answer(_request: web.Request) -> web.StreamResponse:
+        return web.json_response(failure["body"], status=failure["status"])
+
+    with pytest.raises(runner_client.ExecuteRefused) as refused:
+        _run(answer, _VECTOR["phases"]["read"]["request"])
+    assert refused.value.code == read["unknown_refusal_worker_code"]
+
+
+def test_the_read_refusal_codes_are_pre_dispatch_codes() -> None:
+    """@spec AUTOMATED-REMEDIATION-12: ``tool_not_read_only`` is reported as itself.
+
+    Executor amendment E6: the code joins the closed pre-dispatch set; the
+    worker's code for it is the vector's.
+    """
+
+    added = set(_VECTOR["remediation_codes"]["pre_dispatch_added"])
+    read_refusals = [r for r in _VECTOR["refusals"] if "read" in r["phases"]]
+    assert {r["code"] for r in read_refusals} >= {_VECTOR["read"]["not_read_only_refusal"]}
+    for refusal in read_refusals:
+        if refusal["code"] in added:
+            assert refusal["worker_code"] == refusal["code"]

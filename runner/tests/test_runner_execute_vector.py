@@ -16,6 +16,13 @@ fixture logs every ``tools/call`` it receives, which is how a refusal is
 proved to have dialed nothing. The canonical argument texts come from
 ``tests/vectors/action-canonical-arguments.json`` and the ``observe_version``
 replies from ``tests/vectors/executor-restore-calls.json``.
+
+@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-17
+@spec AUTOMATED-REMEDIATION-18 @spec AUTOMATED-REMEDIATION-26. The remediation
+``read`` phase (executor amendments E3, E4 and E6): the request's ``pointer``,
+the read and observe-only sequences, ``tool_not_read_only`` without dialing,
+and the pointer extraction cases of ``tests/vectors/remediation-predicate.json``
+driven through the real route, which answers only the sample.
 """
 
 from __future__ import annotations
@@ -39,6 +46,7 @@ _VECTORS = Path(__file__).resolve().parents[2] / "tests" / "vectors"
 _ROUTE = json.loads((_VECTORS / "runner-execute.json").read_text("utf-8"))
 _CANONICAL = json.loads((_VECTORS / "action-canonical-arguments.json").read_text("utf-8"))
 _CALLS = json.loads((_VECTORS / "executor-restore-calls.json").read_text("utf-8"))
+_PREDICATE = json.loads((_VECTORS / "remediation-predicate.json").read_text("utf-8"))
 _FIXTURE = Path(__file__).parent / "fixtures" / "mcp_executor_connector.py"
 _TOKEN = "example-runner-token"
 _GRANT_HEADER = "X-Curie-Connector-Grant"
@@ -68,6 +76,8 @@ _ROUTE_KEYS = {
     "unauthenticated",
     "status_body",
     "other_routes",
+    "read",
+    "remediation_codes",
 }
 
 
@@ -114,6 +124,8 @@ _ENV_SETTINGS = {
     "CURIE_TEST_CALL_REPLY": ("call_reply", json.loads),
     "CURIE_TEST_LIST_PAGES": ("list_pages", int),
     "CURIE_TEST_CALL_RESULT_BYTES": ("call_result_bytes", int),
+    "CURIE_TEST_READ_REPLY": ("read_reply", json.loads),
+    "CURIE_TEST_READ_ERROR": ("read_error", lambda raw: raw == "1"),
 }
 
 
@@ -391,17 +403,46 @@ def test_observe_returns_the_frozen_version(tmp_path: Path, reply: dict[str, Any
     _drive({_CONNECTOR: _connector(tmp_path, **env)}, drive)
 
 
-def _step(phase: str, before: list[str]) -> dict[str, Any]:
+_READ = _ROUTE["read"]
+_READ_REQUEST = _ROUTE["phases"]["read"]["request"]
+_READ_CONNECTOR = _READ_REQUEST["connector"]
+
+
+def _step(phase: str, before: list[str], *, reading: bool = False) -> dict[str, Any]:
     """The request for ``phase`` after ``before``: a ``call`` after ``observe`` is a restore.
 
     @spec ACTION-EXECUTOR-6 (amended): ``observe`` is accepted only before a
     restore, so a sequence's ``call`` takes the restore request once ``observe``
-    has run and the forward request otherwise.
+    has run and the forward request otherwise. @spec AUTOMATED-REMEDIATION-12:
+    in a sequence that reads, every step names the read's execution and
+    connector, because one sandbox serves one execution on one connector.
     """
 
-    if phase != "call":
-        return _request(phase)
-    return _request("call") if "observe" in before else _forward_call()
+    if phase == "read":
+        request = dict(_READ_REQUEST)
+    elif phase != "call":
+        request = _request(phase)
+    else:
+        request = _request("call") if "observe" in before else _forward_call()
+    if reading:
+        request.update(
+            execution_id=_READ_REQUEST["execution_id"], connector=_READ_REQUEST["connector"]
+        )
+    return request
+
+
+def _sequence_connectors(tmp_path: Path, sequence: list[str]) -> dict[str, Any]:
+    observe_reply = json.dumps({"version": "rv-1041"})
+    if "read" in sequence:
+        return {
+            _READ_CONNECTOR: _connector(
+                tmp_path,
+                CURIE_TEST_EXECUTOR_TOOLS="paired_and_read",
+                CURIE_TEST_OBSERVE_REPLY=observe_reply,
+                CURIE_TEST_READ_REPLY=json.dumps(_READ["structured_reply"]),
+            )
+        }
+    return {_CONNECTOR: _connector(tmp_path, CURIE_TEST_OBSERVE_REPLY=observe_reply)}
 
 
 @pytest.mark.parametrize(
@@ -410,21 +451,44 @@ def _step(phase: str, before: list[str]) -> dict[str, Any]:
 def test_an_out_of_order_phase_is_refused_without_dialing(
     tmp_path: Path, sequence: list[str]
 ) -> None:
-    """@spec ACTION-EXECUTOR-6: anything but the accepted orders, a second call included."""
+    """@spec ACTION-EXECUTOR-6: anything but the accepted orders, a second call included.
+
+    @spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-18: a read never
+    mixes with ``observe`` or ``call``, and no ``call`` follows a second
+    ``observe`` (an observe-only execution never writes).
+    """
 
     *prefix, last = sequence
-    observe_reply = json.dumps({"version": "rv-1041"})
+    reading = "read" in sequence
 
     async def drive(client: TestClient) -> None:
         for index, phase in enumerate(prefix):
-            status, body = await _post(client, _step(phase, prefix[:index]))
+            status, body = await _post(client, _step(phase, prefix[:index], reading=reading))
             assert status == 200, (phase, body)
         before = len(_calls(tmp_path))
-        status, body = await _post(client, _step(last, prefix))
+        status, body = await _post(client, _step(last, prefix, reading=reading))
         _assert_refused(status, body, "phase_out_of_order")
         assert len(_calls(tmp_path)) == before
 
-    _drive({_CONNECTOR: _connector(tmp_path, CURIE_TEST_OBSERVE_REPLY=observe_reply)}, drive)
+    _drive(_sequence_connectors(tmp_path, sequence), drive)
+
+
+@pytest.mark.parametrize("sequence", _ROUTE["sequences"], ids=lambda sequence: "-".join(sequence))
+def test_every_accepted_sequence_is_served(tmp_path: Path, sequence: list[str]) -> None:
+    """@spec ACTION-EXECUTOR-6 @spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-18.
+
+    The frozen orders, including the read sequence and the observe-only one.
+    """
+
+    reading = "read" in sequence
+
+    async def drive(client: TestClient) -> None:
+        for index, phase in enumerate(sequence):
+            status, body = await _post(client, _step(phase, sequence[:index], reading=reading))
+            assert status == 200, (phase, body)
+            assert body["phase"] == phase
+
+    _drive(_sequence_connectors(tmp_path, sequence), drive)
 
 
 @pytest.mark.parametrize(
@@ -631,4 +695,197 @@ def test_a_non_finite_argument_text_is_refused_before_the_call(
         _assert_refused(status, body, _CANONICAL["refusal"])
 
     _drive({_CONNECTOR: _connector(tmp_path)}, drive)
+    assert _calls(tmp_path) == []
+
+
+# --------------------------------------------------------------------------- #
+# Remediation reads (AUTOMATED-REMEDIATION-12, executor amendments E3, E4, E6)
+# --------------------------------------------------------------------------- #
+
+
+def _read_connector(tmp_path: Path, **env: str) -> dict[str, Any]:
+    env.setdefault("CURIE_TEST_EXECUTOR_TOOLS", "read")
+    env.setdefault("CURIE_TEST_READ_REPLY", json.dumps(_READ["structured_reply"]))
+    return {_READ_CONNECTOR: _connector(tmp_path, **env)}
+
+
+def _read_list() -> dict[str, Any]:
+    return _request(
+        "list", execution_id=_READ_REQUEST["execution_id"], connector=_READ_REQUEST["connector"]
+    )
+
+
+def test_the_invalid_pointers_match_the_predicate_vector() -> None:
+    """@spec AUTOMATED-REMEDIATION-26: one invalid pointer list across both vectors."""
+
+    assert _READ["invalid_pointers"] == _PREDICATE["invalid_pointers"]
+
+
+def test_a_read_answers_only_the_pointed_sample(tmp_path: Path) -> None:
+    """@spec AUTOMATED-REMEDIATION-12: one ``tools/call``, the scalar only, no grant."""
+
+    phase = _ROUTE["phases"]["read"]
+
+    async def drive(client: TestClient) -> None:
+        status, listed = await _post(client, _read_list())
+        assert status == 200, listed
+        assert listed == _READ["list_response"]
+        status, body = await _post(client, phase["request"])
+        assert status == 200, body
+        assert body == phase["response"]
+        assert set(body) == set(phase["response_keys"])
+
+    _drive(_read_connector(tmp_path), drive)
+    (call,) = _calls(tmp_path)
+    assert call["name"] == _READ_REQUEST["tool"]
+    assert call["arguments"] == json.loads(_READ_REQUEST["arguments"])
+    assert _GRANT_HEADER.lower() not in call["headers"]
+
+
+@pytest.mark.parametrize("case", _PREDICATE["extractions"], ids=lambda case: case["name"])
+def test_the_runner_extracts_each_frozen_sample(tmp_path: Path, case: dict[str, Any]) -> None:
+    """@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-17: pointer extraction.
+
+    The read tool answers ``structured`` (or text only), and the route answers
+    exactly the frozen sample, never more of the result.
+    """
+
+    env = {}
+    if case["structured"] is not None:
+        env["CURIE_TEST_READ_REPLY"] = json.dumps(case["structured"])
+    else:
+        env["CURIE_TEST_READ_REPLY"] = "null"
+    if case["is_error"]:
+        env["CURIE_TEST_READ_ERROR"] = "1"
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _read_list()))[0] == 200
+        status, body = await _post(client, {**_READ_REQUEST, "pointer": case["pointer"]})
+        assert status == 200, body
+        assert json.dumps(body, sort_keys=True) == json.dumps(
+            {"phase": "read", **case["sample"]}, sort_keys=True
+        )
+
+    _drive(_read_connector(tmp_path, **env), drive)
+    assert len(_calls(tmp_path)) == 1
+
+
+@pytest.mark.parametrize("case", _READ["not_read_only"], ids=lambda case: case["name"])
+def test_a_read_of_a_tool_not_advertised_read_only_is_refused_without_dialing(
+    tmp_path: Path, case: dict[str, Any]
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-12: ``tool_not_read_only`` (executor amendment E4)."""
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _read_list()))[0] == 200
+        status, body = await _post(client, {**_READ_REQUEST, "tool": case["tool"]})
+        _assert_refused(status, body, _READ["not_read_only_refusal"])
+
+    _drive(_read_connector(tmp_path), drive)
+    assert _calls(tmp_path) == []
+
+
+def test_repeated_reads_of_the_same_call_are_served(tmp_path: Path) -> None:
+    """@spec AUTOMATED-REMEDIATION-12: one or more reads, each one ``tools/call``."""
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _read_list()))[0] == 200
+        for _ in range(3):
+            status, body = await _post(client, _READ_REQUEST)
+            assert status == 200, body
+            assert body == _ROUTE["phases"]["read"]["response"]
+
+    _drive(_read_connector(tmp_path), drive)
+    assert [call["name"] for call in _calls(tmp_path)] == [_READ_REQUEST["tool"]] * 3
+
+
+@pytest.mark.parametrize("case", _READ["changed_calls"], ids=lambda case: case["name"])
+def test_a_later_read_of_another_call_is_refused_without_dialing(
+    tmp_path: Path, case: dict[str, Any]
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-12: the same tool, canonical arguments and pointer."""
+
+    assert case["field"] in _READ["same_call_fields"]
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _read_list()))[0] == 200
+        assert (await _post(client, _READ_REQUEST))[0] == 200
+        status, body = await _post(client, {**_READ_REQUEST, case["field"]: case["value"]})
+        _assert_refused(status, body, _READ["changed_call_refusal"])
+
+    _drive(_read_connector(tmp_path), drive)
+    assert len(_calls(tmp_path)) == 1
+
+
+def test_reads_past_the_sample_cap_are_refused(tmp_path: Path) -> None:
+    """@spec AUTOMATED-REMEDIATION-12: at most ``samples_max`` reads per sandbox."""
+
+    cap = _READ["samples_max"]
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _read_list()))[0] == 200
+        for index in range(cap):
+            status, body = await _post(client, _READ_REQUEST)
+            assert status == 200, (index, body)
+        status, body = await _post(client, _READ_REQUEST)
+        _assert_refused(status, body, _READ["over_samples_refusal"])
+
+    _drive(_read_connector(tmp_path), drive)
+    assert len(_calls(tmp_path)) == cap
+
+
+def test_observe_only_past_the_sample_cap_is_refused(tmp_path: Path) -> None:
+    """@spec AUTOMATED-REMEDIATION-18: an observe-only execution shares the 60-sample cap."""
+
+    cap = _READ["samples_max"]
+    connector = _connector(tmp_path, CURIE_TEST_OBSERVE_REPLY=json.dumps({"version": "rv-1041"}))
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _request("list")))[0] == 200
+        for index in range(cap):
+            status, body = await _post(client, _request("observe"))
+            assert status == 200, (index, body)
+            assert body == _ROUTE["phases"]["observe"]["response"]
+        status, body = await _post(client, _request("observe"))
+        _assert_refused(status, body, _READ["over_samples_refusal"])
+
+    _drive({_CONNECTOR: connector}, drive)
+    assert [call["name"] for call in _calls(tmp_path)] == [_CALLS["observe_tool"]] * cap
+
+
+@pytest.mark.parametrize("pointer", _READ["invalid_pointers"])
+def test_an_invalid_pointer_is_refused_without_dialing(tmp_path: Path, pointer: str) -> None:
+    """@spec AUTOMATED-REMEDIATION-17: an RFC 6901 pointer or ``invalid_request``."""
+
+    async def drive(client: TestClient) -> None:
+        assert (await _post(client, _read_list()))[0] == 200
+        status, body = await _post(client, {**_READ_REQUEST, "pointer": pointer})
+        _assert_refused(status, body, "invalid_request")
+
+    _drive(_read_connector(tmp_path), drive)
+    assert _calls(tmp_path) == []
+
+
+@pytest.mark.parametrize("case", _READ["invalid_requests"], ids=lambda case: case["name"])
+def test_a_pointer_outside_a_read_or_a_malformed_read_is_invalid(
+    tmp_path: Path, case: dict[str, Any]
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-12: ``pointer`` is non-null on a ``read`` only."""
+
+    if case["phase"] == "read":
+        request = {**_READ_REQUEST, case["field"]: case["value"]}
+        connectors = _read_connector(tmp_path)
+        listing = _read_list()
+    else:
+        request = {**_step(case["phase"], ["list"]), case["field"]: case["value"]}
+        connectors = {_CONNECTOR: _connector(tmp_path)}
+        listing = _request("list")
+
+    async def drive(client: TestClient) -> None:
+        if case["phase"] != "list":
+            assert (await _post(client, listing))[0] == 200
+        status, body = await _post(client, request)
+        _assert_refused(status, body, "invalid_request")
+
+    _drive(connectors, drive)
     assert _calls(tmp_path) == []

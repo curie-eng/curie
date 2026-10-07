@@ -738,9 +738,40 @@ as a whole; remembered only):
   phase, the route's refusal codes and the worker code each maps to, the status
   body and the mode variable are frozen together. The `observe_version` and
   `restore` call arguments and the reply-to-outcome mapping the two sides apply
-  around those phases are frozen beside it.
+  around those phases are frozen beside it. The remediation `read` phase
+  (AUTOMATED-REMEDIATION-12: the request's `pointer`, the read and
+  observe-only sequences, `tool_not_read_only`, the sample cap) and the
+  pre-dispatch codes it adds, which the API's
+  `apps/api/src/curie_api/action_execution_codes.py` also reads, are frozen in
+  the same vector.
   [vector: `tests/vectors/runner-execute.json`]
   [vector: `tests/vectors/executor-restore-calls.json`]
+- protected worker vs API remediation nomination (AUTOMATED-REMEDIATION-5, -6)
+  -- the protected worker's block extractor and streamed-delta line filter
+  (`apps/worker/src/curie_worker/remediation_capture.py`) and the API's
+  nomination parser (`apps/api/src/curie_api/remediation_nominations.py`) ship
+  in different images, so the fence grammar, the size and entry bounds, fences
+  split across streamed deltas, and the valid and invalid blocks are frozen
+  together.
+  [vector: `tests/vectors/remediation-nomination.json`]
+- runner vs worker vs API remediation predicate (AUTOMATED-REMEDIATION-12, -17)
+  -- the runner's pointer extraction in the `read` phase
+  (`runner/src/curie_runner/executor.py`), the worker's sample report
+  (`apps/worker/src/curie_worker/action_executor.py::sample_report`) and the
+  API's evaluator (`apps/api/src/curie_api/remediation_predicate.py`) must agree
+  on every pointer, sample kind and comparator case.
+  [vector: `tests/vectors/remediation-predicate.json`]
+- API vs CLI remediation policy validation, and API vs worker vs CLI
+  remediation codes (AUTOMATED-REMEDIATION-3, -20) -- the API validator
+  (`apps/api/src/curie_api/remediation_policy_document.py`) and the CLI's
+  mirrored validation (`cli/src/remediation_policy.rs`) cannot share code
+  across Python/Rust, and the closed nomination states, refusal codes,
+  approval reasons and verification outcomes the API stores
+  (`apps/api/src/curie_api/remediation_codes.py`) are rendered by the worker's
+  receipts (`apps/worker/src/curie_worker/remediation_receipts.py`) and the CLI
+  (`cli/src/remediation.rs`) in other images.
+  [vector: `tests/vectors/remediation-policy.json`]
+  [vector: `tests/vectors/remediation-codes.json`]
 - runner vs worker sealed envelope (ACTION-EXECUTOR-9, -10) -- the runner's
   redactor (`runner/src/curie_runner/redact.py::OutboundRedactor`) decides
   whether an envelope crosses unaltered and the worker's `_snapshot`
