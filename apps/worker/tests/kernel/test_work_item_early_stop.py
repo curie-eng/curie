@@ -896,6 +896,161 @@ def test_snapshot_read_starts_no_retry_with_five_seconds_or_less_remaining(
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("remaining_before_snapshot", [5.0, 4.0])
+def test_snapshot_read_starts_no_attempt_after_the_turn_spends_its_delivery_budget(
+    make_harness, monkeypatch: pytest.MonkeyPatch, remaining_before_snapshot: float
+) -> None:
+    from curie_worker import kernel as kernel_module
+    from curie_worker.delivery_lease import DeliveryBudget, unfenced_lease
+
+    delays = _patch_snapshot_backoff(monkeypatch)
+
+    async def exercise() -> None:
+        lease = unfenced_lease()
+        lease.budget = DeliveryBudget(
+            deadline_ms=30_000,
+            anchor_server_ms=0,
+            anchor_monotonic=time.monotonic(),
+        )
+        elapsed = 0.0
+        monkeypatch.setattr(
+            kernel_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed, time=time.time),
+        )
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            _patch_snapshot(h, monkeypatch)
+            valid_snapshot = h.kernel._runner.snapshot
+            real_continue = h.kernel._continue_unpublished
+            calls = 0
+
+            async def spend_turn_budget(*args: object, **kwargs: object) -> object:
+                nonlocal elapsed
+                outcome = await real_continue(*args, **kwargs)
+                remaining = kwargs["remaining_s"]
+                assert isinstance(remaining, float) and remaining > 5.0
+                elapsed += remaining - remaining_before_snapshot
+                lease.budget = DeliveryBudget(
+                    deadline_ms=int(remaining_before_snapshot * 1000),
+                    anchor_server_ms=0,
+                    anchor_monotonic=time.monotonic(),
+                )
+                return outcome
+
+            async def snapshot(*args: object, **kwargs: object) -> object:
+                nonlocal calls
+                calls += 1
+                return await valid_snapshot(*args, **kwargs)
+
+            monkeypatch.setattr(h.kernel, "_continue_unpublished", spend_turn_budget)
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT), lease=lease
+            )
+
+            assert lease.remaining_s() <= 5.0
+            assert calls == 0
+            assert publications.creates == []
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["cause"] == "approval_create_failed"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert detail.startswith("publication snapshot could not be read after 0 attempt(s): ")
+
+    asyncio.run(exercise())
+    assert delays == []
+
+
+@pytest.mark.parametrize(
+    ("remaining_after_failures", "expected_delays"),
+    [
+        pytest.param((5.5,), [], id="first-backoff-would-cross-floor"),
+        pytest.param((6.0,), [], id="first-backoff-would-reach-floor"),
+        pytest.param((20.0, 6.5), [1.0], id="second-backoff-would-cross-floor"),
+    ],
+)
+def test_snapshot_read_skips_backoff_that_would_spend_its_five_second_reserve(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining_after_failures: tuple[float, ...],
+    expected_delays: list[float],
+) -> None:
+    from curie_worker import kernel as kernel_module
+    from curie_worker.delivery_lease import DeliveryBudget, unfenced_lease
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    delays = _patch_snapshot_backoff(monkeypatch)
+
+    async def exercise() -> None:
+        lease = unfenced_lease()
+        lease.budget = DeliveryBudget(
+            deadline_ms=30_000,
+            anchor_server_ms=0,
+            anchor_monotonic=time.monotonic(),
+        )
+        elapsed = 0.0
+        monkeypatch.setattr(
+            kernel_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: time.monotonic() + elapsed, time=time.time),
+        )
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=publications,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            calls = 0
+
+            async def snapshot(
+                *_args: object, remaining_s: float | None = None, **_kwargs: object
+            ) -> object:
+                nonlocal calls, elapsed
+                assert remaining_s is not None and remaining_s > 5.0
+                assert calls < len(remaining_after_failures), "unexpected snapshot retry"
+                remaining_after_failure = remaining_after_failures[calls]
+                calls += 1
+                elapsed += remaining_s - remaining_after_failure
+                lease.budget = DeliveryBudget(
+                    deadline_ms=int(remaining_after_failure * 1000),
+                    anchor_server_ms=0,
+                    anchor_monotonic=time.monotonic(),
+                )
+                raise RunnerSnapshotReadError("/v1/snapshot -> 503: unavailable")
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT), lease=lease
+            )
+
+            assert lease.remaining_s() > 5.0
+            assert calls == len(remaining_after_failures)
+            assert publications.creates == []
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["cause"] == "approval_create_failed"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert detail.startswith(
+                f"publication snapshot could not be read after {calls} attempt(s): "
+            )
+
+    asyncio.run(exercise())
+    assert delays == expected_delays
+
+
 def test_snapshot_validation_refusal_is_not_retried_and_keeps_its_prefix(
     make_harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:

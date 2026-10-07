@@ -3611,7 +3611,15 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
     of the delivery deadline.
     """
 
+    from curie_worker import kernel as kernel_module
+
     async def go() -> None:
+        clock_s = 1000.0
+        monkeypatch.setattr(
+            kernel_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: clock_s, time=kernel_module.time.time),
+        )
         async with make_harness() as h:
             h.runner.default_script = [
                 Final(
@@ -3623,6 +3631,15 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
                 )
             ]
             observed_remaining: list[float] = []
+            consumed_turns = 0
+            real_consume = h.kernel._consume
+
+            async def consume_turn_budget(*args: object, **kwargs: object) -> object:
+                nonlocal clock_s, consumed_turns
+                outcome = await real_consume(*args, **kwargs)
+                consumed_turns += 1
+                clock_s += 0.25
+                return outcome
 
             async def snapshot_spy(
                 _base_url: str,
@@ -3635,6 +3652,7 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
                 # converts runner snapshot failures into a publication error.
                 raise RunnerError("captured snapshot deadline")
 
+            monkeypatch.setattr(h.kernel, "_consume", consume_turn_budget)
             monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot_spy)
             outcome = await h.kernel._attempt(
                 _qevent("publish", thread="th-publication-deadline"),
@@ -3646,7 +3664,9 @@ def test_publication_snapshot_inherits_the_attempts_remaining_delivery_budget(
             )
 
             assert outcome.status is AWAITING
-            assert observed_remaining == [17.25]
+            assert consumed_turns == 1
+            assert clock_s == 1000.25
+            assert observed_remaining == [17.0]
 
     asyncio.run(go())
 

@@ -307,6 +307,8 @@ def test_snapshot_refuses_an_oversized_body_before_json_decoding() -> None:
 
 
 def test_snapshot_reads_the_whole_chunked_400kb_body() -> None:
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
     async def go() -> None:
         patch = b"x" * 300_000
         body = json.dumps(
@@ -346,6 +348,7 @@ def test_snapshot_reads_the_whole_chunked_400kb_body() -> None:
             snapshot = await client.snapshot(
                 f"http://127.0.0.1:{server.port}", token="runner-token"
             )
+            assert isinstance(snapshot, RunnerWorkspaceSnapshot)
             assert snapshot.patch == patch
             assert snapshot.changed_paths == ("src/widget.py",)
         finally:
@@ -408,6 +411,37 @@ def test_snapshot_malformed_json_names_the_inner_error_and_byte_count() -> None:
                 "JSONDecodeError: "
             )
             assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_snapshot_oversized_body_keeps_the_byte_cap_and_named_validation_error() -> None:
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    async def go() -> None:
+        patch_limit = 16
+        encoded_body_limit = 4 * ((patch_limit + 2) // 3) + 131_072
+        body = b"x" * (encoded_body_limit + 1)
+        app = web.Application()
+
+        async def oversized(_request: web.Request) -> web.Response:
+            return web.Response(body=body, content_type="application/json")
+
+        app.add_routes([web.post("/v1/snapshot", oversized)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0, snapshot_patch_max_bytes=patch_limit)
+        try:
+            with pytest.raises(RunnerSnapshotReadError) as caught:
+                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+            assert str(caught.value) == (
+                f"/v1/snapshot returned an invalid bounded payload after {len(body)} bytes: "
+                "ValueError: snapshot response exceeds its encoded byte limit"
+            )
+            assert isinstance(caught.value.__cause__, ValueError)
         finally:
             await client.close()
             await server.close()
