@@ -30,6 +30,7 @@ from channel_protocol import MessageField, OutboundMessage
 from curie_dispatcher.approval_actions import parse_decision_time
 from curie_telemetry import inject_trace_context
 
+from .api_retry import DEFAULT_BUDGET_S, post_with_retry
 from .workspace import WorkspaceSelectionRefused
 
 # Re-exported so this module stays the kernel-facing seam for the approval
@@ -366,7 +367,9 @@ def decided_at(message: OutboundMessage) -> datetime | None:
 class ApprovalCreator(Protocol):
     """The kernel-facing seam; tests supply a recording fake."""
 
-    async def create(self, request: ApprovalRequest) -> CreatedApproval: ...
+    async def create(
+        self, request: ApprovalRequest, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> CreatedApproval: ...
 
 
 @dataclass(frozen=True)
@@ -587,14 +590,18 @@ class ApprovalClient:
         except (KeyError, TypeError, ValueError):
             raise WorkspaceSelectionRefused(refusal) from None
 
-    async def create(self, request: ApprovalRequest) -> CreatedApproval:
+    async def create(
+        self, request: ApprovalRequest, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> CreatedApproval:
         headers = {**self._headers, "Content-Type": "application/json"}
         inject_trace_context(headers)
         try:
-            response = await self._client.post(
+            response = await post_with_retry(
+                self._client,
                 self._url,
                 content=request.model_dump_json(),
                 headers=headers,
+                budget_s=budget_s,
             )
         except httpx.HTTPError as exc:
             raise ApprovalBackendError(f"approval create failed: {exc}") from exc

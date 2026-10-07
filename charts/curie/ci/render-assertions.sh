@@ -58,8 +58,8 @@
 # exactly one connected client. A RollingUpdate starts the replacement pod while
 # the old one is still connected, so events are split between them and the ones
 # handed to the terminating pod are lost. The dispatcher must render
-# `strategy: Recreate` with no rollingUpdate block, and every other workload must
-# keep the strategy it rendered before the fix.
+# `strategy: Recreate` with no rollingUpdate block. The API availability policy
+# is explicit (#4174); all remaining workloads keep their existing strategies.
 #
 # Issue #3182 (sandbox pods preempt Langfuse, the OTel collector and the UI),
 # Assertion 8 extension. Those workloads ran at priority 0, so sandbox pods
@@ -80,6 +80,10 @@
 # Issue #4162, Assertion 20. Metadata CI policy has a first-class chart value,
 # defaults to an empty JSON object, and rejects malformed values and extraEnv
 # overrides. Retained values from before the key existed keep the empty default.
+#
+# Issue #4174, Assertion 22. API rollouts retain an available pod and let
+# terminating pods drain before shutdown. Removing either template block must
+# fail the same rendered-manifest assertion.
 #
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
@@ -2545,7 +2549,7 @@ helm template curie "$CHART" \
   --set dispatcher.slack.appToken=xapp-render-assert \
   --set dispatcher.slack.botToken=xoxb-render-assert \
   >"$STRATEGY_RENDER"
-python3 - "$STRATEGY_RENDER" <<'PYEOF' || fail "dispatcher must render strategy Recreate and every other workload must keep its strategy (issue #2944)."
+python3 - "$STRATEGY_RENDER" <<'PYEOF' || fail "dispatcher must render strategy Recreate, API must retain availability, and other workloads must keep their strategies (#2944, #4174)."
 import sys
 
 import yaml
@@ -2555,7 +2559,9 @@ import yaml
 EXPECTED = {
     ("Deployment", "curie-dispatcher"): ("strategy", {"type": "Recreate"}),
     ("Deployment", "agent-sandbox-controller"): ("strategy", None),
-    ("Deployment", "curie-api"): ("strategy", None),
+    ("Deployment", "curie-api"): ("strategy", {
+        "type": "RollingUpdate", "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1},
+    }),
     ("Deployment", "curie-ui"): ("strategy", None),
     ("Deployment", "curie-worker"): ("strategy", None),
     ("Deployment", "curie-langfuse-web"): ("strategy", {"type": "Recreate"}),
@@ -2582,7 +2588,7 @@ for err in errors:
     sys.stderr.write(err + "\n")
 sys.exit(1 if errors else 0)
 PYEOF
-echo "  ok: dispatcher renders strategy Recreate; every other workload keeps its strategy"
+echo "  ok: dispatcher renders strategy Recreate; API retains availability; other workloads keep their strategies"
 
 echo "=== Assertion 17: rustfs-init caps Langfuse event-upload objects with a lifecycle rule (issue #2870) ==="
 # Langfuse never deletes its S3 event-upload objects after ingest. Each trace
@@ -3258,5 +3264,100 @@ assert "api.extraEnv" in result.stderr and value_key in result.stderr, result.st
 print("  ok: default, configured and retained metadata CI render; schema and extraEnv refuse invalid inputs")
 PYEOF
 
+echo "=== Assertion 22: API rollouts retain availability and drain before shutdown (#4174) ==="
+assert_api_rollout() {
+  python3 - "$1" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as source:
+    deployments = [
+        doc for doc in yaml.safe_load_all(source)
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "api"
+    ]
+if len(deployments) != 1:
+    sys.exit(f"API rollout assertion requires one API Deployment, got {len(deployments)}")
+spec = deployments[0]["spec"]
+strategy = spec.get("strategy") or {}
+rolling = strategy.get("rollingUpdate") or {}
+if (
+    strategy.get("type") != "RollingUpdate"
+    or type(rolling.get("maxUnavailable")) is not int
+    or rolling.get("maxUnavailable") != 0
+    or type(rolling.get("maxSurge")) is not int
+    or rolling.get("maxSurge") != 1
+):
+    sys.exit("API strategy must use RollingUpdate with maxUnavailable 0 and maxSurge 1")
+containers = [
+    container for container in spec["template"]["spec"]["containers"]
+    if container.get("name") == "api"
+]
+if len(containers) != 1:
+    sys.exit(f"API rollout assertion requires one container named api, got {len(containers)}")
+command = (
+    containers[0].get("lifecycle", {}).get("preStop", {}).get("exec", {}).get("command")
+)
+if command != ["sleep", "5"]:
+    sys.exit("API preStop must exec sleep 5")
+print("  ok: API RollingUpdate keeps an available pod and preStop sleeps for 5 seconds")
+PYEOF
+}
+API_ROLLOUT_RENDER="$TMP/api-rollout.yaml"
+helm template acme "$CHART" --namespace acme \
+  --show-only templates/api.yaml > "$API_ROLLOUT_RENDER"
+assert_api_rollout "$API_ROLLOUT_RENDER" \
+  || fail "API rollout must retain availability and drain before shutdown."
+
+echo "=== Assertion 22 negative controls: absent API strategy and preStop blocks FAIL ==="
+for case_name in strategy lifecycle; do
+  mutant_chart="$TMP/api-rollout-$case_name"
+  cp -a "$CHART" "$mutant_chart"
+  python3 - "$mutant_chart/templates/api.yaml" "$case_name" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+blocks = {
+    "strategy": (
+        "  strategy:\n"
+        "    type: RollingUpdate\n"
+        "    rollingUpdate:\n"
+        "      maxUnavailable: 0\n"
+        "      maxSurge: 1\n"
+    ),
+    "lifecycle": (
+        "          lifecycle:\n"
+        "            preStop:\n"
+        "              exec:\n"
+        "                command: [\"sleep\", \"5\"]\n"
+    ),
+}
+block = blocks[sys.argv[2]]
+if source.count(block) != 1:
+    sys.exit(f"API rollout negative control requires exactly one {sys.argv[2]} block")
+path.write_text(source.replace(block, ""))
+PYEOF
+  mutant_render="$TMP/api-rollout-$case_name.yaml"
+  helm template acme "$mutant_chart" --namespace acme \
+    --show-only templates/api.yaml > "$mutant_render"
+  negative_output=""
+  if negative_output="$(assert_api_rollout "$mutant_render" 2>&1)"; then
+    fail "API rollout negative control $case_name passed the assertion."
+  fi
+  if [[ "$case_name" == strategy ]]; then
+    expected_error="API strategy must use RollingUpdate with maxUnavailable 0 and maxSurge 1"
+  else
+    expected_error="API preStop must exec sleep 5"
+  fi
+  if [[ "$negative_output" != *"$expected_error"* ]]; then
+    fail "API rollout negative control $case_name failed unexpectedly: $negative_output"
+  fi
+  echo "  ok: absent API $case_name block is rejected"
+done
+
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate while every other workload keeps its strategy; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate, the API uses RollingUpdate with maxUnavailable 0 and maxSurge 1 plus a preStop sleep 5, proven by both removed-block negative controls, and other workloads keep their strategies; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls."

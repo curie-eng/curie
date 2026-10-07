@@ -163,7 +163,7 @@ class _PublicationPendingWorkItems(_WorkItems):
 
 
 class _Approvals:
-    async def create(self, _request: ApprovalRequest) -> CreatedApproval:
+    async def create(self, _request: ApprovalRequest, *, budget_s: float = 120) -> CreatedApproval:
         return CreatedApproval(id="appr-1", status="pending")
 
 

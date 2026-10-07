@@ -605,6 +605,7 @@ def build(
         # reports on, the one the maintenance tick sweeps.
         progress=ProgressStore(async_redis, config),
     )
+    owner.register_close("work-item-settlement", kernel.close, order=5)
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)
     # Delivery ownership leases (ADR-0131), built from the CONCRETE async client
