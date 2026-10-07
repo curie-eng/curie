@@ -201,7 +201,7 @@ def test_failure_diagnostics_are_owned_bounded_and_exclude_specs(
             return subprocess.CompletedProcess(
                 argv,
                 0,
-                "Waiting for Postgres readiness "
+                "possibly truncated first line\nWaiting for Postgres readiness "
                 "postgresql://user:example-password@postgres/db example-provider-key",
                 "",
             )
@@ -224,6 +224,46 @@ def test_failure_diagnostics_are_owned_bounded_and_exclude_specs(
     else:
         assert len(calls) == 1
         assert diagnostics["ownership"] != "verified"
+
+
+@pytest.mark.parametrize("boundary", ["local", "upstream"])
+@pytest.mark.parametrize("material", ["credential", "dsn"])
+def test_failure_diagnostics_do_not_publish_cutoff_straddling_credentials(
+    monkeypatch: pytest.MonkeyPatch, boundary: str, material: str
+) -> None:
+    kind = _load_kind()
+    secret = "example-secret-prefix-private-suffix"
+    sensitive = secret if material == "credential" else f"postgresql://user:{secret}@postgres/db"
+    # Local retention starts within the credential. Upstream byte retention
+    # has already removed the prefix, leaving an unrecognizable first line.
+    if boundary == "local":
+        retained_suffix = sensitive[sensitive.index("private-suffix") :]
+        captured = sensitive + "x" * (12000 - len(retained_suffix))
+    else:
+        captured = "private-suffix@postgres/db\nWaiting for Postgres readiness\n"
+
+    def kubectl(argv, **_kwargs):
+        output = "owned-run" if "namespace" in argv else "safe status"
+        if (boundary == "local" and "events" in argv) or (
+            boundary == "upstream" and "logs" in argv
+        ):
+            output = captured
+        return subprocess.CompletedProcess(argv, 0, output, "")
+
+    monkeypatch.setattr(kind.subprocess, "run", kubectl)
+    preflight = SimpleNamespace(
+        config=SimpleNamespace(
+            kube_context="kind-example",
+            model_api_key=secret if material == "credential" else "unrelated-example-key",
+        ),
+        namespace="test-factory-diagnostic",
+        run_id="owned-run",
+        release="curie-factory-scripted",
+    )
+    diagnostics = kind.collect_failure_diagnostics(preflight)
+    assert "private-suffix" not in str(diagnostics)
+    if boundary == "upstream":
+        assert diagnostics["schema_log"]["output"] == "Waiting for Postgres readiness\n"
 
 
 @pytest.mark.parametrize("diagnostic_error", [False, True])

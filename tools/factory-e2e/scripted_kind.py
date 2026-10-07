@@ -290,13 +290,19 @@ def collect_failure_diagnostics(preflight: ScriptedPreflight) -> dict[str, Any]:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {"error": type(exc).__name__}
-        output = result.stdout[-12000:] if result.returncode == 0 else ""
+        output = result.stdout if result.returncode == 0 else ""
         for name in ("model_api_key", "actor_token", "webhook_secret"):
             secret = getattr(preflight.config, name, None)
             if secret:
                 output = output.replace(secret, "[redacted]")
         output = re.sub(r"(\w+://)[^\s/@]+:[^\s/@]+@", r"\1[redacted]@", output)
-        return {"exit_code": result.returncode, "output": output}
+        if "logs" in args:
+            # kubectl's byte limit can start within a credential. Its first
+            # line is untrusted even when the full secret no longer matches.
+            output = output.partition("\n")[2]
+        # Redact the complete captured text before local retention can split a
+        # configured secret or a DSN's credential-bearing userinfo.
+        return {"exit_code": result.returncode, "output": output[-12000:]}
 
     marker = capture(
         [
