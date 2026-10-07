@@ -8,12 +8,10 @@ tool, connector_digest, verifier declaration digest)``, the evidence the API
 checked when the record was written. The verifier runs it references live
 beside it in ``remediation_qualification_verifier_runs``.
 
-Revision assumed (see ``.projects/plans/task-remediation-qualification.tests.md``):
-``0093`` on ``0092``. Plan task 9's unmerged admission branch also writes a
-``0093``; whichever of the two lands second renumbers (``0094`` on ``0093``)
-and moves ``BELOW`` and ``HEAD`` here. The revision is otherwise found by its
-source (it creates ``remediation_qualifications``), so a renumbering only moves
-the two constants.
+Revision: ``0094`` on plan task 9's admission revision ``0093``. If another
+revision lands first, renumber and move ``BELOW`` and ``HEAD`` here and the
+head pins. The revision is otherwise found by its source (it creates
+``remediation_qualifications``), so a renumbering only moves the two constants.
 """
 
 from __future__ import annotations
@@ -27,8 +25,8 @@ from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy.exc import DBAPIError
 
-BELOW = "0092"
-HEAD = "0093"
+BELOW = "0093"
+HEAD = "0094"
 TABLES = ("remediation_qualifications", "remediation_qualification_verifier_runs")
 
 

@@ -44,12 +44,16 @@ Surface these tests fix (``.projects/plans/task-remediation-admission.tests.md``
   and armed or a breaker is open for its target key, before any sandbox claim;
   the nomination returns to ``approval_requested`` (reason ``policy_changed``)
   with no verification outcome.
-* Check 6's record lookup is ``curie_api.remediation_admission.qualification_refusal``
-  (``(session, agent_id, action, *, store=None) -> None | code``, beside
-  ``independence_refusal``). Qualification records are plan task 15, so the
-  positive rows here replace it with the stand-in ``qualified`` (a valid
-  record); the ``qualification_missing`` row uses the real function on an
-  action whose ``qualification`` reference is null.
+* Check 6 is the real record lookup of plan task 15,
+  ``curie_api.remediation_qualifications.qualification_refusal``. Since task 15
+  a policy write with an ``automatic`` action needs a valid qualification
+  record (AUTOMATED-REMEDIATION-23), so ``World.bind`` qualifies each automatic
+  action declaration once per world through the real routes, as the drill
+  order states: bind it with ``automatic`` false, seed the restore or repeat
+  evidence on the disposable target ``DRILL_TARGET``, run the declared
+  verifier through ``POST .../remediation-qualifications/{id}/verifier-runs``
+  to ``not-recovered`` and to ``verified``, write the record with ``PUT``, then
+  bind the automatic generation naming it.
 
 Approval requests are asserted on the nomination row (state and reason); the
 ``Approval`` row itself is task 10's (``request_remediation_approval``), on a
@@ -116,6 +120,12 @@ from test_remediation_nomination_routes import (
     staged,
     worker_headers,
 )
+from test_remediation_qualifications import (
+    WORST_CASE,
+    _confirmed_restore,
+    _conflict_restore,
+    _forward,
+)
 
 pytestmark = pytest.mark.usefixtures("support_db")
 admission_service = _broker.admission_service
@@ -131,8 +141,17 @@ READ_CONNECTOR = "example-metrics"
 READ_TOOL = "query_value"
 READ_DIGEST = "sha256:" + "ef" * 32
 READ_IMAGE = f"ghcr.io/example/metrics-mcp@{READ_DIGEST}"
+# The placeholder ``World.bind`` replaces with the record it qualifies (task 15).
 QUALIFICATION = "qual-example-1"
 TARGETS = ["example-api", "example-worker", "example-web", "example-batch", "example-cron"]
+# The disposable target the qualification drills run against; no test nominates it.
+DRILL_TARGET = TARGETS[4]
+DRILL_ARGUMENTS: dict[str, Any] = {
+    "namespace": "example-ns",
+    "deployment": DRILL_TARGET,
+    "replicas": 4,
+}
+UPGRADED_ACT_DIGEST = "sha256:" + "ac" * 32
 # Canonically equivalent to TARGETS-style values but not a literal member:
 # "cafe" + COMBINING ACUTE ACCENT against the precomposed form the policy lists.
 LISTED_COMPOSED = "café-api"
@@ -213,7 +232,7 @@ def target_key(target: str) -> str:
     return f"{ACT_CONNECTOR}:{json.dumps(target, ensure_ascii=False)}"
 
 
-def connectors_yaml(*, shared_secret: bool = False) -> str:
+def connectors_yaml(*, shared_secret: bool = False, act_digest: str = ACT_DIGEST) -> str:
     """The acting ``k8s`` (with its sealing key) and the read connector.
 
     ``shared_secret``: both connectors expand one secret name, so the verifier
@@ -231,7 +250,7 @@ def connectors_yaml(*, shared_secret: bool = False) -> str:
         read_secrets = "    secrets:\n      - METRICS_TOKEN\n"
     return (
         "connectors:\n"
-        f"  {ACT_CONNECTOR}:\n    image: {ACT_IMAGE}\n{act_secrets}"
+        f"  {ACT_CONNECTOR}:\n    image: ghcr.io/example/k8s-restorer@{act_digest}\n{act_secrets}"
         f"  {READ_CONNECTOR}:\n    image: {READ_IMAGE}\n{read_secrets}"
     )
 
@@ -473,7 +492,12 @@ async def forwards(nomination_id: Any) -> list[dict[str, Any]]:
 
 
 async def all_forwards() -> list[dict[str, Any]]:
-    return await q("SELECT * FROM curie.action_executions WHERE kind = 'forward'")
+    """Every forward execution but the qualification drill's seeded evidence."""
+
+    return await q(
+        "SELECT * FROM curie.action_executions WHERE kind = 'forward' "
+        "AND idempotency_key NOT LIKE 'drill:%'"
+    )
 
 
 async def breakers(target: str | None = None) -> list[dict[str, Any]]:
@@ -734,20 +758,62 @@ async def approved_forward(stage: Stage, row: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture
-def qualified(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Check 6 passes: the stand-in for a valid qualification record (plan task 15).
+def _declaration(action: dict[str, Any]) -> str:
+    """What one qualification record covers (AUTOMATED-REMEDIATION-22)."""
 
-    Replaces exactly the record lookup ``qualification_refusal``; every other
-    check runs as built.
-    """
+    return json.dumps(
+        {key: action.get(key) for key in ("connector", "tool", "reversibility", "verifier")},
+        sort_keys=True,
+    )
 
-    admission = importlib.import_module("curie_api.remediation_admission")
 
-    async def valid(*_args: Any, **_kwargs: Any) -> None:
-        return None
+def _qualifications(stage: Stage, qualification_id: str) -> str:
+    return f"/agents/{stage.agent}/remediation-qualifications/{qualification_id}"
 
-    monkeypatch.setattr(admission, "qualification_refusal", valid, raising=True)
+
+async def verifier_run(stage: Stage, qualification_id: str, hook: str, *, healthy: bool) -> str:
+    """One qualification verifier run on ``DRILL_TARGET`` driven to its outcome."""
+
+    started = await stage.client.post(
+        f"{_qualifications(stage, qualification_id)}/verifier-runs",
+        json={"hook": hook, "action": ACTION_NAME, "target": DRILL_TARGET},
+        headers=admin_headers(),
+    )
+    assert started.status_code == 201, started.text
+    run_id = str(started.json()["id"])
+    outcome = None
+    while outcome is None:
+        pending = await q(
+            "SELECT * FROM curie.action_executions WHERE kind = 'read' "
+            "AND authority_ref = :ref AND state = 'requested' ORDER BY not_before",
+            {"ref": run_id},
+        )
+        assert pending, f"verifier run {run_id} has no sample left and no outcome"
+        due = pending[0]["not_before"] - await _db_now() + timedelta(seconds=1)
+        seconds = due.total_seconds()
+        await asyncio.to_thread(
+            sql_rows,
+            "UPDATE curie.action_executions SET not_before = not_before - "
+            "make_interval(secs => :s) WHERE authority_ref = :ref",
+            {"s": seconds, "ref": run_id},
+        )
+        await asyncio.to_thread(
+            sql_rows,
+            "UPDATE curie.remediation_qualification_verifier_runs SET started_at = "
+            "started_at - make_interval(secs => :s) WHERE id = :id",
+            {"s": seconds, "id": uuid.UUID(run_id)},
+        )
+        claimed = await claim_one(stage, pending[0]["id"])
+        reported = await report(stage, claimed, HEALTHY if healthy else UNHEALTHY)
+        assert reported.status_code == 200, reported.text
+        read = await stage.client.get(
+            f"{_qualifications(stage, qualification_id)}/verifier-runs/{run_id}",
+            headers=_platform(),
+        )
+        assert read.status_code == 200, read.text
+        outcome = read.json()["outcome"]
+    assert outcome == ("verified" if healthy else "not-recovered"), outcome
+    return run_id
 
 
 class World:
@@ -757,11 +823,70 @@ class World:
         self.hooks = Hooks()
         self.deliveries = Deliveries(stage)
         self.document: dict[str, Any] = policy()
+        # The record id each qualified action declaration got (task 15).
+        self.records: dict[str, str] = {}
+
+    async def qualify(self, document: dict[str, Any], hook: str = HOOK) -> dict[str, Any]:
+        """``document`` with each automatic action naming a valid record, made once.
+
+        @spec AUTOMATED-REMEDIATION-22 @spec AUTOMATED-REMEDIATION-23: the drill
+        order through the real routes (see the module docstring).
+        """
+
+        qualified = copy.deepcopy(document)
+        for action in qualified["actions"]:
+            if not action.get("automatic") or action.get("qualification") != QUALIFICATION:
+                continue
+            key = _declaration(action)
+            if key not in self.records:
+                self.records[key] = await self._record(document, action, hook)
+            action["qualification"] = self.records[key]
+        return qualified
+
+    async def _record(self, document: dict[str, Any], action: dict[str, Any], hook: str) -> str:
+        drill = copy.deepcopy(document)
+        for declared in drill["actions"]:
+            declared.update(automatic=False, qualification=None)
+        generation = await write_policy(self.stage, self.hooks, drill, hook)
+        qualification_id = str(uuid.uuid4())
+        agent = str(self.stage.agent)
+        evidence: dict[str, Any] = {}
+        if action["reversibility"] == "reversible":
+            evidence["restore_execution_id"] = str(
+                await asyncio.to_thread(_confirmed_restore, agent, arguments=DRILL_ARGUMENTS)
+            )
+            evidence["conflict_execution_id"] = str(
+                await asyncio.to_thread(_conflict_restore, agent, arguments=DRILL_ARGUMENTS)
+            )
+        else:
+            evidence["forward_execution_ids"] = [
+                str(await asyncio.to_thread(_forward, agent, arguments=DRILL_ARGUMENTS))
+                for _ in range(2)
+            ]
+        evidence["not_recovered_run_id"] = await verifier_run(
+            self.stage, qualification_id, hook, healthy=False
+        )
+        evidence["verified_run_id"] = await verifier_run(
+            self.stage, qualification_id, hook, healthy=True
+        )
+        written = await self.stage.client.put(
+            _qualifications(self.stage, qualification_id),
+            json={
+                "hook": hook,
+                "action": action["name"],
+                "generation": str(generation),
+                "evidence": evidence,
+                "worst_case": WORST_CASE,
+            },
+            headers=admin_headers(),
+        )
+        assert written.status_code == 200, written.text
+        return qualification_id
 
     async def bind(
         self, document: dict[str, Any] | None = None, *, armed: bool = True, hook: str = HOOK
     ) -> int:
-        self.document = document or policy()
+        self.document = await self.qualify(document or policy(), hook)
         await write_policy(self.stage, self.hooks, self.document, hook)
         if armed:
             await set_armed(self.stage, self.hooks, True, hook)
@@ -882,7 +1007,7 @@ async def _generation_absent(w: World) -> dict[str, Any]:
 async def _generation_moved(w: World) -> dict[str, Any]:
     admitted = await w.bind()
     event = await w.deliveries.event()
-    current = await write_policy(w.stage, w.hooks, policy())  # N+1, still armed
+    current = await write_policy(w.stage, w.hooks, w.document)  # N+1, still armed
     (row,) = await submit(w.stage, event, entry())
     assert (row["admitted_generation"], row["current_generation"]) == (admitted, current), row
     return row
@@ -954,7 +1079,6 @@ ORDER: list[tuple[str, Callable[[World], Any], str, str]] = [
 ]
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize(
     "producer,state,code", [case[1:] for case in ORDER], ids=[case[0] for case in ORDER]
 )
@@ -993,17 +1117,75 @@ def test_without_its_qualification_record_an_automatic_action_asks_qualification
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-8 (check 6) @spec AUTOMATED-REMEDIATION-22
 
-    The real check 6, no stand-in: an automatic action whose ``qualification``
-    reference is null has no record, so the nomination becomes an approval
-    request ``qualification_missing``, never an execution.
+    The real check 6: a policy write cannot bind an automatic action without a
+    record (AUTOMATED-REMEDIATION-23), so the record is made unreadable after
+    the write; admission fails closed to an approval request
+    ``qualification_missing``, never an execution.
     """
 
     async def scenario() -> None:
         async with world(ingress_broker, tmp_path, monkeypatch) as w:
-            await w.bind(policy(qualification=None))
+            await w.bind()
+            await q(
+                "DELETE FROM curie.remediation_qualifications WHERE agent_id = :a RETURNING id",
+                {"a": uuid.UUID(str(w.stage.agent))},
+            )
             row = await w.one()
             assert_approval(row, "qualification_missing")
             await assert_nothing_executes(row)
+
+    run(scenario)
+
+
+def test_a_connector_upgrade_after_qualification_asks_qualification_stale(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-22 (acceptance) @spec AUTOMATED-REMEDIATION-8 (check 6)
+
+    "deploying a new connector digest makes the same nomination an approval
+    request with ``qualification_stale``": the record must be fresh for the
+    acting digest in force at admission. Before the upgrade the same nomination
+    passes check 6.
+    """
+
+    async def scenario() -> None:
+        async with world(ingress_broker, tmp_path, monkeypatch) as w:
+            await w.bind()
+            await assert_pending(await w.one(entry(TARGETS[0])))
+
+            await deploy(w.stage, w.tmp_path, connectors_yaml(act_digest=UPGRADED_ACT_DIGEST))
+            row = await w.one(entry(TARGETS[1]))
+
+            assert_approval(row, "qualification_stale")
+            await assert_requested(row)
+            await assert_nothing_executes(row)
+
+    run(scenario)
+
+
+def test_a_record_gone_stale_while_precondition_pending_creates_no_execution(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-8 (checks 6 and 12) @spec AUTOMATED-REMEDIATION-22
+
+    The transition from ``precondition_pending`` to ``admitted`` re-runs check 6
+    against the digest in force then: a connector upgrade while the read is
+    outstanding sends the nomination to approval ``qualification_stale`` and
+    creates no forward execution, though the precondition holds.
+    """
+
+    async def scenario() -> None:
+        async with world(ingress_broker, tmp_path, monkeypatch) as w:
+            await w.bind()
+            row = await w.one()
+            await assert_pending(row)
+
+            await deploy(w.stage, w.tmp_path, connectors_yaml(act_digest=UPGRADED_ACT_DIGEST))
+            after = await take_precondition(w.stage, row, CONDITION_PRESENT)
+
+            assert_approval(after, "qualification_stale")
+            assert await forwards(row["id"]) == []
+            assert await all_forwards() == []
 
     run(scenario)
 
@@ -1016,18 +1198,18 @@ def test_remediation_off_still_refuses_at_the_route_with_no_row(
     async def scenario() -> None:
         async with world(ingress_broker, tmp_path, monkeypatch) as w:
             await w.bind()
+            before = await q("SELECT id FROM curie.action_executions")
             event = await w.deliveries.event()
             remediation(monkeypatch, enabled=False)
             response = await w.stage.submit(event, block(entry()))
             assert response.status_code == 409, response.text
             assert response.json()["detail"]["code"] == "remediation_disabled"
             assert await q("SELECT id FROM curie.remediation_nominations") == []
-            assert await q("SELECT id FROM curie.action_executions") == []
+            assert await q("SELECT id FROM curie.action_executions") == before
 
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_with_every_check_passing_one_precondition_read_then_one_forward_execution(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1099,7 +1281,6 @@ async def _out_of_bounds_and_not_reversible(w: World) -> dict[str, Any]:
     return await w.one(entry(replicas=9))
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize(
     "producer,state,code",
     [
@@ -1134,7 +1315,6 @@ def test_the_first_failing_check_decides(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_reversible_action_with_capability_and_custody_passes_check_9(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1168,7 +1348,6 @@ def test_a_reversible_action_with_capability_and_custody_passes_check_9(
 # =========================================================================== #
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_precondition_read_observing_the_condition_absent_asks_though_the_alert_claimed_it(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1193,7 +1372,6 @@ def test_a_precondition_read_observing_the_condition_absent_asks_though_the_aler
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize("refusal", ["sandbox_unavailable", "runner_unavailable"])
 def test_a_precondition_read_that_fails_asks_precondition_unavailable(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: str
@@ -1229,7 +1407,6 @@ async def _unreachable(w: World, row: dict[str, Any]) -> None:
     assert_approval(await nomination(row["id"]), "precondition_unavailable")
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize("ending", [_absent, _unreachable], ids=["not-met", "unavailable"])
 def test_the_reservation_is_released_when_the_precondition_does_not_admit(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: Any
@@ -1284,7 +1461,6 @@ RECHECK = [
 ]
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize("change,state,code", [c[1:] for c in RECHECK], ids=[c[0] for c in RECHECK])
 def test_a_change_while_precondition_pending_makes_the_transition_create_no_execution(
     ingress_broker: Any,
@@ -1328,7 +1504,6 @@ def test_a_change_while_precondition_pending_makes_the_transition_create_no_exec
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_breaker_opened_while_precondition_pending_sends_the_transition_to_approval(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1393,7 +1568,6 @@ INITIAL_FAULTS = [
 ]
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize(
     "fragment,reversible", [f[1:] for f in INITIAL_FAULTS], ids=[f[0] for f in INITIAL_FAULTS]
 )
@@ -1437,7 +1611,6 @@ TRANSITION_FAULTS = [
 ]
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize(
     "fragment,reversible",
     [f[1:] for f in TRANSITION_FAULTS],
@@ -1482,7 +1655,6 @@ def test_an_unreadable_row_at_the_transition_asks_and_never_executes(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize("phase", ["admission", "transition"])
 def test_an_unreadable_kill_switch_ends_the_nomination_agent_stopped(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
@@ -1519,7 +1691,6 @@ def test_an_unreadable_kill_switch_ends_the_nomination_agent_stopped(
 # =========================================================================== #
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_fourth_admissible_nomination_within_the_hour_asks_policy_rate_limit(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1540,7 +1711,6 @@ def test_a_fourth_admissible_nomination_within_the_hour_asks_policy_rate_limit(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_policy_limit_ages_out_after_the_rolling_hour(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1567,7 +1737,6 @@ def test_a_policy_limit_ages_out_after_the_rolling_hour(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_declared_per_action_limit_asks_action_rate_limit(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1583,7 +1752,6 @@ def test_a_declared_per_action_limit_asks_action_rate_limit(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_two_nominations_in_one_turn_yield_one_admission_and_one_turn_limit(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1605,7 +1773,6 @@ def test_two_nominations_in_one_turn_yield_one_admission_and_one_turn_limit(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_second_automatic_action_on_a_live_target_asks_target_live(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1624,7 +1791,6 @@ def test_a_second_automatic_action_on_a_live_target_asks_target_live(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_two_hooks_racing_for_one_target_yield_exactly_one_execution(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1661,7 +1827,6 @@ def test_two_hooks_racing_for_one_target_yield_exactly_one_execution(
     run(scenario, timeout=180)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_target_equivalent_to_but_not_literally_in_the_list_asks_and_the_literal_admits(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1696,7 +1861,6 @@ async def _verified_on(w: World, target: str) -> dict[str, Any]:
     return row
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_second_automatic_action_on_a_target_within_the_window_asks_incident_limit(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1717,7 +1881,6 @@ def test_a_second_automatic_action_on_a_target_within_the_window_asks_incident_l
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize(
     "window,still_open,closed",
     [(None, 3500, 3700), (7200, 7100, 7300)],
@@ -1775,7 +1938,6 @@ def test_a_window_below_the_default_is_refused_at_write(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_another_hook_cannot_act_inside_a_targets_incident_window(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1798,7 +1960,6 @@ def test_another_hook_cannot_act_inside_a_targets_incident_window(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_an_approved_action_opens_the_incident_too(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1826,7 +1987,6 @@ def test_an_approved_action_opens_the_incident_too(
 # =========================================================================== #
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize("outcome", ["not-recovered", "failed", "indeterminate"])
 def test_an_outcome_other_than_verified_opens_a_breaker_that_sends_the_next_nomination_to_approval(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
@@ -1861,7 +2021,6 @@ def test_an_outcome_other_than_verified_opens_a_breaker_that_sends_the_next_nomi
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_verified_outcome_opens_no_breaker(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1876,7 +2035,6 @@ def test_a_verified_outcome_opens_no_breaker(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_an_approved_action_that_does_not_recover_opens_the_breaker_too(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1923,7 +2081,6 @@ def _hook_signed(agent: str, body: bytes) -> dict[str, str]:
     }
 
 
-@pytest.mark.usefixtures("qualified")
 def test_only_the_administrative_route_with_an_operator_principal_closes_a_breaker(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2033,7 +2190,6 @@ async def assert_policy_changed(w: World, row: dict[str, Any], forward: dict[str
     assert [r for r in await executions_of(row["id"], "read") if r["state"] == "requested"] == []
 
 
-@pytest.mark.usefixtures("qualified")
 @pytest.mark.parametrize("change", ["disarm", "new-generation"])
 def test_a_policy_change_after_creation_refuses_the_execution_policy_changed_at_claim(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
@@ -2052,13 +2208,12 @@ def test_a_policy_change_after_creation_refuses_the_execution_policy_changed_at_
             if change == "disarm":
                 await set_armed(w.stage, w.hooks, False)
             else:
-                await write_policy(w.stage, w.hooks, policy())
+                await write_policy(w.stage, w.hooks, w.document)
             await assert_policy_changed(w, row, forward)
 
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_breaker_opened_after_creation_refuses_the_execution_policy_changed_at_claim(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2091,7 +2246,6 @@ def test_a_breaker_opened_after_creation_refuses_the_execution_policy_changed_at
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_an_approval_authority_execution_is_claimed_whatever_the_policy_state(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2111,7 +2265,6 @@ def test_an_approval_authority_execution_is_claimed_whatever_the_policy_state(
     run(scenario)
 
 
-@pytest.mark.usefixtures("qualified")
 def test_with_the_policy_unchanged_the_policy_execution_is_claimed(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -34,7 +34,7 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
     )
     # The next-only migrations follow the immutable published 0.12.2 chain.
     # The minimum tracks the deployment notification ledger schema.
-    assert window == {"schema_min": "0082", "schema_head": "0093"}
+    assert window == {"schema_min": "0082", "schema_head": "0094"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -51,8 +51,8 @@ def test_new_candidate_release_fields_are_0130(field: str) -> None:
 def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     data = catalog()
-    assert data["windows"].get("0.13.0") == {"schema_min": "0082", "schema_head": "0093"}
-    assert data["revisions"][-3:] == ["0091", "0092", "0093"]
+    assert data["windows"].get("0.13.0") == {"schema_min": "0082", "schema_head": "0094"}
+    assert data["revisions"][-3:] == ["0092", "0093", "0094"]
     assert (
         json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())["0082"]
         == "expand"

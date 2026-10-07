@@ -392,7 +392,13 @@ def _record(
             "call_id": f"call-{action_id.hex[:8]}",
             "tool": tool,
             "arguments": json.dumps(arguments or FORWARD_ARGUMENTS),
-            "target": json.dumps({"kind": "Deployment", "namespace": "example-ns", "name": TARGET}),
+            "target": json.dumps(
+                {
+                    "kind": "Deployment",
+                    "namespace": "example-ns",
+                    "name": (arguments or FORWARD_ARGUMENTS)["deployment"],
+                }
+            ),
             "dedupe": f"drill:{action_id}",
             "post_version": post_version,
             "connector": ACT_CONNECTOR,
@@ -467,11 +473,16 @@ def _conflict_audit(action_id: uuid.UUID, versions: dict[str, Any]) -> None:
 
 
 def _confirmed_restore(
-    agent_id: str, *, tool: str = ACT_TOOL, digest: str = ACT_DIGEST, state: str = "confirmed"
+    agent_id: str,
+    *,
+    tool: str = ACT_TOOL,
+    digest: str = ACT_DIGEST,
+    state: str = "confirmed",
+    arguments: dict[str, Any] | None = None,
 ) -> uuid.UUID:
     """A restore of a record this tool produced at ``digest``, ended in ``state``."""
 
-    record = _record(agent_id, tool=tool, digest=digest)
+    record = _record(agent_id, tool=tool, digest=digest, arguments=arguments)
     return _execution(agent_id, kind="restore", subject=record, state=state, digest=digest)
 
 
@@ -481,10 +492,11 @@ def _conflict_restore(
     digest: str = ACT_DIGEST,
     code: str = "version_conflict",
     audit: bool = True,
+    arguments: dict[str, Any] | None = None,
 ) -> uuid.UUID:
     """A restore refused because the target moved, with its audit row naming both versions."""
 
-    record = _record(agent_id, digest=digest, post_version="rv-2002")
+    record = _record(agent_id, digest=digest, post_version="rv-2002", arguments=arguments)
     versions = {"recorded_version": "rv-2002", "observed_version": "rv-2077"}
     execution_id = _execution(
         agent_id,
