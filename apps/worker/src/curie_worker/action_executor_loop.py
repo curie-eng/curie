@@ -310,8 +310,9 @@ class _Run:
     state: str = "unreported"
     stage: str = "claim"
     code: str | None = None
-    # Set once a sandbox claim was attempted, so release runs only when needed.
-    sandbox: bool = False
+    # The sandbox this attempt claimed. Release is of this handle only, never
+    # of whatever the ``action-exec:<id>`` route names by then.
+    handle: SandboxHandle | None = None
     # Monotonic time the lease expires, measured from before the claim request
     # so it never runs later than the API's own clock would.
     lease_deadline: float = 0.0
@@ -566,8 +567,8 @@ class ActionExecutorLoop:
                     execution.connector,
                 )
         finally:
-            if run.sandbox:
-                await self._release(execution)
+            if run.handle is not None:
+                await self._release(execution, run.handle)
 
     async def _restore(self, execution: Execution, run: _Run) -> None:
         run.stage = "killswitch"
@@ -581,8 +582,7 @@ class ActionExecutorLoop:
         run.stage = "deployment"
         await self._require_serving(execution, gated_tool=RESTORE_TOOL)
         run.stage = "sandbox"
-        run.sandbox = True
-        handle, agent_name = await self._claim_sandbox(execution)
+        handle, agent_name = await self._claim_sandbox(execution, run)
         run.stage = "list"
         tools = await self._list(execution, run, handle)
         names = {t.get("name") for t in tools if isinstance(t, Mapping)}
@@ -637,8 +637,7 @@ class ActionExecutorLoop:
         run.stage = "digest"
         await self._require_serving(execution)
         run.stage = "sandbox"
-        run.sandbox = True
-        handle, _agent_name = await self._claim_sandbox(execution)
+        handle, _agent_name = await self._claim_sandbox(execution, run)
         run.stage = "list"
         tools = await self._list(execution, run, handle)
         run.stage = "digest"
@@ -768,12 +767,14 @@ class ActionExecutorLoop:
 
     # -- the sandbox and the runner -----------------------------------------
 
-    async def _claim_sandbox(self, execution: Execution) -> tuple[SandboxHandle, str]:
+    async def _claim_sandbox(self, execution: Execution, run: _Run) -> tuple[SandboxHandle, str]:
         """@spec ACTION-EXECUTOR-5: the agent's pool, the stripped env, fresh only.
 
         Returns the handle and the agent name the grant is signed for.
         """
 
+        # Raises (runner_unavailable) when the lease is already spent.
+        reclaim = execution.attempt > 1 and self._lease_left(run, "sandbox") > 0
         try:
             boot = await self._executor_boot(
                 execution.agent_id, execution.connector, thread_key=execution.thread_key
@@ -781,9 +782,11 @@ class ActionExecutorLoop:
             env = executor_env(boot)
             # A reclaim (ACTION-EXECUTOR-17) finds the dead holder's sandbox for
             # this execution still running, and ``fresh_only`` would refuse it.
-            # Holding the claim means the earlier fence can no longer dispatch,
-            # so its sandbox is released first. No route makes this a no-op.
-            await asyncio.to_thread(self._substrate.release, execution.thread_key)
+            # Only a later attempt has a predecessor, and only while this
+            # attempt's own lease holds is every earlier fence provably expired
+            # (the API reclaimed it), so only then is that route released.
+            if reclaim:
+                await asyncio.to_thread(self._substrate.release, execution.thread_key)
             handle = await asyncio.to_thread(
                 self._substrate.claim,
                 execution.thread_key,
@@ -800,6 +803,7 @@ class ActionExecutorLoop:
                 type(exc).__name__,
             )
             raise _Refuse("sandbox_unavailable", "sandbox") from None
+        run.handle = handle
         return handle, boot.agent_name
 
     def _request(
@@ -989,11 +993,15 @@ class ActionExecutorLoop:
 
     # -- release and telemetry ----------------------------------------------
 
-    async def _release(self, execution: Execution) -> None:
-        """@spec ACTION-EXECUTOR-5: on every path; a release error is logged."""
+    async def _release(self, execution: Execution, handle: SandboxHandle) -> None:
+        """@spec ACTION-EXECUTOR-5: on every path; a release error is logged.
+
+        Only the claim this attempt holds: a holder fenced out by a reclaim
+        must not release the reclaimer's live sandbox on the same thread key.
+        """
 
         try:
-            await asyncio.to_thread(self._substrate.release, execution.thread_key)
+            await asyncio.to_thread(self._substrate.release_claim, execution.thread_key, handle)
         except Exception as exc:  # noqa: BLE001 -- the outcome already stands
             logger.warning(
                 "action execution %s sandbox release failed connector=%s error=%s",
