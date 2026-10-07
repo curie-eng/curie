@@ -650,7 +650,7 @@ def test_cli_rejects_dispatcher_invalid_declarations(tmp_path: Path, violation: 
     elif violation == "shared_lanes":
         declaration.append({**declaration[1], "name": "other"})
     elif violation == "reserved_identity":
-        declaration[1]["name"] = "cluster-message"
+        declaration[1]["name"] = "curie-cluster-message"
     elif violation == "long_identity":
         declaration[1]["name"] = "a" * 41
     elif violation == "invalid_identity":
