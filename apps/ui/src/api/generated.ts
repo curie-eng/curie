@@ -49,6 +49,33 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/action-executions/{execution_id}/arguments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Read Arguments
+         * @description The bound tool and arguments of the claimed forward execution this fence holds.
+         *
+         *     @spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19. The worker recomputes
+         *     ``arguments_sha256`` over the text it will send and refuses
+         *     ``arguments_mismatch`` on any difference, so it needs the bound arguments
+         *     before dispatch; ``ExecutionOut`` never carries them. The body is exactly
+         *     the fence (a body naming a tool or arguments is a 422), a stale fence is a
+         *     ``409``, and only a ``claimed`` forward execution answers. Nothing moves.
+         */
+        post: operations["read_arguments_action_executions__execution_id__arguments_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/action-executions/{execution_id}/dispatch": {
         parameters: {
             query?: never;
@@ -64,9 +91,9 @@ export interface paths {
          *
          *     @spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-15: only a ``claimed``
          *     restore whose observed version equalled the recorded one dispatches. A
-         *     probe never does (ACTION-EXECUTOR-1). A forward execution dispatches only
-         *     once the API creates its ledger row at dispatch (ACTION-EXECUTOR-19), which
-         *     is not built yet, so it is refused here too.
+         *     probe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a
+         *     ``claimed`` forward execution dispatches without observing, and the commit
+         *     creates its one ledger row; a replay answers the row it already names.
          */
         post: operations["dispatch_execution_action_executions__execution_id__dispatch_post"];
         delete?: never;
@@ -217,7 +244,9 @@ export interface paths {
          *     ``connector_digest`` are the worker's attribution, so a completion carrying
          *     them also needs the internal worker token (403 otherwise), and the connector
          *     must be the one the stored tool names (422 otherwise). Either refusal stores
-         *     nothing. A completion without them still takes the platform key alone.
+         *     nothing. A completion without them still takes the platform key alone,
+         *     except for a forward execution's ``exec:`` row (ACTION-EXECUTOR-19), which
+         *     only the worker token completes (403 otherwise, nothing stored).
          */
         post: operations["complete_action_actions__action_id__complete_post"];
         delete?: never;
@@ -5142,6 +5171,24 @@ export interface components {
             version_id: string;
         };
         /**
+         * ExecutionArguments
+         * @description A claimed forward execution's bound call, read by its holder only.
+         *
+         *     @spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19: the worker recomputes
+         *     ``arguments_sha256`` over the text it sends, so it reads the tool and the
+         *     arguments the authority bound under its fence before dispatch. Answered
+         *     only by ``POST /action-executions/{id}/arguments`` (internal worker token);
+         *     ``ExecutionOut`` keeps carrying no argument.
+         */
+        ExecutionArguments: {
+            /** Arguments */
+            arguments: {
+                [key: string]: unknown;
+            };
+            /** Tool */
+            tool: string;
+        };
+        /**
          * ExecutionClaim
          * @description @spec ACTION-EXECUTOR-17: who claims, and for how long the lease holds.
          */
@@ -8023,6 +8070,43 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    read_arguments_action_executions__execution_id__arguments_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionFence"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionArguments"];
                 };
             };
             /** @description Validation Error */

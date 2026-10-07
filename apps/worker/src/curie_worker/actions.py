@@ -127,6 +127,26 @@ def _snapshot(frame: SideEffectFlag) -> Snapshot:
     return Snapshot(prior, _obj(POST_KEY), target, version)
 
 
+def completion_body(frame: SideEffectFlag) -> dict[str, Any]:
+    """The completion route's body for one closing frame, connector pair aside.
+
+    The one snapshot parsing (``_snapshot``) every completion goes through: a
+    model turn's call here, and a platform-executed forward call in the
+    executor loop (ACTION-EXECUTOR-19), so both are undoable on the same terms.
+    """
+
+    snapshot = _snapshot(frame)
+    return {
+        "failed": bool(frame.failed),
+        "result": frame.result,
+        "prior_state": snapshot.prior_state,
+        "post_state": snapshot.post_state,
+        "post_version": snapshot.post_version,
+        "target": snapshot.target,
+        "detail": frame.detail,
+    }
+
+
 class ActionClient:
     """HTTP implementation against the platform API's /actions endpoint."""
 
@@ -199,16 +219,7 @@ class ActionClient:
         digest costs only the digest, never the turn.
         """
 
-        snapshot = _snapshot(frame)
-        body: dict[str, Any] = {
-            "failed": bool(frame.failed),
-            "result": frame.result,
-            "prior_state": snapshot.prior_state,
-            "post_state": snapshot.post_state,
-            "post_version": snapshot.post_version,
-            "target": snapshot.target,
-            "detail": frame.detail,
-        }
+        body = completion_body(frame)
         url = f"{self._url}/{action_id}/complete"
         if connector is not None and connector_digest is not None:
             attributed = {**body, "connector": connector, "connector_digest": connector_digest}
@@ -254,8 +265,6 @@ class ActionClient:
     def _accepted(response: httpx.Response, what: str) -> dict[str, Any]:
         # 201 is a fresh record; 200 is the idempotent replay of either call.
         if response.status_code not in (200, 201):
-            raise ActionBackendError(
-                f"{what} failed: HTTP {response.status_code}: {response.text}"
-            )
+            raise ActionBackendError(f"{what} failed: HTTP {response.status_code}: {response.text}")
         payload: dict[str, Any] = response.json()
         return payload

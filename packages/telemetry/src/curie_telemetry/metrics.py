@@ -289,6 +289,7 @@ _REPLY_RETRY_ATTRIBUTES = {
 _HTTP_OPERATIONS = [
     "/action-executions/claim",
     "/action-executions/{execution_id}",
+    "/action-executions/{execution_id}/arguments",
     "/action-executions/{execution_id}/dispatch",
     "/action-executions/{execution_id}/observation",
     "/action-executions/{execution_id}/outcome",

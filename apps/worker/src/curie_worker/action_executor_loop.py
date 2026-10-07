@@ -2,7 +2,8 @@
 
 @spec ACTION-EXECUTOR-4 @spec ACTION-EXECUTOR-5 @spec ACTION-EXECUTOR-7
 @spec ACTION-EXECUTOR-13 @spec ACTION-EXECUTOR-14 @spec ACTION-EXECUTOR-15
-@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-21 @spec ACTION-EXECUTOR-22
+@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-19 @spec ACTION-EXECUTOR-21
+@spec ACTION-EXECUTOR-22
 
 Runs beside the connector reconcile loop, never inside the consumer: no stream,
 no thread lock (each execution has its own ``action-exec:<id>`` key), no turn
@@ -36,6 +37,16 @@ its code, which is a provable non-write):
 A probe is a ``list`` bracketed by the digest check, reporting the verbs that
 meet ACTION-EXECUTOR-13's rule; it never observes, dispatches or calls.
 
+A forward execution (ACTION-EXECUTOR-19) runs ``list`` then one ``call`` and
+never observes: claim; the kill switch; the bound tool and arguments read under
+the fence (``authority_unavailable`` when the API will not produce them) with
+the digest recomputed over the exact text (``arguments_mismatch``); the pinned
+digest with the tool gated; the sandbox; ``list`` (``tool_not_advertised``);
+the digest again; the kill switch; the dispatch commit, which creates the
+action's one ledger row; one grant for that tool over that text and one
+``call``; the ledger completion under the worker token, with the execution's
+connector and digest; then the outcome.
+
 Nothing here logs arguments, envelopes, targets, versions, grants or tokens:
 log lines carry the execution id, kind, state, stage, code and connector only.
 """
@@ -54,7 +65,7 @@ from fnmatch import fnmatchcase
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import httpx
-from aci_protocol import BootEnv
+from aci_protocol import BootEnv, SideEffectFlag
 from curie_connector_proxy.server import GATED_TOOLS_ENV
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind, StatusCode
@@ -69,6 +80,7 @@ from .action_executor import (
     call_outcome,
     restore_call,
 )
+from .actions import completion_body
 from .caller_token import signing_key
 from .runner_client import EXECUTOR_MODE, RUNNER_MODE_ENV, ExecuteRefused, RunnerClient
 from .sandbox import EXECUTOR_THREAD_KEY_PREFIX
@@ -185,6 +197,7 @@ class Execution:
     lease_owner: str
     connector_digest: str | None
     arguments_sha256: str | None
+    tool: str | None = None
 
     @classmethod
     def from_claim(cls, body: Mapping[str, Any], lease_owner: str) -> Execution:
@@ -199,6 +212,7 @@ class Execution:
             lease_owner=str(body.get("lease_owner") or lease_owner),
             connector_digest=body.get("connector_digest"),
             arguments_sha256=body.get("arguments_sha256"),
+            tool=str(body["tool"]) if body.get("tool") else None,
         )
 
     def fence(self) -> dict[str, Any]:
@@ -274,7 +288,7 @@ class ExecutionApi:
     async def transition(
         self, execution: Execution, route: str, body: Mapping[str, Any]
     ) -> ApiAnswer:
-        """POST one fenced transition (``observation``, ``dispatch`` or ``outcome``)."""
+        """POST one fenced transition: observation, arguments, dispatch or outcome."""
 
         response = await self._client.post(
             f"{self._base}/action-executions/{execution.id}/{route}",
@@ -284,6 +298,22 @@ class ExecutionApi:
         )
         row = response.json() if response.status_code == 200 else None
         return ApiAnswer(status=response.status_code, row=row)
+
+    async def complete(self, action_id: str, body: Mapping[str, Any]) -> int:
+        """Close a forward call's ledger row (``POST /actions/{id}/complete``).
+
+        @spec ACTION-EXECUTOR-19 @spec ACTION-EXECUTOR-12: the body carries the
+        connector attribution, so it goes under the internal worker token.
+        Returns the status; the body is never logged.
+        """
+
+        response = await self._client.post(
+            f"{self._base}/actions/{action_id}/complete",
+            json=dict(body),
+            headers=self._worker_headers,
+            timeout=_API_TIMEOUT_S,
+        )
+        return response.status_code
 
 
 class _Abandon(Exception):  # noqa: N818 -- a control signal, not an error
@@ -428,6 +458,24 @@ def tool_is_gated(patterns: tuple[str, ...], connector: str, tool: str) -> bool:
     return any(fnmatchcase(c, pattern) for pattern in patterns for c in candidates)
 
 
+def _forward_outcome(*, is_error: bool, structured: object) -> tuple[str, str | None]:
+    """A forward tool's terminal state and code for one ``call`` reply.
+
+    @spec ACTION-EXECUTOR-19 @spec ACTION-EXECUTOR-20. A forward tool is an
+    ordinary connector tool, so the paired verbs' ``ok`` convention does not
+    bind it: a reply that is not a tool error confirms, structured or not (the
+    ledger completion records what it answered). A tool error, or a structured
+    ``ok: false``, fails; a known connector refusal keeps its code and anything
+    else is ``connector_error``.
+    """
+
+    if isinstance(structured, Mapping) and structured.get("ok") is False:
+        return call_outcome(is_error=is_error, structured=structured)
+    if is_error:
+        return "failed", "connector_error"
+    return "confirmed", None
+
+
 def _stage(state: str, code: str | None) -> str:
     if state == "refused":
         return "pre_dispatch"
@@ -550,9 +598,10 @@ class ActionExecutorLoop:
                     await self._restore(execution, run)
                 elif execution.kind == "probe":
                     await self._probe(execution, run)
+                elif execution.kind == "forward":
+                    await self._forward(execution, run)
                 else:
-                    # Forward execution (ACTION-EXECUTOR-19) is not served by this
-                    # loop yet; its authority cannot be verified here.
+                    # No producer makes any other kind (ACTION-EXECUTOR-1).
                     raise _Refuse("authority_unavailable", "kind")
             except _Refuse as refusal:
                 run.stage = refusal.stage
@@ -627,7 +676,43 @@ class ActionExecutorLoop:
         run.stage = "dispatch"
         await self._dispatch(execution)
         run.stage = "call"
-        state, code = await self._call(execution, run, handle, agent_name, arguments)
+        state, code, _reply = await self._call(execution, run, handle, agent_name, arguments)
+        run.stage = "report"
+        await self._report(execution, run, state, code)
+
+    async def _forward(self, execution: Execution, run: _Run) -> None:
+        """@spec ACTION-EXECUTOR-19: ``list`` then one ``call``; never ``observe``."""
+
+        run.stage = "killswitch"
+        await self._check_killswitch(execution)
+        if not self._grant_key_ok:
+            raise _Refuse("tool_not_grant_bound", "grant")
+        run.stage = "arguments"
+        tool, arguments = await self._bound_call(execution)
+        run.stage = "deployment"
+        await self._require_serving(execution, gated_tool=tool)
+        run.stage = "sandbox"
+        handle, agent_name = await self._claim_sandbox(execution, run)
+        run.stage = "list"
+        tools = await self._list(execution, run, handle)
+        if tool not in {t.get("name") for t in tools if isinstance(t, Mapping)}:
+            raise _Refuse("tool_not_advertised", "list")
+        run.stage = "digest"
+        await self._require_serving(execution)
+        run.stage = "killswitch"
+        await self._check_killswitch(execution)
+        run.stage = "lease"
+        if self._lease_left(run, "lease") < self._dispatch_deadline_s + _LEASE_MARGIN_S:
+            raise _Refuse(_LEASE_SPENT, "lease")
+        run.stage = "dispatch"
+        subject = await self._dispatch(execution)
+        run.stage = "call"
+        state, code, reply = await self._call(
+            execution, run, handle, agent_name, arguments, tool=tool
+        )
+        if subject is not None and reply is not None:
+            run.stage = "complete"
+            await self._complete(execution, subject, tool, state, reply)
         run.stage = "report"
         await self._report(execution, run, state, code)
 
@@ -696,6 +781,36 @@ class ActionExecutorLoop:
         except ValueError:
             raise _Refuse("arguments_mismatch", "ledger") from None
         return target, prior_state
+
+    async def _bound_call(self, execution: Execution) -> tuple[str, str]:
+        """The forward call's tool and exact text, checked against the authority.
+
+        @spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19. Read under the fence
+        from ``POST /action-executions/{id}/arguments``; an API that never
+        answers is ``runner_unavailable``, and one that will not produce the
+        bound call is ``authority_unavailable``. The digest is recomputed over
+        the canonical text the call will send; a difference from the
+        execution's ``arguments_sha256``, a tool other than the one claimed, or
+        arguments with no canonical form are ``arguments_mismatch``.
+        """
+
+        answer = await self._send(execution, "arguments", {})
+        if answer is None:
+            raise _Refuse(_PLATFORM_UNAVAILABLE, "arguments")
+        if answer.status != 200 or answer.row is None:
+            raise _Refuse("authority_unavailable", "arguments")
+        tool = answer.row.get("tool")
+        bound = answer.row.get("arguments")
+        if not isinstance(tool, str) or not tool or tool != execution.tool:
+            raise _Refuse("arguments_mismatch", "arguments")
+        try:
+            text = connector_grant.canonical_arguments(bound)
+        except (TypeError, ValueError):
+            raise _Refuse("arguments_mismatch", "arguments") from None
+        expected = execution.arguments_sha256 or ""
+        if not secrets.compare_digest(connector_grant.arguments_sha256(text), expected):
+            raise _Refuse("arguments_mismatch", "arguments")
+        return tool, text
 
     async def _require_serving(
         self, execution: Execution, *, gated_tool: str | None = None
@@ -881,12 +996,16 @@ class ActionExecutorLoop:
         handle: SandboxHandle,
         agent_name: str,
         arguments: str,
-    ) -> tuple[str, str | None]:
+        *,
+        tool: str = RESTORE_TOOL,
+    ) -> tuple[str, str | None, Mapping[str, Any] | None]:
         """One grant, one ``call``. @spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-17.
 
         Past ``dispatched`` nothing is ``refused``: a reply maps through
-        ``call_outcome``, and anything else may have reached the connector, so
-        it is ``indeterminate`` and never repeated.
+        ``call_outcome`` (a restore) or ``_forward_outcome`` (a forward tool),
+        and anything else may have reached the connector, so it is
+        ``indeterminate`` and never repeated. The reply is returned beside the
+        state for a forward call's ledger completion; it is None when lost.
         """
 
         started = time.monotonic()
@@ -899,7 +1018,7 @@ class ActionExecutorLoop:
             self._grant_signing_key,
             agent=agent_name,
             connector=execution.connector,
-            tool=RESTORE_TOOL,
+            tool=tool,
             args=arguments,
             exp=int(time.time() + self._dispatch_deadline_s),
             jti=str(uuid.uuid4()),
@@ -907,19 +1026,21 @@ class ActionExecutorLoop:
         try:
             reply = await self._runner.execute(
                 handle.base_url,
-                self._request(
-                    execution, "call", tool=RESTORE_TOOL, arguments=arguments, grant=grant
-                ),
+                self._request(execution, "call", tool=tool, arguments=arguments, grant=grant),
                 token=handle.token,
                 remaining_s=budget,
             )
         except Exception:  # noqa: BLE001 -- ExecuteRefused included: never refused here
             if time.monotonic() - started >= budget:
-                return "indeterminate", _DEADLINE
-            return "indeterminate", _LOST
-        return call_outcome(
-            is_error=bool(reply.get("is_error")), structured=reply.get("structured")
-        )
+                return "indeterminate", _DEADLINE, None
+            return "indeterminate", _LOST, None
+        is_error = bool(reply.get("is_error"))
+        structured = reply.get("structured")
+        if execution.kind == "forward":
+            state, code = _forward_outcome(is_error=is_error, structured=structured)
+        else:
+            state, code = call_outcome(is_error=is_error, structured=structured)
+        return state, code, reply
 
     # -- API transitions -----------------------------------------------------
 
@@ -951,16 +1072,70 @@ class ActionExecutorLoop:
         if answer.state != "claimed":
             raise _Abandon("observation")
 
-    async def _dispatch(self, execution: Execution) -> None:
-        """@spec ACTION-EXECUTOR-17: no confirmed ``dispatched`` commit, no request."""
+    async def _dispatch(self, execution: Execution) -> str | None:
+        """@spec ACTION-EXECUTOR-17: no confirmed ``dispatched`` commit, no request.
+
+        Returns the subject action the committed row names: for a forward
+        execution, the ledger row the commit created (ACTION-EXECUTOR-19).
+        """
 
         answer = await self._send(execution, "dispatch", {})
         if answer is not None and answer.status == 200 and answer.state == "dispatched":
-            return
+            subject = (answer.row or {}).get("subject_action_id")
+            return str(subject) if subject else None
         # Never confirmed, or refused by the API (409, or 503 with the executor
         # switched off). A refusal is offered; the API accepts it only if the
         # commit did not happen, and otherwise the lease sweep ends the row.
         raise _Refuse(_PLATFORM_UNAVAILABLE, "dispatch")
+
+    async def _complete(
+        self,
+        execution: Execution,
+        action_id: str,
+        tool: str,
+        state: str,
+        reply: Mapping[str, Any],
+    ) -> None:
+        """@spec ACTION-EXECUTOR-19: complete the forward call's ledger row.
+
+        With the same snapshot parsing as a model turn's call
+        (``actions.completion_body``), so a platform-executed forward action is
+        undoable on the same terms, and attributed to the execution's connector
+        and digest under the worker token (ACTION-EXECUTOR-12). Sent up to
+        ``MAX_SENDS`` times; the completion route keeps the first account, so a
+        resend cannot move it. A completion never sent leaves the row
+        ``pending`` and the outcome is still reported.
+        """
+
+        structured = reply.get("structured")
+        frame = SideEffectFlag(
+            tool=f"mcp__{execution.connector}__{tool}",
+            call_id=f"exec:{execution.id}",
+            result=dict(structured) if isinstance(structured, Mapping) else None,
+            failed=state != "confirmed",
+        )
+        body = {
+            **completion_body(frame),
+            "connector": execution.connector,
+            "connector_digest": execution.connector_digest,
+        }
+        for _ in range(MAX_SENDS):
+            try:
+                status = await self._api.complete(action_id, body)
+            except httpx.HTTPError:
+                continue
+            if status < 500:
+                break
+        else:
+            status = 0
+        if status != 200:
+            logger.info(
+                "action execution %s ledger completion not recorded kind=%s status=%s connector=%s",
+                execution.id,
+                execution.kind,
+                status,
+                execution.connector,
+            )
 
     async def _report(
         self,

@@ -71,6 +71,14 @@ RULING_SHA256 = connector_grant.arguments_sha256(
     connector_grant.canonical_arguments({"target": TARGET, "prior_state": PRIOR_STATE})
 )
 
+# @spec ACTION-EXECUTOR-19: a forward execution of the vector's advertised
+# ``scale`` tool, with the arguments its authority bound (non-ASCII included,
+# so the canonical form's ``ensure_ascii=False`` is exercised).
+FORWARD_TOOL = "scale"
+FORWARD_ARGUMENTS: dict[str, Any] = {"target": TARGET, "replicas": 3, "note": "réplicas"}
+FORWARD_TEXT: str = connector_grant.canonical_arguments(FORWARD_ARGUMENTS)
+FORWARD_SHA256: str = connector_grant.arguments_sha256(FORWARD_TEXT)
+
 
 def list_tools() -> list[dict[str, Any]]:
     return copy.deepcopy(RUNNER_VECTOR["phases"]["list"]["response"]["tools"])
@@ -173,6 +181,11 @@ class FakeApi:
         self.faults: dict[str, list[str]] = {}
         self.statuses: dict[str, list[int]] = {}
         self.executor_enabled = True
+        # @spec ACTION-EXECUTOR-19: the arguments each forward execution's
+        # authority bound (the row's ``forward_arguments``), the ledger rows
+        # dispatch created, and every completion posted to the ledger.
+        self.forward_arguments: dict[str, dict[str, Any]] = {}
+        self.completions: list[dict[str, Any]] = []
 
     # -- seeding ------------------------------------------------------------
 
@@ -208,12 +221,30 @@ class FakeApi:
         self.order.append(execution.id)
         return execution
 
-    def add_forward(self, **fields: Any) -> Execution:
-        """A forward execution (ACTION-EXECUTOR-19), which has no authority source yet."""
+    def add_forward(
+        self,
+        *,
+        arguments: dict[str, Any] | None = None,
+        bound: bool = True,
+        **fields: Any,
+    ) -> Execution:
+        """A forward execution (ACTION-EXECUTOR-19) as the creation function writes it.
 
-        execution = Execution(id=str(uuid.uuid4()), kind="forward", tool="scale", **fields)
+        ``arguments`` are the row's ``forward_arguments`` (the authority's by
+        default); ``fields`` may override ``arguments_sha256`` to model drift
+        between the two. ``bound=False`` models a row the API will not hand
+        arguments for, so its authority cannot be produced.
+        """
+
+        fields.setdefault("arguments_sha256", FORWARD_SHA256)
+        fields.setdefault("tool", FORWARD_TOOL)
+        execution = Execution(id=str(uuid.uuid4()), kind="forward", **fields)
         self.executions[execution.id] = execution
         self.order.append(execution.id)
+        if bound:
+            self.forward_arguments[execution.id] = copy.deepcopy(
+                FORWARD_ARGUMENTS if arguments is None else arguments
+            )
         return execution
 
     def fail(self, route: str, *modes: str) -> None:
@@ -262,6 +293,8 @@ class FakeApi:
         parts = request.url.path.strip("/").split("/")
         if parts[:1] == ["actions"] and len(parts) == 2 and request.method == "GET":
             return "ledger", parts[1]
+        if parts[:1] == ["actions"] and len(parts) == 3 and parts[2] == "complete":
+            return "complete", parts[1]
         if parts == ["action-executions", "claim"]:
             return "claim", None
         if parts[:1] == ["action-executions"] and len(parts) == 3:
@@ -278,6 +311,8 @@ class FakeApi:
                 return httpx.Response(401, json={"detail": "api key required"})
             row = self.ledger.get(str(execution_id))
             return httpx.Response(200, json=row) if row else httpx.Response(404)
+        if route == "complete":
+            return self._complete(str(execution_id), body, request)
         if request.headers.get("x-curie-worker-token") != WORKER_TOKEN:
             return httpx.Response(401, json={"detail": "worker token required"})
         if route == "claim":
@@ -294,6 +329,7 @@ class FakeApi:
             return _conflict("the lease on this execution has expired")
         handler = {
             "observation": self._observation,
+            "arguments": self._arguments,
             "dispatch": self._dispatch,
             "outcome": self._outcome,
         }[route]
@@ -354,12 +390,71 @@ class FakeApi:
             return httpx.Response(200, json=execution.out())
         if execution.state != "claimed":
             return _conflict(f"an execution in state {execution.state} cannot dispatch")
+        if execution.kind == "forward":
+            # @spec ACTION-EXECUTOR-19: the dispatch commit creates exactly one
+            # ledger row for the call, and the execution names it.
+            action_id = str(uuid.uuid4())
+            self.ledger[action_id] = {
+                "id": action_id,
+                "agent_id": execution.agent_id,
+                "tool": f"mcp__{execution.connector}__{execution.tool}",
+                "call_id": f"exec:{execution.id}",
+                "dedupe_key": f"exec:{execution.id}",
+                "arguments": copy.deepcopy(self.forward_arguments.get(execution.id)),
+                "connector": execution.connector,
+                "connector_digest": execution.connector_digest,
+                "status": "pending",
+            }
+            execution.subject_action_id = action_id
+            execution.state = "dispatched"
+            return httpx.Response(200, json=execution.out())
         if execution.kind != "restore":
             return _conflict(f"a {execution.kind} execution cannot dispatch")
         if not execution.observed:
             return _conflict("a restore dispatches only after an unchanged version is observed")
         execution.state = "dispatched"
         return httpx.Response(200, json=execution.out())
+
+    def _arguments(self, execution: Execution, body: dict[str, Any]) -> httpx.Response:
+        """``POST /action-executions/{id}/arguments``: a claimed forward's bound call."""
+
+        if set(body or {}) != {"lease_owner", "attempt"}:
+            return httpx.Response(422, json={"detail": "the body is exactly the fence"})
+        if execution.kind != "forward" or execution.id not in self.forward_arguments:
+            return _conflict("this execution has no bound arguments")
+        if execution.state != "claimed":
+            return _conflict(f"an execution in state {execution.state} reads no arguments")
+        return httpx.Response(
+            200,
+            json={"tool": execution.tool, "arguments": self.forward_arguments[execution.id]},
+        )
+
+    def _complete(
+        self, action_id: str, body: dict[str, Any], request: httpx.Request
+    ) -> httpx.Response:
+        """``POST /actions/{id}/complete``, as ``routers/actions.py`` accepts it."""
+
+        if request.headers.get("x-api-key") != API_KEY:
+            return httpx.Response(401, json={"detail": "api key required"})
+        row = self.ledger.get(action_id)
+        if row is None:
+            return httpx.Response(404)
+        if body.get("connector") is not None:
+            if request.headers.get("x-curie-worker-token") != WORKER_TOKEN:
+                return httpx.Response(403, json={"detail": "worker token required"})
+            if row["tool"].split("__")[1] != body["connector"]:
+                return httpx.Response(422, json={"detail": "connector is not the tool's"})
+        self.completions.append({"action_id": action_id, "body": dict(body)})
+        self.timeline.add("api:complete-applied")
+        row.update(
+            {
+                "status": "failed" if body.get("failed") else "succeeded",
+                "result": body.get("result"),
+                "connector": body.get("connector"),
+                "connector_digest": body.get("connector_digest"),
+            }
+        )
+        return httpx.Response(200, json=row)
 
     def _outcome(self, execution: Execution, body: dict[str, Any]) -> httpx.Response:
         state = body.get("state")

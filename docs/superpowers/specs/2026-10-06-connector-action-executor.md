@@ -716,8 +716,10 @@ second grant is minted for one execution.
 reports through API-key routes `POST /action-executions/claim`,
 `POST /action-executions/{id}/observation`, `POST /action-executions/{id}/dispatch`
 and `POST /action-executions/{id}/outcome`, plus `GET /action-executions/{id}`.
-Each transition is idempotent for the same fence and payload and returns `409`
-for a conflicting one. A confirmed restore sets `undone_at` and `undone_by`
+A forward execution's holder also reads its bound call through
+`POST /action-executions/{id}/arguments` (ACTION-EXECUTOR-19). Each transition
+is idempotent for the same fence and payload and returns `409` for a
+conflicting one. A confirmed restore sets `undone_at` and `undone_by`
 (from `requested_by`) and appends audit `confirmed`; a failed or indeterminate
 one appends its code. These routes replace the `confirm-undo` route the ADR
 0121 spike named, so restores and forward actions share one surface.
@@ -749,10 +751,28 @@ connector whose probe recorded the pair (`reserved_verb_via_forward`); a lone
 `agent_actions` row: `dedupe_key` and `call_id` both `exec:<execution id>`,
 tool `mcp__<connector>__<tool>`, the canonical arguments, the authority fields,
 and `connector` and `connector_digest` copied from the execution, status
-`pending`. The outcome completes it with the same snapshot parsing as a model
-turn's call, so a platform-executed forward action is undoable on the same
-terms. Until #4068 delivers authority-aware undo authorization, undo of a
-forward-executed record is refused `refused_authority_unresolved`;
+`pending`, listed under the conversation `action-exec:<execution id>`. The
+outcome completes it with the same snapshot parsing as a model turn's call, so
+a platform-executed forward action is undoable on the same terms.
+
+The receipt (`ExecutionOut`) never carries arguments, so before dispatch the
+worker reads the bound call through `POST /action-executions/{id}/arguments`,
+internal worker token, whose body is exactly the claim's fence. It answers
+`{tool, arguments}` for a `claimed` forward execution only, `409` for a stale
+fence or any other kind or state, and moves nothing. The worker refuses
+`authority_unavailable` when the route will not answer and recomputes
+`arguments_sha256` over the canonical text it will send (ACTION-EXECUTOR-7).
+A forward run is the kill switch, that read, the pinned digest with the tool in
+the caller proxy's gated set, the sandbox, `list` (the tool must be advertised,
+`tool_not_advertised`), the digest again, the kill switch, the `dispatched`
+commit, one grant and one `call` of that tool over that text, then the
+completion through `POST /actions/{id}/complete` under the worker token with the
+execution's `connector` and `connector_digest`, then the outcome. It never runs
+`observe`. A forward tool is an ordinary connector tool: a reply that is not a
+tool error confirms, and a tool error or a structured `ok: false` fails. Until #4068 delivers authority-aware undo authorization, undo of a
+forward-executed record (any record carrying an `authority_kind`) is refused
+`refused_authority_unresolved` with HTTP 409 and one audit row, before the
+authorization check, and the derived `undoable` is false;
 REMEDIATION-14 makes it approval gated, and ADR 0117 decision 3's ungated
 default must not apply.
 

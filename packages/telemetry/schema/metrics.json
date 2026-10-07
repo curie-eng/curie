@@ -421,6 +421,7 @@
         "operation": [
           "/action-executions/claim",
           "/action-executions/{execution_id}",
+          "/action-executions/{execution_id}/arguments",
           "/action-executions/{execution_id}/dispatch",
           "/action-executions/{execution_id}/observation",
           "/action-executions/{execution_id}/outcome",
@@ -578,7 +579,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1128,
+      "cardinality_bound": 1136,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -589,6 +590,7 @@
         "operation": [
           "/action-executions/claim",
           "/action-executions/{execution_id}",
+          "/action-executions/{execution_id}/arguments",
           "/action-executions/{execution_id}/dispatch",
           "/action-executions/{execution_id}/observation",
           "/action-executions/{execution_id}/outcome",
@@ -753,7 +755,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5640,
+      "cardinality_bound": 5680,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -764,6 +766,7 @@
         "operation": [
           "/action-executions/claim",
           "/action-executions/{execution_id}",
+          "/action-executions/{execution_id}/arguments",
           "/action-executions/{execution_id}/dispatch",
           "/action-executions/{execution_id}/observation",
           "/action-executions/{execution_id}/outcome",
@@ -928,7 +931,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5640,
+      "cardinality_bound": 5680,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",
