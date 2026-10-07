@@ -48,15 +48,15 @@ Waves group tasks that can start in parallel once their dependencies merge.
 | **Wave 1** | | | | |
 | 1. Measure the open facts | AR-6, AR-12, AR-15, AR-18 | integration owner | 0 | Recorded, anonymized observations for M1 to M5 below. A fact that contradicts the spec stops the dependent task and returns to the spec. |
 | 2. Shared vectors and parity entries | AR-5, AR-12, AR-17, AR-26 | `tests/vectors` and AGENTS.md (integration owner) | 0 | `remediation-nomination`, `remediation-predicate`, `remediation-policy`, `remediation-codes`, and the `read` phase added to `runner-execute`; failing reader tests on each consuming side; AGENTS.md entries. |
-| 3. Policy store and administration | AR-1, AR-2, AR-3, AR-10 (limit schema), AR-24 (kind rules) | `apps/api` (regenerated `apps/ui` types) | 0 | Migration round trip on real Postgres; CAS, idempotent operation id, immutable generations; every validation refusal; a hook-key-signed write refused `401`; chart and compose `remediation.enabled` render into API and worker, refused with the executor off. |
+| 3. Policy store and administration | AR-1, AR-2, AR-3, AR-10 (limit schema), AR-24 (kind rules) | `apps/api` (regenerated `apps/ui` types) | 0 | Migration round trip on real Postgres; CAS, idempotent operation id, immutable generations; every validation refusal; a hook-key-signed write refused `401`; a write or breaker close without an operator principal refused `operator_principal_required` and the principal recorded as `bound_by`; chart and compose `remediation.enabled` render into API and worker, refused with the executor off. |
 | **Wave 2** | | | | |
-| 4. Policy CLI | AR-3 (CLI), AR-20 (CLI receipt) | `cli` | 2, 3 | `remediation-policy` and `remediation` verb groups under `local` and `cluster`; one JSON object per verb under `--json`; mirrored validation refuses with the API's reason; CLI manifest regenerated. |
+| 4. Policy CLI | AR-3 (CLI), AR-20 (CLI receipt) | `cli` | 2, 3 | `remediation-policy` and `remediation` verb groups under `local` and `cluster`; one JSON object per verb under `--json`; mirrored validation refuses with the API's reason; write verbs present the operator principal from `CURIE_APPROVAL_PRINCIPAL_TOKEN` and refuse without it; CLI manifest regenerated. |
 | 5. Remediation generation at admission | AR-4 | `packages/protected-hooks`, `apps/api` (`apps/api/src/curie_api/routers/hooks.py`), reviewed by the #3603 owner | 3; protected hooks plan task 3 | Intent and envelope carry `remediation_generation` read under the agent gate; an envelope without it refuses automatic execution only; a policy write racing an admission yields either the old or the new generation, never a mix (real Valkey and Postgres). |
 | 6. Nomination route and parser | AR-5, AR-7 | `apps/api` | 2, 3 | Idempotent per `event_id`; `nomination_conflict`, `not_protected_event`, `remediation_disabled`; one row per entry; every parse refusal from the vector. |
 | 7. Read executions | AR-12 | `apps/api` (migration, sample route), `runner` (`read` phase), `apps/worker` (executor loop) | 2; executor task 11 | Pointed scalar only crosses; `tool_not_read_only` without dialing; sandbox released after the last sample and after a crash; vector fails one-sided. |
 | 8. Forward execution with authority, ledger fields and actor | AR-13, AR-14 | `apps/api` with `apps/worker` | 3; executor tasks 11 and 12 | One ledger row per execution with closed `authority_kind`, generation in `authority_ref`, `actor_kind`, delivery and nomination ids; replay creates nothing; legacy rows unchanged; an unknown authority kind violates the check. |
 | **Wave 3** | | | | |
-| 9. Admission, limits, breaker, disarm | AR-8, AR-9, AR-10, AR-11 | `apps/api` | 5, 6, 7, 8 | Table-driven order through real producers; racing last slot yields one execution; injected read failures never execute; breaker closes only through the administrative route; disarm and kill switch take effect between admission and dispatch. |
+| 9. Admission, limits, breaker, disarm | AR-8, AR-9, AR-10, AR-11 | `apps/api` | 5, 6, 7, 8 | Table-driven order through real producers; racing last slot yields one execution; injected read failures never execute; breaker closes only through the administrative route with an operator principal; incident window of one hour after verification, lengthen-only, never read from the alert body; disarm and kill switch take effect between admission and dispatch. |
 | 10. Remediation approvals | AR-15, AR-16 | `apps/api` (purpose, resolution), `apps/worker` (card loop beside the publication loop) | 6, 8 | Bound `granted_arguments`; dedupe attaches; card on the route with existing action ids; approve yields one execution and no resume turn; reject and expiry yield none; tampered arguments refused. |
 | 11. Verifier | AR-17, AR-18 | `apps/api` (evaluator, scheduling), `apps/worker` (sampling loop) | 7, 8 | Four outcomes on a real cluster; settle respected; independence refused at write and at admission; one outcome per record. |
 | 12. Escalation and authority-aware undo | AR-19 | `apps/api` | 8, 10, 11 | Report, breaker and undo approval on any non-`verified`; approval drives one restore under the approving principal; policy and approval records refuse outsiders; no automatic undo path exists (no caller of the ruling without a principal). |
@@ -64,7 +64,7 @@ Waves group tasks that can start in parallel once their dependencies merge.
 | 13. Receipts and telemetry | AR-20, AR-21 | `apps/worker`, `packages/telemetry`, `cli` | 9, 10, 11, 12 | One thread message per stage; metric manifest includes the counter with bounded domains; capture contains no argument, sample, reason or alert text. |
 | 14. Nomination capture in the protected worker | AR-6 | `apps/worker` (protected lane runner client wrapper) | 2, 6; protected hooks plan task 4 | `done` turn submits once and the posted reply has no block; other statuses submit nothing; retries cannot add nominations; off-limits files untouched. |
 | 15. Qualification records | AR-22, AR-23 | `apps/api`, `cli` | 8, 10, 11 | Evidence references checked by state and digest; digest upgrade makes the record stale; verifier-run route accepts no tool or arguments; `automatic` refused without a record. |
-| 16. Tuning and prevention kinds | AR-24, AR-25 | `apps/api`, `apps/worker` (card rendering) | 9, 10 | `prevent` always asks and is verified when approved; one tuning request per recorded series with platform-rendered diff and declared-read evidence; approval ends `tune_execution_undecided` until OR-3 is ruled. |
+| 16. Tuning and prevention kinds | AR-24, AR-25 | `apps/api`, `apps/worker` (card rendering) | 9, 10 | `prevent` always asks and is verified when approved; one tuning request per recorded series with platform-rendered diff and declared-read evidence; approval ends `tune_execution_not_automated` with no write. |
 | **Wave 5** | | | | |
 | 17. Documentation | AR-12, AR-26, AR-27 | docs, `ARCHITECTURE.md`, ACI producer interface (seam owner review), example bundle docs | 7, 13, 14 | The `read` phase listed beside `/v1/execute`; the remediation data path; the nomination block author guide; the qualification drill order; the SRE example's intake guide states the policy boundary honestly. |
 | 18. Complete campaign | all | integration owner | 1 to 17 | On the final artifacts: protected delivery to automatic remediation verified; out-of-bounds to approval to execution verified; `not-recovered` to report, breaker and approved undo; disarm, kill and limits refusals; a recorded duplicate-rule series to one tuning request. |
@@ -211,7 +211,7 @@ and compose files (chart owner).
 
 No task modifies `packages/aci-protocol` or `packages/plugin-format` (AR-27).
 
-## Blockers and open rulings
+## Blockers and maintainer rulings
 
 * **Executor tasks 11 and 12.** Read executions, forward execution and every
   positive runtime row wait for them; executor task 10's digest recording gates
@@ -222,16 +222,15 @@ No task modifies `packages/aci-protocol` or `packages/plugin-format` (AR-27).
 * **Protected envelope schema (task 5).** Adding `remediation_generation` to the
   intent and envelope is an internal schema change reviewed by the #3603 owner;
   it is not a frozen ACI change.
-* **OR-1 incident identity.** Task 9 implements the proposed conservative rule;
-  the default window ships only after the ruling.
-* **OR-2 administrative principal.** Task 3 records the credential class; if the
-  ruling requires an operator principal, task 3 adds the requirement before
-  task 9 merges.
-* **OR-3 tuning execution and verification.** Task 16 ships the request, card and
-  dedupe; execution stays refused `tune_execution_undecided` until the ruling,
-  and a different outcome set or execution path would need a new ADR.
-* **OR-4 predicate grammar.** Tasks 2, 7 and 11 build the closed grammar; a
-  ruling against it stops them.
+* **Maintainer rulings, 2026-10-07.** Settled and carried in the tasks: the
+  incident is a per-target window of one hour after verification that a policy
+  may only lengthen, never derived from the alert body (task 9); policy writes
+  and breaker closes require an ADR 0106 operator principal recorded as the actor
+  (tasks 3, 4 and 9); tuning stops at the nomination and the approval card, and an
+  approved tuning request ends refused with no write (task 16); one JSON pointer
+  and a closed comparator set is the predicate grammar (tasks 2, 7 and 11).
+* **Tuning execution.** Automated rule-owner change requests need a separate
+  Draft ADR; no task here builds an execution path for them.
 * **Frozen contracts.** None needed. AR-27 lists the reviewer requests that would
   become a frozen contract blocker.
 
@@ -255,10 +254,13 @@ tier's evidence or a recorded waiver that keeps the item open. Then:
 * **#4070** closes on tasks 11 and 12.
 * **#4071** closes on task 9's limit, breaker, disarm and kill switch rows.
 * **#4072** closes on task 13.
-* **#4073** closes on task 8's actor fields, after OR-2 is ruled.
-* **#4144** stays open after task 16 until OR-3 is ruled and the tuning execution
-  path is built and verified; its recurrence prevention half is evidenced by
-  task 16 and the campaign.
+* **#4073** closes on task 8's actor fields, including the operator principal on
+  each policy generation.
+* **#4144** closes on task 16 and the campaign's recurrence prevention and tuning
+  rows (one request per series, bound card, approval refused with no write,
+  rejection leaving the rule untouched); automated execution of a tuning change
+  is tracked by the separate Draft ADR the maintainer asked for, not by #4144's
+  closure.
 * **#4074** closes when every issue above is closed. **#3603** is not closed by
   this work.
 

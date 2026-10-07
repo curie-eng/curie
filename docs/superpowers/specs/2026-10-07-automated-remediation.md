@@ -32,11 +32,27 @@ on any outcome other than `verified`, whatever authorized the action
 automatic in the first release (AUTOMATED-REMEDIATION-24); and qualification
 evidence must be observed in the installation that binds the action
 (AUTOMATED-REMEDIATION-23). Each is a tightening the ADR permits ("a policy may
-tighten these, never loosen them"). Three realizations go beyond what the ADR
-text settles and are listed as open rulings under "Open rulings" rather than
-decided here: what identifies an incident, which administrative principal is
-recorded for a policy generation, and how an alert rule tuning change is
-executed and verified. Where realizing a decision meets an existing invariant,
+tighten these, never loosen them").
+
+**Maintainer rulings, 2026-10-07.** The maintainer ruled on the four questions
+this specification raised as open, and the affected criteria carry the rulings
+as decided text:
+
+* **Incident.** "Per incident per target" is a per-target incident window that
+  opens with the first automatic action on a target and stays open for one hour
+  after that action's verification finishes. A policy may only lengthen the
+  window. It is never derived from the alert body (AUTOMATED-REMEDIATION-10).
+* **Administrative principal.** Policy writes and breaker closes require an
+  ADR 0106 operator principal in addition to the administrative credential, and
+  that principal is recorded as the actor (AUTOMATED-REMEDIATION-3, -11, -14).
+* **Alert rule tuning (#4144).** Tuning stops at the nomination and the approval
+  card; an approved tuning request ends refused with no write. Automated
+  rule-owner change requests need a separate Draft ADR later
+  (AUTOMATED-REMEDIATION-25).
+* **Predicate grammar.** One JSON pointer and a closed comparator set is not an
+  expression language under ADR 0007 or ADR 0117 (AUTOMATED-REMEDIATION-17).
+
+Where realizing a decision meets an existing invariant,
 the conflict is stated, not designed around.
 
 ## Evidence labels
@@ -220,7 +236,7 @@ time, checked against `main`) adds:
   with no active generation, as the source policy does.
 * `remediation_policy_generations`: primary key `(agent_id, hook, generation)`;
   `operation_id`, `intent_sha256`, `document JSONB` (the whole policy below),
-  `armed`, `bound_by_credential` (AUTOMATED-REMEDIATION-14), `created_at`. Rows
+  `armed`, `bound_by` (the operator principal, AUTOMATED-REMEDIATION-3), `created_at`. Rows
   are immutable and never deleted while the agent exists, enforced by a trigger
   like the one on `hook_source_operations`, so an earlier generation can always
   be read back.
@@ -264,7 +280,12 @@ Routes under `/agents/{agent_id}/hooks/{hook}/remediation-policy` (`GET`, `PUT`,
 `DELETE`, and `POST .../arm`, `POST .../disarm`, `POST .../breakers/{breaker_id}/close`)
 use the same dependency as the source policy routes,
 `require_api_key` (REMEDIATION-13: "the same trust model as ADR 0190 source
-policy"). Responses carry `Cache-Control: no-store`. The hook ingress, its
+policy"). Every write (`PUT`, `DELETE`, arm, disarm and breaker close) also
+requires an ADR 0106 operator principal, verified as the approval resolve path
+verifies one, and records that principal as the actor on the generation or the
+breaker row (maintainer ruling, 2026-10-07); a write with the administrative
+credential and no principal is refused `operator_principal_required`. Reads need
+no principal. Responses carry `Cache-Control: no-store`. The hook ingress, its
 scoped key, the support probe, the delivery body and the nomination submission
 route have no write path to these tables; a request to the policy routes signed
 with a hook key and no platform credential is refused `401`. Validation is
@@ -273,7 +294,9 @@ mirrored in a new `remediation-policy` verb group under `curie local` and
 `--json`, ADR-0021 exit codes and `{"error","fix"}` errors, following the CLI
 and API validation convention.
 
-Acceptance: a policy write with the platform key creates a generation; the same
+Acceptance: a policy write with the platform key and an operator principal
+creates a generation naming that principal as `bound_by`; the same write without
+a principal is refused `operator_principal_required` and creates nothing; the same
 write carrying only a valid hook source signature returns `401` and creates
 nothing; a delivery body or nomination containing a policy document changes no
 policy row; every CLI verb emits one JSON object under `--json`, refusals
@@ -450,13 +473,13 @@ authorized by the policy, under a transaction-scoped advisory lock keyed by the
 agent and hook, and the reservation is written in the same transaction, so two
 concurrent admissions cannot both take the last slot.
 
-Incident: pending ruling OR-1, the first release realizes "per incident per
-target" without trusting the alert body: an incident on a target opens with the
+Incident (maintainer ruling, 2026-10-07): an incident on a target opens with the
 first automatic action on it and stays open for `incident_window_seconds`
-(default 3600, tighten-only meaning longer) after that action's verification
-finished; while open, a further automatic action on the target is refused to the
-approval path with `incident_limit`. A source fingerprint, if a later decision
-admits one, may only split nothing and merge more.
+(default 3600; a policy may only lengthen it) after that action's verification
+finished. While it is open, a further automatic action on the target goes to the
+approval path with `incident_limit`. The incident is never derived from the alert
+body, a source fingerprint or the nomination; a policy declaring a window below
+the default is refused at write.
 
 Acceptance: a fourth admissible nomination within an hour becomes an approval
 request with `policy_rate_limit`; a second automatic action on one target within
@@ -473,7 +496,7 @@ whether the action ran under the policy or under an approval, and on an
 execution that ended `failed` or `indeterminate`. An open breaker sends every
 later nomination for that action and target to approval. Only the policy's
 administrative routes close it (`POST .../breakers/{breaker_id}/close`), which
-writes the closing credential class and a reason; no nomination, delivery,
+requires an operator principal and records it as the closing actor with a reason; no nomination, delivery,
 verifier or approval closes it. Disarm writes a new generation with `armed`
 false and takes effect for every nomination evaluated after it, including those
 from deliveries admitted earlier (AUTOMATED-REMEDIATION-4). The kill switch is
@@ -484,7 +507,8 @@ dispatch (AE-21), so a kill between admission and dispatch refuses
 Acceptance: a `not-recovered` outcome opens a breaker and the next nomination for
 that action and target becomes an approval request; closing the breaker through
 the hook source key, the worker token or an approval is refused; closing it with
-the platform key re-allows automatic admission; disarming while a nomination is
+the platform key and an operator principal re-allows automatic admission, while
+the platform key alone is refused `operator_principal_required`; disarming while a nomination is
 `precondition_pending` sends it to approval; killing the agent after admission
 yields `agent_stopped` with no write observed at the connector.
 
@@ -556,9 +580,8 @@ Additive columns on `agent_actions`: `delivery_event_id`, `nomination_id`,
 `approval`, `qualification` and null (null only for rows a model turn recorded).
 Every executed remediation produces exactly one ledger record whose authority is
 a policy generation or an approval (REMEDIATION-6). The record and its audit rows
-name: the policy and generation, the credential class that bound that generation
-(pending ruling OR-2: `platform_key` or `console_session` today, since neither
-dependency yields a principal), the source delivery's `event_id`, the
+name: the policy and generation, the operator principal that bound that
+generation (maintainer ruling, 2026-10-07), the source delivery's `event_id`, the
 precondition and verifier read execution ids, and the outcome. A policy actor is
 represented as `actor_kind` `policy` with the policy reference as `actor`, never
 as an empty human field (#4073, extending #3653).
@@ -626,7 +649,9 @@ for `in`, a list of at most 16 scalars), and for a verifier `settle_seconds`,
 least 10) and `consecutive` (at least 1, default 1). Numeric comparison applies
 only when both sides are JSON numbers; otherwise only `eq`, `ne` and `in` apply,
 by exact string comparison. There are no functions, arithmetic, variables or
-nesting (pending ruling OR-4 on ADR 0007's boundary). Independence
+nesting; the maintainer ruled on 2026-10-07 that this closed form is not an
+expression language under ADR 0007 or ADR 0117, and anything richer needs a new
+decision. Independence
 (REMEDIATION-15) is checked at policy write and again at admission against the
 in-force version: the verifier's connector differs from the acting connector,
 and the set of secret names the verifier connector's MCP headers expand is
@@ -804,15 +829,17 @@ alert resolved without action) comes only from reads the action declares; any
 model-supplied figure is shown as unverified model text. Dedupe by the canonical
 change (AUTOMATED-REMEDIATION-15) makes a recurring series produce one request.
 Rejection or expiry leaves the rule untouched and records it. Approved execution
-is blocked on pending ruling OR-3: until it is decided, an approved `tune`
-request ends `refused` with `tune_execution_undecided`, with no write call, and
-the receipt says so.
+stops at the approval (maintainer ruling, 2026-10-07): an approved `tune` request
+ends `refused` with `tune_execution_not_automated`, with no write call, and the
+receipt says so. Automated rule-owner change requests (for example a change
+request to the repository that holds the rules) need a separate Draft ADR before
+any execution path is built.
 
 Acceptance: a recorded alert series with a duplicate rule, replayed as
 deliveries, produces exactly one tuning approval request whose card shows the
 platform-rendered diff and the declared-read evidence; a nomination naming an
 undeclared rule or field is refused `arguments_schema_mismatch`; approval
-produces `tune_execution_undecided` and no write; rejection changes nothing.
+produces `tune_execution_not_automated` and no write; rejection changes nothing.
 
 ## Cross-image seams and frozen contracts
 
@@ -856,35 +883,6 @@ a frozen contract change that lands as its own reviewed PR first.
 Acceptance: the wire lock, the ACI schema compatibility test and the
 plugin-format schema export are unchanged by every realizing PR.
 
-## Open rulings
-
-These need the maintainer's decision; the criteria that depend on them say so.
-
-* **OR-1. What identifies an incident.** ADR 0203 limits automatic actions "per
-  incident per target", but the platform has no incident identity and any alert
-  fingerprint is untrusted body content. AUTOMATED-REMEDIATION-10 proposes the
-  conservative realization (a per-target incident window opened by the first
-  automatic action, default one hour after verification, tighten-only) and
-  needs confirmation of that rule and its default.
-* **OR-2. The administrative principal on a policy generation.** The ADR's audit
-  clause names "the administrator principal who bound that generation", but the
-  administrative dependency REMEDIATION-13 selects yields no principal. Either
-  accept the credential class as the recorded identity (proposed for the first
-  release), or require an ADR 0106 operator principal alongside the
-  administrative credential for policy writes and breaker closes.
-* **OR-3. Executing and verifying an alert rule change.** #4144 asks that an
-  approved rule change go through the rules' owner (for example a change request
-  to the repository that holds them), not a cluster write. Whether a rule-owner
-  connector verb that opens a change request is a forward action under
-  REMEDIATION-5, and what `verified` means for it (the live rule observed changed
-  through a distinct read before a deadline long enough for a person to merge, or
-  a different outcome set), is not settled by ADR 0203's recovery definition. A
-  different outcome set or a non-connector execution path would need a new ADR.
-* **OR-4. The predicate grammar.** AUTOMATED-REMEDIATION-17 keeps the verifier a
-  single pointer, a closed comparator and a literal. Confirm this is not the
-  expression language ADR 0007 and ADR 0117 keep out; anything richer needs a
-  decision first.
-
 ## Out of scope for the first release
 
 * Composite or multi-step actions; one nomination is one write call.
@@ -901,6 +899,8 @@ These need the maintainer's decision; the criteria that depend on them say so.
 * A console surface for policies or nominations; the CLI is the operator surface
   and no console action is added, so the console parity map gains no entry.
 * Importing qualification evidence from another installation.
+* Executing an approved alert rule tuning change, including automated change
+  requests to the rules' owner; a separate Draft ADR decides it later.
 
 ## Acceptance commands
 
