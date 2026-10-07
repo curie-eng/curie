@@ -36,7 +36,9 @@ from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
+    WorkItemRequestView,
     WorkItemStartGrant,
+    WorkItemTransportError,
 )
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
@@ -110,11 +112,20 @@ class _Workspace:
 class _WorkItems:
     """Dispatch double: records every finish the worker posts."""
 
-    def __init__(self, *, deadline_s: float = 3600.0) -> None:
+    def __init__(
+        self,
+        *,
+        deadline_s: float = 3600.0,
+        request_reads: list[str | float | BaseException] | None = None,
+    ) -> None:
         self.deadline_s = deadline_s
         self.calls: list[str] = []
         self.finishes: list[dict[str, object]] = []
         self.after_finish: Callable[[], Awaitable[None]] | None = None
+        # What each ``get_request`` answers, in order: a status, or an error to
+        # raise, or a number of seconds to hang before reading as ``running``.
+        # Once exhausted, the request reads as ``running``.
+        self.request_reads = list(request_reads or [])
 
     async def acquire(
         self, request_id: uuid.UUID, *, owner: str, generation: int
@@ -145,6 +156,21 @@ class _WorkItems:
 
     async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
         return "acme widgets issue 7", f"wir.capability-for-{request_id}"
+
+    async def get_request(self, _request_id: uuid.UUID) -> WorkItemRequestView:
+        self.calls.append("get_request")
+        read = self.request_reads.pop(0) if self.request_reads else "running"
+        if isinstance(read, BaseException):
+            raise read
+        if isinstance(read, float):
+            await asyncio.sleep(read)
+            read = "running"
+        return WorkItemRequestView(
+            status=read,
+            runtime_epoch=1,
+            runtime_claim_name=None,
+            runtime_sandbox_name=None,
+        )
 
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         async def record(*_args: object, **_kwargs: object) -> None:
@@ -921,5 +947,156 @@ def test_a_continuation_the_runner_refuses_keeps_the_runner_failure(make_harness
             assert finish["outcome"] == "failed"
             assert finish["cause"] not in {"early_stop", "no_pull_request"}
             assert finish["cause"] in {"runner_failed", "runner_escalated"}
+
+    asyncio.run(exercise())
+
+
+# --- #4191: a cancelled request is not re-prompted or flagged -----------------------
+
+
+class _CountingPrecheckApi(_PublicationApi):
+    """Counts precheck-context reads; raises from read ``fail_from`` (1-based) on."""
+
+    def __init__(self, *, fail_from: int | None = None) -> None:
+        super().__init__()
+        self.prechecks = 0
+        self.fail_from = fail_from
+
+    async def get_publication_precheck_context(self, **_kwargs: object) -> None:
+        from curie_worker.approvals import ApprovalBackendError
+
+        self.prechecks += 1
+        if self.fail_from is not None and self.prechecks >= self.fail_from:
+            raise ApprovalBackendError("publication precheck context failed: HTTP 409")
+        return None
+
+
+# The first turn worked (Bash) and never published, so the continuation, when it
+# opens, carries the unpublished prompt.
+WORKED_TURN: list[OutboundEvent] = [_tool("Bash"), _done("Edited the parser.")]
+
+
+def _continuation_noise(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if "continuation failed to start" in r.getMessage() or "escalating event" in r.getMessage()
+    ]
+
+
+def test_a_cancelled_request_is_not_continued(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#4191 AC3: the request reads ``cancellation_requested`` before the
+    continuation, so it is skipped: no second turn, no precheck, no flag."""
+
+    caplog.set_level("INFO", logger="curie_worker.kernel")
+
+    async def exercise() -> None:
+        publications = _CountingPrecheckApi()
+        opened, items, _ = await _run_execute(
+            make_harness,
+            [WORKED_TURN, [_done("a continuation must not open")]],
+            work_items=_WorkItems(request_reads=["cancellation_requested"]),
+            publication_creator=publications,
+        )
+
+        assert opened == [ISSUE_PROMPT]
+        # The one precheck read is the first turn's own; the continuation made none.
+        assert publications.prechecks == 1
+        assert items.calls.count("get_request") == 1
+        assert _continuation_noise(caplog) == []
+        assert any(
+            "work-item continuation skipped" in r.getMessage()
+            and "cancellation_requested" in r.getMessage()
+            for r in caplog.records
+        )
+
+    asyncio.run(exercise())
+
+
+def test_a_cancel_landing_during_the_continuation_precheck_stops_quietly(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#4191 AC4: the request was running at the first read, the cancel landed
+    before the precheck, and the precheck was refused. The continuation stops
+    without a traceback or a flag."""
+
+    caplog.set_level("INFO", logger="curie_worker.kernel")
+
+    async def exercise() -> None:
+        publications = _CountingPrecheckApi(fail_from=2)
+        opened, items, _ = await _run_execute(
+            make_harness,
+            [WORKED_TURN, [_done("a continuation must not open")]],
+            work_items=_WorkItems(request_reads=["running", "cancellation_requested"]),
+            publication_creator=publications,
+        )
+
+        assert opened == [ISSUE_PROMPT]
+        assert publications.prechecks == 2
+        assert items.calls.count("get_request") == 2
+        continuation_records = [r for r in caplog.records if "continuation" in r.getMessage()]
+        assert continuation_records
+        assert all(r.exc_info is None for r in continuation_records)
+        assert _continuation_noise(caplog) == []
+        assert any(
+            "work-item continuation stopped" in r.getMessage()
+            and "cancellation_requested" in r.getMessage()
+            for r in caplog.records
+        )
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    "case", ["read_unreachable", "read_hangs", "running", "running_precheck_fails"]
+)
+def test_a_running_or_unreadable_request_continues_as_before(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, case: str
+) -> None:
+    """#4191 AC5: an unreadable or running request continues exactly as before;
+    a running request whose precheck fails is still today's runner failure."""
+
+    from curie_worker.kernel import _UNPUBLISHED_PROMPT
+
+    caplog.set_level("INFO", logger="curie_worker.kernel")
+    reads: list[str | float | BaseException] = []
+    if case == "read_unreachable":
+        reads = [WorkItemTransportError("work-item dispatch endpoint is unreachable")]
+    elif case == "read_hangs":
+        monkeypatch.setattr("curie_worker.kernel._REQUEST_STATUS_READ_TIMEOUT_S", 0.05)
+        reads = [30.0]
+
+    async def exercise() -> None:
+        publications = _CountingPrecheckApi(
+            fail_from=2 if case == "running_precheck_fails" else None
+        )
+        opened, items, _ = await _run_execute(
+            make_harness,
+            [WORKED_TURN, [_done("Still not publishing.")]],
+            work_items=_WorkItems(request_reads=reads),
+            publication_creator=publications,
+        )
+
+        if case == "running_precheck_fails":
+            assert opened[0] == ISSUE_PROMPT
+            assert any(
+                "continuation failed to start" in r.getMessage() and r.exc_info is not None
+                for r in caplog.records
+            )
+            escalations = [
+                r.getMessage() for r in caplog.records if "escalating event" in r.getMessage()
+            ]
+            assert any("runner-error" in text for text in escalations), escalations
+            assert len(items.finishes) == 1
+            assert items.finishes[0]["cause"] in {"runner_failed", "runner_escalated"}
+        else:
+            assert len(opened) == 2
+            assert opened[0] == ISSUE_PROMPT
+            assert _UNPUBLISHED_PROMPT in opened[1]
+            assert len(items.finishes) == 1
+            assert items.finishes[0]["cause"] == "no_pull_request"
+            assert items.finishes[0]["detail"] == "Still not publishing."
 
     asyncio.run(exercise())
