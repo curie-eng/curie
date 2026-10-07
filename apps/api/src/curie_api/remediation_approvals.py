@@ -119,7 +119,7 @@ def _connector_tool(action: Mapping[str, Any] | None) -> tuple[str, str] | None:
     return connector, tool
 
 
-def _ttl_seconds(document: Mapping[str, Any]) -> int:
+def approval_ttl_seconds(document: Mapping[str, Any]) -> int:
     limits = document.get("limits")
     value = limits.get("approval_ttl_seconds") if isinstance(limits, Mapping) else None
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
@@ -127,7 +127,7 @@ def _ttl_seconds(document: Mapping[str, Any]) -> int:
     return APPROVAL_TTL_SECONDS_DEFAULT
 
 
-def _card_channel(agent: Agent | None, route: str | None) -> str | None:
+def route_card_channel(agent: Agent | None, route: str | None) -> str | None:
     """The route's fixed resolution address, or None for the requesting surface."""
 
     routes = agent.approval_routes if agent is not None else None
@@ -300,10 +300,10 @@ async def request_remediation_approval(
             reply_endpoint=handle.endpoint,
             reply_adapter=handle.adapter,
             route=route,
-            card_channel=_card_channel(agent, route),
+            card_channel=route_card_channel(agent, route),
             dedupe_key=dedupe_key(nomination.id),
             status=ApprovalStatus.pending,
-            expires_at=func.now() + timedelta(seconds=_ttl_seconds(document)),
+            expires_at=func.now() + timedelta(seconds=approval_ttl_seconds(document)),
             granted_tool=granted_tool(connector, tool),
             granted_arguments=arguments,
             purpose=REMEDIATION_PURPOSE,
