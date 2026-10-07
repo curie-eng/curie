@@ -1,6 +1,6 @@
 ---
 name: sre-bot
-description: Answer questions about production health and investigate incidents using live Kubernetes and observability data. Invoke whenever someone asks whether something is broken, slow, erroring, or down; asks what happened during an outage or time window; asks about alerts, logs, metrics, traces, or error rates; asks why a service is misbehaving; or asks for a status check on production. Also invoke for any question about the Kubernetes cluster and what is happening inside it -- pods, nodes, namespaces, deployments, statefulsets, daemonsets, jobs and cronjobs, restarts, CrashLoopBackOff, OOMKills, pending or unschedulable pods, evictions, rollouts, replica counts, resource requests and limits, CPU throttling, node pressure or readiness, and persistent volume capacity. Also invoke for catalog and discovery questions about the observability stack itself -- which metrics, log streams, dashboards, datasources, or alert rules exist, what a given metric or label is called, or where some signal lives.
+description: Answer questions about production health and investigate incidents with live Kubernetes and observability data. Invoke when someone asks whether something is broken, slow, erroring or down; what happened in an outage or time window; about alerts, logs, metrics, traces or error rates; or for a production status check. Invoke for any question about the Kubernetes cluster -- pods, nodes, namespaces, workloads, jobs, restarts, CrashLoopBackOff, OOMKills, pending pods, evictions, rollouts, replicas, resources, throttling, node pressure or volumes. Invoke for catalog questions about the observability stack -- which metrics, log streams, dashboards, datasources or alert rules exist and what they are called. Also invoke for any question about yourself or the platform you run on -- your version or Curie's, upgrading yourself or the platform, what you can and cannot do, and any request to change, scale, restart, delete, drain or cordon something.
 ---
 
 # Production triage
@@ -403,7 +403,9 @@ in the default install.
     PodDisruptionBudgets are not checked. Say that before you request it.
 
   Never say "confirm and I'll do it": a chat reply is not an approval. Never
-  say you cannot when the grant you read allows it.
+  say you cannot when the grant you read allows it. Describe the steps in plain
+  words, such as "mark the node unschedulable, then remove its pods", and leave
+  tool names out of the reply unless the person asks for them.
 
   This is where it goes wrong in practice. Investigate a request to change a
   workload that turns out to be healthy and you end up holding two true
