@@ -29,7 +29,7 @@ from curie_worker.sandbox import (
     SuspendedThreadError,
     UnschedulableClaimError,
 )
-from curie_worker.sandbox.k8s import _claim_view
+from curie_worker.sandbox.k8s import KubernetesSandboxClient, _claim_view
 
 from .conftest import FakeClaim, FakeSandbox, FakeSandboxClient
 
@@ -330,6 +330,177 @@ def test_claim_timeout_cleans_up_claim(
     # The unbound claim is not leaked and no route was recorded.
     assert fake_k8s.deleted == fake_k8s.created
     assert affinity.get("T1") is None
+
+
+class _RunnerLogSandboxClient(FakeSandboxClient, KubernetesSandboxClient):
+    """Fake the Kubernetes control plane while retaining its substrate gate."""
+
+    def __init__(self, tail: str | None, *, reported_pod: str | None = None) -> None:
+        FakeSandboxClient.__init__(self, bind_ready=False)
+        self.tail = tail
+        self.reported_pod = reported_pod
+        self.log_reads: list[tuple[str, float]] = []
+        self.diagnostic_order: list[str] = []
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        view = super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
+        if view is not None and not view.ready:
+            return replace(view, sandbox_name=self.reported_pod)
+        return view
+
+    def pod_log_tail(self, name: str, *, request_timeout_seconds: float) -> str | None:
+        assert self.claims, "capture must precede claim deletion"
+        self.log_reads.append((name, request_timeout_seconds))
+        self.diagnostic_order.append("tail")
+        return self.tail
+
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        self.diagnostic_order.append("delete")
+        super().delete_claim(name, request_timeout_seconds=request_timeout_seconds)
+
+
+@pytest.mark.parametrize("reported_pod", [None, "runner-pod"], ids=["claim-name", "sandbox-name"])
+def test_claim_timeout_logs_one_redacted_runner_tail_before_cleanup(
+    reported_pod: str | None,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    tail = "runner boot marker\nAuthorization: Bearer fixture-private-value\nTraceback: boot died"
+    fake_k8s = _RunnerLogSandboxClient(tail, reported_pod=reported_pod)
+    fake_k8s.ready_reason = "ReconcilerError"
+    fake_k8s.ready_message = "runner never became Ready"
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.025)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        with pytest.raises(ClaimTimeoutError) as excinfo:
+            substrate.claim("T-runner-log")
+
+    assert type(excinfo.value) is ClaimTimeoutError
+    claim_name = fake_k8s.created[0]
+    pod_name = reported_pod or claim_name
+    assert fake_k8s.log_reads == [(pod_name, 5.0)]
+    assert fake_k8s.diagnostic_order == ["tail", "delete"]
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "curie_worker.sandbox.substrate" and record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert warnings[0].getMessage() == (
+        f"runner log tail for claim {claim_name} pod {pod_name}:\n"
+        "runner boot marker\nAuthorization: [REDACTED:bearer_token]\nTraceback: boot died"
+    )
+    assert "fixture-private-value" not in caplog.text
+    message = str(excinfo.value)
+    assert "ReconcilerError" in message
+    assert "runner never became Ready" in message
+    assert "runner boot marker" not in message
+    assert "Traceback" not in message
+    assert "fixture-private-value" not in message
+    assert fake_k8s.deleted == fake_k8s.created
+    assert affinity.get("T-runner-log") is None
+
+
+@pytest.mark.parametrize("tail", [None, ""], ids=["api-error", "empty-output"])
+def test_claim_timeout_without_runner_output_keeps_the_original_failure(
+    tail: str | None,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_k8s = _RunnerLogSandboxClient(tail)
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.025)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        with pytest.raises(ClaimTimeoutError) as excinfo:
+            substrate.claim("T-no-runner-log")
+
+    assert type(excinfo.value) is ClaimTimeoutError
+    assert "no Ready condition was observed" in str(excinfo.value)
+    assert fake_k8s.log_reads == [(fake_k8s.created[0], 5.0)]
+    assert "runner log tail" not in caplog.text
+    assert fake_k8s.deleted == fake_k8s.created
+
+
+@pytest.mark.parametrize("failure", ["quota", "unschedulable"])
+def test_capacity_claim_failure_never_reads_runner_log(
+    failure: str,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_k8s = _RunnerLogSandboxClient("must not be read")
+    expected: type[SandboxError]
+    if failure == "quota":
+        fake_k8s.quota_rejection = QuotaRejection(
+            quota_name="curie-sandbox-quota",
+            requested={"pods": "1"},
+            used={"pods": "1"},
+            hard={"pods": "1"},
+        )
+        expected = CapacityExhaustedError
+    else:
+        fake_k8s.unschedulable_message = "0/1 nodes are available: 1 Insufficient cpu."
+        expected = UnschedulableClaimError
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.025)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        with pytest.raises(expected):
+            substrate.claim("T-capacity-no-log")
+
+    assert fake_k8s.log_reads == []
+    assert "runner log tail" not in caplog.text
+    assert fake_k8s.diagnostic_order == ["delete"]
+    assert fake_k8s.deleted == fake_k8s.created
+
+
+def test_ready_kubernetes_claim_never_reads_runner_log(
+    affinity: AffinityStore, config: SubstrateConfig, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake_k8s = _RunnerLogSandboxClient("must not be read")
+    fake_k8s.bind_ready = True
+    substrate = SandboxSubstrate(fake_k8s, affinity, config)
+
+    with caplog.at_level(logging.WARNING, logger="curie_worker.sandbox.substrate"):
+        handle = substrate.claim("T-ready-no-log")
+
+    assert handle.sandbox_name in fake_k8s.sandboxes
+    assert fake_k8s.log_reads == []
+    assert "runner log tail" not in caplog.text
+    assert affinity.get("T-ready-no-log") == RouteRecord(handle=handle)
+
+
+def test_non_kubernetes_timeout_does_not_request_runner_log(
+    fake_k8s: FakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_k8s.bind_ready = False
+
+    def forbidden_log_read(name: str, *, request_timeout_seconds: float) -> str | None:
+        raise AssertionError("non-Kubernetes substrate attempted a runner log read")
+
+    monkeypatch.setattr(fake_k8s, "pod_log_tail", forbidden_log_read, raising=False)
+    substrate = SandboxSubstrate(
+        fake_k8s, affinity, replace(config, claim_timeout_seconds=0.025)
+    )
+
+    with pytest.raises(ClaimTimeoutError) as excinfo:
+        substrate.claim("T-other-substrate-no-log")
+
+    assert type(excinfo.value) is ClaimTimeoutError
+    assert fake_k8s.deleted == fake_k8s.created
 
 
 def test_quota_rejection_fails_promptly_and_cleans_up_claim(

@@ -32,6 +32,9 @@
 # negative controls. Every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from
 # the chart-owned runner token Secret and nothing renders the tokenless dev flag.
 #
+# Issue #4171 (runner boot failure log capture), Assertion 20 and its negative
+# controls. The worker gets exactly one read-only pods/log rule for diagnosis.
+#
 # Issue #1109/#1124 (the API's outbound GitHub credential), Assertion 12 and its
 # negative control. api.githubToken is the one OPTIONAL credential in the
 # Secret, so it is a deliberate plain pass-through rather than a
@@ -3110,7 +3113,71 @@ if check_runner_token "$MUTANT_19C" present "19c: tokenless dev flag injected" 2
 fi
 echo "  ok: 19c a runner template carrying the tokenless dev flag is rejected"
 
-echo "=== Assertion 20: API metadata CI policy renders from its chart value (#4162) ==="
+echo "=== Assertion 20: worker runner log capture grants only namespaced pods/log get (#4171) ==="
+assert_worker_log_rule() {
+  python3 - "$1" <<'PYEOF'
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as source:
+    roles = [
+        doc for doc in yaml.safe_load_all(source)
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Role"
+        and (doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component")) == "worker"
+    ]
+if len(roles) != 1:
+    sys.exit(f"worker pods/log rule requires one worker Role, got {len(roles)}")
+log_rules = [
+    rule for rule in roles[0].get("rules") or []
+    if set(rule.get("apiGroups") or []) & {"", "*"}
+    and set(rule.get("resources") or []) & {"pods/log", "*/log", "*"}
+]
+expected = {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]}
+if log_rules != [expected]:
+    sys.exit(f"worker pods/log rule must grant only namespaced get: {log_rules}")
+print("  ok: worker grants exactly namespaced get on pods/log")
+PYEOF
+}
+WORKER_LOG_RENDER="$TMP/worker-log-tail.yaml"
+helm template acme "$CHART" --namespace acme \
+  --show-only templates/worker.yaml > "$WORKER_LOG_RENDER"
+assert_worker_log_rule "$WORKER_LOG_RENDER" \
+  || fail "worker runner log capture requires only namespaced get on pods/log."
+
+echo "=== Assertion 20 negative controls: absent and broader pods/log rules FAIL ==="
+for case_name in absent broader; do
+  mutant_chart="$TMP/worker-log-tail-$case_name"
+  cp -a "$CHART" "$mutant_chart"
+  python3 - "$mutant_chart/templates/worker.yaml" "$case_name" <<'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text()
+rule = '  - apiGroups: [""]\n    resources: ["pods/log"]\n    verbs: ["get"]\n'
+if source.count(rule) != 1:
+    sys.exit("worker log negative control requires exactly one pods/log get rule")
+replacement = "" if sys.argv[2] == "absent" else rule.replace(
+    'verbs: ["get"]', 'verbs: ["get", "list"]'
+)
+path.write_text(source.replace(rule, replacement))
+PYEOF
+  mutant_render="$TMP/worker-log-tail-$case_name.yaml"
+  helm template acme "$mutant_chart" --namespace acme \
+    --show-only templates/worker.yaml > "$mutant_render"
+  negative_output=""
+  if negative_output="$(assert_worker_log_rule "$mutant_render" 2>&1)"; then
+    fail "worker log negative control $case_name passed the pods/log rule assertion."
+  fi
+  if [[ "$negative_output" != *"worker pods/log rule must grant only namespaced get"* ]]; then
+    fail "worker log negative control $case_name failed unexpectedly: $negative_output"
+  fi
+  echo "  ok: $case_name worker pods/log rule is rejected"
+done
+
+echo "=== Assertion 21: API metadata CI policy renders from its chart value (#4162) ==="
 python3 - "$CHART" "$TMP/reuse-render/curie/templates/api.yaml" <<'PYEOF'
 import json
 import pathlib

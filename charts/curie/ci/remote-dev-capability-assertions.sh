@@ -108,17 +108,18 @@ for workload in [doc for doc in docs if doc.get("kind") == "Deployment" and doc 
 
 
 # Publication authority lives only in the dedicated namespace Role. The main
-# worker Role remains free of publication resources.
+# worker Role remains free of publication resources except its read-only
+# runner boot diagnosis log grant (#4171).
 worker_role = one("Role", component="worker")
 worker_resources = {
     resource
     for rule in worker_role.get("rules") or []
     for resource in rule.get("resources") or []
 }
-if worker_resources & {"jobs", "configmaps", "secrets", "pods/log"}:
+if worker_resources & {"jobs", "configmaps", "secrets"}:
     fail(f"main worker Role carries publication authority: {sorted(worker_resources)}")
 # The one pod grant is the exact-name read an unschedulable claim needs
-# (#3169); publication's pod authority is list plus pods/log.
+# (#3169); publication's pod discovery authority remains list.
 pod_verbs = {
     verb
     for rule in worker_role.get("rules") or []
@@ -127,6 +128,14 @@ pod_verbs = {
 }
 if pod_verbs - {"get"}:
     fail(f"main worker Role grants pods beyond get: {sorted(pod_verbs)}")
+log_rules = [
+    rule
+    for rule in worker_role.get("rules") or []
+    if set(rule.get("apiGroups") or []) & {"", "*"}
+    and set(rule.get("resources") or []) & {"pods/log", "*/log", "*"}
+]
+if log_rules != [{"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]}]:
+    fail(f"main worker Role must grant namespaced pods/log get only: {log_rules}")
 event_rules = [
     rule
     for rule in worker_role.get("rules") or []
