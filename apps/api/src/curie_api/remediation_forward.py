@@ -67,6 +67,9 @@ POLICY_AUTHORITY: Final = "policy"
 APPROVAL_AUTHORITY: Final = "approval"
 
 _UNAVAILABLE: Final = "authority_unavailable"
+# @spec AUTOMATED-REMEDIATION-25: a tune action has no forward execution.
+_TUNE_KIND: Final = "tune"
+_TUNE_EXECUTION_NOT_AUTOMATED: Final = "tune_execution_not_automated"
 _DIGEST = re.compile(DIGEST_PATTERN)
 
 
@@ -242,7 +245,8 @@ async def create_remediation_forward(
     policy and the nomination must be ``admitted``; with it, the nomination
     must be ``approved`` under exactly that approval. Commits on success and
     records the execution on the nomination. Raises ``ForwardRefused`` having
-    written nothing.
+    written nothing. A ``tune`` action is always refused
+    ``tune_execution_not_automated`` (@spec AUTOMATED-REMEDIATION-25).
     """
 
     nomination = await session.scalar(
@@ -284,6 +288,14 @@ async def create_remediation_forward(
     declared = (
         declared_action(generation.document, nomination.action) if generation is not None else None
     )
+    if declared is not None and declared.get("kind") == _TUNE_KIND:
+        # AUTOMATED-REMEDIATION-25 (maintainer ruling, 2026-10-07): no write
+        # path exists for an alert rule tuning request under any authority.
+        raise await _refuse(
+            session,
+            _TUNE_EXECUTION_NOT_AUTOMATED,
+            "an alert rule tuning request is never executed",
+        )
     connector = declared.get("connector") if declared is not None else None
     tool = declared.get("tool") if declared is not None else None
     if not isinstance(connector, str) or not isinstance(tool, str):
