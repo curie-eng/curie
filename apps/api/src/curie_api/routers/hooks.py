@@ -694,7 +694,11 @@ async def _ingest_protected(
                     remediation_generation=remediation_generation,
                     # AUTOMATED-REMEDIATION-6, -15: the binding names the turn's
                     # reply surface, which a remediation approval is raised on.
-                    record_reply_handle=settings.remediation_enabled,
+                    # Only for a hook with a bound policy, like the generation:
+                    # an unbound hook keeps the released key sets (rollback).
+                    record_reply_handle=(
+                        settings.remediation_enabled and remediation_generation is not None
+                    ),
                 )
             except ValueError:
                 raise HTTPException(
