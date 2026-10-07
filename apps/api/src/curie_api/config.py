@@ -502,6 +502,14 @@ class Settings(BaseSettings):
             "WORK_ITEM_BACKOFF_MAX_SECONDS",
         ),
     )
+    work_item_start_deferral_limit: int = Field(
+        default=5,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_START_DEFERRAL_LIMIT",
+            "WORK_ITEM_START_DEFERRAL_LIMIT",
+        ),
+    )
     work_item_terminate_retry_seconds: int = Field(
         default=30,
         gt=0,

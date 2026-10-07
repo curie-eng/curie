@@ -230,6 +230,7 @@ async def defer_work_item_request(
     return {
         "dispatch_generation": result.dispatch_generation,
         "not_before": result.not_before,
+        "terminal_cause": result.terminal_cause,
     }
 
 

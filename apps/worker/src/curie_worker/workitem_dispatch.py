@@ -227,8 +227,14 @@ class WorkItemDispatchClient:
         reason: str,
         capacity: bool,
         budget_s: float = DEFAULT_BUDGET_S,
-    ) -> None:
-        await self._post_settlement(
+    ) -> str | None:
+        """Defer the request; return its terminal cause if the deferral ended it.
+
+        A non-capacity deferral past the start limit settles the request
+        ``failed`` instead of rescheduling it (#4170).
+        """
+
+        body = await self._post_settlement(
             f"/v1/internal/work-items/requests/{request_id}/defer",
             {
                 "owner": owner,
@@ -238,6 +244,12 @@ class WorkItemDispatchClient:
             },
             budget_s=budget_s,
         )
+        cause = body.get("terminal_cause")
+        if cause is None:
+            return None
+        if not isinstance(cause, str) or not cause:
+            raise WorkItemTransportError("work-item defer returned an unusable body")
+        return cause
 
     async def start(
         self,
@@ -584,7 +596,7 @@ class WorkItemRun:
         self._stopping = False
 
     async def defer(self, reason: str, *, capacity: bool) -> None:
-        await self._client.defer(
+        terminal_cause = await self._client.defer(
             self.request_id,
             owner=self.owner,
             generation=self.generation,
@@ -592,6 +604,14 @@ class WorkItemRun:
             capacity=capacity,
             budget_s=self._write_budget_s(),
         )
+        if terminal_cause is not None:
+            # #4170: the deferral ended the request (start_failed). As in
+            # #3208, an unstarted request gets no terminate wake, so count the
+            # run as settled and let this delivery release its sandbox claim
+            # instead of holding quota until the route TTL lapses. A deferral
+            # that leaves the request waiting keeps the claim for the next
+            # acquire of this thread to adopt.
+            self.finished = True
 
     async def start(self, *, claim_name: str, sandbox_name: str) -> WorkItemStartGrant:
         grant = await self._client.start(

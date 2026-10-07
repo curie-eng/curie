@@ -127,6 +127,7 @@ _CAUSE_TEXT = {
     "no_pull_request": "the run ended without publishing a pull request.",
     "execution_deadline": "the run did not finish before its deadline.",
     "capacity_wait_expired": "no runner capacity came free before the wait expired.",
+    "start_failed": "the sandbox did not start.",
     "owner_lost": "the worker running this request stopped responding.",
     "issue_cancelled": "the request was cancelled.",
     "publication_denied": "a person denied the request to open the pull request.",
@@ -296,6 +297,12 @@ def cause_text(cause: str) -> str:
     """A plain sentence for a terminus cause; unknown codes get a generic one."""
 
     return _CAUSE_TEXT.get(cause, "the run stopped for a reason Curie did not recognize.")
+
+
+def start_failed_sentence(attempts: int, reason: str) -> str:
+    """The ``start_failed`` sentence naming the attempt count and last reason (#4170)."""
+
+    return f"the sandbox did not start after {attempts} attempts. Last reason: {reason}."
 
 
 def marker_for(request_id: uuid.UUID) -> str:
@@ -491,15 +498,22 @@ def result_section(
                     "cannot identify which limit from the reported detail. "
                     "Check the agent's configured budget, then retry."
                 )
+        if cause == "start_failed" and detail is not None and detail.strip():
+            # Curie writes this sentence (#4170), but it quotes the worker's
+            # deferral reason: one line, and no HTML comment opener.
+            sentence = _inert_line(detail)
         text = f"Could not complete: {sentence}\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
         elif cause == "approval_create_failed" and detail is not None and detail.strip():
             # The API refusal can quote caller-supplied paths (#3617): one line,
             # so it cannot add a ``Cause:`` line, and no HTML comment opener.
-            inert = _break_html_comments(" ".join(detail.split()))
-            text += f"Details: {inert}\n"
-        elif cause != "history_capacity" and detail is not None and detail.strip():
+            text += f"Details: {_inert_line(detail)}\n"
+        elif (
+            cause not in {"history_capacity", "start_failed"}
+            and detail is not None
+            and detail.strip()
+        ):
             label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
@@ -513,6 +527,10 @@ def result_section(
 
 def _break_html_comments(text: str) -> str:
     return text.replace("<!--", "<\u200b!--")
+
+
+def _inert_line(text: str) -> str:
+    return _break_html_comments(" ".join(text.split()))
 
 
 def _agent_message_block(message: str) -> str:
