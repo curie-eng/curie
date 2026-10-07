@@ -8461,6 +8461,85 @@
         "title": "QueuedTurn",
         "type": "object"
       },
+      "RemediationNominationAccepted": {
+        "additionalProperties": false,
+        "description": "The event's accepted submission: its nominations in block order.\n\n@spec AUTOMATED-REMEDIATION-6 @spec AUTOMATED-REMEDIATION-7.",
+        "properties": {
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "nomination_ids": {
+            "items": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "title": "Nomination Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "event_id",
+          "nomination_ids"
+        ],
+        "title": "RemediationNominationAccepted",
+        "type": "object"
+      },
+      "RemediationNominationRefusal": {
+        "additionalProperties": false,
+        "description": "@spec AUTOMATED-REMEDIATION-6.",
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/RemediationNominationRefusalDetail"
+          }
+        },
+        "required": [
+          "detail"
+        ],
+        "title": "RemediationNominationRefusal",
+        "type": "object"
+      },
+      "RemediationNominationRefusalDetail": {
+        "additionalProperties": false,
+        "description": "@spec AUTOMATED-REMEDIATION-6.",
+        "properties": {
+          "code": {
+            "pattern": "^[a-z][a-z0-9_]{0,62}$",
+            "title": "Code",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "RemediationNominationRefusalDetail",
+        "type": "object"
+      },
+      "RemediationNominationSubmit": {
+        "additionalProperties": false,
+        "description": "One protected turn's nomination block. @spec AUTOMATED-REMEDIATION-6.",
+        "properties": {
+          "block": {
+            "description": "The withheld block text, fences included, exactly as extracted.",
+            "maxLength": 262144,
+            "title": "Block",
+            "type": "string"
+          },
+          "event_id": {
+            "description": "The protected event whose turn produced the block.",
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Event Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "block"
+        ],
+        "title": "RemediationNominationSubmit",
+        "type": "object"
+      },
       "RemediationPolicyMutation": {
         "additionalProperties": false,
         "description": "Compare and swap plus idempotency for arm, disarm and removal.\n\n@spec AUTOMATED-REMEDIATION-2.",
@@ -22012,6 +22091,89 @@
         "summary": "Advance Publication Lineage",
         "tags": [
           "internal-publications"
+        ]
+      }
+    },
+    "/v1/internal/remediation/nominations": {
+      "post": {
+        "description": "Record one protected turn's nomination block.",
+        "operationId": "submit_remediation_nominations_v1_internal_remediation_nominations_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RemediationNominationSubmit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationNominationAccepted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationNominationRefusal"
+                }
+              }
+            },
+            "description": "Refusal"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationNominationRefusal"
+                }
+              }
+            },
+            "description": "Refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "description": "Broker unavailable"
+          }
+        },
+        "summary": "Submit Remediation Nominations",
+        "tags": [
+          "internal-remediation"
         ]
       }
     },

@@ -546,6 +546,7 @@
           "/v1/internal/channel-read/context",
           "/v1/internal/thread-attachments/query",
           "/v1/internal/thread-attachments/append",
+          "/v1/internal/remediation/nominations",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -577,7 +578,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1120,
+      "cardinality_bound": 1128,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -713,6 +714,7 @@
           "/v1/internal/channel-read/context",
           "/v1/internal/thread-attachments/query",
           "/v1/internal/thread-attachments/append",
+          "/v1/internal/remediation/nominations",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -751,7 +753,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5600,
+      "cardinality_bound": 5640,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -887,6 +889,7 @@
           "/v1/internal/channel-read/context",
           "/v1/internal/thread-attachments/query",
           "/v1/internal/thread-attachments/append",
+          "/v1/internal/remediation/nominations",
           "/v1/work-item-progress/{request_id}",
           "/v1/work-item-progress/{request_id}/usage",
           "/v1/work-item-progress/{request_id}/verification",
@@ -925,7 +928,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5600,
+      "cardinality_bound": 5640,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

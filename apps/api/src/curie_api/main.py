@@ -74,6 +74,7 @@ from .routers import (
     provider_installations,
     publication_precheck,
     publications,
+    remediation_nominations,
     remediation_policy,
     runs,
     schedules,
@@ -473,6 +474,7 @@ def create_app() -> FastAPI:
     app.include_router(agents.router)
     app.include_router(hook_source_policy.router)
     app.include_router(remediation_policy.router)
+    app.include_router(remediation_nominations.router)
     app.include_router(deployments.router)
     app.include_router(bundles.router)
     app.include_router(deploy_targets.router)

@@ -2286,6 +2286,113 @@ class RemediationPolicyGeneration(Base):
     )
 
 
+class RemediationNominationSubmission(Base):
+    """The one accepted nomination submission of a protected event.
+
+    Keyed on the event so the first accepted submission wins; ``block_sha256``
+    decides a byte-identical replay from a ``nomination_conflict``.
+    @spec AUTOMATED-REMEDIATION-6.
+    """
+
+    __tablename__ = "remediation_nomination_submissions"
+    __table_args__ = (
+        CheckConstraint(
+            "block_sha256 ~ '^[0-9a-f]{64}$'", name="remediation_nomination_submissions_digest_ck"
+        ),
+    )
+
+    event_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    block_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class RemediationNomination(Base):
+    """One nominated action of a protected turn, or one malformed block.
+
+    @spec AUTOMATED-REMEDIATION-7 @spec AUTOMATED-REMEDIATION-8.
+    """
+
+    __tablename__ = "remediation_nominations"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('received', 'refused', 'precondition_pending', 'admitted', "
+            "'approval_requested', 'approved', 'rejected', 'expired', 'executing', "
+            "'verifying', 'finished')",
+            name="remediation_nominations_state_ck",
+        ),
+        CheckConstraint(
+            "refusal_code IS NULL OR refusal_code IN ('nomination_malformed', 'unknown_action', "
+            "'nomination_duplicate', 'arguments_schema_mismatch', 'agent_stopped')",
+            name="remediation_nominations_refusal_ck",
+        ),
+        CheckConstraint(
+            "(state = 'refused') = (refusal_code IS NOT NULL)",
+            name="remediation_nominations_refused_ck",
+        ),
+        CheckConstraint(
+            "refusal_code = 'nomination_malformed' OR "
+            "(action IS NOT NULL AND arguments IS NOT NULL AND arguments_sha256 IS NOT NULL)",
+            name="remediation_nominations_action_ck",
+        ),
+        CheckConstraint(
+            "kind IS NULL OR kind IN ('remediate', 'prevent', 'tune')",
+            name="remediation_nominations_kind_ck",
+        ),
+        CheckConstraint(
+            "verification_outcome IS NULL OR verification_outcome IN "
+            "('verified', 'not-recovered', 'verifier-unavailable', 'superseded')",
+            name="remediation_nominations_outcome_ck",
+        ),
+        CheckConstraint(
+            "arguments_sha256 IS NULL OR arguments_sha256 ~ '^[0-9a-f]{64}$'",
+            name="remediation_nominations_digest_ck",
+        ),
+        CheckConstraint(
+            "admitted_generation IS NULL OR admitted_generation > 0",
+            name="remediation_nominations_admitted_ck",
+        ),
+        CheckConstraint(
+            "current_generation IS NULL OR current_generation > 0",
+            name="remediation_nominations_current_ck",
+        ),
+        Index("ix_remediation_nominations_event", "event_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    agent_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey(f"{SCHEMA}.agents.id", ondelete="CASCADE"), nullable=False
+    )
+    hook: Mapped[str] = mapped_column(String(63), nullable=False)
+    event_id: Mapped[str] = mapped_column(
+        String(256),
+        ForeignKey(f"{SCHEMA}.remediation_nomination_submissions.event_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    admitted_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    current_generation: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    action: Mapped[str | None] = mapped_column(Text, nullable=True)
+    kind: Mapped[str | None] = mapped_column(Text, nullable=True)
+    arguments: Mapped[str | None] = mapped_column(Text, nullable=True)
+    arguments_sha256: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
+    target: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    refusal_code: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approval_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    execution_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    verification_outcome: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class HookRun(Base):
     """One claimed trigger slot for an agent version."""
 

@@ -800,12 +800,20 @@ of `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `in`, `absent`), `value` (a JSON scalar o
 for `in`, a list of at most 16 scalars), and for a verifier `settle_seconds` (at least `interval_seconds`, ADR 0203's minimum settle
 interval), `deadline_seconds` (greater than settle, at most 3600, and at most 60
 times the interval, matching the sample cap of AUTOMATED-REMEDIATION-12),
-`interval_seconds` (at least 10) and `consecutive` (at least 1, default 1). Numeric comparison applies
-only when both sides are JSON numbers; otherwise only `eq`, `ne` and `in` apply,
-by exact string comparison. There are no functions, arithmetic, variables or
-nesting; the maintainer ruled on 2026-10-07 that this closed form is not an
-expression language under ADR 0007 or ADR 0117, and anything richer needs a new
-decision. Independence
+`interval_seconds` (at least 10) and `consecutive` (at least 1, default 1). The
+ordering comparators (`lt`, `le`, `gt`, `ge`) apply only when both sides are
+numeric, compared by numeric value. A side is numeric when it is a JSON number or
+a string matching a strict decimal grammar: an optional sign, ASCII digits, an
+optional fraction (a point and digits), an optional exponent, and nothing else
+(no whitespace, hexadecimal, `NaN`, `Infinity` or `inf`). A Prometheus sample
+value such as `"0.5"` therefore satisfies `gt` 0.4. A boolean is never numeric,
+and an ordering comparator with a non-numeric side is unsatisfied. `eq`, `ne` and
+`in` never read a string as a number: they compare JSON numbers numerically and
+any other value by its type and exact value. There are no functions, arithmetic,
+variables or nesting; the maintainer ruled on 2026-10-07 that this closed form is
+not an expression language under ADR 0007 or ADR 0117, and anything richer needs
+a new decision. The numeric string rule was confirmed by the maintainer on
+2026-10-07. Independence
 (REMEDIATION-15) is checked at policy write and again at admission against the
 in-force version: the verifier's connector differs from the acting connector,
 and the set of secret names the verifier connector's MCP headers expand is
