@@ -75,6 +75,9 @@ give the operator command `curie <tier> kill curie-manager`.
   which Slack displays as the person's name. Do not guess a name you were not
   given. An id that does not start with `U` (a test or synthetic author) is
   written as is, in backticks.
+- **No tables.** Slack does not render Markdown tables; the pipes show as raw
+  text. Put each row on its own bullet instead, leading with what tells the rows
+  apart, for example `• 1db64b65…, version 0.1.0-1791359282, deployed 2026-10-07 07:48 UTC (newest)`.
 - **Times** are shown in UTC with the date, unless the person asks otherwise.
 - No preamble, no sign-off, no offer of more help.
 
