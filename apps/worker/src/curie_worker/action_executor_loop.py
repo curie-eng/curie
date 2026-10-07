@@ -647,17 +647,23 @@ class ActionExecutorLoop:
     ) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
         """``target`` and ``prior_state``, checked against the ruling's digest.
 
-        @spec ACTION-EXECUTOR-7. A ledger the API cannot serve now leaves the
-        row for a later attempt; a row without the two keys, or whose digest
-        differs, refuses ``arguments_mismatch``.
+        @spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-18. The read is sent up to
+        ``MAX_SENDS`` times on a transport error or a 5xx; a ledger that never
+        answers refuses ``runner_unavailable`` (a pre-dispatch refusal, before
+        any sandbox). No such row, a row without the two keys, or a digest that
+        differs refuses ``arguments_mismatch``.
         """
 
         if execution.subject_action_id is None or not execution.arguments_sha256:
             raise _Refuse("arguments_mismatch", "ledger")
-        try:
-            row = await self._api.ledger(execution.subject_action_id)
-        except httpx.HTTPError:
-            raise _Refuse(_PLATFORM_UNAVAILABLE, "ledger") from None
+        row: Mapping[str, Any] | None = None
+        for attempt in range(MAX_SENDS):
+            try:
+                row = await self._api.ledger(execution.subject_action_id)
+                break
+            except httpx.HTTPError:
+                if attempt == MAX_SENDS - 1:
+                    raise _Refuse(_PLATFORM_UNAVAILABLE, "ledger") from None
         target = row.get("target") if row is not None else None
         prior_state = row.get("prior_state") if row is not None else None
         if not isinstance(target, Mapping) or not isinstance(prior_state, Mapping):
