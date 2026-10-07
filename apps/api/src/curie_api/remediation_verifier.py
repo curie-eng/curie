@@ -26,8 +26,10 @@ for its connector, not independent now) is ``verifier-unavailable``.
 
 Evaluation (``reads_ended``, called after every transition that ends a read):
 
-* ``superseded`` first: a later ledger record whose nomination has the same
-  target key, or an observe-only execution that reported a version other than
+* ``superseded`` first: any later ledger record on the same target key (a
+  remediation's, by its nomination's key; a model turn's or an approval's, by
+  its connector and the value of the action's declared target argument in its
+  arguments), or an observe-only execution that reported a version other than
   the record's ``post_version``. Attribution, never success;
 * ``verifier-unavailable`` at once when a sample read was ``refused``;
 * ``verified`` once ``consecutive`` adjacent samples due at or after settle
@@ -54,6 +56,7 @@ admission.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -64,8 +67,8 @@ from tempfile import TemporaryDirectory
 from typing import Any, Final
 
 from plugin_format.connectors import ConnectorSpec
-from sqlalchemy import select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import cast, literal, or_, select, update
+from sqlalchemy.dialects.postgresql import JSONB, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
@@ -592,13 +595,44 @@ async def schedule_verification(
 # --------------------------------------------------------------------------- #
 
 
+def _record_target_matches(declared: Mapping[str, Any], action: AgentAction) -> Any | None:
+    """A ledger record without a nomination on this verification's target key.
+
+    The AUTOMATED-REMEDIATION-10 key of a record no nomination names: its
+    connector (the ``connector`` column, else the ``mcp__<connector>__`` tool
+    prefix) and the value of the declared action's target argument in its
+    arguments, compared as JSON.
+    """
+
+    target = declared.get("target")
+    connector = declared.get("connector")
+    if not isinstance(target, Mapping) or not isinstance(connector, str):
+        return None
+    argument = target.get("argument")
+    arguments = action.arguments or {}
+    if not isinstance(argument, str) or argument not in arguments:
+        return None
+    connector_matches = or_(
+        AgentAction.connector == connector,
+        AgentAction.connector.is_(None)
+        & AgentAction.tool.startswith(f"mcp__{connector}__", autoescape=True),
+    )
+    value = cast(literal(json.dumps(arguments[argument])), JSONB)
+    return (
+        AgentAction.nomination_id.is_(None)
+        & connector_matches
+        & (AgentAction.arguments[argument] == value)
+    )
+
+
 async def _superseded(
     session: AsyncSession,
     action: AgentAction,
     nomination: RemediationNomination,
+    declared: Mapping[str, Any],
     observes: list[ActionExecution],
 ) -> bool:
-    """A later record on the same target key, or another version observed."""
+    """Any later ledger record on the same target key, or another version observed."""
 
     for observed in observes:
         if observed.state != ExecutionState.confirmed:
@@ -606,17 +640,28 @@ async def _superseded(
         version = (observed.outcome or {}).get("observed_version")
         if version != action.post_version:
             return True
-    if nomination.target is None:
+    same_target = []
+    if nomination.target is not None:
+        same_target.append(
+            AgentAction.nomination_id.in_(
+                select(RemediationNomination.id).where(
+                    RemediationNomination.agent_id == action.agent_id,
+                    RemediationNomination.target == nomination.target,
+                )
+            )
+        )
+    unnominated = _record_target_matches(declared, action)
+    if unnominated is not None:
+        same_target.append(unnominated)
+    if not same_target:
         return False
     later = await session.scalar(
         select(AgentAction.id)
-        .join(RemediationNomination, RemediationNomination.id == AgentAction.nomination_id)
         .where(
             AgentAction.agent_id == action.agent_id,
             AgentAction.id != action.id,
             AgentAction.created_at > action.created_at,
-            RemediationNomination.agent_id == action.agent_id,
-            RemediationNomination.target == nomination.target,
+            or_(*same_target),
         )
         .limit(1)
     )
@@ -653,7 +698,7 @@ async def _evaluate(
     found = await _verifier_of(session, forward, nomination)
     if found is None:
         return
-    _declared, verifier = found
+    declared, verifier = found
     settle = _seconds(verifier, "settle_seconds") or 0
 
     reads = (
@@ -685,7 +730,7 @@ async def _evaluate(
             now=now,
         )
 
-    if await _superseded(session, action, nomination, observes):
+    if await _superseded(session, action, nomination, declared, observes):
         await decide(SUPERSEDED)
         return
     if any(sample.state == ExecutionState.refused for sample in samples):
