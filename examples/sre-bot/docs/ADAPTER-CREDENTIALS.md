@@ -19,6 +19,8 @@ Python program. Run it inside Kubernetes using a ServiceAccount token and CA
 from `/var/run/secrets/kubernetes.io/serviceaccount`. An optional `SA_DIR`
 selects the mounted ServiceAccount directory. The API endpoint is
 `https://kubernetes.default.svc`; every request has a finite timeout.
+Redirects are refused so the ServiceAccount bearer token stays on that
+endpoint.
 
 ```json
 {
