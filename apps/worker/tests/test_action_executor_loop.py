@@ -88,6 +88,8 @@ from executor_loop_fixtures import (  # noqa: E402
     OTHER_SECRET,
     PRIOR_STATE,
     QUOTA_REJECTION,
+    READ_CONNECTOR,
+    READ_SECRET,
     RECORDED_VERSION,
     TARGET,
     TARGET_SECRET,
@@ -142,12 +144,15 @@ def _binding_boot_env() -> dict[str, str]:
             BootEnv.env_key("budget"): "{}",
             BootEnv.env_key("bundle_ref"): "bundles/example-agent.tar.gz",
             BootEnv.env_key("connector_caller_token"): "cct.placeholder.signature",
-            BootEnv.env_key("connector_secret_keys"): f"{OTHER_SECRET},{TARGET_SECRET}",
+            BootEnv.env_key("connector_secret_keys"): (
+                f"{OTHER_SECRET},{TARGET_SECRET},{READ_SECRET}"
+            ),
             BootEnv.env_key("model_env_key"): "ANTHROPIC_API_KEY",
             "CURIE_CREDENTIALS": "placeholder-model-credential",
             "ANTHROPIC_API_KEY": "placeholder-model-key",
             TARGET_SECRET: "placeholder-target-secret",
             OTHER_SECRET: "placeholder-other-secret",
+            READ_SECRET: "placeholder-read-secret",
         }
     )
     return env
@@ -281,12 +286,14 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
     runner_client = _BudgetRecordingRunner(rig, connect_timeout_s=2.0, total_timeout_s=10.0)
     rig.substrate = substrate
 
+    # @spec AUTOMATED-REMEDIATION-12: a read execution runs under the read
+    # connector's own binding, so the rig resolves both connectors.
     async def deployment_name(agent_id: str | None, connector: str) -> str | None:
-        assert (agent_id, connector) == (AGENT_ID, CONNECTOR)
+        assert agent_id == AGENT_ID and connector in {CONNECTOR, READ_CONNECTOR}
         return DEPLOYMENT
 
     async def in_force_digest(agent_id: str, connector: str) -> str | None:
-        assert (str(agent_id), connector) == (AGENT_ID, CONNECTOR)
+        assert str(agent_id) == AGENT_ID and connector in {CONNECTOR, READ_CONNECTOR}
         return rig.in_force["digest"]
 
     async def executor_boot(agent_id: str, connector: str, **kwargs: Any) -> ExecutorBoot:
@@ -294,7 +301,9 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
         rig.boot_kwargs.append(dict(kwargs))
         return ExecutorBoot(
             boot_env=_binding_boot_env(),
-            header_secret_names=frozenset({TARGET_SECRET}),
+            header_secret_names=frozenset(
+                {READ_SECRET if connector == READ_CONNECTOR else TARGET_SECRET}
+            ),
             agent_name=AGENT_NAME,
         )
 
@@ -305,6 +314,9 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
             "dispatch_deadline_s": DISPATCH_DEADLINE_S,
             **overrides,
         }
+        # @spec AUTOMATED-REMEDIATION-12 (E9): the loop's concurrency, passed
+        # only when a test sets it so the existing loop keeps its signature.
+        extra = {name: settings[name] for name in ("max_concurrent_sandboxes",) if name in settings}
         return ActionExecutorLoop(
             api=ExecutionApi(
                 api_base_url=API_BASE, api_key=API_KEY, worker_token=WORKER_TOKEN, client=http
@@ -322,6 +334,7 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
             lease_seconds=settings["lease_seconds"],
             dispatch_deadline_s=settings["dispatch_deadline_s"],
             interval_seconds=0.01,
+            **extra,
         )
 
     rig._make = make

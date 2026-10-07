@@ -746,9 +746,24 @@ as a whole; remembered only):
   phase, the route's refusal codes and the worker code each maps to, the status
   body and the mode variable are frozen together. The `observe_version` and
   `restore` call arguments and the reply-to-outcome mapping the two sides apply
-  around those phases are frozen beside it.
+  around those phases are frozen beside it. The remediation `read` phase
+  (AUTOMATED-REMEDIATION-12: the request's `pointer`, one `read` per sandbox,
+  `tool_not_read_only` without dialing, the read refusals' worker codes) and
+  the codes it adds, which the API's
+  `apps/api/src/curie_api/action_execution_codes.py` also reads (the
+  worker-reported pre-dispatch code and the sample results that are never
+  refusals), are frozen in the same vector.
   [vector: `tests/vectors/runner-execute.json`]
   [vector: `tests/vectors/executor-restore-calls.json`]
+- runner vs worker remediation sample (AUTOMATED-REMEDIATION-12, -17) -- the
+  runner's pointer extraction in the `read` phase
+  (`runner/src/curie_runner/executor.py`: structured content, or a single text
+  block's strict JSON, otherwise `result_unstructured`) and the worker's sample
+  report (`apps/worker/src/curie_worker/action_executor.py::sample_report`) ship
+  in different images, so every pointer, result shape and sample kind is frozen
+  together with the comparator cases the API's evaluator joins with the
+  verifier (plan task 11).
+  [vector: `tests/vectors/remediation-predicate.json`]
 - API vs CLI remediation policy validation and policy refusal codes
   (AUTOMATED-REMEDIATION-3) -- the API validator
   (`apps/api/src/curie_api/remediation_policy_document.py`) and the CLI's

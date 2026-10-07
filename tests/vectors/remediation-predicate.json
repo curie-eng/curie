@@ -1,5 +1,5 @@
 {
-  "comment": "@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-17 @spec AUTOMATED-REMEDIATION-26. The declared-read predicate (maintainer ruling 2026-10-07: one RFC 6901 JSON pointer and a closed comparator set, not an expression language), frozen across three images: the runner's pointer extraction (the `read` phase answers only the sample, never the result), the worker's sample report to the API, and the API's evaluator. `extractions`: given a read tool's `structured` content (null when the tool returned none) and `is_error`, the runner yields `sample`, one of `sample_kinds`, with `value` the pointed JSON scalar for `value` and null otherwise. A scalar whose compact JSON text (ensure_ascii false) exceeds `value_max_chars` code points is `value_too_long`. `successful` names the kinds a verifier counts as a sample taken (AUTOMATED-REMEDIATION-18); the others are unsuccessful samples, never refusals. `invalid_pointers` are refused at policy write (policy_document_invalid) and by the runner (invalid_request, without dialing). `sample_report` is the worker's body for `POST /action-executions/{id}/samples`: the fence, the zero-based sample `index`, and the sample and value exactly as the runner answered. `evaluations`: the API evaluator's `result` (one of `results`) for a declared `comparator` and `value` (no `value` for `absent`) against a reported sample. Ordering comparators apply only when both sides are numeric (a JSON number, or a string matching `numeric_string_grammar`: optional sign, ASCII digits, optional fraction, optional exponent, nothing else; booleans are never numeric), compared by numeric value; otherwise an ordering comparator is unsatisfied. eq, ne and in never coerce: they compare JSON numbers numerically and everything else by type and value exactly. Read by runner/tests/test_runner_execute_vector.py (the extraction cases and invalid pointers, through the real `read` phase), apps/worker/tests/test_remediation_predicate_vector.py and apps/api/tests/test_remediation_predicate_vector.py, each of which rejects an unknown key.",
+  "comment": "@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-17 @spec AUTOMATED-REMEDIATION-26. The declared-read predicate (maintainer ruling 2026-10-07: one RFC 6901 JSON pointer and a closed comparator set, not an expression language), frozen across three images: the runner's pointer extraction (the `read` phase answers only the sample, never the result), the worker's sample report to the API, and the API's evaluator. `extractions`: given a read tool's `structured` content (null when the tool returned none), its `content` blocks and `is_error`, the runner applies the pointer to the structured content when present, and otherwise, when `content` is exactly one block of type text whose text is strict JSON (no NaN or Infinity; maintainer ruling M3, 2026-10-07), to that parsed JSON; any other shape is `result_unstructured`. It yields `sample`, one of `sample_kinds`, with `value` the pointed JSON scalar for `value` and null otherwise. A scalar whose compact JSON text (ensure_ascii false) exceeds `value_max_chars` code points is `value_too_long`. `successful` names the kinds a verifier counts as a sample taken (AUTOMATED-REMEDIATION-18); the others are unsuccessful samples, never refusals. `invalid_pointers` are refused at policy write (policy_document_invalid) and by the runner (invalid_request, without dialing). `sample_report` is the worker's body for `POST /action-executions/{id}/samples`: the fence and the sample and value exactly as the runner answered. One read execution is one sample (maintainer ruling M2), so the body carries no index: the execution is the sample. `evaluations`: the API evaluator's `result` (one of `results`) for a declared `comparator` and `value` (no `value` for `absent`) against a reported sample. Ordering comparators apply only when both sides are numeric (a JSON number, or a string matching `numeric_string_grammar`: optional sign, ASCII digits, optional fraction, optional exponent, nothing else; booleans are never numeric), compared by numeric value; otherwise an ordering comparator is unsatisfied. eq, ne and in never coerce: they compare JSON numbers numerically and everything else by type and value exactly. Read by runner/tests/test_runner_execute_vector.py (the extraction cases and invalid pointers, through the real `read` phase), apps/worker/tests/test_remediation_predicate_vector.py and apps/api/tests/test_remediation_predicate_vector.py, each of which rejects an unknown key.",
   "comparators": [
     "eq",
     "ne",
@@ -25,7 +25,7 @@
     "not_scalar",
     "value_too_long",
     "tool_error",
-    "not_structured"
+    "result_unstructured"
   ],
   "successful": [
     "value",
@@ -44,6 +44,12 @@
           "value": 0.02
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/value",
       "sample": {
@@ -58,6 +64,12 @@
           "replicas": 4
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/spec/replicas",
       "sample": {
@@ -72,6 +84,12 @@
           "phase": "Running"
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/status/phase",
       "sample": {
@@ -84,6 +102,12 @@
       "structured": {
         "ready": true
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/ready",
       "sample": {
@@ -98,6 +122,12 @@
           "value": null
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/value",
       "sample": {
@@ -122,6 +152,12 @@
           ]
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/result/0/value/1",
       "sample": {
@@ -136,6 +172,12 @@
           "m~n": 3
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/a~1b/m~0n",
       "sample": {
@@ -150,6 +192,12 @@
           "x": "y"
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "//x",
       "sample": {
@@ -162,6 +210,12 @@
       "structured": {
         "data": {}
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/value",
       "sample": {
@@ -186,6 +240,12 @@
           ]
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/result/1/value",
       "sample": {
@@ -210,6 +270,12 @@
           ]
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/result/-",
       "sample": {
@@ -234,6 +300,12 @@
           ]
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/result/00",
       "sample": {
@@ -258,6 +330,12 @@
           ]
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/result/first",
       "sample": {
@@ -272,6 +350,12 @@
           "value": 1
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/value/unit",
       "sample": {
@@ -288,6 +372,12 @@
           }
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/value",
       "sample": {
@@ -312,6 +402,12 @@
           ]
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/result",
       "sample": {
@@ -324,6 +420,12 @@
       "structured": {
         "data": 1
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "",
       "sample": {
@@ -336,6 +438,12 @@
       "structured": {
         "s": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/s",
       "sample": {
@@ -348,6 +456,12 @@
       "structured": {
         "s": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": false,
       "pointer": "/s",
       "sample": {
@@ -362,6 +476,12 @@
           "value": 0.02
         }
       },
+      "content": [
+        {
+          "type": "text",
+          "text": "example summary"
+        }
+      ],
       "is_error": true,
       "pointer": "/data/value",
       "sample": {
@@ -370,12 +490,219 @@
       }
     },
     {
-      "name": "no_structured_content",
-      "structured": null,
+      "name": "structured_wins_over_json_text",
+      "structured": {
+        "data": {
+          "value": 0.02
+        }
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"data\":{\"value\":0.9}}"
+        }
+      ],
       "is_error": false,
       "pointer": "/data/value",
       "sample": {
-        "sample": "not_structured",
+        "sample": "value",
+        "value": 0.02
+      }
+    },
+    {
+      "name": "text_json_instant_series",
+      "structured": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"status\":\"success\",\"data\":[{\"metric\":{},\"value\":[1767225600,\"1\"]}]}"
+        }
+      ],
+      "is_error": false,
+      "pointer": "/data/0/value/1",
+      "sample": {
+        "sample": "value",
+        "value": "1"
+      }
+    },
+    {
+      "name": "text_json_scalar",
+      "structured": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"status\":\"success\",\"data\":[1767225600,\"0.5\"]}"
+        }
+      ],
+      "is_error": false,
+      "pointer": "/data/1",
+      "sample": {
+        "sample": "value",
+        "value": "0.5"
+      }
+    },
+    {
+      "name": "text_json_instant_no_series",
+      "structured": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"status\":\"success\",\"data\":[]}"
+        }
+      ],
+      "is_error": false,
+      "pointer": "/data/0/value/1",
+      "sample": {
+        "sample": "pointer_absent",
+        "value": null
+      }
+    },
+    {
+      "name": "text_json_object_at_pointer",
+      "structured": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"status\":\"success\",\"data\":[{\"metric\":{},\"value\":[1767225600,\"1\"]}]}"
+        }
+      ],
+      "is_error": false,
+      "pointer": "/data/0",
+      "sample": {
+        "sample": "not_scalar",
+        "value": null
+      }
+    },
+    {
+      "name": "text_json_tool_error",
+      "structured": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"status\":\"success\",\"data\":[{\"metric\":{},\"value\":[1767225600,\"1\"]}]}"
+        }
+      ],
+      "is_error": true,
+      "pointer": "/data/0/value/1",
+      "sample": {
+        "sample": "tool_error",
+        "value": null
+      }
+    },
+    {
+      "name": "text_not_json",
+      "structured": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "query failed to parse"
+        }
+      ],
+      "is_error": false,
+      "pointer": "/data/value",
+      "sample": {
+        "sample": "result_unstructured",
+        "value": null
+      }
+    },
+    {
+      "name": "text_json_with_nan",
+      "structured": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"data\":{\"value\":NaN}}"
+        }
+      ],
+      "is_error": false,
+      "pointer": "/data/value",
+      "sample": {
+        "sample": "result_unstructured",
+        "value": null
+      }
+    },
+    {
+      "name": "text_json_with_trailing_text",
+      "structured": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"data\":{\"value\":1}} trailing"
+        }
+      ],
+      "is_error": false,
+      "pointer": "/data/value",
+      "sample": {
+        "sample": "result_unstructured",
+        "value": null
+      }
+    },
+    {
+      "name": "two_text_blocks",
+      "structured": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"status\":\"success\",\"data\":[{\"metric\":{},\"value\":[1767225600,\"1\"]}]}"
+        },
+        {
+          "type": "text",
+          "text": "{\"status\":\"success\",\"data\":[{\"metric\":{},\"value\":[1767225600,\"1\"]}]}"
+        }
+      ],
+      "is_error": false,
+      "pointer": "/data/0/value/1",
+      "sample": {
+        "sample": "result_unstructured",
+        "value": null
+      }
+    },
+    {
+      "name": "text_and_image_blocks",
+      "structured": null,
+      "content": [
+        {
+          "type": "text",
+          "text": "{\"status\":\"success\",\"data\":[{\"metric\":{},\"value\":[1767225600,\"1\"]}]}"
+        },
+        {
+          "type": "image",
+          "data": "ZXhhbXBsZQ==",
+          "mimeType": "image/png"
+        }
+      ],
+      "is_error": false,
+      "pointer": "/data/0/value/1",
+      "sample": {
+        "sample": "result_unstructured",
+        "value": null
+      }
+    },
+    {
+      "name": "image_block_only",
+      "structured": null,
+      "content": [
+        {
+          "type": "image",
+          "data": "ZXhhbXBsZQ==",
+          "mimeType": "image/png"
+        }
+      ],
+      "is_error": false,
+      "pointer": "/data/value",
+      "sample": {
+        "sample": "result_unstructured",
+        "value": null
+      }
+    },
+    {
+      "name": "no_content",
+      "structured": null,
+      "content": [],
+      "is_error": false,
+      "pointer": "/data/value",
+      "sample": {
+        "sample": "result_unstructured",
         "value": null
       }
     }
@@ -391,15 +718,13 @@
     "keys": [
       "lease_owner",
       "attempt",
-      "index",
       "sample",
       "value"
     ],
     "fence": {
       "lease_owner": "example-worker-1",
       "attempt": 1
-    },
-    "index": 0
+    }
   },
   "evaluations": [
     {

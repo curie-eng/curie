@@ -42,6 +42,9 @@ from curie_worker.sandbox.types import ClaimView, QuotaRejection, SandboxView
 
 _VECTORS = Path(__file__).resolve().parents[3] / "tests" / "vectors"
 RUNNER_VECTOR: dict[str, Any] = json.loads((_VECTORS / "runner-execute.json").read_text("utf-8"))
+_SAMPLE_KINDS = frozenset(
+    json.loads((_VECTORS / "remediation-predicate.json").read_text("utf-8"))["sample_kinds"]
+)
 
 AGENT_ID = "00000000-0000-4000-8000-0000000000a1"
 AGENT_NAME = "example-agent"
@@ -78,6 +81,20 @@ FORWARD_TOOL = "scale"
 FORWARD_ARGUMENTS: dict[str, Any] = {"target": TARGET, "replicas": 3, "note": "réplicas"}
 FORWARD_TEXT: str = connector_grant.canonical_arguments(FORWARD_ARGUMENTS)
 FORWARD_SHA256: str = connector_grant.arguments_sha256(FORWARD_TEXT)
+
+# @spec AUTOMATED-REMEDIATION-12: a read execution (one verifier sample) of the
+# vector's read connector, with the declaration's tool, arguments and pointer.
+_READ_REQUEST: dict[str, Any] = RUNNER_VECTOR["phases"]["read"]["request"]
+READ_CONNECTOR: str = _READ_REQUEST["connector"]
+READ_TOOL: str = _READ_REQUEST["tool"]
+READ_TEXT: str = _READ_REQUEST["arguments"]
+READ_ARGUMENTS: dict[str, Any] = json.loads(READ_TEXT)
+READ_POINTER: str = _READ_REQUEST["pointer"]
+READ_SECRET = "EXAMPLE_METRICS_TOKEN"
+
+
+def read_list_tools() -> list[dict[str, Any]]:
+    return copy.deepcopy(RUNNER_VECTOR["read"]["list_response"]["tools"])
 
 
 def list_tools() -> list[dict[str, Any]]:
@@ -140,6 +157,11 @@ class Execution:
     advertised: list[str] | None = None
     restore_capable: bool | None = None
     reports: list[dict[str, Any]] = field(default_factory=list)
+    # @spec AUTOMATED-REMEDIATION-12: a read's stored sample, every sample body
+    # posted, and how many executor sandboxes were live when the read ended.
+    sample: dict[str, Any] | None = None
+    samples: list[dict[str, Any]] = field(default_factory=list)
+    live_claims_at_end: int | None = None
 
     def out(self) -> dict[str, Any]:
         now = datetime.now(UTC)
@@ -186,6 +208,13 @@ class FakeApi:
         # dispatch created, and every completion posted to the ledger.
         self.forward_arguments: dict[str, dict[str, Any]] = {}
         self.completions: list[dict[str, Any]] = []
+        # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): the claim
+        # route's installation-wide cap (None: uncapped, as before the
+        # amendment); while two or more slots exist, all but one may be reads.
+        self.cap: int | None = None
+        # Set by a test to count the executor sandboxes live when a read ends.
+        self.live_claims: Callable[[], int] | None = None
+        self.max_live = 0
 
     # -- seeding ------------------------------------------------------------
 
@@ -245,6 +274,18 @@ class FakeApi:
             self.forward_arguments[execution.id] = copy.deepcopy(
                 FORWARD_ARGUMENTS if arguments is None else arguments
             )
+        return execution
+
+    def add_read(self, **fields: Any) -> Execution:
+        """A read execution (AUTOMATED-REMEDIATION-12) as the read producer writes it."""
+
+        fields.setdefault("connector", READ_CONNECTOR)
+        fields.setdefault("tool", READ_TOOL)
+        fields.setdefault("arguments_sha256", None)
+        fields.setdefault("requested_by", None)
+        execution = Execution(id=str(uuid.uuid4()), kind="read", **fields)
+        self.executions[execution.id] = execution
+        self.order.append(execution.id)
         return execution
 
     def fail(self, route: str, *modes: str) -> None:
@@ -316,7 +357,9 @@ class FakeApi:
         if request.headers.get("x-curie-worker-token") != WORKER_TOKEN:
             return httpx.Response(401, json={"detail": "worker token required"})
         if route == "claim":
-            return self._claim(body)
+            response = self._claim(body)
+            self.max_live = max(self.max_live, self._live())
+            return response
         execution = self.executions.get(str(execution_id))
         if execution is None:
             return httpx.Response(404)
@@ -327,13 +370,43 @@ class FakeApi:
             return _conflict("the fence does not hold this execution")
         if execution.state not in _TERMINAL and execution.lease_expired:
             return _conflict("the lease on this execution has expired")
+        if (
+            execution.kind == "read"
+            and route in {"samples", "outcome"}
+            and execution.state not in _TERMINAL
+            and self.live_claims is not None
+        ):
+            execution.live_claims_at_end = self.live_claims()
         handler = {
             "observation": self._observation,
             "arguments": self._arguments,
             "dispatch": self._dispatch,
             "outcome": self._outcome,
+            "samples": self._samples,
         }[route]
         return handler(execution, body)
+
+    def _live(self) -> int:
+        return sum(
+            1
+            for execution in self.executions.values()
+            if execution.state in {"claimed", "dispatched"} and not execution.lease_expired
+        )
+
+    def _admits(self, execution: Execution) -> bool:
+        """@spec AUTOMATED-REMEDIATION-12: the cap, keeping one slot for writes."""
+
+        if self.cap is None:
+            return True
+        live = [
+            e
+            for e in self.executions.values()
+            if e.state in {"claimed", "dispatched"} and not e.lease_expired
+        ]
+        if len(live) >= self.cap:
+            return False
+        reads = sum(1 for e in live if e.kind == "read")
+        return not (execution.kind == "read" and self.cap >= 2 and reads >= self.cap - 1)
 
     def _claim(self, body: dict[str, Any]) -> httpx.Response:
         if not self.executor_enabled:
@@ -351,9 +424,14 @@ class FakeApi:
             )
             if not claimable:
                 continue
-            if execution.state == "claimed" and execution.attempt >= MAX_ATTEMPTS:
+            if execution.state == "claimed" and (
+                execution.attempt >= MAX_ATTEMPTS or execution.kind == "read"
+            ):
+                # @spec AUTOMATED-REMEDIATION-12: a read is never re-queued.
                 execution.state = "refused"
                 execution.refusal_code = "runner_unavailable"
+                continue
+            if not self._admits(execution):
                 continue
             execution.state = "claimed"
             execution.attempt += 1
@@ -420,6 +498,17 @@ class FakeApi:
 
         if set(body or {}) != {"lease_owner", "attempt"}:
             return httpx.Response(422, json={"detail": "the body is exactly the fence"})
+        if execution.kind == "read":
+            if execution.state != "claimed":
+                return _conflict(f"an execution in state {execution.state} reads no arguments")
+            return httpx.Response(
+                200,
+                json={
+                    "tool": execution.tool,
+                    "arguments": copy.deepcopy(READ_ARGUMENTS),
+                    "pointer": READ_POINTER,
+                },
+            )
         if execution.kind != "forward" or execution.id not in self.forward_arguments:
             return _conflict("this execution has no bound arguments")
         if execution.state != "claimed":
@@ -475,7 +564,11 @@ class FakeApi:
                 return _conflict("this execution already ended with another outcome")
             return httpx.Response(200, json=execution.out())
         allowed: str | None
-        if state == "refused":
+        if execution.kind == "read" and state != "refused":
+            # @spec AUTOMATED-REMEDIATION-12: a read ends confirmed only through
+            # its sample.
+            allowed = None
+        elif state == "refused":
             allowed = "claimed"
         elif execution.kind == "probe":
             allowed = "claimed" if state == "confirmed" else None
@@ -491,6 +584,27 @@ class FakeApi:
         if probe_confirmed:
             execution.advertised = list(advertised or ())
             execution.restore_capable = {"restore", "observe_version"} <= set(advertised or ())
+        return httpx.Response(200, json=execution.out())
+
+    def _samples(self, execution: Execution, body: dict[str, Any]) -> httpx.Response:
+        """``POST /action-executions/{id}/samples``: one read's sample, then ``confirmed``."""
+
+        execution.samples.append(dict(body))
+        if set(body) != {"lease_owner", "attempt", "sample", "value"}:
+            return httpx.Response(422, json={"detail": "the body is the fence and the sample"})
+        if body["sample"] not in _SAMPLE_KINDS:
+            return httpx.Response(422, json={"detail": "unknown sample kind"})
+        if execution.kind != "read":
+            return _conflict("only a read reports a sample")
+        sample = {"sample": body["sample"], "value": body["value"]}
+        if execution.state == "confirmed" and execution.sample is not None:
+            if execution.sample != sample:
+                return _conflict("a different sample was already reported")
+            return httpx.Response(200, json=execution.out())
+        if execution.state != "claimed":
+            return _conflict(f"a read in {execution.state} reports no sample")
+        execution.sample = sample
+        execution.state = "confirmed"
         return httpx.Response(200, json=execution.out())
 
 
@@ -522,6 +636,10 @@ class FakeRunner:
         self.version: str | None = RECORDED_VERSION
         self.call_mode = "reply"
         self.call_reply: dict[str, Any] = copy.deepcopy(_CALL["response"])
+        # @spec AUTOMATED-REMEDIATION-12: what a ``read`` phase answers.
+        self.read_response: dict[str, Any] = copy.deepcopy(
+            RUNNER_VECTOR["phases"]["read"]["response"]
+        )
         self.phase_status: dict[str, tuple[int, dict[str, Any]]] = {}
         self.hooks: dict[str, Hook] = {}
 
@@ -553,6 +671,8 @@ class FakeRunner:
             return web.json_response({"phase": "list", "tools": self.tools})
         if phase == "observe":
             return web.json_response({"phase": "observe", "version": self.version})
+        if phase == "read":
+            return web.json_response(self.read_response)
         if phase != "call":
             return web.json_response({"refused": "invalid_request"}, status=400)
         if self.call_mode.startswith("refuse:"):

@@ -622,6 +622,15 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/remediation-config-assertions.sh
 
+      # Prove the installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+      # executor amendment E9): one value renders
+      # CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES identically into the API
+      # and the worker, default 2, typed integer with minimum 1, chart-owned.
+      - name: helm render assertions (executor sandbox cap)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/executor-sandbox-cap-assertions.sh
+
       # Pin the end to end connector's test cluster identity (ADR 0176
       # decision 4, #3243): off by default, no cluster scoped write beyond
       # namespace create and delete, the per namespace role never bound cluster
