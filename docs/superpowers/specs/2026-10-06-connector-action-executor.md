@@ -176,7 +176,7 @@ land (ACTION-EXECUTOR-19).
 ## Activation and authority
 
 <!-- @spec ACTION-EXECUTOR-1 -->
-**ACTION-EXECUTOR-1. Closed by default; three named producers.** One chart
+**ACTION-EXECUTOR-1. Closed by default; named producers.** One chart
 value, `actionExecutor.enabled` (default off), and the matching compose value
 render the same setting `CURIE_ACTION_EXECUTOR_ENABLED` into both the API and
 the worker. With it off the worker claims nothing and the API refuses an undo
@@ -193,9 +193,21 @@ only by:
 3. the capability probe route `POST /connector-capabilities/probes`
    (ACTION-EXECUTOR-13), worker API key only, whose body is exactly
    `{agent_id, connector, digest}`, `authority_kind = capability_probe`, and
-   which can only produce a `tools/list`.
+   which can only produce a `tools/list`;
+4. amendment E1 (AUTOMATED-REMEDIATION-12, -18, -22): the read creation
+   function
+   (`apps/api/src/curie_api/remediation_reads.py::scheduled_read`), also an API
+   function and not a route, called by the precondition read at admission, the
+   verifier's samples, the tuning evidence reads and the qualification
+   verifier-run route, with `authority_kind` `policy`, `approval` or
+   `qualification`. Together with item 2's remediation caller
+   (`apps/api/src/curie_api/remediation_forward.py::create_remediation_forward`,
+   fed by admission and by an approved remediation approval), these are the
+   remediation creation functions. Each takes its connector, tool and
+   arguments from a policy generation or a nomination row.
 
-No route accepts a tool name or arguments for execution.
+The producer set is closed to these. No route accepts a tool name or
+arguments for execution.
 
 Acceptance: with the setting off, an undo of an undoable record returns
 `executor_disabled`, writes one refusal audit row and no execution; with it
@@ -305,6 +317,12 @@ the pool source stay the agent's, so reach is unchanged. The template also drops
 are excluded from `SandboxSubstrate.pressure_candidates`, so idle reclamation
 never selects one, and a quota rejection maps to `sandbox_unavailable`. The
 sandbox is released after the outcome is reported and on every error path.
+Amendment E7 (AUTOMATED-REMEDIATION-12): a `read` execution requires this
+per-claim template. The pool template would put the acting connector's
+credential into the verifier's sandbox and defeat the independence rule of
+REMEDIATION-15, so no read runs from it and the verification contract does not
+ship on the pool template.
+
 Amendment E9 (AUTOMATED-REMEDIATION-12): the claim route never hands out more
 than `actionExecutor.maxConcurrentSandboxes` live (claimed or dispatched)
 executions across the installation (default 2, at least 1, rendered into the
@@ -350,6 +368,11 @@ target}` with `phase` one of:
   `list`, exactly one `tools/call` of a declared read tool with its canonical
   `arguments` text and no grant; a tool not advertised `readOnlyHint: true` in
   this sandbox's own `list` is refused `tool_not_read_only` without dialing.
+  What authorizes a platform-originated read (amendment E4) is the policy
+  generation that declares it and, for automatic execution, the action's
+  qualification record. `readOnlyHint` is never that authorization (ADR 0121
+  decision 5 calls it a runtime hint); in executor mode the read-only set is
+  absent, so the hint is only the runner's one fail-closed refusal on top.
   The answer is only `{phase, sample, value}`: the scalar at the pointer in
   the structured content, else in the strict JSON of a result's one and only
   text block within the result bound, else `result_unstructured`.
