@@ -125,7 +125,9 @@ Argument usage failures follow the same structured error contract.
 
 The behavioral tests live at `examples/tests/test_startability_observer.py` in
 the existing root collection tree; this example does not change the root
-dependency manifest to add a new collection path.
+dependency manifest to add a new collection path. Its focused workflow uses
+a distinctive check name so it cannot turn a product term into a repository
+check-name fact.
 
 
 Pin the judgment against real current worker and protocol helpers, without
