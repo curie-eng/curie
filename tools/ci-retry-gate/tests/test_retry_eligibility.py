@@ -49,6 +49,7 @@ RETRY_ALLOWLIST = frozenset(
     {
         ("ci.yaml", "python", "Install uv"),
         ("ci.yaml", "python-pytest", "Install uv"),
+        ("ci.yaml", "turn-canary-contract", "Install uv"),
         ("fix-pin.yaml", "fix-pin", "Install uv"),
         ("ci.yaml", "e2e-ladder-cluster", "Create the kind cluster"),
         ("ci.yaml", "e2e-cluster-chart-regressions", "Create the kind cluster"),
