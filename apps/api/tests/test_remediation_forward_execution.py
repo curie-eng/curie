@@ -42,7 +42,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import io
 import json
+import tarfile
 import uuid
 from pathlib import Path
 from typing import Any
@@ -52,6 +54,7 @@ from _migration_support import sql_dicts, sql_rows
 from _sealed_actions import (
     CONNECTOR,
     DIGEST,
+    IMAGE,
     POST_VERSION,
     executor_enabled,  # noqa: F401 - fixture, requested by name
     operator_headers,
@@ -1043,3 +1046,130 @@ def test_an_approval_other_than_the_nominations_creates_nothing_after_one_execut
 
     assert [row["id"] for row in _executions()] == [first.execution_id]
     assert _nomination(nomination_id)["execution_id"] == first.execution_id
+
+
+# --------------------------------------------------------------------------- #
+# Review round 3: the nomination guard and the custody path of not_reversible_now
+# --------------------------------------------------------------------------- #
+
+
+def _refuse_at_dispatch(client: Any, execution_id: Any) -> dict[str, Any]:
+    """Claim and attempt dispatch; return the execution row afterwards."""
+
+    fence = _claim_fence(client, execution_id)
+    response = client.post(
+        f"/action-executions/{execution_id}/dispatch", json=fence, headers=worker_headers()
+    )
+    assert not (response.status_code == 200 and response.json().get("state") == "dispatched"), (
+        response.text
+    )
+    rows = [row for row in _executions() if row["id"] == execution_id]
+    assert len(rows) == 1
+    return rows[0]
+
+
+@pytest.mark.parametrize("state", ["approval_requested", "rejected", "expired", "finished"])
+def test_a_not_reversible_now_refusal_moves_only_an_admitted_nomination_to_approval(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, state: str
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-13: the refusal sends the nomination to
+    approval only while it is still ``admitted``; a nomination that has already
+    moved on (another path decided it) keeps its state. The execution is still
+    refused ``not_reversible_now`` with no ledger row.
+    """
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    nomination_id = _nominate(agent_id)
+    created = _create(nomination_id)
+    sql_rows(
+        "UPDATE curie.remediation_nominations SET state = :state WHERE id = :id",
+        {"state": state, "id": nomination_id},
+    )
+    _lose_capability(agent_id, "row-gone")
+
+    execution = _refuse_at_dispatch(client, created.execution_id)
+
+    assert execution["state"] == "refused"
+    assert execution["refusal_code"] == "not_reversible_now"
+    assert _ledger() == []
+    assert _nomination(nomination_id)["state"] == state
+
+
+_UNSEALED_CONNECTORS = f"""connectors:
+  {CONNECTOR}:
+    image: {IMAGE}
+"""
+
+
+def _unsealed_archive(tmp_path: Path, name: str) -> bytes:
+    """A bundle pinning the same ``k8s`` image but declaring no sealing key."""
+
+    root = tmp_path / f"unsealed-{uuid.uuid4().hex[:8]}"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": name, "version": "0.2.0", "description": "t"}), encoding="utf-8"
+    )
+    (root / "skills" / name).mkdir(parents=True)
+    (root / "skills" / name / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: t\n---\nhi\n", encoding="utf-8"
+    )
+    (root / "connectors.yaml").write_text(_UNSEALED_CONNECTORS, encoding="utf-8")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        tf.add(root, arcname=name)
+    return buf.getvalue()
+
+
+def _deploy_without_custody(
+    client: Any, headers: dict[str, str], tmp_path: Path, agent_id: str
+) -> None:
+    """Put a version in force that pins the same digest but drops the sealing key."""
+
+    version = client.post(
+        f"/agents/{agent_id}/versions",
+        json={"version_label": "v2", "created_by": "test"},
+        headers=headers,
+    )
+    assert version.status_code == 201, version.text
+    version_id = str(version.json()["id"])
+    name = client.get(f"/agents/{agent_id}", headers=headers).json()["name"]
+    upload = client.put(
+        f"/agents/{agent_id}/versions/{version_id}/bundle",
+        files={"file": ("bundle.tar.gz", _unsealed_archive(tmp_path, name))},
+        headers=headers,
+    )
+    assert upload.status_code == 201, upload.text
+    deployment = client.post(
+        "/deployments",
+        json={"agent_id": agent_id, "version_id": version_id, "environment": "dev"},
+        headers=headers,
+    )
+    assert deployment.status_code == 201, deployment.text
+
+
+def test_a_reversible_action_whose_custody_no_longer_holds_is_refused_at_dispatch(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-13: "capability **or custody**". The restore
+    capability row still holds, but the version now in force pins the same image
+    digest and declares no sealing key (ACTION-EXECUTOR-16), so the policy
+    execution is refused ``not_reversible_now`` with no ledger row and its
+    nomination goes to approval.
+    """
+
+    agent_id = _setup(client, auth_headers, tmp_path)
+    nomination_id = _nominate(agent_id)
+    created = _create(nomination_id)
+    _deploy_without_custody(client, auth_headers, tmp_path, agent_id)
+    assert sql_rows(
+        "SELECT 1 FROM curie.connector_capabilities WHERE agent_id = :a AND restore_capable",
+        {"a": uuid.UUID(agent_id)},
+    )
+
+    execution = _refuse_at_dispatch(client, created.execution_id)
+
+    assert execution["state"] == "refused"
+    assert execution["refusal_code"] == "not_reversible_now"
+    assert execution["dispatched_at"] is None
+    assert _ledger() == []
+    assert _nomination(nomination_id)["state"] == "approval_requested"
