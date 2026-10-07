@@ -464,8 +464,8 @@ class ActionExecutorLoop:
         self._in_force_digest = in_force_digest
         self._executor_boot = executor_boot
         self._grant_signing_key = grant_signing_key
-        # Checked once here so a missing or malformed key refuses before the
-        # ``dispatched`` commit rather than failing the mint after it.
+        # Checked once here so a missing or malformed key refuses a restore
+        # before any sandbox rather than failing the mint after the commit.
         try:
             signing_key(grant_signing_key)
         except ValueError:
@@ -562,6 +562,10 @@ class ActionExecutorLoop:
     async def _restore(self, execution: Execution, run: _Run) -> None:
         run.stage = "killswitch"
         await self._check_killswitch(execution)
+        if not self._grant_key_ok:
+            # @spec ACTION-EXECUTOR-7: no grant can be attached, so the proxy
+            # would refuse the call. Known before the run, so no sandbox.
+            raise _Refuse("tool_not_grant_bound", "grant")
         run.stage = "ledger"
         target, prior_state = await self._ruled_arguments(execution)
         run.stage = "deployment"
@@ -605,9 +609,6 @@ class ActionExecutorLoop:
             raise _Refuse(refusal.code, "arguments") from None
         except ValueError:
             raise _Refuse("arguments_mismatch", "arguments") from None
-        if not self._grant_key_ok:
-            # No grant can be minted, so the proxy would refuse the call.
-            raise _Refuse("tool_not_grant_bound", "grant")
         run.stage = "dispatch"
         await self._dispatch(execution)
         run.stage = "call"
