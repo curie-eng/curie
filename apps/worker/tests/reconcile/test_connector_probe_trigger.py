@@ -674,3 +674,167 @@ async def test_the_worker_composes_the_trigger_when_the_executor_is_on(
     assert len(probes) == 1
     assert json.loads(probes[0].content) == expected()
     assert probes[0].headers["X-Curie-Worker-Token"] == "curie-dev-worker-token"
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1: the resend window, the memo bound, and what is excluded
+# --------------------------------------------------------------------------- #
+WINDOW = 3600.0
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def timed_trigger(
+    requester: Any, capabilities: Any, clock: Clock, **kw: Any
+) -> Any:
+    from curie_worker.connector_probe import ProbeTrigger
+
+    return ProbeTrigger(
+        requester=requester,
+        capabilities=capabilities,
+        resend_after_seconds=WINDOW,
+        clock=clock,
+        **kw,
+    )
+
+
+def live_deployment(
+    connector: str = "grafana", digest: str = DIGEST, name: str | None = None
+) -> dict[str, Any]:
+    image = f"registry.example/connectors/{connector}@{digest}"
+    found = [o for o in served(rendered(connector, image=image)) if o["kind"] == "Deployment"]
+    deployment = found[0]
+    if name is not None:
+        deployment["metadata"]["name"] = name
+    return deployment
+
+
+async def _offer(trigger_: Any, *deployments: dict[str, Any]) -> None:
+    await trigger_.after_reconcile(
+        agent_id=str(TARGET.agent_id), agent_name=AGENT, observed=list(deployments)
+    )
+
+
+async def test_no_resend_before_the_window() -> None:
+    requester, clock = Requester(), Clock()
+    probe = timed_trigger(requester, Capabilities(), clock)
+
+    await _offer(probe, live_deployment())
+    clock.now += WINDOW - 1
+    await _offer(probe, live_deployment())
+
+    assert requester.sent == [expected()]
+
+
+async def test_resent_after_the_window_while_no_row_has_landed() -> None:
+    # A probe that ended refused or failed records no row; the API starts a
+    # new attempt when asked again.
+    requester, clock = Requester(), Clock()
+    probe = timed_trigger(requester, Capabilities(), clock)
+
+    await _offer(probe, live_deployment())
+    clock.now += WINDOW
+    await _offer(probe, live_deployment())
+
+    assert requester.sent == [expected(), expected()]
+
+
+async def test_a_landed_row_stops_the_resend_and_clears_the_entry() -> None:
+    requester, clock = Requester(), Clock()
+    rows = Capabilities()
+    probe = timed_trigger(requester, rows, clock)
+
+    await _offer(probe, live_deployment())
+    rows.rows.add((str(TARGET.agent_id), "grafana", DIGEST))
+    clock.now += WINDOW
+    await _offer(probe, live_deployment())
+    assert requester.sent == [expected()], "a row landed, so nothing is due"
+
+    # Cleared, not merely skipped: were the row to vanish, the triple is due at
+    # once rather than after another window counted from the first send.
+    rows.rows.clear()
+    clock.now += 1
+    await _offer(probe, live_deployment())
+    assert requester.sent == [expected(), expected()]
+
+
+async def test_the_oldest_remembered_request_is_forgotten_first() -> None:
+    capacity = 4096
+    requester, clock = Requester(), Clock()
+    probe = timed_trigger(requester, Capabilities(), clock)
+    template = live_deployment()
+
+    def at(index: int) -> dict[str, Any]:
+        deployment = copy.deepcopy(template)
+        digest = "sha256:" + f"{index:064x}"
+        for container in deployment["spec"]["template"]["spec"]["containers"]:
+            if container["name"] == "server":
+                container["image"] = f"registry.example/connectors/grafana@{digest}"
+        return deployment
+
+    for index in range(capacity + 1):
+        clock.now += 0.001
+        await _offer(probe, at(index))
+    assert len(requester.sent) == capacity + 1
+    requester.sent.clear()
+
+    clock.now += 1  # still well inside the window
+    # Remembered ones first: resending the oldest re-remembers it and evicts
+    # the next oldest, which would blur what is being checked.
+    await _offer(probe, at(1))
+    await _offer(probe, at(capacity))
+    await _offer(probe, at(0))
+
+    assert [body["digest"] for body in requester.sent] == ["sha256:" + f"{0:064x}"], (
+        "only the oldest triple should have been forgotten"
+    )
+
+
+async def test_a_deployment_the_same_pass_deletes_is_not_probed() -> None:
+    # The render no longer declares grafana, so the pass deletes its
+    # Deployment: probing it would ask about an image that is going away.
+    requester = Requester()
+    live = served(rendered())
+    built, client = loop(live, desired=[], requester=requester)
+
+    await built.one_pass()
+
+    assert ("Deployment", "curie-acme-bot-mcp-grafana") in client.deleted
+    assert requester.sent == []
+
+
+async def test_a_deployment_not_at_its_rendered_name_is_not_probed() -> None:
+    requester, clock = Requester(), Clock()
+    probe = timed_trigger(requester, Capabilities(), clock, release=RELEASE)
+
+    await _offer(probe, live_deployment(name="curie-other-bot-mcp-grafana"))
+    assert requester.sent == [], "the proxy env alone must not name a connector"
+
+    await _offer(probe, live_deployment())
+    assert requester.sent == [expected()], "the rendered name is probed"
+
+
+async def test_a_bad_deployment_name_does_not_skip_the_agents_other_probes() -> None:
+    # A connector forging a second ``-mcp-`` makes ``object_name`` raise. That
+    # Deployment is not a probe target, and the agent's other connectors in
+    # the same pass still are.
+    requester, clock = Requester(), Clock()
+    probe = timed_trigger(requester, Capabilities(), clock, release=RELEASE)
+    forged = live_deployment(name="curie-acme-bot-mcp-x-mcp-y")
+    for container in forged["spec"]["template"]["spec"]["containers"]:
+        for env in container.get("env") or []:
+            if env.get("name") == "CURIE_CALLER_PROXY_CONNECTOR":
+                env["value"] = "x-mcp-y"
+
+    try:
+        await _offer(probe, forged, live_deployment())
+    except Exception:  # noqa: BLE001 -- the loop would contain it; the probe is still lost
+        pass
+
+    assert requester.sent == [expected()]
