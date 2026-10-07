@@ -608,6 +608,36 @@ def test_cli_sidecar_reference_cannot_cover_missing_runner_reference(tmp_path: P
     assert "CONNECTOR_ROOT" in rows[0]["reason"]
 
 
+@pytest.mark.parametrize("runner_count", [0, 2])
+def test_cli_selected_template_requires_one_runner_without_connector_secrets(
+    tmp_path: Path, runner_count: int
+) -> None:
+    """@spec STARTABILITY-2 STARTABILITY-5 STARTABILITY-7."""
+    data = snapshot()
+    data["bindings"] = [binding(kind="email")]
+    containers = data["templates"][1]["spec"]["podTemplate"]["spec"]["containers"]
+    runner = containers.pop(0)
+    containers.extend([runner.copy() for _ in range(runner_count)])
+    result, _ = run_cli(tmp_path, data)
+    assert result.returncode == 0
+    rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
+    assert rows[0]["ready"] == 0 and total["not_ready"] == 1
+    assert "acme-agent-runner" in rows[0]["reason"]
+    assert "runner" in rows[0]["reason"]
+
+
+def test_cli_unselected_template_without_runner_preserves_ready_binding(tmp_path: Path) -> None:
+    """@spec STARTABILITY-2 STARTABILITY-5 STARTABILITY-7."""
+    data = snapshot()
+    data["bindings"] = [binding("acme-dev", kind="email")]
+    containers = data["templates"][1]["spec"]["podTemplate"]["spec"]["containers"]
+    containers.pop(0)
+    result, _ = run_cli(tmp_path, data)
+    assert result.returncode == 0
+    rows, total = split([json.loads(line) for line in result.stdout.splitlines()])
+    assert rows[0]["ready"] == 1 and total["not_ready"] == 0
+
+
 def test_cli_unreadable_identity_declaration_is_a_collection_error(tmp_path: Path) -> None:
     """@spec STARTABILITY-3 STARTABILITY-5 STARTABILITY-6."""
     data = snapshot()
