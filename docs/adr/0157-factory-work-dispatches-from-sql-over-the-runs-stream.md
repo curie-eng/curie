@@ -4,6 +4,12 @@ Date: 2026-09-19
 
 Status: Accepted
 
+**Amended by [ADR 0206](0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md)**
+(back link added under [ADR-0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+D5 is overtaken for what follows a lost owner. A request that ends
+`failed/owner_lost` is followed by a new request on the same WorkItem, up to 3
+owner_lost requests in a row. The rest of this ADR stands.
+
 Partially amends
 [ADR 0146](0146-headless-capacity-is-a-wait-not-a-reply.md)
 and

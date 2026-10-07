@@ -7,11 +7,11 @@ from alembic import command
 from test_migration_0056_factory_status_comments import _seed_notice, _seed_request
 
 
-def test_0089_status_sync_lease_upgrades_and_downgrades_without_losing_notices(
+def test_0092_status_sync_lease_upgrades_and_downgrades_without_losing_notices(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     config = alembic_config()
-    isolated_migration_db.at("0081")
+    isolated_migration_db.at("0091")
     work_item, request = _seed_request(9959, "https://github.com/acme-corp/acme-bot/issues/9959")
     _seed_notice(work_item, request, comment_id=7999)
     original = sql_dicts(
@@ -20,7 +20,7 @@ def test_0089_status_sync_lease_upgrades_and_downgrades_without_losing_notices(
         {"id": request},
     )[0]
     try:
-        command.upgrade(config, "0089")
+        command.upgrade(config, "0092")
         metadata = sql_dicts(
             "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
             "WHERE table_schema = 'curie' AND table_name = 'factory_terminal_notices' "
@@ -49,7 +49,7 @@ def test_0089_status_sync_lease_upgrades_and_downgrades_without_losing_notices(
             "WHERE execution_request_id = :id",
             {"id": request},
         )
-        command.downgrade(config, "0081")
+        command.downgrade(config, "0091")
         assert not {"sync_owner", "sync_lease_expires_at", "sync_invalidated"} & column_names(
             "factory_terminal_notices"
         )
@@ -59,7 +59,7 @@ def test_0089_status_sync_lease_upgrades_and_downgrades_without_losing_notices(
             {"id": request},
         )[0]
         assert restored == original
-        command.upgrade(config, "0089")
+        command.upgrade(config, "0092")
         lease = sql_dicts(
             "SELECT sync_owner, sync_lease_expires_at, sync_invalidated "
             "FROM curie.factory_terminal_notices "

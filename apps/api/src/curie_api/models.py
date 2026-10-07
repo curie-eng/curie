@@ -974,6 +974,8 @@ class ExecutionRequest(Base):
     reply_kind: Mapped[str | None] = mapped_column(Text, default=None)
     reply_address: Mapped[str | None] = mapped_column(Text, default=None)
     reply_conversation_id: Mapped[str | None] = mapped_column(Text, default=None)
+    # Admitted because its predecessor ended failed/owner_lost (ADR 0206).
+    owner_lost_retry: Mapped[bool] = mapped_column(default=False, server_default="false")
 
     work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
 

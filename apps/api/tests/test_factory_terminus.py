@@ -1311,12 +1311,16 @@ def test_owner_lost_posts_one_comment(admitted: Any) -> None:
     )
     assert _notices(row["id"])[0]["terminal_cause"] is None
     _observe_termination(client, row["id"])
-    terminal = _request(number)
-    assert (terminal["status"], terminal["terminal_cause"]) == ("failed", "owner_lost")
+    lost = [r for r in _requests(number) if r["id"] == row["id"]]
+    assert len(lost) == 1, lost
+    assert (lost[0]["status"], lost[0]["terminal_cause"]) == ("failed", "owner_lost")
+    successors = [r for r in _requests(number) if r["id"] != row["id"]]
+    assert len(successors) == 1, successors
+    assert successors[0]["status"] == "waiting"
     _reconcile()
-    assert sink.posts == 1
-    assert "owner_lost" in sink.comments[0]["body"]
-    _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
+    final = _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
+    assert "Cause: owner_lost" in final
+    assert "(attempt 2 of 3)" in final
 
 
 def test_runner_failure_posts_one_comment(admitted: Any) -> None:

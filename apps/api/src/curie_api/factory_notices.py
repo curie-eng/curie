@@ -60,6 +60,7 @@ from .models import (
     WorkItem,
 )
 from .repo_full_name import repo_url_path
+from .workitems import OWNER_LOST_RETRY_LIMIT, owner_lost_streak, owner_lost_successor_admitted
 
 logger = logging.getLogger(__name__)
 
@@ -421,8 +422,15 @@ def result_section(
     feedback_url: str | None = None,
     detail: str | None = None,
     superseded: bool = False,
+    lost_streak: int = 0,
+    lost_retried: bool = False,
 ) -> str:
-    """The terminal result lines of a status comment, without any marker."""
+    """The terminal result lines of a status comment, without any marker.
+
+    For ``owner_lost``, ``lost_streak`` is the consecutive losses through
+    this request and ``lost_retried`` whether its settlement admitted a
+    successor (ADR 0206); together they choose the retry or exhausted sentence.
+    """
 
     if cause == "completed":
         if feedback_url is not None:
@@ -455,7 +463,18 @@ def result_section(
         )
     else:
         sentence = cause_text(cause)
-        if cause == "budget_exceeded":
+        if cause == "owner_lost" and lost_streak == OWNER_LOST_RETRY_LIMIT:
+            sentence = (
+                "the worker running this request stopped responding "
+                f"{OWNER_LOST_RETRY_LIMIT} times."
+            )
+        elif cause == "owner_lost" and lost_retried and 1 <= lost_streak < OWNER_LOST_RETRY_LIMIT:
+            sentence = (
+                "the worker running this request stopped responding. Curie started "
+                "the work again as a new run "
+                f"(attempt {lost_streak + 1} of {OWNER_LOST_RETRY_LIMIT})."
+            )
+        elif cause == "budget_exceeded":
             token_budget = _OUTPUT_TOKEN_BUDGET_DETAIL.fullmatch(detail or "")
             usd_budget = _USD_BUDGET_DETAIL.fullmatch(detail or "")
             if token_budget is not None:
@@ -965,6 +984,13 @@ async def _render(
             and target.kind == "issue"
             and (not isinstance(pr_url, str) or not pr_url.strip())
         ):
+            streak = 0
+            retried = False
+            if cause == "owner_lost":
+                streak = await owner_lost_streak(
+                    session, work_item.id, through_sequence=request.sequence
+                )
+                retried = await owner_lost_successor_admitted(session, request)
             result = result_section(
                 cause,
                 pr_url=pr_url,
@@ -972,6 +998,8 @@ async def _render(
                 detail=row.detail,
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),
+                lost_streak=streak,
+                lost_retried=retried,
             )
             # Tokens and estimated cost over every round of the work item
             # (#3223), after the Cause line so its parse is unchanged.
