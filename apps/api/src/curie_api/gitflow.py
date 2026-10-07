@@ -407,7 +407,7 @@ def log_push_outcome(result: WebhookResult, payload: dict[str, object], *, sourc
 
 
 def _rejected(
-    exc: deploy.ApprovalRoutesUnbound | deploy.BundleTooLarge,
+    exc: deploy.ApprovalRoutesUnbound | deploy.BundleTooLarge | deploy.SealingKeyCustody,
     agent_id: uuid.UUID | None = None,
 ) -> WebhookResult:
     """The rejection envelope for the two refusals `process_push` shares with the API.
@@ -721,7 +721,14 @@ async def process_push(
                 await deploy.check_approval_route_bindings(
                     store, sibling, agent.approval_routes, settings
                 )
-            except (deploy.BundleTooLarge, deploy.ApprovalRoutesUnbound) as exc:
+                # @spec ACTION-EXECUTOR-16: the sibling object is stored
+                # bytes too, so it gets the custody re-check intake would give.
+                await deploy.check_stored_sealing_key_custody(store, sibling, settings)
+            except (
+                deploy.BundleTooLarge,
+                deploy.ApprovalRoutesUnbound,
+                deploy.SealingKeyCustody,
+            ) as exc:
                 # `bundle.too_large` is live here, not theoretical: the sibling
                 # object is a DIFFERENT object from the archive
                 # `validate_archive` cleared moments ago, and on this path
@@ -774,7 +781,11 @@ async def process_push(
     if not bundle_built:
         try:
             await deploy.revalidate_stored_bundle(store, version, settings)
-        except deploy.BundleTooLarge as exc:
+            # @spec ACTION-EXECUTOR-16: a reused bundle stored before intake
+            # refused a non-SecretRef sealing key declaration is refused here,
+            # as `POST /deployments` refuses it.
+            await deploy.check_stored_sealing_key_custody(store, version, settings)
+        except (deploy.BundleTooLarge, deploy.SealingKeyCustody) as exc:
             return _rejected(exc, agent.id)
 
     # The declared/bound approval-route join at the moment the version becomes
