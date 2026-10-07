@@ -15,7 +15,13 @@ import redis
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT
 from redis.asyncio import Redis as AsyncRedis
 
-from .types import PressureCandidate, PressureScanResult, RouteRecord, RouteState
+from .types import (
+    EXECUTOR_THREAD_KEY_PREFIX,
+    PressureCandidate,
+    PressureScanResult,
+    RouteRecord,
+    RouteState,
+)
 
 # SCAN COUNT is an approximate database work hint, not a result limit. The
 # caller permits eight pages, roughly 65,000 examined database keys, while its
@@ -313,6 +319,30 @@ class AffinityStore:
 
         inventory = self.route_inventory(thread_keys_scan_count)
         return set().union(*inventory.values())
+
+    def executor_routes(self, scan_count: int = 500) -> dict[str, RouteRecord]:
+        """Every unexpired executor route (``action-exec:<id>``) by thread key.
+
+        @spec AUTOMATED-REMEDIATION-12: what a live executor loop sweeps after a
+        holder crashed. Turn routes are never matched.
+        """
+
+        route_prefix = f"{self._prefix}:route:"
+        routes: dict[str, RouteRecord] = {}
+        for key in self._redis.scan_iter(
+            match=f"{route_prefix}{EXECUTOR_THREAD_KEY_PREFIX}*", count=scan_count
+        ):
+            key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+            raw = self._redis.get(key)
+            if raw is None:
+                continue
+            text = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            try:
+                record = RouteRecord.from_json(text)
+            except (ValueError, TypeError, KeyError):
+                continue
+            routes[key_text[len(route_prefix) :]] = record
+        return routes
 
     def route_inventory(self, thread_keys_scan_count: int = 500) -> dict[RouteState, set[str]]:
         """Authoritative unexpired route claims grouped by persisted state."""

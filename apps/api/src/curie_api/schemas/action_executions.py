@@ -9,11 +9,14 @@ No response here carries an envelope, a state, a version or a result: an
 execution reads back as identity, state, fence and codes only.
 """
 
+import json
 import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from ..action_execution_codes import SAMPLE_KINDS
 
 # The connector name grammar of ``plugin_format.connectors`` (an RFC 1123
 # label), and the only digest form a pinned connector renders at. Public because
@@ -129,3 +132,53 @@ class ExecutionArguments(BaseModel):
 
     tool: str
     arguments: dict[str, Any]
+
+
+class ReadArguments(BaseModel):
+    """A claimed read execution's bound call and pointer, read by its holder only.
+
+    @spec AUTOMATED-REMEDIATION-12: the read is the declaration's, never a
+    caller's. Answered only by ``POST /action-executions/{id}/arguments``.
+    """
+
+    tool: str
+    arguments: dict[str, Any]
+    pointer: str
+
+
+# remediation-predicate.json ``value_max_chars``: a sample's compact JSON text.
+SAMPLE_VALUE_MAX_CHARS = 256
+
+
+class ExecutionSample(ExecutionFence):
+    """@spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and ``value``.
+
+    remediation-predicate.json ``sample_report``: the sample kind the runner
+    answered and, for ``value``, the pointed JSON scalar (at most
+    ``SAMPLE_VALUE_MAX_CHARS`` characters of compact JSON); null otherwise.
+    ``skipped`` is the API's own record, never a report. The API never receives
+    more than the scalar.
+    """
+
+    sample: str = Field(max_length=32)
+    value: Any
+
+    @model_validator(mode="after")
+    def _the_frozen_report(self) -> "ExecutionSample":
+        if self.sample not in SAMPLE_KINDS:
+            raise ValueError("sample is one of the frozen sample kinds")
+        if self.sample != "value":
+            if self.value is not None:
+                raise ValueError("only a value sample carries a value")
+            return self
+        if isinstance(self.value, (dict, list)):
+            raise ValueError("a sample value is a JSON scalar")
+        try:
+            text = json.dumps(
+                self.value, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("a sample value is a JSON scalar") from exc
+        if len(text) > SAMPLE_VALUE_MAX_CHARS:
+            raise ValueError("a sample value is at most 256 characters of JSON")
+        return self

@@ -88,7 +88,7 @@ def test_real_required_table_wait_obeys_deadline_or_cancellation_and_disposes_ba
                 async with observer.connect() as observed:
                     assert (
                         await observed.scalar(text("SELECT version_num FROM curie.alembic_version"))
-                        == "0089"
+                        == "0090"
                     )
                     assert (
                         await observed.scalar(

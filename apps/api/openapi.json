@@ -5578,6 +5578,39 @@
         "title": "ExecutionOutcome",
         "type": "object"
       },
+      "ExecutionSample": {
+        "additionalProperties": false,
+        "description": "@spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and ``value``.\n\nremediation-predicate.json ``sample_report``: the sample kind the runner\nanswered and, for ``value``, the pointed JSON scalar (at most\n``SAMPLE_VALUE_MAX_CHARS`` characters of compact JSON); null otherwise.\n``skipped`` is the API's own record, never a report. The API never receives\nmore than the scalar.",
+        "properties": {
+          "attempt": {
+            "minimum": 0.0,
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "lease_owner": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Lease Owner",
+            "type": "string"
+          },
+          "sample": {
+            "maxLength": 32,
+            "title": "Sample",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value"
+          }
+        },
+        "required": [
+          "lease_owner",
+          "attempt",
+          "sample",
+          "value"
+        ],
+        "title": "ExecutionSample",
+        "type": "object"
+      },
       "FinishBody": {
         "properties": {
           "cause": {
@@ -8577,6 +8610,31 @@
           "received_at"
         ],
         "title": "QueuedTurn",
+        "type": "object"
+      },
+      "ReadArguments": {
+        "description": "A claimed read execution's bound call and pointer, read by its holder only.\n\n@spec AUTOMATED-REMEDIATION-12: the read is the declaration's, never a\ncaller's. Answered only by ``POST /action-executions/{id}/arguments``.",
+        "properties": {
+          "arguments": {
+            "additionalProperties": true,
+            "title": "Arguments",
+            "type": "object"
+          },
+          "pointer": {
+            "title": "Pointer",
+            "type": "string"
+          },
+          "tool": {
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tool",
+          "arguments",
+          "pointer"
+        ],
+        "title": "ReadArguments",
         "type": "object"
       },
       "RemediationNominationAccepted": {
@@ -11736,7 +11794,7 @@
   "paths": {
     "/action-executions/claim": {
       "post": {
-        "description": "Claim the oldest claimable execution under a lease, or ``204``.\n\n@spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a\n``requested`` row is claimable, and so is a ``claimed`` row whose lease\nexpired, which is reclaimed with the next attempt so the earlier holder's\nfence is stale. A reclaim forgets the earlier attempt's observation, so the\nnew holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.\n@spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.",
+        "description": "Claim the oldest due execution under a lease, or ``204``.\n\n@spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a\n``requested`` row is claimable, and so is a ``claimed`` row whose lease\nexpired, which is reclaimed with the next attempt so the earlier holder's\nfence is stale. A reclaim forgets the earlier attempt's observation, so the\nnew holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.\n@spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.\n\n@spec AUTOMATED-REMEDIATION-12 (executor amendments E5 and E9): only due\nexecutions (``not_before`` NULL or past) are handed out, oldest\n``not_before`` first (an unscheduled row by its creation time); never more\nthan ``action_executor_max_concurrent_sandboxes`` are live (claimed or\ndispatched) across the installation, and while two or more slots exist at\nmost all but one are reads. An expired read is refused ``runner_unavailable``\nand never reclaimed; a due read whose series successor is due is skipped.",
         "operationId": "claim_execution_action_executions_claim_post",
         "parameters": [
           {
@@ -11859,7 +11917,7 @@
     },
     "/action-executions/{execution_id}/arguments": {
       "post": {
-        "description": "The bound tool and arguments of the claimed forward execution this fence holds.\n\n@spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19. The worker recomputes\n``arguments_sha256`` over the text it will send and refuses\n``arguments_mismatch`` on any difference, so it needs the bound arguments\nbefore dispatch; ``ExecutionOut`` never carries them. The body is exactly\nthe fence (a body naming a tool or arguments is a 422), a stale fence is a\n``409``, and only a ``claimed`` forward execution answers. Nothing moves.",
+        "description": "The bound tool and arguments of the claimed forward execution this fence holds.\n\n@spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19. The worker recomputes\n``arguments_sha256`` over the text it will send and refuses\n``arguments_mismatch`` on any difference, so it needs the bound arguments\nbefore dispatch; ``ExecutionOut`` never carries them. The body is exactly\nthe fence (a body naming a tool or arguments is a 422), a stale fence is a\n``409``, and only a ``claimed`` forward execution answers. Nothing moves.\n\n@spec AUTOMATED-REMEDIATION-12: a ``claimed`` read execution answers its\nbound tool, arguments and pointer the same way.",
         "operationId": "read_arguments_action_executions__execution_id__arguments_post",
         "parameters": [
           {
@@ -11904,7 +11962,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ExecutionArguments"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ExecutionArguments"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReadArguments"
+                    }
+                  ],
+                  "title": "Response Read Arguments Action Executions  Execution Id  Arguments Post"
                 }
               }
             },
@@ -12132,6 +12198,76 @@
           }
         },
         "summary": "Report Outcome",
+        "tags": [
+          "action-executions"
+        ]
+      }
+    },
+    "/action-executions/{execution_id}/samples": {
+      "post": {
+        "description": "Record the one sample a claimed read execution took, ending it ``confirmed``.\n\n@spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and\n``value`` (remediation-predicate.json ``sample_report``); the API evaluates\nthe predicate from the stored sample (plan task 11). Only a ``claimed`` read\nreports one; a replay of the stored sample answers the row unchanged and a\ndifferent one is refused (``409``). The answer is the receipt, which never\ncarries the value or the pointer.",
+        "operationId": "report_sample_action_executions__execution_id__samples_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "execution_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Execution Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecutionSample"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Report Sample",
         "tags": [
           "action-executions"
         ]

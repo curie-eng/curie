@@ -17,6 +17,7 @@
           "sandbox_unavailable",
           "runner_unavailable",
           "connector_unreachable",
+          "tool_not_read_only",
           "version_conflict_at_write",
           "sealing_key_unavailable",
           "snapshot_unopenable",
@@ -57,7 +58,7 @@
           "unreported"
         ]
       },
-      "cardinality_bound": 22440,
+      "cardinality_bound": 23460,
       "description": "Connector action executions by kind, terminal state, stage, code and connector.",
       "monotonic": true,
       "type": "counter",
@@ -425,6 +426,7 @@
           "/action-executions/{execution_id}/dispatch",
           "/action-executions/{execution_id}/observation",
           "/action-executions/{execution_id}/outcome",
+          "/action-executions/{execution_id}/samples",
           "/actions",
           "/actions/{action_id}",
           "/actions/{action_id}/audit",
@@ -579,7 +581,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1136,
+      "cardinality_bound": 1144,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -594,6 +596,7 @@
           "/action-executions/{execution_id}/dispatch",
           "/action-executions/{execution_id}/observation",
           "/action-executions/{execution_id}/outcome",
+          "/action-executions/{execution_id}/samples",
           "/actions",
           "/actions/{action_id}",
           "/actions/{action_id}/audit",
@@ -755,7 +758,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5680,
+      "cardinality_bound": 5720,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -770,6 +773,7 @@
           "/action-executions/{execution_id}/dispatch",
           "/action-executions/{execution_id}/observation",
           "/action-executions/{execution_id}/outcome",
+          "/action-executions/{execution_id}/samples",
           "/actions",
           "/actions/{action_id}",
           "/actions/{action_id}/audit",
@@ -931,7 +935,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5680,
+      "cardinality_bound": 5720,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",

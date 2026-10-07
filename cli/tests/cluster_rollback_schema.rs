@@ -166,7 +166,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
 
     assert_eq!(source.schema_head, "0044");
     assert_eq!(target.schema_min, "0082");
-    assert_eq!(target.schema_head, "0089");
+    assert_eq!(target.schema_head, "0090");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
@@ -181,7 +181,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             "0045", "0046", "0047", "0048", "0049", "0050", "0051", "0052", "0053", "0054", "0055",
             "0056", "0057", "0058", "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066",
             "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0075", "0076", "0079", "0080",
-            "0081", "0082", "0083", "0084", "0085", "0086", "0087", "0088", "0089"
+            "0081", "0082", "0083", "0084", "0085", "0086", "0087", "0088", "0089", "0090"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -225,7 +225,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0058");
-    assert_eq!(target.schema_head, "0089");
+    assert_eq!(target.schema_head, "0090");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.1 reaches the new head");
     assert_eq!(
@@ -238,7 +238,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
         [
             "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066", "0067", "0068", "0069",
             "0070", "0071", "0072", "0073", "0075", "0076", "0079", "0080", "0081", "0082", "0083",
-            "0084", "0085", "0086", "0087", "0088", "0089"
+            "0084", "0085", "0086", "0087", "0088", "0089", "0090"
         ]
     );
 
@@ -279,7 +279,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0062");
-    assert_eq!(target.schema_head, "0089");
+    assert_eq!(target.schema_head, "0090");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.2 reaches the new head");
     assert_eq!(
@@ -292,7 +292,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
         [
             "0063", "0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071", "0072", "0073",
             "0075", "0076", "0079", "0080", "0081", "0082", "0083", "0084", "0085", "0086", "0087",
-            "0088", "0089"
+            "0088", "0089", "0090"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -335,7 +335,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0063");
-    assert_eq!(target.schema_head, "0089");
+    assert_eq!(target.schema_head, "0090");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.3 reaches the new head");
     assert_eq!(
@@ -348,7 +348,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
         [
             "0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0075",
             "0076", "0079", "0080", "0081", "0082", "0083", "0084", "0085", "0086", "0087", "0088",
-            "0089"
+            "0089", "0090"
         ]
     );
     let contracts: Vec<&str> = pending

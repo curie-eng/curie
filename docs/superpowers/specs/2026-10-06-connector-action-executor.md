@@ -212,13 +212,13 @@ adds `action_executions`:
 | Column | Type | Meaning |
 | --- | --- | --- |
 | `id` | UUID PK | Execution identity. |
-| `kind` | text: `restore`, `forward`, `probe` | What is executed. |
+| `kind` | text: `restore`, `forward`, `probe`; amendment E2 adds `read` (revision 0090, AUTOMATED-REMEDIATION-12) | What is executed. |
 | `agent_id` | UUID FK agents, cascade, not null | Whose binding the call runs under. |
 | `connector` | text | Connector name. |
 | `tool` | text, null for `probe` | Upstream tool name; `restore` for a restore. |
 | `subject_action_id` | UUID FK agent_actions, nullable | Restore: the action put back. Forward: the record created at dispatch. |
 | `arguments_sha256` | text, nullable | SHA-256 of the canonical argument bytes (ACTION-EXECUTOR-7). |
-| `forward_arguments` | JSONB, nullable | Forward only: the canonical arguments the authority bound. |
+| `forward_arguments` | JSONB, nullable | Forward and read: the canonical arguments the authority bound. |
 | `connector_digest` | text | The `sha256:` digest the call must run against. |
 | `authority_kind`, `authority_ref` | text | `undo_ruling` with the authorizing audit row id, `policy` with the generation reference, `approval` with the approval id, `capability_probe` with the reconcile pass id. Amendment E1 adds `qualification`; a check constraint closes `authority_kind` to those five (revision 0089, AUTOMATED-REMEDIATION-14). |
 | `requested_by` | text, nullable | The ruling's actor; copied to `undone_by` on confirmation. |
@@ -228,6 +228,9 @@ adds `action_executions`:
 | `attempt`, `lease_owner`, `lease_expires_at` | int, text, timestamptz | Claim fencing. |
 | `dispatched_at`, `finished_at`, `created_at` | timestamptz | Lifecycle. |
 | `outcome` | JSONB, nullable | Version strings, key identifier and codes only; never an envelope, a state or a result. |
+| `not_before` | timestamptz, nullable | Amendment E9: handed out only once due; NULL is due (revision 0090). |
+| `pointer` | text, nullable | Read only: the predicate's RFC 6901 pointer, bound with the tool and arguments (revision 0090). |
+| `sample` | JSONB, nullable | Read only: the one `{sample, value}` reported, or the API's `skipped`; never the result (revision 0090). |
 
 Constraints: check constraints on `kind` and `state`; a unique partial index on
 `subject_action_id` for `kind = 'restore'` and `state <> 'refused'`; uniqueness
@@ -302,6 +305,14 @@ the pool source stay the agent's, so reach is unchanged. The template also drops
 are excluded from `SandboxSubstrate.pressure_candidates`, so idle reclamation
 never selects one, and a quota rejection maps to `sandbox_unavailable`. The
 sandbox is released after the outcome is reported and on every error path.
+Amendment E9 (AUTOMATED-REMEDIATION-12): the claim route never hands out more
+than `actionExecutor.maxConcurrentSandboxes` live (claimed or dispatched)
+executions across the installation (default 2, at least 1, rendered into the
+API and the worker), so ordinary turns keep sandbox quota; executor routes stay
+out of the pressure path. A read execution claims its own sandbox under the
+read connector's binding and releases it before its sample is reported; a live
+loop's pass that claims nothing releases the sandbox of a read the API ended
+after its holder crashed.
 
 Acceptance (cluster): the executor sandbox reaches the agent's own connector
 and is refused at the network layer toward another agent's connector; its
@@ -334,13 +345,22 @@ target}` with `phase` one of:
   <target>}` and returns its `version`. Read-only, ungated, no grant.
 * `call`: issues exactly one `tools/call` of `tool` with the canonical
   `arguments` text and the grant header, after the preflight below.
+* `read` (amendments E3 and E4, AUTOMATED-REMEDIATION-12): the request adds
+  `pointer`, an RFC 6901 pointer, and no other phase carries one. After
+  `list`, exactly one `tools/call` of a declared read tool with its canonical
+  `arguments` text and no grant; a tool not advertised `readOnlyHint: true` in
+  this sandbox's own `list` is refused `tool_not_read_only` without dialing.
+  The answer is only `{phase, sample, value}`: the scalar at the pointer in
+  the structured content, else in the strict JSON of a result's one and only
+  text block within the result bound, else `result_unstructured`.
 
 The runner derives the connector's MCP entry exactly as an ordinary boot does
 and opens each session through the standalone client, promoted from the
 private `_server_streams` to a public helper in the same module. Within one
 sandbox the only accepted sequences are `list`, or `list` then `observe` then
-`call` for a restore, or `list` then `call` for a forward action; anything
-else, including a second `call`, returns `409` without dialing. Preflight before
+`call` for a restore, or `list` then `call` for a forward action, or `list`
+then one `read` (amendment E3); anything else, including a second `call` or a
+second `read`, returns `409` without dialing. Preflight before
 `call`: the tool is advertised; for `restore`, ACTION-EXECUTOR-13's capability
 rule holds; the argument text parses to an object whose canonical form is
 byte-identical to the text received. The route emits no ACI frame and logs no
@@ -707,6 +727,19 @@ and `ChannelCanvasEdit`. `refused` means provably no write call and releases the
 action. `confirmed`, `failed` and `indeterminate` are terminal. A sweeper in
 the executor loop applies the expiry rules.
 
+Amendments E5 and E9 (AUTOMATED-REMEDIATION-12): a `read` execution never
+enters `dispatched`. It runs `list` and its one `read` in `claimed` and ends
+`confirmed` through `POST /action-executions/{id}/samples`, or `refused`; a read
+whose lease expires in `claimed` ends `refused` with `runner_unavailable` and is
+never re-queued. The claim route hands out only due executions (`not_before`
+NULL or past), oldest `not_before` first, under one transaction-scoped advisory
+lock so the installation-wide cap holds across API replicas; while two or more
+slots exist, at most all but one live executions are reads. A requested read
+whose next sample in its series (same agent, `authority_ref`, connector, tool,
+arguments and pointer) is already due ends `confirmed` with the sample
+`skipped`, never claimed. The worker loop runs up to the cap at once; the API's
+count is the authority.
+
 Acceptance (fault injection on real Postgres, Valkey and the reference
 connector): kill the worker before the `dispatched` commit, between the commit
 and the request, after the connector call and before the report, and during
@@ -792,12 +825,15 @@ one stage; only ruling and pre-dispatch codes are provable non-writes.
 | Stage | Codes |
 | --- | --- |
 | Ruling (HTTP 409, 412 or 503; audit row, no execution) | `executor_disabled`, `refused_restore_in_flight`, `refused_no_agent`, `refused_unsealed`, `refused_unversioned`, `refused_no_digest`, `refused_not_restore_capable`, `refused_key_custody`, `refused_authority_unresolved`, `refused_actor_mismatch` (HTTP 403), `refused_duplicate_ruling` (HTTP 409), plus the existing ruling refusals |
-| Pre-dispatch (`refused`) | `agent_stopped`, `authority_unavailable`, `reserved_verb_via_forward`, `arguments_mismatch`, `tool_not_grant_bound`, `connector_not_hosted`, `connector_digest_unavailable`, `restore_not_advertised`, `restore_schema_mismatch`, `tool_not_advertised`, `version_conflict`, `sandbox_unavailable`, `runner_unavailable`, `connector_unreachable` |
+| Pre-dispatch (`refused`) | `agent_stopped`, `authority_unavailable`, `reserved_verb_via_forward`, `arguments_mismatch`, `tool_not_grant_bound`, `connector_not_hosted`, `connector_digest_unavailable`, `restore_not_advertised`, `restore_schema_mismatch`, `tool_not_advertised`, `version_conflict`, `sandbox_unavailable`, `runner_unavailable`, `connector_unreachable`; amendment E6 adds `tool_not_read_only` (worker reported) |
 | Connector refusal during `call` (`failed`) | `version_conflict_at_write`, `sealing_key_unavailable`, `snapshot_unopenable` |
 | Post-dispatch (`failed` or `indeterminate`) | `connector_error`, `unstructured_reply`, `response_lost`, `deadline_exceeded` |
 
 An unknown code from a runner or connector is normalized to `connector_error`
-or `response_lost` by stage, never passed through.
+or `response_lost` by stage, never passed through. Amendment E6: a read's
+`pointer_absent`, `result_unstructured` and a `skipped` sample are sample
+results stored on the execution, never refusal codes, and an unknown refusal of
+a read is `runner_unavailable`, because a read cannot write.
 The ruling route answers `executor_disabled` with HTTP 503 and every other
 ruling refusal with the status its existing refusal used.
 

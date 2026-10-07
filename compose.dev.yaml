@@ -425,6 +425,10 @@ services:
       # same interpolation, so one CURIE_ACTION_EXECUTOR_ENABLED in the
       # environment turns both on and an unset one leaves both off.
       CURIE_ACTION_EXECUTOR_ENABLED: ${CURIE_ACTION_EXECUTOR_ENABLED:-false}
+      # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+      # executor amendment E9), enforced by the claim route. curie-worker reads
+      # the same interpolation; the two must never differ.
+      CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES: ${CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES:-2}
       # The automated remediation switch (AUTOMATED-REMEDIATION-1). curie-worker
       # reads the same interpolation. It requires the executor switch above; the
       # API and the worker refuse to boot with it on and the executor off.
@@ -709,6 +713,9 @@ services:
       # The action executor switch (ACTION-EXECUTOR-1). curie-api reads the
       # same interpolation; the two must never differ.
       - CURIE_ACTION_EXECUTOR_ENABLED=${CURIE_ACTION_EXECUTOR_ENABLED:-false}
+      # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+      # executor amendment E9). curie-api reads the same interpolation.
+      - CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES=${CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES:-2}
       # The automated remediation switch (AUTOMATED-REMEDIATION-1). curie-api
       # reads the same interpolation; the two must never differ.
       - CURIE_REMEDIATION_ENABLED=${CURIE_REMEDIATION_ENABLED:-false}

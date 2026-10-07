@@ -454,7 +454,12 @@
       "type": "object",
       "description": "The connector action executor switch (ACTION-EXECUTOR-1), rendered into both the API and the worker. A boolean, so a quoted \"false\" cannot turn it on.",
       "properties": {
-        "enabled": {"type": "boolean"}
+        "enabled": {"type": "boolean"},
+        "maxConcurrentSandboxes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12, executor amendment E9), rendered into both the API and the worker. An integer of at least 1, so 0 or a quoted \"3\" does not render."
+        }
       }
     },
     "remediation": {

@@ -15,7 +15,26 @@ phases against a real MCP session, not a stub of the route. It runs two ways:
 Settings (env name in parentheses for stdio):
 
 * ``tools`` (``CURIE_TEST_EXECUTOR_TOOLS``): ``paired`` (default),
-  ``lone_restore``, ``no_restore`` or ``readonly_restore``.
+  ``lone_restore``, ``no_restore`` or ``readonly_restore``; ``read`` advertises
+  the read connector's catalogue of ``runner-execute.json``'s ``read.list_response``
+  (``query_value`` read-only, ``query_unhinted`` without the hint, a write
+  ``scale``), and ``paired_and_read`` both catalogues on one connector
+  (@spec AUTOMATED-REMEDIATION-12).
+* ``read_reply`` (``CURIE_TEST_READ_REPLY``, JSON): the ``structuredContent``
+  every ``query_*`` tool answers with; null answers no structured content.
+* ``read_content`` (``CURIE_TEST_READ_CONTENT``, JSON list of MCP content
+  blocks, ``text`` or ``image``): the ``content`` every ``query_*`` tool answers
+  with (default one non-JSON text block), so a text-only JSON result
+  (maintainer ruling M3) and the other shapes are served as connectors send them.
+* ``read_text_bytes`` (``CURIE_TEST_READ_TEXT_BYTES``): when set, every
+  ``query_*`` tool answers no structured content and one text block holding a
+  JSON object ``{"data": {"value": 1}, "padding": ...}`` padded past that many
+  bytes.
+* ``read_structured_bytes`` (``CURIE_TEST_READ_STRUCTURED_BYTES``): when set,
+  every ``query_*`` tool answers structured content
+  ``{"data": {"value": 1}, "padding": ...}`` padded past that many bytes.
+* ``read_error`` (``CURIE_TEST_READ_ERROR``, ``1``): every ``query_*`` tool
+  answers ``isError`` with ``read_reply`` and ``read_content``.
 * ``observe_reply`` (``CURIE_TEST_OBSERVE_REPLY``, JSON): the
   ``structuredContent`` ``observe_version`` answers with; null answers text only.
 * ``call_reply`` (``CURIE_TEST_CALL_REPLY``, JSON): the ``structuredContent``
@@ -42,7 +61,13 @@ from mcp import Tool, types
 from mcp.server import ServerRequestContext
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import CallToolResult, ListToolsResult, TextContent, ToolAnnotations
+from mcp.types import (
+    CallToolResult,
+    ImageContent,
+    ListToolsResult,
+    TextContent,
+    ToolAnnotations,
+)
 
 _TARGET_SCHEMA = {
     "type": "object",
@@ -60,7 +85,37 @@ _RESTORE_SCHEMA = {
 }
 
 
+def _read_tools() -> list[Tool]:
+    """The read connector's catalogue. @spec AUTOMATED-REMEDIATION-12."""
+
+    return [
+        Tool(
+            name="query_value",
+            description="Query an example metric.",
+            inputSchema={"type": "object"},
+            annotations=ToolAnnotations(readOnlyHint=True),
+        ),
+        Tool(
+            name="query_unhinted",
+            description="Query an example metric without a read-only hint.",
+            inputSchema={"type": "object"},
+        ),
+    ]
+
+
 def _tools(mode: str) -> list[Tool]:
+    if mode == "read":
+        return [
+            *_read_tools(),
+            Tool(
+                name="scale",
+                description="Scale an example deployment.",
+                inputSchema={"type": "object"},
+                annotations=ToolAnnotations(readOnlyHint=False),
+            ),
+        ]
+    if mode == "paired_and_read":
+        return [*_tools("paired"), *_read_tools()]
     tools = [
         Tool(
             name="scale",
@@ -90,6 +145,39 @@ def _tools(mode: str) -> list[Tool]:
     return tools
 
 
+def _content_block(block: dict[str, Any]) -> TextContent | ImageContent:
+    if block.get("type") == "image":
+        return ImageContent(type="image", data=block["data"], mimeType=block["mimeType"])
+    return TextContent(type="text", text=block["text"])
+
+
+def _read_result(settings: dict[str, Any]) -> CallToolResult:
+    """A ``query_*`` tool's answer. @spec AUTOMATED-REMEDIATION-12."""
+
+    structured_padding = settings.get("read_structured_bytes")
+    if structured_padding:
+        return CallToolResult(
+            content=[TextContent(type="text", text="example summary")],
+            structuredContent={
+                "data": {"value": 1},
+                "padding": "x" * (int(structured_padding) + 1),
+            },
+        )
+    padding = settings.get("read_text_bytes")
+    if padding:
+        text = json.dumps({"data": {"value": 1}, "padding": "x" * (int(padding) + 1)})
+        return CallToolResult(content=[TextContent(type="text", text=text)])
+    structured = settings.get("read_reply")
+    blocks = settings.get("read_content")
+    if blocks is None:
+        blocks = [{"type": "text", "text": "example summary"}]
+    return CallToolResult(
+        content=[_content_block(block) for block in blocks],
+        structuredContent=structured if isinstance(structured, dict) else None,
+        isError=bool(settings.get("read_error")),
+    )
+
+
 def build_server(
     settings: dict[str, Any], record: Callable[[str, object], None] | None = None
 ) -> Server[Any]:
@@ -112,6 +200,8 @@ def build_server(
     ) -> CallToolResult:
         if record is not None:
             record(params.name, params.arguments)
+        if params.name.startswith("query_"):
+            return _read_result(settings)
         if params.name == "observe_version":
             structured = settings.get("observe_reply")
         else:
@@ -194,6 +284,11 @@ def _env_settings() -> dict[str, Any]:
         "call_reply": loaded("CURIE_TEST_CALL_REPLY"),
         "list_pages": os.environ.get("CURIE_TEST_LIST_PAGES"),
         "call_result_bytes": os.environ.get("CURIE_TEST_CALL_RESULT_BYTES"),
+        "read_reply": loaded("CURIE_TEST_READ_REPLY"),
+        "read_content": loaded("CURIE_TEST_READ_CONTENT"),
+        "read_text_bytes": os.environ.get("CURIE_TEST_READ_TEXT_BYTES"),
+        "read_structured_bytes": os.environ.get("CURIE_TEST_READ_STRUCTURED_BYTES"),
+        "read_error": os.environ.get("CURIE_TEST_READ_ERROR") == "1",
     }
 
 

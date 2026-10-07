@@ -1,4 +1,4 @@
-"""The worker executor loop: one connector action execution at a time (ADR 0121).
+"""The worker executor loop: connector action executions (ADR 0121).
 
 @spec ACTION-EXECUTOR-4 @spec ACTION-EXECUTOR-5 @spec ACTION-EXECUTOR-7
 @spec ACTION-EXECUTOR-13 @spec ACTION-EXECUTOR-14 @spec ACTION-EXECUTOR-15
@@ -47,8 +47,24 @@ action's one ledger row; one grant for that tool over that text and one
 ``call``; the ledger completion under the worker token, with the execution's
 connector and digest; then the outcome.
 
-Nothing here logs arguments, envelopes, targets, versions, grants or tokens:
-log lines carry the execution id, kind, state, stage, code and connector only.
+A read execution (@spec AUTOMATED-REMEDIATION-12, executor amendments E3 to
+E5) is one remediation sample: claim; the bound tool, arguments and pointer
+read under the fence; a sandbox under the read connector's own binding;
+``list``; exactly one ``read`` carrying the pointer and no grant; the sandbox
+released; then the sample relayed unjudged to ``POST .../samples``, or the
+refusal reported. The kill switch does not stop it (a read never dispatches,
+AUTOMATED-REMEDIATION-18), and it never dispatches, mints a grant, observes or
+completes a ledger row. A pass that claims nothing releases the executor
+sandbox of any read the API ended after its holder crashed (a read is never
+re-queued, so no later holder can own that route).
+
+@spec AUTOMATED-REMEDIATION-12 (executor amendment E9): ``run_forever`` runs up
+to ``max_concurrent_sandboxes`` executions at once; the API's claim route, not
+this loop, holds the installation-wide count.
+
+Nothing here logs arguments, envelopes, targets, versions, grants, pointers,
+samples or tokens: log lines carry the execution id, kind, state, stage, code
+and connector only.
 """
 
 from __future__ import annotations
@@ -79,6 +95,7 @@ from .action_executor import (
     ExecutorRefusal,
     call_outcome,
     restore_call,
+    sample_report,
 )
 from .actions import completion_body
 from .caller_token import signing_key
@@ -271,6 +288,20 @@ class ExecutionApi:
         body: Mapping[str, Any] = response.json()
         return body
 
+    async def receipt(self, execution_id: str) -> Mapping[str, Any] | None:
+        """An execution's receipt (identity, kind, state, codes), or None when absent."""
+
+        response = await self._client.get(
+            f"{self._base}/action-executions/{execution_id}",
+            headers=self._worker_headers,
+            timeout=_API_TIMEOUT_S,
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        body: Mapping[str, Any] = response.json()
+        return body
+
     async def ledger(self, action_id: str) -> Mapping[str, Any] | None:
         """The recorded action, or None when the ledger has no such row."""
 
@@ -288,7 +319,7 @@ class ExecutionApi:
     async def transition(
         self, execution: Execution, route: str, body: Mapping[str, Any]
     ) -> ApiAnswer:
-        """POST one fenced transition: observation, arguments, dispatch or outcome."""
+        """POST one fenced transition: observation, arguments, dispatch, outcome or samples."""
 
         response = await self._client.post(
             f"{self._base}/action-executions/{execution.id}/{route}",
@@ -491,7 +522,7 @@ def _stage(state: str, code: str | None) -> str:
 
 
 class ActionExecutorLoop:
-    """Claims, runs and reports connector action executions, one at a time."""
+    """Claims, runs and reports connector action executions, up to N at once."""
 
     def __init__(
         self,
@@ -510,7 +541,10 @@ class ActionExecutorLoop:
         lease_seconds: int,
         dispatch_deadline_s: float,
         interval_seconds: float,
+        max_concurrent_sandboxes: int = 1,
     ) -> None:
+        if max_concurrent_sandboxes < 1:
+            raise ValueError("max_concurrent_sandboxes is at least 1")
         self._api = api
         self._substrate = substrate
         self._runner = runner
@@ -534,60 +568,140 @@ class ActionExecutorLoop:
         self._lease_seconds = lease_seconds
         self._dispatch_deadline_s = dispatch_deadline_s
         self._interval_seconds = interval_seconds
+        # @spec AUTOMATED-REMEDIATION-12 (E9): this loop's own ceiling; the
+        # API's claim route holds the installation-wide count.
+        self._max_concurrent = max_concurrent_sandboxes
+        # The executions this loop is running now, never swept as crashed.
+        self._active: set[str] = set()
 
     # -- the loop ------------------------------------------------------------
 
     async def run_forever(self, shutdown: asyncio.Event) -> None:
-        """Claim until nothing is claimable, then wait one interval or shutdown."""
+        """Claim while a slot is free, then wait one interval, a finished run or shutdown.
 
-        while not shutdown.is_set():
-            claimed = False
-            try:
-                claimed = await self.run_once()
-            except Exception as exc:  # noqa: BLE001 -- one bad pass never ends the loop
-                logger.warning("action executor pass failed error=%s", type(exc).__name__)
-            if claimed:
-                continue
-            try:
-                await asyncio.wait_for(shutdown.wait(), timeout=self._interval_seconds)
-            except TimeoutError:
-                pass
+        @spec AUTOMATED-REMEDIATION-12 (E9): up to ``max_concurrent_sandboxes``
+        executions run at once. On shutdown the running ones finish.
+        """
+
+        running: set[asyncio.Task[None]] = set()
+        try:
+            while not shutdown.is_set():
+                claimed = False
+                if len(running) < self._max_concurrent:
+                    try:
+                        claim = await self._claim()
+                        if claim is None:
+                            await self._sweep_ended_reads()
+                        else:
+                            task = asyncio.create_task(self._execute(*claim))
+                            running.add(task)
+                            task.add_done_callback(running.discard)
+                            claimed = True
+                    except Exception as exc:  # noqa: BLE001 -- one bad pass never ends the loop
+                        logger.warning("action executor pass failed error=%s", type(exc).__name__)
+                if claimed:
+                    continue
+                stop = asyncio.create_task(shutdown.wait())
+                try:
+                    await asyncio.wait(
+                        {stop, *running},
+                        timeout=self._interval_seconds,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    stop.cancel()
+            if running:
+                await asyncio.gather(*running, return_exceptions=True)
+        finally:
+            for task in running:
+                task.cancel()
 
     async def run_once(self) -> bool:
-        """Claim and run one execution. True when one was claimed."""
+        """Claim and run one execution. True when one was claimed.
 
+        A pass that claims nothing releases the executor sandboxes of reads the
+        API ended after their holder crashed (AUTOMATED-REMEDIATION-12).
+        """
+
+        claim = await self._claim()
+        if claim is None:
+            await self._sweep_ended_reads()
+            return False
+        await self._execute(*claim)
+        return True
+
+    async def _claim(self) -> tuple[Execution, _Run] | None:
         lease_started = time.monotonic()
         body = await self._api.claim(
             lease_owner=self._lease_owner, lease_seconds=self._lease_seconds
         )
         if body is None:
-            return False
+            return None
         execution = Execution.from_claim(body, self._lease_owner)
-        run = _Run(lease_deadline=lease_started + self._lease_seconds)
-        with operation_span(
-            "curie.action_executor.execution",
-            kind=SpanKind.INTERNAL,
-            attributes={
-                "service.name": "curie-worker",
-                "operation": f"action-exec-{execution.kind}",
-            },
-        ) as span:
+        return execution, _Run(lease_deadline=lease_started + self._lease_seconds)
+
+    async def _execute(self, execution: Execution, run: _Run) -> None:
+        self._active.add(execution.id)
+        try:
+            with operation_span(
+                "curie.action_executor.execution",
+                kind=SpanKind.INTERNAL,
+                attributes={
+                    "service.name": "curie-worker",
+                    "operation": f"action-exec-{execution.kind}",
+                },
+            ) as span:
+                try:
+                    await self._run(execution, run)
+                except Exception as exc:  # noqa: BLE001 -- the row's state machine decides
+                    logger.warning(
+                        "action execution %s stopped kind=%s stage=%s connector=%s error=%s",
+                        execution.id,
+                        execution.kind,
+                        run.stage,
+                        execution.connector,
+                        type(exc).__name__,
+                    )
+                if run.state != "confirmed" and hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event("action_executor.finished", {"outcome": run.state})
+            self._record(execution, run)
+        finally:
+            self._active.discard(execution.id)
+
+    async def _sweep_ended_reads(self) -> None:
+        """Release the executor sandbox of each read the API has already ended.
+
+        @spec AUTOMATED-REMEDIATION-12: "the sandbox is released after each
+        sample and after a worker crash". A crashed holder's read is ended by
+        the claim route (``refused`` ``runner_unavailable``) and never
+        re-queued, so its ``action-exec:<id>`` route has no later holder; only
+        exactly the handle read from the route is released. Executions of other
+        kinds, and live ones, are left alone. A failure is logged, never raised.
+        """
+
+        try:
+            routes = await asyncio.to_thread(self._substrate.executor_routes)
+        except Exception as exc:  # noqa: BLE001 -- the next pass tries again
+            logger.info("action executor sweep unreadable error=%s", type(exc).__name__)
+            return
+        for thread_key, handle in routes.items():
+            execution_id = thread_key[len(EXECUTOR_THREAD_KEY_PREFIX) :]
+            if execution_id in self._active:
+                continue
             try:
-                await self._run(execution, run)
-            except Exception as exc:  # noqa: BLE001 -- the row's state machine decides
-                logger.warning(
-                    "action execution %s stopped kind=%s stage=%s connector=%s error=%s",
-                    execution.id,
-                    execution.kind,
-                    run.stage,
-                    execution.connector,
+                row = await self._api.receipt(execution_id)
+                if row is None or row.get("kind") != "read" or row.get("state") not in _TERMINAL:
+                    continue
+                await asyncio.to_thread(self._substrate.release_claim, thread_key, handle)
+            except Exception as exc:  # noqa: BLE001 -- the next pass tries again
+                logger.info(
+                    "action execution %s sweep release failed error=%s",
+                    execution_id,
                     type(exc).__name__,
                 )
-            if run.state != "confirmed" and hasattr(span, "set_status"):
-                span.set_status(StatusCode.ERROR)
-            span.add_event("action_executor.finished", {"outcome": run.state})
-        self._record(execution, run)
-        return True
+                continue
+            logger.info("action execution %s ended read sandbox released", execution_id)
 
     # -- one execution -------------------------------------------------------
 
@@ -600,11 +714,16 @@ class ActionExecutorLoop:
                     await self._probe(execution, run)
                 elif execution.kind == "forward":
                     await self._forward(execution, run)
+                elif execution.kind == "read":
+                    await self._read(execution, run)
                 else:
                     # No producer makes any other kind (ACTION-EXECUTOR-1).
                     raise _Refuse("authority_unavailable", "kind")
             except _Refuse as refusal:
                 run.stage = refusal.stage
+                if execution.kind == "read":
+                    # @spec AUTOMATED-REMEDIATION-12: released before it ends.
+                    await self._release_read(execution, run)
                 await self._report(execution, run, "refused", refusal.code)
             except _Abandon as abandoned:
                 run.stage = abandoned.stage
@@ -729,6 +848,93 @@ class ActionExecutorLoop:
         await self._require_serving(execution)
         run.stage = "report"
         await self._report(execution, run, "confirmed", None, advertised=advertised_verbs(tools))
+
+    async def _read(self, execution: Execution, run: _Run) -> None:
+        """@spec AUTOMATED-REMEDIATION-12: ``list`` then one ``read``; one sample.
+
+        No kill switch check (a read never dispatches), no digest gate, no
+        grant: the read connector's own binding in a fresh sandbox, released
+        before the sample is reported.
+        """
+
+        run.stage = "arguments"
+        tool, arguments, pointer = await self._bound_read(execution)
+        run.stage = "sandbox"
+        handle, _agent_name = await self._claim_sandbox(execution, run)
+        run.stage = "list"
+        await self._list(execution, run, handle)
+        run.stage = "read"
+        remaining = self._lease_left(run, "read")
+        request = {
+            **self._request(execution, "read", tool=tool, arguments=arguments),
+            "pointer": pointer,
+        }
+        try:
+            reply = await self._runner.execute(
+                handle.base_url, request, token=handle.token, remaining_s=remaining
+            )
+        except ExecuteRefused as refused:
+            raise _Refuse(refused.code, "read") from None
+        except Exception:  # noqa: BLE001 -- a runner the worker cannot drive
+            raise _Refuse("runner_unavailable", "read") from None
+        try:
+            body = sample_report(
+                reply, lease_owner=execution.lease_owner, attempt=execution.attempt
+            )
+        except (TypeError, ValueError):
+            raise _Refuse("runner_unavailable", "read") from None
+        await self._release_read(execution, run)
+        run.stage = "sample"
+        answer = await self._send(
+            execution, "samples", {"sample": body["sample"], "value": body["value"]}
+        )
+        if answer is not None and answer.status == 200 and answer.state == "confirmed":
+            run.state = "confirmed"
+            run.code = None
+            return
+        # Never answered, or refused (a stale fence or an expired lease): the
+        # claim route ends the read ``runner_unavailable`` once its lease ends.
+        raise _Abandon("sample")
+
+    async def _bound_read(self, execution: Execution) -> tuple[str, str, str]:
+        """The read's tool, exact argument text and pointer, read under the fence.
+
+        @spec AUTOMATED-REMEDIATION-12: the declaration's, never a caller's. An
+        API that never answers is ``runner_unavailable``; one that will not
+        produce them is ``authority_unavailable``; a tool other than the one
+        claimed, arguments without a canonical form, a claimed ``arguments_sha256``
+        that is missing, empty or differs, or no pointer are ``arguments_mismatch``.
+        """
+
+        answer = await self._send(execution, "arguments", {})
+        if answer is None:
+            raise _Refuse(_PLATFORM_UNAVAILABLE, "arguments")
+        if answer.status != 200 or answer.row is None:
+            raise _Refuse("authority_unavailable", "arguments")
+        tool = answer.row.get("tool")
+        pointer = answer.row.get("pointer")
+        if not isinstance(tool, str) or not tool or tool != execution.tool:
+            raise _Refuse("arguments_mismatch", "arguments")
+        if not isinstance(pointer, str):
+            raise _Refuse("arguments_mismatch", "arguments")
+        try:
+            text = connector_grant.canonical_arguments(answer.row.get("arguments"))
+        except (TypeError, ValueError):
+            raise _Refuse("arguments_mismatch", "arguments") from None
+        # Fail closed like a forward: a missing or empty digest is no pass.
+        expected = execution.arguments_sha256 or ""
+        if not expected or not secrets.compare_digest(
+            connector_grant.arguments_sha256(text), expected
+        ):
+            raise _Refuse("arguments_mismatch", "arguments")
+        return tool, text, pointer
+
+    async def _release_read(self, execution: Execution, run: _Run) -> None:
+        """Release a read's sandbox now, so it is free before the read ends."""
+
+        handle, run.handle = run.handle, None
+        if handle is not None:
+            await self._release(execution, handle)
 
     # -- checks --------------------------------------------------------------
 

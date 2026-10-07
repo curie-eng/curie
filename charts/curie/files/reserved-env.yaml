@@ -4,6 +4,7 @@
 worker:
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
   CURIE_ACTION_EXECUTOR_ENABLED: actionExecutor.enabled
+  CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES: actionExecutor.maxConcurrentSandboxes
   CURIE_ADAPTER_CREDENTIALS: worker.adapterCredentialsExistingSecret
   CURIE_AGENT_CONNECTOR_SECRET_POOLS: agentSandbox.connectorSecrets
   CURIE_AGENT_SANDBOX_POOLS: agentSandbox.connectorSecrets or agentSandbox.registryEgress
@@ -115,6 +116,7 @@ api:
   BUNDLE_BUCKET: agentSandbox.runner.bundleFetch.bucket
   COMMIT_POLL_INTERVAL_S: api.commitPollIntervalSeconds
   CURIE_ACTION_EXECUTOR_ENABLED: actionExecutor.enabled
+  CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES: actionExecutor.maxConcurrentSandboxes
   CURIE_APPROVAL_CHAT_ATTESTER_SECRET: api.approvalChatAttesterSecret
   CURIE_APPROVAL_RECOVERY_ENABLED: api.approvalRecovery.enabled
   CURIE_CONNECTOR_CALLER_PREVIOUS_PUBLIC_KEY: connectorCaller.previousVerifyKey

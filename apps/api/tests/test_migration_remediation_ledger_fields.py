@@ -133,8 +133,10 @@ def test_one_hand_written_revision_on_the_nomination_head() -> None:
     revision, down = _revision()
     assert down == BELOW, f"revision {revision} revises {down}, expected {BELOW}"
     assert revision == HEAD
+    # The read executions revision (task 7, 0090) now follows this one; the head
+    # pin lives in test_migration_remediation_read_executions.py.
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == [HEAD]
+    assert HEAD in {rev.revision for rev in script.iterate_revisions(script.get_heads()[0], BELOW)}
 
 
 def test_the_upgrade_adds_the_columns(isolated_migration_db: IsolatedMigrationDb) -> None:
