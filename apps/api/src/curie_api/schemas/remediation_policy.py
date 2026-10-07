@@ -22,13 +22,13 @@ from ..hook_source_policy_schemas import SourceDecimal, SourceHook, SourceUuid
 _CODE = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,62}$")]
 
 
-class _RemediationModel(BaseModel):
+class RemediationModel(BaseModel):
     """@spec AUTOMATED-REMEDIATION-2."""
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
 
-class RemediationPolicyMutation(_RemediationModel):
+class RemediationPolicyMutation(RemediationModel):
     """Compare and swap plus idempotency for arm, disarm and removal.
 
     @spec AUTOMATED-REMEDIATION-2.
@@ -52,7 +52,7 @@ class RemediationPolicyWrite(RemediationPolicyMutation):
     )
 
 
-class RemediationPolicyOut(_RemediationModel):
+class RemediationPolicyOut(RemediationModel):
     """One committed remediation policy generation.
 
     @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
@@ -68,7 +68,7 @@ class RemediationPolicyOut(_RemediationModel):
     updated_at: datetime
 
 
-class RemediationPolicyRefusalDetail(_RemediationModel):
+class RemediationPolicyRefusalDetail(RemediationModel):
     """A stable refusal code and, where one applies, the offending path.
 
     @spec AUTOMATED-REMEDIATION-2.
@@ -79,13 +79,13 @@ class RemediationPolicyRefusalDetail(_RemediationModel):
     message: str | None = None
 
 
-class RemediationPolicyRefusal(_RemediationModel):
+class RemediationPolicyRefusal(RemediationModel):
     """@spec AUTOMATED-REMEDIATION-2."""
 
     detail: RemediationPolicyRefusalDetail
 
 
-class RemediationBreakerClose(_RemediationModel):
+class RemediationBreakerClose(RemediationModel):
     """Why an operator closes a breaker; exactly ``{"reason"}``.
 
     @spec AUTOMATED-REMEDIATION-11.
@@ -99,7 +99,7 @@ class RemediationBreakerClose(_RemediationModel):
     )
 
 
-class RemediationBreakerOut(_RemediationModel):
+class RemediationBreakerOut(RemediationModel):
     """One breaker on an agent's connector, tool and target key.
 
     @spec AUTOMATED-REMEDIATION-11.

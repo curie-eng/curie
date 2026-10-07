@@ -19,13 +19,13 @@ from typing import Any
 from pydantic import Field, StrictBool, StrictFloat, StrictInt, StrictStr
 
 from ..hook_source_policy_schemas import SourceDecimal, SourceHook, SourceUuid
-from .remediation_policy import _RemediationModel
+from .remediation_policy import RemediationModel
 
 # A literal member of an action's ``target.allowed``: a JSON scalar.
 TargetValue = StrictStr | StrictInt | StrictFloat | StrictBool
 
 
-class RemediationQualificationWrite(_RemediationModel):
+class RemediationQualificationWrite(RemediationModel):
     """One qualification record: the declaration it qualifies and its evidence.
 
     @spec AUTOMATED-REMEDIATION-22.
@@ -46,7 +46,7 @@ class RemediationQualificationWrite(_RemediationModel):
     worst_case: str = Field(description="The worst case statement, 1 to 2000 characters.")
 
 
-class RemediationQualificationOut(_RemediationModel):
+class RemediationQualificationOut(RemediationModel):
     """One qualification record. @spec AUTOMATED-REMEDIATION-22."""
 
     id: SourceUuid
@@ -65,7 +65,7 @@ class RemediationQualificationOut(_RemediationModel):
     created_at: datetime
 
 
-class RemediationVerifierRunStart(_RemediationModel):
+class RemediationVerifierRunStart(RemediationModel):
     """Start a qualification verifier run; exactly ``{"hook", "action", "target"}``.
 
     @spec AUTOMATED-REMEDIATION-22.
@@ -76,7 +76,7 @@ class RemediationVerifierRunStart(_RemediationModel):
     target: TargetValue = Field(description="A literal member of the action's target.allowed list.")
 
 
-class RemediationVerifierRunOut(_RemediationModel):
+class RemediationVerifierRunOut(RemediationModel):
     """One qualification verifier run. @spec AUTOMATED-REMEDIATION-22."""
 
     id: SourceUuid
