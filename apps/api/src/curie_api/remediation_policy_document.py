@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections.abc import Mapping
 from typing import Any, Final
@@ -136,8 +137,8 @@ def _integer(value: Any, path: str) -> int:
 
 
 def _number(value: Any, path: str) -> int | float:
-    if type(value) not in (int, float):
-        raise _refuse("policy_document_invalid", path, "must be a number")
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise _refuse("policy_document_invalid", path, "must be a finite number")
     return value  # type: ignore[no-any-return]
 
 
@@ -148,7 +149,9 @@ def _identifier(value: Any, path: str) -> str:
 
 
 def _scalar(value: Any) -> bool:
-    return value is None or type(value) in (str, int, float, bool)
+    if type(value) is float:
+        return math.isfinite(value)
+    return value is None or type(value) in (str, int, bool)
 
 
 def _bounded(value: int, path: str, *, minimum: int, maximum: int) -> int:
@@ -387,11 +390,29 @@ def _validate_action(action: Any, path: str) -> str:
     return name
 
 
+def _refuse_non_finite(value: Any, path: str) -> None:
+    """Refuse NaN and Infinity anywhere in the document.
+
+    Canonical JSON has no non-finite numbers, but the request parser accepts
+    the tokens; refusing them here, before any check or digest, keeps every
+    numeric field finite. @spec AUTOMATED-REMEDIATION-2.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        raise _refuse("policy_document_invalid", path or "/", "must be a finite number")
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _refuse_non_finite(item, f"{path}/{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            _refuse_non_finite(item, f"{path}/{index}")
+
+
 def validate_document(document: Any) -> dict[str, Any]:
     """Validate a whole policy document; returns it unchanged.
 
     @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-24.
     """
+    _refuse_non_finite(document, "")
     document = _closed(document, "", _TOP_KEYS)
     _require(document, "", _TOP_KEYS)
     route = document["route"]
