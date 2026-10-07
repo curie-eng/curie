@@ -131,11 +131,14 @@ async def report_work_item_verification(
     request_id: uuid.UUID, body: VerificationObservation, session: SessionDep
 ) -> Any:
     result = await record_verification(session, token_request_id=request_id, body=body)
-    if result.outcome != "recorded":
+    if result.outcome not in ("recorded", "replayed"):
         return JSONResponse(
             status_code=_STATUS_CODES[result.outcome], content={"code": result.outcome}
         )
-    return {"recorded": True, "request_id": str(result.request_id)}
+    response = {"recorded": True, "request_id": str(result.request_id)}
+    if result.outcome == "replayed":
+        response["replayed"] = True
+    return response
 
 
 @router.get(

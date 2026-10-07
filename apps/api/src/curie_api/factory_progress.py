@@ -9,6 +9,7 @@ the pure phase view the status comment and the SVG card render from.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from collections.abc import Sequence
@@ -21,6 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import ExecutionRequest, ExecutionRequestPhaseReport, FactoryStatusComment
 from .workitems import _lock_active_request
+
+logger = logging.getLogger(__name__)
 
 PROGRESS_SCOPE = "work_item.progress"
 REPORT_LIMIT = 200
@@ -252,6 +255,7 @@ def verification_route(
 class RecordResult:
     outcome: Literal[
         "recorded",
+        "replayed",
         "request_not_found",
         "no_active_request",
         "declaration_changed",
@@ -339,9 +343,10 @@ async def record_verification(
     """Store one immutable preflight observation per declared check on the token's
     active request.
 
-    A repeated check id, a second ``not_declared`` record, or mixing
-    ``not_declared`` with declared checks is ``verification_exists``; the first
-    stored rows stand.
+    A repeated check id with the same command is ``replayed``; the first
+    observation stays authoritative, even when the replay's result differs.
+    A changed command, mixing ``not_declared`` with declared checks, or a fifth
+    distinct check is ``verification_exists``.
     """
 
     token_request: ExecutionRequest | None = await session.scalar(
@@ -362,13 +367,27 @@ async def record_verification(
         # Unreadable stored evidence is never extended; the gates fail closed on it.
         await session.rollback()
         return RecordResult("verification_exists", active_id)
+    for observation in existing:
+        if observation.check != body.check:
+            continue
+        if observation.command != body.command:
+            await session.rollback()
+            return RecordResult("verification_exists", active_id)
+        if observation != body:
+            logger.info(
+                "verification replay retained first observation: "
+                "request_id=%s check=%s stored_outcome=%s replayed_outcome=%s",
+                active_id,
+                body.check,
+                observation.outcome,
+                body.outcome,
+            )
+        await session.rollback()
+        return RecordResult("replayed", active_id)
     if existing and (
         body.outcome == "not_declared"
         or len(existing) >= VERIFICATION_CHECK_LIMIT
-        or any(
-            observation.outcome == "not_declared" or observation.check == body.check
-            for observation in existing
-        )
+        or any(observation.outcome == "not_declared" for observation in existing)
     ):
         await session.rollback()
         return RecordResult("verification_exists", active_id)
