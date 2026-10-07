@@ -25,10 +25,10 @@ from ..attachments import ATTACHMENTS_REF_ENV
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
 from .claim_tokens import (
     CLAIM_LABEL,
-    EXECUTOR_WITHHELD_ENVS,
     ClaimObjectNames,
     claim_object_names,
     claim_template_spec,
+    executor_withheld_names,
     split_claim_tokens,
 )
 from .quota import quota_has_live_headroom, quota_rejection_is_valid
@@ -470,6 +470,7 @@ class KubernetesSandboxClient:
         tokens: dict[str, str],
         runner_resources: dict[str, Any] | None,
         executor_secret_names: frozenset[str] | None = None,
+        executor_withheld: frozenset[str] = frozenset(),
     ) -> ClaimObjectNames:
         """Write the per-claim template, token Secret and pool; return their names.
 
@@ -492,6 +493,7 @@ class KubernetesSandboxClient:
             token_names=sorted(tokens),
             runner_resources=runner_resources,
             executor_secret_names=executor_secret_names,
+            executor_withheld=executor_withheld,
         )
         labels = {MANAGED_BY_LABEL: MANAGED_BY_VALUE, CLAIM_LABEL: claim}
         created = self._api.create_namespaced_custom_object(
@@ -614,10 +616,13 @@ class KubernetesSandboxClient:
     ) -> None:
         env = filter_agent_child_env(env)
         executor = executor_secret_names is not None
+        withheld: frozenset[str] = frozenset()
         if executor:
-            # @spec ACTION-EXECUTOR-5: the model credential and its env-key
-            # declaration never reach an executor runner, by claim or template.
-            env = {k: v for k, v in env.items() if k not in EXECUTOR_WITHHELD_ENVS}
+            # @spec ACTION-EXECUTOR-5: no model credential, its env-key
+            # declaration, or a name that declaration points at reaches an
+            # executor runner, by claim or template.
+            withheld = executor_withheld_names(env)
+            env = {k: v for k, v in env.items() if k not in withheld}
         # Scoped tokens never ride the value-only claim (#3842): they go to a
         # per-claim Secret read by a per-claim template copy, which also
         # carries any runner resources override. A token-free claim keeps the
@@ -628,7 +633,7 @@ class KubernetesSandboxClient:
         claim_template: str | None = None
         if tokens or executor:
             claim_names = self._claim_scoped_pool(
-                name, pool, tokens, runner_resources, executor_secret_names
+                name, pool, tokens, runner_resources, executor_secret_names, withheld
             )
             pool = claim_names.pool
             claim_template = claim_names.template

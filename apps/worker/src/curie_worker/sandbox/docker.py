@@ -91,7 +91,7 @@ from ..workspace import (
     WorkspaceRef,
     validate_workspace_archive,
 )
-from .claim_tokens import EXECUTOR_WITHHELD_ENVS
+from .claim_tokens import executor_withheld_names
 from .types import (
     BUNDLE_REF_LABEL,
     MANAGED_BY_LABEL,
@@ -250,13 +250,13 @@ def _executor_claim_env(env: dict[str, str], secret_names: frozenset[str]) -> di
 
     The Docker tier has no pool template, so the same stripping the Kubernetes
     per-claim template applies is applied to the env itself: no model
-    credential, no model env-key declaration, and no connector secret value
+    credential, no model env-key declaration or name it declares, and no connector secret value
     outside ``secret_names``. The connector-secret marker is narrowed to match.
     """
 
     marker = env.get(_CONNECTOR_SECRET_KEYS_ENV, "")
     marked = {name for name in marker.split(",") if name}
-    dropped = EXECUTOR_WITHHELD_ENVS | (marked - secret_names)
+    dropped = executor_withheld_names(env) | (marked - secret_names)
     kept = {key: value for key, value in env.items() if key not in dropped}
     if _CONNECTOR_SECRET_KEYS_ENV in kept:
         narrowed = ",".join(name for name in marker.split(",") if name in secret_names)

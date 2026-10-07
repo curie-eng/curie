@@ -13,6 +13,7 @@ client so the rules are testable without one.
 from __future__ import annotations
 
 import copy
+import json
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -57,11 +58,61 @@ _RUNNER_CONTAINER = "runner"
 # (charts/curie/templates/agent-connector-secrets.yaml); the runner reads each of
 # its keys by ``secretKeyRef``. Matched by suffix so a release name never matters.
 CONNECTOR_SECRET_NAME_SUFFIX = "-connector-secrets"
-# Runner env an executor claim's template never carries (ACTION-EXECUTOR-5): the
-# model credential and the model env-key declaration. Named from ``BootEnv``.
+_MODEL_ENV_KEY_ENV = BootEnv.env_key("model_env_key")
+# Every model credential an executor runner refuses to boot with (@spec
+# ACTION-EXECUTOR-4, ACTION-EXECUTOR-5), so its claim never carries one. This is
+# the worker's copy of the runner's two inventories, which the worker cannot
+# import: ``runner/src/curie_runner/__main__.py::_EXECUTOR_REFUSED_CREDENTIALS``
+# (read through ``executor_model_credentials``) and
+# ``runner/src/curie_runner/subprocess_env.py::CLI_PARENT_MODEL_KEYS``.
+# ``apps/worker/tests/sandbox/test_executor_claim.py`` derives its oracle from
+# those two; keep this set a superset of both. The names ``CURIE_MODEL_ENV_KEY``
+# declares are model credentials too; ``declared_model_env_keys`` resolves them
+# per claim.
 EXECUTOR_WITHHELD_ENVS: frozenset[str] = frozenset(
-    BootEnv.env_key(field) for field in ("credentials_ref", "model_env_key")
+    {
+        BootEnv.env_key("credentials_ref"),
+        _MODEL_ENV_KEY_ENV,
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "ANTHROPIC_FOUNDRY_API_KEY",
+        "ANTHROPIC_CUSTOM_HEADERS",
+    }
 )
+
+
+def declared_model_env_keys(raw: str) -> frozenset[str]:
+    """The env names a ``CURIE_MODEL_ENV_KEY`` value declares.
+
+    Mirrors ``runner/src/curie_runner/sdk_auth.py::parse_env_keys``: a JSON array
+    of names or a single bare name. It is used only to withhold names, so it is
+    lenient where the runner is strict: any string in an array counts, and a
+    value of another shape declares nothing the runner would read.
+    """
+
+    raw = raw.strip()
+    if not raw:
+        return frozenset()
+    try:
+        decoded: object = json.loads(raw)
+    except ValueError:
+        decoded = raw
+    if isinstance(decoded, str):
+        items: list[object] = [decoded]
+    elif isinstance(decoded, list):
+        items = list(decoded)
+    else:
+        return frozenset()
+    return frozenset(item.strip() for item in items if isinstance(item, str) and item.strip())
+
+
+def executor_withheld_names(env: Mapping[str, str]) -> frozenset[str]:
+    """Model credential names withheld from an executor claim given ``env``."""
+
+    return EXECUTOR_WITHHELD_ENVS | declared_model_env_keys(env.get(_MODEL_ENV_KEY_ENV, ""))
+
+
 _SECRET_SUFFIX = "-tokens"
 # Kubernetes object names and label values are capped at 63 characters; the
 # pool carries the longest suffix.
@@ -116,6 +167,7 @@ def claim_template_spec(
     token_names: Iterable[str],
     runner_resources: dict[str, Any] | None,
     executor_secret_names: frozenset[str] | None = None,
+    executor_withheld: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Copy ``source_spec`` with each token read from ``secret_name`` on the runner.
 
@@ -126,10 +178,14 @@ def claim_template_spec(
     changed.
 
     ``executor_secret_names`` set marks an executor claim (@spec
-    ACTION-EXECUTOR-5): the runner additionally loses ``CURIE_CREDENTIALS``, the
-    model env-key declaration, and every connector secret ``secretKeyRef`` whose
-    name is not in the set. Kept entries stay verbatim and in order; init
-    containers and the rest of the pod spec are untouched.
+    ACTION-EXECUTOR-5): the runner additionally loses every model credential
+    (``EXECUTOR_WITHHELD_ENVS``, the names the template's own
+    ``CURIE_MODEL_ENV_KEY`` declares, and ``executor_withheld``), every
+    connector secret ``secretKeyRef`` whose name is not in the set, and every
+    ``envFrom`` source, whose keys cannot be checked here. A declaration this
+    copy cannot read (a ``valueFrom`` one) raises ``ValueError``. Kept entries
+    stay verbatim and in order; init containers and the rest of the pod spec
+    are untouched.
     """
 
     spec = (
@@ -144,7 +200,11 @@ def claim_template_spec(
     names = list(token_names)
     env = [entry for entry in runner.get("env") or [] if entry.get("name") not in names]
     if executor_secret_names is not None:
-        env = [entry for entry in env if _executor_keeps(entry, executor_secret_names)]
+        withheld = _template_withheld_names(env) | frozenset(executor_withheld)
+        env = [
+            entry for entry in env if _executor_keeps(entry, executor_secret_names, withheld)
+        ]
+        runner.pop("envFrom", None)
     for key in names:
         env.append(
             {
@@ -163,11 +223,29 @@ def _is_connector_secret_ref(entry: Mapping[str, Any]) -> bool:
     return str(ref.get("name", "")).endswith(CONNECTOR_SECRET_NAME_SUFFIX)
 
 
-def _executor_keeps(entry: Mapping[str, Any], secret_names: frozenset[str]) -> bool:
+def _template_withheld_names(env: list[dict[str, Any]]) -> frozenset[str]:
+    """``EXECUTOR_WITHHELD_ENVS`` plus what the runner's declaration names."""
+
+    names = set(EXECUTOR_WITHHELD_ENVS)
+    for entry in env:
+        if entry.get("name") != _MODEL_ENV_KEY_ENV:
+            continue
+        if "valueFrom" in entry:
+            raise ValueError(
+                f"source template declares {_MODEL_ENV_KEY_ENV} by valueFrom; an "
+                "executor claim cannot tell which model credentials it names"
+            )
+        names |= declared_model_env_keys(str(entry.get("value") or ""))
+    return frozenset(names)
+
+
+def _executor_keeps(
+    entry: Mapping[str, Any], secret_names: frozenset[str], withheld: frozenset[str]
+) -> bool:
     """Whether an executor claim's runner keeps this source env entry."""
 
     name = entry.get("name")
-    if name in EXECUTOR_WITHHELD_ENVS:
+    if name in withheld:
         return False
     if _is_connector_secret_ref(entry):
         return name in secret_names
