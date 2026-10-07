@@ -28,7 +28,8 @@ example artifacts rather than a platform architectural decision.
   existing installation's metric names by explicitly setting its previous
   prefix. Accept only `[a-zA-Z_][a-zA-Z0-9_]*` prefixes and positive finite
   polling intervals. Invalid configuration exits 2 without opening a listener
-  or requesting credentials. The STS session name is `curie-cloudwatch-alarms`.
+  or requesting credentials. A refused listener bind exits 2 with a bounded
+  configuration error and no traceback, exception text or installation values. The STS session name is `curie-cloudwatch-alarms`.
 
 - **SRE-CW-2 — signed complete reads.** Read the projected web identity token
   from its file for every AssumeRoleWithWebIdentity request to regional STS.
@@ -36,7 +37,12 @@ example artifacts rather than a platform architectural decision.
   again and sign subsequent requests with the newly issued credentials.
   DescribeAlarms uses regional CloudWatch, StateValue ALARM, ActionPrefix equal
   to TOPIC_ARN, both MetricAlarm and CompositeAlarm, MaxRecords 100 and every
-  returned NextToken, correctly form encoded. Requests use AWS SigV4, signing
+  returned NextToken, correctly form encoded. ActionPrefix is a provider-side
+  candidate filter: publish only returned alarms whose StateValue is exactly
+  ALARM and whose AlarmActions contains TOPIC_ARN as an exact member. A matching
+  OKActions or InsufficientDataActions entry, or a similarly prefixed topic in
+  AlarmActions, does not qualify. `parse_alarms(xml, topic_arn)` receives the
+  configured topic explicitly. Requests use AWS SigV4, signing
   the exact body and session-token header. Only direct alarm members count;
   nested dimensions or metrics do not. ActionsEnabled false suppresses both
   kinds; absent descriptions become empty strings. Requests time out after
@@ -88,6 +94,11 @@ example artifacts rather than a platform architectural decision.
   Operators changing METRIC_PREFIX also update consumer expressions. Publish
   executable promtool vectors for healthy empty, firing, failed read,
   missing reader, recovery, duplicate readers and short restart scenarios.
+  The root-collected vector test uses PROMTOOL, an installed promtool, or the
+  same actual evaluator in pinned Docker image prom/prometheus:v3.5.0; lack
+  of an evaluator fails the check rather than skipping the vectors. The
+  focused example workflow publishes a distinct job/check name and adds no
+  root-CI dependency requirement.
 
 - **SRE-CW-8 — neutral installation.** The optional manifest uses the pinned
   standard-library Python image already used by alert-signer, one replica,
