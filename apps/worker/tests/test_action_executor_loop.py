@@ -1950,6 +1950,38 @@ async def test_a_stopped_agent_refuses_a_forward_execution_before_any_sandbox(
         assert rig.runner.requests == []
 
 
+async def test_killing_the_agent_after_admission_refuses_a_policy_forward_with_no_write(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-11 @spec ACTION-EXECUTOR-21: "The kill switch is
+    read at admission (check 2) and again by the executor at claim and before
+    dispatch, so a kill between admission and dispatch refuses ``agent_stopped``
+    with no write call." A policy-authorized forward execution whose agent is
+    stopped after the sandbox's ``list`` and before the dispatch commit ends
+    ``agent_stopped``: no dispatch, no grant minted, no call at the connector.
+    """
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.runner.call_reply = _forward_reply()
+        execution = rig.api.add_forward()
+
+        def stop(body: dict[str, Any]) -> None:
+            rig.killswitch.killed = True
+
+        rig.runner.hooks["list"] = stop
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "agent_stopped")
+        assert rig.killswitch.reads >= 2
+        assert "dispatch" not in _api_routes(rig)
+        assert rig.runner.writes == []
+        assert "call" not in _phases(rig)
+        assert minted == []
+        rig.assert_released()
+
+
 async def test_a_lost_forward_call_is_indeterminate_and_never_repeated(
     valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
 ) -> None:
