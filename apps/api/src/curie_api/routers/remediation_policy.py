@@ -30,10 +30,11 @@ from .. import approval_principal
 from ..approval_auth import APPROVAL_PRINCIPAL_HEADER
 from ..auth import require_api_key
 from ..config import get_settings
-from ..deps import SessionDep
+from ..deps import SessionDep, StoreDep
 from ..hook_source_policy_schemas import SourceHook, SourceUuid
 from ..remediation_policy_document import PolicyRefused, validate_document
 from ..remediation_policy_store import PolicyGeneration, Verb, read_policy, write_policy
+from ..remediation_verifier import NOT_INDEPENDENT, independence_refusal
 from ..schemas.remediation_policy import (
     RemediationPolicyMutation,
     RemediationPolicyOut,
@@ -185,6 +186,7 @@ async def put_remediation_policy(
     hook: HookPath,
     body: RemediationPolicyWrite,
     session: SessionDep,
+    store: StoreDep,
     principal: OperatorDep,
 ) -> JSONResponse:
     """Bind, tighten or widen a protected hook's remediation policy.
@@ -193,11 +195,30 @@ async def put_remediation_policy(
     write creates a generation recorded with the operator principal.
     \f
     @spec AUTOMATED-REMEDIATION-1 @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3.
+    @spec AUTOMATED-REMEDIATION-17: every verifier is independent of its acting
+    connector in the agent's in-force version, or the write is refused
+    ``verifier_not_independent`` and creates no generation.
     """
     try:
         document = validate_document(body.policy)
     except PolicyRefused as error:
         return _refusal(error)
+    for index, action in enumerate(document.get("actions") or []):
+        if isinstance(action, dict) and await independence_refusal(
+            session, uuid.UUID(agent_id), action, store=store
+        ):
+            return _refusal(
+                PolicyRefused(
+                    NOT_INDEPENDENT,
+                    path=f"/actions/{index}/verifier/connector",
+                    message=(
+                        "the verifier must read through its own connector and credential, "
+                        "not the acting connector's"
+                    ),
+                )
+            )
+    # The check only read; the store opens its own transaction for the write.
+    await session.rollback()
     return await _write(session, agent_id, hook, "bind", body, principal, document)
 
 
