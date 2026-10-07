@@ -43,6 +43,13 @@ from .workspace_policy import repository_is_allowed
 
 logger = logging.getLogger(__name__)
 
+# The worker's kernel defers with this exact reason, capacity=False, when the
+# work item's thread is held by another turn that has not reached its handoff
+# (for example a pending publication from an earlier run). That is a wait on
+# another turn, not a failed sandbox start, so it keeps the flat base backoff
+# and never counts toward the start deferral limit (#4170).
+THREAD_BUSY_DEFER_REASON = "thread_busy"
+
 RefusalCode = Literal[
     "not_found",
     "identity_mismatch",
@@ -692,7 +699,10 @@ async def defer(
     reason: str,
     capacity: bool,
 ) -> DeferResult | DispatchConflict:
-    if capacity:
+    counts_as_start = not capacity and reason != THREAD_BUSY_DEFER_REASON
+    if not counts_as_start:
+        # Capacity and thread_busy defers never settle the request, so the
+        # request lock alone suffices.
         request = await _lock_request_by_id(session, request_id)
         if request is None:
             return await _refuse(session, "not_found", request_id=request_id)
@@ -737,6 +747,9 @@ async def defer(
         deferral_values: dict[str, Any] = {
             "capacity_deferrals": ExecutionRequest.capacity_deferrals + 1
         }
+    elif not counts_as_start:
+        delay = settings.work_item_backoff_base_seconds
+        deferral_values = {}
     else:
         assert work_item is not None
         if request.start_deferrals + 1 >= settings.work_item_start_deferral_limit:

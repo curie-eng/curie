@@ -1190,7 +1190,7 @@ until chart-owned values land):
 | `CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS` | `120` | A cancellation with no worker teardown receipt settles as cancelled after this |
 | `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` | `10` | Defer backoff base |
 | `CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS` | `120` | Defer backoff cap |
-| `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` | `5` | The non-capacity defer that reaches this count fails the request with cause `start_failed` |
+| `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` | `5` | The non-capacity defer that reaches this count fails the request with cause `start_failed`; a `thread_busy` defer (the thread is held by another turn) waits at the base backoff and never counts |
 | `CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS` | `30` | Terminate wake republish window |
 | `CURIE_CONSUMER_GROUP` | `curie-workers` | Runs consumer group the reconciler ensures |
 
@@ -1216,7 +1216,9 @@ A delivery that ends without starting its sandbox for a reason other than
 capacity defers with the same backoff curve, counted separately. The defer that
 reaches `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` ends the request as `failed` /
 `start_failed`, frees its quota slot, and names the attempt count and the last
-deferral reason on the status comment.
+deferral reason on the status comment. A `thread_busy` defer, sent while
+another turn holds the work item's thread, is a wait rather than a failed
+start: it waits `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` and never counts.
 
 Each factory execution request owns exactly one App-authored status comment.
 The reconciler creates it on its first pass after admission and then edits it
