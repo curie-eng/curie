@@ -78,7 +78,14 @@ def connector_deployments_api(*, kubeconfig: str | None = None) -> k8s_client.Ap
     """
 
     _load_cluster_config(kubeconfig)
-    return k8s_client.AppsV1Api()
+    # One attempt per read. The recorder abandons a read at its two second
+    # bound, but the sync client keeps running in its thread; urllib3's default
+    # Retry(3) would hold that thread for several more bounds against a stalled
+    # API server. With no retries, the per-request total timeout the recorder
+    # passes ends the thread at the bound too.
+    configuration = k8s_client.Configuration.get_default_copy()
+    configuration.retries = 0
+    return k8s_client.AppsV1Api(k8s_client.ApiClient(configuration))
 
 
 class KubernetesConnectorClient:
