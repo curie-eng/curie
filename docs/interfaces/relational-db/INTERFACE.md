@@ -133,9 +133,8 @@ AUTOMATED-REMEDIATION-12, executor amendments E2 and E9) is additive.
 `action_executions` (`apps/api/src/curie_api/models.py::ActionExecution`) gains
 `not_before` (the claim route hands out an execution once due; NULL is due),
 `pointer` (a read's RFC 6901 pointer) and `sample` (a read's reported
-`{sample, value}`, or the API's `skipped`), all nullable with no backfill, and a
-partial index on (`not_before`, `created_at`) over requested rows. The kind
-check is replaced so `kind` gains `read`. Read executions are created only by
+`{sample, value}`, or the API's `skipped`), all nullable with no backfill. The
+kind check is replaced so `kind` gains `read`. Read executions are created only by
 `apps/api/src/curie_api/remediation_reads.py::create_read_execution`; the
 downgrade deletes them before restoring the check.
 

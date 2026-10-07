@@ -16,12 +16,11 @@ reported, or the API's ``skipped``). Every new column is nullable with no
 default, so existing rows read NULL and nothing is backfilled.
 
 ``action_executions_kind_ck`` is replaced in the same revision so ``kind``
-gains ``read`` (executor amendment E2). A partial index serves the claim
-route's due-first order over requested rows.
+gains ``read`` (executor amendment E2).
 
 The downgrade removes read executions (samples only: a read never dispatches,
 so no ledger row names one), restores the kind check without ``read`` and
-drops the index and the new columns.
+drops the new columns.
 
 @spec AUTOMATED-REMEDIATION-12
 """
@@ -40,7 +39,6 @@ depends_on: str | Sequence[str] | None = None
 SCHEMA = "curie"
 EXECUTIONS = "action_executions"
 KIND_CHECK = "action_executions_kind_ck"
-DUE_INDEX = "ix_action_executions_requested_not_before"
 
 KINDS_WITH_READ = "kind IN ('restore', 'forward', 'probe', 'read')"
 KINDS_WITHOUT_READ = "kind IN ('restore', 'forward', 'probe')"
@@ -53,18 +51,10 @@ def upgrade() -> None:
     op.add_column(EXECUTIONS, sa.Column("sample", postgresql.JSONB()), schema=SCHEMA)
     op.drop_constraint(KIND_CHECK, EXECUTIONS, type_="check", schema=SCHEMA)
     op.create_check_constraint(KIND_CHECK, EXECUTIONS, KINDS_WITH_READ, schema=SCHEMA)
-    op.create_index(
-        DUE_INDEX,
-        EXECUTIONS,
-        ["not_before", "created_at"],
-        schema=SCHEMA,
-        postgresql_where=sa.text("state = 'requested'"),
-    )
 
 
 def downgrade() -> None:
     """@spec AUTOMATED-REMEDIATION-12."""
-    op.drop_index(DUE_INDEX, table_name=EXECUTIONS, schema=SCHEMA)
     op.execute(f"DELETE FROM {SCHEMA}.{EXECUTIONS} WHERE kind = 'read'")
     op.drop_constraint(KIND_CHECK, EXECUTIONS, type_="check", schema=SCHEMA)
     op.create_check_constraint(KIND_CHECK, EXECUTIONS, KINDS_WITHOUT_READ, schema=SCHEMA)

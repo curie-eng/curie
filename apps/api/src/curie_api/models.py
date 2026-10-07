@@ -1914,13 +1914,6 @@ class ActionExecution(Base):
             unique=True,
             postgresql_where=text("kind = 'restore' AND state <> 'refused'"),
         ),
-        # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): due first.
-        Index(
-            "ix_action_executions_requested_not_before",
-            "not_before",
-            "created_at",
-            postgresql_where=text("state = 'requested'"),
-        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
