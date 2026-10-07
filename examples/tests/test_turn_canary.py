@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import asyncio
 
 import pytest
 from aci_protocol.turn import QueuedTurn
@@ -121,3 +122,107 @@ def test_owned_reset_key_matches_named_worker_route() -> None:
 def test_cleanup_requires_confirmed_route_release(state, confirmed) -> None:
     """@spec TURN-CANARY-4"""
     assert _canary().cleanup_confirmed(state) is confirmed
+
+
+class CyclePlatform:
+    """In-memory platform boundary for the async contract. @spec TURN-CANARY-3 TURN-CANARY-4"""
+
+    def __init__(self, *, reset_state=None, reply_events=None, headroom=True):
+        self.calls = []
+        self.reset_state_value = reset_state or {"requested": False, "route_existed": True}
+        self.reply_events = reply_events
+        self.headroom = headroom
+        self.active = 0
+        self.peak = 0
+
+    async def inventory(self):
+        return [_binding(), {**_binding(), "address": "C-EXAMPLE-2"}]
+
+    async def read_only_supported(self):
+        return True
+
+    async def quota_headroom(self):
+        self.calls.append("quota")
+        return self.headroom
+
+    async def enqueue(self, turn):
+        assert QueuedTurn.model_validate_json(turn.model_dump_json()).tool_access.value == "read-only"
+        self.calls.append(("enqueue", turn.conversation_id))
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+
+    async def replies(self, reply_ref, after):
+        self.calls.append(("replies", after))
+        if self.reply_events is None:
+            return {"events": [], "next_cursor": after, "terminal": False}
+        return {"events": self.reply_events, "next_cursor": after + len(self.reply_events), "terminal": True}
+
+    async def reset(self, agent_id, thread_key):
+        self.calls.append(("reset", thread_key))
+
+    async def reset_state(self, agent_id, thread_key):
+        self.calls.append(("reset_state", thread_key))
+        if self.reset_state_value == {"requested": False, "route_existed": True}:
+            self.active -= 1
+        return self.reset_state_value
+
+
+def _routes():
+    return [("slack", "C-EXAMPLE-1", "blue"), ("slack", "C-EXAMPLE-2", "blue")]
+
+
+def test_timeout_resets_owned_route_and_stops_when_cleanup_unconfirmed():
+    """@spec TURN-CANARY-3 TURN-CANARY-4"""
+    canary = _canary()
+    platform = CyclePlatform(reset_state={"requested": True, "route_existed": None})
+    result = asyncio.run(canary.run_cycle(platform, _routes(), turn_deadline=0.02,
+                                    cleanup_deadline=0.02, poll_period=0.005))
+    assert len([call for call in platform.calls if isinstance(call, tuple) and call[0] == "enqueue"]) == 1
+    assert len([call for call in platform.calls if isinstance(call, tuple) and call[0] == "reset"]) == 1
+    assert result.cleanup_degraded is True
+    assert result.success is False
+
+
+def test_false_reset_result_stops_before_second_probe():
+    """@spec TURN-CANARY-4"""
+    platform = CyclePlatform(reset_state={"requested": False, "route_existed": False})
+    result = asyncio.run(_canary().run_cycle(platform, _routes(), turn_deadline=0.02,
+                                       cleanup_deadline=0.02, poll_period=0.005))
+    assert result.cleanup_degraded is True
+    assert sum(call[0] == "enqueue" for call in platform.calls if isinstance(call, tuple)) == 1
+
+
+def test_successful_cycle_runs_probes_serially():
+    """@spec TURN-CANARY-3 TURN-CANARY-5"""
+    platform = CyclePlatform(reply_events=[{"event": "turn.completed", "outcome": "dropped"}])
+    result = asyncio.run(_canary().run_cycle(platform, _routes(), turn_deadline=0.02,
+                                       cleanup_deadline=0.02, poll_period=0.005))
+    assert result.cleanup_degraded is False
+    assert platform.peak == 1
+    assert sum(call[0] == "enqueue" for call in platform.calls if isinstance(call, tuple)) == 2
+
+
+@pytest.mark.parametrize("headroom", [False, None])
+def test_quota_headroom_refuses_enqueue(headroom):
+    """@spec TURN-CANARY-5"""
+    platform = CyclePlatform(headroom=headroom)
+    result = asyncio.run(_canary().run_cycle(platform, _routes()[:1], turn_deadline=0.02,
+                                       cleanup_deadline=0.02, poll_period=0.005))
+    assert result.capacity_skips == 1
+    assert not any(call[0] == "enqueue" for call in platform.calls if isinstance(call, tuple))
+
+
+def test_network_error_diagnostic_omits_raw_secret_and_reply():
+    """@spec TURN-CANARY-6"""
+    class Broken(CyclePlatform):
+        async def replies(self, reply_ref, after):
+            raise RuntimeError("token=private-secret reply=private-content")
+
+    platform = Broken()
+    result = asyncio.run(_canary().run_cycle(platform, _routes()[:1], turn_deadline=0.02,
+                                       cleanup_deadline=0.02, poll_period=0.005))
+    rendered = repr(result) + str(result.logs)
+    assert "private-secret" not in rendered
+    assert "private-content" not in rendered
+    assert "RuntimeError" in rendered
+    assert any(call[0] == "reset" for call in platform.calls if isinstance(call, tuple))
