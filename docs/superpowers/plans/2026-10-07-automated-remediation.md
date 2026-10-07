@@ -58,11 +58,11 @@ route body gates in the same change, so no route-adding PR fails those gates.
 | 4. Policy CLI | AR-3 (CLI), AR-20 (CLI receipt) | `cli` | 2, 3 | `remediation-policy` and `remediation` verb groups under `local` and `cluster`; one JSON object per verb under `--json`; mirrored validation refuses with the API's reason; write verbs present the operator principal from `CURIE_APPROVAL_PRINCIPAL_TOKEN` and refuse without it; CLI manifest regenerated. |
 | 5. Remediation generation at admission | AR-4, AR-6 (binding retention) | `packages/protected-hooks`, `apps/api` (`apps/api/src/curie_api/routers/hooks.py`), reviewed by the #3603 owner | 3; protected hooks plan task 3 | Intent and envelope carry `remediation_generation` read under the agent gate; an envelope without it refuses automatic execution only; a policy write racing an admission yields either the old or the new generation, never a mix (real Valkey and Postgres); the binding outlives the turn until its submission window closes. |
 | 6. Nomination route and parser | AR-5, AR-7 | `apps/api` | 2, 3 | Idempotent per `event_id`; `nomination_conflict`, `not_protected_event`, `remediation_disabled`; agent, hook, generation and reply handle resolved from the inserted binding, and a request carrying them refused; one row per entry with its target key; every parse refusal from the vector. |
-| 7. Read executions | AR-12 | `apps/api` (migration, sample route), `runner` (`read` phase in `runner/src/curie_runner/executor.py`), `apps/worker` (executor loop) | 1 (M2, M3), 2; executor task 11; #4204 | Pointed scalar only crosses; `tool_not_read_only` without dialing; lease renewed per sample and expiry ends `refused`; sandbox released after the last sample and after a crash; no acting connector credential in a read sandbox (cluster exec); vector fails one-sided. |
+| 7. Read executions, scheduling and the sandbox cap | AR-12, E9 | `apps/api` (migration with `not_before`, sample route, claim route cap), `runner` (`read` phase in `runner/src/curie_runner/executor.py`), `apps/worker` (executor loop concurrency), `charts/curie` and compose (`actionExecutor.maxConcurrentSandboxes`, default 2) | 1 (M2, M3), 2; executor task 11; #4204 | One sample per execution, sandbox released after each read and after a crash; structured and single-text-JSON results yield the pointed scalar, other shapes `result_unstructured`; `tool_not_read_only` without dialing; never more than the cap live across two worker replicas, a write-kind execution claimed while samples are due, a sample that misses its slot recorded skipped; the chart value renders the same cap into API and worker (render assertion); no acting connector credential in a read sandbox (cluster exec); vector fails one-sided. |
 | 8. Forward execution with authority, ledger fields and actor | AR-13, AR-14 | `apps/api` with `apps/worker` | 3; executor tasks 11 and 12 | One ledger row per execution with closed `authority_kind`, generation in `authority_ref`, `actor_kind`, delivery and nomination ids; replay creates nothing; legacy rows unchanged; an unknown authority kind violates the check. |
 | **Wave 3** | | | | |
 | 10. Remediation approvals (driven by inserted not-admitted nomination rows, since admission is task 9; verification of approved calls is proved in task 11) | AR-15, AR-16 | `apps/api` (purpose, resolution), `apps/worker` (card loop beside the publication loop) | 1 (M4), 6, 8 | Explicit expiry set; dedupe on nomination rows attaches while pending and raises a new approval after resolution; attached nominations finish with the approval; card rendered from the nomination row with inert `reason`; approve builds from the nomination row and yields one execution and no resume turn; a database-edited `granted_arguments` refused `arguments_mismatch`; withdrawn action refused `policy_changed`; reject and expiry yield none. |
-| 11. Verifier | AR-17, AR-18 | `apps/api` (evaluator, scheduling), `apps/worker` (sampling loop) | 7, 8 | Four outcomes on a real cluster; settle at least one interval; at most 60 samples; observe-only `superseded` check; independence refused at write and at admission; grammar refusals; one outcome per record. |
+| 11. Verifier | AR-17, AR-18 | `apps/api` (evaluator, sample scheduling) | 7, 8 | Four outcomes on a real cluster with samples as scheduled executions and no sandbox held between samples; settle at least one interval; at most 60 samples; an instant `scalar()` read against a text-only metrics connector verifies, and a range-query read ends `verifier-unavailable`; observe-only `superseded` check scheduled per sample; independence refused at write and at admission; grammar refusals; one outcome per record. |
 | 14. Nomination capture in the protected worker | AR-6 | `apps/worker` (runner client wrapper in the protected lane's composition, reviewed by the #3603 owner) | 1 (M1), 2, 6; protected hooks plan task 4 | `done` turn submits once; no streamed edit or final reply contains the fence, including a fence split across deltas; other statuses submit nothing; retries cannot add nominations; off-limits files untouched. |
 | **Wave 4** | | | | |
 | 9. Admission, limits, breaker, disarm | AR-8, AR-9, AR-10, AR-11 | `apps/api` | 1 (M5), 5, 6, 7, 8, 11 | Table-driven order through real producers, including independence; re-check at the `precondition_pending` transition; racing last slot from two hooks yields one execution under the per-agent lock; target key literal membership; incident window per agent and target, opened by automatic and approved actions, one hour after verification, lengthen-only, never read from the alert body; breaker opens on outcomes and closes only through the administrative route with an operator principal; disarm after creation refused `policy_changed` at claim through the remediation authority hook (executor amendment E8); kill switch between admission and dispatch refuses with no write; injected read failures never execute. |
@@ -72,7 +72,7 @@ route body gates in the same change, so no route-adding PR fails those gates.
 | 16. Tuning and prevention kinds | AR-24, AR-25 | `apps/api`, `apps/worker` (card rendering) | 9, 10 | `prevent` always asks and is verified when approved; `kind_not_automatic` for `prevent` and `tune`; one tuning request per recorded series with platform-rendered diff and declared-read evidence; approval ends `tune_execution_not_automated` with no write. |
 | **Wave 6** | | | | |
 | 13. Receipts and telemetry | AR-20, AR-21 | `apps/worker`, `packages/telemetry`, `cli` | 9, 10, 11, 12 | One thread message per stage; metric manifest includes the counter with bounded domains; capture of messages, logs and spans contains no non-target argument, sample, reason or alert text. |
-| 17. Documentation | AR-12, AR-26, AR-27 | docs, `ARCHITECTURE.md`, ACI producer interface (seam owner review), executor spec amendments E1 to E8, example bundle docs | 7, 13, 14 | The `read` phase listed beside `/v1/execute`; the executor spec text amended as the remediation spec lists; the remediation data path; the nomination block author guide; the qualification drill order, including that a drill relies on a model nominating and is repeated with a fresh delivery, never replaced by a direct write, when the model does not; the SRE example's intake guide states the policy boundary honestly. |
+| 17. Documentation | AR-12, AR-26, AR-27 | docs, `ARCHITECTURE.md`, ACI producer interface (seam owner review), executor spec amendments E1 to E9, example bundle docs | 7, 13, 14 | The `read` phase listed beside `/v1/execute`; the executor spec text amended as the remediation spec lists; the remediation data path; the nomination block author guide; the qualification drill order, including that a drill relies on a model nominating and is repeated with a fresh delivery, never replaced by a direct write, when the model does not; the SRE example's intake guide states the policy boundary honestly. |
 | **Wave 7** | | | | |
 | 18. Complete campaign | all | integration owner | 1 to 17 | On the final artifacts: protected delivery to automatic remediation verified; out-of-bounds to approval to execution verified; `not-recovered` to report, breaker and approved undo; disarm, kill and limits refusals; a recorded duplicate-rule series to one tuning request. |
 
@@ -90,14 +90,45 @@ identifiers.
   context variable set by the guarded consumer adapter before delegating is
   visible in `start_turn` for every attempt of that turn; and that the wrapped
   stream keeps `turn_epoch` and the async context manager protocol.
-* **M2.** Executor sandbox hold time and pool impact of a verifier read
-  execution held for a 600 second deadline at 10 second intervals, claimed with
-  the per-claim stripped template from the agent's pool source (#4204), together
-  with its observe-only `superseded` execution against the acting connector (two
-  sandboxes per verification), against an ordinary turn's claim latency.
-* **M3.** Structured content shapes returned by representative read connectors
-  (a metrics query and an alert state read) at a pinned digest, and whether a
-  JSON pointer reaches the needed scalar without transformation.
+* **M2.** Sandbox quota and executor loop occupancy of a verifier, and claim and
+  release cost of an executor sandbox with the per-claim stripped template.
+  Observed 2026-10-07 at candidate `974678acb` on a disposable single-node
+  cluster (4 CPU, 6 GiB) with the chart's sandbox substrate subset applied and the
+  worker's own sandbox client driven as the chart's worker service account. Every
+  claim, executor or ordinary, cold-creates through a per-claim template (the warm
+  pool renders 0 replicas), so the contended resource is the sandbox
+  ResourceQuota (default ceiling 8, bound by `limits.cpu` 1 per sandbox), not a
+  warm pool. The per-claim template's runner carried only the runner token and
+  sandbox id as secret references. Claim to ready: 15.6 s for the first claim on
+  the node, then 4.8 to 5.2 s; eight concurrent claims all ready in 6.5 to
+  6.6 s. Release: the delete returns at once, but the pod takes 7.9 to 8.2 s to
+  leave and free quota. A ninth claim at the ceiling was refused by the quota and
+  became ready 14.2 s after a held claim was deleted. An idle executor runner
+  used about 77 MiB and negligible CPU. The worker's executor loop runs one
+  execution at a time, and the pressure path cannot reclaim executor sandboxes.
+  Projection, not measured: a verification holding two sandboxes for a 600 s
+  deadline would take a quarter of the default ceiling and block that worker's
+  executor for the whole deadline. Led to the M2 ruling (one sandbox per sample,
+  a cap of 2, interleaved scheduling). Not measured: an ordinary turn's claim
+  latency under verifier load (needs a full install with bundles), the real
+  read-phase cost (not implemented), and behavior across worker replicas;
+  task 18 measures the first.
+* **M3.** Result shapes of representative read connectors. Observed 2026-10-07 at
+  the same candidate, with the reference connector run as a process and the SRE
+  example's metrics and alerting connector at its pinned digest run against a
+  local metrics server and dashboard server with placeholder data. The reference
+  connector's `observe_version` returns structured content `{"version": ...}`,
+  reached by `/version`. The metrics and alerting connector declares no output
+  schema on any of its 48 tools (all annotated read-only) and returns no
+  structured content: each result is one text block holding JSON. Instant
+  single-series and aggregate queries reach the value at `/data/0/value/1`,
+  `scalar(...)` at `/data/1`, both as numeric strings such as `"1"` (so the
+  numeric string rule is needed); an instant query with no series has no
+  `/data/0`; a range query's latest sample has no fixed index; an alert rule read
+  by id has its state at `/state`, while a rule list's order is not stable. Under
+  the spec as first written every such verifier would have ended
+  `verifier-unavailable`. Led to the M3 rulings (text-only JSON is evaluated; no
+  pointer extension; instant and `scalar()` shapes).
 * **M4.** That a remediation-purpose approval created with no model turn renders
   and resolves through the operator principal path with the dispatcher at zero
   replicas, as the publication purpose does.
@@ -139,7 +170,7 @@ repository validators for their artifacts.
 | 4 | n/a (f) | R | n/a (a) | R | n/a (c) | n/a (d) | n/a (e) |
 | 5 | n/a (f) | R (g) | n/a (a) | R | n/a (c) | n/a (d) | n/a (e) |
 | 6 | n/a (f) | R | n/a (a) | n/a (b) | n/a (c) | n/a (d) | n/a (e) |
-| 7 | R | R | n/a (a) | R | n/a (c) | n/a (d) | n/a (e) |
+| 7 | R | R | R | R | n/a (c) | n/a (d) | n/a (e) |
 | 8 | n/a (f) | R | n/a (a) | R | n/a (c) | n/a (d) | n/a (e) |
 | 9 | n/a (f) | R | n/a (a) | R | n/a (c) | n/a (d) | n/a (e) |
 | 10 | n/a (f) | R | n/a (a) | R | n/a (c) | R | n/a (e) |
@@ -154,8 +185,8 @@ repository validators for their artifacts.
 Reasons:
 
 * (a) No released binary, image identity, install path, version pin or release
-  compose change in this task. Task 3 adds the release compose value, so it
-  carries the row.
+  compose change in this task. Tasks 3 and 7 add release compose values, so they
+  carry the row.
 * (b) No chart template, RBAC, securityContext, NetworkPolicy, sandbox claim or
   init container change; the behavior is in the API, exercised by the local
   tier.
@@ -239,7 +270,7 @@ No task modifies `packages/aci-protocol` or `packages/plugin-format` (AR-27).
 * **#4204 (per-claim stripped sandbox template).** Read executions and the
   verifier wait for it, because the pool template would carry the acting
   connector's credential into the verifier's sandbox.
-* **Executor spec amendments E1 to E8.** Each lands with the task that needs it
+* **Executor spec amendments E1 to E9.** Each lands with the task that needs it
   and updates the executor spec text (task 17 checks it); the remediation spec
   judges none of them to need an ADR and lists what would.
 * **The protected worker (#3603, protected hooks plan task 4).** No protected
