@@ -203,6 +203,19 @@ the agent. Rows are written by
 `apps/api/src/curie_api/remediation_qualifications.py`; the downgrade drops both
 tables.
 
+Migration `0095_remediation_escalations.py` (automated remediation,
+AUTOMATED-REMEDIATION-19) is additive. `remediation_escalations`
+(`apps/api/src/curie_api/models.py::RemediationEscalation`) holds one row per
+nomination whose verification outcome is not `verified` (unique
+`nomination_id`): the agent, the ledger record when the forward left one, the
+outcome, and the undo approval when one was offered (`undo_approval_id`, set
+null if that approval is deleted). The undo approval is an `approvals` row of
+purpose `remediation` with a `remediation-undo:<nomination id>` dedupe key and
+no `remediation_approval_requests` row. Rows are written by
+`apps/api/src/curie_api/remediation_escalation.py` in the transaction that
+writes the outcome; the downgrade deletes the undo approvals the table names,
+then drops it.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.
