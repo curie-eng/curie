@@ -1260,6 +1260,8 @@ async def _publication_run(
     thread: str,
     approval_routes: dict | None = None,
     approval_route: str | None = None,
+    publication_creator: object | None = None,
+    lease: object | None = None,
 ) -> AsyncIterator[_PublicationRun]:
     """Drive one Slack turn that ends in a publication approval gate.
 
@@ -1267,6 +1269,8 @@ async def _publication_run(
     recording publication API with no prior lineage, a fixed private repository,
     a prepared README snapshot, and one ``process_event`` of a publish request
     in ``C0EXAMPLE1``. The harness stays open while the test asserts.
+    ``publication_creator`` replaces the recording API, and ``lease`` is passed
+    to ``process_event`` as the turn's delivery lease.
     """
     from curie_worker.approvals import CreatedPublication
     from curie_worker.runner_client import RunnerWorkspaceSnapshot
@@ -1300,7 +1304,9 @@ async def _publication_run(
             self.reads.append((requested_deployment, conversation, repo))
             return None
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest, *, budget_s: float = 120
+        ) -> CreatedPublication:
             self.creates.append(request)
             return CreatedPublication(
                 id="publication-example",
@@ -1335,7 +1341,7 @@ async def _publication_run(
         def touch(self, _thread_identity: str, *, ttl_seconds: int) -> None:
             del ttl_seconds
 
-    publication_api = PublicationApi()
+    publication_api = PublicationApi() if publication_creator is None else publication_creator
     workspace = Workspace()
     binding = Binding(grant_event_id="unused", grant_tool="unused")
     async with make_harness(binding=binding, publication_creator=publication_api) as h:
@@ -1374,7 +1380,8 @@ async def _publication_run(
                 "Publish https://github.com/acme-corp/acme-private",
                 thread=thread,
                 channel="C0EXAMPLE1",
-            )
+            ),
+            lease=lease,
         )
         yield _PublicationRun(h=h, publication_api=publication_api, workspace=workspace)
 
@@ -1524,7 +1531,9 @@ def test_publication_notice_keeps_the_announcement_above_it(
         ) -> None:
             return None
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest, *, budget_s: float = 120
+        ) -> CreatedPublication:
             self.creates.append(request)
             return CreatedPublication(
                 id="publication-example",
@@ -2005,19 +2014,53 @@ def _refusal_publication_request() -> PublicationCreateRequest:
     )
 
 
+@contextmanager
+def _fake_retry_time() -> Iterator[list[float]]:
+    """Replace the API retry helper's clock and sleep; yield the recorded sleeps.
+
+    Each fake sleep advances the fake clock by its delay, so a retry window
+    (#4174, #4180) is spent without waiting for real.
+    """
+
+    from curie_worker import api_retry
+
+    now = 0.0
+    sleeps: list[float] = []
+
+    async def sleep(delay: float) -> None:
+        nonlocal now
+        sleeps.append(delay)
+        now += delay
+        await asyncio.sleep(0)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(api_retry, "_clock", lambda: now)
+        patch.setattr(api_retry, "_sleep", sleep)
+        yield sleeps
+
+
+def _publication_client(http: httpx.AsyncClient) -> ApprovalClient:
+    return ApprovalClient(
+        api_base_url="https://api.example.test",
+        api_key="",
+        client=http,
+        read_timeout_s=1.0,
+        worker_token="worker-test-token",
+    )
+
+
 async def _create_publication_error(response: httpx.Response) -> Any:
     from curie_worker.approvals import ApprovalBackendError
 
-    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: response)) as http:
-        client = ApprovalClient(
-            api_base_url="https://api.example.test",
-            api_key="",
-            client=http,
-            read_timeout_s=1.0,
-            worker_token="worker-test-token",
-        )
-        with pytest.raises(ApprovalBackendError) as excinfo:
-            await client.create_publication(_refusal_publication_request())
+    # A persistent 5xx is retried for the whole window (#4180); the fake clock
+    # spends it at once.
+    with _fake_retry_time():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: response)
+        ) as http:
+            client = _publication_client(http)
+            with pytest.raises(ApprovalBackendError) as excinfo:
+                await client.create_publication(_refusal_publication_request())
     return excinfo.value
 
 
@@ -2098,6 +2141,478 @@ def test_a_long_refusal_is_redacted_whole_before_it_is_clipped() -> None:
     assert pause.failure_detail is not None
     assert "publication.example" in pause.failure_detail
     assert "AAAAAAAAAA" not in pause.failure_detail
+
+
+# --- #4180: publication create retries transient faults within the budget -----
+#
+# The create route is replay safe on ``dedupe_key``: an exact replay is adopted
+# and answered 200 instead of 201, so a retry cannot mint a second card or a
+# second publication. API replay contract:
+# apps/api/src/curie_api/routers/publications.py::create_publication.
+
+_CREATED_PUBLICATION = {
+    "id": "publication-example",
+    "approval_id": "approval-example",
+    "status": "pending",
+}
+
+
+def _assert_identical_replays(seen: list[httpx.Request], count: int) -> None:
+    assert len(seen) == count
+    assert all(request.method == "POST" for request in seen)
+    assert all(request.url.path == "/v1/internal/publications" for request in seen)
+    assert len({request.content for request in seen}) == 1
+    assert {json.loads(request.content)["dedupe_key"] for request in seen} == {
+        "publication-example"
+    }
+
+
+def test_publication_create_retries_a_transport_fault_and_a_500_then_returns_201() -> None:
+    """#4180 AC1: ConnectError, then 500, then 201 returns the publication.
+
+    Every replay carries the same body and ``dedupe_key``, which is what lets the
+    API adopt it (publications.py::create_publication).
+    """
+
+    async def go() -> None:
+        seen: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if len(seen) == 1:
+                raise httpx.ConnectError("API restarting", request=request)
+            if len(seen) == 2:
+                return httpx.Response(500, text="Internal Server Error")
+            return httpx.Response(201, json=_CREATED_PUBLICATION)
+
+        with _fake_retry_time() as sleeps:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+                published = await _publication_client(http).create_publication(
+                    _refusal_publication_request()
+                )
+
+        assert (published.id, published.approval_id, published.status) == (
+            "publication-example",
+            "approval-example",
+            "pending",
+        )
+        _assert_identical_replays(seen, 3)
+        assert sleeps == [0.5, 1.0]
+
+    asyncio.run(go())
+
+
+def test_publication_create_adopts_a_200_replay_after_a_read_timeout() -> None:
+    """#4180 AC2: the first POST may have committed before its response was lost.
+
+    The replay is answered 200 by publications.py::create_publication and is
+    the created publication, not an error.
+    """
+
+    async def go() -> None:
+        seen: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            if len(seen) == 1:
+                raise httpx.ReadTimeout("response lost", request=request)
+            return httpx.Response(200, json=_CREATED_PUBLICATION)
+
+        with _fake_retry_time():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+                published = await _publication_client(http).create_publication(
+                    _refusal_publication_request()
+                )
+
+        assert published.approval_id == "approval-example"
+        assert published.status == "pending"
+        _assert_identical_replays(seen, 2)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("response", "raised", "detail"),
+    [
+        (
+            httpx.Response(
+                409,
+                json={
+                    "detail": {
+                        "code": "publication.metadata_stale",
+                        "message": "pull request metadata changed since it was observed",
+                    }
+                },
+            ),
+            ApprovalBackendError,
+            "publication.metadata_stale: pull request metadata changed since it was observed",
+        ),
+        (
+            httpx.Response(422, json={"detail": "invalid publication request"}),
+            ApprovalBackendError,
+            "invalid publication request",
+        ),
+        (
+            httpx.Response(
+                409, json={"detail": "conversation has no selected repository workspace"}
+            ),
+            WorkspaceSelectionRefused,
+            "conversation has no selected repository workspace",
+        ),
+    ],
+    ids=["metadata-stale-409", "plain-422", "workspace-409"],
+)
+def test_publication_create_never_retries_a_4xx_refusal(
+    response: httpx.Response, raised: type[Exception], detail: str
+) -> None:
+    """#4180 AC3: a 4xx is a real refusal, so one POST and today's handling.
+
+    Only a transport fault or a 5xx is retried; publications.py::create_publication
+    answers a refusal with a 4xx whose reason the issue must show.
+    """
+
+    async def go() -> None:
+        seen: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return response
+
+        with _fake_retry_time() as sleeps:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+                with pytest.raises(raised) as excinfo:
+                    await _publication_client(http).create_publication(
+                        _refusal_publication_request()
+                    )
+
+        assert len(seen) == 1
+        assert sleeps == []
+        error = excinfo.value
+        if isinstance(error, WorkspaceSelectionRefused):
+            assert error.public_detail == detail
+        else:
+            assert isinstance(error, ApprovalBackendError)
+            assert error.refusal == detail
+
+    asyncio.run(go())
+
+
+def test_publication_create_stops_retrying_when_its_budget_is_spent() -> None:
+    """#4180 AC4: a dead API raises ApprovalBackendError within ``budget_s``.
+
+    The retries replay one body under one ``dedupe_key``, safe per
+    publications.py::create_publication, but never past the budget.
+    """
+
+    async def go() -> None:
+        seen: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            raise httpx.ConnectError("API unreachable", request=request)
+
+        with _fake_retry_time() as sleeps:
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+                with pytest.raises(ApprovalBackendError) as excinfo:
+                    await _publication_client(http).create_publication(
+                        _refusal_publication_request(), budget_s=3
+                    )
+
+        assert str(excinfo.value).startswith("publication create failed:")
+        assert len(seen) > 1
+        assert sum(sleeps) <= 3
+        _assert_identical_replays(seen, len(seen))
+
+    asyncio.run(go())
+
+
+class _FactoryBinding:
+    """A workspace-enabled deployment for a factory execute turn."""
+
+    async def resolve(self, kind: str, adapter: str | None, channel: str) -> object:
+        return SimpleNamespace(
+            agent_id=uuid.UUID("11111111-1111-4111-8111-111111114180"),
+            agent_name="acme-bot",
+            deployment_id=uuid.UUID("22222222-2222-4222-8222-222222224180"),
+            endpoint=None,
+            adapter=None,
+            approval_routes=None,
+        )
+
+    def boot_env(self, _resolved: object, thread_key: str, **_: object) -> dict[str, str]:
+        return {
+            "CURIE_SESSION_ID": f"work-item-{thread_key}",
+            "CURIE_RUNNER_TOKEN": "example-work-item-runner-token",
+        }
+
+    def packs_for(self, _resolved: object) -> BehaviorPacks:
+        return BehaviorPacks()
+
+
+class _FactoryWorkspace:
+    def __init__(self, substrate: object) -> None:
+        self.substrate = substrate
+
+    def select_repository(self, **kwargs: object) -> object:
+        return kwargs["repo_full_name"]
+
+    def claim_or_resume_with_handle(self, **kwargs: object) -> object:
+        handle = self.substrate.claim(  # type: ignore[attr-defined]
+            str(kwargs["thread_key"]),
+            env=kwargs.get("env"),
+            agent_name=kwargs.get("agent_name"),
+            workspace_repo=kwargs.get("repo_full_name"),
+            caller_run=kwargs.get("caller_run"),
+        )
+        return SimpleNamespace(handle=handle, prepared=None)
+
+    def touch(self, _thread_key: str, *, ttl_seconds: int) -> bool:
+        return True
+
+    def release(self, _thread_key: str) -> None:
+        return None
+
+
+class _FactoryWorkItems:
+    """The WorkItems dispatch double: an acquired execution that records each call."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.finishes: list[dict[str, object]] = []
+
+    async def acquire(self, request_id: uuid.UUID, *, owner: str, generation: int) -> object:
+        from datetime import timedelta
+
+        from curie_worker.workitem_dispatch import WorkItemAcquireGrant
+
+        self.calls.append("acquire")
+        return WorkItemAcquireGrant(
+            generation=generation,
+            work_item_id=request_id,
+            conversation_id=f"work-item-{request_id}",
+            wait_deadline=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+            repo_full_name="acme-corp/widgets",
+        )
+
+    async def start(self, request_id: uuid.UUID, **_: object) -> object:
+        from datetime import timedelta
+
+        from curie_worker.workitem_dispatch import WorkItemStartGrant
+
+        self.calls.append("start")
+        return WorkItemStartGrant(
+            runtime_epoch=1,
+            execution_deadline=datetime.now(UTC) + timedelta(hours=1),
+            remaining_s=3600.0,
+            heartbeat_interval_s=60.0,
+        )
+
+    async def finish(self, _request_id: uuid.UUID, **kwargs: object) -> None:
+        self.calls.append("finish")
+        self.finishes.append(kwargs)
+
+    async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
+        return "acme widgets issue 123", f"wir.capability-for-{request_id}"
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]  # noqa: ANN204
+        async def record(*_args: object, **_kwargs: object) -> None:
+            self.calls.append(name)
+
+        return record
+
+
+def test_factory_publication_turn_rides_out_two_503s_and_holds_for_approval(
+    make_harness,  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#4180 AC5: a factory execute turn whose publication create sees 503, 503, 201.
+
+    The turn is a ``work-item-<request>-execute-<epoch>`` event with an acquired
+    execution, and its POST goes through the real
+    ``ApprovalClient.create_publication`` and the shared retry helper; only the
+    lineage and precheck reads are stubbed. publications.py::create_publication
+    adopts the identical replays, so the factory request is held for approval
+    and is never finished as ``approval_create_failed``.
+    """
+
+    from aci_protocol import PublicationContext, ToolNote, TurnSource
+    from curie_worker.approvals import PublicationLineage
+    from curie_worker.kernel import TURN_FAILURE_REPLY_PREFIX
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    class PublicationClient(ApprovalClient):
+        async def get_publication_lineage(
+            self, deployment_id: uuid.UUID, conversation_id: str, repo_full_name: str
+        ) -> PublicationLineage | None:
+            return None
+
+        async def get_publication_precheck_context(
+            self,
+            *,
+            deployment_id: uuid.UUID,
+            work_item_id: uuid.UUID,
+            execution_request_id: uuid.UUID,
+            runtime_epoch: int,
+            queued_event_id: str,
+        ) -> PublicationContext | None:
+            return None
+
+    publish_tool = "mcp__curie__publish_changes"
+    event_id = f"work-item-{uuid.uuid4()}-execute-1"
+
+    async def go() -> None:
+        seen: list[httpx.Request] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1/internal/publications"
+            seen.append(request)
+            if len(seen) <= 2:
+                return httpx.Response(503, text="Service Unavailable")
+            return httpx.Response(201, json=_CREATED_PUBLICATION)
+
+        async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+            return RunnerWorkspaceSnapshot(
+                repo_full_name="acme-corp/widgets",
+                base_sha="a1" * 20,
+                patch=b"diff --git a/src/widget.py b/src/widget.py\n",
+                changed_paths=("src/widget.py",),
+                contains_workflow_files=False,
+                publication_title="Fix the widget parser",
+                publication_body="Fixes the parser.",
+            )
+
+        with _fake_retry_time() as sleeps, caplog.at_level(logging.DEBUG):
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+                client = PublicationClient(
+                    api_base_url="https://api.example.test",
+                    api_key="",
+                    client=http,
+                    read_timeout_s=1.0,
+                    worker_token="worker-test-token",
+                )
+                async with make_harness(
+                    binding=_FactoryBinding(),
+                    workspace_factory=_FactoryWorkspace,
+                    publication_creator=client,
+                ) as h:
+                    items = _FactoryWorkItems()
+                    h.kernel._work_items = items
+                    monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+                    monkeypatch.setattr(
+                        "curie_worker.kernel.validate_snapshot_against_base",
+                        lambda *_args, **_kwargs: None,
+                    )
+                    h.runner.turn_scripts = [
+                        [
+                            ToolNote(text=f"running tool {publish_tool}", tool=publish_tool),
+                            Final(
+                                text="Ready to publish",
+                                status=AWAITING,
+                                approval_summary="Publish the change",
+                                approval_gate_kind="permission",
+                                approval_granted_tool=publish_tool,
+                            ),
+                        ]
+                    ]
+                    h.runner.default_script = [
+                        Final(text="default script must not run", status=DONE)
+                    ]
+
+                    await h.kernel.process_event(
+                        QueuedTurn(
+                            event_id=event_id,
+                            conversation_id="1700000000.004180",
+                            author="U0EXAMPLE1",
+                            text="Resolve https://github.com/acme-corp/widgets/issues/123",
+                            reply_handle=ReplyHandle(
+                                kind="slack",
+                                channel="C0EXAMPLE1",
+                                placeholder=None,
+                                endpoint=None,
+                                adapter=None,
+                            ),
+                            received_at="2026-09-25T01:00:00+00:00",
+                            source=TurnSource.SLACK,
+                        )
+                    )
+
+                    assert len(h.runner.opened) == 1
+                    assert items.finishes == []
+                    assert "hold_for_approval" in items.calls
+                    outcomes = [c.outcome for c in h.sink.completions]
+                    assert "escalated" not in outcomes
+                    replies = [text for _address, _ref, text in h.sink.updates]
+                    assert not any("approval-create-failed" in text for text in replies)
+                    assert not any(
+                        text.lstrip().startswith(TURN_FAILURE_REPLY_PREFIX) for text in replies
+                    )
+
+        assert len(seen) == 3
+        assert all(request.method == "POST" for request in seen)
+        assert len({request.content for request in seen}) == 1
+        assert json.loads(seen[0].content)["dedupe_key"] == event_id
+        assert sleeps == [0.5, 1.0]
+        warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+        assert not any("approval create failed" in message for message in warnings)
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("remaining", [None, 40.0])
+def test_publication_create_budget_is_bounded_by_the_delivery_lease(
+    make_harness, monkeypatch: pytest.MonkeyPatch, remaining: float | None
+) -> None:
+    """#4180 AC5: the kernel passes ``min(120, lease.remaining_s())``, else 120.
+
+    The same rule as ``ApprovalClient.create``: a replayed publication
+    (publications.py::create_publication) must never outlive its delivery.
+    """
+
+    import time
+
+    from curie_worker.approvals import CreatedPublication
+    from curie_worker.delivery_lease import DeliveryBudget, unfenced_lease
+
+    class BudgetRecorder:
+        def __init__(self) -> None:
+            self.budgets: list[float] = []
+
+        async def get_publication_lineage(
+            self, requested_deployment: uuid.UUID, conversation: str, repo: str
+        ) -> None:
+            return None
+
+        async def create_publication(
+            self, request: PublicationCreateRequest, *, budget_s: float = 120
+        ) -> CreatedPublication:
+            self.budgets.append(budget_s)
+            return CreatedPublication(**_CREATED_PUBLICATION)
+
+    async def go() -> None:
+        recorder = BudgetRecorder()
+        lease = None
+        if remaining is not None:
+            lease = unfenced_lease()
+            lease.budget = DeliveryBudget(
+                deadline_ms=int(remaining * 1000),
+                anchor_server_ms=0,
+                anchor_monotonic=time.monotonic(),
+            )
+        async with _publication_run(
+            make_harness,
+            monkeypatch,
+            deployment_id=uuid.UUID("11111111-1111-4111-8111-111111114181"),
+            thread="1700000000.004181",
+            publication_creator=recorder,
+            lease=lease,
+        ) as run:
+            assert [c.outcome for c in run.h.sink.completions] == ["awaiting-approval"]
+
+        expected = 120 if remaining is None else 40
+        assert recorder.budgets == [pytest.approx(expected, abs=0.5)]
+
+    asyncio.run(go())
 
 
 def test_worker_approval_http_does_not_fabricate_a_parent() -> None:
@@ -5096,7 +5611,9 @@ def test_publication_with_bound_route_is_created_and_does_not_escalate_unexpecte
         ) -> None:
             return None
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest, *, budget_s: float = 120
+        ) -> CreatedPublication:
             self.creates.append(request)
             return CreatedPublication(
                 id="publication-example",
@@ -5191,7 +5708,9 @@ def test_publication_with_named_unbound_route_escalates_and_creates_nothing(
         ) -> None:
             return None
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest, *, budget_s: float = 120
+        ) -> CreatedPublication:
             self.creates.append(request)
             return CreatedPublication(
                 id="publication-example",

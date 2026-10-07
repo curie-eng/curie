@@ -2086,7 +2086,9 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
         def __init__(self, engine: Any) -> None:
             self.engine = engine
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest, *, budget_s: float = 120
+        ) -> CreatedPublication:
             sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 data = PublicationCreate.model_validate(request.to_json())
