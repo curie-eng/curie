@@ -446,6 +446,24 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             )
             .await?,
         ),
+        // @spec ACTION-EXECUTOR-23
+        LocalAction::Actions { verb } => {
+            let (verb, conn) = verb.into_parts();
+            // Validated before the connection is resolved, so a malformed id
+            // or a missing principal never reaches discovery or the API.
+            let verb = verb.validate()?;
+            emit(
+                commands::actions(
+                    commands::ActionsOpts {
+                        api_url: conn.api_url,
+                        api_key: conn.api_key,
+                        tier: "local",
+                    },
+                    verb,
+                )
+                .await?,
+            )
+        }
         LocalAction::Observability { query, open } => match query {
             None => emit(commands::observability(open).await?),
             Some(_) if open => Err(curie::exit::usage(

@@ -286,14 +286,27 @@ boot env minus everything ACTION-EXECUTOR-4 excludes, minus every connector
 secret except those the target connector's derived MCP entry headers expand,
 plus the caller token and the runner-private `CURIE_RUNNER_MODE=execute`
 (not a `BootEnv` field; it joins the non-boot allowlist beside
-`CURIE_CONNECTOR_TOOL_GRANT`). The grant never rides claim env. Executor routes
+`CURIE_CONNECTOR_TOOL_GRANT`). The grant never rides claim env. Claim env
+cannot remove what the pool template already carries: the chart renders every
+`agentSandbox.connectorSecrets` name onto the runner as a `secretKeyRef` and
+bakes `CURIE_CREDENTIALS` into every non-fake runner template (measurement M3).
+The executor claim therefore runs from its own per-claim template, written by
+the substrate the way `apps/worker/src/curie_worker/sandbox/claim_tokens.py::claim_template_spec` already
+writes one for token-bearing claims: a copy of the agent's pool template with
+`CURIE_CREDENTIALS` and the model env-key declaration removed and the connector
+secret `secretKeyRef`s limited to the target connector's header set. Labels and
+the pool source stay the agent's, so reach is unchanged. Executor routes
 are excluded from `SandboxSubstrate.pressure_candidates`, so idle reclamation
 never selects one, and a quota rejection maps to `sandbox_unavailable`. The
 sandbox is released after the outcome is reported and on every error path.
 
 Acceptance (cluster): the executor sandbox reaches the agent's own connector
-and is refused at the network layer toward another agent's connector; its pool
-and labels equal an ordinary turn sandbox's for the same agent; under quota
+and is refused at the network layer toward another agent's connector; its
+labels and pool source equal an ordinary turn sandbox's for the same agent, and
+on an install with a real model credential (fake model off) the executor pod
+spec lists no `CURIE_CREDENTIALS`, no model env-key declaration and no
+connector secret outside the target's header set, while an ordinary turn's pod
+still lists them; under quota
 pressure an ordinary turn never reclaims a live executor sandbox and an
 executor claim over quota refuses `sandbox_unavailable`; the claim object
 carries no grant, envelope or secret value.

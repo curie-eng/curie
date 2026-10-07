@@ -255,6 +255,9 @@ testpaths = [
     "examples/sre-bot/connectors",
     # The github-activity connector ships its own test_server.py, same reason.
     "examples/github-activity/connectors",
+    # @spec ACTION-EXECUTOR-9: the reference reversible connector is a hosted
+    # fixture the e2e ladder builds into a bundle; its tests ship beside it.
+    "cli/scripts/fixtures/reversible-reference",
     "tools/preflight/tests",
     "tools/doclint/tests",
     # @spec PROTECTED-HOOK-LANE-2
