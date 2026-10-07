@@ -157,8 +157,8 @@ def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
     ``secrets`` name (a sandbox secret) are each refused, naming the key. So
     is naming the key for the sandbox to expand without declaring it: a
     ``bearer_secret`` (the derived ``Authorization: Bearer ${NAME}`` header), or
-    a ``${NAME}`` reference in a remote connector's ``headers`` or a hosted
-    connector's ``unhosted_url``. Each is expanded from the sandbox environment
+    a ``${NAME}`` reference in a remote connector's ``url`` or ``headers``, or
+    in a hosted connector's ``unhosted_url``. Each is expanded from the sandbox environment
     by the MCP client, so each declares that the sandbox holds the key.
 
     Applied at API intake on top of the frozen ``validate_bundle``, so the
@@ -210,6 +210,10 @@ def sealing_key_custody_issues(root: Path) -> list[ValidationIssue]:
         if spec.bearer_secret is not None and is_sealing_key_name(spec.bearer_secret):
             refuse(spec.bearer_secret, f"{where}.bearer_secret)")
         expanded = [(f"headers.{key}", value) for key, value in spec.headers.items()]
+        if spec.url is not None:
+            # `connector_render` writes it verbatim into `.mcp.json`, and the
+            # MCP client expands it like `headers`.
+            expanded.append(("url", spec.url))
         if spec.unhosted_url is not None:
             expanded.append(("unhosted_url", spec.unhosted_url))
         for field, text in expanded:
