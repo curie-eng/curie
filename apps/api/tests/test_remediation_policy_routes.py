@@ -143,6 +143,45 @@ def _action(**overrides: Any) -> dict[str, Any]:
     return action
 
 
+def _tune_action(**overrides: Any) -> dict[str, Any]:
+    """A ``tune`` action in its AUTOMATED-REMEDIATION-25 shape (the policy vector's)."""
+
+    rule = "example-claim-slow"
+    action: dict[str, Any] = {
+        "name": "tune-alert-rule",
+        "kind": "tune",
+        "connector": "example-rules",
+        "tool": "update_rule",
+        "rules": {
+            rule: {
+                "current": {
+                    "threshold": {
+                        "connector": "example-rules",
+                        "tool": "get_rule",
+                        "arguments": {"rule": rule},
+                        "pointer": f"/rules/{rule}/threshold",
+                    }
+                },
+                "evidence": {
+                    "fire_count": {
+                        "connector": "example-metrics",
+                        "tool": "query_value",
+                        "arguments": {"query": "example_alert_fire_count"},
+                        "pointer": "/data/1",
+                    }
+                },
+            }
+        },
+        "change": {
+            "threshold": {"type": "number", "minimum": 5, "maximum": 300},
+            "retire": {"duplicate_of": [rule]},
+        },
+        "automatic": False,
+        "qualification": None,
+    }
+    action.update(overrides)
+    return action
+
 # ---------------------------------------------------------------------------
 # Fixtures and helpers
 # ---------------------------------------------------------------------------
@@ -834,7 +873,7 @@ INVALID: list[Any] = [
         id="automatic-prevent",
     ),
     pytest.param(
-        _policy(actions=[_action(kind="tune", automatic=True)]),
+        _policy(actions=[_tune_action(automatic=True)]),
         "kind_not_automatic",
         id="automatic-tune",
     ),

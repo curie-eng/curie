@@ -46,8 +46,8 @@ Surface these tests fix (``.projects/plans/task-remediation-tuning.tests.md``):
 * A recorded series of deliveries nominating the same change yields exactly one
   approval and one card; every nomination of it points at that approval.
 * Approving it answers ``409`` ``{"code": "tune_execution_not_automated"}``,
-  records the approval ``approved`` and finishes every nomination (the raising
-  one with ``execution_code`` ``tune_execution_not_automated``): no forward
+  records the approval ``approved`` and ends every nomination of the request
+  ``refused`` with ``refusal_code`` ``tune_execution_not_automated``: no forward
   execution, no ledger row, nothing claimable but reads, and a reconciliation
   pass creates nothing. Rejecting it ends the nominations ``rejected`` and
   creates nothing.
@@ -97,7 +97,6 @@ from test_remediation_admission import (
     nomination,
     policy,
     q,
-    qualified,  # noqa: F401  (fixture)
     report,
     run,
     run_forward,
@@ -429,13 +428,14 @@ async def asked_tune(w: World, item: dict[str, Any] | None = None) -> dict[str, 
 # =========================================================================== #
 
 
-@pytest.mark.usefixtures("qualified")
 def test_a_prevent_nomination_passing_every_bound_asks_and_never_executes(
     ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """@spec AUTOMATED-REMEDIATION-24: "its nominations always become approval
-    requests": an in-bounds ``prevent`` nomination under an armed, current,
-    qualified policy becomes an approval request, never a read or an execution.
+    requests": an in-bounds ``prevent`` nomination under an armed, current
+    policy becomes an approval request, never a read or an execution. Check 5
+    (``not_automatic``) decides before check 6, so no qualification record bears
+    on it, and a ``prevent`` action can never be written automatic (below).
     """
 
     async def scenario() -> None:
@@ -769,9 +769,10 @@ def test_approving_a_tuning_request_ends_tune_execution_not_automated_with_no_wr
     no write call, and the receipt says so."
 
     The approver's decision is recorded (``approved``); the route answers the
-    code; every nomination of the request finishes, the raising one naming the
-    code; no forward execution or ledger row exists, nothing but reads was ever
-    claimable, and a reconciliation pass creates nothing either.
+    code; every nomination of the request ends ``refused`` naming the code
+    (``refusal_code``), with no execution and a decision time; no forward
+    execution or ledger row exists, nothing but reads was ever claimable, and a
+    reconciliation pass creates nothing either.
     """
 
     async def scenario() -> None:
@@ -787,12 +788,13 @@ def test_approving_a_tuning_request_ends_tune_execution_not_automated_with_no_wr
                 "SELECT * FROM curie.approvals WHERE id = :id", {"id": approval["id"]}
             )
             assert after["status"] == "approved", after
-            raising = await nomination(rows[0]["id"])
-            assert raising["state"] == "finished", raising
-            assert raising["execution_code"] == "tune_execution_not_automated", raising
-            assert raising["execution_id"] is None, raising
-            for row in rows[1:]:
-                assert (await nomination(row["id"]))["state"] == "finished"
+            for row in rows:
+                ended = await nomination(row["id"])
+                assert ended["state"] == "refused", ended
+                assert ended["refusal_code"] == "tune_execution_not_automated", ended
+                assert ended["execution_id"] is None, ended
+                assert ended["verification_outcome"] is None, ended
+                assert ended["decided_at"] is not None, ended
 
             reconcile = importlib.import_module("curie_api.remediation_approvals")
             engine = create_async_engine(get_settings().database_url)
