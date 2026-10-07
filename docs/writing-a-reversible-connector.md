@@ -183,18 +183,27 @@ executor. Its actions are not undoable. The one exception is a runner boot whose
 probe of that connector failed: it hides `restore` because it cannot tell a lone
 one from a paired one.
 
-### Gate `restore` at the caller proxy
+### `restore` is gated for you
 
 The executor sends `restore` with a one-shot grant bound to the exact argument
-text, and the caller proxy spends it. A `restore` outside the connector's
-rendered gated set refuses `tool_not_grant_bound` before anything is called.
-The gated set is rendered from the bundle's approval patterns
-([`apps/api/src/curie_api/bundles.py::approval_tool_patterns`](../apps/api/src/curie_api/bundles.py),
-[`apps/api/src/curie_api/bundles.py::gated_tools_for_connector`](../apps/api/src/curie_api/bundles.py)),
-so list the paired verb there, for example `"toolPolicy": {"approvalRequired":
-["scaler/restore"]}` in `plugin.json`. The model never sees a paired `restore`,
-so the entry raises no approval card; it makes the proxy refuse any `restore`
-without a grant.
+text, and the caller proxy spends it. You declare nothing for this. Once the
+capability probe records the pair for the digest the agent's version pins, the
+API adds `<connector>/restore` to that connector's rendered gated set, beside
+the bundle's own approval patterns
+([`apps/api/src/curie_api/routers/agents.py::_with_probed_restore`](../apps/api/src/curie_api/routers/agents.py)),
+and the connector reconcile applies the re-rendered proxy. From then on the
+proxy refuses any `restore` that carries no matching grant. Until that render
+lands, every restore for the connector refuses `tool_not_grant_bound` before
+anything is called, so the executor never calls an ungated `restore`. A lone
+`restore`, a connector with no capable row, or a row for another digest leaves
+the gated set unchanged, and `observe_version` is never gated.
+
+**The paired verbs are not forward actions.** A platform-executed forward
+action never calls `restore` or `observe_version`, whether or not the
+connector pairs them; it is refused `reserved_verb_via_forward` before dispatch
+([`apps/worker/src/curie_worker/action_executor_loop.py::ActionExecutorLoop`](../apps/worker/src/curie_worker/action_executor_loop.py)).
+A lone `restore` therefore stays callable by the model on an ordinary turn, but
+cannot be run by the executor.
 
 ## Sealing and key custody
 

@@ -492,7 +492,11 @@ row per agent, connector and digest, `restore_capable` only when `restore` and
 annotations. At boot the runner hides a paired `restore` from the model
 catalogue
 ([`runner/src/curie_runner/adapter.py::hidden_restore_tools`](runner/src/curie_runner/adapter.py));
-a lone `restore` stays an ordinary tool.
+a lone `restore` stays an ordinary tool. Once a digest is capable, the
+connectors route adds `<connector>/restore` to that connector's caller proxy
+gated set for the version that pins it
+([`apps/api/src/curie_api/routers/agents.py::_with_probed_restore`](apps/api/src/curie_api/routers/agents.py)),
+so the proxy refuses a `restore` without a grant.
 
 **Undoable, derived.** `undoable` is never stored. Every read and the undo
 ruling go through one derivation
@@ -561,7 +565,8 @@ and spent once at the caller proxy
 so a tool outside the proxy's rendered gated set refuses `tool_not_grant_bound`
 before dispatch. The local tier runs no caller proxy and no connector
 Deployment, so every restore there refuses. A forward execution runs `list`
-then one `call` and never observes; its `dispatched` commit creates the one
+then one `call`, never observes, and never calls `restore` or `observe_version`
+(`reserved_verb_via_forward`); its `dispatched` commit creates the one
 ledger row the call completes.
 
 **At most once.** Everything before the `dispatched` commit is a provable
