@@ -8474,7 +8474,8 @@ class Kernel:
                         observed_lineage_version=(
                             observation.lineage_version if observation is not None else None
                         ),
-                    )
+                    ),
+                    budget_s=_api_write_budget_s(),
                 )
                 created = CreatedApproval(
                     id=published.approval_id,
