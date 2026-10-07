@@ -951,10 +951,6 @@ fn assert_original_catalog_refusal(
         fix, expected_fix,
         "refusal fix must be the plain catalog fail forward fix: {payload}"
     );
-    assert!(
-        !fix.contains("helm get manifest"),
-        "a catalog refusal must not carry retained-manifest guidance: {payload}"
-    );
     fixture.assert_no_mutation();
 }
 

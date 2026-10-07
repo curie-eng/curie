@@ -239,29 +239,29 @@ def test_actual_checker_refuses_corrupted_shared_runtime_graph(
     resource.parent.mkdir(parents=True, exist_ok=True)
     payload = graph_payload()
     resource.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    # The schema window gate reads a released window from its release tag, so
-    # the copied tree is a git repository tagged v<appVersion>.
-    app_version = next(
-        line.split(":", 1)[1].strip().strip("\"'")
-        for line in (tmp_path / "charts/curie/Chart.yaml").read_text().splitlines()
-        if line.startswith("appVersion:")
-    )
-    git = [
-        "git",
-        "-c", "user.name=Schema Serving Test",
-        "-c", "user.email=schema-serving@example.invalid",
-        "-c", "commit.gpgsign=false",
-        "-c", "tag.gpgsign=false",
-        "-c", "core.hooksPath=/dev/null",
-        "-C", str(tmp_path),
-    ]
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
-    subprocess.run([*git, "add", "-A"], check=True)
-    subprocess.run([*git, "commit", "-q", "-m", f"release {app_version}"], check=True)
-    subprocess.run([*git, "tag", f"v{app_version}"], check=True)
     command = [sys.executable, str(tmp_path / "scripts" / checker)]
     if checker == "check-schema-window.py":
         command += ["--repo-root", str(tmp_path)]
+        # The schema window gate reads a released window from its release tag,
+        # so the copied tree is a git repository tagged v<appVersion>.
+        app_version = next(
+            line.split(":", 1)[1].strip().strip("\"'").removeprefix("v")
+            for line in (tmp_path / "charts/curie/Chart.yaml").read_text().splitlines()
+            if line.strip().startswith("appVersion:")
+        )
+        git = [
+            "git",
+            "-c", "user.name=Schema Serving Test",
+            "-c", "user.email=schema-serving@example.invalid",
+            "-c", "commit.gpgsign=false",
+            "-c", "tag.gpgsign=false",
+            "-c", "core.hooksPath=/dev/null",
+            "-C", str(tmp_path),
+        ]
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-q", "-m", f"release {app_version}"], check=True)
+        subprocess.run([*git, "tag", f"v{app_version}"], check=True)
     healthy = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=15)
     assert healthy.returncode == 0, healthy.stderr
     payload["revision_parents"]["0076"] = []

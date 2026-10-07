@@ -302,25 +302,25 @@ def main() -> int:
     ):
         return _fail("architecture atlas versions manifest is malformed")
     released = any(item["id"] == f"v{app_version}" for item in atlas_versions)
-    if released:
-        tagged_window = _released_window(repo_root, app_version)
-        if tagged_window is not None:
-            # A released window is immutable; only the candidate may move.
-            if chart_window != tagged_window:
-                return _fail(
-                    f"windows[{app_version!r}] differs from its v{app_version} "
-                    "release tag; a released window is immutable, so move only "
-                    "the candidate"
-                )
-        elif chart_min != schema_min or chart_head != schema_head:
-            # The release commit registers the atlas before the tag is pushed,
-            # and the window still equals the candidate in that interval.
+    tagged_window = _released_window(repo_root, app_version) if released else None
+    matches_candidate = chart_min == schema_min and chart_head == schema_head
+    if tagged_window is not None:
+        # A released window is immutable; only the candidate may move.
+        if chart_window != tagged_window:
             return _fail(
-                f"windows[{app_version!r}] differs from candidate and the "
-                f"v{app_version} release tag is not readable; "
-                "run git fetch --tags origin"
+                f"windows[{app_version!r}] differs from its v{app_version} "
+                "release tag; a released window is immutable, so move only "
+                "the candidate"
             )
-    elif chart_min != schema_min or chart_head != schema_head:
+    elif released and not matches_candidate:
+        # The release commit registers the atlas before the tag is pushed,
+        # and the window still equals the candidate in that interval.
+        return _fail(
+            f"windows[{app_version!r}] differs from candidate and the "
+            f"v{app_version} release tag is not readable; "
+            "run git fetch --tags origin"
+        )
+    elif not matches_candidate:
         return _fail(
             f"windows[{app_version!r}] differs from candidate; "
             f"rerun curie dev bump-version {app_version} for the same version"
