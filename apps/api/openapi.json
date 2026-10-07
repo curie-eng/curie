@@ -108,6 +108,32 @@
       "ActionComplete": {
         "description": "The closing frame: what came back, and what it takes to put it back.\n\n``prior_state`` and ``target`` are what a restore replays. Both are optional\nbecause a connector that answers in prose reports neither, and a record that\nholds neither is not undoable -- which is the honest answer rather than a\nmissing one.",
         "properties": {
+          "connector": {
+            "anyOf": [
+              {
+                "maxLength": 63,
+                "minLength": 1,
+                "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector"
+          },
+          "connector_digest": {
+            "anyOf": [
+              {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Connector Digest"
+          },
           "detail": {
             "anyOf": [
               {

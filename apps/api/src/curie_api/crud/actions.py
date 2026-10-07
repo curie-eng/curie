@@ -85,6 +85,9 @@ async def complete_action(
         "post_state": null() if data.post_state is None else data.post_state,
         # Text, not JSONB: Python None binds as SQL NULL. @spec ACTION-EXECUTOR-11.
         "post_version": data.post_version,
+        # Text, validated as a pair by the schema. @spec ACTION-EXECUTOR-12.
+        "connector": data.connector,
+        "connector_digest": data.connector_digest,
         "target": null() if data.target is None else data.target,
         "completed_at": datetime.now(UTC).replace(tzinfo=None),
     }

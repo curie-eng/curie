@@ -165,29 +165,43 @@ class ActionClient:
         payload = await self._post(self._url, body, "action record")
         return RecordedAction(id=str(payload["id"]), status=str(payload["status"]))
 
-    async def complete(self, action_id: str, frame: SideEffectFlag) -> dict[str, Any]:
+    async def complete(
+        self,
+        action_id: str,
+        frame: SideEffectFlag,
+        *,
+        connector: str | None = None,
+        connector_digest: str | None = None,
+    ) -> dict[str, Any]:
         """Close the record with what came back, and return the row as stored.
 
         Returned rather than discarded because the receipt is rendered from what
         the LEDGER holds, not from what the worker sent: ``undoable`` is derived
         on the record, so reading it back is what keeps a receipt from claiming a
         reversibility the row does not have.
+
+        ``connector`` and ``connector_digest`` are the digest-attributing
+        wrapper's verdict (``action_digest``, @spec ACTION-EXECUTOR-12). They
+        travel as a pair or not at all; the API refuses half of one, and a
+        refused completion would fail the turn, so half a pair is dropped here.
         """
 
         snapshot = _snapshot(frame)
-        return await self._post(
-            f"{self._url}/{action_id}/complete",
-            {
-                "failed": bool(frame.failed),
-                "result": frame.result,
-                "prior_state": snapshot.prior_state,
-                "post_state": snapshot.post_state,
-                "post_version": snapshot.post_version,
-                "target": snapshot.target,
-                "detail": frame.detail,
-            },
-            "action complete",
-        )
+        body: dict[str, Any] = {
+            "failed": bool(frame.failed),
+            "result": frame.result,
+            "prior_state": snapshot.prior_state,
+            "post_state": snapshot.post_state,
+            "post_version": snapshot.post_version,
+            "target": snapshot.target,
+            "detail": frame.detail,
+        }
+        if connector is not None and connector_digest is not None:
+            body["connector"] = connector
+            body["connector_digest"] = connector_digest
+        elif connector is not None or connector_digest is not None:
+            logger.warning("action %s: half a connector attribution dropped", action_id)
+        return await self._post(f"{self._url}/{action_id}/complete", body, "action complete")
 
     async def _post(self, url: str, body: dict[str, Any], what: str) -> dict[str, Any]:
         try:

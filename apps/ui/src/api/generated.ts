@@ -2904,6 +2904,10 @@ export interface components {
          *     missing one.
          */
         ActionComplete: {
+            /** Connector */
+            connector?: string | null;
+            /** Connector Digest */
+            connector_digest?: string | null;
             /** Detail */
             detail?: string | null;
             /**

@@ -34,7 +34,7 @@ from redis.maint_notifications import MaintNotificationsConfig
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from . import __version__
-from .actions import ActionClient
+from .actions import ActionClient, ActionRecorder
 from .approval_cards import ApprovalCardStore
 from .approvals import ApprovalClient
 from .attachments import (
@@ -560,10 +560,14 @@ def build(
         # defers card settlement without changing creation or shared clients.
         read_timeout_s=2.0,
     )
-    action_client = ActionClient(
-        api_base_url=config.api_base_url,
-        api_key=config.api_key,
-        client=eval_http,
+    action_client = _build_action_recorder(
+        config,
+        engine,
+        ActionClient(
+            api_base_url=config.api_base_url,
+            api_key=config.api_key,
+            client=eval_http,
+        ),
     )
     sink = build_reply_sink(config, slack_tokens=slack_tokens)
     owner.register_close("reply-sink", sink.aclose, order=20)
@@ -976,6 +980,33 @@ def _supervise_policy(config: WorkerConfig) -> _SupervisePolicy:
         "failure_reset_s": config.supervise_failure_reset_s,
         "boot_grace_s": _BOOT_GRACE_S,
     }
+
+
+def _build_action_recorder(
+    config: WorkerConfig, engine: AsyncEngine, client: ActionClient
+) -> ActionRecorder:
+    """The ledger client, wrapped to attribute connector digests where it can.
+
+    @spec ACTION-EXECUTOR-12: only on the cluster tier with the connector
+    reconciler (which owns the Deployments read) and the executor (whose chart
+    gate is what grants the worker ``get`` on Deployments) both enabled. With
+    either off the worker Role has no such ``get``, so the wrapper is not
+    composed and every action records a null digest, as on the local tier.
+    """
+
+    if not (config.connector_reconcile_enabled and config.action_executor_enabled):
+        return client
+    from .action_digest import DigestAttributingRecorder, agent_deployment_resolver
+    from .connector_k8s import connector_deployments_api
+
+    return DigestAttributingRecorder(
+        client,
+        deployments=connector_deployments_api(),
+        namespace=config.connector_namespace,
+        deployment_name=agent_deployment_resolver(
+            engine, db_schema=config.db_schema, release=config.connector_release
+        ),
+    )
 
 
 def _build_connector_loop(

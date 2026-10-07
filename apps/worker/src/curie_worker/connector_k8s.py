@@ -62,14 +62,30 @@ class UnsupportedKind(ValueError):
     """A plan named an object kind connectors are not made of."""
 
 
+def _load_cluster_config(kubeconfig: str | None) -> None:
+    try:
+        k8s_config.load_incluster_config()
+    except k8s_config.ConfigException:
+        k8s_config.load_kube_config(config_file=kubeconfig)
+
+
+def connector_deployments_api(*, kubeconfig: str | None = None) -> k8s_client.AppsV1Api:
+    """The apps API the digest-attributing recorder reads one Deployment through.
+
+    Same credential as the reconciler. @spec ACTION-EXECUTOR-12: the recorder
+    uses only ``read_namespaced_deployment`` on it, the ``get`` the chart grants
+    with the executor enabled -- never this module's ``list_owned``.
+    """
+
+    _load_cluster_config(kubeconfig)
+    return k8s_client.AppsV1Api()
+
+
 class KubernetesConnectorClient:
     """ConnectorClient against a real cluster (in-cluster or kubeconfig auth)."""
 
     def __init__(self, *, kubeconfig: str | None = None) -> None:
-        try:
-            k8s_config.load_incluster_config()
-        except k8s_config.ConfigException:
-            k8s_config.load_kube_config(config_file=kubeconfig)
+        _load_cluster_config(kubeconfig)
         self._apis: dict[str, Any] = {}
 
     def _api(self, kind: str) -> tuple[Any, str]:
