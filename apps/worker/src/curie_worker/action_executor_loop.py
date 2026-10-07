@@ -779,6 +779,11 @@ class ActionExecutorLoop:
                 execution.agent_id, execution.connector, thread_key=execution.thread_key
             )
             env = executor_env(boot)
+            # A reclaim (ACTION-EXECUTOR-17) finds the dead holder's sandbox for
+            # this execution still running, and ``fresh_only`` would refuse it.
+            # Holding the claim means the earlier fence can no longer dispatch,
+            # so its sandbox is released first. No route makes this a no-op.
+            await asyncio.to_thread(self._substrate.release, execution.thread_key)
             handle = await asyncio.to_thread(
                 self._substrate.claim,
                 execution.thread_key,
