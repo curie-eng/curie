@@ -91,6 +91,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from . import caller_token
+from .attachments import AgentRoute
 from .behaviorpacks import BehaviorPacks
 from .config import WorkerConfig
 
@@ -722,6 +723,27 @@ class BindingResolver:
             )
             value = result.scalar()
         return value if isinstance(value, str) and value else None
+
+    async def routes_for_agent(self, agent_id: uuid.UUID) -> list[AgentRoute]:
+        """The agent's bindings as they are NOW (ADR 0205 decision 5).
+
+        A re-fetch of an earlier attachment resolves its route from these and
+        never from anything recorded with the file, so a removed binding makes
+        the file unavailable and a moved adapter endpoint is followed. Read
+        only; the address is not returned because no re-fetch needs it.
+        """
+
+        sql = text(
+            f"SELECT kind, adapter, endpoint FROM {self._config.db_schema}.agent_channels "
+            "WHERE agent_id = :id ORDER BY kind, adapter NULLS FIRST, endpoint NULLS FIRST"
+        )
+        async with self._engine.connect() as conn:
+            result = await conn.execute(sql, {"id": agent_id})
+            rows = result.all()
+        return [
+            AgentRoute(kind=str(row.kind), adapter=row.adapter, endpoint=row.endpoint)
+            for row in rows
+        ]
 
     async def repo_full_name(self, agent_id: uuid.UUID) -> str | None:
         """The agent's GitHub repo (owner/name), for the eval PR-check report."""
