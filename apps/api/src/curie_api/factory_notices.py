@@ -126,6 +126,7 @@ _CAUSE_TEXT = {
     "no_pull_request": "the run ended without publishing a pull request.",
     "execution_deadline": "the run did not finish before its deadline.",
     "capacity_wait_expired": "no runner capacity came free before the wait expired.",
+    "start_failed": "the sandbox did not start.",
     "owner_lost": "the worker running this request stopped responding.",
     "issue_cancelled": "the request was cancelled.",
     "publication_denied": "a person denied the request to open the pull request.",
@@ -472,6 +473,10 @@ def result_section(
                     "cannot identify which limit from the reported detail. "
                     "Check the agent's configured budget, then retry."
                 )
+        if cause == "start_failed" and detail is not None and detail.strip():
+            # Curie writes this sentence (#4170), but it quotes the worker's
+            # deferral reason: one line, and no HTML comment opener.
+            sentence = _break_html_comments(" ".join(detail.split()))
         text = f"Could not complete: {sentence}\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
@@ -480,7 +485,11 @@ def result_section(
             # so it cannot add a ``Cause:`` line, and no HTML comment opener.
             inert = _break_html_comments(" ".join(detail.split()))
             text += f"Details: {inert}\n"
-        elif cause != "history_capacity" and detail is not None and detail.strip():
+        elif (
+            cause not in {"history_capacity", "start_failed"}
+            and detail is not None
+            and detail.strip()
+        ):
             label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"

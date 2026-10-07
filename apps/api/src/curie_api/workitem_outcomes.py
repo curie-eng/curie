@@ -181,6 +181,12 @@ def _cause(
             "was observed"
         )
     if state == "failed":
+        if cause == "start_failed":
+            return (
+                f"failed: start_failed, the sandbox did not start after "
+                f"{req.start_deferrals} attempts. "
+                f"Last reason: {req.last_deferral_reason or 'unknown'}."
+            )
         text = f"failed: {cause}"
         if cause == "deadline_halted":
             text += (

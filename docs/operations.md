@@ -1189,7 +1189,8 @@ until chart-owned values land):
 | `CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS` | `45` | Runtime heartbeat expiry; interval is ttl / 3 |
 | `CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS` | `120` | A cancellation with no worker teardown receipt settles as cancelled after this |
 | `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` | `10` | Defer backoff base |
-| `CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS` | `120` | Capacity defer backoff cap |
+| `CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS` | `120` | Defer backoff cap |
+| `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` | `5` | The non-capacity defer that reaches this count fails the request with cause `start_failed` |
 | `CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS` | `30` | Terminate wake republish window |
 | `CURIE_CONSUMER_GROUP` | `curie-workers` | Runs consumer group the reconciler ensures |
 
@@ -1211,6 +1212,12 @@ Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
 dead-letter graveyard.
 
+A delivery that ends without starting its sandbox for a reason other than
+capacity defers with the same backoff curve, counted separately. The defer that
+reaches `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` ends the request as `failed` /
+`start_failed`, frees its quota slot, and names the attempt count and the last
+deferral reason on the status comment.
+
 Each factory execution request owns exactly one App-authored status comment.
 The reconciler creates it on its first pass after admission and then edits it
 in place; there is no separate final comment. While the run is live the
@@ -1230,7 +1237,7 @@ once more in the same session. If it still does not publish, it ends as
 `no_pull_request`, and an `Agent's last message:` block carries the agent's
 final reply, redacted and shown inside a code fence so none of it renders.
 A last `Cause:` line names the platform cause code
-(`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
+(`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
@@ -1561,7 +1568,9 @@ request, a `state` and an `actionable_cause`. The states:
   request already opened is kept.
 - `expired`: `capacity_wait_expired` or `execution_deadline`.
 - `failed`: the cause names the terminal cause verbatim. For
-  `deadline_halted`, raise `worker.deliveryBudgetSeconds`.
+  `deadline_halted`, raise `worker.deliveryBudgetSeconds`. For `start_failed`,
+  the sandbox never started; the cause names the attempt count and the last
+  deferral reason.
 - `awaiting_approval`: a publication approval or a tool approval on the same
   conversation is pending.
 - `publishing`: the publication is approved and in flight.

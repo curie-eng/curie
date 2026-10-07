@@ -781,7 +781,10 @@ class ExecutionRequest(Base):
             name="execution_requests_deadline_ck",
         ),
         CheckConstraint(
-            "((status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
+            "((status = 'failed' AND started_at IS NULL "
+            "AND execution_deadline IS NULL AND terminal_at IS NOT NULL "
+            "AND terminal_cause = 'start_failed' AND termination_observation IS NULL) "
+            "OR (status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
             "AND execution_deadline IS NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NULL AND termination_observation IS NULL) "
             "OR (status = 'waiting' AND wait_deadline IS NOT NULL AND started_at IS NULL "
@@ -843,6 +846,10 @@ class ExecutionRequest(Base):
         CheckConstraint(
             "capacity_deferrals >= 0",
             name="execution_requests_capacity_deferrals_ck",
+        ),
+        CheckConstraint(
+            "start_deferrals >= 0",
+            name="execution_requests_start_deferrals_ck",
         ),
         CheckConstraint(
             "dispatch_epoch >= 0",
@@ -946,6 +953,7 @@ class ExecutionRequest(Base):
         DateTime(timezone=True), default=None
     )
     capacity_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
+    start_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
     last_deferral_reason: Mapped[str | None] = mapped_column(Text, default=None)
     execution_attempts: Mapped[int] = mapped_column(default=0, server_default="0")
     runtime_owner: Mapped[str | None] = mapped_column(Text, default=None)

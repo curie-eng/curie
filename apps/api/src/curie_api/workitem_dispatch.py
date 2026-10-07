@@ -82,7 +82,8 @@ class AcquireGrant:
 @dataclass(frozen=True)
 class DeferResult:
     dispatch_generation: int
-    not_before: datetime
+    not_before: datetime | None
+    terminal_cause: str | None = None
 
 
 @dataclass(frozen=True)
@@ -691,9 +692,18 @@ async def defer(
     reason: str,
     capacity: bool,
 ) -> DeferResult | DispatchConflict:
-    request = await _lock_request_by_id(session, request_id)
-    if request is None:
-        return await _refuse(session, "not_found", request_id=request_id)
+    if capacity:
+        request = await _lock_request_by_id(session, request_id)
+        if request is None:
+            return await _refuse(session, "not_found", request_id=request_id)
+        work_item = None
+    else:
+        # A start deferral may settle the request, so it takes the locks in
+        # the order every settling path does: work item, then request.
+        locked = await _lock_pair(session, request_id)
+        if isinstance(locked, DispatchConflict):
+            return locked
+        work_item, request = locked
     if request.status != "waiting":
         return await _refuse(
             session,
@@ -728,8 +738,18 @@ async def defer(
             "capacity_deferrals": ExecutionRequest.capacity_deferrals + 1
         }
     else:
-        delay = settings.work_item_backoff_base_seconds
-        deferral_values = {}
+        assert work_item is not None
+        if request.start_deferrals + 1 >= settings.work_item_start_deferral_limit:
+            return await _fail_unstarted(
+                session, work_item, request, owner=owner, generation=generation,
+                reason=reason, now=now,
+            )
+        delay = min(
+            settings.work_item_backoff_base_seconds
+            * (2 ** request.start_deferrals),
+            settings.work_item_backoff_max_seconds,
+        )
+        deferral_values = {"start_deferrals": ExecutionRequest.start_deferrals + 1}
     not_before = now + timedelta(seconds=delay)
     changed_id = await session.scalar(
         update(ExecutionRequest)
@@ -759,6 +779,69 @@ async def defer(
         not_before=request.dispatch_not_before,
     )
     await session.commit()
+    return result
+
+
+async def _fail_unstarted(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    *,
+    owner: str,
+    generation: int,
+    reason: str,
+    now: datetime,
+) -> DeferResult | DispatchConflict:
+    """End a request whose sandbox never started once start deferrals hit the limit (#4170)."""
+
+    changed_id = await session.scalar(
+        update(ExecutionRequest)
+        .where(
+            ExecutionRequest.id == request.id,
+            ExecutionRequest.status == "waiting",
+            ExecutionRequest.acquire_owner == owner,
+            ExecutionRequest.acquired_generation == generation,
+        )
+        .values(
+            status="failed",
+            terminal_at=now,
+            terminal_cause="start_failed",
+            last_deferral_reason=reason,
+            start_deferrals=ExecutionRequest.start_deferrals + 1,
+            dispatch_generation=ExecutionRequest.dispatch_generation + 1,
+            acquired_generation=None,
+            acquire_owner=None,
+            acquire_expires_at=None,
+            version=ExecutionRequest.version + 1,
+            updated_at=func.clock_timestamp(),
+        )
+        .returning(ExecutionRequest.id)
+    )
+    if changed_id is None:
+        return await _refuse(session, "not_dispatchable", request_id=request.id)
+    request = await _reload_request(session, request.id)
+    await workitems._settle_terminal(
+        session,
+        work_item,
+        request,
+        detail=(
+            f"the sandbox did not start after {request.start_deferrals} attempts. "
+            f"Last reason: {reason}."
+        ),
+    )
+    result = DeferResult(
+        dispatch_generation=request.dispatch_generation,
+        not_before=None,
+        terminal_cause="start_failed",
+    )
+    attempts = request.start_deferrals
+    await session.commit()
+    logger.warning(
+        "work item request %s failed to start after %d start deferrals; last reason %s",
+        changed_id,
+        attempts,
+        reason,
+    )
     return result
 
 
