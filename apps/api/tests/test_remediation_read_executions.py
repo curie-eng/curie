@@ -621,14 +621,17 @@ def test_only_a_read_reports_a_sample(client: Any) -> None:
     assert _sample(client, forward, fence).status_code == 409
 
 
-def test_the_receipt_never_carries_the_sampled_value(client: Any) -> None:
+def test_the_receipt_never_carries_the_sampled_value(
+    client: Any, auth_headers: dict[str, str]
+) -> None:
     """@spec AUTOMATED-REMEDIATION-12: identity, state, fence and codes only."""
 
     created = _create_read(_agent())
     fence = _fence(_claimed(client))
     assert _sample(client, created.execution_id, fence, value=SAMPLED).status_code == 200
 
-    receipt = client.get(f"/action-executions/{created.execution_id}", headers=operator_headers())
+    # The receipt route takes the platform key (ACTION-EXECUTOR-23).
+    receipt = client.get(f"/action-executions/{created.execution_id}", headers=auth_headers)
 
     assert receipt.status_code == 200, receipt.text
     assert SAMPLED not in receipt.text

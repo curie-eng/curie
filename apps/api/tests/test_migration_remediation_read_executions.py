@@ -13,8 +13,9 @@ column names ``not_before`` and ``sample`` are the shapes these tests fix (see
 
 The revision is the next free one on this stack when these tests were written:
 ``0090``, revising the ledger fields revision ``0089`` (plan task 8, #4245). It
-is found by its source (the one revision adding ``not_before``), so a
-renumbering at merge only moves the two constants below.
+is found by its revision id (``not_before`` alone is not unique: 0047 has a
+work item column of that name) and checked to add ``action_executions.not_before``,
+so a renumbering at merge only moves the two constants below.
 """
 
 from __future__ import annotations
@@ -44,16 +45,13 @@ DIGEST = "sha256:" + "ab" * 32
 
 def _revision() -> tuple[str, str]:
     script = ScriptDirectory.from_config(alembic_config())
-    found = [
-        rev
-        for rev in script.walk_revisions()
-        if rev.path and "not_before" in Path(rev.path).read_text()
-    ]
-    assert len(found) == 1, (
-        "expected exactly one alembic revision adding action_executions.not_before "
-        f"(AUTOMATED-REMEDIATION-12, executor amendment E9), found {[r.revision for r in found]}"
+    rev = script.get_revision(HEAD)
+    assert rev is not None and rev.path, f"no alembic revision {HEAD}"
+    source = Path(rev.path).read_text()
+    assert "action_executions" in source and "not_before" in source, (
+        f"revision {HEAD} does not add action_executions.not_before "
+        "(AUTOMATED-REMEDIATION-12, executor amendment E9)"
     )
-    rev = found[0]
     assert isinstance(rev.down_revision, str), rev.down_revision
     return rev.revision, rev.down_revision
 

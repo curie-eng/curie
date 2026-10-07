@@ -129,6 +129,8 @@ _ENV_SETTINGS = {
     "CURIE_TEST_CALL_RESULT_BYTES": ("call_result_bytes", int),
     "CURIE_TEST_READ_REPLY": ("read_reply", json.loads),
     "CURIE_TEST_READ_ERROR": ("read_error", lambda raw: raw == "1"),
+    "CURIE_TEST_READ_CONTENT": ("read_content", json.loads),
+    "CURIE_TEST_READ_TEXT_BYTES": ("read_text_bytes", int),
 }
 
 
