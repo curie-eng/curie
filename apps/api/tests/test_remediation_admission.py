@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import importlib
 import io
 import json
@@ -91,12 +92,14 @@ from _protected_ingress_harness import (
 from _protected_ingress_harness import (
     event_id as event_id_of,
 )
+from channel_protocol import hook_conversation_id
 from curie_api import hook_signing, hook_source_signing
 from curie_api.config import get_settings
 from curie_internal.keyspace import kill_key
 from sqlalchemy import event as sa_event
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from test_hook_source_support import (  # noqa: F401  (support_db is a fixture)
     HOOK,
     scoped_secret,
@@ -348,12 +351,16 @@ class Deliveries:
         self.stage = stage
         self.count = 0
 
-    async def event(self, body: bytes | None = None) -> str:
+    async def event(
+        self, body: bytes | None = None, *, params: dict[str, str] | None = None
+    ) -> str:
         self.count += 1
         delivery = f"admission-delivery-{self.count}-{uuid.uuid4().hex[:6]}"
         payload = BODY if body is None else body
         headers = signed(scoped_secret(self.stage.agent), delivery=delivery, body=payload)
-        response = await deliver(self.stage.client, self.stage.agent, headers, body=payload)
+        response = await deliver(
+            self.stage.client, self.stage.agent, headers, body=payload, params=params
+        )
         assert response.status_code == 200, response.text
         assert response.json()["acceptance_status"] == "accepted", response.text
         event = str(response.json()["event_id"])
@@ -2104,3 +2111,286 @@ def test_with_the_policy_unchanged_the_policy_execution_is_claimed(
             assert claimed["state"] == "claimed", claimed
 
     run(scenario)
+
+
+# =========================================================================== #
+# Review round 1: the approval's reply surface is the delivery's own
+# (AUTOMATED-REMEDIATION-15), and owed approvals never starve
+# =========================================================================== #
+
+SECOND_REPLY = {"kind": "slack", "address": "C0EXAMPLE3"}
+EMAIL_REPLY = {
+    "kind": "email",
+    "address": "support@example.test",
+    "endpoint": "http://adapter.example.test",
+    "adapter": "mail",
+}
+REPLY_COLUMNS = ("reply_kind", "reply_channel", "reply_endpoint", "reply_adapter")
+
+
+async def add_reply_channel(stage: Stage) -> None:
+    """A second reply channel: the hook route now needs the delivery to select one."""
+
+    added = await stage.client.post(
+        f"/agents/{stage.agent}/channels", json=dict(SECOND_REPLY), headers=_platform()
+    )
+    assert added.status_code in (200, 201), added.text
+
+
+async def submission(event: str) -> dict[str, Any]:
+    (row,) = await q(
+        "SELECT * FROM curie.remediation_nomination_submissions WHERE event_id = :e", {"e": event}
+    )
+    return row
+
+
+async def approval_of(row: dict[str, Any]) -> dict[str, Any]:
+    fresh = await nomination(row["id"])
+    assert fresh["approval_id"] is not None, fresh
+    (approval,) = await q(
+        "SELECT * FROM curie.approvals WHERE id = :id", {"id": fresh["approval_id"]}
+    )
+    return approval
+
+
+@pytest.mark.parametrize(
+    "selected", [SECOND_REPLY, EMAIL_REPLY], ids=["second-channel", "first-channel"]
+)
+def test_an_agent_with_two_reply_channels_asks_on_the_deliverys_own_surface(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, selected: Any
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-15: ``reply_kind`` and ``reply_channel`` (and the
+    nullable reply columns) are "copied from the protected delivery's
+    ``QueuedTurn``". With two reply channels the hook route makes the delivery
+    select one (``?kind=&address=``); that surface is recorded on the
+    submission row, next to ``conversation_id``, at nomination time
+    (``reply_kind``, ``reply_channel``, ``reply_endpoint``, ``reply_adapter``),
+    and the approval is raised on it, never guessed from the agent's channels.
+    """
+
+    async def scenario() -> None:
+        async with world(ingress_broker, tmp_path, monkeypatch) as w:
+            await add_reply_channel(w.stage)
+            await w.bind(policy(automatic=False))
+            params = {"kind": selected["kind"], "address": selected["address"]}
+            if "adapter" in selected:
+                params["adapter"] = selected["adapter"]
+            event = await w.deliveries.event(params=params)
+            (row,) = await submit(w.stage, event, entry())
+
+            recorded = await submission(event)
+            assert recorded["conversation_id"] is not None, recorded
+            assert recorded["reply_kind"] == selected["kind"], recorded
+            assert recorded["reply_channel"] == selected["address"], recorded
+            assert recorded["reply_endpoint"] == selected.get("endpoint"), recorded
+            assert recorded["reply_adapter"] in (selected.get("adapter"), "default"), recorded
+
+            assert_approval(row, "not_automatic")
+            approval = await approval_of(row)
+            assert approval["reply_kind"] == selected["kind"], approval
+            assert approval["reply_channel"] == selected["address"], approval
+            assert approval["conversation_id"] == recorded["conversation_id"], approval
+
+    run(scenario)
+
+
+def test_the_surface_is_the_deliverys_even_after_the_agents_channels_change(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-15: the handle is the delivery's, recorded at
+    nomination time. A delivery that selected the second channel is asked on
+    it although that channel was removed before the block was submitted,
+    leaving the agent one channel that a guess would pick.
+    """
+
+    async def scenario() -> None:
+        async with world(ingress_broker, tmp_path, monkeypatch) as w:
+            await add_reply_channel(w.stage)
+            await w.bind(policy(automatic=False))
+            event = await w.deliveries.event(
+                params={"kind": SECOND_REPLY["kind"], "address": SECOND_REPLY["address"]}
+            )
+            removed = await w.stage.client.request(
+                "DELETE",
+                f"/agents/{w.stage.agent}/channels",
+                params={"kind": SECOND_REPLY["kind"], "address": SECOND_REPLY["address"]},
+                headers=_platform(),
+            )
+            assert removed.status_code in (200, 204), removed.text
+
+            (row,) = await submit(w.stage, event, entry())
+
+            assert_approval(row, "not_automatic")
+            approval = await approval_of(row)
+            assert (approval["reply_kind"], approval["reply_channel"]) == (
+                SECOND_REPLY["kind"],
+                SECOND_REPLY["address"],
+            ), approval
+
+    run(scenario)
+
+
+async def _reconcile_once(w: World) -> int:
+    """One pass of the API's admission reconciler, as the expiry sweeper runs it."""
+
+    admission = importlib.import_module("curie_api.remediation_admission")
+    from curie_api.killswitch import KillSwitch
+    from curie_api.storage import BundleStore
+
+    engine = create_async_engine(get_settings().database_url)
+    valkey = redis.asyncio.from_url(get_settings().valkey_dsn())
+    try:
+        async with async_sessionmaker(engine, expire_on_commit=False)() as session:
+            handled: int = await admission.reconcile_admissions(
+                session, BundleStore(get_settings()), KillSwitch(valkey)
+            )
+            return handled
+    finally:
+        await valkey.aclose()
+        await engine.dispose()
+
+
+async def _owed(
+    w: World,
+    *,
+    action: str = ACTION_NAME,
+    reply: dict[str, Any] | None = EMAIL_REPLY,
+    target: str = TARGETS[0],
+    age_seconds: int = 0,
+) -> uuid.UUID:
+    """A nomination sent to approval whose approval is still owed.
+
+    The state admission leaves when raising the approval failed after the
+    decision (``approval_requested`` with its reason and no approval): its
+    submission recorded ``reply`` (None: no surface), and ``action`` names a
+    declared action or, otherwise, one no generation declares (never raisable).
+    """
+
+    event = f"hook-{w.stage.agent}-{HOOK}-{uuid.uuid4().hex[:16]}"
+    columns = {
+        "reply_kind": None,
+        "reply_channel": None,
+        "reply_endpoint": None,
+        "reply_adapter": None,
+    }
+    if reply is not None:
+        columns.update(
+            reply_kind=reply["kind"],
+            reply_channel=reply["address"],
+            reply_endpoint=reply.get("endpoint"),
+            reply_adapter=reply.get("adapter"),
+        )
+    await asyncio.to_thread(
+        sql_rows,
+        "INSERT INTO curie.remediation_nomination_submissions "
+        "(event_id, agent_id, hook, block_sha256, conversation_id, reply_kind, reply_channel, "
+        "reply_endpoint, reply_adapter) VALUES (:e, :agent, :hook, :sha, :conversation, "
+        ":reply_kind, :reply_channel, :reply_endpoint, :reply_adapter)",
+        {
+            "e": event,
+            "agent": uuid.UUID(w.stage.agent),
+            "hook": HOOK,
+            "sha": "cd" * 32,
+            "conversation": hook_conversation_id(uuid.UUID(w.stage.agent), HOOK, None),
+            **columns,
+        },
+    )
+    arguments = {"deployment": target, "namespace": "example-ns", "replicas": 4}
+    text = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+    nomination_id = uuid.uuid4()
+    await asyncio.to_thread(
+        sql_rows,
+        "INSERT INTO curie.remediation_nominations "
+        "(id, agent_id, hook, event_id, admitted_generation, current_generation, action, kind, "
+        "arguments, arguments_sha256, target, state, approval_reason, created_at, decided_at) "
+        "VALUES (:id, :agent, :hook, :e, :g, :g, :action, 'remediate', :arguments, :sha, "
+        ":target, 'approval_requested', 'not_automatic', "
+        "now() - make_interval(secs => :age), now() - make_interval(secs => :age))",
+        {
+            "id": nomination_id,
+            "agent": uuid.UUID(w.stage.agent),
+            "hook": HOOK,
+            "e": event,
+            "g": w.hooks.generation[HOOK],
+            "action": action,
+            "arguments": text,
+            "sha": hashlib.sha256(text.encode()).hexdigest(),
+            "target": target_key(target),
+            "age": age_seconds,
+        },
+    )
+    return nomination_id
+
+
+def test_a_nomination_whose_delivery_left_no_reply_surface_ends_visibly_with_a_named_code(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-15 @spec AUTOMATED-REMEDIATION-8: when the
+    delivery's reply surface is genuinely missing there is nowhere to ask, so
+    the nomination does not sit ``approval_requested`` with no approval, card
+    or expiry: the next reconciler pass ends it ``refused`` with
+    ``reply_surface_unavailable`` (a frozen nomination refusal), ``decided_at``
+    set, no approval and no execution, and later passes leave it alone.
+    """
+
+    async def scenario() -> None:
+        async with world(ingress_broker, tmp_path, monkeypatch) as w:
+            await add_reply_channel(w.stage)  # two channels: nothing to guess from
+            await w.bind(policy(automatic=False))
+            stranded = await _owed(w, reply=None, age_seconds=600)
+
+            await _reconcile_once(w)
+
+            row = await nomination(stranded)
+            assert row["state"] == "refused", row
+            assert row["refusal_code"] == "reply_surface_unavailable", row
+            assert row["approval_id"] is None and row["execution_id"] is None, row
+            assert row["decided_at"] is not None, row
+            assert await q("SELECT id FROM curie.approvals") == []
+            await _reconcile_once(w)
+            assert (await nomination(stranded))["state"] == "refused"
+
+    run(scenario)
+
+
+def test_reply_surface_unavailable_is_a_frozen_nomination_refusal() -> None:
+    """@spec AUTOMATED-REMEDIATION-8: the code is in the closed vocabulary the
+    API, worker and CLI share (``nomination_refusals``)."""
+
+    codes = json.loads(
+        (
+            Path(__file__).resolve().parents[3] / "tests" / "vectors" / "remediation-codes.json"
+        ).read_text("utf-8")
+    )
+    assert "reply_surface_unavailable" in codes["nomination_refusals"]
+
+
+def test_unraisable_owed_approvals_do_not_starve_a_raisable_one(
+    ingress_broker: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-8 @spec AUTOMATED-REMEDIATION-15: 105 owed
+    approvals that can never be raised (their action is declared by no
+    generation), all older than one that can, do not stop the next reconciler
+    pass from raising the newer one's approval.
+    """
+
+    async def scenario() -> None:
+        async with world(ingress_broker, tmp_path, monkeypatch) as w:
+            await w.bind(policy(automatic=False))
+            for index in range(105):
+                await _owed(w, action="withdrawn-action", age_seconds=7200 - index)
+            raisable = await _owed(w, age_seconds=60)
+
+            await _reconcile_once(w)
+
+            row = await nomination(raisable)
+            assert row["state"] == "approval_requested", row
+            assert row["approval_id"] is not None, row
+            approval = await approval_of(row)
+            assert approval["purpose"] == "remediation", approval
+            assert (approval["reply_kind"], approval["reply_channel"]) == (
+                EMAIL_REPLY["kind"],
+                EMAIL_REPLY["address"],
+            ), approval
+
+    run(scenario, timeout=240)
