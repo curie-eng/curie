@@ -1,13 +1,16 @@
 """Opt-in, bounded synthetic turn checker. @spec TURN-CANARY-1 TURN-CANARY-6"""
 
 import asyncio
+import fcntl
 import json
+import os
 import secrets
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Protocol
+from pathlib import Path
+from typing import Any, Protocol, TextIO
 
 from aci_protocol import READER_CONTEXT, QueuedTurn, ReplyHandle, TurnSource
 from aci_protocol.events import ToolAccess
@@ -76,6 +79,92 @@ class CycleResult:
             if isinstance(status, int):
                 item["http_status"] = str(status)
         self.logs.append(item)
+
+
+class StateJournal:
+    """Locked, fsynced intent for an owned in-flight probe. @spec TURN-CANARY-4"""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._file: TextIO | None = None
+        self.data: dict[str, Any] = {}
+
+    def __enter__(self) -> "StateJournal":
+        state = self.path.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(state, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            state.seek(0)
+            raw = state.read().strip()
+            data = json.loads(raw) if raw else {}
+            pending = data.get("pending") if isinstance(data, dict) else None
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("capacity_skips_total", 0), int)
+                or not isinstance(data.get("target_last_success", {}), dict)
+                or data.get("cleanup_blocked", False) not in (True, False)
+                or (
+                    pending is not None
+                    and (
+                        not isinstance(pending, dict)
+                        or not isinstance(pending.get("agent_id"), str)
+                        or not isinstance(pending.get("thread_key"), str)
+                    )
+                )
+            ):
+                raise ValueError("invalid state fields")
+            self.data = data
+            self._file = state
+            return self
+        except BaseException:
+            state.close()
+            raise
+
+    def __exit__(self, *_args: object) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+    @property
+    def pending(self) -> dict[str, str] | None:
+        return self.data.get("pending")
+
+    def _write(self) -> None:
+        if self._file is None:
+            raise RuntimeError("state journal is not locked")
+        self._file.seek(0)
+        self._file.truncate()
+        self._file.write(json.dumps(self.data, sort_keys=True) + "\n")
+        self._file.flush()
+        os.fsync(self._file.fileno())
+
+    def record_intent(self, agent_id: str, thread_key: str) -> None:
+        if self.pending is not None:
+            raise RuntimeError("previous owned cleanup remains pending")
+        self.data["pending"] = {"agent_id": agent_id, "thread_key": thread_key}
+        self._write()
+
+    def clear_intent(self, agent_id: str, thread_key: str) -> None:
+        if self.pending != {"agent_id": agent_id, "thread_key": thread_key}:
+            raise RuntimeError("cleanup does not match the recorded owned route")
+        self.data["pending"] = None
+        self._write()
+
+    def save_result(self, result: CycleResult) -> None:
+        result.capacity_skips += self.data.get("capacity_skips_total", 0)
+        result.last_success = result.last_success or self.data.get("last_success")
+        result.target_last_success = {
+            **self.data.get("target_last_success", {}),
+            **result.target_last_success,
+        }
+        self.data.update(
+            {
+                "cleanup_blocked": result.cleanup_degraded or self.pending is not None,
+                "capacity_skips_total": result.capacity_skips,
+                "last_success": result.last_success,
+                "target_last_success": result.target_last_success,
+            }
+        )
+        self._write()
 
 
 def select_targets(
@@ -216,6 +305,7 @@ async def run_cycle(
     platform: Platform,
     selected: list[tuple[str, str, str]],
     *,
+    journal: StateJournal | None = None,
     turn_deadline: float = 90.0,
     cleanup_deadline: float = 60.0,
     poll_period: float = 2.0,
@@ -229,7 +319,7 @@ async def run_cycle(
         max_targets=max_targets,
     )
     result = CycleResult()
-    if getattr(platform, "cleanup_blocked", False):
+    if getattr(platform, "cleanup_blocked", False) or (journal is not None and journal.pending):
         result.cleanup_degraded = True
         result.record("cleanup", "previous_unconfirmed")
         return result
@@ -268,6 +358,9 @@ async def run_cycle(
             event_id="EvCANARY-" + uuid.uuid4().hex,
             received_at=datetime.now(UTC).isoformat(),
         )
+        key = scoped_reset_key(binding, conversation_id)
+        if journal is not None:
+            journal.record_intent(binding["agent_id"], key)
         enqueued = False
         try:
             await platform.enqueue(turn)
@@ -289,12 +382,13 @@ async def run_cycle(
             all_ok = all_ok and result.target_success[target_label]
             if result.target_success[target_label]:
                 result.target_last_success[target_label] = time.time()
-        key = scoped_reset_key(binding, conversation_id)
         try:
             await platform.reset(binding["agent_id"], key)
             confirmed = await _await_cleanup(
                 platform, binding["agent_id"], key, cleanup_deadline, poll_period
             )
+            if confirmed and journal is not None:
+                journal.clear_intent(binding["agent_id"], key)
         except Exception as exc:  # noqa: BLE001 - unknown reset state must stop the cycle
             result.record("cleanup", "failed", exc)
             confirmed = False
@@ -545,69 +639,24 @@ async def main() -> int:
         quota_resource=os.environ.get("TURN_CANARY_QUOTA_RESOURCE", "count/pods"),
         quota_min_free=int(os.environ.get("TURN_CANARY_QUOTA_MIN_FREE", "1")),
     )
-    import fcntl
-    from pathlib import Path
-
     state_file = Path(state_path)
-    with state_file.open("a+", encoding="utf-8") as state:
-        try:
-            fcntl.flock(state, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            await platform.close()
-            raise RuntimeError("a canary cycle is already running") from exc
-        state.seek(0)
-        raw_state = state.read().strip()
-        try:
-            saved = json.loads(raw_state) if raw_state else {}
-            if not isinstance(saved, dict):
-                raise ValueError("invalid state")
-            if (
-                not isinstance(saved.get("capacity_skips_total", 0), int)
-                or not isinstance(saved.get("target_last_success", {}), dict)
-                or saved.get("cleanup_blocked", False) not in (True, False)
-            ):
-                raise ValueError("invalid state fields")
-        except (ValueError, TypeError) as exc:
-            await platform.close()
-            raise ValueError("canary state is unreadable; refusing enqueue") from exc
-        platform.cleanup_blocked = saved.get("cleanup_blocked") is True
-        try:
+    try:
+        with StateJournal(state_file) as journal:
+            platform.cleanup_blocked = journal.data.get("cleanup_blocked") is True
             result = await run_cycle(
                 platform,
                 selected,
+                journal=journal,
                 turn_deadline=limits.turn_deadline,
                 cleanup_deadline=limits.cleanup_deadline,
                 poll_period=limits.poll_period,
                 max_targets=limits.max_targets,
             )
-        finally:
-            await platform.close()
-        result.capacity_skips += saved.get("capacity_skips_total", 0)
-        result.last_success = result.last_success or saved.get("last_success")
-        result.target_last_success = {
-            **saved.get("target_last_success", {}),
-            **result.target_last_success,
-        }
-        state.seek(0)
-        state.truncate()
-        state.write(
-            json.dumps(
-                {
-                    "cleanup_blocked": result.cleanup_degraded,
-                    "capacity_skips_total": result.capacity_skips,
-                    "last_success": result.last_success,
-                    "target_last_success": result.target_last_success,
-                },
-                sort_keys=True,
-            )
-            + "\n"
-        )
-        state.flush()
-        os.fsync(state.fileno())
+            journal.save_result(result)
+    finally:
+        await platform.close()
     metrics_path = os.environ.get("TURN_CANARY_METRICS_PATH")
     if metrics_path:
-        from pathlib import Path
-
         Path(metrics_path).write_text(prometheus_text(result))
     for item in result.logs:
         print(json.dumps(item, sort_keys=True))

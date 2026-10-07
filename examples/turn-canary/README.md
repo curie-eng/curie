@@ -29,10 +29,13 @@ qualification. Use a disposable route and verify a real delivered nonce, the
 protected runner trace, and reset completion before enabling periodic use.
 
 The state file must be on persistent storage shared by repeated invocations.
-A process lock prevents overlapping cycles on that file. If a reset is not
-confirmed, its `cleanup_blocked` field is `true` and later invocations refuse
-to enqueue. An operator must inspect and resolve the outstanding route before
-changing that field to `false`. Never treat an absent route as confirmation.
+A process lock prevents overlapping cycles on that file. Before enqueue, the
+checker fsyncs a `pending` record with the exact agent ID and scoped thread key.
+It removes that record only after the matching reset is confirmed. A crash or
+unconfirmed reset leaves it in place, and later invocations refuse to enqueue.
+An operator must verify that exact route has been released before clearing
+`pending` and changing `cleanup_blocked` to `false`. Never treat an absent route
+as confirmation.
 The file also retains the capacity skip counter and last success timestamps.
 The script does not resolve approval cards.
 
