@@ -11981,7 +11981,7 @@
     },
     "/actions/{action_id}/complete": {
       "post": {
-        "description": "Record what the tool answered.\n\n``prior_state`` and ``target`` are what a restore replays. A completion that\ncarries neither produces a record that is not undoable, which is the honest\nanswer for a connector that replied in prose -- nothing has to declare it.",
+        "description": "Record what the tool answered.\n\n``prior_state`` and ``target`` are what a restore replays. A completion that\ncarries neither produces a record that is not undoable, which is the honest\nanswer for a connector that replied in prose -- nothing has to declare it.\n\n@spec ACTION-EXECUTOR-11 @spec ACTION-EXECUTOR-12: ``connector`` and\n``connector_digest`` are the worker's attribution, so a completion carrying\nthem also needs the internal worker token (403 otherwise), and the connector\nmust be the one the stored tool names (422 otherwise). Either refusal stores\nnothing. A completion without them still takes the platform key alone.",
         "operationId": "complete_action_actions__action_id__complete_post",
         "parameters": [
           {
@@ -11992,6 +11992,22 @@
               "format": "uuid",
               "title": "Action Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Curie-Worker-Token",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Curie-Worker-Token"
             }
           },
           {
