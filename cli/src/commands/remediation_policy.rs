@@ -72,15 +72,22 @@ pub struct RemediationPolicyOpts {
 
 // @spec AUTOMATED-REMEDIATION-3
 /// Output of `<tier> remediation-policy <verb>`: the committed generation the
-/// API answered with, passed through as one JSON object under `--json`.
+/// API answered with, passed through as one JSON object under `--json`. A
+/// write adds the `operation_id` it sent, so the operator can replay it.
 pub struct RemediationPolicyOutput {
     pub verb: &'static str,
     pub policy: RemediationPolicyGeneration,
+    /// The idempotency key a write carried (passed or minted); `None` for `show`.
+    pub operation_id: Option<String>,
 }
 
 impl crate::ui::CliOutput for RemediationPolicyOutput {
     fn to_json(&self) -> serde_json::Value {
-        serde_json::to_value(&self.policy).unwrap_or(serde_json::Value::Null)
+        let mut value = serde_json::to_value(&self.policy).unwrap_or(serde_json::Value::Null);
+        if let (Some(id), Some(object)) = (&self.operation_id, value.as_object_mut()) {
+            object.insert("operation_id".to_string(), serde_json::json!(id));
+        }
+        value
     }
 
     fn render(&self, ui: &crate::ui::Ui) {
@@ -93,6 +100,9 @@ impl crate::ui::CliOutput for RemediationPolicyOutput {
         line("armed", if policy.armed { "yes" } else { "no" });
         line("bound by", &policy.bound_by);
         line("updated", &policy.updated_at);
+        if let Some(id) = &self.operation_id {
+            line("operation", id);
+        }
         if self.verb == "show" && policy.active {
             let actions = policy.policy["actions"]
                 .as_array()
@@ -312,6 +322,56 @@ pub async fn remediation_policy(
         verb,
         principal,
     } = validated;
+    let operation_id = match &verb {
+        Validated::Show => None,
+        Validated::Apply { body } => Some(body.operation_id.clone()),
+        Validated::Arm(cas) | Validated::Disarm(cas) | Validated::Remove(cas) => {
+            Some(cas.operation_id.clone())
+        }
+    };
+    match send(opts, agent, hook, verb, principal).await {
+        Ok((verb, policy)) => Ok(RemediationPolicyOutput {
+            verb,
+            policy,
+            operation_id,
+        }),
+        Err(error) => Err(match operation_id {
+            Some(id) => with_operation_id(error, &id),
+            None => error,
+        }),
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// A failed write names the operation id it carried, keeping its exit class.
+/// A transient failure may have committed before its answer was lost, so its
+/// fix says to rerun with that id: the API replays a committed write for the
+/// same id instead of refusing the rerun as stale.
+fn with_operation_id(error: anyhow::Error, id: &str) -> anyhow::Error {
+    let (class, fix) = crate::exit::classify(&error);
+    let fix = if class == crate::exit::ExitClass::Transient {
+        Some(format!(
+            "rerun the same command with --operation-id {id}: if the write committed before \
+             the failure, the platform replays it rather than refusing it as stale"
+        ))
+    } else {
+        fix
+    };
+    anyhow::Error::from(CliError {
+        message: format!("{error:#} (operation id {id})"),
+        fix,
+        class,
+    })
+}
+
+/// Resolve the agent and send the verb's request.
+async fn send(
+    opts: RemediationPolicyOpts,
+    agent: String,
+    hook: String,
+    verb: Validated,
+    principal: Option<String>,
+) -> Result<(&'static str, RemediationPolicyGeneration)> {
     // A cluster tunnel is loopback too; its key is already the release's, so
     // it must not trigger local key discovery.
     let client = if opts.tier == "cluster" {
@@ -351,5 +411,5 @@ pub async fn remediation_policy(
                 .await?,
         ),
     };
-    Ok(RemediationPolicyOutput { verb, policy })
+    Ok((verb, policy))
 }

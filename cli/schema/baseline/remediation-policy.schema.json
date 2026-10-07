@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/remediation-policy/v1.0.json",
+  "$id": "https://schemas.curietech.ai/cli/remediation-policy/v1.1.json",
   "title": "curie <tier> remediation-policy --json",
-  "description": "The agent-facing payload of `curie <tier> remediation-policy <show|apply|arm|disarm|remove>` (AUTOMATED-REMEDIATION-3): the hook's committed policy generation exactly as the API's `RemediationPolicyOut` carries it. `generation` is a canonical decimal string, `bound_by` names the operator principal's subject (never its token), and a removed policy is `active` false with an empty `policy`. Refusals are the shared error object.",
+  "description": "The agent-facing payload of `curie <tier> remediation-policy <show|apply|arm|disarm|remove>` (AUTOMATED-REMEDIATION-3): the hook's committed policy generation exactly as the API's `RemediationPolicyOut` carries it. `generation` is a canonical decimal string, `bound_by` names the operator principal's subject (never its token), and a removed policy is `active` false with an empty `policy`. A write (never `show`) adds the `operation_id` it sent, passed or minted, so a rerun with `--operation-id` replays it (v1.1). Refusals are the shared error object.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -41,6 +41,10 @@
     },
     "updated_at": {
       "type": "string"
+    },
+    "operation_id": {
+      "type": "string",
+      "description": "The idempotency key the write carried. Absent on show."
     }
   }
 }
