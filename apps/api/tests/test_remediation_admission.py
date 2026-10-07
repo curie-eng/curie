@@ -791,6 +791,13 @@ def run(scenario: Callable[[], Any], timeout: float = TIMEOUT) -> None:
 # --------------------------------------------------------------------------- #
 
 
+# The per-agent admission lock (AUTOMATED-REMEDIATION-10): the advisory lock
+# whose key names the remediation admission namespace and the agent. Only it is
+# made to fail; other advisory locks (task 10's approval identity lock) still
+# work, so the fail-closed approval can be raised.
+ADMISSION_LOCK = "curie.remediation.admission:"
+
+
 @contextmanager
 def failing_statements(fragment: str) -> Iterator[list[str]]:
     """Every SQL statement containing ``fragment`` fails as an unreachable database would."""
@@ -1361,7 +1368,7 @@ async def _reversible_with_capability(w: World) -> None:
 # (id, statement fragment, reversible) for reads admission makes at submission.
 INITIAL_FAULTS = [
     ("breaker", "remediation_breakers", False),
-    ("limit-lock", "pg_advisory_xact_lock", False),
+    ("limit-lock", ADMISSION_LOCK, False),
     ("capability", "connector_capabilities", True),
 ]
 
@@ -1405,7 +1412,7 @@ def test_an_unreadable_breaker_limit_or_capability_row_at_admission_asks_and_nev
 TRANSITION_FAULTS = [
     ("policy", "remediation_policy_generations", False),
     ("breaker", "remediation_breakers", False),
-    ("limit-lock", "pg_advisory_xact_lock", False),
+    ("limit-lock", ADMISSION_LOCK, False),
     ("capability", "connector_capabilities", True),
 ]
 
@@ -1525,9 +1532,13 @@ def test_a_policy_limit_ages_out_after_the_rolling_hour(
     async def scenario() -> None:
         async with world(ingress_broker, tmp_path, monkeypatch) as w:
             await w.bind()
-            for target in TARGETS[:3]:
-                row = await w.one(entry(target))
+            # All three reach their precondition reads before any forward
+            # exists, so the claim route (oldest due first) hands out each
+            # read in turn rather than an earlier action's forward.
+            rows = [await w.one(entry(target)) for target in TARGETS[:3]]
+            for row in rows:
                 await assert_pending(row)
+            for row in rows:
                 await admit(w.stage, row)
             assert_approval(await w.one(entry(TARGETS[3])), "policy_rate_limit")
             await age(3700)
