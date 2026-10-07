@@ -139,11 +139,13 @@ class ReadArguments(BaseModel):
 
     @spec AUTOMATED-REMEDIATION-12: the read is the declaration's, never a
     caller's. Answered only by ``POST /action-executions/{id}/arguments``.
+    @spec AUTOMATED-REMEDIATION-18 (executor amendment E3): ``pointer`` is null
+    only for an observe-only execution (``observe_version`` of the target).
     """
 
     tool: str
     arguments: dict[str, Any]
-    pointer: str
+    pointer: str | None
 
 
 # remediation-predicate.json ``value_max_chars``: a sample's compact JSON text.

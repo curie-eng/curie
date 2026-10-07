@@ -761,8 +761,12 @@ as a whole; remembered only):
   block's strict JSON, otherwise `result_unstructured`) and the worker's sample
   report (`apps/worker/src/curie_worker/action_executor.py::sample_report`) ship
   in different images, so every pointer, result shape and sample kind is frozen
-  together with the comparator cases the API's evaluator joins with the
-  verifier (plan task 11).
+  together with the comparator cases the API's evaluator
+  (`apps/api/src/curie_api/remediation_predicate.py::evaluate_sample`, which
+  judges each verifier sample, plan task 11) reads too: ordering comparators
+  read a JSON number or a strict numeric string, `eq`, `ne` and `in` never
+  coerce, and every unsuccessful sample (including the API's own `skipped`) is
+  `unsuccessful`. Read by `apps/api/tests/test_remediation_predicate_vector.py`.
   [vector: `tests/vectors/remediation-predicate.json`]
 - API vs CLI remediation policy validation and policy refusal codes
   (AUTOMATED-REMEDIATION-3) -- the API validator

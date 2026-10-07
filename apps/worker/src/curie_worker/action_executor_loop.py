@@ -58,6 +58,12 @@ completes a ledger row. A pass that claims nothing releases the executor
 sandbox of any read the API ended after its holder crashed (a read is never
 re-queued, so no later holder can own that route).
 
+An observe-only execution (@spec AUTOMATED-REMEDIATION-18, executor amendment
+E3) is a read of the acting connector's ``observe_version`` with no pointer:
+the bound target read under the fence; a sandbox under the acting connector's
+binding; ``list`` (``observe_version`` advertised); exactly one ``observe``; the
+sandbox released; then the version relayed unjudged to ``POST .../observation``.
+
 @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): ``run_forever`` runs up
 to ``max_concurrent_sandboxes`` executions at once; the API's claim route, not
 this loop, holds the installation-wide count.
@@ -859,6 +865,9 @@ class ActionExecutorLoop:
 
         run.stage = "arguments"
         tool, arguments, pointer = await self._bound_read(execution)
+        if pointer is None:
+            await self._observe_only(execution, run, arguments)
+            return
         run.stage = "sandbox"
         handle, _agent_name = await self._claim_sandbox(execution, run)
         run.stage = "list"
@@ -896,7 +905,45 @@ class ActionExecutorLoop:
         # claim route ends the read ``runner_unavailable`` once its lease ends.
         raise _Abandon("sample")
 
-    async def _bound_read(self, execution: Execution) -> tuple[str, str, str]:
+    async def _observe_only(self, execution: Execution, run: _Run, arguments: str) -> None:
+        """@spec AUTOMATED-REMEDIATION-18 (executor amendment E3): ``list`` then one ``observe``.
+
+        The ``superseded`` check's execution against the acting connector: a
+        sandbox under its own binding, ``observe_version`` advertised in that
+        sandbox's ``list`` (``tool_not_advertised``), exactly one ``observe`` of
+        the bound target with no grant, the sandbox released, then the version
+        relayed unjudged to ``POST .../observation``, which ends it. No kill
+        switch check (it never dispatches), no ``read``, sample, dispatch, call
+        or completion. Nothing logs the version or the target.
+        """
+
+        try:
+            bound = json.loads(arguments)
+        except ValueError:
+            raise _Refuse("arguments_mismatch", "arguments") from None
+        target = bound.get("target") if isinstance(bound, dict) else None
+        if not isinstance(target, Mapping) or set(bound) != {"target"}:
+            raise _Refuse("arguments_mismatch", "arguments")
+        run.stage = "sandbox"
+        handle, _agent_name = await self._claim_sandbox(execution, run)
+        run.stage = "list"
+        tools = await self._list(execution, run, handle)
+        if OBSERVE_TOOL not in {t.get("name") for t in tools if isinstance(t, Mapping)}:
+            raise _Refuse("tool_not_advertised", "list")
+        run.stage = "observe"
+        version = await self._observe(execution, run, handle, target)
+        await self._release_read(execution, run)
+        run.stage = "observation"
+        answer = await self._send(execution, "observation", {"version": version})
+        if answer is not None and answer.status == 200 and answer.state == "confirmed":
+            run.state = "confirmed"
+            run.code = None
+            return
+        # Never answered, or refused (a stale fence or an expired lease): the
+        # claim route ends the read ``runner_unavailable`` once its lease ends.
+        raise _Abandon("observation")
+
+    async def _bound_read(self, execution: Execution) -> tuple[str, str, str | None]:
         """The read's tool, exact argument text and pointer, read under the fence.
 
         @spec AUTOMATED-REMEDIATION-12: the declaration's, never a caller's. An
@@ -904,6 +951,8 @@ class ActionExecutorLoop:
         produce them is ``authority_unavailable``; a tool other than the one
         claimed, arguments without a canonical form, a claimed ``arguments_sha256``
         that is missing, empty or differs, or no pointer are ``arguments_mismatch``.
+        @spec AUTOMATED-REMEDIATION-18 (E3): a null pointer is accepted only for
+        ``observe_version``, an observe-only execution.
         """
 
         answer = await self._send(execution, "arguments", {})
@@ -915,7 +964,7 @@ class ActionExecutorLoop:
         pointer = answer.row.get("pointer")
         if not isinstance(tool, str) or not tool or tool != execution.tool:
             raise _Refuse("arguments_mismatch", "arguments")
-        if not isinstance(pointer, str):
+        if not isinstance(pointer, str) and not (pointer is None and tool == OBSERVE_TOOL):
             raise _Refuse("arguments_mismatch", "arguments")
         try:
             text = connector_grant.canonical_arguments(answer.row.get("arguments"))
