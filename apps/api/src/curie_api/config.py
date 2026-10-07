@@ -115,6 +115,21 @@ class Settings(BaseSettings):
             "CURIE_ACTION_EXECUTOR_ENABLED", "action_executor_enabled"
         ),
     )
+    # @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): the most executions
+    # live (claimed or dispatched) across the installation at once, so ordinary
+    # turns keep sandbox quota. The chart value
+    # ``actionExecutor.maxConcurrentSandboxes`` and the matching compose value
+    # render this one setting into both the API and the worker; the claim route
+    # enforces it, keeping one slot for write-kind executions while two or more
+    # exist.
+    action_executor_max_concurrent_sandboxes: int = Field(
+        default=2,
+        ge=1,
+        validation_alias=AliasChoices(
+            "CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES",
+            "action_executor_max_concurrent_sandboxes",
+        ),
+    )
     # @spec AUTOMATED-REMEDIATION-1: automated remediation is closed by default.
     # The chart value ``remediation.enabled`` and the matching compose value
     # render this one setting into both the API and the worker. Enabling it

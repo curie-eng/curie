@@ -13,7 +13,7 @@ export interface paths {
         put?: never;
         /**
          * Claim Execution
-         * @description Claim the oldest claimable execution under a lease, or ``204``.
+         * @description Claim the oldest due execution under a lease, or ``204``.
          *
          *     @spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a
          *     ``requested`` row is claimable, and so is a ``claimed`` row whose lease
@@ -21,6 +21,14 @@ export interface paths {
          *     fence is stale. A reclaim forgets the earlier attempt's observation, so the
          *     new holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.
          *     @spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.
+         *
+         *     @spec AUTOMATED-REMEDIATION-12 (executor amendments E5 and E9): only due
+         *     executions (``not_before`` NULL or past) are handed out, oldest
+         *     ``not_before`` first (an unscheduled row by its creation time); never more
+         *     than ``action_executor_max_concurrent_sandboxes`` are live (claimed or
+         *     dispatched) across the installation, and while two or more slots exist at
+         *     most all but one are reads. An expired read is refused ``runner_unavailable``
+         *     and never reclaimed; a due read whose series successor is due is skipped.
          */
         post: operations["claim_execution_action_executions_claim_post"];
         delete?: never;
@@ -68,6 +76,9 @@ export interface paths {
          *     before dispatch; ``ExecutionOut`` never carries them. The body is exactly
          *     the fence (a body naming a tool or arguments is a 422), a stale fence is a
          *     ``409``, and only a ``claimed`` forward execution answers. Nothing moves.
+         *
+         *     @spec AUTOMATED-REMEDIATION-12: a ``claimed`` read execution answers its
+         *     bound tool, arguments and pointer the same way.
          */
         post: operations["read_arguments_action_executions__execution_id__arguments_post"];
         delete?: never;
@@ -154,6 +165,33 @@ export interface paths {
          *     is refused and the first stands.
          */
         post: operations["report_outcome_action_executions__execution_id__outcome_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/action-executions/{execution_id}/samples": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Report Sample
+         * @description Record the one sample a claimed read execution took, ending it ``confirmed``.
+         *
+         *     @spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and
+         *     ``value`` (remediation-predicate.json ``sample_report``); the API evaluates
+         *     the predicate from the stored sample (plan task 11). Only a ``claimed`` read
+         *     reports one; a replay of the stored sample answers the row unchanged and a
+         *     different one is refused (``409``). The answer is the receipt, which never
+         *     carries the value or the pointer.
+         */
+        post: operations["report_sample_action_executions__execution_id__samples_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5339,6 +5377,26 @@ export interface components {
             /** State */
             state: string;
         };
+        /**
+         * ExecutionSample
+         * @description @spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and ``value``.
+         *
+         *     remediation-predicate.json ``sample_report``: the sample kind the runner
+         *     answered and, for ``value``, the pointed JSON scalar (at most
+         *     ``SAMPLE_VALUE_MAX_CHARS`` characters of compact JSON); null otherwise.
+         *     ``skipped`` is the API's own record, never a report. The API never receives
+         *     more than the scalar.
+         */
+        ExecutionSample: {
+            /** Attempt */
+            attempt: number;
+            /** Lease Owner */
+            lease_owner: string;
+            /** Sample */
+            sample: string;
+            /** Value */
+            value: unknown;
+        };
         /** FinishBody */
         FinishBody: {
             /** Cause */
@@ -6637,6 +6695,23 @@ export interface components {
             /** Text */
             text: string;
             tool_access?: components["schemas"]["ToolAccess"] | null;
+        };
+        /**
+         * ReadArguments
+         * @description A claimed read execution's bound call and pointer, read by its holder only.
+         *
+         *     @spec AUTOMATED-REMEDIATION-12: the read is the declaration's, never a
+         *     caller's. Answered only by ``POST /action-executions/{id}/arguments``.
+         */
+        ReadArguments: {
+            /** Arguments */
+            arguments: {
+                [key: string]: unknown;
+            };
+            /** Pointer */
+            pointer: string;
+            /** Tool */
+            tool: string;
         };
         /**
          * RemediationNominationAccepted
@@ -8126,7 +8201,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ExecutionArguments"];
+                    "application/json": components["schemas"]["ExecutionArguments"] | components["schemas"]["ReadArguments"];
                 };
             };
             /** @description Validation Error */
@@ -8228,6 +8303,43 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["ExecutionOutcome"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    report_sample_action_executions__execution_id__samples_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionSample"];
             };
         };
         responses: {

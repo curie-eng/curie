@@ -90,6 +90,12 @@ _VERIFIER_KEYS: Final = _READ_KEYS | _VERIFIER_TIMING_KEYS
 _ACTION_NAME: Final = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}")
 _POINTER: Final = re.compile(r"(/([^~/]|~[01])*)*")
+
+
+def valid_pointer(value: object) -> bool:
+    """An RFC 6901 JSON pointer (remediation-predicate.json ``invalid_pointers``)."""
+
+    return type(value) is str and _POINTER.fullmatch(value) is not None
 _IN_LIST_MAXIMUM: Final = 16
 _ALLOWED_MAXIMUM: Final = 256
 _VERIFIER_INTERVAL_MINIMUM: Final = 10
