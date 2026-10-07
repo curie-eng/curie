@@ -44,6 +44,7 @@ class ScheduledJobAlertsCLITests(unittest.TestCase):
             self.assertEqual(labels["component"], "scheduled-job")
             self.assertIn(NAMESPACE, rule["expr"])
             self.assertEqual(rule["annotations"]["description"], DESCRIPTION)
+            self.assertIn("{{ $labels.cronjob }}", rule["annotations"]["summary"])
 
         rule_text = json.dumps(groups)
         for expected_label in ("namespace", "cronjob"):
@@ -156,7 +157,6 @@ class ScheduledJobAlertsPromtoolTests(unittest.TestCase):
         failed_without_previous_success = [
             nonsuspended,
             self._series("kube_cronjob_status_last_schedule_time", value="200+0x20"),
-            self._series("kube_cronjob_status_last_successful_time", value="0+0x20"),
         ]
         successful_schedule = [
             nonsuspended,
@@ -185,7 +185,23 @@ class ScheduledJobAlertsPromtoolTests(unittest.TestCase):
                     {
                         "eval_time": "1m",
                         "alertname": suspension_alert,
-                        "exp_alerts": [self._expected_alert()],
+                        "exp_alerts": [
+                            self._expected_alert(
+                                "Scheduled job credential-rotation is suspended"
+                            )
+                        ],
+                    }
+                ],
+            },
+            {
+                "name": "nonsuspended job stays quiet",
+                "interval": "1m",
+                "input_series": [nonsuspended],
+                "alert_rule_test": [
+                    {
+                        "eval_time": "5m",
+                        "alertname": suspension_alert,
+                        "exp_alerts": [],
                     }
                 ],
             },
@@ -197,7 +213,23 @@ class ScheduledJobAlertsPromtoolTests(unittest.TestCase):
                     {
                         "eval_time": "15m",
                         "alertname": unsuccessful_alert,
-                        "exp_alerts": [self._expected_alert()],
+                        "exp_alerts": [
+                            self._expected_alert(
+                                "Scheduled job credential-rotation's last run did not succeed"
+                            )
+                        ],
+                    }
+                ],
+            },
+            {
+                "name": "unsuccessful schedule stays pending before fifteen minutes",
+                "interval": "1m",
+                "input_series": failed_with_previous_success,
+                "alert_rule_test": [
+                    {
+                        "eval_time": "14m",
+                        "alertname": unsuccessful_alert,
+                        "exp_alerts": [],
                     }
                 ],
             },
@@ -209,7 +241,11 @@ class ScheduledJobAlertsPromtoolTests(unittest.TestCase):
                     {
                         "eval_time": "15m",
                         "alertname": unsuccessful_alert,
-                        "exp_alerts": [self._expected_alert()],
+                        "exp_alerts": [
+                            self._expected_alert(
+                                "Scheduled job credential-rotation's last run did not succeed"
+                            )
+                        ],
                     }
                 ],
             },
@@ -288,7 +324,7 @@ class ScheduledJobAlertsPromtoolTests(unittest.TestCase):
         }
 
     # @spec SRE-SCHEDULED-JOBS c3
-    def _expected_alert(self) -> dict[str, object]:
+    def _expected_alert(self, summary: str) -> dict[str, object]:
         return {
             "exp_labels": {
                 "namespace": NAMESPACE,
@@ -296,7 +332,7 @@ class ScheduledJobAlertsPromtoolTests(unittest.TestCase):
                 "severity": "page",
                 "component": "scheduled-job",
             },
-            "exp_annotations": {"description": DESCRIPTION},
+            "exp_annotations": {"summary": summary, "description": DESCRIPTION},
         }
 
 
