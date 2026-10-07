@@ -182,3 +182,30 @@ fn the_document_codes_are_policy_refusals() {
         set(&codes.policy_refusals)
     );
 }
+
+/// @spec AUTOMATED-REMEDIATION-20 @spec AUTOMATED-REMEDIATION-26: the receipt verbs
+/// render exactly the API's vocabularies (restored from `task/remediation-vectors`
+/// now that `remediation list` and `show` land with the nomination read route).
+/// Expects `curie::remediation::{NOMINATION_STATES, NOMINATION_REFUSALS,
+/// SUBMISSION_REFUSALS, APPROVAL_REASONS, APPROVAL_RESOLUTION_REFUSALS,
+/// VERIFICATION_OUTCOMES, RECEIPT_STAGES, KINDS, AUTHORITIES, AUTHORITY_KINDS,
+/// ACTOR_KINDS}` as `&[&'static str]`.
+#[test]
+fn the_cli_closes_the_frozen_code_sets() {
+    let codes = codes_vector();
+    assert_eq!(set_of(remediation::NOMINATION_STATES), set(&codes.nomination_states));
+    assert_eq!(set_of(remediation::NOMINATION_REFUSALS), set(&codes.nomination_refusals));
+    assert_eq!(set_of(remediation::SUBMISSION_REFUSALS), set(&codes.submission_refusals));
+    assert_eq!(set_of(remediation::APPROVAL_REASONS), set(&codes.approval_reasons));
+    assert_eq!(
+        set_of(remediation::APPROVAL_RESOLUTION_REFUSALS),
+        set(&codes.approval_resolution_refusals)
+    );
+    assert_eq!(set_of(remediation::VERIFICATION_OUTCOMES), set(&codes.verification_outcomes));
+    assert_eq!(set_of(remediation::RECEIPT_STAGES), set(&codes.receipt_stages));
+    assert_eq!(set_of(remediation::KINDS), set(&codes.kinds));
+    assert_eq!(set_of(remediation::AUTHORITIES), set(&codes.authorities));
+    assert_eq!(set_of(remediation::AUTHORITY_KINDS), set(&codes.authority_kinds));
+    assert_eq!(set_of(remediation::ACTOR_KINDS), set(&codes.actor_kinds));
+    assert!(!codes.admission_checks.is_empty());
+}
