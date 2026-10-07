@@ -1978,6 +1978,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.18",
-  "title": "ACI Protocol v0.5.18"
+  "protocolVersion": "0.5.19",
+  "title": "ACI Protocol v0.5.19"
 }

@@ -756,6 +756,21 @@
           "title": "Name",
           "type": "string"
         },
+        "optionalSecrets": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Optionalsecrets"
+        },
         "repository": {
           "anyOf": [
             {

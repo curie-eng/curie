@@ -1627,24 +1627,40 @@ def _unknown_tool_policy_server_message(
 
 
 def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
-    """Validate the manifest ``secrets`` policy (deploy-time gate, ADR-0009 / #429).
+    """Validate the manifest secret policy (deploy-time gate, ADR-0009 / #429, ADR 0209).
 
-    ``secrets`` is a list of the named connector secrets the bundle needs (the
-    NAMES only, never values). Each must be an environment-variable-style name
+    ``secrets`` lists the named connector secrets the bundle requires and
+    ``optionalSecrets`` the ones it can use but does not need (the NAMES only,
+    never values). Each must be an environment-variable-style name
     (``^[A-Z_][A-Z0-9_]*$``) so it can be forwarded into the sandbox env and
     consumed by ``.mcp.json`` ``${VAR}`` expansion; a malformed name is rejected
-    at deploy before an agent ships expecting a secret that can never bind.
+    at deploy before an agent ships expecting a secret that can never bind. A
+    name may not be both required and optional.
     """
 
-    declared = manifest.secrets
-    if declared is None:
-        return
-    if not isinstance(declared, list):
-        c.error("secrets.invalid", "secrets must be a list of names", "plugin.json")
-        return
+    required = _validate_secret_names(manifest.secrets, "secrets", c)
+    optional = _validate_secret_names(manifest.optionalSecrets, "optionalSecrets", c)
+    for name in sorted(set(required) & set(optional)):
+        c.error(
+            "secrets.optional_overlap",
+            f"secret name {name!r} is declared in both `secrets` and `optionalSecrets`; "
+            "declare it once, as required or as optional",
+            "plugin.json (optionalSecrets)",
+        )
 
+
+def _validate_secret_names(declared: object, field: str, c: _Collector) -> list[str]:
+    """Validate one secret NAME list and return its string entries."""
+
+    if declared is None:
+        return []
+    if not isinstance(declared, list):
+        c.error("secrets.invalid", f"{field} must be a list of names", "plugin.json")
+        return []
+
+    names: list[str] = []
     for i, name in enumerate(declared):
-        loc = f"plugin.json (secrets[{i}])"
+        loc = f"plugin.json ({field}[{i}])"
         if not isinstance(name, str) or not SECRET_NAME_RE.match(name):
             c.error(
                 "secrets.name_invalid",
@@ -1652,7 +1668,9 @@ def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
                 "(uppercase letters, digits, underscore; not starting with a digit)",
                 loc,
             )
-        elif is_reserved_boot_env_name(name):
+            continue
+        names.append(name)
+        if is_reserved_boot_env_name(name):
             # Reserved sandbox boot-env / model-credential keys (#457, #445):
             # the whole CURIE_* namespace plus the runner's non-prefixed
             # credential keys (ANTHROPIC_BASE_URL etc). A connector secret must
@@ -1665,6 +1683,7 @@ def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
                 "used for a connector secret",
                 loc,
             )
+    return names
 
 
 def _validate_scripts(root: Path, c: _Collector) -> None:

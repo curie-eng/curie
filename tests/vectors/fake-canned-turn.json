@@ -1,17 +1,17 @@
 [
   {
-    "version": "0.5.18",
+    "version": "0.5.19",
     "type": "text_delta",
     "text": "Looking into it"
   },
   {
-    "version": "0.5.18",
+    "version": "0.5.19",
     "type": "tool_note",
     "text": "running tool Bash",
     "tool": "Bash"
   },
   {
-    "version": "0.5.18",
+    "version": "0.5.19",
     "type": "side_effect_flag",
     "tool": "Bash",
     "detail": "non-idempotent tool executed",
@@ -22,7 +22,7 @@
     "redacted": null
   },
   {
-    "version": "0.5.18",
+    "version": "0.5.19",
     "type": "side_effect_flag",
     "tool": "Bash",
     "detail": "non-idempotent tool completed",
@@ -33,12 +33,12 @@
     "redacted": null
   },
   {
-    "version": "0.5.18",
+    "version": "0.5.19",
     "type": "text_delta",
     "text": "\n\nall done"
   },
   {
-    "version": "0.5.18",
+    "version": "0.5.19",
     "type": "final",
     "text": "all done",
     "status": "done",
