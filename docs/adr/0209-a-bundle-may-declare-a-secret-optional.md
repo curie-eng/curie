@@ -2,21 +2,19 @@
 
 Date: 2026-10-06
 
-Status: Draft
+Status: Accepted
 
-This Draft proposes to amend [ADR 0009](0009-per-agent-connector-auth.md)
+Accepted on 2026-10-07 with explicit maintainer approval from Junwon Jung
+(jw3329), before any implementation.
+
+This ADR supersedes in part [ADR 0009](0009-per-agent-connector-auth.md)
 (Accepted) in one clause: the manifest `secrets` list is "the versioned,
 evaluable list of named secrets the bundle requires", and a deploy refuses any
 declared name it does not bind. Everything else in ADR 0009 stands: secrets are
 declared by name only, values are bound per agent at deploy time, and they
 reach the sandbox as environment that the bundle's MCP configuration consumes
 as `${VAR}`. It answers
-[#4129](https://github.com/curie-eng/curie/issues/4129). It does not authorize
-implementation until it is published as Accepted with explicit maintainer
-approval. No back link is added to ADR 0009 while this ADR is a Draft: under
-[ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md) the
-back link names an ADR that has amended it, and a Draft has amended nothing.
-The back link is added when this ADR is Accepted.
+[#4129](https://github.com/curie-eng/curie/issues/4129).
 
 ## Context
 
