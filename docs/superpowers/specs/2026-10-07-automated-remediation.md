@@ -812,9 +812,8 @@ and an ordering comparator with a non-numeric side is unsatisfied. `eq`, `ne` an
 any other value by its type and exact value. There are no functions, arithmetic,
 variables or nesting; the maintainer ruled on 2026-10-07 that this closed form is
 not an expression language under ADR 0007 or ADR 0117, and anything richer needs
-a new decision. The numeric string rule is a refinement within that ruling: the
-predicate stays one pointer and a closed comparator set, and the rule only
-defines which values count as numbers. Independence
+a new decision. The numeric string rule was confirmed by the maintainer on
+2026-10-07. Independence
 (REMEDIATION-15) is checked at policy write and again at admission against the
 in-force version: the verifier's connector differs from the acting connector,
 and the set of secret names the verifier connector's MCP headers expand is

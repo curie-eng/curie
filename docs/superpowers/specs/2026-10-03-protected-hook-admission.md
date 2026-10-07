@@ -110,7 +110,8 @@ identity. No worker snapshot or caller chosen record substitutes for control.
 `qualification_id: UUID`, `runner_image_digest: oci_digest`,
 `bundle_digest: sha256`, `execution_config_digest: sha256`,
 `logical_conversation_key: str`, `execution_session_key: str`, and
-`payload_sha256: sha256`. Logical key is the unchanged QueuedTurn conversation
+`payload_sha256: sha256`, plus the optional `remediation_generation` described
+below (Intent and Receipt likewise). Logical key is the unchanged QueuedTurn conversation
 ID, a nonempty string of at most 1024 UTF-8 bytes without C0 controls/DEL.
 Execution key is `protected:{runtime_id}:{runtime_generation}:{h}`, where `h`
 is SHA256 of canonical ASCII JSON `[runtime_id, runtime_generation,
@@ -122,7 +123,12 @@ Envelope, Intent and Receipt also carry `remediation_generation`
 (AUTOMATED-REMEDIATION-4 of
 `docs/superpowers/specs/2026-10-07-automated-remediation.md`): the hook's
 remediation policy generation current at admission, a canonical `generation`
-string, or `null` when no remediation policy is bound. It sits beside
+string. The key is optional: when no remediation policy is bound it is omitted,
+so those records have exactly the fields above and stay readable by a release
+that predates the key. A record carrying it is a one-way change: a rollback
+below the version that introduced it rejects the records written while a
+policy was bound, and those deliveries' retries and recovery are unavailable
+until they age out. It sits beside
 `source_revision` as internal transport metadata (ADR 0191), not an ACI field.
 The protected ingress reads it under the agent's source gate, which remediation
 policy writes also take, so it is the generation before or after any racing
