@@ -118,6 +118,26 @@ logical_conversation_key]`. The library derives this from trusted selection;
 a source does not choose it. A future worker independently derives and checks
 it before using its private execution domain under LANE-7.
 
+Envelope, Intent and Receipt also carry `remediation_generation`
+(AUTOMATED-REMEDIATION-4 of
+`docs/superpowers/specs/2026-10-07-automated-remediation.md`): the hook's
+remediation policy generation current at admission, a canonical `generation`
+string, or `null` when no remediation policy is bound. It sits beside
+`source_revision` as internal transport metadata (ADR 0191), not an ACI field.
+The protected ingress reads it under the agent's source gate, which remediation
+policy writes also take, so it is the generation before or after any racing
+write, never a mix; the caller supplies it on `AdmissionRequest`
+(`remediation_generation`, refused outside the grammar). Admission copies it
+from the request into the Intent and from the Intent into the binding, so the
+envelope carries it exactly when its Intent does, and a binding whose value
+disagrees with its Intent is unavailable. A record written before the field
+existed parses without it and gains nothing on read; consumers treat the
+absence as no admitted generation, which refuses automatic remediation and
+never the turn. A retry never relabels a binding: the first admission's
+generation stays. The nomination route reads the binding through the enqueue
+client's `read_binding(event_id)`, a single GET of an `opaque_ref` event's
+binding that never writes or expires it.
+
 `Intent` contains exactly `schema_version: 1`, `identity: DeliveryIdentity`,
 `requested_tool_access`, `effective_tool_access: "read-only"`,
 `request_body_sha256`, `source_generation`, `source_operation_id`,
