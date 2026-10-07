@@ -44,6 +44,7 @@ from typing import Any
 import pytest
 import redis.exceptions
 from aci_protocol import Final, QueuedTurn, SessionStatus, SideEffectFlag, TextDelta
+from aiohttp import web
 from curie_dispatcher.queue import to_stream_fields
 from curie_worker import kernel as kernel_module
 from curie_worker.consumer import Consumer
@@ -115,6 +116,7 @@ def test_twenty_nine_second_ownership_outage_preserves_the_whole_live_turn(
             attempts = {"delivery": 0, "liveness": 0, "marker": 0}
             failures = {"delivery": 0, "liveness": 0, "marker": 0}
             recovered = {lane: asyncio.Event() for lane in attempts}
+            final_allowed = asyncio.Event()
             ready = {lane: asyncio.Event() for lane in ("delivery", "liveness")}
             renewals: dict[str, list[float]] = {lane: [] for lane in ready}
             marker_entered = asyncio.Event()
@@ -123,6 +125,16 @@ def test_twenty_nine_second_ownership_outage_preserves_the_whole_live_turn(
             real_renew = liveness.renew
             real_marker = h.kernel._markers.mark_side_effect
             real_action = h.kernel._record_action
+            real_runner_write = web.StreamResponse.write
+            final_payload = (h.runner.tail[-1].model_dump_json() + "\n").encode("utf-8")
+
+            async def held_runner_final(response: Any, data: bytes) -> None:
+                # Keep the model's real HTTP stream open until both ownership
+                # renewals confirm recovery. Marker success may precede the
+                # next normal renewal, and must not end the test turn early.
+                if data == final_payload:
+                    await final_allowed.wait()
+                await real_runner_write(response, data)
 
             def unavailable(lane: str) -> None:
                 attempts[lane] += 1
@@ -137,6 +149,8 @@ def test_twenty_nine_second_ownership_outage_preserves_the_whole_live_turn(
                 result = await real_heartbeat(*args, **kwargs)
                 if until is not None:
                     recovered["delivery"].set()
+                    if recovered["liveness"].is_set():
+                        final_allowed.set()
                 else:
                     ready["delivery"].set()
                 return result
@@ -146,6 +160,8 @@ def test_twenty_nine_second_ownership_outage_preserves_the_whole_live_turn(
                 result = await real_renew(**kwargs)
                 if until is not None:
                     recovered["liveness"].set()
+                    if recovered["delivery"].is_set():
+                        final_allowed.set()
                 else:
                     ready["liveness"].set()
                 return result
@@ -170,6 +186,7 @@ def test_twenty_nine_second_ownership_outage_preserves_the_whole_live_turn(
             monkeypatch.setattr(liveness, "renew", alive)
             monkeypatch.setattr(h.kernel._markers, "mark_side_effect", marker)
             monkeypatch.setattr(h.kernel, "_record_action", action)
+            monkeypatch.setattr(web.StreamResponse, "write", held_runner_final)
             monkeypatch.setattr(
                 kernel_module,
                 "asyncio",
@@ -220,6 +237,7 @@ def test_twenty_nine_second_ownership_outage_preserves_the_whole_live_turn(
                     for message in caplog.messages
                 )
             finally:
+                final_allowed.set()
                 hold.set()
                 consumer.request_stop()
                 await asyncio.wait_for(task, timeout=5.0)

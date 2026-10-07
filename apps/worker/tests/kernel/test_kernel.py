@@ -5985,6 +5985,7 @@ class _MarkerRetryClock:
 
     def __init__(self) -> None:
         self.now = time.monotonic()
+        self.owner_task = asyncio.current_task()
         self.delays: list[float] = []
         self.after_sleep: Callable[[], None] | None = None
 
@@ -5992,6 +5993,9 @@ class _MarkerRetryClock:
         return self.now
 
     async def sleep(self, delay: float) -> None:
+        if asyncio.current_task() is not self.owner_task:
+            await asyncio.sleep(delay)
+            return
         self.delays.append(delay)
         self.now += delay
         if self.after_sleep is not None:

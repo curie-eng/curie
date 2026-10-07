@@ -51,7 +51,7 @@ from curie_worker.consumer_liveness import (
     consumer_heartbeat_key,
 )
 from curie_worker.cron_loop import CronSchedulerLoop, _Target
-from curie_worker.delivery_lease import DeliveryLeaseStore, LeaseLostError
+from curie_worker.delivery_lease import DeliveryBudget, DeliveryLeaseStore, LeaseLostError
 from curie_worker.hook_source_guard import CronHookSourceGuard
 from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
@@ -563,6 +563,54 @@ def test_terminal_xack_stops_retrying_after_a_confirmed_lease_loss(
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, LeaseLostError):
                         await task
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("first_attempt", ["success", "transport-error", "lost-fence"])
+def test_expired_delivery_budget_allows_only_the_initial_fenced_terminal_ack(
+    make_harness, monkeypatch: pytest.MonkeyPatch, first_attempt: str
+) -> None:
+    """Exhaustion bars settlement retries while preserving the first fenced ACK."""
+
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, _store, entry_id, fields = await _outage_delivery(h)
+            real_xack = h.async_redis.xack
+            attempts = 0
+
+            async def acknowledge(*args: Any, **kwargs: Any) -> Any:
+                nonlocal attempts
+                attempts += 1
+                if first_attempt == "transport-error":
+                    raise redis.exceptions.ConnectionError("injected first terminal ACK failure")
+                return await real_xack(*args, **kwargs)
+
+            monkeypatch.setattr(h.async_redis, "xack", acknowledge)
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                lease.budget = DeliveryBudget(
+                    deadline_ms=lease.budget.anchor_server_ms - 1,
+                    anchor_server_ms=lease.budget.anchor_server_ms,
+                    anchor_monotonic=time.monotonic(),
+                )
+                assert lease.remaining_s() <= 0
+                assert lease.local_deadline_monotonic > time.monotonic()
+                if first_attempt == "lost-fence":
+                    lease.lost.set()
+                    with pytest.raises(LeaseLostError):
+                        await consumer._ack(entry_id)
+                    assert attempts == 0
+                elif first_attempt == "transport-error":
+                    with pytest.raises(TimeoutError, match="delivery budget exhausted"):
+                        await consumer._ack(entry_id)
+                    assert attempts == 1, "an exhausted delivery retried its terminal ACK"
+                else:
+                    await consumer._ack(entry_id)
+                    assert attempts == 1
+                assert lease.acknowledged.is_set() is (first_attempt == "success")
+                pending = await h.async_redis.xpending(lease.stream, lease.group)
+                assert pending["pending"] == (0 if first_attempt == "success" else 1)
 
     asyncio.run(go())
 
@@ -4026,6 +4074,9 @@ def test_transient_liveness_renewal_failure_recovers_before_lease_expiry(
             reclaim_min_idle_ms=300,
             consumer_heartbeat_ttl_ms=150,
             consumer_capability_ttl_ms=450,
+            # Normal cadence retries at 80ms before the 110ms local deadline;
+            # a TTL/3 cadence would put its retry exactly at the deadline.
+            delivery_lease_heartbeat_s=0.04,
             read_block_ms=10,
         ) as h:
             consumer = Consumer(
