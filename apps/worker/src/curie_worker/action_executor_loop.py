@@ -158,7 +158,12 @@ class ExecutorBoot:
     agent_name: str
 
 
-ExecutorBootResolver = Callable[[str, str], Awaitable[ExecutorBoot]]
+class ExecutorBootResolver(Protocol):
+    """Resolves the binding for ``(agent_id, connector)`` under the execution's thread key."""
+
+    def __call__(
+        self, agent_id: str, connector: str, *, thread_key: str
+    ) -> Awaitable[ExecutorBoot]: ...
 
 
 @dataclass(frozen=True)
@@ -748,7 +753,9 @@ class ActionExecutorLoop:
         """
 
         try:
-            boot = await self._executor_boot(execution.agent_id, execution.connector)
+            boot = await self._executor_boot(
+                execution.agent_id, execution.connector, thread_key=execution.thread_key
+            )
             env = executor_env(boot)
             handle = await asyncio.to_thread(
                 self._substrate.claim,

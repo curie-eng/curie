@@ -36,7 +36,6 @@ from plugin_format.yaml_loader import safe_load_unique
 from .action_digest import observe
 from .action_executor_loop import ExecutorBoot
 from .bundle_store import extract_bundle
-from .sandbox import EXECUTOR_THREAD_KEY_PREFIX
 
 if TYPE_CHECKING:
     from .binding import BindingResolver, ResolvedDeployment
@@ -99,13 +98,19 @@ class ExecutorBindings:
                 return observe(manifest).digest
         return None
 
-    async def executor_boot(self, agent_id: str, connector: str) -> ExecutorBoot:
-        """The binding's boot env and the target connector's header secret set."""
+    async def executor_boot(
+        self, agent_id: str, connector: str, *, thread_key: str
+    ) -> ExecutorBoot:
+        """The binding's boot env and the target connector's header secret set.
+
+        ``thread_key`` is the execution's ``action-exec:<execution id>``, so the
+        session identity the binding mints is per execution.
+        """
 
         resolved = await self._resolved(agent_id)
         if resolved is None:
             raise LookupError("the agent has no in-force deployment")
-        env = self._binding.boot_env(resolved, f"{EXECUTOR_THREAD_KEY_PREFIX}{connector}")
+        env = self._binding.boot_env(resolved, thread_key)
         names = await asyncio.to_thread(
             self._header_secret_names, resolved.bundle_ref, resolved.agent_name, connector
         )
