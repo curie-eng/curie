@@ -91,6 +91,7 @@ from pydantic import ValidationError
 
 from . import caller_token, sandbox_token
 from .actions import ActionBackendError, ActionRecorder
+from .api_retry import DEFAULT_BUDGET_S
 from .approval_cards import ApprovalCardStore
 from .approval_wording import approval_display
 from .approvals import (
@@ -1475,6 +1476,30 @@ _HOOK_RUN_CARRY: ContextVar[_HookRunCarry | None] = ContextVar(
 _OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
     "curie_worker_owned_work_item", default=None
 )
+_DELIVERY_LEASE: ContextVar[DeliveryLease | None] = ContextVar(
+    "curie_worker_delivery_lease", default=None
+)
+
+
+def _api_write_budget_s() -> float:
+    lease = _DELIVERY_LEASE.get()
+    return DEFAULT_BUDGET_S if lease is None else min(DEFAULT_BUDGET_S, lease.remaining_s())
+
+
+async def _settle_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
+@dataclass
+class _SettlingWorkItem:
+    run: WorkItemRun
+    outcome: str
+    cause: str
+    detail: str | None
+    task: asyncio.Task[None] | None = None
+    cleaned: bool = False
+
+
 _PUBLICATION_CONTEXT: ContextVar[PublicationContext | None] = ContextVar(
     "curie_worker_publication_context", default=None
 )
@@ -1985,6 +2010,7 @@ class Kernel:
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
         self._held_work_items: dict[str, WorkItemRun] = {}
+        self._settling_work_items: dict[uuid.UUID, _SettlingWorkItem] = {}
         # Approval resume ids that were mapped to a factory execution.
         # The live run can be removed before a later delivery failure reaches
         # ``notify_turn_not_started``, so the exact event identity survives to
@@ -2043,11 +2069,119 @@ class Kernel:
         (#3564).
         """
 
+        if request_id in self._settling_work_items:
+            return True
         self._evict_expired_held_work_items()
         run = self._work_item_runs.get(request_id)
         if run is not None and not run.finished:
             return True
         return any(held.request_id == request_id for held in self._held_work_items.values())
+
+    def _begin_settling(
+        self, run: WorkItemRun, *, outcome: str, cause: str, detail: str | None
+    ) -> None:
+        """Hand off only the report, synchronously retaining ownership (#4174)."""
+
+        if run.request_id in self._settling_work_items:
+            return
+        pending = _SettlingWorkItem(run=run, outcome=outcome, cause=cause, detail=detail)
+        self._settling_work_items[run.request_id] = pending
+        if self._work_item_runs.get(run.request_id) is run:
+            self._work_item_runs.pop(run.request_id)
+        pending.task = asyncio.create_task(
+            self._settle_work_item(pending), name=f"work-item-settle-{run.request_id}"
+        )
+
+    async def _finish_or_settle(
+        self, run: WorkItemRun, *, outcome: str, cause: str, detail: str | None
+    ) -> None:
+        try:
+            await run.finish(outcome=outcome, cause=cause, detail=detail)
+        except WorkItemConflict as exc:
+            if exc.code != "not_running":
+                raise
+            # The preceding attempt may have committed before its response was
+            # lost. Nothing remains to own; do not redeliver the ended turn.
+            run.finished = True
+        except WorkItemTransportError:
+            self._begin_settling(run, outcome=outcome, cause=cause, detail=detail)
+
+    async def _settle_work_item(self, pending: _SettlingWorkItem) -> None:
+        run = pending.run
+        try:
+            while run.heartbeat_running and self._settling_before_deadline(run):
+                delay = run.bound_remaining_s(15.0)
+                assert delay is not None
+                await _settle_sleep(delay)
+                if not run.heartbeat_running or not self._settling_before_deadline(run):
+                    return
+                try:
+                    await run.finish(
+                        outcome=pending.outcome, cause=pending.cause, detail=pending.detail
+                    )
+                except WorkItemConflict as exc:
+                    if exc.code in {"not_running", "publication_pending"}:
+                        run.finished = True
+                    return
+                except WorkItemTransportError:
+                    logger.warning("work-item finish still unavailable for %s", run.request_id)
+                else:
+                    return
+        finally:
+            await self._clean_settling_work_item(pending)
+
+    async def _clean_settling_work_item(self, pending: _SettlingWorkItem) -> None:
+        if pending.cleaned:
+            return
+        run = pending.run
+        if self._settling_work_items.get(run.request_id) is pending:
+            self._settling_work_items.pop(run.request_id)
+        # A heartbeat's shielded stop callback can cancel this task. Joining
+        # that heartbeat here would deadlock against the callback's join.
+        if run.heartbeat_running:
+            await run.close()
+        if run.finished:
+            await self._release_work_item_sandbox(run.thread_key)
+        pending.cleaned = True
+
+    @staticmethod
+    def _settling_before_deadline(run: WorkItemRun) -> bool:
+        return run.execution_deadline is None or run.execution_deadline > datetime.now(UTC)
+
+    async def _cancel_settling_work_items(
+        self,
+        *,
+        request_id: uuid.UUID | None = None,
+        thread_key: str | None = None,
+        agent_id: uuid.UUID | None = None,
+    ) -> None:
+        """Join reports before a termination or reset changes their runtime."""
+
+        tasks: list[asyncio.Task[None]] = []
+        cancelled: list[_SettlingWorkItem] = []
+        current = asyncio.current_task()
+        for key, pending in list(self._settling_work_items.items()):
+            if request_id is not None and key != request_id:
+                continue
+            if thread_key is not None and pending.run.thread_key != thread_key:
+                continue
+            if agent_id is not None and pending.run.agent_id != agent_id:
+                continue
+            self._settling_work_items.pop(key)
+            if pending.task is not None and pending.task is not current:
+                pending.task.cancel()
+                tasks.append(pending.task)
+                cancelled.append(pending)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        # A task cancelled before its first instruction never enters finally.
+        for pending in cancelled:
+            await self._clean_settling_work_item(pending)
+
+    async def close(self) -> None:
+        """Cancel and join terminal reports before their runtime clients close."""
+
+        await self._cancel_settling_work_items()
 
     def _evict_expired_held_work_items(self) -> None:
         """Drop held runs whose execution deadline has passed (#3564).
@@ -2502,6 +2636,7 @@ class Kernel:
         _check_targetless_shape(qevent)
         error: BaseException | None = None
         hook_token = _HOOK_RUN_CARRY.set(_HookRunCarry())
+        lease_token = _DELIVERY_LEASE.set(lease)
         # A redelivery must never inherit an earlier delivery's terminal-send mark
         # from this process (#2433).
         self._terminal_reply_attempted.discard(qevent.event_id)
@@ -2574,6 +2709,7 @@ class Kernel:
                 _TURN_AGENT.reset(agent_token)
                 _LIFECYCLE_SPAN.reset(token)
                 _HOOK_RUN_CARRY.reset(hook_token)
+                _DELIVERY_LEASE.reset(lease_token)
         if error is not None:
             raise error
 
@@ -3639,7 +3775,8 @@ class Kernel:
                         run = self._run_for_event(qevent.event_id)
                         if run is not None:
                             try:
-                                await run.finish(
+                                await self._finish_or_settle(
+                                    run,
                                     outcome="failed",
                                     cause="approval_create_failed",
                                     detail=pause.failure_detail,
@@ -3803,6 +3940,8 @@ class Kernel:
                 await asyncio.sleep(backoff_s)
         finally:
             if owned_work_item_id is not None:
+                # A settlement handoff already removed the active entry. Its
+                # task exclusively owns heartbeat close and sandbox release.
                 owned_run = self._work_item_runs.get(owned_work_item_id)
                 if owned_run is not None and owned_run.held:
                     self._held_work_items[owned_run.thread_key] = owned_run
@@ -4115,6 +4254,7 @@ class Kernel:
         True if a route existed to release."""
         # An operator release ends any run parked on the thread (#3564).
         self._forget_held_work_items(thread_key=thread_key, reason="operator release")
+        await self._cancel_settling_work_items(thread_key=thread_key)
         try:
             interrupted = await asyncio.wait_for(
                 self.interrupt_thread(thread_key, "operator requested a sandbox reset"),
@@ -4221,6 +4361,7 @@ class Kernel:
         # Cleared only once the claim succeeds, so a refused claim leaves the
         # held run in place for whoever does own the termination (#3564).
         self._forget_held_work_items(thread_key=thread_key, reason="terminated")
+        await self._cancel_settling_work_items(request_id=request_id)
         claim_name: str | None = None
         sandbox_name: str | None = None
         try:
@@ -4262,6 +4403,7 @@ class Kernel:
         """Heartbeat saw cancellation_requested: interrupt, observe, record."""
 
         self._forget_held_run(thread_key, run, reason="cancellation requested")
+        await self._cancel_settling_work_items(request_id=run.request_id)
         if self._work_items is None or run.runtime_epoch is None:
             return
         observation = await self._halt_work_item_runtime(
@@ -4292,6 +4434,7 @@ class Kernel:
     async def _abandon_stale_work_item(self, thread_key: str, run: WorkItemRun) -> None:
         """Heartbeat 409 stale_owner: drop local ownership without touching the current route."""
 
+        await self._cancel_settling_work_items(request_id=run.request_id)
         run.finished = True
         self._forget_held_run(thread_key, run, reason="stale owner")
         logger.warning(
@@ -4352,6 +4495,7 @@ class Kernel:
         release to run afterward on this path (unlike `release_thread`), so the
         failure is surfaced via logging rather than swallowed."""
         threads = list(self._active_by_agent.get(agent_id, set()))
+        await self._cancel_settling_work_items(agent_id=agent_id)
 
         async def _interrupt_one(thread_key: str) -> bool:
             try:
@@ -4603,6 +4747,8 @@ class Kernel:
             (parsed is not None and parsed.is_ci_fix) or self._is_approval_resume(qevent.event_id)
         ):
             run = self._run_for_event(qevent.event_id)
+        if run is not None and run.request_id in self._settling_work_items:
+            run = None
         if run is not None and run.started and not run.finished:
             try:
                 if outcome == "awaiting-approval":
@@ -4629,7 +4775,8 @@ class Kernel:
                     else:
                         cause = _unpublished_cause(turn.tools_called)
                     try:
-                        await run.finish(
+                        await self._finish_or_settle(
+                            run,
                             outcome="failed",
                             cause=cause,
                             detail=(
@@ -4646,13 +4793,16 @@ class Kernel:
                         # the stored patch, not the sandbox.
                         run.finished = True
                 elif outcome == "escalated":
-                    await run.finish(
+                    await self._finish_or_settle(
+                        run,
                         outcome="failed",
                         cause=_escalation_cause(turn),
                         detail=turn.error_message if turn is not None else None,
                     )
                 else:
-                    await run.finish(outcome="failed", cause="runner_failed", detail=None)
+                    await self._finish_or_settle(
+                        run, outcome="failed", cause="runner_failed", detail=None
+                    )
             except WorkItemConflict as exc:
                 logger.warning(
                     "work-item finish refused for %s: %s; writing no marker",
@@ -8370,7 +8520,8 @@ class Kernel:
                         granted_tool=outcome.approval_granted_tool,
                         granted_arguments=outcome.approval_granted_arguments,
                         expires_in_seconds=_SESSION_APPROVAL_EXPIRES_IN_SECONDS,
-                    )
+                    ),
+                    budget_s=_api_write_budget_s(),
                 )
         except WorkspaceSelectionRefused as exc:
             logger.info(
@@ -9157,10 +9308,11 @@ class Kernel:
                 # card teardown reads -- and an ordinary turn yields None, which
                 # is exactly "nothing gated it".
                 gate_approval_id=_approval_id_from_resume_event(qevent.event_id),
+                budget_s=_api_write_budget_s(),
             )
             acc.open_actions[frame.call_id] = recorded.id
             return
-        completed = await self._actions.complete(opened, frame)
+        completed = await self._actions.complete(opened, frame, budget_s=_api_write_budget_s())
         if completed:
             acc.receipt_rows.append(completed)
 

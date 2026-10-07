@@ -428,7 +428,9 @@ def test_targetless_approval_gate_is_not_bypassed_and_fails_the_hook_run(
         def __init__(self) -> None:
             self.requests: list[ApprovalRequest] = []
 
-        async def create(self, request: ApprovalRequest) -> CreatedApproval:
+        async def create(
+            self, request: ApprovalRequest, *, budget_s: float = 120
+        ) -> CreatedApproval:
             self.requests.append(request)
             return CreatedApproval(id=f"appr-{uuid.uuid4().hex}", status="pending")
 

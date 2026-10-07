@@ -21,6 +21,8 @@ from channel_protocol.work_item_events import (
     parse_work_item_event_id as _parse_shared_event_id,
 )
 
+from .api_retry import DEFAULT_BUDGET_S, post_with_retry
+
 logger = logging.getLogger(__name__)
 
 _HEARTBEAT_TRANSPORT_FAILURES = 3
@@ -224,8 +226,9 @@ class WorkItemDispatchClient:
         generation: int,
         reason: str,
         capacity: bool,
+        budget_s: float = DEFAULT_BUDGET_S,
     ) -> None:
-        await self._post(
+        await self._post_settlement(
             f"/v1/internal/work-items/requests/{request_id}/defer",
             {
                 "owner": owner,
@@ -233,6 +236,7 @@ class WorkItemDispatchClient:
                 "reason": reason,
                 "capacity": capacity,
             },
+            budget_s=budget_s,
         )
 
     async def start(
@@ -319,10 +323,13 @@ class WorkItemDispatchClient:
                 "work-item running lookup returned an unusable body"
             ) from exc
 
-    async def hold_for_approval(self, request_id: uuid.UUID, *, runtime_epoch: int) -> None:
-        await self._post(
+    async def hold_for_approval(
+        self, request_id: uuid.UUID, *, runtime_epoch: int, budget_s: float = DEFAULT_BUDGET_S
+    ) -> None:
+        await self._post_settlement(
             f"/v1/internal/work-items/requests/{request_id}/hold-approval",
             {"runtime_epoch": runtime_epoch},
+            budget_s=budget_s,
         )
 
     async def finish(
@@ -333,8 +340,9 @@ class WorkItemDispatchClient:
         outcome: str,
         cause: str,
         detail: str | None,
+        budget_s: float = DEFAULT_BUDGET_S,
     ) -> None:
-        await self._post(
+        await self._post_settlement(
             f"/v1/internal/work-items/requests/{request_id}/finish",
             {
                 "runtime_epoch": runtime_epoch,
@@ -342,6 +350,7 @@ class WorkItemDispatchClient:
                 "cause": cause,
                 "detail": detail,
             },
+            budget_s=budget_s,
         )
 
     async def claim_termination(
@@ -487,6 +496,28 @@ class WorkItemDispatchClient:
             raise WorkItemTransportError(
                 "work-item dispatch endpoint is unreachable"
             ) from exc
+        return self._post_result(response)
+
+    async def _post_settlement(
+        self, path: str, payload: dict[str, Any], *, budget_s: float
+    ) -> dict[str, Any]:
+        try:
+            response = await post_with_retry(
+                self._client,
+                f"{self._base}{path}",
+                headers=self._headers,
+                json=payload,
+                follow_redirects=False,
+                budget_s=budget_s,
+            )
+        except httpx.HTTPError as exc:
+            raise WorkItemTransportError(
+                "work-item dispatch endpoint is unreachable"
+            ) from exc
+        return self._post_result(response)
+
+    @staticmethod
+    def _post_result(response: httpx.Response) -> dict[str, Any]:
         if response.status_code == 409:
             raise WorkItemConflict(_conflict_code(response))
         if response.status_code != 200:
@@ -559,6 +590,7 @@ class WorkItemRun:
             generation=self.generation,
             reason=reason,
             capacity=capacity,
+            budget_s=self._write_budget_s(),
         )
 
     async def start(self, *, claim_name: str, sandbox_name: str) -> WorkItemStartGrant:
@@ -592,11 +624,21 @@ class WorkItemRun:
             return left
         return min(remaining_s, left)
 
+    def _write_budget_s(self) -> float:
+        budget = self.bound_remaining_s(DEFAULT_BUDGET_S)
+        assert budget is not None
+        return budget
+
+    @property
+    def heartbeat_running(self) -> bool:
+        task = self._heartbeat_task
+        return task is not None and not task.done() and not self._stopping
+
     async def hold_for_approval(self) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item hold called before start")
         await self._client.hold_for_approval(
-            self.request_id, runtime_epoch=self.runtime_epoch
+            self.request_id, runtime_epoch=self.runtime_epoch, budget_s=self._write_budget_s()
         )
 
     async def finish(self, *, outcome: str, cause: str, detail: str | None) -> None:
@@ -608,6 +650,7 @@ class WorkItemRun:
             outcome=outcome,
             cause=cause,
             detail=detail,
+            budget_s=self._write_budget_s(),
         )
         self.finished = True
 

@@ -22,6 +22,8 @@ from typing import Any, Protocol
 import httpx
 from aci_protocol import SideEffectFlag
 
+from .api_retry import DEFAULT_BUDGET_S, post_with_retry
+
 logger = logging.getLogger(__name__)
 
 # The keys a reporting connector answers with. Named here rather than inline
@@ -54,9 +56,12 @@ class ActionRecorder(Protocol):
         conversation_id: str,
         agent_id: str | None,
         gate_approval_id: str | None = None,
+        budget_s: float = DEFAULT_BUDGET_S,
     ) -> RecordedAction: ...
 
-    async def complete(self, action_id: str, frame: SideEffectFlag) -> dict[str, Any]: ...
+    async def complete(
+        self, action_id: str, frame: SideEffectFlag, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> dict[str, Any]: ...
 
 
 def _snapshot(
@@ -115,6 +120,7 @@ class ActionClient:
         conversation_id: str,
         agent_id: str | None,
         gate_approval_id: str | None = None,
+        budget_s: float = DEFAULT_BUDGET_S,
     ) -> RecordedAction:
         """Open the record for a call that was just made.
 
@@ -135,10 +141,12 @@ class ActionClient:
             "gate_approval_id": gate_approval_id,
             "dedupe_key": f"{event_id}:{frame.call_id}",
         }
-        payload = await self._post(self._url, body, "action record")
+        payload = await self._post(self._url, body, "action record", budget_s=budget_s)
         return RecordedAction(id=str(payload["id"]), status=str(payload["status"]))
 
-    async def complete(self, action_id: str, frame: SideEffectFlag) -> dict[str, Any]:
+    async def complete(
+        self, action_id: str, frame: SideEffectFlag, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> dict[str, Any]:
         """Close the record with what came back, and return the row as stored.
 
         Returned rather than discarded because the receipt is rendered from what
@@ -159,11 +167,16 @@ class ActionClient:
                 "detail": frame.detail,
             },
             "action complete",
+            budget_s=budget_s,
         )
 
-    async def _post(self, url: str, body: dict[str, Any], what: str) -> dict[str, Any]:
+    async def _post(
+        self, url: str, body: dict[str, Any], what: str, *, budget_s: float
+    ) -> dict[str, Any]:
         try:
-            response = await self._client.post(url, json=body, headers=self._headers)
+            response = await post_with_retry(
+                self._client, url, json=body, headers=self._headers, budget_s=budget_s
+            )
         except httpx.HTTPError as exc:
             raise ActionBackendError(f"{what} failed: {exc}") from exc
         # 201 is a fresh record; 200 is the idempotent replay of either call.
