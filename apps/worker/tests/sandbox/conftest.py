@@ -164,6 +164,8 @@ class FakeClaim:
     quota_rejection: QuotaRejection | None = None
     ready_reason: str | None = None
     ready_message: str | None = None
+    # The executor claim's header set (ACTION-EXECUTOR-5); None is an ordinary claim.
+    executor_secret_names: frozenset[str] | None = None
 
 
 @dataclass
@@ -215,6 +217,7 @@ class FakeSandboxClient:
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
+        executor_secret_names: frozenset[str] | None = None,
     ) -> None:
         sandbox_name = f"sbx-{name}"
         self.claims[name] = FakeClaim(
@@ -228,6 +231,7 @@ class FakeSandboxClient:
             quota_rejection=self.quota_rejection,
             ready_reason=self.ready_reason,
             ready_message=self.ready_message,
+            executor_secret_names=executor_secret_names,
         )
         self.sandboxes[sandbox_name] = FakeSandbox(
             name=sandbox_name,

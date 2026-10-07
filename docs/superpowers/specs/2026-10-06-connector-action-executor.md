@@ -295,7 +295,7 @@ the substrate the way `apps/worker/src/curie_worker/sandbox/claim_tokens.py::cla
 writes one for token-bearing claims: a copy of the agent's pool template with
 `CURIE_CREDENTIALS` and the model env-key declaration removed and the connector
 secret `secretKeyRef`s limited to the target connector's header set. Labels and
-the pool source stay the agent's, so reach is unchanged. Executor routes
+the pool source stay the agent's, so reach is unchanged. The template also drops every other model credential the runner's executor mode refuses (the SDK credential variables and the variable `CURIE_MODEL_ENV_KEY` names), from `env` and `envFrom`; a target connector secret that shares such a name is dropped too, which fails closed, and a `valueFrom` model env-key declaration refuses the claim. `resume` and `handoff` refuse an `action-exec:` route. Executor routes
 are excluded from `SandboxSubstrate.pressure_candidates`, so idle reclamation
 never selects one, and a quota rejection maps to `sandbox_unavailable`. The
 sandbox is released after the outcome is reported and on every error path.

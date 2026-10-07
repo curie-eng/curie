@@ -37,6 +37,17 @@ THREAD_HASH_LABEL = "curietech.ai/thread-hash"
 # claim metadata labels are the supported paths (#1488).
 AGENT_LABEL = "curietech.ai/agent"
 TURN_PROGRESS_ELIGIBILITY_ENV = "CURIE_TURN_PROGRESS_ENABLED"
+# Thread key prefix of a connector action execution's sandbox (@spec
+# ACTION-EXECUTOR-5): ``action-exec:<execution id>``. Pressure reclamation keys
+# on it, so the substrate refuses a claim whose key and executor keyword disagree.
+EXECUTOR_THREAD_KEY_PREFIX = "action-exec:"
+
+
+def is_executor_thread_key(thread_key: str) -> bool:
+    """Whether ``thread_key`` names a connector action execution's sandbox."""
+
+    return thread_key.startswith(EXECUTOR_THREAD_KEY_PREFIX)
+
 
 _GENERIC_POOL_SUFFIX = "-runner-pool"
 
@@ -417,11 +428,17 @@ class SandboxClient(Protocol):
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, object] | None = None,
         agent_name: str | None = None,
+        executor_secret_names: frozenset[str] | None = None,
     ) -> None:
         """Create a claim after excluding host credentials from the child environment.
 
         Implementations must apply ``filter_agent_child_env`` before constructing
         any agent child environment.
+
+        ``executor_secret_names`` is ``None`` for an ordinary claim. A set
+        (possibly empty) marks an executor claim (@spec ACTION-EXECUTOR-5): the
+        runner gets no model credential, no model env-key declaration, and no
+        connector secret outside the set, whatever the pool template carries.
         """
 
         ...

@@ -91,6 +91,7 @@ from ..workspace import (
     WorkspaceRef,
     validate_workspace_archive,
 )
+from .claim_tokens import executor_withheld_names
 from .types import (
     BUNDLE_REF_LABEL,
     MANAGED_BY_LABEL,
@@ -239,6 +240,33 @@ _SDK_PASSTHROUGH_ENV = (
 # authority for the prefix semantics -- and pinned across both lanes by the
 # `byo_oauth_shaped` vector input (issue #603).
 _OAUTH_TOKEN_PREFIX = "sk-ant-oat"
+# Names the connector secret values the claim env carries (Kubernetes reads
+# the same marker in ``k8s.py``).
+_CONNECTOR_SECRET_KEYS_ENV = BootEnv.env_key("connector_secret_keys")
+
+
+def _executor_claim_env(env: dict[str, str], secret_names: frozenset[str]) -> dict[str, str]:
+    """An executor claim's container env (@spec ACTION-EXECUTOR-5).
+
+    The Docker tier has no pool template, so the same stripping the Kubernetes
+    per-claim template applies is applied to the env itself: no model
+    credential, no model env-key declaration or name it declares, and no connector secret value
+    outside ``secret_names``. The connector-secret marker is narrowed to match.
+    """
+
+    marker = env.get(_CONNECTOR_SECRET_KEYS_ENV, "")
+    marked = {name for name in marker.split(",") if name}
+    dropped = executor_withheld_names(env) | (marked - secret_names)
+    kept = {key: value for key, value in env.items() if key not in dropped}
+    if _CONNECTOR_SECRET_KEYS_ENV in kept:
+        narrowed = ",".join(name for name in marker.split(",") if name in secret_names)
+        if narrowed:
+            kept[_CONNECTOR_SECRET_KEYS_ENV] = narrowed
+        else:
+            del kept[_CONNECTOR_SECRET_KEYS_ENV]
+    return kept
+
+
 # Env keys the worker sets explicitly or forwards specially, so the generic
 # value loop must not also emit them: the plugin dir and sandbox id are set
 # explicitly, the bundle ref names a RustFS object the worker already fetched,
@@ -475,8 +503,12 @@ class DockerSandboxClient:
         labels: dict[str, str] | None = None,
         runner_resources: dict[str, Any] | None = None,
         agent_name: str | None = None,  # noqa: ARG002 -- naming is a cluster concern.
+        executor_secret_names: frozenset[str] | None = None,
     ) -> None:
         env = filter_agent_child_env(env)
+        executor = executor_secret_names is not None
+        if executor_secret_names is not None:
+            env = _executor_claim_env(env, executor_secret_names)
         plugin_dir = env.get(PLUGIN_DIR_ENV, self._default_plugin_dir)
         args = [
             "run",
@@ -593,7 +625,9 @@ class DockerSandboxClient:
         #     base URL; suppressing it would break BYO OpenRouter.
         fake_model = FAKE_MODEL_ENV in env
         base_url_override = BASE_URL_ENV in env
-        if not fake_model:
+        # An executor runner calls one connector tool and never the model
+        # (@spec ACTION-EXECUTOR-5), so it is forwarded no model credential.
+        if not fake_model and not executor:
             byo = self._environ.get(CREDENTIALS_ENV)
             drop_oauth_byo = (
                 base_url_override and byo is not None and byo.startswith(_OAUTH_TOKEN_PREFIX)
