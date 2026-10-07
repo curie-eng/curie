@@ -70,7 +70,7 @@ def _nomination() -> uuid.UUID:
         "INSERT INTO curie.remediation_nominations "
         "(id, agent_id, hook, event_id, action, kind, arguments, arguments_sha256, target, "
         "reason, state) VALUES (:id, :agent_id, 'alerts', :e, 'tune-alert-rule', 'tune', "
-        '\'{"field":"threshold","rule":"example-claim-slow","value":90}\', :sha, '
+        '\'{"field":"threshold","rule":"example-claim-slow","value"\\:90}\', :sha, '
         "'example-rules:\"example-claim-slow\"', 'example reason', 'approved')",
         {"id": nomination_id, "agent_id": agent_id, "e": event_id, "sha": "ef" * 32},
     )
