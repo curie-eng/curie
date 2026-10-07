@@ -171,10 +171,22 @@ fn run_group(
     principal: Option<&str>,
     json_mode: bool,
 ) -> Output {
+    run_at(tier, group, args, &server.base_url, principal, json_mode)
+}
+
+/// [`run_group`] against any base URL, such as a port nothing listens on.
+fn run_at(
+    tier: &str,
+    group: &str,
+    args: &[&str],
+    base_url: &str,
+    principal: Option<&str>,
+    json_mode: bool,
+) -> Output {
     let mut command = Command::new(bin());
     command.arg(tier).arg(group).args(args).args([
         "--api-url",
-        &server.base_url,
+        base_url,
         "--api-key",
         TEST_API_KEY,
     ]);
@@ -845,5 +857,420 @@ fn cluster_tier_refuses_input_errors_before_discovering_the_connection() {
         assert_error_object(&value, &what);
         assert!(value.to_string().contains(needle), "{what}: {value}");
         assert_no_connection_discovery(output, &what);
+    }
+}
+
+// --------------------------------------------------------------------------
+// operation ids: validated, always reported, and a rerun with one replays
+// --------------------------------------------------------------------------
+
+/// A hook whose writes the stub refuses 403 (`operator_principal_required`).
+const FORBIDDEN_HOOK: &str = "forbidden";
+/// A hook whose writes the stub answers 503, as a failure after commit would.
+const UNAVAILABLE_HOOK: &str = "unavailable";
+/// A hook whose first write commits and then loses its response (502); a later
+/// write with the committed operation id replays the committed row, and one
+/// with any other id is stale, as `write_policy` behaves.
+const LOST_HOOK: &str = "lost";
+
+const WRITE_VERBS: [&str; 4] = ["apply", "arm", "disarm", "remove"];
+
+fn write_argv_with_id<'a>(
+    verb: &'a str,
+    hook: &'a str,
+    file: &'a str,
+    id: &'a str,
+) -> Vec<&'a str> {
+    let mut argv = write_argv(verb, file);
+    argv[2] = hook;
+    argv.extend(["--operation-id", id]);
+    argv
+}
+
+/// The operation id a write request carries: the body's for PUT and POST, the
+/// query's for DELETE.
+fn sent_operation_id(request: &Request) -> Option<String> {
+    if request.method == "DELETE" {
+        return query_pairs(&request.path)
+            .into_iter()
+            .find(|(k, _)| k == "operation_id")
+            .map(|(_, v)| v);
+    }
+    let body: Value = serde_json::from_slice(&request.body).ok()?;
+    body["operation_id"].as_str().map(str::to_owned)
+}
+
+/// The first UUID in `haystack` that is not the agent's id (an error may name
+/// the request path, which carries it).
+fn first_uuid(haystack: &str) -> Option<String> {
+    let bytes = haystack.as_bytes();
+    (0..bytes.len().saturating_sub(35))
+        .filter(|start| haystack.is_char_boundary(*start) && haystack.is_char_boundary(start + 36))
+        .map(|start| &haystack[start..start + 36])
+        .find(|candidate| is_uuid(candidate) && *candidate != AGENT_ID)
+        .map(str::to_owned)
+}
+
+/// The stub of [`api`] plus the failure hooks above. `committed` holds the
+/// operation id the lost hook committed.
+fn failing_api() -> MockServer {
+    let committed = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    serve(move |request: &Request| {
+        let (route, _) = request.path.split_once('?').unwrap_or((&request.path, ""));
+        let is_write = request.method != "GET";
+        if route.starts_with(&base(FORBIDDEN_HOOK)) && is_write {
+            return refusal(
+                403,
+                "operator_principal_required",
+                None,
+                Some("policy writes need an operator principal"),
+            );
+        }
+        if route.starts_with(&base(UNAVAILABLE_HOOK)) && is_write {
+            return Response::json(503, r#"{"detail":"service unavailable"}"#);
+        }
+        if route.starts_with(&base(LOST_HOOK)) && is_write {
+            let id = sent_operation_id(request).unwrap_or_default();
+            let mut committed = committed.lock().unwrap();
+            return match committed.as_deref() {
+                None => {
+                    *committed = Some(id);
+                    Response::json(502, r#"{"detail":"bad gateway"}"#)
+                }
+                Some(done) if done == id => {
+                    Response::json(200, &policy_out(LOST_HOOK, "5", true, true).to_string())
+                }
+                Some(_) => refusal(
+                    409,
+                    "stale_policy_generation",
+                    None,
+                    Some("the current generation is 5"),
+                ),
+            };
+        }
+        match (request.method.as_str(), route) {
+            ("GET", "/agents") => Response::json(200, &format!("[{}]", agent_json())),
+            ("GET", p) if p == format!("/agents/{AGENT_ID}") => Response::json(200, &agent_json()),
+            _ => Response::json(405, r#"{"detail":"unexpected request"}"#),
+        }
+    })
+}
+
+/// A base URL nothing listens on: bound, then released.
+fn dead_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a free port");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    format!("http://127.0.0.1:{port}")
+}
+
+fn assert_valid(schema_file: &str, value: &Value, what: &str) {
+    let path = format!("{}/schema/{schema_file}", env!("CARGO_MANIFEST_DIR"));
+    let schema: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}")),
+    )
+    .unwrap_or_else(|e| panic!("{path} is JSON: {e}"));
+    let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+    assert!(
+        validator.is_valid(value),
+        "{what}: does not validate against {schema_file}: {value}\nerrors: {:?}",
+        validator
+            .iter_errors(value)
+            .map(|e| e.to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// `--operation-id` is validated as the API validates it (a canonical,
+/// lowercase, hyphenated UUID) and refused before any request.
+#[test]
+fn a_malformed_operation_id_is_refused_before_any_request() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_file(dir.path(), "policy.json", &base_document().to_string());
+    let malformed = [
+        "not-a-uuid",
+        "11111111-1111-4111-8111-11111111111",
+        "11111111111141118111111111111111",
+        "AAAAAAAA-1111-4111-8111-111111111111",
+    ];
+    for tier in ["local", "cluster"] {
+        for verb in WRITE_VERBS {
+            for id in malformed {
+                let server = api();
+                let output = run(
+                    tier,
+                    &write_argv_with_id(verb, HOOK, &file, id),
+                    &server,
+                    Some(OPERATOR_PRINCIPAL),
+                );
+                let what = format!("{tier} remediation-policy {verb} --operation-id {id}");
+                assert_eq!(output.status.code(), Some(2), "{what}:\n{}", text(&output));
+                let value = one_object(&output, &what);
+                assert_error_object(&value, &what);
+                assert!(
+                    value["error"].as_str().unwrap().contains(id),
+                    "{what}: the error names the value: {value}"
+                );
+                assert!(server.recorded().is_empty(), "{what}: no request is sent");
+            }
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// Every successful write reports the operation id it used, the passed one or
+/// the minted one, beside the committed row, and the output is still the
+/// committed row's fields as the schema maps them. A read reports none.
+#[test]
+fn every_write_output_names_the_operation_id_it_used() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_file(dir.path(), "policy.json", &base_document().to_string());
+    for tier in ["local", "cluster"] {
+        for verb in WRITE_VERBS {
+            // Passed.
+            let server = api();
+            let output = run(
+                tier,
+                &write_argv_with_id(verb, HOOK, &file, OPERATION_ID),
+                &server,
+                Some(OPERATOR_PRINCIPAL),
+            );
+            let what = format!("{tier} remediation-policy {verb} --operation-id");
+            assert_eq!(output.status.code(), Some(0), "{what}:\n{}", text(&output));
+            let value = one_object(&output, &what);
+            assert_eq!(value["operation_id"], OPERATION_ID, "{what}: {value}");
+            assert_eq!(value["generation"], "5", "{what}: {value}");
+            assert_valid("remediation-policy.schema.json", &value, &what);
+
+            // Minted.
+            let server = api();
+            let output = run(
+                tier,
+                &write_argv(verb, &file),
+                &server,
+                Some(OPERATOR_PRINCIPAL),
+            );
+            let what = format!("{tier} remediation-policy {verb} (minted id)");
+            assert_eq!(output.status.code(), Some(0), "{what}:\n{}", text(&output));
+            let value = one_object(&output, &what);
+            let sent = writes(&server);
+            assert_eq!(sent.len(), 1, "{what}: one write");
+            let minted = sent_operation_id(&sent[0]).expect("the write carries an operation id");
+            assert_eq!(
+                value["operation_id"].as_str(),
+                Some(minted.as_str()),
+                "{what}: the output names the id the request carried: {value}"
+            );
+            assert_valid("remediation-policy.schema.json", &value, &what);
+        }
+    }
+    let server = api();
+    let output = run("local", &["show", AGENT_NAME, HOOK], &server, None);
+    let value = one_object(&output, "local remediation-policy show");
+    assert_valid("remediation-policy.schema.json", &value, "show");
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// Every write failure that happens once the write is attempted carries the
+/// operation id in its one error object: API refusals (403, 409, 422), a 5xx,
+/// and a transport failure. The exit class is unchanged.
+#[test]
+fn every_write_failure_carries_the_operation_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_file(dir.path(), "policy.json", &base_document().to_string());
+    let dead = dead_url();
+    for tier in ["local", "cluster"] {
+        for verb in WRITE_VERBS {
+            let cases: [(&str, Option<&str>, i32); 5] = [
+                (FORBIDDEN_HOOK, None, 1),
+                (STALE_HOOK, None, 1),
+                (ROUTE_HOOK, None, 2),
+                (UNAVAILABLE_HOOK, None, 3),
+                (HOOK, Some(dead.as_str()), 3),
+            ];
+            for (hook, url, exit) in cases {
+                let stub = if hook == STALE_HOOK || hook == ROUTE_HOOK {
+                    api()
+                } else {
+                    failing_api()
+                };
+                let argv = write_argv_with_id(verb, hook, &file, OPERATION_ID);
+                let base_url = url
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| stub.base_url.clone());
+                let output = run_at(
+                    tier,
+                    "remediation-policy",
+                    &argv,
+                    &base_url,
+                    Some(OPERATOR_PRINCIPAL),
+                    true,
+                );
+                let what = format!(
+                    "{tier} remediation-policy {verb} ({})",
+                    if url.is_some() { "no listener" } else { hook }
+                );
+                assert_eq!(
+                    output.status.code(),
+                    Some(exit),
+                    "{what}:\n{}",
+                    text(&output)
+                );
+                let value = one_object(&output, &what);
+                assert_error_object(&value, &what);
+                assert_valid("error.schema.json", &value, &what);
+                assert!(
+                    value.to_string().contains(OPERATION_ID),
+                    "{what}: the error carries the operation id: {value}"
+                );
+                assert!(
+                    !text(&output).contains(OPERATOR_PRINCIPAL),
+                    "{what}: token never printed"
+                );
+            }
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// A transient failure names the minted id and how to retry with it, so a
+/// write whose response was lost is replayed rather than refused as stale.
+#[test]
+fn a_transient_failure_names_the_minted_id_for_a_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_file(dir.path(), "policy.json", &base_document().to_string());
+    let dead = dead_url();
+    for verb in WRITE_VERBS {
+        for url in [None, Some(dead.as_str())] {
+            let stub = failing_api();
+            let mut argv = write_argv(verb, &file);
+            argv[2] = UNAVAILABLE_HOOK;
+            let base_url = url
+                .map(str::to_owned)
+                .unwrap_or_else(|| stub.base_url.clone());
+            let output = run_at(
+                "local",
+                "remediation-policy",
+                &argv,
+                &base_url,
+                Some(OPERATOR_PRINCIPAL),
+                true,
+            );
+            let what = format!(
+                "local remediation-policy {verb} ({}, minted id)",
+                if url.is_some() { "no listener" } else { "503" }
+            );
+            assert_eq!(output.status.code(), Some(3), "{what}:\n{}", text(&output));
+            let value = one_object(&output, &what);
+            let rendered = value.to_string();
+            let minted = first_uuid(&rendered)
+                .unwrap_or_else(|| panic!("{what}: the error names the minted id: {value}"));
+            if url.is_none() {
+                let sent = writes(&stub);
+                assert_eq!(
+                    sent_operation_id(&sent[0]).as_deref(),
+                    Some(minted.as_str()),
+                    "{what}: the named id is the one the request carried"
+                );
+            }
+            assert!(
+                value["fix"]
+                    .as_str()
+                    .is_some_and(|fix| fix.contains("--operation-id") && fix.contains(&minted)),
+                "{what}: the fix says to retry with --operation-id {minted}: {value}"
+            );
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// The end to end retry: a write commits and loses its response, the operator
+/// reruns with the id the error named, and the API's replay of the committed
+/// generation is reported as success. A rerun with a fresh id is stale.
+#[test]
+fn a_rerun_with_the_named_operation_id_replays_the_committed_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = write_file(dir.path(), "policy.json", &base_document().to_string());
+    for tier in ["local", "cluster"] {
+        for verb in WRITE_VERBS {
+            let stub = failing_api();
+            let mut argv = write_argv(verb, &file);
+            argv[2] = LOST_HOOK;
+            let first = run(tier, &argv, &stub, Some(OPERATOR_PRINCIPAL));
+            let what = format!("{tier} remediation-policy {verb} (lost response)");
+            assert_eq!(first.status.code(), Some(3), "{what}:\n{}", text(&first));
+            let value = one_object(&first, &what);
+            let id = first_uuid(&value.to_string())
+                .unwrap_or_else(|| panic!("{what}: the error names the id: {value}"));
+
+            // A fresh id does not replay.
+            let fresh = run(tier, &argv, &stub, Some(OPERATOR_PRINCIPAL));
+            assert_eq!(
+                fresh.status.code(),
+                Some(1),
+                "{what}: a rerun with a fresh id is stale:\n{}",
+                text(&fresh)
+            );
+
+            let mut retry = argv.clone();
+            retry.extend(["--operation-id", id.as_str()]);
+            let replay = run(tier, &retry, &stub, Some(OPERATOR_PRINCIPAL));
+            let what = format!("{tier} remediation-policy {verb} (replay)");
+            assert_eq!(replay.status.code(), Some(0), "{what}:\n{}", text(&replay));
+            let value = one_object(&replay, &what);
+            assert_eq!(
+                value["operation_id"].as_str(),
+                Some(id.as_str()),
+                "{what}: {value}"
+            );
+            assert_eq!(value["generation"], "5", "{what}: {value}");
+
+            let ids: Vec<Option<String>> = writes(&stub).iter().map(sent_operation_id).collect();
+            assert_eq!(ids.len(), 3, "{what}: three writes reached the API");
+            assert_eq!(ids[0].as_deref(), Some(id.as_str()), "{what}");
+            assert_ne!(ids[1].as_deref(), Some(id.as_str()), "{what}");
+            assert_eq!(ids[2].as_deref(), Some(id.as_str()), "{what}");
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
+/// A number a native JSON value can change is refused by `apply` with the
+/// API's code and path, before any request, never accepted and never sent in
+/// a changed form.
+#[test]
+fn apply_refuses_each_numeric_text_with_the_api_code_and_path_before_any_request() {
+    let vector = policy_vector();
+    let dir = tempfile::tempdir().expect("tempdir");
+    for case in vector["numeric_texts"].as_array().expect("numeric texts") {
+        let name = case["name"].as_str().unwrap();
+        let code = case["code"].as_str().unwrap();
+        let path = case["path"].as_str().unwrap();
+        let file = write_file(
+            dir.path(),
+            &format!("{name}.json"),
+            case["text"].as_str().unwrap(),
+        );
+        let server = api();
+        let output = run(
+            "local",
+            &write_argv("apply", &file),
+            &server,
+            Some(OPERATOR_PRINCIPAL),
+        );
+        let what = format!("local remediation-policy apply ({name})");
+        assert_eq!(output.status.code(), Some(2), "{what}:\n{}", text(&output));
+        let value = one_object(&output, &what);
+        assert_error_object(&value, &what);
+        let error = value["error"].as_str().unwrap();
+        assert!(
+            error.contains(code) && error.contains(path),
+            "{what}: the error names {code} at {path}: {value}"
+        );
+        assert!(
+            server.recorded().is_empty(),
+            "{what}: refused before any request"
+        );
     }
 }

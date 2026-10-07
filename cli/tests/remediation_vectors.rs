@@ -56,6 +56,7 @@ struct PolicyVector {
     valid: Vec<ValidCase>,
     invalid: Vec<InvalidCase>,
     invalid_texts: Vec<InvalidText>,
+    numeric_texts: Vec<InvalidText>,
 }
 
 /// Every key is declared so an unknown key still fails; only `policy_refusals`
@@ -146,6 +147,26 @@ fn a_non_finite_policy_text_is_refused() {
             refusal.code, case.code,
             "{} (API path {})",
             case.name, case.path
+        );
+    }
+}
+
+/// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3: a number a
+/// native JSON value can change (an integer outside the signed 64-bit range,
+/// an exponent beyond a double) is refused with the API's code AND path, by a
+/// strict parse followed by validation, as `curie <tier> remediation-policy
+/// apply` reads a file.
+#[test]
+fn a_number_a_json_value_can_change_is_refused_at_its_path() {
+    for case in policy_vector().numeric_texts {
+        let refusal = parse_policy_text(&case.text)
+            .and_then(|document| validate_policy_document(&document))
+            .expect_err(&format!("{}: accepted", case.name));
+        assert_eq!(
+            (refusal.code.as_str(), refusal.path.as_str()),
+            (case.code.as_str(), case.path.as_str()),
+            "{}",
+            case.name
         );
     }
 }
