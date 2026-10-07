@@ -573,3 +573,236 @@ def test_undo_of_a_forward_executed_record_is_refused_authority_unresolved(
     ]
     assert [row["kind"] for row in _executions()] == ["forward"]
     assert _ledger()[0]["undone_at"] is None
+
+
+# --------------------------------------------------------------------------- #
+# Review round 1
+# --------------------------------------------------------------------------- #
+
+_COMPLETION: dict[str, Any] = {
+    "failed": False,
+    "result": {"ok": True, "version": "rv-forged"},
+    "prior_state": ENVELOPE,
+    "post_state": {"spec": {"replicas": 99}},
+    "post_version": "rv-forged",
+    "target": {"kind": "Deployment", "namespace": "other", "name": "forged"},
+}
+
+
+def test_a_forward_ledger_row_is_completed_only_under_the_worker_token(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """@spec ACTION-EXECUTOR-19 @spec ACTION-EXECUTOR-12 (review finding 7): the
+    ``exec:<id>`` row is the platform's own record of a platform-executed call,
+    so a completion under the platform key alone is refused 403 and stores
+    nothing; the worker's attributed completion still completes it.
+    """
+
+    _agent_id, execution_id, fence, dispatched = _dispatched(client, auth_headers, tmp_path)
+    action_id = dispatched["subject_action_id"]
+
+    forged = client.post(f"/actions/{action_id}/complete", json=_COMPLETION, headers=auth_headers)
+
+    assert forged.status_code == 403, forged.text
+    row = _ledger()[0]
+    assert row["status"] == "pending"
+    assert row["completed_at"] is None
+    assert row["target"] is None and row["prior_state"] is None
+    assert row["post_version"] is None and row["result"] is None
+
+    worker = client.post(
+        f"/actions/{action_id}/complete",
+        json={
+            **_COMPLETION,
+            "result": {"ok": True, "version": POST_VERSION},
+            "post_version": POST_VERSION,
+            "target": TARGET,
+            "connector": CONNECTOR,
+            "connector_digest": DIGEST,
+        },
+        headers={**auth_headers, **worker_headers()},
+    )
+
+    assert worker.status_code == 200, worker.text
+    row = _ledger()[0]
+    assert row["status"] == "succeeded"
+    assert row["target"] == TARGET
+    assert row["post_version"] == POST_VERSION
+    assert row["connector_digest"] == DIGEST
+    reported = _post(client, execution_id, "outcome", {**fence, "state": "confirmed"})
+    assert reported.status_code == 200, reported.text
+
+
+def test_a_forward_ledger_row_refuses_an_unattributed_completion_even_with_the_worker_token(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Review finding 7: the platform key is what the worker token must add to;
+    a completion of an ``exec:`` row without the token is refused whatever it carries.
+    """
+
+    _agent_id, _execution_id, _fence_, dispatched = _dispatched(client, auth_headers, tmp_path)
+    action_id = dispatched["subject_action_id"]
+
+    attributed_without_token = client.post(
+        f"/actions/{action_id}/complete",
+        json={**_COMPLETION, "connector": CONNECTOR, "connector_digest": DIGEST},
+        headers=auth_headers,
+    )
+
+    assert attributed_without_token.status_code == 403, attributed_without_token.text
+    assert _ledger()[0]["status"] == "pending"
+
+
+def test_a_model_turn_row_still_completes_under_the_platform_key_alone(
+    client: Any, auth_headers: dict[str, str]
+) -> None:
+    """Control for finding 7: a row a model turn recorded (no authority) is unchanged."""
+
+    opened = client.post(
+        "/actions",
+        json={
+            "agent_id": None,
+            "conversation_id": "C1",
+            "call_id": "toolu_01",
+            "tool": f"mcp__{CONNECTOR}__{TOOL}",
+            "arguments": ARGUMENTS,
+            "dedupe_key": f"event-{uuid.uuid4()}:toolu_01",
+        },
+        headers=auth_headers,
+    )
+    assert opened.status_code == 201, opened.text
+
+    completed = client.post(
+        f"/actions/{opened.json()['id']}/complete", json=_COMPLETION, headers=auth_headers
+    )
+
+    assert completed.status_code == 200, completed.text
+    assert completed.json()["status"] == "succeeded"
+
+
+def _refused_in_one_session(authority: Any) -> tuple[str, bool]:
+    """Refuse ``authority`` in a session; report the code and whether a transaction is left open."""
+
+    async def run() -> tuple[str, bool]:
+        engine = create_async_engine(get_settings().database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with sessions() as session:
+                with pytest.raises(_forward().ForwardRefused) as refused:
+                    await _forward().create_forward_execution(session, authority)
+                return str(refused.value.code), session.in_transaction()
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("path", ["no canonical form", "digest differs"])
+def test_an_arguments_mismatch_refusal_rolls_its_transaction_back(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, path: str
+) -> None:
+    """Review finding 2: like every other refusal, both ``arguments_mismatch``
+    paths end the caller's transaction (nothing written, nothing left open).
+    """
+
+    agent_id = _agent(client, auth_headers, tmp_path)
+    if path == "no canonical form":
+        authority = _authority(
+            agent_id,
+            arguments={"target": TARGET, "replicas": float("nan")},
+            arguments_sha256=_sha(ARGUMENTS),
+        )
+    else:
+        authority = _authority(
+            agent_id, arguments=OTHER_ARGUMENTS, arguments_sha256=_sha(ARGUMENTS)
+        )
+
+    code, open_transaction = _refused_in_one_session(authority)
+
+    assert code == "arguments_mismatch"
+    assert open_transaction is False
+    assert _executions() == []
+    assert _ledger() == []
+
+
+@pytest.mark.parametrize("creators", [2, 8])
+def test_concurrent_creations_under_one_authority_key_yield_exactly_one_execution(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path, creators: int
+) -> None:
+    """Review finding 4 @spec ACTION-EXECUTOR-2 @spec ACTION-EXECUTOR-19: sessions
+    racing on real Postgres with the same authority create one execution; every
+    racer answers its id, exactly one reports ``created``.
+    """
+
+    agent_id = _agent(client, auth_headers, tmp_path)
+    authority = _authority(agent_id)
+
+    async def race() -> list[Any]:
+        engine = create_async_engine(get_settings().database_url, pool_size=creators + 2)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        start = asyncio.Event()
+
+        async def one() -> Any:
+            async with sessions() as session:
+                await start.wait()
+                return await _forward().create_forward_execution(session, authority)
+
+        try:
+            tasks = [asyncio.create_task(one()) for _ in range(creators)]
+            await asyncio.sleep(0.05)
+            start.set()
+            return list(await asyncio.gather(*tasks))
+        finally:
+            await engine.dispose()
+
+    results = asyncio.run(race())
+
+    rows = _executions()
+    assert len(rows) == 1
+    assert {r.execution_id for r in results} == {rows[0]["id"]}
+    assert sum(1 for r in results if r.created) == 1
+    assert _ledger() == []
+
+
+def test_a_concurrent_creation_with_other_arguments_is_refused_and_one_row_stands(
+    client: Any, auth_headers: dict[str, str], tmp_path: Path
+) -> None:
+    """Review finding 4: the race loser naming other arguments under the same key
+    is refused ``arguments_mismatch``; the single row holds the winner's arguments.
+    """
+
+    agent_id = _agent(client, auth_headers, tmp_path)
+    first = _authority(agent_id)
+    second = _authority(agent_id, arguments=OTHER_ARGUMENTS)
+
+    async def race() -> list[Any]:
+        engine = create_async_engine(get_settings().database_url)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        start = asyncio.Event()
+
+        async def one(authority: Any) -> Any:
+            async with sessions() as session:
+                await start.wait()
+                try:
+                    return await _forward().create_forward_execution(session, authority)
+                except _forward().ForwardRefused as refused:
+                    return refused.code
+
+        try:
+            tasks = [asyncio.create_task(one(a)) for a in (first, second)]
+            await asyncio.sleep(0.05)
+            start.set()
+            return list(await asyncio.gather(*tasks))
+        finally:
+            await engine.dispose()
+
+    results = asyncio.run(race())
+
+    rows = _executions()
+    assert len(rows) == 1
+    codes = [r for r in results if isinstance(r, str)]
+    created = [r for r in results if not isinstance(r, str)]
+    assert codes == ["arguments_mismatch"]
+    assert len(created) == 1 and created[0].execution_id == rows[0]["id"]
+    winner = ARGUMENTS if results[0] is created[0] else OTHER_ARGUMENTS
+    assert rows[0]["forward_arguments"] == winner
