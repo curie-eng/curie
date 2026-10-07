@@ -101,6 +101,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "ci_failed",
         "ci_timeout",
         "ci_unverified",
+        "merge_conflict",
         "ci_fix_unpublished",
     ],
 )
@@ -151,7 +152,7 @@ def test_ci_failed_notice_labels_its_details_not_a_provider_message() -> None:
 def test_ci_unverified_notice_says_it_is_not_a_success() -> None:
     body = result_section("ci_unverified", pr_url=None, detail="Reason: github_forbidden")
     assert body.startswith("Could not complete:")
-    assert "unverified" in body.splitlines()[0]
+    assert "CI could not be verified" in body.splitlines()[0]
     assert "Reason: github_forbidden" in body
     assert "Completed:" not in body
 
@@ -363,9 +364,18 @@ class _GitHubComments(BaseHTTPRequestHandler):
         subject = _ISSUE_OR_PR.match(path)
         if subject is not None:
             number = int(subject.group(1))
+            payload: dict[str, Any] = {
+                "number": number, "title": server.titles.get(number, f"Issue {number}")
+            }
+            if "/pulls/" in path:
+                # GitHub computes mergeability asynchronously and returns null:
+                # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+                index = min(len(server.pull_observations), len(server.pull_script) - 1)
+                server.pull_observations.append(number)
+                payload.update(server.pull_script[index])
             self._send(
                 200,
-                {"number": number, "title": server.titles.get(number, f"Issue {number}")},
+                payload,
             )
             return
         single = _COMMENT.match(path)
@@ -539,6 +549,12 @@ class _CommentServer(ThreadingHTTPServer):
         self.ci_scripts: dict[str, list[CiEntry]] = {}
         self.ci_cursor: dict[str, int] = {}
         self.ci_observations: list[str] = []
+        # #4263. Pull reads default to a mergeable head; scripts can replay the
+        # provider's null computation window or a dirty head without checks.
+        self.pull_script: list[dict[str, Any]] = [
+            {"mergeable": True, "mergeable_state": "clean", "merged": False}
+        ]
+        self.pull_observations: list[int] = []
         self.annotations: dict[int, list[dict[str, Any]]] = {}
         # #4105. Branch name -> the sha it points to; empty means every base read 404s.
         self.branches: dict[str, str] = {}

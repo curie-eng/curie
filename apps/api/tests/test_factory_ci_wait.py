@@ -460,6 +460,92 @@ def test_no_checks_within_the_grace_period_completes_with_a_note(admitted: Any) 
     assert _ci_turns(published["id"]) == []
 
 
+def test_a_dirty_pull_without_checks_fails_promptly_without_a_ci_fix(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9761
+    sink.ci_script = [ci_empty()]
+    sink.pull_script = [{"mergeable": False, "mergeable_state": "dirty", "merged": False}]
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _ci_turns(published["id"]) == []
+    _assert_no_final_result(sink)
+
+    _reconcile_later(130)
+
+    assert _terminal(number) == ("failed", "merge_conflict")
+    body = _body(sink, published["id"])
+    assert body.startswith("Could not complete: the pull request has merge conflicts")
+    assert "Reason: merge_conflict" in body
+    assert published["pr_url"] in body
+    assert "Details:" in body
+    assert "Provider message:" not in body
+    assert "Cause: merge_conflict" in body
+    assert _ci_turns(published["id"]) == []
+    assert sink.reruns == []
+
+
+def test_null_pull_mergeability_waits_for_the_third_clean_observation(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9762
+    sink.ci_script = [ci_empty()]
+    sink.pull_script = [
+        {"mergeable": None, "mergeable_state": "unknown", "merged": False},
+        {"mergeable": None, "mergeable_state": "unknown", "merged": False},
+        {"mergeable": True, "mergeable_state": "clean", "merged": False},
+    ]
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert sink.pull_observations == [published["pr"]]
+
+    _reconcile_later(130)
+
+    assert _terminal(number) == ("running", None)
+    assert sink.pull_observations == [published["pr"]] * 2
+    _assert_no_final_result(sink)
+    assert _ci_turns(published["id"]) == []
+
+    _reconcile_later(150)
+
+    assert _terminal(number) == ("completed", "completed")
+    assert sink.pull_observations == [published["pr"]] * 3
+    body = _body(sink, published["id"])
+    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert "Note: No CI checks appeared within 120 s." in body
+    assert _ci_turns(published["id"]) == []
+
+
+def test_persistently_null_pull_mergeability_ends_unverified_at_the_deadline(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9763
+    sink.ci_script = [ci_empty()]
+    sink.pull_script = [{"mergeable": None, "mergeable_state": "unknown", "merged": False}]
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    _assert_no_final_result(sink)
+
+    _reconcile_later(1210)
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert "Reason: mergeability_unknown" in body
+    assert published["pr_url"] in body
+    assert "CI could not be verified" in body
+    assert "could not be read" not in body
+    assert _ci_turns(published["id"]) == []
+    assert sink.reruns == []
+
+
 # --- AC2: the fix loop, capped at 3 rounds ---------------------------------------
 
 
@@ -1210,7 +1296,7 @@ def test_unreadable_ci_ends_unverified_at_once(admitted: Any, entry: Any, reason
     assert _terminal(number) == ("failed", "ci_unverified")
     body = _body(sink, published["id"])
     assert body.startswith("Could not complete:")
-    assert "unverified" in body
+    assert "CI could not be verified" in body
     assert f"Reason: {reason}" in body
     assert "BODYTEXT" not in body
     assert "Completed:" not in body

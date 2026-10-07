@@ -72,7 +72,7 @@ CI_CLAIM_SECONDS = 60
 # they may land after the execution deadline. ``ci_fix_unpublished`` is written
 # by the worker and stays bounded by the deadline. ``workitems`` keeps an equal
 # literal set (importing this one there would be circular).
-CI_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
+CI_CAUSES = frozenset({"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict"})
 
 # Reason codes that can never become readable by waiting.
 PERMANENT_UNREADABLE = frozenset(
@@ -260,7 +260,9 @@ def metadata_ci_policy(settings: Settings, repo_full_name: str) -> MetadataCiPol
     return MetadataCiPolicy(checks=tuple(value["checks"]), statuses=tuple(value["statuses"]))
 
 
-VerdictKind = Literal["green", "no_ci", "failing", "pending", "timed_out", "unverified"]
+VerdictKind = Literal[
+    "green", "no_ci", "failing", "pending", "timed_out", "unverified", "merge_conflict"
+]
 GateResult = Literal["settled", "waiting", "fixing", "continued"]
 
 
@@ -414,6 +416,15 @@ def decide(
                 return Verdict(kind="timed_out", reason=reason)
             return Verdict(kind="pending", reason=reason)
         return Verdict(kind="unverified", reason=reason)
+    conflicted = (
+        detail.mergeable is False
+        and detail.mergeable_state == "dirty"
+        and detail.merged is not True
+    )
+    if conflicted:
+        if now < published_at + timedelta(seconds=CI_GRACE_SECONDS):
+            return Verdict(kind="pending", reason="merge_conflict_grace")
+        return Verdict(kind="merge_conflict", reason="merge_conflict")
     base_failing_names, base_failing_contexts = _preexisting(detail)
     check_runs = detail.check_runs
     statuses = detail.statuses
@@ -593,7 +604,11 @@ def decide(
             return Verdict(kind="unverified", reason="checks_disappeared")
         if in_grace:
             return Verdict(kind="timed_out")
-        return Verdict(kind="no_ci", note=_NO_CI_NOTE)
+        if detail.merged is True or detail.mergeable is True:
+            return Verdict(kind="no_ci", note=_NO_CI_NOTE)
+        if expired:
+            return Verdict(kind="unverified", reason="mergeability_unknown")
+        return Verdict(kind="pending", reason="mergeability_unknown")
     if pending:
         return Verdict(kind="timed_out" if expired else "pending", pending=pending)
     if preexisting:
@@ -1083,6 +1098,7 @@ async def gate(
             "failing": "ci_failed",
             "timed_out": "ci_timeout",
             "unverified": "ci_unverified",
+            "merge_conflict": "merge_conflict",
         }[verdict.kind]
         text = tried_summary(facts.publications, verdict, pr_url)
     async with sessionmaker() as session:

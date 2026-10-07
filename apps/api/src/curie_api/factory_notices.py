@@ -148,8 +148,14 @@ _CAUSE_TEXT = {
         "pull request stays open."
     ),
     "ci_unverified": (
-        "the pull request's checks could not be read, so CI is unverified. The pull "
+        "the pull request's CI could not be verified, so the run did not complete. "
+        "The Reason line below says why. The pull "
         "request stays open; check it yourself."
+    ),
+    "merge_conflict": (
+        "the pull request has merge conflicts with its base branch, so GitHub ran "
+        "no pull request checks. The pull request stays open; resolve the conflicts "
+        "to continue."
     ),
     "ci_fix_unpublished": (
         "a CI fix round ended without pushing a fix. The pull request stays open."
@@ -158,7 +164,14 @@ _CAUSE_TEXT = {
 
 # Infrastructure and CI causes carry details, not a provider message.
 _DETAIL_CAUSES = frozenset(
-    {"sandbox_terminated", "ci_failed", "ci_timeout", "ci_unverified", "approval_create_failed"}
+    {
+        "sandbox_terminated",
+        "ci_failed",
+        "ci_timeout",
+        "ci_unverified",
+        "merge_conflict",
+        "approval_create_failed",
+    }
 )
 # A run that ended without publishing carries the agent's own last message
 # (#3128). That text is model-authored, so it renders inert inside a code fence.
