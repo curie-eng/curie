@@ -526,7 +526,7 @@ class WorkItemDispatchClient:
             )
         except httpx.HTTPError as exc:
             raise WorkItemTransportError(
-                "work-item dispatch endpoint is unreachable"
+                f"work-item dispatch endpoint is unreachable: {type(exc).__name__}"
             ) from exc
         return self._post_result(response)
 

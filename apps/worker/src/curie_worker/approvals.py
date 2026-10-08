@@ -606,7 +606,9 @@ class ApprovalClient:
                 budget_s=budget_s,
             )
         except httpx.HTTPError as exc:
-            raise ApprovalBackendError(f"approval create failed: {exc}") from exc
+            raise ApprovalBackendError(
+                f"approval create failed: {type(exc).__name__}: {exc}"
+            ) from exc
         refusal = _rejected_reraise_refusal(response)
         if refusal is not None:
             raise ApprovalRefused(refusal)

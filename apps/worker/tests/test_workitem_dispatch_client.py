@@ -252,6 +252,57 @@ def test_run_finish_clamps_retry_budget_to_execution_deadline(monkeypatch) -> No
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.ConnectError])
+def test_settlement_empty_transport_message_retains_the_exception_type(
+    monkeypatch, error_type
+) -> None:
+    from curie_worker import api_retry
+
+    async def go() -> None:
+        now = 0.0
+        sleeps: list[float] = []
+        seen: list[httpx.Request] = []
+
+        async def sleep(delay: float) -> None:
+            nonlocal now
+            sleeps.append(delay)
+            now += delay
+
+        monkeypatch.setattr(api_retry, "_clock", lambda: now)
+        monkeypatch.setattr(api_retry, "_sleep", sleep)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            raise error_type("", request=request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = WorkItemDispatchClient(
+                api_base_url="http://api.example",
+                worker_token="example-token",
+                client=http,
+            )
+            with pytest.raises(WorkItemTransportError, match=error_type.__name__) as caught:
+                await client.finish(
+                    REQUEST_ID,
+                    runtime_epoch=1,
+                    outcome="delivered",
+                    cause="completed",
+                    detail="done",
+                    budget_s=3,
+                )
+
+        assert isinstance(caught.value.__cause__, error_type)
+        assert str(caught.value.__cause__) == ""
+        assert str(caught.value) == (
+            f"work-item dispatch endpoint is unreachable: {error_type.__name__}"
+        )
+        assert sleeps == [0.5, 1.0, 1.5]
+        assert len(seen) == 4
+        assert all(attempt.content == seen[0].content for attempt in seen)
+
+    asyncio.run(go())
+
+
 # --- #4170 a start deferral can end the request ------------------------------
 
 # Response shape: apps/api/src/curie_api/routers/work_items.py defer route.
