@@ -462,8 +462,13 @@ class SessionRunner:
         # transcript append re-authorizes replacement, unless an earlier turn
         # was already lost by this process. Later appends cannot repair that
         # missing prefix, so the loss remains sticky for this runner's lifetime.
+        # A turn whose terminal the transcript never records (failed, budget,
+        # interrupted, result-less) re-authorizes it too (#4188): replay
+        # already holds everything it ever will, and leaving the fence shut
+        # would lock the thread, since only another turn could reopen it.
         self._history_durable = True
         self._history_loss_observed = False
+        self._terminal_persistence_ran = False
         # The cap and turn size of the last unboundable turn (#3301).
         self._capacity_detail: str | None = None
         self._active_state: TurnState | None = None
@@ -703,6 +708,7 @@ class SessionRunner:
 
         self._status = final.status
         self._persistence_owned = True
+        self._terminal_persistence_ran = True
         self._turn_open = False
         self._turn_ready = False
         state.final_text = final_text
@@ -1008,6 +1014,7 @@ class SessionRunner:
             self._persistence_owned = False
             self._turn_open = True
             self._history_durable = False
+            self._terminal_persistence_ran = False
             if self._turn_progress is not None:
                 self._turn_progress.open(progress)
             # Not ready until turn-start connector recovery completes (#2634):
@@ -1351,6 +1358,10 @@ class SessionRunner:
                                 self._turn_ready = False
                                 self._turn_epoch = None
             finally:
+                if terminal_for_log and not self._terminal_persistence_ran:
+                    # A terminal the transcript does not record adds nothing
+                    # replay must hold; only an earlier loss keeps the fence shut.
+                    self._history_durable = not self._history_loss_observed
                 if self._usage_reporter is not None:
                     # Every ending passes here, including GeneratorExit and
                     # cancellation. A turn that reached its result already
