@@ -45,6 +45,7 @@ from test_factory_progress import (
     _constraint_statuses,
     report,
 )
+from test_factory_status_comment import _issue_requests, _lose_owner
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     REPO,
     _label,
@@ -327,6 +328,42 @@ def test_terminal_cause_selects_the_card_pill_at_the_route(
     assert pill in _all_text(root)
     assert "#bf8700" in response.text
     assert "blocked" in _classes(_stage(root, "implement"))
+
+
+def test_owner_lost_cards_show_retrying_until_the_retry_limit(admitted: Any) -> None:  # noqa: F811
+    client, github, _sink = admitted
+    number = 9808
+    _label(client, github, number)
+    current = _request(number)["id"]
+    _reconcile()
+    lost: list[uuid.UUID] = []
+    for attempt in (2, 3):
+        _lose_owner(client, current)
+        lost.append(current)
+        requests = _issue_requests(number)
+        assert len(requests) == attempt, requests
+        current = requests[-1]["id"]
+    _lose_owner(client, current)
+    lost.append(current)
+
+    # A late image fetch still describes each request's own settlement,
+    # even after the newest request exhausted the WorkItem's retry budget.
+    for request_id, label, color in zip(
+        lost,
+        ("RETRYING", "RETRYING", "NEEDS HUMAN"),
+        ("#2f81f7", "#2f81f7", "#bf8700"),
+        strict=True,
+    ):
+        response = client.get(f"/v1/factory/cards/{_token(request_id)}.svg")
+        assert response.status_code == 200, response.text
+        root = _parse(response.text)
+        (pill,) = _with_class(root, "pill-text")
+        assert pill.text == label
+        assert any(
+            _local(element.tag) == "rect" and element.get("fill") == color
+            for element in root.iter()
+        )
+        assert not _with_class(root, "live")
 
 
 # --- the pure renderer ------------------------------------------------------------

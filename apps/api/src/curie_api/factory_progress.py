@@ -796,18 +796,21 @@ _PILLS: dict[str, tuple[str, str, bool]] = {
     "running": ("RUNNING", "#2f81f7", True),
     "cancellation_requested": ("STOPPING", "#bc4c00", True),
     "completed": ("SUCCEEDED", "#1a7f37", False),
-    # A failed or expired run carries curie-factory:needs-human; the pill says the same.
+    # Failed and expired runs need a human unless an owner_lost successor was admitted.
     "failed": ("NEEDS HUMAN", "#bf8700", False),
     "expired": ("NEEDS HUMAN", "#bf8700", False),
     "cancelled": ("CANCELLED", "#6e7781", False),
 }
 _PUBLISHING = ("PUBLISHING", "#8250df", True)
+_RETRYING = ("RETRYING", "#2f81f7", False)
 _UNKNOWN_COLOR = "#6e7781"
 
 
-def pill_for(status: str, publishing: bool) -> tuple[str, str, bool]:
+def pill_for(status: str, publishing: bool, *, retrying: bool = False) -> tuple[str, str, bool]:
     """The status pill: label, color, and whether its dot pulses."""
 
+    if retrying:
+        return _RETRYING
     if status == "running" and publishing:
         return _PUBLISHING
     return _PILLS.get(status, (status.upper(), _UNKNOWN_COLOR, False))

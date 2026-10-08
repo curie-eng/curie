@@ -1735,6 +1735,11 @@ def test_a_running_request_that_is_publishing_shows_publishing() -> None:
     assert pill_for("running", True) == ("PUBLISHING", "#8250df", True)
 
 
+def test_a_retrying_failed_request_has_a_blue_non_live_pill() -> None:
+    assert pill_for("failed", False, retrying=True) == ("RETRYING", "#2f81f7", False)
+    assert pill_for("failed", False) == ("NEEDS HUMAN", "#bf8700", False)
+
+
 def test_an_unknown_status_shows_its_raw_value_in_grey() -> None:
     label, color, _live = pill_for("paused_for_audit", False)
     assert (label, color) == ("PAUSED_FOR_AUDIT", "#6e7781")
