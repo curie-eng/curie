@@ -2136,8 +2136,13 @@ class Kernel:
                     if exc.code in {"not_running", "publication_pending"}:
                         run.finished = True
                     return
-                except WorkItemTransportError:
-                    logger.warning("work-item finish still unavailable for %s", run.request_id)
+                except WorkItemTransportError as exc:
+                    logger.warning(
+                        "work-item finish still unavailable for %s: %s: %s",
+                        run.request_id,
+                        type(exc).__name__,
+                        exc,
+                    )
                 else:
                     return
         finally:
@@ -8683,7 +8688,12 @@ class Kernel:
                 # #4191: a cancelled run is not a failure for a person.
                 logger.info("approval create refused for cancelled work item %s", qevent.event_id)
                 return _ApprovalPause.refused(refusal)
-            logger.warning("approval create failed for %s: %s", qevent.event_id, exc)
+            logger.warning(
+                "approval create failed for %s: %s: %s",
+                qevent.event_id,
+                type(exc).__name__,
+                exc,
+            )
             await self._escalate(
                 qevent,
                 route,
@@ -9370,7 +9380,12 @@ class Kernel:
             # RETRYABLE_CLASSIFICATIONS: a retry would re-execute a side effect,
             # which is the rule ADR-0013 already holds, and escalation puts a
             # human in front of the gap.
-            logger.error("action ledger write failed for %s: %s", qevent.event_id, exc)
+            logger.error(
+                "action ledger write failed for %s: %s: %s",
+                qevent.event_id,
+                type(exc).__name__,
+                exc,
+            )
             return TurnOutcome(
                 terminal_ok=False,
                 saw_side_effect=acc.saw_side_effect,

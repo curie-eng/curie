@@ -178,7 +178,7 @@ class ActionClient:
                 self._client, url, json=body, headers=self._headers, budget_s=budget_s
             )
         except httpx.HTTPError as exc:
-            raise ActionBackendError(f"{what} failed: {exc}") from exc
+            raise ActionBackendError(f"{what} failed: {type(exc).__name__}: {exc}") from exc
         # 201 is a fresh record; 200 is the idempotent replay of either call.
         if response.status_code not in (200, 201):
             raise ActionBackendError(
