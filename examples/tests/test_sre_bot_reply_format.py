@@ -326,3 +326,52 @@ def test_resolved_uncertainty_and_pending_approval_have_three_short_lines() -> N
     assert re.search(
         r"do not.{0,50}(approve|approval).{0,90}(failed|unconfirmed|unavailable)", text, re.I
     )
+
+
+def _front_alert_decision() -> str:
+    text = SKILL.read_text(encoding="utf-8")
+    heading = "## First alert reply decision"
+    assert heading in text, "alert decision is buried after platform and tool instructions"
+    assert text.index(heading) < text.index("## What you are running on")
+    return text.split(heading, 1)[1].split("\n## ", 1)[0]
+
+
+def test_front_alert_decision_anchors_context_and_owner_requests() -> None:
+    front = _flat(_front_alert_decision())
+    assert "| Evidence | First line | Next request |" in front
+    assert re.search(
+        r"Matched.{0,180}confirmed error.{0,90}matches.{0,90}verify recovery", front, re.I
+    )
+    assert re.search(
+        r"Unavailable.{0,120}attribution unverified.{0,100}provide.{0,60}target.{0,30}window",
+        front,
+        re.I,
+    )
+    assert re.search(r"Out-of-scope.{0,130}outside.{0,100}investigate", front, re.I)
+
+
+def test_front_alert_templates_keep_evidence_unknowns_and_identity_visible() -> None:
+    front = _flat(_front_alert_decision())
+    assert re.search(r"never.{0,90}not a new fault", front, re.I)
+    assert re.search(r"Ref:.{0,80}<alertname>.{0,80}<target>.{0,80}<startsAt>", front)
+    assert re.search(r"Ref:.{0,70}final line.{0,60}no (appendix|trailing)", front, re.I)
+    assert "<notice target>" in front and "<notice end>" in front and "<alert time>" in front
+
+
+def test_front_resolved_template_is_short_and_preserves_the_denial_condition() -> None:
+    front = _flat(_front_alert_decision())
+    assert re.search(
+        r"recovery unconfirmed.{0,100}What I changed:.{0,150}still pending.{0,80}deny.{0,100}Next:",
+        front,
+        re.I,
+    )
+    assert re.search(r"three.{0,40}short.{0,30}lines", front, re.I)
+    assert re.search(r"no.{0,30}commands", front, re.I)
+
+
+def test_front_partial_notice_does_not_claim_notice_text_is_absent() -> None:
+    front = _flat(_front_alert_decision())
+    unavailable = next(line for line in front.split("- ") if line.startswith("Unavailable `Cause:"))
+    assert "cannot verify" in unavailable and "notice" in unavailable
+    assert "target/window" in unavailable
+    assert "no operator notice text" not in unavailable

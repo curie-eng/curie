@@ -174,3 +174,14 @@ def test_original_graders_reject_observed_owner_request_and_identity_failures(
     suite = EvalSuite.model_validate_json((BUNDLE / "evals/cases.json").read_text())
     case = next(c for c in suite.cases if c.id == f"sre-planned-work-{case_id}")
     assert not case.grader.grade(bad)
+
+
+def test_original_unavailable_grader_rejects_context_asked_only_after_a_config_check() -> None:
+    suite = EvalSuite.model_validate_json((BUNDLE / "evals/cases.json").read_text())
+    case = next(c for c in suite.cases if c.id == "sre-planned-work-unavailable")
+    bad = GOOD["unavailable"].replace(
+        "Next: the owner should provide the notice target and window and check recovery.",
+        "Next: target owner -- confirm whether a test covers this window "
+        "and check token configuration.",
+    )
+    assert not case.grader.grade(bad)
