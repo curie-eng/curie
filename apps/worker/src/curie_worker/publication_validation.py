@@ -147,7 +147,7 @@ def _cargo_name(value: object) -> str:
     name = _dependency_string(value)
     if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) is None:
         raise ValueError("dependency name is malformed")
-    return name.lower().replace("_", "-")
+    return name
 
 
 def _cargo_manifest_names(document: dict[str, object]) -> set[str]:
