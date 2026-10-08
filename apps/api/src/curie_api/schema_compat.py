@@ -398,7 +398,6 @@ class _PauseAuthority:
         self._confirmed = False
         self._lost = False
         self._deadline = time.monotonic() + PAUSE_LEASE_S - PAUSE_RENEW_INTERVAL_S
-        self._apply_started = False
         self._reason = "expired"
 
     def _valid_locked(self) -> bool:
@@ -436,9 +435,8 @@ class _PauseAuthority:
         with self._lock:
             if not self._valid_locked():
                 raise _PauseLost()
-            # This is the start linearization point, immediately before Alembic.
+            # Passing this guard is the start linearization point before Alembic.
             # No lock or event-loop callback is held during the synchronous apply.
-            self._apply_started = True
 
     def report_loss(self) -> None:
         with self._lock:

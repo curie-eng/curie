@@ -40,9 +40,13 @@ if not string.match(raw, '^%s*{') then return -1 end
 local parse_ok, marker = pcall(cjson.decode, raw)
 if not parse_ok or type(marker) ~= 'table' then return -1 end
 local revision = marker['revision']
-if type(revision) ~= 'number' or math.abs(revision) == math.huge
+local requested_revision = tonumber(ARGV[1])
+if type(revision) ~= 'number' or revision < 0 or math.abs(revision) == math.huge
     or revision ~= math.floor(revision)
-    or revision ~= tonumber(ARGV[1]) then
+    or type(requested_revision) ~= 'number' or requested_revision < 0
+    or math.abs(requested_revision) == math.huge
+    or requested_revision ~= math.floor(requested_revision)
+    or revision ~= requested_revision then
   return -1
 end
 
