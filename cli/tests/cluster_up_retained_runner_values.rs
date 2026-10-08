@@ -1033,7 +1033,7 @@ fn fake_model_and_inline_set_override_lower_priority_file_choices() {
             args.push("--fake-model");
         } else {
             args.extend([
-                "--set-string",
+                "--set",
                 "agentSandbox.runner.credentials=sk-ant-api03-PLACEHOLDER-set-credential",
             ]);
         }
