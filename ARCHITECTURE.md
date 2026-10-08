@@ -506,14 +506,16 @@ a succeeded row with an agent, a sealed `prior_state`, a `post_version`, a
 key custody (the agent's in-force version declares `SNAPSHOT_SEALING_KEY` as a
 `SecretRef` on that hosted connector), and no live restore.
 
-**Who creates an execution.** Exactly three producers write
+**Who creates an execution.** A closed set of producers writes
 [`apps/api/src/curie_api/models.py::ActionExecution`](apps/api/src/curie_api/models.py):
 the undo ruling
 ([`apps/api/src/curie_api/routers/actions.py::undo_action`](apps/api/src/curie_api/routers/actions.py),
 `202` with the execution id and state, never a snapshot), the forward creation
 function
 ([`apps/api/src/curie_api/action_forward.py::create_forward_execution`](apps/api/src/curie_api/action_forward.py),
-an API function, not a route) and the probe route. No route accepts a tool
+an API function, not a route), the probe route, and the two remediation
+creation functions (`create_remediation_forward` and `scheduled_read`, see
+[Automated remediation](#automated-remediation)). No route accepts a tool
 name or arguments for execution. The operator asks for an undo with
 `curie <local|cluster> actions undo <id>` and reads the receipt with
 `actions execution <id>`
@@ -582,6 +584,153 @@ free-form `result` of `SideEffectFlag`; `/v1/execute` and the mode variable are
 runner-private, outside `BootEnv` and the ACI frames (see the
 [ACI producer interface](docs/interfaces/aci-producer/INTERFACE.md)); the
 sealing key uses the existing `SecretRef` seam.
+
+### Automated remediation
+
+A hook an administrator has made protected
+([ADR-0190](docs/adr/0190-automated-hook-sources-cannot-widen-their-tool-access.md),
+[ADR-0191](docs/adr/0191-protected-hook-delivery-authority.md)) may be bound to a
+remediation policy, and the platform then runs a bounded action for it with no
+model in the execution path
+([ADR-0203](docs/adr/0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md)).
+The contract is the
+[automated remediation specification](docs/superpowers/specs/2026-10-07-automated-remediation.md);
+the model author's half is
+[`docs/writing-remediation-nominations.md`](docs/writing-remediation-nominations.md),
+the operator's half is
+[Automated remediation](docs/operations.md#automated-remediation) in the
+operations guide. It is closed by default: `remediation.enabled` (compose
+`CURIE_REMEDIATION_ENABLED`) renders into both the API and the worker and a
+render with it on and `actionExecutor.enabled` off fails. With it off the
+policy routes stay readable and writable so a policy can be staged.
+
+```
+protected delivery                      API                                  worker                    executor / connectors
+------------------                      ---                                  ------                    ---------------------
+admitted: envelope carries
+remediation_generation  -----------------> (read under the source gate)
+read-only turn; final text may
+carry one curie-remediation block
+                          capture seam (planned: the protected worker's runner client wrapper
+                          withholds the fence from every reply and submits the block) ---------+
+POST /v1/internal/remediation/nominations (worker token, event_id + block)  <-------------------+
+  binding by event_id -> agent, hook, generation, reply surface; parse; one row per entry
+  admission, checks 2..12 in order, under a per-agent advisory lock
+     failed check ---------------------> approval request (purpose remediation) -> card loop ---> Slack card
+                                          approve: arguments hash must match -> forward (approval authority)
+     passed 2..11 ---------------------> precondition read (kind read) ---------------------------> sandbox, one sample
+                                          re-check 2..11 in the transaction that creates the forward
+                                          forward execution (policy authority)
+claim route: remediation authority hook (generation current and armed, no breaker)
+                                                                                -> run, claim, dispatch, outcome
+confirmed -> verifier samples (kind read, one execution each, due every interval)  ----------> sandbox per sample
+  verified | not-recovered | verifier-unavailable | superseded, written once
+  anything but verified: breaker opens, escalation row, undo offered as an approval
+```
+
+**Policy and generations.** One row per bound hook in `remediation_policies`
+and one immutable row per generation in `remediation_policy_generations`; a
+write compares and swaps on `expected_generation`, is idempotent on its
+operation id, and records the ADR 0106 operator principal as `bound_by`
+([`apps/api/src/curie_api/remediation_policy_store.py::write_policy`](apps/api/src/curie_api/remediation_policy_store.py),
+[`apps/api/src/curie_api/routers/remediation_policy.py`](apps/api/src/curie_api/routers/remediation_policy.py)).
+The document is closed and validated twice, by
+[`apps/api/src/curie_api/remediation_policy_document.py::validate_document`](apps/api/src/curie_api/remediation_policy_document.py)
+and by the CLI's mirror
+([`cli/src/remediation_policy.rs`](cli/src/remediation_policy.rs)),
+frozen together by `tests/vectors/remediation-policy.json`. The hook ingress,
+its scoped key and the nomination route have no write path to it. The protected
+envelope carries the generation active at admission as `remediation_generation`
+(internal metadata, not an ACI field), so a nomination is automatic only while
+that generation is still current and armed.
+
+**Nominations.** The model names an action and its arguments in one fenced
+block of its final output; the block is data, never a tool call, and the
+turn stays `read-only`. The API route resolves the agent, hook, generation and
+reply surface from the protected binding of the `event_id`, never from the
+request, and the first accepted submission per event wins
+([`apps/api/src/curie_api/routers/remediation_nominations.py::submit_remediation_nominations`](apps/api/src/curie_api/routers/remediation_nominations.py),
+[`apps/api/src/curie_api/remediation_nominations.py::parse_nomination_block`](apps/api/src/curie_api/remediation_nominations.py)).
+The grammar is frozen by `tests/vectors/remediation-nomination.json`; see the
+[author guide](docs/writing-remediation-nominations.md).
+
+**Admission.** `admit_nominations`
+([`apps/api/src/curie_api/remediation_admission.py::admit_nominations`](apps/api/src/curie_api/remediation_admission.py))
+evaluates each nomination through the twelve checks of the specification in
+order, and the first failing check decides. An unreadable policy, breaker,
+limit or capability row fails closed to an approval request, never to
+execution. Counts and reservations are taken under one advisory lock keyed by
+the agent. The precondition is a declared read, never the alert body. At most
+one automatic action leaves a turn.
+
+**Reads.** A precondition, a verifier sample and a qualification run are each
+one `read` execution: one sandbox under the read connector's own binding, one
+`tools/call`, and only the scalar at the declared pointer comes back
+([`apps/api/src/curie_api/remediation_reads.py::scheduled_read`](apps/api/src/curie_api/remediation_reads.py),
+[`runner/src/curie_runner/executor.py::sample_of`](runner/src/curie_runner/executor.py),
+the `POST /action-executions/{id}/samples` route). The API evaluates the
+predicate against one pointer and a closed comparator set
+([`apps/api/src/curie_api/remediation_predicate.py`](apps/api/src/curie_api/remediation_predicate.py)),
+frozen by `tests/vectors/remediation-predicate.json`. Executions carry a
+`not_before`, and the claim route never hands out more than
+`actionExecutor.maxConcurrentSandboxes` live executions across the installation
+(default 2), keeping one slot for writes.
+
+**Execution and the ledger.** An admitted nomination, or an approved
+remediation approval, becomes one forward execution whose connector, tool and
+arguments come from the nomination row, with `authority_kind` `policy` or
+`approval`
+([`apps/api/src/curie_api/remediation_forward.py::create_remediation_forward`](apps/api/src/curie_api/remediation_forward.py)).
+Before a policy-authorized execution is claimed, the remediation authority hook
+([`apps/api/src/curie_api/remediation_admission.py::authority_refusal`](apps/api/src/curie_api/remediation_admission.py))
+refuses it `policy_changed` if the generation is no longer current and armed or
+a breaker is open. Its ledger record carries the authority, the delivery event,
+the nomination and an `actor_kind`.
+
+**Verification and escalation.** When the forward is `confirmed`, the verifier
+schedules one read per interval from a connector that is not the acting one
+([`apps/api/src/curie_api/remediation_verifier.py::schedule_verification`](apps/api/src/curie_api/remediation_verifier.py),
+[`apps/api/src/curie_api/remediation_verifier.py::independence_refusal`](apps/api/src/curie_api/remediation_verifier.py)).
+Any outcome other than `verified` opens a breaker for the agent, connector,
+tool and target, writes an escalation, and for a reversible, undoable record
+raises an undo approval; nothing undoes a policy-executed action without an
+approving principal
+([`apps/api/src/curie_api/remediation_escalation.py::escalate`](apps/api/src/curie_api/remediation_escalation.py)).
+Only the policy route `POST .../breakers/{breaker_id}/close`, with an operator
+principal, closes a breaker.
+
+**Approvals.** A well-formed nomination that is not admitted raises one
+argument-bound approval of purpose `remediation`; resolving it wakes no model.
+The worker's card loop renders the card from the nomination row, never from
+the alert, and the model's `reason` appears only as escaped, labeled text
+([`apps/worker/src/curie_worker/remediation_cards.py::RemediationCardLoop`](apps/worker/src/curie_worker/remediation_cards.py),
+[`apps/api/src/curie_api/remediation_approvals.py::execute_approved`](apps/api/src/curie_api/remediation_approvals.py)).
+Approving rebuilds the call from the nomination row and refuses
+`arguments_mismatch` when the approval's tool or arguments hash differ.
+
+**Qualification.** A record per action declaration, written with an operator
+principal, holds references to rows this installation observed; admission check
+6 and the policy write's `qualification_required` check read it
+([`apps/api/src/curie_api/remediation_qualifications.py::record_qualification`](apps/api/src/curie_api/remediation_qualifications.py)).
+No route lets an administrator request a write: forward evidence comes only
+through ordinary approvals.
+
+**Kinds.** The policy declares each action's `kind`; the model names only the
+action. `remediate` follows the whole order and may be automatic. `prevent` is
+verified like it but always asks. `tune` is an alert rule change request that
+always asks, and an approved one ends `refused`
+(`tune_execution_not_automated`) with no write: the platform renders the diff
+and the evidence from declared reads
+([`apps/api/src/curie_api/remediation_tuning.py`](apps/api/src/curie_api/remediation_tuning.py)).
+
+**Nothing frozen changed.** `packages/aci-protocol` and `packages/plugin-format`
+are untouched: the nomination rides inside the free text of `Final.text`,
+`ToolAccess` keeps its one value, the policy lives in the API rather than a
+bundle, the `read` phase is runner-private like `/v1/execute`, and
+`remediation_generation` is internal envelope metadata. Five shared vectors
+(`remediation-nomination`, `remediation-predicate`, `remediation-policy`,
+`remediation-codes`, and `runner-execute`'s `read` section) freeze the seams
+between the images; the AGENTS.md parity registry names them.
 
 ## Pushing agent versions with git (deploy flow)
 
