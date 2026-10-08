@@ -299,6 +299,11 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/otel-collector-durability-assertions.sh
 
+      - name: helm render assertions (otel collector trace processors)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-processors-assertions.sh
+
       - name: helm render assertions (exporters without exporterhelper)
         run: |
           set -euo pipefail
