@@ -1765,7 +1765,8 @@
                   "console",
                   "operator",
                   "adapter",
-                  "platform"
+                  "platform",
+                  "test_driver"
                 ],
                 "type": "string"
               },

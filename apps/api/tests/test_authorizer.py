@@ -855,3 +855,32 @@ def test_an_email_list_is_never_read_on_another_non_slack_channel() -> None:
     )
     assert (name, decision.allowed) == ("NoVerifiableApprovers", False)
     assert "webchat has no approver list" in decision.reason
+
+
+def test_test_driver_resolves_only_explicit_users() -> None:
+    from curie_api.approvers import InvalidApprovers, NoVerifiableApprovers, UnboundRoute
+
+    async def decide(approvers: ApproverSet) -> AuthzDecision:
+        _, verdict = await authorize_approval(
+            _approval(),
+            _LISTED,
+            _CARD_CHANNEL,
+            approver_set=approvers,
+            principal_kind="test_driver",
+        )
+        return verdict
+
+    assert asyncio.run(decide(ExplicitUsers([_LISTED]))).allowed
+    assert not asyncio.run(decide(ExplicitUsers([_OUTSIDER]))).allowed
+    for approvers in [
+        SlackChannelMembers(_CARD_CHANNEL),
+        SlackUserGroupMembers(_GROUP, None),
+        EmailApprovers(["approver@example.com"]),
+        InvalidApprovers("invalid"),
+        UnboundRoute("missing"),
+        NoVerifiableApprovers("discord", slack_declared=False),
+    ]:
+        verdict = asyncio.run(decide(approvers))
+        assert not verdict.allowed
+        assert verdict.evidence is not None
+        assert verdict.evidence["principal_kind"] == "test_driver"

@@ -25,7 +25,7 @@ from curie_internal.sandbox_token import b64url, b64url_decode, signature
 _PREFIX = "apr"
 APPROVE_SCOPE = "approval.resolve"
 OPERATOR_TOKEN_TTL_SECONDS = 12 * 60 * 60
-PrincipalKind = Literal["chat", "operator"]
+PrincipalKind = Literal["chat", "operator", "test_driver"]
 
 
 @dataclass(frozen=True)
@@ -57,11 +57,11 @@ def mint(
 
     if not isinstance(subject, str) or not subject.strip():
         raise ValueError("approval principal subject must be non-empty")
-    if kind not in ("chat", "operator"):
-        raise ValueError("approval principal kind must be chat or operator")
+    if kind not in ("chat", "operator", "test_driver"):
+        raise ValueError("approval principal kind must be chat, operator or test_driver")
     if not isinstance(exp, int) or isinstance(exp, bool):
         raise ValueError("approval principal expiry must be an integer")
-    if kind == "chat":
+    if kind in ("chat", "test_driver"):
         if not isinstance(actor_channel, str) or not actor_channel.strip():
             raise ValueError("chat approval principals must attest a channel")
         if not isinstance(approval_id, str) or not approval_id.strip():
@@ -107,6 +107,8 @@ def unverified_kind(token: str) -> PrincipalKind | None:
     kind = payload.get("kind")
     if kind == "chat":
         return "chat"
+    if kind == "test_driver":
+        return "test_driver"
     if kind == "operator":
         return "operator"
     return None
@@ -157,14 +159,14 @@ def verify_claims(
     exp = payload.get("exp")
     if not isinstance(subject, str) or not subject.strip():
         return None
-    if kind not in ("chat", "operator"):
+    if kind not in ("chat", "operator", "test_driver"):
         return None
     if not isinstance(exp, int) or isinstance(exp, bool):
         return None
     current = now if now is not None else int(time.time())
-    if exp <= current:
+    if exp <= current or (kind == "test_driver" and exp > current + 60):
         return None
-    if kind == "chat":
+    if kind in ("chat", "test_driver"):
         if not isinstance(actor_channel, str) or not actor_channel.strip():
             return None
         if not isinstance(claimed_approval_id, str) or not claimed_approval_id.strip():

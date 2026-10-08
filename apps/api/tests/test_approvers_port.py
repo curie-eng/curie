@@ -32,6 +32,7 @@ class _EveryoneIsAMember:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 
@@ -44,6 +45,7 @@ class _NobodyIsAMember:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 
@@ -60,6 +62,7 @@ class _CannotTell:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 

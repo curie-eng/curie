@@ -1576,7 +1576,7 @@ class ApprovalAuditEntry(Base):
     __table_args__ = (
         CheckConstraint(
             "principal_kind IS NULL OR principal_kind IN "
-            "('chat', 'console', 'operator', 'adapter', 'platform')",
+            "('chat', 'console', 'operator', 'adapter', 'platform', 'test_driver')",
             name="approval_audit_principal_kind_ck",
         ),
     )
