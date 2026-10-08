@@ -4198,5 +4198,10 @@ fn upgrade_refuses_before_render_when_captured_overlay_cannot_be_materialized() 
             .any(|args| args.iter().any(|arg| arg == "templates/schema-compat.yaml")),
         "metadata was admitted without its overlay"
     );
-    assert!(mutating_calls(&fixture).is_empty());
+    // Ownership acquisition/release precedes admission by existing policy.
+    assert!(fixture.helm_upgrades().is_empty());
+    assert!(
+        fixture.records().is_empty(),
+        "lifecycle checkpoint advanced after metadata refusal"
+    );
 }
