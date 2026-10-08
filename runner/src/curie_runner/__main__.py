@@ -949,12 +949,16 @@ def build_runner(
     # cannot read the PAT from the process env (#2559). The on-disk catalog
     # keeps the placeholder; derive_mcp_servers never sees a value.
     spawn_env = sdk_env if sdk_env is not None else os.environ
+    # Optional binding presence is judged before hosted credential custody
+    # removes environment names. Reuse this immutable-bundle projection for
+    # redaction and mounting rather than reclassifying a bound name as absent.
+    bundle_servers = bundle_mcp_servers(config.session.plugin_dir)
     held_secrets = collect_held_secrets(
         config,
         environments=(os.environ, sdk_env or {}),
         credential_names=DEFAULT_CREDENTIAL_ENV_KEYS,
         connector_names=declared_secret_names(config.session.plugin_dir),
-        server_groups=(bundle_mcp_servers(config.session.plugin_dir), derived_mcp_servers),
+        server_groups=(bundle_servers, derived_mcp_servers),
     )
     dropped = materialize_hosted_bearer_headers(derived_mcp_servers, spawn_env)
     if spawn_env is not os.environ:
@@ -1160,7 +1164,7 @@ def build_runner(
                 # strict_mcp_config drops plugin-loaded servers (#2899), so the
                 # bundle's own servers ride the same channel under the name the
                 # plugin loader would have given them.
-                **bundle_mcp_servers(config.session.plugin_dir),
+                **bundle_servers,
                 **build_mcp_servers(
                     platform=platform_servers,
                     derived=derived_mcp_servers,
