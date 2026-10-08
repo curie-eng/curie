@@ -47,6 +47,8 @@ plugin shape verbatim plus a strict Curie-only overlay, not a Claude Code plugin
 
 ## Current contract
 
+The optional-secret contract follows the [accepted decision on the source release train](https://github.com/curie-eng/curie/blob/757ac40ff53af39622e0dc0fe09db4ea66dcf868/docs/adr/0209-a-bundle-may-declare-a-secret-optional.md) and #4129. This backport preserves that decision without assigning its number to a different decision on this release train.
+
 `validate_bundle(path) -> ValidationResult` is the single entry point every deploy path calls
 (`packages/plugin-format/src/plugin_format/validate.py::validate_bundle`). It returns path-qualified
 issues (codes like `manifest.missing`, `manifest.name_invalid`, `mcp.server_incomplete`) instead of

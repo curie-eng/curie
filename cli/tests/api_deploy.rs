@@ -1912,7 +1912,7 @@ async fn redeploy_without_connector_secrets_clears_the_agent_record() {
     );
 }
 
-// @spec ADR-0209 d2-d3: declaration alone must never synthesize a binding.
+// @spec #4129 optional-secret contract: declaration alone must never synthesize a binding.
 #[tokio::test]
 async fn optional_secrets_are_absent_from_local_and_cluster_deploy_records() {
     for tier in [commands::DeployTier::Local, commands::DeployTier::Cluster] {
@@ -1962,7 +1962,7 @@ async fn optional_secrets_are_absent_from_local_and_cluster_deploy_records() {
     }
 }
 
-// @spec ADR-0209 d2-d3: an explicit optional binding follows normal local delivery.
+// @spec #4129 optional-secret contract: an explicit optional binding follows normal local delivery.
 #[cfg(unix)]
 #[tokio::test]
 async fn local_cli_delivers_only_explicitly_bound_optional_secrets() {

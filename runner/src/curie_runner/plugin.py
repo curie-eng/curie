@@ -279,7 +279,7 @@ def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
     ``${CLAUDE_PLUGIN_ROOT}`` is the one variable the plugin loader supplies that
     the ``--mcp-config`` path does not, so it is substituted here and exported to
     a stdio server's env. An absent optional secret's whole-value stdio env
-    reference is omitted before mounting (ADR-0209); the bundle stays immutable.
+    reference is omitted before mounting (#4129); the bundle stays immutable.
     Every other ``${VAR}`` is left for the CLI, which
     expands ``--mcp-config`` entries from the session env exactly as it expands a
     plugin's. Call only after ``load_plugins`` has validated the bundle; a
