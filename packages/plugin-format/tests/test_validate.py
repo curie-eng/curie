@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from plugin_format import (
     TOOL_POLICY_ENFORCEMENT,
+    PluginManifest,
     ValidationResult,
     validate_bundle,
     validate_pattern,
@@ -620,6 +621,59 @@ def test_legitimate_connector_secret_name_is_not_reserved(tmp_path: Path) -> Non
 def test_malformed_secrets_shape_is_rejected(tmp_path: Path) -> None:
     # A non-list secrets value is rejected.
     bundle = _bundle(tmp_path, '{"name": "demo", "secrets": "nope"}')
+    assert not validate_bundle(bundle).valid
+
+
+# ADR 0209: `optionalSecrets` names secrets a bundle can use but does not need.
+def test_valid_optional_secrets_pass(tmp_path: Path) -> None:
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "secrets": ["API_KEY"], '
+        '"optionalSecrets": ["GITHUB_PERSONAL_ACCESS_TOKEN"]}',
+    )
+    assert validate_bundle(bundle).valid
+
+
+def test_optional_secrets_parse_onto_the_manifest() -> None:
+    manifest = PluginManifest.model_validate(
+        {"name": "demo", "optionalSecrets": ["GITHUB_PERSONAL_ACCESS_TOKEN"]}
+    )
+    assert manifest.optionalSecrets == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+    assert PluginManifest.model_validate({"name": "demo"}).optionalSecrets is None
+
+
+def test_non_env_var_optional_secret_name_is_rejected(tmp_path: Path) -> None:
+    bundle = _bundle(tmp_path, '{"name": "demo", "optionalSecrets": ["github-token"]}')
+    result = validate_bundle(bundle)
+    assert not result.valid
+    assert "secrets.name_invalid" in _codes(bundle)
+    assert any("optionalSecrets[0]" in e.location for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    "name", ["CURIE_BUDGET", *_RESERVED_CREDENTIAL_KEYS, *_REDIRECT_CAPTURE_KEYS]
+)
+def test_reserved_optional_secret_name_is_rejected(tmp_path: Path, name: str) -> None:
+    bundle = _bundle(tmp_path, f'{{"name": "demo", "optionalSecrets": ["{name}"]}}')
+    assert "secrets.name_reserved" in _codes(bundle)
+
+
+def test_a_name_in_both_secret_lists_is_rejected(tmp_path: Path) -> None:
+    # Required or optional, never both: the deploy gate could not tell which.
+    bundle = _bundle(
+        tmp_path,
+        '{"name": "demo", "secrets": ["API_KEY"], "optionalSecrets": ["API_KEY"]}',
+    )
+    assert "secrets.optional_overlap" in _codes(bundle)
+
+
+def test_malformed_optional_secrets_shape_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    bundle = _bundle(tmp_path / "a", '{"name": "demo", "optionalSecrets": "nope"}')
+    assert not validate_bundle(bundle).valid
+    # The object form ADR 0209 rejected is not accepted either.
+    bundle = _bundle(tmp_path / "b", '{"name": "demo", "optionalSecrets": [{"name": "X"}]}')
     assert not validate_bundle(bundle).valid
 
 

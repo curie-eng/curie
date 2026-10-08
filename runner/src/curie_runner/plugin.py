@@ -278,7 +278,9 @@ def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
 
     ``${CLAUDE_PLUGIN_ROOT}`` is the one variable the plugin loader supplies that
     the ``--mcp-config`` path does not, so it is substituted here and exported to
-    a stdio server's env. Every other ``${VAR}`` is left for the CLI, which
+    a stdio server's env. An absent optional secret's whole-value stdio env
+    reference is omitted before mounting (ADR-0209); the bundle stays immutable.
+    Every other ``${VAR}`` is left for the CLI, which
     expands ``--mcp-config`` entries from the session env exactly as it expands a
     plugin's. Call only after ``load_plugins`` has validated the bundle; a
     malformed declaration was already refused there.
@@ -299,6 +301,9 @@ def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
         declarations.append(json.loads(root_mcp.read_text(encoding="utf-8")))
 
     plugin_root = str(root)
+    absent_optional_refs = {
+        f"${{{name}}}" for name in manifest.optionalSecrets or [] if name not in os.environ
+    }
     servers: dict[str, Any] = {}
     for payload in declarations:
         if not isinstance(payload, dict):
@@ -312,7 +317,15 @@ def bundle_mcp_servers(plugin_dir: str | None) -> dict[str, Any]:
             entry = cast("dict[str, object]", _substitute_plugin_root(config, plugin_root))
             if isinstance(entry.get("command"), str):
                 raw_env = entry.get("env")
-                env = dict(raw_env) if isinstance(raw_env, dict) else {}
+                env = (
+                    {
+                        key: value
+                        for key, value in raw_env.items()
+                        if not (isinstance(value, str) and value in absent_optional_refs)
+                    }
+                    if isinstance(raw_env, dict)
+                    else {}
+                )
                 env.setdefault("CLAUDE_PLUGIN_ROOT", plugin_root)
                 entry["env"] = env
             servers[f"plugin:{manifest.name}:{name}"] = entry
