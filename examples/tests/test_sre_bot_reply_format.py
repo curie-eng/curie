@@ -8,7 +8,10 @@ whether anything was wrong without reading all of it.
 
 So the skill's reply guidance fixes a shape for the first reply to an alert
 notification or a health or status question: a verdict line that starts with one
-of three markers, then at most three short labelled lines. A key number said in
+of three markers, then at most three short labelled lines: ``Cause:``, ``Next:``
+and ``Ref:`` (the alert identity, always last). ``What I changed:`` is dropped
+unless an approved action ran or an approval is still pending. A resolved or
+repeated delivery with nothing new gets one line. A key number said in
 plain words ("about 1 in 20 requests is failing (4.8%)") belongs in it. Raw query
 output, tool names, fingerprints and trace ids go in a later reply, on request.
 A catalog or listing question still gets the complete list.
@@ -108,13 +111,13 @@ def test_the_verdict_line_starts_with_one_of_three_markers(marker: str, meaning:
 @pytest.mark.parametrize(
     "label,required",
     [
-        ("What I checked:", [r"\bplain\b"]),
-        ("What to do:", [r"\bwho\b", r"\bnothing\b"]),
-        ("What I changed:", [r"\bnothing\b", r"\bapprov"]),
+        ("Cause:", [r"\bplain\b", r"\bunknown\b", r"\bwindow\b"]),
+        ("Next:", [r"\bwho\b|\bowner\b", r"\bnothing\b"]),
+        ("Ref:", [r"\balertname\b", r"\balarm name\b", r"\bfingerprint\b", r"\bstartsAt\b"]),
     ],
-    ids=["checked", "to-do", "changed"],
+    ids=["cause", "next", "ref"],
 )
-def test_the_reply_guidance_states_the_three_line_labels(label: str, required: list[str]) -> None:
+def test_the_reply_guidance_states_the_line_labels(label: str, required: list[str]) -> None:
     items = _items_with(label)
     assert items, (
         f"SKILL.md's reply guidance never states the {label!r} line. State it in "
@@ -127,9 +130,71 @@ def test_the_reply_guidance_states_the_three_line_labels(label: str, required: l
     ]
     assert not missing, (
         f"the {label!r} line is stated without saying what goes in it "
-        f"(missing /{'/, /'.join(missing)}/). 'What I checked:' is plain words; "
-        "'What to do:' names who does what, or nothing; 'What I changed:' is "
-        "nothing unless an approved call ran."
+        f"(missing /{'/, /'.join(missing)}/). 'Cause:' is plain words and the window "
+        "looked at, or unknown so far; 'Next:' names an owner and what they do, or "
+        "nothing; 'Ref:' carries the alert identity."
+    )
+
+
+def test_the_old_three_line_labels_are_gone() -> None:
+    # The shape changed: users found "What I checked:" / "What to do:" replies
+    # long and jargon-heavy. A leftover label teaches the model the old shape.
+    prose = _flat(_skill_prose())
+    for old in ("What I checked:", "What to do:"):
+        assert old not in prose, f"SKILL.md still teaches the retired {old!r} line"
+
+
+def test_the_reply_shape_orders_the_lines_with_ref_last() -> None:
+    guidance = _flat(_reply_guidance())
+    positions = [guidance.find(f"`{label}`") for label in ("Cause:", "Next:", "Ref:")]
+    assert all(pos >= 0 for pos in positions) and positions == sorted(positions), (
+        "the reply guidance must introduce `Cause:`, `Next:` and `Ref:` in that order"
+    )
+    assert any(re.search(r"\blast line\b", item, re.IGNORECASE) for item in _items_with("Ref:")), (
+        "`Ref:` must be stated as the last line of the reply"
+    )
+
+
+def test_what_i_changed_is_dropped_by_default() -> None:
+    items = _items_with("What I changed:")
+    assert items, "SKILL.md must still say when a `What I changed:` line appears"
+    joined = " ".join(items)
+    assert re.search(r"\b(omit|drop|dropped|only when|only if|no such line)\b", joined, re.I), (
+        "`What I changed:` must be omitted by default, not written as 'nothing'"
+    )
+    assert re.search(r"\bapprov\w* (call|action|change)?[^.]{0,60}\bran\b|\bactually ran\b", joined, re.I), (
+        "`What I changed:` appears when an approved action actually ran"
+    )
+    assert re.search(r"\bpending\b", joined, re.I) and re.search(r"\bdeni", joined, re.I), (
+        "`What I changed:` also appears while an approval this thread raised is pending, "
+        "saying it should be denied if no longer needed"
+    )
+    assert not re.search(r"`What I changed:`[^.]{0,40}\"nothing\"", joined), (
+        "`What I changed:` must not be the always-written 'nothing' line any more"
+    )
+
+
+def test_resolved_and_repeated_deliveries_get_one_line() -> None:
+    prose = _flat(_skill_prose())
+    items = [
+        " ".join(part.split())
+        for part in re.split(r"\n[ \t]*\n", _skill_prose())
+        if re.search(r"resolved", part, re.IGNORECASE)
+    ]
+    one_line = [
+        item
+        for item in items
+        if re.search(r"\bone line\b|\bsingle line\b|\bone-line\b", item, re.IGNORECASE)
+    ]
+    assert one_line, "a resolved delivery must get ONE line after the same reads"
+    text = " ".join(one_line)
+    assert re.search(r"repeated|no change|unchanged", prose, re.IGNORECASE)
+    assert re.search(r"\bpending\b", text, re.IGNORECASE), (
+        "the one-line resolved reply adds a line only for a still-pending approval"
+    )
+    assert re.search(r"could not (confirm|read)|cannot confirm|not confirm", text, re.IGNORECASE), (
+        "a resolved delivery whose reads could not confirm recovery is ⚠️ and says what "
+        "could not be confirmed"
     )
 
 
