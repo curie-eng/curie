@@ -9,6 +9,7 @@ https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-s
 
 from __future__ import annotations
 
+import ast
 import inspect
 import json
 import re
@@ -20,7 +21,7 @@ from typing import Any
 import pytest
 from channel_protocol import work_item_events
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
-from curie_api import factory_ci, workitems
+from curie_api import factory_ci, factory_notices, workitems
 from curie_api.config import Settings
 from curie_api.workitem_outcomes import CiDetail
 from pydantic import ValidationError
@@ -92,6 +93,9 @@ def _detail(
     reason: str | None = None,
     base_runs: tuple[dict[str, Any], ...] | None = None,
     base_statuses: tuple[dict[str, Any], ...] | None = None,
+    mergeable: bool | None = None,
+    mergeable_state: str | None = None,
+    merged: bool | None = None,
 ) -> CiDetail:
     # The base fields are passed only when a test reads a base head, so every
     # other detail is built exactly as before #4105.
@@ -108,6 +112,9 @@ def _detail(
         check_runs=list(runs),
         statuses=list(statuses),
         annotations=annotations or {},
+        mergeable=mergeable,
+        mergeable_state=mergeable_state,
+        merged=merged,
         **base,
     )
 
@@ -166,11 +173,42 @@ def test_bounds_are_the_planned_constants() -> None:
 
 
 def test_ci_causes_match_the_literal_set_in_workitems() -> None:
-    assert factory_ci.CI_CAUSES == frozenset({"ci_failed", "ci_timeout", "ci_unverified"})
+    assert factory_ci.CI_CAUSES == frozenset(
+        {"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict"}
+    )
     assert "ci_fix_unpublished" not in factory_ci.CI_CAUSES
-    source = inspect.getsource(workitems)
-    literal = re.search(r"\{\s*\"ci_failed\",\s*\"ci_timeout\",\s*\"ci_unverified\"\s*\}", source)
-    assert literal is not None, "workitems must keep the CI cause literal equal to CI_CAUSES"
+    source = ast.parse(inspect.getsource(workitems._terminalize_execution))
+    literals = [
+        ast.literal_eval(node.value.comparators[0])
+        for node in ast.walk(source)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "ci_cause" for target in node.targets)
+        and isinstance(node.value, ast.Compare)
+        and isinstance(node.value.comparators[0], ast.Set)
+    ]
+    assert literals == [set(factory_ci.CI_CAUSES)]
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected"),
+    [
+        (
+            "merge_conflict",
+            "the pull request has merge conflicts with its base branch, so GitHub ran no "
+            "pull request checks. The pull request stays open; resolve the conflicts to continue.",
+        ),
+        (
+            "ci_unverified",
+            "the pull request's CI could not be verified, so the run did not complete. "
+            "The Reason line below says why. The pull request stays open; check it yourself.",
+        ),
+    ],
+)
+def test_ci_notices_name_the_action_without_claiming_a_read_failure(
+    cause: str, expected: str,
+) -> None:
+    assert factory_notices.cause_text(cause) == expected
+    assert "could not be read" not in factory_notices.cause_text(cause)
 
 
 def test_continuation_event_id_is_the_worker_contract() -> None:
@@ -497,9 +535,104 @@ def test_no_checks_inside_the_grace_period_is_pending() -> None:
 
 
 def test_no_checks_after_the_grace_period_is_success_with_a_note() -> None:
-    verdict = _decide(_detail(), 120)
+    verdict = _decide(_detail(mergeable=True), 120)
     assert verdict.kind == "no_ci"
     assert verdict.note
+
+
+@pytest.mark.parametrize("seconds", [120, 121])
+@pytest.mark.parametrize("checks", ["empty", "green", "failing", "delegated_missing"])
+def test_a_dirty_head_ends_as_merge_conflict_regardless_of_check_state(
+    seconds: int, checks: str,
+) -> None:
+    # GitHub's pull response shape and dirty state are documented at:
+    # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+    runs = () if checks in {"empty", "delegated_missing"} else (
+        _run("build", conclusion="failure" if checks == "failing" else "success"),
+    )
+    detail = _detail(*runs, mergeable=False, mergeable_state="dirty", merged=False)
+    verdict = _decide(
+        detail, seconds,
+        delegated_checks=("integration-tests",) if checks == "delegated_missing" else (),
+    )
+    assert verdict.kind == "merge_conflict"
+    assert verdict.reason == "merge_conflict"
+
+
+def test_a_dirty_head_inside_the_grace_waits_instead_of_starting_a_fix() -> None:
+    detail = _detail(
+        _run("build", conclusion="failure"),
+        mergeable=False, mergeable_state="dirty", merged=False,
+    )
+    verdict = _decide(detail, 119, delegated_checks=("integration-tests",))
+    assert verdict.kind == "pending"
+    assert verdict.reason == "merge_conflict_grace"
+    assert verdict.failing == []
+
+
+def test_merge_conflict_precedes_the_metadata_revision_wait() -> None:
+    failed = _run("Publication description guard", conclusion="failure")
+    failed["started_at"] = "2026-09-24T11:00:00Z"
+    verdict = _decide(
+        _detail(failed, mergeable=False, mergeable_state="dirty"), 121,
+        fresh_after=PUBLISHED, metadata_ci=conversion_metadata_ci(),
+    )
+    assert verdict.kind == "merge_conflict"
+    assert verdict.reason == "merge_conflict"
+
+
+@pytest.mark.parametrize("mergeable", [None, False])
+def test_an_already_merged_pull_request_with_no_checks_is_no_ci(
+    mergeable: bool | None,
+) -> None:
+    detail = _detail(mergeable=mergeable, mergeable_state="dirty", merged=True)
+    verdict = _decide(detail, 121)
+    assert verdict.kind == "no_ci"
+    assert verdict.note
+
+
+@pytest.mark.parametrize(
+    ("mergeable", "mergeable_state"),
+    [(None, None), (None, "dirty"), (None, "clean"), (False, None), (False, "blocked")],
+)
+@pytest.mark.parametrize("merged", [None, False])
+def test_no_checks_waits_for_known_mergeability_until_the_ci_deadline(
+    mergeable: bool | None, mergeable_state: str | None, merged: bool | None,
+) -> None:
+    detail = _detail(mergeable=mergeable, mergeable_state=mergeable_state, merged=merged)
+    for seconds in (121, 1199):
+        verdict = _decide(detail, seconds)
+        assert verdict.kind == "pending"
+        assert verdict.reason == "mergeability_unknown"
+    verdict = _decide(detail, 1200)
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "mergeability_unknown"
+
+
+def test_unknown_mergeability_uses_the_earlier_execution_deadline() -> None:
+    deadline = PUBLISHED + timedelta(seconds=600)
+    detail = _detail()
+    assert _decide(detail, 599, execution_deadline=deadline).kind == "pending"
+    verdict = _decide(detail, 600, execution_deadline=deadline)
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "mergeability_unknown"
+
+
+@pytest.mark.parametrize(
+    ("conclusion", "expected"), [("success", "green"), ("failure", "failing")],
+)
+def test_null_mergeability_preserves_verdicts_when_checks_exist(
+    conclusion: str, expected: str,
+) -> None:
+    detail = _detail(_run("build", conclusion=conclusion), mergeable=None)
+    assert _decide(detail, 121).kind == expected
+
+
+def test_a_dirty_unreadable_detail_still_reports_the_ci_read_failure() -> None:
+    detail = _detail(reason="github_forbidden", mergeable=False, mergeable_state="dirty")
+    verdict = _decide(detail, 121)
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "github_forbidden"
 
 
 def test_checks_that_disappear_after_a_failed_round_are_unverified() -> None:
@@ -1392,7 +1525,7 @@ def test_a_missing_delegated_check_is_unverified_at_the_ci_deadline() -> None:
 
 
 def test_no_checks_at_all_is_never_no_ci_when_a_check_is_delegated() -> None:
-    empty = _detail()
+    empty = _detail(mergeable=True)
     assert _decide(empty, 130).kind == "no_ci"  # control: today's verdict without delegation
 
     after_grace = _decide(empty, 130, delegated_checks=(DELEGATED,))

@@ -985,18 +985,26 @@ otherwise green completes with the note `Also failing on the base branch, not
 caused by this change: <names>`. The required Python check and any check a
 sandbox check delegated to are the exception: failing on the base too leaves
 the run `ci_unverified`. When the base branch cannot be read, every failure
-counts. No checks within 120 s of the push completes with a
-note only when no required check applies. A factory Python publication needs
-in-sandbox verification evidence; beyond that it is judged on the repository's
+counts. With no required check, zero checks after the 120 s grace complete with
+a note only when GitHub reports the pull request mergeable or already merged.
+A pull request with merge conflicts waits through that grace, then ends as
+`merge_conflict`, regardless of any checks, without a CI fix round. The pull
+request stays open for a person to resolve the conflicts. Unknown mergeability,
+including GitHub's `null` while it computes the result, keeps a zero-check run
+waiting with reason `mergeability_unknown` until the CI deadline, then ends as
+`ci_unverified` with that reason. Each observation reads mergeability again;
+check-backed verdicts do not depend on unknown mergeability.
+A factory Python publication needs in-sandbox verification evidence; beyond
+that it is judged on the repository's
 own checks unless the repository has a required Python CI policy (below).
 Checks still pending when the CI wait (by default 1200 s from the push, or the
 execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
 `api.githubFactoryCiWaitSeconds` (API env `GITHUB_FACTORY_CI_WAIT_S`, default
 1200, 1 to 10800, checked at boot) when the repository's required checks take
 longer than 20 minutes; the wait still ends at the execution deadline if that
-comes first. Unreadable CI, such as missing Checks or Commit statuses permission,
-ends as `ci_unverified`, which is never success;
-the pull request stays open either way. The work item detail route still
+comes first. CI that cannot be verified, including unreadable checks or missing
+required evidence, ends as `ci_unverified`, which is never success. The notice's
+Reason line explains why. The pull request stays open. The work item detail route still
 reports CI as `unavailable` / `github_forbidden` without the permission.
 
 Required Python CI is set per repository with `api.githubFactoryPythonCi` (API

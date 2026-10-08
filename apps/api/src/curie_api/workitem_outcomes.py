@@ -822,6 +822,9 @@ class CiDetail:
     # unreadable; set both or neither.
     base_check_runs: list[dict[str, Any]] | None = None
     base_statuses: list[dict[str, Any]] | None = None
+    mergeable: bool | None = None
+    mergeable_state: str | None = None
+    merged: bool | None = None
 
 
 def _detail_unavailable(reason: str, head_sha: str | None) -> CiDetail:
@@ -1064,6 +1067,22 @@ async def _observe_ci_detail(
         statuses = _statuses_list(status_payload)
         if statuses is None:
             return _detail_unavailable("malformed_response", head_sha)
+        mergeable: bool | None = None
+        mergeable_state: str | None = None
+        merged: bool | None = None
+        pr_number = getattr(lineage, "pr_number", None)
+        if isinstance(pr_number, int) and not isinstance(pr_number, bool):
+            pull, pull_reason = await get(f"/pulls/{pr_number}", {})
+            if pull_reason is None and isinstance(pull, dict):
+                mergeable_value = pull.get("mergeable")
+                if isinstance(mergeable_value, bool):
+                    mergeable = mergeable_value
+                mergeable_state_value = pull.get("mergeable_state")
+                if isinstance(mergeable_state_value, str):
+                    mergeable_state = mergeable_state_value
+                merged_value = pull.get("merged")
+                if isinstance(merged_value, bool):
+                    merged = merged_value
         check_runs: list[dict[str, Any]] = list(runs_payload["check_runs"])
         annotations: dict[int, list[dict[str, Any]]] = {}
         job_logs: dict[int, str] = {}
@@ -1130,4 +1149,7 @@ async def _observe_ci_detail(
         job_log_unavailable=job_log_unavailable,
         base_check_runs=base_check_runs,
         base_statuses=base_statuses,
+        mergeable=mergeable,
+        mergeable_state=mergeable_state,
+        merged=merged,
     )
