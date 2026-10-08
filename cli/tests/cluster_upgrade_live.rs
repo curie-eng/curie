@@ -4104,3 +4104,63 @@ fn explicit_file_repairs_a_retained_config_conflict_before_admission() {
         Some(&serde_json::json!([]))
     );
 }
+
+#[test]
+fn upgrade_file_inline_credentials_replace_retained_secret_references() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3, CLUSTER-VALUES-FILES c4
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success());
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let fixture = Fixture::new(Some(
+        r#"{"agentSandbox":{"runner":{"credentialsExistingSecret":"old-model","credentialsExistingSecretKey":"token"}},"api":{"githubTokenExistingSecret":"old-github","githubTokenExistingSecretKey":"token"},"postgres":{"existingSecret":"old-postgres"}}"#,
+    ));
+    let file = fixture.0.path().join("credential-replacements.yaml");
+    fs::write(&file, "agentSandbox:\n  runner:\n    credentials: PLACEHOLDER-new-model\napi:\n  githubToken: PLACEHOLDER-new-github\npostgres:\n  auth:\n    password: PLACEHOLDER-new-postgres\n").unwrap();
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["-f", file.to_str().unwrap()],
+        &[("VALUES_FILES_REAL_HELM", helm.trim())],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let applied: Value = serde_json::from_str(&fixture.values(1)).unwrap();
+    for (path, replacement) in [
+        ("/agentSandbox/runner/credentials", "PLACEHOLDER-new-model"),
+        ("/api/githubToken", "PLACEHOLDER-new-github"),
+        ("/postgres/auth/password", "PLACEHOLDER-new-postgres"),
+    ] {
+        assert_eq!(
+            applied.pointer(path).and_then(Value::as_str),
+            Some(replacement),
+            "file replacement lost at {path}"
+        );
+        assert!(!visible(&output).contains(replacement));
+        assert!(!fixture
+            .argv()
+            .iter()
+            .flatten()
+            .any(|arg| arg.contains(replacement)));
+    }
+    for path in [
+        "/agentSandbox/runner/credentialsExistingSecret",
+        "/agentSandbox/runner/credentialsExistingSecretKey",
+        "/api/githubTokenExistingSecret",
+        "/api/githubTokenExistingSecretKey",
+        "/postgres/existingSecret",
+    ] {
+        assert!(
+            applied
+                .pointer(path)
+                .is_none_or(|value| value.as_str() == Some("")),
+            "retained reference still active: {path}"
+        );
+    }
+    for path in fixture.captured_paths("render-values") {
+        let admitted: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(admitted, applied);
+    }
+}

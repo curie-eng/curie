@@ -170,3 +170,31 @@ fn malformed_files_are_refused_without_echoing_yaml_contents() {
         );
     }
 }
+
+#[test]
+fn explicit_set_repairs_file_configuration_before_final_admission() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("repair.yaml");
+    fs::write(&file, "worker:\n  deliveryBudgetSeconds: 700\n  extraEnv:\n    - name: CURIE_DELIVERY_BUDGET_S\n      value: '800'\n").unwrap();
+    let output = invoke(&[
+        "--json",
+        "cluster",
+        "up",
+        "--dry-run",
+        "--dev",
+        "--fake-model",
+        "--chart",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie"),
+        "-f",
+        file.to_str().unwrap(),
+        "--set",
+        "worker.deliveryBudgetSeconds=800",
+    ]);
+    assert!(
+        output.status.success(),
+        "final explicit value was not admitted: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
