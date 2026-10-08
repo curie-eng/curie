@@ -1133,6 +1133,38 @@ fn inline_file_credential_replaces_a_retained_secret_reference() {
 }
 
 #[test]
+fn indexed_set_preserves_file_list_item_siblings() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3
+    let helm = real_helm().expect("real Helm required");
+    let fixture = Fixture::new(&serde_json::json!({}));
+    let file = fixture.temp.path().join("indexed-overlay.yaml");
+    fs::write(
+        &file,
+        "security:\n  gvisor:\n    mode: 'off'\n  networkPolicy:\n    allowedEgress:\n      - cidr: 192.0.2.0/24\n        ports:\n          - protocol: TCP\n            port: 80\nagentSandbox:\n  controller:\n    deploy: false\n",
+    )
+    .unwrap();
+    let output = fixture.cluster_up_with_args(
+        &[("CURIE_TEST_REAL_HELM", &helm)],
+        &[
+            "--fake-model",
+            "-f",
+            file.to_str().unwrap(),
+            "--set",
+            "security.networkPolicy.allowedEgress[0].ports[0].port=443",
+        ],
+    );
+    fixture.assert_succeeded(&output);
+    let values = effective_captured_values(&helm, &fixture);
+    assert_eq!(
+        values.pointer("/security/networkPolicy/allowedEgress/0"),
+        Some(&serde_json::json!({
+            "cidr": "192.0.2.0/24",
+            "ports": [{"protocol": "TCP", "port": 443}],
+        }))
+    );
+}
+
+#[test]
 fn file_without_schema_cannot_mask_an_unsupported_retained_configuration() {
     // @spec CLUSTER-VALUES-FILES c3
     let helm = real_helm().expect("real Helm required");
