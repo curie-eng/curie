@@ -998,9 +998,11 @@ strings, dotted mapping keys and empty lists/maps.
 
 `CLUSTER-VALUES-FILES c3`: file values override retained operator configuration;
 existing credential, provider, namespace, controller, gVisor, configuration and
-schema admission checks validate the final effective overlay. All preflight
-renders and the actual Helm application use that same overlay and the same
-existing generated/inferred overrides. A file may not bypass a guard.
+schema admission checks validate the final effective overlay. On upgrade, any
+derived stock runner layer rebind or stale binding removal becomes part of that
+final snapshot before schema compatibility and timeout metadata are rendered.
+All preflight renders and the actual Helm application use that same overlay and
+the same existing generated/inferred overrides. A file may not bypass a guard.
 
 `CLUSTER-VALUES-FILES c4`: file credentials use the existing private values-file
 lifecycle and stay out of previews, JSON plans, diagnostic contents and argument
