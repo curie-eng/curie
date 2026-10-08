@@ -17,11 +17,14 @@ single peer without weakening the rest of the data-tier boundary.
   rule from the Valkey allow-ingress policy. Keep the Valkey default-deny policy,
   the release app peer and its Valkey port, every other store policy, and all
   other NetworkPolicies unchanged.
-- A chart values set that omits the new key, including one retained from a
-  release created before the key existed and upgraded with `--reuse-values`,
-  retains the current peer through the chart default.
-- Explicit non-boolean values fail chart validation. Do not silently coerce a
-  string, number, or other type into the opt-out.
+- A values set that omits the new key retains the current peer. This includes
+  a legacy release upgraded with `--reuse-values`: the template defaults an
+  absent value to `true`, since Helm uses the old chart's values rather than
+  the new chart defaults for that upgrade mode.
+- Explicit strings, numbers, arrays, and objects fail chart validation. Helm
+  coalesces an explicit YAML `null` to the same absent value before schema
+  validation, so `null` follows the absent/default-on behavior; this chart does
+  not promise to reject it. Operators must use literal `false` to opt out.
 - `security.dataTierNetworkPolicy.enabled: false` keeps its existing behavior
   of disabling the entire data-tier rail.
 - Keep the caller-proxy preflight and all Helm-owned NetworkPolicy verification
@@ -35,9 +38,22 @@ single peer without weakening the rest of the data-tier boundary.
 2. Explicit `false` removes only that peer and its port rule. It preserves the
    release app peer, Valkey default-deny policy, other data-tier policies, and
    all other rendered NetworkPolicies.
-3. Explicit invalid types fail rendering, while an old values set without the
-   new key retains current behavior.
+3. Explicit string, number, array, and object types fail rendering. A legacy
+   values shape with no new key renders the existing peer under a simulated
+   `--reuse-values` upgrade; explicit `null` follows the same default-on
+   behavior because Helm coalesces it to absence.
 4. The existing tenant network-boundary post-render verification passes against
    the opt-out render. Keep its output and tenant details out of public artifacts.
 5. No caller-proxy preflight or Helm-owned NetworkPolicy verification is
    removed or weakened.
+
+## Recorded implementation ruling
+
+The chart schema cannot distinguish an omitted value from YAML `null` after
+Helm coalescing. Requiring the key rejects legacy `--reuse-values` upgrades;
+making it optional means `null` becomes absence. Preserve upgrade compatibility:
+absence and `null` both default to the existing allow rule, and opt-out requires
+literal boolean `false`. This was confirmed with Helm 3.18.2 by replacing the
+candidate chart's `values.yaml` with the imported `curie-public/main` chart
+values, and by rendering candidate-chart overlays with the nested property
+omitted and set to `null`.
