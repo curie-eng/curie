@@ -149,10 +149,13 @@ Edit "Where you work" in [`skills/mean-tester/SKILL.md`](skills/mean-tester/SKIL
 - how many new threads a campaign may open per 15 minutes, how many follow-ups
   a thread may carry, and the turn budget (see "A campaign").
 
-Every probe only reads or asks. The tester never asks for an action, even on a
-test installation and even when the action is approval gated. It never creates
-or resolves an approval card, and it never attaches a file (ADR 0172 decision
-5, tightened by #3043).
+Read-or-ask remains the default. On an operator-declared test installation,
+ADR 0202 permits a listed driver's marked actions after its own root ping's
+first target reply confirms admission. Every action carries `[test action]`
+immediately after the target mention. An approve/reject reply belongs only to
+the native target card in the tester's own thread. State checks use declared
+read access; the tester gains no API key or additional tool permissions.
+Attachments and non-approver button clicks remain unsupported and blocked.
 
 The sandbox needs egress to Slack's API, and to GitHub's API when a repository
 is listed. Add one `agentSandbox.connectorEgress.<agent>` entry per CIDR, for
@@ -279,30 +282,32 @@ then an invented fact, then a failure text, then a wrong answer, then UNCLEAR.
 It counts each kind of thread and carries eval cases for the worst three FAILs,
 all in one Slack reply of under 3,000 characters.
 
-## Validator slice 1
+## Validator gate
 
 <!-- @spec VALIDATOR-README-1 -->
-A validation campaign runs a target-owned `acceptance/cases.json` fixed suite
-before invented probes, reports each criterion's executed cases and gaps, and
-plans 2–4 realistic user sessions. It grades read-or-ask steps from the user's
-seat. Attachments, actions, card resolution and state checks remain
-`BLOCKED: slice 2`, even on a marked installation. A missing or malformed suite,
-UNCLEAR, incomplete repeats or blocked steps cannot become PASS or full GO.
+Run the target-owned `acceptance/cases.json` before invented probes and plan
+2–4 realistic scenario sessions. The bundled `mean-tester-gate` computes the
+verdict from each fixed repeat, scenario step and planned probe; copy its
+`Ship:`, `Coverage:` and `Ledger:` lines unchanged. Missing suites, UNCLEAR,
+unrun cases and unsupported dependencies never become PASS.
 
-The ship verdict comes from the bundle's gate, [`gate/mean_tester_gate.py`](gate/mean_tester_gate.py),
-which the runner layer installs as `mean-tester-gate`. It validates the suite,
-records each judged probe and computes the verdict; the report quotes it. A
-suite with no action-bearing case can receive `GO (read-only scope)` when
-every case, repeat, scenario step and other recorded or planned probe passes. A suite with actions,
-attachments, card actions or state checks stays NO-GO until slice 2.
+Readonly campaigns retain `GO (read-only scope)`. An admitted campaign can
+receive `GO (action scope)` only with the actual marked probes, own-thread
+cards and declared read observations, verified restoration preserving base
+content, every test/production configuration difference explained, and an
+actual post-deploy readonly production smoke. Pre-deploy reports stay NO-GO.
+No installation name or caller assertion substitutes for the own-ping check.
 
-See [the validator design](docs/VALIDATOR.md) for the separate suite format,
-configuration comparison, smoke, snapshot/restore and fault-injection contracts,
-and [phase 0 evidence](docs/PHASE-0.md) for approval and attachment limitations.
-The [illustrative suite](acceptance/cases.json) is sample data for a fictional
-target; the tester's own grading regressions remain in `evals/cases.json`.
-Human and campaign findings become permanent case drafts for a maintainer to
-commit. The shipped tool permissions and read-or-ask rule remain unchanged.
+The gate only checks driver-supplied observations; it neither attests identity
+nor authorizes actions. Preserve bounded credential-free projections and
+fingerprints. Never put whole configurations, sealed snapshots or secrets in
+its ledger/report. Oversize continuation checkpoints are explicit NO-GO gaps,
+never truncated evidence. See [the validator contract](docs/VALIDATOR.md) for
+JSON inputs and [the skill](skills/mean-tester/SKILL.md) for the exact sequence.
+[Phase 0](docs/PHASE-0.md) remains historical evidence, not current authority.
+The shipped illustrative suite requires an unsupported upload and stays NO-GO;
+it is sample data, not another target's acceptance suite. The platform's frozen
+eval format and this bundle's seven-tool policy are unchanged.
 
 ## Models
 
@@ -323,18 +328,25 @@ misleading tool-call
 inventories presented as changes, replies that leave their Slack thread,
 settled approval cards that still look pending, approval messages in the
 wrong order, and a capability the target denies that only a source spec
-declares (UNCLEAR) against one a deployed spec declares (FAIL). Approval cases are recorded exchanges only. The tester never
-creates a card to exercise them. Run the cases with a model credential:
+declares (UNCLEAR) against one a deployed spec declares (FAIL). These evals judge recorded exchanges. Live marked-action qualification is
+a separate run against an admitted installation; a recorded exchange is not
+proof of a live card or state change. From the bundle directory, run the cases
+with a model credential and the example runner image built above. Set
+`MEAN_TESTER_RUNNER_IMAGE` to that image's immutable reference and `CURIE_MODEL`
+to the model you want to evaluate:
 
 ```bash
-curie skill eval --plugin-dir examples/mean-tester
+cd examples/mean-tester
+curie skill up --image "$MEAN_TESTER_RUNNER_IMAGE" --model "$CURIE_MODEL"
+curie skill eval --cases evals/cases.json
+curie skill down
 ```
 
 ## What it will not do
 
-- Resolve, approve or reject any approval card.
-- Ask a target to perform an action or create an approval card.
-- Change anything about its target, or file anything.
+- Press a Slack button or resolve a card outside its admitted own-thread campaign.
+- Send unmarked actions, or actions before its own admission check.
+- Fix the target, change its configuration or file an issue.
 - Reply in any thread but the ones its own probes opened, react, or read Slack
   users: the tool policy allows exactly the seven tools listed in
   [`docs/PERMISSION-MAP.md`](docs/PERMISSION-MAP.md).

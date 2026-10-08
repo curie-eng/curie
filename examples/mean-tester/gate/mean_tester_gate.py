@@ -22,7 +22,9 @@ import hashlib
 import json
 import re
 import sys
+import time
 import zlib
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +55,7 @@ MAX_REPEAT = 100
 MIN_SCENARIOS = 2
 MAX_SCENARIOS = 4
 TOKEN_PREFIX = "mt1"
+MAX_TOKEN_CHARS = 1800
 CODES = {"PASS": "P", "FAIL": "F", "UNCLEAR": "U", "BLOCKED": "B"}
 VERDICTS_BY_CODE = {code: verdict for verdict, code in CODES.items()}
 
@@ -186,6 +189,277 @@ def _action_reason(case: dict[str, Any], flagged: set[str]) -> str | None:
     return None
 
 
+# These are campaign observations, never credentials or platform authority.
+# The gate does no network I/O, snapshot writes, restores or approval resolves.
+def _require(condition: bool, reason: str) -> None:
+    if not condition:
+        raise Refused(reason)
+
+
+def _at(value: Any) -> Decimal:
+    try:
+        _require(not isinstance(value, bool), "invalid observation time")
+        result = Decimal(str(value))
+        _require(
+            result.is_finite() and 0 < result <= Decimal(str(time.time())),
+            "invalid or future observation time",
+        )
+        return result
+    except InvalidOperation as exc:
+        raise Refused("invalid observation time") from exc
+
+
+def _digest(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _read_evidence(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise Refused(f"cannot read evidence: {exc}") from exc
+    _require(isinstance(data, dict), "evidence must be an object")
+    return data
+
+
+def _authored(message: dict[str, Any], evidence: dict[str, Any], who: str) -> bool:
+    return (
+        message.get("user") == evidence[f"{who}_user"]
+        and message.get("bot_id") == evidence[f"{who}_bot"]
+    )
+
+
+def _admission(evidence: dict[str, Any], ledger: dict[str, Any]) -> dict[str, Any]:
+    _require(
+        evidence.get("campaign") == ledger["campaign"] and evidence.get("suite") == ledger["suite"],
+        "admission belongs to another campaign or suite",
+    )
+    for key in ("channel", "driver_user", "driver_bot", "target_user", "target_bot"):
+        _require(_nonempty_str(evidence.get(key)), f"admission needs {key}")
+    _require(
+        evidence["driver_user"] != evidence["target_user"]
+        and evidence["driver_bot"] != evidence["target_bot"],
+        "driver and target must differ",
+    )
+    window = evidence.get("window_seconds")
+    _require(
+        isinstance(window, int) and not isinstance(window, bool) and 1 <= window <= 60,
+        "admission window must be 1 to 60 seconds",
+    )
+    page = evidence.get("thread", {})
+    _require(
+        isinstance(page, dict)
+        and page.get("ok") is True
+        and page.get("has_more") is False
+        and not page.get("response_metadata", {}).get("next_cursor"),
+        "admission needs a complete thread read",
+    )
+    messages = page.get("messages")
+    _require(
+        isinstance(messages, list)
+        and len(messages) >= 2
+        and all(isinstance(m, dict) for m in messages),
+        "admission needs the ping and first reply",
+    )
+    messages = sorted(messages, key=lambda m: _at(m.get("ts")))
+    root, first = messages[:2]
+    root_ts = root["ts"]
+    _require(len({m.get("ts") for m in messages}) == len(messages), "duplicate admission messages")
+    _require(
+        root.get("thread_ts", root_ts) == root_ts
+        and _authored(root, evidence, "driver")
+        and root.get("text") == f"<@{evidence['target_user']}> [test action] ping",
+        "not the driver's own root ping",
+    )
+    _require(
+        all(m.get("thread_ts") == root_ts for m in messages[1:]), "reply is outside the ping thread"
+    )
+    _require(
+        _authored(first, evidence, "target")
+        and first.get("text")
+        == f"This installation accepts test actions from <@{evidence['driver_user']}>."
+        and 0 < _at(first["ts"]) - _at(root_ts) <= window,
+        "the first reply is not the target's timely admission",
+    )
+    snapshot = evidence.get("snapshot", {})
+    _require(
+        isinstance(snapshot, dict)
+        and snapshot.get("source") == "read-own-observation"
+        and isinstance(snapshot.get("content"), dict)
+        and bool(snapshot["content"])
+        and _nonempty_str(snapshot.get("restore_contract")),
+        "snapshot or restore contract is unavailable",
+    )
+    _require(_at(snapshot.get("at")) < _at(root_ts), "snapshot must precede the action campaign")
+    return {**evidence, "thread": {**page, "messages": messages}}
+
+
+def _action_observation(
+    evidence: dict[str, Any], admission: dict[str, Any], case: dict[str, Any] | None, verdict: str
+) -> None:
+    _require(
+        evidence.get("channel") == admission["channel"], "action is outside the admitted channel"
+    )
+    probe = evidence.get("probe", {})
+    _require(
+        isinstance(probe, dict) and _authored(probe, admission, "driver"),
+        "action probe has the wrong author",
+    )
+    prefix = f"<@{admission['target_user']}> [test action] [mean test {admission['campaign']}] "
+    _require(
+        isinstance(probe.get("text"), str) and probe["text"].startswith(prefix),
+        "action probe is unmarked",
+    )
+    if case is not None:
+        _require(
+            probe["text"] == prefix + case["probe"], "action probe differs from the fixed case"
+        )
+    admitted_at = _at(admission["thread"]["messages"][1]["ts"])
+    _require(_at(probe.get("ts")) > admitted_at, "action precedes admission")
+    _require(_at(probe["ts"]) - admitted_at <= 600, "action admission window expired")
+    root_ts = probe.get("thread_ts", probe["ts"])
+    # A follow-up must retain the original driver-authored root observation.
+    if root_ts != probe["ts"]:
+        root = evidence.get("root", {})
+        _require(
+            isinstance(root, dict)
+            and root.get("ts") == root_ts
+            and root.get("thread_ts", root_ts) == root_ts
+            and _authored(root, admission, "driver"),
+            "action is outside an owned thread",
+        )
+    last = _at(probe["ts"])
+    action = case["card_action"] if case is not None else evidence.get("card_action")
+    if action is not None:
+        _require(
+            action in {"approve", "reject"},
+            "non-approver clicks need an unavailable human transport",
+        )
+        card, decision = evidence.get("card", {}), evidence.get("decision", {})
+        _require(
+            isinstance(card, dict)
+            and isinstance(decision, dict)
+            and _authored(card, admission, "target")
+            and card.get("thread_ts", card.get("ts")) == root_ts,
+            "card does not belong to the target and owned thread",
+        )
+        buttons = [
+            element
+            for block in card.get("blocks", [])
+            if isinstance(block, dict)
+            for element in block.get("elements", [])
+            if isinstance(element, dict) and element.get("type") == "button"
+        ]
+        ids = {b.get("value") for b in buttons if b.get("action_id") == "curie-approval-approve"}
+        ids &= {b.get("value") for b in buttons if b.get("action_id") == "curie-approval-reject"}
+        _require(
+            len(ids) == 1 and all(_nonempty_str(i) for i in ids),
+            "card has no unique pending approval",
+        )
+        approval_id = next(iter(ids))
+        _require(
+            _authored(decision, admission, "driver")
+            and decision.get("thread_ts") == root_ts
+            and decision.get("text")
+            == f"<@{admission['target_user']}> [test action] {action} {approval_id}",
+            "approval reply does not match the case's card action",
+        )
+        _require(
+            last < _at(card.get("ts")) < _at(decision.get("ts")),
+            "card decision has the wrong order",
+        )
+        last = _at(decision["ts"])
+    expected = case["expected_state"] if case is not None else evidence.get("expected_state")
+    state = evidence.get("state", {})
+    if expected is not None:
+        _require(
+            isinstance(state, dict)
+            and state.get("source") == "read-own-observation"
+            and isinstance(state.get("content"), dict)
+            and bool(state["content"]),
+            "state needs an own read observation",
+        )
+        _require(_at(state.get("at")) > last, "state read precedes the action")
+        _require(
+            _at(state["at"]) - _at(probe["ts"]) <= 180,
+            "state observation is outside the probe's 180-second window",
+        )
+        if verdict == "PASS":
+            _require(
+                bool(expected)
+                and all(
+                    k in state["content"] and _digest(state["content"][k]) == _digest(v)
+                    for k, v in expected.items()
+                ),
+                "observed state does not match expected_state",
+            )
+
+
+def _closeout(evidence: dict[str, Any], action: dict[str, Any]) -> None:
+    snapshot = action["admission"]["snapshot"]
+    restored = evidence.get("restoration", {})
+    _require(
+        isinstance(restored, dict)
+        and restored.get("source") == "read-own-observation"
+        and _digest(restored.get("content")) == _digest(snapshot["content"])
+        and restored.get("cleanup_failures") == []
+        and restored.get("pending_cards") == [],
+        "restoration, pending cards or cleanup failed",
+    )
+    latest = max(
+        (
+            max(
+                _at(o["probe"]["ts"]),
+                _at(o.get("state", {}).get("at", o["probe"]["ts"])),
+                _at(o.get("decision", {}).get("ts", o["probe"]["ts"])),
+            )
+            for o in action["observations"].values()
+        ),
+        default=_at(snapshot["at"]),
+    )
+    _require(_at(restored.get("at")) > latest, "restoration precedes recorded actions")
+    config = evidence.get("configuration", {})
+    _require(
+        isinstance(config, dict)
+        and all(isinstance(config.get(k), dict) for k in ("test", "production", "explanations")),
+        "configuration diff is unavailable",
+    )
+    differences = {
+        k
+        for k in set(config["test"]) | set(config["production"])
+        if _digest(config["test"].get(k)) != _digest(config["production"].get(k))
+        or (k in config["test"]) != (k in config["production"])
+    }
+    _require(
+        config["test"].get("testInstallation") is True
+        and config["production"].get("testInstallation") is False,
+        "configuration must show marked testing and unmarked production",
+    )
+    _require(
+        set(config["explanations"]) == differences
+        and all(_nonempty_str(v) for v in config["explanations"].values()),
+        "configuration differences are unexplained",
+    )
+    deploy, smoke = evidence.get("deployment", {}), evidence.get("smoke", {})
+    _require(
+        isinstance(deploy, dict)
+        and isinstance(smoke, dict)
+        and _nonempty_str(deploy.get("identity"))
+        and smoke.get("deployment") == deploy["identity"]
+        and smoke.get("read_only") is True
+        and smoke.get("verdict") == "PASS"
+        and _nonempty_str(smoke.get("probe"))
+        and _nonempty_str(smoke.get("reply")),
+        "production read-only smoke is unavailable",
+    )
+    _require(
+        _at(restored["at"]) < _at(deploy.get("at")) < _at(smoke.get("at")),
+        "smoke is not an actual post-deploy observation",
+    )
+
+
 def intake(path: Path, blob_sha: str | None, action_cases: list[str]) -> dict[str, Any]:
     """Read and classify a suite. Raises Refused for an unknown --action-case."""
     result: dict[str, Any] = {
@@ -215,6 +489,7 @@ def intake(path: Path, blob_sha: str | None, action_cases: list[str]) -> dict[st
             data = data[:-1]
             path.write_bytes(data)
     result["suite_digest"] = hashlib.sha256(data).hexdigest()
+    result["suite_bytes"] = data.decode("utf-8", errors="replace")
     if blob_sha is not None and git_blob_sha(data) != blob_sha:
         result["errors"] = [
             "the suite file does not match the Git blob it was read from "
@@ -257,7 +532,7 @@ def intake(path: Path, blob_sha: str | None, action_cases: list[str]) -> dict[st
         )
     result["cases"] = cases
     result["blocked_by"] = reasons
-    result["scope"] = "action" if any(not c["eligible"] for c in cases) else "read-only"
+    result["scope"] = "action" if reasons else "read-only"
     result["plan"] = [
         {"case": c["id"], "repeat": r}
         for c in cases
@@ -288,13 +563,16 @@ def _empty_ledger(digest: str, campaign: str) -> dict[str, Any]:
         "cases": {},
         "scenarios": {},
         "probes": {},
+        "actions": None,
     }
 
 
 def _check_ledger(ledger: Any, info: dict[str, Any], campaign: str) -> dict[str, Any]:
     """Refuse a ledger that is not exactly what this gate writes for `campaign`."""
-    if not isinstance(ledger, dict) or set(ledger) != set(_empty_ledger("", "")):
+    fields = set(_empty_ledger("", ""))
+    if not isinstance(ledger, dict) or set(ledger) not in (fields, fields - {"actions"}):
         raise Refused("the ledger does not have the gate's shape")
+    ledger.setdefault("actions", None)
     if ledger["suite"] != info["suite_digest"]:
         raise Refused("the ledger belongs to a different suite")
     if ledger["campaign"] != campaign:
@@ -336,6 +614,63 @@ def _check_ledger(ledger: Any, info: dict[str, Any], campaign: str) -> dict[str,
             or not (verdict is None or verdict in CASE_VERDICTS)
         ):
             raise Refused(f"the ledger has a bad probe record {label!r}")
+    action = ledger["actions"]
+    if action is not None:
+        _require(
+            isinstance(action, dict) and set(action) == {"admission", "observations", "closeout"},
+            "invalid action ledger",
+        )
+        _admission(action["admission"], ledger)
+        _require(isinstance(action["observations"], dict), "invalid action observations")
+        suite = json.loads(info["suite_bytes"])
+        cases_by_id = {c["id"]: c for c in suite["cases"]}
+        for label, observation in action["observations"].items():
+            _require(isinstance(observation, dict), "invalid action observation")
+            cid, repeat = observation.get("case"), observation.get("repeat")
+            if cid is not None:
+                _require(
+                    cid in cases_by_id
+                    and isinstance(repeat, int)
+                    and not isinstance(repeat, bool)
+                    and label == f"case:{cid}#{repeat}"
+                    and 1 <= repeat <= repeats[cid],
+                    "invalid action case record",
+                )
+                verdict = ledger["cases"].get(cid, [None] * repeats[cid])[repeat - 1]
+            else:
+                _require(label.startswith(("scenario:", "probe:")), "invalid action step or probe")
+                if label.startswith("scenario:"):
+                    name, step = label.removeprefix("scenario:").rsplit("#", 1)
+                    _require(
+                        name in scenarios
+                        and step.isdigit()
+                        and 1 <= int(step) <= len(scenarios[name]),
+                        "invalid action scenario step",
+                    )
+                    verdict = scenarios[name][int(step) - 1]
+                else:
+                    verdict = probes[label.removeprefix("probe:")]
+            allowed = STEP_VERDICTS if label.startswith("scenario:") else CASE_VERDICTS
+            _require(verdict in allowed, "action has no recorded verdict")
+            observed_admission = observation.get("admission", action["admission"])
+            _admission(observed_admission, ledger)
+            _require(
+                all(
+                    _digest(observed_admission.get(k)) == _digest(action["admission"].get(k))
+                    for k in (
+                        "channel",
+                        "driver_user",
+                        "driver_bot",
+                        "target_user",
+                        "target_bot",
+                        "snapshot",
+                    )
+                ),
+                "observation belongs to a different installation or baseline",
+            )
+            _action_observation(observation, observed_admission, cases_by_id.get(cid), verdict)
+        if action["closeout"] is not None:
+            _closeout(action["closeout"], action)
     return ledger
 
 
@@ -368,14 +703,31 @@ def _campaign(value: str) -> str:
 def _open(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     """The suite's intake and the campaign's ledger, with every flag ever given.
 
-    Flags only accumulate: a case flagged once as asking for an action stays
-    blocked for the rest of the campaign, whatever later commands pass.
+    Flags only accumulate: a case flagged once stays action-bearing for the
+    campaign. Admission may enable supported actions, never readonly bypass.
     """
     campaign = _campaign(args.campaign)
     info = _ready(intake(args.suite, getattr(args, "blob_sha", None), args.action_case))
     ledger = load_ledger(args.ledger, info, campaign)
     ledger["flagged"] = sorted(set(ledger["flagged"]) | set(args.action_case))
-    return intake(args.suite, None, ledger["flagged"]), ledger
+    return _eligible(intake(args.suite, None, ledger["flagged"]), ledger), ledger
+
+
+def _eligible(info: dict[str, Any], ledger: dict[str, Any]) -> dict[str, Any]:
+    if ledger["actions"] is None:
+        return info
+    info["scope"] = "action"
+    suite = json.loads(info["suite_bytes"])
+    for case, raw in zip(info["cases"], suite["cases"], strict=True):
+        if not raw["attachments"] and raw["card_action"] != "click-as-non-approver":
+            case.update(eligible=True, blocked=None)
+    info["plan"] = [
+        {"case": c["id"], "repeat": r}
+        for c in info["cases"]
+        if c["eligible"]
+        for r in range(1, c["repeat"] + 1)
+    ]
+    return info
 
 
 def _codes(row: list[str | None]) -> str:
@@ -395,6 +747,8 @@ def encode_token(ledger: dict[str, Any], cases: list[dict[str, Any]]) -> str:
         "s": {name: _codes(steps) for name, steps in sorted(ledger["scenarios"].items())},
         "p": {label: CODES[v] if v else "." for label, v in sorted(ledger["probes"].items())},
     }
+    if ledger["actions"] is not None:
+        compact["a"] = ledger["actions"]
     raw = json.dumps(compact, separators=(",", ":"), sort_keys=True).encode()
     payload = base64.urlsafe_b64encode(zlib.compress(raw, 9)).decode().rstrip("=")
     head = f"{TOKEN_PREFIX}.{ledger['suite'][:12]}.{payload}"
@@ -421,6 +775,7 @@ def decode_token(token: str, info: dict[str, Any]) -> dict[str, Any]:
         if len(compact["c"]) != len(cases):
             raise ValueError("case count differs from the suite")
         ledger = _empty_ledger(info["suite_digest"], compact["id"])
+        ledger["actions"] = compact.get("a")
         ledger["flagged"] = list(compact["f"])
         for case, row in zip(cases, compact["c"], strict=True):
             if any(ch != "." for ch in row):
@@ -459,6 +814,21 @@ def ship_verdict(
             + ", ".join(f"{c['id']} {info['blocked_by'][c['id']]}" for c in blocked)
             + "); full GO is not available"
         )
+    if info["scope"] == "action":
+        action = ledger["actions"]
+        if action is None or action["closeout"] is None:
+            reasons.append(
+                "action closeout missing: restoration, configuration diff "
+                "and post-deploy read-only production smoke"
+            )
+        for case in info["cases"]:
+            if case["id"] in info["blocked_by"] and case["eligible"]:
+                for repeat in range(1, case["repeat"] + 1):
+                    if (
+                        action is None
+                        or f"case:{case['id']}#{repeat}" not in action["observations"]
+                    ):
+                        reasons.append(f"action observation missing: {case['id']}#{repeat}")
 
     tallies = {"PASS": 0, "FAIL": 0, "UNCLEAR": 0, "NOT RUN": 0}
     bad: dict[str, list[str]] = {"FAIL": [], "UNCLEAR": [], "NOT RUN": []}
@@ -539,8 +909,68 @@ def ship_verdict(
 
 def cmd_intake(args: argparse.Namespace) -> int:
     info = intake(args.suite, args.blob_sha, args.action_case)
-    print(json.dumps(info, indent=1))
+    print(json.dumps({k: v for k, v in info.items() if k != "suite_bytes"}, indent=1))
     return EXIT_GO if info["status"] == "READY" else EXIT_NO_GO
+
+
+def cmd_admit(args: argparse.Namespace) -> int:
+    info, ledger = _open(args)
+    action = ledger["actions"]
+    _require(
+        (action is None and not args.refresh)
+        or (action is not None and args.refresh and action["closeout"] is None),
+        "campaign admission is already recorded or refresh has no open campaign",
+    )
+    admission = _admission(_read_evidence(args.evidence), ledger)
+    first = admission["thread"]["messages"][1]
+    _require(
+        Decimal(str(time.time())) - _at(first["ts"]) <= admission["window_seconds"],
+        "admission observation has expired; start with a fresh own ping",
+    )
+    if action is None:
+        ledger["actions"] = {"admission": admission, "observations": {}, "closeout": None}
+    else:
+        _require(
+            all(
+                _digest(admission.get(k)) == _digest(action["admission"].get(k))
+                for k in (
+                    "channel",
+                    "driver_user",
+                    "driver_bot",
+                    "target_user",
+                    "target_bot",
+                    "snapshot",
+                )
+            ),
+            "refresh cannot change installation or original baseline",
+        )
+        _require(
+            _at(admission["thread"]["messages"][0]["ts"])
+            > _at(action["admission"]["thread"]["messages"][0]["ts"]),
+            "refresh needs a new own root ping",
+        )
+        for observation in action["observations"].values():
+            observation.setdefault("admission", action["admission"])
+        action["admission"] = admission
+    save_ledger(args.ledger, ledger)
+    eligible = _eligible(info, ledger)
+    print(json.dumps({k: v for k, v in eligible.items() if k != "suite_bytes"}, indent=1))
+    return EXIT_GO
+
+
+def cmd_closeout(args: argparse.Namespace) -> int:
+    _, ledger = _open(args)
+    action = ledger["actions"]
+    _require(
+        action is not None and action["closeout"] is None,
+        "closeout needs an open admitted campaign",
+    )
+    evidence = _read_evidence(args.evidence)
+    _closeout(evidence, action)
+    action["closeout"] = evidence
+    save_ledger(args.ledger, ledger)
+    print("recorded action closeout; verdict still checks all cases, scenarios and probes")
+    return EXIT_GO
 
 
 def cmd_scenario(args: argparse.Namespace) -> int:
@@ -642,6 +1072,38 @@ def cmd_record(args: argparse.Namespace) -> int:
         label = _record_step(args, ledger)
     else:
         label = _record_probe(args, ledger)
+    raw_case = None
+    if args.case is not None:
+        raw_case = next(c for c in json.loads(info["suite_bytes"])["cases"] if c["id"] == args.case)
+    needs_action = args.action or (args.case is not None and args.case in info["blocked_by"])
+    if needs_action:
+        action = ledger["actions"]
+        _require(
+            action is not None and action["closeout"] is None,
+            "action needs an open admitted campaign",
+        )
+        _require(args.evidence is not None, "action record requires observed evidence")
+        admitted = _at(action["admission"]["thread"]["messages"][1]["ts"])
+        _require(
+            Decimal(str(time.time())) - admitted <= 600,
+            "admission has expired for a new action record; obtain a fresh own ping",
+        )
+        observation = _read_evidence(args.evidence)
+        _action_observation(observation, action["admission"], raw_case, args.verdict)
+        kind = (
+            "case"
+            if args.case is not None
+            else "scenario"
+            if args.scenario is not None
+            else "probe"
+        )
+        action["observations"][f"{kind}:{label}"] = {
+            **observation,
+            "case": args.case,
+            "repeat": args.repeat,
+        }
+    elif args.evidence is not None:
+        raise Refused("action evidence needs an action case or --action step/probe")
     save_ledger(args.ledger, ledger)
     print(f"recorded {label} {args.verdict}")
     return EXIT_GO
@@ -665,15 +1127,22 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         print(f"Ship: NO-GO — gate refused: {exc}")
         raise
     go, reasons, coverage = ship_verdict(info, ledger, args.gap)
-    if go:
-        print(
-            "Ship: GO (read-only scope) — every fixed case, repeat, scenario step and probe passed"
+    token = encode_token(ledger, info["cases"]) if ledger is not None else None
+    if token is not None and len(token) > MAX_TOKEN_CHARS:
+        go = False
+        reasons.append(
+            "checkpoint exceeds the bounded report; retain private evidence "
+            "and report a continuation gap"
         )
+        token = None
+    if go:
+        scope = "action scope" if info["scope"] == "action" else "read-only scope"
+        print(f"Ship: GO ({scope}) — every fixed case, repeat, scenario step and probe passed")
     else:
         print("Ship: NO-GO — " + "; ".join(reasons))
     print(coverage)
-    if ledger is not None:
-        print(f"Ledger: {encode_token(ledger, info['cases'])}")
+    if token is not None:
+        print(f"Ledger: {token}")
     return EXIT_GO if go else EXIT_NO_GO
 
 
@@ -727,6 +1196,14 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--steps", type=int, required=True)
     p.set_defaults(run=cmd_scenario)
 
+    for command, handler in (("admit", cmd_admit), ("closeout", cmd_closeout)):
+        p = sub.add_parser(command, help=f"record action campaign {command} observations")
+        common(p, ledger=True)
+        p.add_argument("--evidence", type=Path, required=True)
+        if command == "admit":
+            p.add_argument("--refresh", action="store_true")
+        p.set_defaults(run=handler)
+
     p = sub.add_parser("plan", help="declare the invented probes a campaign plans to send")
     common(p, ledger=True)
     p.add_argument("--probe", action="append", required=True)
@@ -741,6 +1218,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--repeat", type=int)
     p.add_argument("--step", type=int)
     p.add_argument("--verdict", required=True)
+    p.add_argument("--evidence", type=Path)
+    p.add_argument("--action", action="store_true")
     p.set_defaults(run=cmd_record)
 
     p = sub.add_parser("verdict", help="aggregate the ledger into GO or NO-GO")
@@ -767,6 +1246,9 @@ def main(argv: list[str] | None = None) -> int:
         return int(args.run(args))
     except Refused as exc:
         print(f"refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    except (KeyError, TypeError, AttributeError, ValueError) as exc:
+        print(f"refused: malformed observation or ledger: {exc}", file=sys.stderr)
         return EXIT_REFUSED
 
 
