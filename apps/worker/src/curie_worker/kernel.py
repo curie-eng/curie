@@ -6036,6 +6036,9 @@ class Kernel:
                                 self._config.publication_git_command_timeout_seconds
                             ),
                             protected_paths=self._config.publication_protected_paths,
+                            allow_dependency_additions=(
+                                self._config.publication_allow_dependency_additions
+                            ),
                         )
                         outcome.publication_snapshot = snapshot
                     except WorkspacePreparationError as exc:
