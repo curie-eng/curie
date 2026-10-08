@@ -108,13 +108,13 @@ def test_the_bundle_image_pins_the_slack_server():
     assert "bless another authed third-party MCP server" not in platform
 
 
-def test_the_manifest_declares_the_three_secrets_and_no_approval_route():
+def test_the_manifest_requires_slack_and_keeps_github_optional_without_approval_route():
     manifest = _manifest()
     assert manifest["secrets"] == [
         "MEAN_TESTER_SLACK_BOT_TOKEN",
         "MEAN_TESTER_SLACK_TEAM_ID",
-        "GITHUB_PERSONAL_ACCESS_TOKEN",
     ]
+    assert manifest["optionalSecrets"] == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
     assert "approvalPolicy" not in manifest
     assert manifest["toolPolicy"]["approvalRequired"] == []
 

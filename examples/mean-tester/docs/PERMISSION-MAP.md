@@ -7,7 +7,8 @@ tool not named below is denied, including tools a server adds later.
 
 ## Credentials
 
-All three sit in the sandbox's environment, so any tool in the session could
+The two Slack declarations are required; the GitHub token is optional. Bound
+values sit in the sandbox's environment, so any tool in the session could
 read them. The tool policy limits which MCP tools run. It does not hide the
 credentials. Their own scope is the real bound.
 
@@ -15,7 +16,7 @@ credentials. Their own scope is the real bound.
 |---|---|---|
 | `MEAN_TESTER_SLACK_BOT_TOKEN` | `slack-mcp` | The tester's own app. It posts only where the app is invited. |
 | `MEAN_TESTER_SLACK_TEAM_ID` | `slack-mcp` | Not a credential; the server refuses to start without it. |
-| `GITHUB_PERSONAL_ACCESS_TOKEN` | `mcp-server-github` | Fine-grained, **Contents: Read**, the listed repositories only. With none listed, a token that can read no private repository. |
+| `GITHUB_PERSONAL_ACCESS_TOKEN` | `mcp-server-github` | Optional. Bind only for listed repository reads; fine-grained, **Contents: Read**, those repositories only. Slack-only campaigns need no GitHub token. |
 
 ## Writes
 
