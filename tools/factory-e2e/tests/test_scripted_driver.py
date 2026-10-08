@@ -95,7 +95,7 @@ def test_partial_resource_creation_failure_deletes_every_attempted_owned_resourc
             ("kind", "get", "clusters"),
             ("docker", "rm", "-f"),
             ("docker", "ps", "-aq"),
-        }:
+        } and argv[:2] != ("docker", "images"):
             raise AssertionError(f"unexpected external command: {argv}")
         return subprocess.CompletedProcess(argv, 0, output, "")
 

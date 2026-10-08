@@ -173,7 +173,7 @@ class ScriptedRun:
         self.forward: subprocess.Popen[str] | None = None
         self.cluster_attempted = False
         self.registry_attempted = False
-        self.local_tags: list[str] = []
+        self.registry_ref: str | None = None
         self.install_started: float | None = None
         self.deadline: float | None = None
         self.secrets = [os.environ.get("CURIE_FACTORY_RECORD_KEY")]
@@ -316,6 +316,7 @@ class ScriptedRun:
             timeout=300,
         )
         registry_ref = f"localhost:{registry_port}"
+        self.registry_ref = registry_ref
         config = self.workdir / "kind.yaml"
         config.write_text(
             "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n"
@@ -360,7 +361,6 @@ class ScriptedRun:
         # reads a registry and never the local daemon, so the base goes to the
         # run's own registry before the chart names it.
         runner_image = f"{registry_ref}/curie-runner"
-        self.local_tags.append(f"{runner_image}:latest")
         self.command("docker", "tag", "curie-runner:latest", f"{runner_image}:latest")
         self.command("docker", "push", f"{runner_image}:latest", timeout=900)
         github = _module("factory_github_stub", REPO_ROOT / "tools/github-stub/github_stub.py")
@@ -789,11 +789,20 @@ class ScriptedRun:
                     errors.append("owned registry remains after teardown")
             except Exception as exc:
                 errors.append(str(exc))
-        for tag in self.local_tags:
-            # The tag names a port of this run's deleted registry; the image
-            # itself stays under curie-runner:latest.
+        if self.registry_ref is not None:
+            # The pushed runner base and curie build's layer leave local tags
+            # naming this run's deleted registry; the images keep other names.
             try:
-                self.command("docker", "image", "rm", tag)
+                tags = self.command(
+                    "docker",
+                    "images",
+                    "--format",
+                    "{{.Repository}}:{{.Tag}}",
+                    "--filter",
+                    f"reference={self.registry_ref}/*",
+                ).split()
+                if tags:
+                    self.command("docker", "image", "rm", *tags)
             except Exception as exc:
                 errors.append(str(exc))
         # A killed key-generation docker client can leave its --rm container
