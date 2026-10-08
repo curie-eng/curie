@@ -2891,6 +2891,10 @@ security:
   # single-tenant single-node dev cluster; matters for the shared/production path.
   dataTierNetworkPolicy:
     enabled: true
+    # @spec docs/superpowers/specs/2026-10-08-mcp-connector-valkey-ingress-optout.md
+    # Keep the existing MCP connector peer by default. Set false only when
+    # connector proxies do not need to reach this release's in-chart Valkey.
+    allowMcpConnectorValkeyIngress: true
   # Default-on ingress isolation for Collector self-metrics. OTLP receivers
   # remain open to platform workloads and external senders on 4317/4318, and
   # the kubelet health probe remains admitted on 13133. The Prometheus endpoint
