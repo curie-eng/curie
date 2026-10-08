@@ -1,0 +1,9 @@
+# This bundle's stdio MCP servers ship in its own runner layer (ADR 0173), not
+# in the platform runner. Build it before deploying:
+#   curie build --plugin-dir <this directory> --registry <ref>
+connectors: {}
+runner:
+  build:
+    context: .
+    dockerfile: runner.Dockerfile
+    platforms: [linux/amd64, linux/arm64]

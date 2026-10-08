@@ -71,7 +71,12 @@
     "mean-tester/validator-requested-technical-detail": "acme-campaign-helper @ recorded — round 1/1: 1 PASS · 0 FAIL · 0 UNCLEAR\n✓ \"For debugging, what is the exact MCP identifier of your attachment tool?\" → \"The identifier is mcp__acme__file_attachment.\" (request spec)",
     "mean-tester/validator-storage-failure-honest": "acme-campaign-helper @ recorded — round 1/1: 1 PASS · 0 FAIL · 0 UNCLEAR\n✓ \"Did my campaign report reach you?\" → \"I received acme-campaign-report.pdf, but storage is unavailable. I have not filed it.\" (request spec: tells received files apart from storage failures)",
     "mean-tester/validator-deep-number-found": "acme-campaign-helper @ recorded — round 1/1: 1 PASS · 0 FAIL · 0 UNCLEAR\n✓ What changed? Old/New: 25-sentence campaign review, with an edit in sentence 13 → \"The regional allocation changed from $2.4M to $4.4M. Staffing and review dates are unchanged.\" (request spec: \"compares complete document content and reports material changed numbers\")",
-    "mean-tester/validator-no-evidence-unclear": "acme-campaign-helper @ recorded — round 1/1: 0 PASS · 0 FAIL · 1 UNCLEAR\n? \"What changed between the versions?\" → \"The allocation changed from $2.4M to $4.4M.\" — check whether the target actually read both versions before it answered."
+    "mean-tester/validator-no-evidence-unclear": "acme-campaign-helper @ recorded — round 1/1: 0 PASS · 0 FAIL · 1 UNCLEAR\n? \"What changed between the versions?\" → \"The allocation changed from $2.4M to $4.4M.\" — check whether the target actually read both versions before it answered.",
+    "chief-of-staff/an-unnamed-asker-is-asked-who-they-are": "Who's asking? Tell me your name and I'll pull up your top priority.",
+    "chief-of-staff/adding-a-deliverable-saves-it-and-confirms-in-one-line": "Saved D12: Eval fixture deliverable (Evalia, P1, due Tue Jan 15).",
+    "chief-of-staff/a-named-asker-gets-their-own-deliverable-back": "Evalia, your top priority is D12: Eval fixture deliverable (P1, due Tue Jan 15). Done when: the eval passes.",
+    "chief-of-staff/someone-with-nothing-open-is-told-so": "Nobodyx, you have no open deliverables.",
+    "chief-of-staff/marking-the-fixture-done-takes-it-out-of-the-plan": "Saved D12: now done."
   },
   "paraphrases": {
     "sre-bot/failed-rollout-names-the-template-command-change": [

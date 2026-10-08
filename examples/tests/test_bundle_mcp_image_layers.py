@@ -83,7 +83,8 @@ def _runner_layer_errors(text: str, commands: set[str], bundle_name: str) -> lis
 
 def test_bundle_mcp_servers_are_installed_by_bundle_runner_layers() -> None:
     declared = _declared_commands()
-    assert set(declared) == {"github-issues", "mean-tester"}
+    assert set(declared) == {"chief-of-staff", "github-issues", "mean-tester"}
+    assert declared["chief-of-staff"] == {"mcp-server-github"}
     assert declared["github-issues"] == {"mcp-server-github"}
     assert declared["mean-tester"] == {"slack-mcp", "mcp-server-github"}
     for name, commands in declared.items():
