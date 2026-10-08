@@ -874,13 +874,17 @@ _EARLY_STOP_PROMPT = (
     "Your last turn ended before any work was reported or published. Start the "
     "work on the issue now, report progress as you go, and call publish_changes "
     "only when the change is complete and reviewed. If it cannot be done, post "
-    "the skill's `Could not complete:` explanation instead."
+    "the skill's `Could not complete:` explanation instead. If this request needs "
+    "no change to the open pull request, reply beginning with `No changes needed:` "
+    "and give the reason."
 )
 _UNPUBLISHED_PROMPT = (
     "Your last turn ended before the work was published. Continue from the last "
     "phase and round you reported. Call publish_changes only when the work is "
     "complete and reviewed. If you cannot finish, post the skill's "
-    "`Could not complete:` explanation instead."
+    "`Could not complete:` explanation instead. If this request needs no change "
+    "to the open pull request, reply beginning with `No changes needed:` and give "
+    "the reason."
 )
 
 
