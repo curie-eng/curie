@@ -121,7 +121,8 @@ def _attempted_resources(run: sk.ScriptedRun) -> None:
 
 
 def test_remaining_owned_cluster_overrides_a_successful_scenario(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(sk.ScriptedRun, "execute", _attempted_resources)
@@ -156,7 +157,8 @@ def test_remaining_owned_cluster_overrides_a_successful_scenario(
 
 
 def test_cluster_delete_error_does_not_prevent_registry_deletion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(sk.ScriptedRun, "execute", _attempted_resources)
@@ -180,7 +182,8 @@ def test_cluster_delete_error_does_not_prevent_registry_deletion(
 
 
 def test_unexpected_real_model_request_fails_and_records_evidence_after_endpoint_cleanup(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Use the real HTTP replay endpoint; no model or teardown fact is supplied."""
 
@@ -260,7 +263,8 @@ def _successful_cleanup_commands(
 
 
 def _assert_remaining_teardown_attempted(
-    run: sk.ScriptedRun, calls: list[tuple[str, ...]],
+    run: sk.ScriptedRun,
+    calls: list[tuple[str, ...]],
 ) -> None:
     assert ("kind", "delete", "cluster", "--name", run.cluster) in calls
     assert ("docker", "rm", "-f", run.registry) in calls
@@ -268,7 +272,8 @@ def _assert_remaining_teardown_attempted(
 
 
 def test_forward_termination_error_does_not_interrupt_remaining_teardown(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run = _cleanup_run(tmp_path, monkeypatch)
     calls = _successful_cleanup_commands(monkeypatch)
@@ -294,7 +299,8 @@ def test_forward_termination_error_does_not_interrupt_remaining_teardown(
 
 
 def test_endpoint_probe_error_does_not_interrupt_cluster_and_registry_teardown(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_module = sk._module(
         "factory_cleanup_model_script", REPO_ROOT / "tools/model-script/model_script.py"
@@ -322,7 +328,8 @@ def test_endpoint_probe_error_does_not_interrupt_cluster_and_registry_teardown(
 
 
 def test_failed_registry_delete_and_verification_still_remove_owned_workdir(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     run = _cleanup_run(tmp_path, monkeypatch)
     run.cluster_attempted = False
@@ -343,3 +350,32 @@ def test_failed_registry_delete_and_verification_still_remove_owned_workdir(
     assert run.evidence["cleanup_verified"] is False
     assert ("docker", "rm", "-f", run.registry) in calls
     assert run.workdir is not None and not run.workdir.exists()
+
+
+def test_registry_publishes_the_explicit_port_its_mirror_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Joining the kind network reassigned an ephemeral port on a real host."""
+
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.ScriptedRun, "prerequisites", lambda _self: None)
+    published: list[str] = []
+    mirrors: list[str] = []
+
+    def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if argv[:2] == ("docker", "run"):
+            published.append(argv[argv.index("-p") + 1])
+        elif argv[:3] == ("kind", "create", "cluster"):
+            mirrors.append(Path(argv[argv.index("--config") + 1]).read_text())
+            return subprocess.CompletedProcess(argv, 1, "", "stop after create")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
+    assert len(published) == 1
+    host, port, container = published[0].split(":")
+    assert (host, container) == ("127.0.0.1", "5000")
+    assert 0 < int(port) < 32768
+    assert f'registry.mirrors."localhost:{port}"' in mirrors[0]

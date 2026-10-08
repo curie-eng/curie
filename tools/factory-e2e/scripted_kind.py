@@ -8,6 +8,7 @@ import importlib.util
 import ipaddress
 import json
 import os
+import random
 import shutil
 import signal
 import socket
@@ -125,6 +126,19 @@ def verdict(preflight_outcome: str, publication_paths: list[str]) -> int:
     except scenario.ScenarioAssertionError:
         return fe.EXIT_FAILED
     return 0
+
+
+def free_registry_port() -> int:
+    """Return a free loopback port below the kernel's ephemeral range."""
+
+    for port in random.sample(range(20000, 32000), 50):
+        with socket.socket() as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise ScriptedScenarioError("no free loopback port for the run registry")
 
 
 class ScriptedRun:
@@ -280,6 +294,10 @@ class ScriptedRun:
         self.workdir = Path(tempfile.mkdtemp(prefix=f"{self.run_id}-", dir=scratch))
         self.env["KUBECONFIG"] = str(self.workdir / "kubeconfig")
         self.env["CURIE_CONFIG_DIR"] = str(self.workdir / "curie-config")
+        # Docker can reassign an ephemeral published port when the registry
+        # later joins the kind network, which strands the mirror key and the
+        # push address. An explicit port below the ephemeral range stays put.
+        registry_port = free_registry_port()
         self.registry_attempted = True
         self.command(
             "docker",
@@ -290,12 +308,10 @@ class ScriptedRun:
             "--label",
             f"curie.factory-scripted={self.run_id}",
             "-p",
-            "127.0.0.1::5000",
+            f"127.0.0.1:{registry_port}:5000",
             "mirror.gcr.io/library/registry:2",
             timeout=300,
         )
-        inspection = json.loads(self.command("docker", "inspect", self.registry))[0]
-        registry_port = inspection["NetworkSettings"]["Ports"]["5000/tcp"][0]["HostPort"]
         registry_ref = f"localhost:{registry_port}"
         config = self.workdir / "kind.yaml"
         config.write_text(
