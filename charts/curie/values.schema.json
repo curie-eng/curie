@@ -179,7 +179,6 @@
       "properties": {
         "dataTierNetworkPolicy": {
           "type": "object",
-          "required": ["allowMcpConnectorValkeyIngress"],
           "properties": {
             "allowMcpConnectorValkeyIngress": {
               "type": "boolean",
