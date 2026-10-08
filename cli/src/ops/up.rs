@@ -5181,10 +5181,27 @@ pub async fn up(
 ) -> Result<ClusterUpOutput> {
     // @spec CLUSTER-VALUES-FILES c1-c3
     apply_flags_to_file_values(&mut opts, github_token.as_deref(), clear_github_token);
+    if opts.file_values.is_some() {
+        // @spec CLUSTER-VALUES-FILES c1-c3: Helm supplies actual typed set semantics.
+        let args = file_set_args(&opts);
+        let explicit = if args.is_empty() {
+            serde_json::json!({})
+        } else {
+            super::lint_values::pending_set_values(&args).await?
+        };
+        if let Some(values) = &mut opts.file_values {
+            crate::config_migrate::clear_replaced_secret_refs(&mut values.0, &explicit);
+            super::lint_values::merge_values(&mut values.0, explicit);
+            values.1.clear();
+            flatten_file_values(&values.0, "", &mut values.1);
+        }
+    }
     // @spec CLUSTER-VALUES-FILES c3: validation sees the captured files.
     validate_up_inputs(&opts, github_token.as_deref(), clear_github_token)?;
     validate_credential_egress_consistency(&opts)?;
-    provider_contradiction(&opts, &up_value_plan(&opts))?;
+    if opts.file_values.is_none() {
+        provider_contradiction(&opts, &up_value_plan(&opts))?;
+    }
     let resolve_provider_egress = !opts.common.dry_run;
     let existing = if should_read_existing(opts.dev, opts.common.dry_run) {
         require_on_path("helm")?;
@@ -5195,8 +5212,20 @@ pub async fn up(
     // @spec CLUSTER-VALUES-FILES c3: preserve completion, with explicit files winning.
     let mut effective_existing = existing.clone();
     if let Some(values) = &opts.file_values {
+        let supplied_keys: BTreeSet<String> = values.1.keys().cloned().collect();
         let merged = effective_existing.get_or_insert_with(|| serde_json::json!({}));
+        crate::config_migrate::clear_replaced_secret_refs(merged, &values.0);
         super::lint_values::merge_values(merged, values.0.clone());
+        // @spec CLUSTER-VALUES-FILES c3: normalize the admitted full snapshot,
+        // but keep input provenance separate from retained value ownership.
+        opts.file_values = Some(PrivateHelmValues(merged.clone(), BTreeMap::new()));
+        apply_flags_to_file_values(&mut opts, github_token.as_deref(), clear_github_token);
+        let mut values = opts.file_values.take().expect("captured file snapshot");
+        values.0 = crate::config_migrate::migrate_installed_config(values.0, None)?.values;
+        flatten_file_values(&values.0, "", &mut values.1);
+        values.1.retain(|key, _| supplied_keys.contains(key));
+        *merged = values.0.clone();
+        opts.file_values = Some(values);
     }
     opts = complete_up_opts_without_runner_egress(
         opts,
@@ -5818,6 +5847,28 @@ mod tests {
     use super::*;
 
     use crate::ops::testsupport::*;
+
+    #[test]
+    fn file_set_capture_masks_credential_values_in_command_diagnostics() {
+        // @spec CLUSTER-VALUES-FILES c4
+        let o = UpOpts {
+            set: vec![
+                "api.githubToken=PLACEHOLDER-capture-secret".into(),
+                "worker.adapterCredentials={}".into(),
+            ],
+            set_string: vec!["agentSandbox.runner.credentials=PLACEHOLDER-model-secret".into()],
+            ..opts()
+        };
+        let cmd = OpsCommand::new("helm", file_set_args(&o));
+        let display = cmd.display();
+        assert!(!display.contains("PLACEHOLDER-capture-secret"));
+        assert!(!display.contains("PLACEHOLDER-model-secret"));
+        assert!(cmd
+            .argv()
+            .iter()
+            .any(|arg| arg.contains("PLACEHOLDER-capture-secret")));
+        assert!(cmd.argv().iter().any(|arg| arg == "--set-json"));
+    }
 
     fn opts() -> UpOpts {
         UpOpts {
@@ -10331,6 +10382,30 @@ fn effective_existing_secret(
     preserved_value(existing, &reference).is_some()
 }
 
+/// @spec CLUSTER-VALUES-FILES c1-c4
+fn file_set_args(opts: &UpOpts) -> Vec<CmdArg> {
+    opts.set
+        .iter()
+        .map(|expression| {
+            if let Some(typed) = typed_empty_worker_map_override(expression) {
+                [plain("--set-json"), CmdArg::HelmSetExpression(typed)]
+            } else {
+                [
+                    plain("--set"),
+                    CmdArg::HelmSetExpression(expression.clone()),
+                ]
+            }
+        })
+        .chain(opts.set_string.iter().map(|expression| {
+            [
+                plain("--set-string"),
+                CmdArg::HelmSetExpression(expression.clone()),
+            ]
+        }))
+        .flatten()
+        .collect()
+}
+
 /// @spec CLUSTER-VALUES-FILES c1-c3
 fn apply_flags_to_file_values(opts: &mut UpOpts, github_token: Option<&str>, clear: bool) {
     let Some(values) = &mut opts.file_values else {
@@ -10362,27 +10437,6 @@ fn apply_flags_to_file_values(opts: &mut UpOpts, github_token: Option<&str>, cle
     if opts.no_expose {
         for key in ["ui.service.type", "langfuse.web.service.type"] {
             changes.push((key.to_string(), Some(serde_json::json!("ClusterIP"))));
-        }
-    }
-    // Keep the established inline replacement rule for actual --set lanes,
-    // while file references remain lower priority than those replacements.
-    let explicit: Vec<String> = opts.set.iter().chain(&opts.set_string).cloned().collect();
-    let explicit_keys = operator_set_keys(&explicit);
-    for key in values.1.keys() {
-        let Some(inline) = key
-            .strip_suffix("ExistingSecretKey")
-            .or_else(|| key.strip_suffix("ExistingSecret"))
-        else {
-            continue;
-        };
-        if !explicit_keys.contains(key.as_str())
-            && operator_set_entries(&explicit)
-                .into_iter()
-                .rev()
-                .find(|(name, _)| name.trim() == inline)
-                .is_some_and(|(_, value)| !value.is_empty())
-        {
-            changes.push((key.clone(), Some(serde_json::json!(""))));
         }
     }
     for (key, replacement) in changes {
@@ -10418,9 +10472,8 @@ pub async fn load_values_files(files: &[std::path::PathBuf]) -> Result<Option<Pr
         return Ok(None);
     }
     let parsed = super::lint_values::pending_values(files).await?;
-    let document = crate::config_migrate::migrate_installed_config(parsed, None)
-        .map_err(|_| crate::exit::CliError::failure("values files failed configuration admission"))?
-        .values;
+    // Admission belongs after dedicated flags and typed --set overlays.
+    let document = parsed;
     let mut flattened = BTreeMap::new();
     flatten_file_values(&document, "", &mut flattened);
     Ok(Some(PrivateHelmValues(document, flattened)))

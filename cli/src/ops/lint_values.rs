@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde_json::Value;
 
+use super::CmdArg;
 use super::{fetch_release_values, plain, run_capture, CommonOpts, OpsCommand};
 use crate::ui::{CliOutput, Ui};
 
@@ -53,6 +54,16 @@ impl CliOutput for LintValuesOutput {
 /// keeps explicit nulls that Helm omits from its computed `.Values` template.
 /// The same captured copies go through `-f` so Helm validates this input.
 pub(crate) async fn pending_values(files: &[PathBuf]) -> Result<Value> {
+    parsed_values(files, &[]).await
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c3
+pub(crate) async fn pending_set_values(args: &[CmdArg]) -> Result<Value> {
+    parsed_values(&[], args).await
+}
+
+/// @spec CLUSTER-VALUES-FILES c2-c3
+async fn parsed_values(files: &[PathBuf], explicit_args: &[CmdArg]) -> Result<Value> {
     // @spec CLUSTER-VALUES-FILES c2: Helm parses only captured copies.
     let chart = tempfile::tempdir()
         .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
@@ -82,6 +93,9 @@ pub(crate) async fn pending_values(files: &[PathBuf]) -> Result<Value> {
             "  file{index}: {{{{ (.Files.Get \"files/{index}.yaml\" | fromYaml | toJson) | quote }}}}\n"
         ));
     }
+    if !explicit_args.is_empty() {
+        template.push_str("  operatorValues: {{ .Values | toJson | quote }}\n");
+    }
     std::fs::write(templates.join("values.yaml"), template)
         .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
 
@@ -98,6 +112,7 @@ pub(crate) async fn pending_values(files: &[PathBuf]) -> Result<Value> {
         args.push(plain("-f"));
         args.push(plain(path));
     }
+    args.extend_from_slice(explicit_args);
     let (ok, output, _) = run_capture(&OpsCommand::new("helm", args))
         .await
         .map_err(|_| {
@@ -125,6 +140,16 @@ pub(crate) async fn pending_values(files: &[PathBuf]) -> Result<Value> {
                 crate::exit::CliError::failure("values files must contain YAML maps").into(),
             );
         }
+        merge_values(&mut pending, values);
+    }
+    if !explicit_args.is_empty() {
+        let json = rendered
+            .get("data")
+            .and_then(|data| data.get("operatorValues"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| crate::exit::CliError::failure("could not read Helm parsed values"))?;
+        let values: Value = serde_json::from_str(json)
+            .map_err(|_| crate::exit::CliError::failure("could not read Helm parsed values"))?;
         merge_values(&mut pending, values);
     }
     Ok(pending)

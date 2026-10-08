@@ -1117,18 +1117,14 @@ fn inline_file_credential_replaces_a_retained_secret_reference() {
             .and_then(Value::as_str),
         Some("sk-ant-api03-PLACEHOLDER-file-replacement")
     );
-    assert_eq!(
-        values
-            .pointer("/agentSandbox/runner/credentialsExistingSecret")
-            .and_then(Value::as_str),
-        Some("")
-    );
-    assert_eq!(
-        values
-            .pointer("/agentSandbox/runner/credentialsExistingSecretKey")
-            .and_then(Value::as_str),
-        Some("")
-    );
+    for path in [
+        "/agentSandbox/runner/credentialsExistingSecret",
+        "/agentSandbox/runner/credentialsExistingSecretKey",
+    ] {
+        assert!(values
+            .pointer(path)
+            .is_none_or(|value| value.as_str() == Some("")));
+    }
     assert!(!all_output(&output).contains("sk-ant-api03-PLACEHOLDER-file-replacement"));
     assert!(!fixture
         .upgrade_argv()

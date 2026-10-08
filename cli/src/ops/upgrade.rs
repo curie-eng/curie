@@ -2246,13 +2246,18 @@ impl LiveHost {
             args.push(plain("--version"));
             args.push(plain(&self.opts.to));
         }
-        let tmp = tempfile::NamedTempFile::new().ok();
-        if let (Some(overlay), Some(tmp)) = (&self.overlay, &tmp) {
-            if std::fs::write(tmp.path(), overlay).is_ok() {
-                args.push(plain("-f"));
-                args.push(plain(tmp.path().to_string_lossy().into_owned()));
-            }
-        }
+        // @spec CLUSTER-VALUES-FILES c3-c4: never admit defaults after losing the overlay.
+        let _tmp = if let Some(overlay) = &self.overlay {
+            let tmp = tempfile::NamedTempFile::new()
+                .map_err(|_| "could not prepare target metadata values".to_string())?;
+            std::fs::write(tmp.path(), overlay)
+                .map_err(|_| "could not write target metadata values".to_string())?;
+            args.push(plain("-f"));
+            args.push(plain(tmp.path().to_string_lossy().into_owned()));
+            Some(tmp)
+        } else {
+            None
+        };
         let cmd = OpsCommand::new("helm", args);
         let (ok, out, err) = match self.run(&cmd) {
             Ok(v) => v,
@@ -2344,6 +2349,7 @@ impl LiveHost {
         mut values: serde_json::Value,
     ) -> Result<Option<(String, String)>> {
         if let Some(files) = &self.opts.file_values {
+            crate::config_migrate::clear_replaced_secret_refs(&mut values, &files.0);
             super::lint_values::merge_values(&mut values, files.0.clone());
         }
         // Unlike `up.rs`, the installed chart version is known here, so
