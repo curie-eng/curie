@@ -12,7 +12,7 @@ from sqlalchemy import delete, func, literal, null, or_, select, text, tuple_, u
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import aliased, selectinload
 from sqlalchemy.sql.elements import ColumnElement
 
 from .approvers import card_on_requesting_surface
@@ -1658,21 +1658,24 @@ async def _bind_running_work_item_lineage(
     *,
     publication: Publication,
     lineage: ThreadPublicationLineage,
-    identity: VerifiedPublicationIdentity | None,
 ) -> None:
-    """Bind only the running request that created the successful publication."""
+    """Record the publishing request's PR even after that request stops running."""
 
-    if publication.execution_request_id is None:
+    if (
+        publication.execution_request_id is None
+        or lineage.status != "open"
+        or lineage.pr_number is None
+    ):
         return
     request_owns_item = (
         select(ExecutionRequest.id)
         .where(
             ExecutionRequest.id == publication.execution_request_id,
             ExecutionRequest.work_item_id == WorkItem.id,
-            ExecutionRequest.status == "running",
         )
         .exists()
     )
+    other_owner = aliased(WorkItem)
     predicates: list[ColumnElement[bool]] = [
         WorkItem.agent_id == lineage.agent_id,
         WorkItem.conversation_id.in_(
@@ -1682,15 +1685,14 @@ async def _bind_running_work_item_lineage(
         WorkItem.cancelled_at.is_(None),
         WorkItem.publication_lineage_id.is_(None),
         request_owns_item,
+        ~select(other_owner.id).where(other_owner.publication_lineage_id == lineage.id).exists(),
     ]
-    repository_id = identity.repository_id if identity is not None else lineage.github_repository_id
-    installation_id = (
-        identity.installation_id if identity is not None else lineage.github_installation_id
+    predicates.extend(
+        [
+            WorkItem.github_repository_id == lineage.github_repository_id,
+            WorkItem.github_installation_id == lineage.github_installation_id,
+        ]
     )
-    if repository_id is not None:
-        predicates.append(WorkItem.github_repository_id == repository_id)
-    if installation_id is not None:
-        predicates.append(WorkItem.github_installation_id == installation_id)
     await session.execute(
         update(WorkItem)
         .where(*predicates)
@@ -2211,7 +2213,6 @@ async def advance_publication_lineage(
             session,
             publication=publication,
             lineage=lineage,
-            identity=identity,
         )
     await session.commit()
     refreshed = await session.get(ThreadPublicationLineage, lineage.id)

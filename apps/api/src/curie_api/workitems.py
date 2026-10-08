@@ -26,6 +26,7 @@ from .factory_reply_target import is_follow_up, parse_reply_target
 from .models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     Agent,
+    Deployment,
     ExecutionRequest,
     FactoryStatusComment,
     Publication,
@@ -1017,6 +1018,125 @@ async def expire_waiting(
     return await _outcome(session, work_item, request)
 
 
+async def adopt_orphan_publication_lineage(
+    session: AsyncSession,
+    *,
+    deployment_id: uuid.UUID,
+    work_item_id: uuid.UUID,
+    execution_request_id: uuid.UUID,
+    runtime_epoch: int,
+) -> None:
+    """Commit an eligible predecessor's open PR link before any provider read.
+
+    Lock in lifecycle order: WorkItem, calling request, then lineage. Publication
+    provenance is read without locking its writer. Ineligible candidates leave
+    the existing publication authority reader to return its usual refusal.
+    """
+
+    work_item = await _lock_work_item(session, work_item_id)
+    if (
+        work_item is None
+        or work_item.cancelled_at is not None
+        or work_item.publication_lineage_id is not None
+    ):
+        await session.commit()
+        return
+    request = await _lock_request(
+        session, work_item_id=work_item_id, request_id=execution_request_id
+    )
+    deployment_agent_id = await session.scalar(
+        select(Deployment.agent_id).where(Deployment.id == deployment_id)
+    )
+    now = await _database_now(session)
+    if (
+        request is None
+        or deployment_agent_id != work_item.agent_id
+        or request.status != "running"
+        or request.runtime_epoch != runtime_epoch
+        or not request.runtime_owner
+        or request.runtime_heartbeat_expires_at is None
+        or request.runtime_heartbeat_expires_at <= now
+        or request.execution_deadline is None
+        or request.execution_deadline <= now
+    ):
+        await session.commit()
+        return
+    candidates = list(
+        await session.scalars(
+            select(ThreadPublicationLineage)
+            .where(
+                ThreadPublicationLineage.agent_id == work_item.agent_id,
+                ThreadPublicationLineage.conversation_id == work_item.conversation_id,
+                func.lower(ThreadPublicationLineage.repo_full_name)
+                == work_item.repo_full_name.casefold(),
+                ThreadPublicationLineage.status == "open",
+                ThreadPublicationLineage.pr_number.is_not(None),
+            )
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+    )
+    if len(candidates) != 1:
+        await session.commit()
+        return
+    lineage = candidates[0]
+    if (
+        lineage.github_repository_id != work_item.github_repository_id
+        or lineage.github_installation_id != work_item.github_installation_id
+    ):
+        await session.commit()
+        return
+    owner = await session.scalar(
+        select(WorkItem.id).where(WorkItem.publication_lineage_id == lineage.id)
+    )
+    predecessor_publication = await session.scalar(
+        select(Publication.id)
+        .join(ExecutionRequest, ExecutionRequest.id == Publication.execution_request_id)
+        .where(
+            Publication.lineage_id == lineage.id,
+            ExecutionRequest.work_item_id == work_item_id,
+            ExecutionRequest.sequence < request.sequence,
+        )
+        .limit(1)
+    )
+    if owner is not None or predecessor_publication is None:
+        await session.commit()
+        return
+    try:
+        async with session.begin_nested():
+            await session.execute(
+                update(WorkItem)
+                .where(
+                    WorkItem.id == work_item_id,
+                    WorkItem.version == work_item.version,
+                    WorkItem.cancelled_at.is_(None),
+                    WorkItem.publication_lineage_id.is_(None),
+                    select(ExecutionRequest.id)
+                    .where(
+                        ExecutionRequest.id == execution_request_id,
+                        ExecutionRequest.work_item_id == work_item_id,
+                        ExecutionRequest.version == request.version,
+                        ExecutionRequest.status == "running",
+                        ExecutionRequest.runtime_epoch == runtime_epoch,
+                        ExecutionRequest.runtime_heartbeat_expires_at > func.clock_timestamp(),
+                        ExecutionRequest.execution_deadline > func.clock_timestamp(),
+                    )
+                    .exists(),
+                )
+                .values(
+                    publication_lineage_id=lineage.id,
+                    version=WorkItem.version + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+                .execution_options(synchronize_session=False)
+            )
+    except IntegrityError:
+        # A competing work item can claim the unique link under a shared
+        # lineage lock. Its committed ownership is handled by the reader.
+        pass
+    await session.commit()
+
+
 async def link_publication_lineage(
     session: AsyncSession,
     *,
@@ -1042,15 +1162,13 @@ async def link_publication_lineage(
         return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
-    if request.status != "running":
-        return await _conflict(
-            session, "publication_ineligible", work_item=work_item, request=request
-        )
-    now = await _database_now(session)
-    if request.execution_deadline is None or now >= request.execution_deadline:
-        return await _conflict(
-            session, "execution_deadline_elapsed", work_item=work_item, request=request
-        )
+    running_request = request.status == "running"
+    if running_request:
+        now = await _database_now(session)
+        if request.execution_deadline is None or now >= request.execution_deadline:
+            return await _conflict(
+                session, "execution_deadline_elapsed", work_item=work_item, request=request
+            )
 
     if (
         work_item.publication_lineage_id is not None
@@ -1066,16 +1184,34 @@ async def link_publication_lineage(
         .with_for_update(read=True)
         .execution_options(populate_existing=True)
     )
+    if not running_request and (
+        lineage is None
+        or lineage.status != "open"
+        or lineage.pr_number is None
+        or await session.scalar(
+            select(Publication.id)
+            .where(
+                Publication.execution_request_id == request_id,
+                Publication.lineage_id == publication_lineage_id,
+                Publication.status == "succeeded",
+            )
+            .limit(1)
+        )
+        is None
+    ):
+        return await _conflict(
+            session, "publication_ineligible", work_item=work_item, request=request
+        )
     if lineage is None or (
         lineage.agent_id != work_item.agent_id
         or lineage.conversation_id != work_item.conversation_id
         or lineage.repo_full_name.casefold() != work_item.repo_full_name.casefold()
         or (
-            lineage.github_repository_id is not None
+            (not running_request or lineage.github_repository_id is not None)
             and lineage.github_repository_id != work_item.github_repository_id
         )
         or (
-            lineage.github_installation_id is not None
+            (not running_request or lineage.github_installation_id is not None)
             and lineage.github_installation_id != work_item.github_installation_id
         )
     ):
@@ -1091,6 +1227,14 @@ async def link_publication_lineage(
         )
 
     lineage_changed = False
+    request_predicates: list[ColumnElement[bool]] = [
+        ExecutionRequest.id == request_id,
+        ExecutionRequest.work_item_id == work_item_id,
+        ExecutionRequest.version == expected_request_version,
+        ExecutionRequest.status == request.status,
+    ]
+    if running_request:
+        request_predicates.append(ExecutionRequest.execution_deadline > func.clock_timestamp())
     try:
         async with session.begin_nested():
             changed_id: uuid.UUID | None = await session.scalar(
@@ -1100,15 +1244,7 @@ async def link_publication_lineage(
                     WorkItem.version == expected_work_item_version,
                     WorkItem.cancelled_at.is_(None),
                     WorkItem.publication_lineage_id.is_(None),
-                    select(ExecutionRequest.id)
-                    .where(
-                        ExecutionRequest.id == request_id,
-                        ExecutionRequest.work_item_id == work_item_id,
-                        ExecutionRequest.version == expected_request_version,
-                        ExecutionRequest.status == "running",
-                        ExecutionRequest.execution_deadline > func.clock_timestamp(),
-                    )
-                    .exists(),
+                    select(ExecutionRequest.id).where(*request_predicates).exists(),
                 )
                 .values(
                     publication_lineage_id=publication_lineage_id,
@@ -1135,7 +1271,7 @@ async def link_publication_lineage(
     if not lineage_changed:
         work_item = await _reload_work_item(session, work_item_id)
         request = await _reload_request(session, request_id)
-        if (
+        if running_request and (
             request.execution_deadline is None
             or await _database_now(session) >= request.execution_deadline
         ):

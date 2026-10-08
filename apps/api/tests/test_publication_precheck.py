@@ -17,6 +17,7 @@ import json
 import time
 import uuid
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -124,6 +125,11 @@ def precheck_case(
     )
     work_item_id, request_id = uuid.uuid4(), uuid.uuid4()
     now = datetime.now(UTC)
+    refusal = (
+        request.node.callspec.params.get("refusal")
+        if getattr(request.node, "callspec", None)
+        else None
+    )
     _execute(
         "INSERT INTO curie.work_items "
         "(id, github_repository_id, github_issue_number, github_installation_id, "
@@ -132,8 +138,8 @@ def precheck_case(
         ":conversation, :lineage)",
         {
             "id": work_item_id,
-            "repository": REPOSITORY_ID,
-            "installation": INSTALLATION_ID,
+            "repository": 9002 if refusal == "repository_id" else REPOSITORY_ID,
+            "installation": 42 if refusal == "installation_id" else INSTALLATION_ID,
             "agent": uuid.UUID(deployment["agent_id"]),
             "repo": (
                 "acme-corp/other"
@@ -153,9 +159,11 @@ def precheck_case(
                 )
                 else lineage["conversation_id"]
             ),
-            "lineage": None
-            if forge is not None and forge.get("unlinked")
-            else uuid.UUID(lineage_id),
+            "lineage": (
+                None
+                if forge is not None and forge.get("unlinked_work_item")
+                else uuid.UUID(lineage_id)
+            ),
         },
     )
     _execute(
@@ -169,12 +177,19 @@ def precheck_case(
             "id": request_id,
             "item": work_item_id,
             "wait": now - timedelta(minutes=2),
-            "started": now - timedelta(minutes=1),
+            "started": now - timedelta(hours=2)
+            if refusal == "deadline"
+            else now - timedelta(minutes=1),
             "deadline": (
                 now - timedelta(seconds=1)
                 if getattr(request.node, "callspec", None)
-                and request.node.callspec.params.get("mutation") == "deadline"
-                else now + timedelta(seconds=4)
+                and (
+                    request.node.callspec.params.get("mutation") == "deadline"
+                    or refusal == "deadline"
+                )
+                # Leave fixture setup and the bounded mint enough time under
+                # concurrent integration load before waiting for real expiry.
+                else now + timedelta(seconds=30)
                 if getattr(request.node, "callspec", None)
                 and request.node.callspec.params.get("mutation") == "deadline elapsed"
                 else now + timedelta(hours=1)
@@ -214,6 +229,7 @@ def precheck_case(
     }
     calls: list[httpx.Request] = []
     provider_status = {"value": 200}
+    pull_observer: dict[str, Any] = {}
 
     def github(request: httpx.Request) -> httpx.Response:
         calls.append(request)
@@ -227,6 +243,8 @@ def precheck_case(
         assert request.headers["authorization"] == "Bearer fixture-precheck-app-token"
         assert request.method == "GET"
         assert request.url.path.endswith(f"/repos/{REPO}/pulls/{PR_NUMBER}")
+        if callback := pull_observer.get("callback"):
+            callback()
         if provider_status["value"] == 302:
             return httpx.Response(302, headers={"Location": "https://attacker.example.com/collect"})
         return httpx.Response(provider_status["value"], json=copy.deepcopy(truth))
@@ -251,6 +269,7 @@ def precheck_case(
             "reply_conversation_id": conversation,
             "truth": truth,
             "provider_status": provider_status,
+            "pull_observer": pull_observer,
             "calls": calls,
             "queued_event_id": str(uuid.uuid4()),
             "html_base": html_base,
@@ -321,6 +340,236 @@ def _durable_snapshot() -> tuple[list[dict[str, Any]], ...]:
             "execution_deadline FROM curie.execution_requests ORDER BY id"
         ),
     )
+
+
+def _orphaned_precheck(case: dict[str, Any]) -> uuid.UUID:
+    """Replay a cancelled publisher followed by an unlinked running successor."""
+    previous_request_id = case["request_id"]
+    current_request_id = uuid.uuid4()
+    _execute(
+        "UPDATE curie.execution_requests SET status = 'cancelled', "
+        "terminal_at = clock_timestamp(), terminal_cause = 'issue_cancelled', "
+        "termination_observation = 'fixture runtime termination observed' WHERE id = :id",
+        {"id": previous_request_id},
+    )
+    _execute(
+        "INSERT INTO curie.execution_requests (id, work_item_id, sequence, status, "
+        "wait_deadline, started_at, execution_deadline, execution_attempts, runtime_owner, "
+        "runtime_epoch, runtime_heartbeat_expires_at) SELECT :id, work_item_id, 2, 'running', "
+        "wait_deadline, started_at, execution_deadline, execution_attempts, runtime_owner, "
+        "runtime_epoch, runtime_heartbeat_expires_at FROM curie.execution_requests WHERE id = :old",
+        {"id": current_request_id, "old": previous_request_id},
+    )
+    _execute(
+        "UPDATE curie.work_items SET next_sequence = 3 WHERE id = :id",
+        {"id": case["work_item_id"]},
+    )
+    _execute(
+        "UPDATE curie.publications SET execution_request_id = :request WHERE id = :id",
+        {"id": uuid.UUID(case["publication_id"]), "request": previous_request_id},
+    )
+    case["request_id"] = current_request_id
+    return previous_request_id
+
+
+def _other_precheck_work_item(case: dict[str, Any]) -> uuid.UUID:
+    item_id = uuid.uuid4()
+    _execute(
+        "INSERT INTO curie.work_items (id, github_repository_id, github_issue_number, "
+        "github_installation_id, agent_id, repo_full_name, conversation_id) "
+        "SELECT :other, github_repository_id, github_issue_number + 1, "
+        "github_installation_id, agent_id, repo_full_name, 'other-conversation' "
+        "FROM curie.work_items WHERE id = :id",
+        {"id": case["work_item_id"], "other": item_id},
+    )
+    return item_id
+
+
+@pytest.mark.parametrize("precheck_case", [{"unlinked_work_item": True}], indirect=True)
+def test_mint_adopts_the_cancelled_predecessors_pr_before_reading_github(
+    precheck_case: dict[str, Any],
+) -> None:
+    case = precheck_case
+    previous_request_id = _orphaned_precheck(case)
+    old_request = _rows(
+        "SELECT * FROM curie.execution_requests WHERE id = :id", {"id": previous_request_id}
+    )
+    old_publication = _rows(
+        "SELECT * FROM curie.publications WHERE id = :id",
+        {"id": uuid.UUID(case["publication_id"])},
+    )
+    version = _rows(
+        "SELECT version FROM curie.work_items WHERE id = :id", {"id": case["work_item_id"]}
+    )[0]["version"]
+    expected = {
+        "publication_lineage_id": uuid.UUID(case["lineage_id"]),
+        "version": version + 1,
+    }
+    observed: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=1) as database_reader:
+
+        def observe_committed_link() -> None:
+            # A fresh database connection must see the committed link and be
+            # able to lock the item while the external pull request read runs.
+            rows = database_reader.submit(
+                _rows,
+                "SELECT publication_lineage_id, version FROM curie.work_items "
+                "WHERE id = :id FOR UPDATE NOWAIT",
+                {"id": case["work_item_id"]},
+            ).result(timeout=5)
+            assert rows == [expected]
+            observed.extend(rows)
+
+        case["pull_observer"]["callback"] = observe_committed_link
+        context = _mint(case)
+        replay = _mint(case)
+
+    assert context["lineage_id"] == replay["lineage_id"] == case["lineage_id"]
+    assert observed == [expected, expected]
+    assert len(_pull_reads(case)) == 2
+    assert _rows(
+        "SELECT publication_lineage_id, version FROM curie.work_items WHERE id = :id",
+        {"id": case["work_item_id"]},
+    ) == [expected]
+    assert (
+        _rows("SELECT * FROM curie.execution_requests WHERE id = :id", {"id": previous_request_id})
+        == old_request
+    )
+    assert (
+        _rows(
+            "SELECT * FROM curie.publications WHERE id = :id",
+            {"id": uuid.UUID(case["publication_id"])},
+        )
+        == old_publication
+    )
+
+
+@pytest.mark.parametrize("precheck_case", [{"unlinked_work_item": True}], indirect=True)
+@pytest.mark.parametrize(
+    "refusal", ["closed", "merged", "another_owner", "different_work_item", "no_publication"]
+)
+def test_mint_refuses_ineligible_orphan_lineages_without_durable_writes(
+    precheck_case: dict[str, Any], refusal: str
+) -> None:
+    case = precheck_case
+    previous_request_id = _orphaned_precheck(case)
+    if refusal in {"closed", "merged"}:
+        _execute(
+            "UPDATE curie.thread_publication_lineages SET status = :status WHERE id = :id",
+            {"id": uuid.UUID(case["lineage_id"]), "status": refusal},
+        )
+    elif refusal == "another_owner":
+        _execute(
+            "UPDATE curie.work_items SET publication_lineage_id = :lineage WHERE id = :id",
+            {"id": _other_precheck_work_item(case), "lineage": uuid.UUID(case["lineage_id"])},
+        )
+    elif refusal == "different_work_item":
+        foreign_request_id = uuid.uuid4()
+        _execute(
+            "INSERT INTO curie.execution_requests (id, work_item_id, sequence, status, "
+            "wait_deadline, started_at, execution_deadline, terminal_at, terminal_cause, "
+            "termination_observation, execution_attempts) SELECT :id, :item, 1, status, "
+            "wait_deadline, started_at, execution_deadline, terminal_at, terminal_cause, "
+            "termination_observation, execution_attempts FROM curie.execution_requests "
+            "WHERE id = :old",
+            {
+                "id": foreign_request_id,
+                "item": _other_precheck_work_item(case),
+                "old": previous_request_id,
+            },
+        )
+        _execute(
+            "UPDATE curie.publications SET execution_request_id = :request WHERE id = :id",
+            {"id": uuid.UUID(case["publication_id"]), "request": foreign_request_id},
+        )
+    else:
+        _execute(
+            "UPDATE curie.publications SET execution_request_id = NULL WHERE id = :id",
+            {"id": uuid.UUID(case["publication_id"])},
+        )
+    before = _durable_snapshot()
+
+    response = case["client"].post(MINT_URL, json=_mint_body(case), headers=WORKER_HEADERS)
+
+    assert response.status_code == 409, response.text
+    assert _durable_snapshot() == before
+    assert _pull_reads(case) == []
+
+
+@pytest.mark.parametrize("precheck_case", [{"unlinked_work_item": True}], indirect=True)
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        "cancelled",
+        "not_running",
+        "repository_id",
+        "installation_id",
+        "epoch",
+        "lease",
+        "deadline",
+        "not_earlier",
+    ],
+)
+def test_mint_cannot_adopt_without_current_execution_and_matching_identity(
+    precheck_case: dict[str, Any], refusal: str
+) -> None:
+    case = precheck_case
+    _orphaned_precheck(case)
+    body = _mint_body(case)
+    if refusal == "epoch":
+        body["runtime_epoch"] += 1
+    elif refusal == "not_earlier":
+        _execute(
+            "UPDATE curie.publications SET execution_request_id = :request WHERE id = :id",
+            {"id": uuid.UUID(case["publication_id"]), "request": case["request_id"]},
+        )
+    elif refusal == "cancelled":
+        _execute(
+            "UPDATE curie.work_items SET cancelled_at = clock_timestamp() WHERE id = :id",
+            {"id": case["work_item_id"]},
+        )
+    elif refusal in {"repository_id", "installation_id", "deadline"}:
+        pass  # Immutable identity and deadlines were seeded by precheck_case.
+    else:
+        changes = {
+            "not_running": "status = 'cancellation_requested', terminal_cause = 'issue_cancelled'",
+            "lease": "runtime_heartbeat_expires_at = clock_timestamp() - interval '1 second'",
+        }
+        _execute(
+            f"UPDATE curie.execution_requests SET {changes[refusal]} WHERE id = :id",
+            {"id": case["request_id"]},
+        )
+    before = _durable_snapshot()
+
+    response = case["client"].post(MINT_URL, json=body, headers=WORKER_HEADERS)
+
+    assert response.status_code == 409, response.text
+    assert _durable_snapshot() == before
+    assert _pull_reads(case) == []
+
+
+@pytest.mark.parametrize("precheck_case", [{"unlinked_work_item": True}], indirect=True)
+def test_adoption_remains_committed_when_the_provider_read_is_unavailable(
+    precheck_case: dict[str, Any],
+) -> None:
+    case = precheck_case
+    _orphaned_precheck(case)
+    version = _rows(
+        "SELECT version FROM curie.work_items WHERE id = :id", {"id": case["work_item_id"]}
+    )[0]["version"]
+    case["provider_status"]["value"] = 500
+
+    response = case["client"].post(MINT_URL, json=_mint_body(case), headers=WORKER_HEADERS)
+
+    assert response.status_code == 503, response.text
+    assert _rows(
+        "SELECT publication_lineage_id, version FROM curie.work_items WHERE id = :id",
+        {"id": case["work_item_id"]},
+    ) == [{"publication_lineage_id": uuid.UUID(case["lineage_id"]), "version": version + 1}]
+    before_retry = _durable_snapshot()
+    case["provider_status"]["value"] = 200
+    assert _mint(case)["lineage_id"] == case["lineage_id"]
+    assert _durable_snapshot() == before_retry
 
 
 def test_mint_binds_running_request_and_comparison_reads_fresh_truth_without_writes(
@@ -595,7 +844,7 @@ def test_running_factory_request_without_existing_pr_gets_authenticated_absence(
     assert _durable_snapshot() == before
 
 
-@pytest.mark.parametrize("precheck_case", [{"unlinked": True}], indirect=True, ids=["unlinked"])
+@pytest.mark.parametrize("precheck_case", [{"unlinked_work_item": True}], indirect=True, ids=["unlinked"])
 def test_mint_names_an_existing_conversation_pr_without_a_work_item_link(
     precheck_case: dict[str, Any],
 ) -> None:
@@ -616,7 +865,7 @@ def test_mint_names_an_existing_conversation_pr_without_a_work_item_link(
 
 
 @pytest.mark.parametrize("authority_loss", ["epoch", "lease", "status"])
-@pytest.mark.parametrize("precheck_case", [{"unlinked": True}], indirect=True, ids=["unlinked"])
+@pytest.mark.parametrize("precheck_case", [{"unlinked_work_item": True}], indirect=True, ids=["unlinked"])
 def test_unlinked_existing_pr_does_not_hide_a_generic_execution_refusal(
     precheck_case: dict[str, Any], authority_loss: str
 ) -> None:
@@ -651,7 +900,7 @@ def test_unlinked_existing_pr_does_not_hide_a_generic_execution_refusal(
 
 
 @pytest.mark.parametrize("other_scope", ["conversation", "repository"])
-@pytest.mark.parametrize("precheck_case", [{"unlinked": True}], indirect=True, ids=["unlinked"])
+@pytest.mark.parametrize("precheck_case", [{"unlinked_work_item": True}], indirect=True, ids=["unlinked"])
 def test_an_unlinked_running_request_ignores_a_pr_outside_its_scope(
     precheck_case: dict[str, Any], other_scope: str
 ) -> None:
