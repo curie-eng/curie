@@ -2465,6 +2465,10 @@ impl LiveHost {
                 }
             }
         }
+        // #4321 with @spec CLUSTER-VALUES-FILES c3-c4: runner rebinding is
+        // part of the final effective overlay, so metadata admission and the
+        // timeout render must see the same document that Apply receives.
+        self.compute_runner_layers();
         if self.opts.chart.pending_release().is_none() {
             self.compute_schema_compat();
             if self.current.is_some()
@@ -2478,7 +2482,6 @@ impl LiveHost {
                 }
             }
         }
-        self.compute_runner_layers();
     }
 
     /// What the upgrade does to each layered agent (#3218, #4321).
