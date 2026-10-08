@@ -2,9 +2,9 @@
 
 Date: 2026-10-06
 
-Status: Draft
+Status: Accepted
 
-This Draft answers the product question that
+Accepted 2026-10-08. This ADR answers the product question that
 [#4158](https://github.com/curie-eng/curie/issues/4158) Decision 3 left open,
 for the case where the open PR is not linked to its work item: when a relabel
 or other cancellation lands while a publication is in flight and the PR opens
