@@ -5454,7 +5454,9 @@ async fn run_prepared_up(
             }
         }
     }
-    if set_passthrough_leaks_github_token(&opts.operator_sets()) {
+    // @spec CLUSTER-VALUES-FILES c4: files are not argv credential inputs.
+    let argv_sets: Vec<String> = opts.set.iter().chain(&opts.set_string).cloned().collect();
+    if set_passthrough_leaks_github_token(&argv_sets) {
         match invocation {
             UpInvocation::ClusterUp => ui.warn("a GitHub credential passed with --set lands in the process table and shell history; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too"),
             UpInvocation::Apply => ui.warn("a GitHub credential placed under `set:` in `curie.yaml` reaches the Helm process table; use `credentials.github_token` to name a credential source instead"),
