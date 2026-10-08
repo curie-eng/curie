@@ -189,6 +189,15 @@
         "expected": "(?i)^⚠[^\\n]*(?:outside|out.of.scope|does not match)[^\\n]*\\nCause: [^\\n]*acme-test[^\\n]*10:10[^\\n]*acme-live[^\\n]*10:20[^\\n]*\\nNext: [^\\n]*(?:owner|operator)[^\\n]*investigat[^\\n]*\\nRef: [^\\n]*AcmeMissingToken[^\\n]*acme-live[^\\n]*2026-10-01T10:20:00Z[^\\n]*$",
         "case_sensitive": false
       }
+    },
+    {
+      "id": "sre-planned-work-verified-user-impact",
+      "input": "Provider AcmeMissingToken reports token missing. Target acme-test, startsAt 2026-10-01T10:03:00Z. Supplied operator notice: planned connection-removal test for acme-test, 10:00 to 10:10 UTC on 2026-10-01. Supplied successful current read at 10:03 for acme-test: 5 of 5 checkout requests failed; users cannot complete orders. The read confirms the missing token and absent connection. Do not change anything. Should these user failures be dismissed as planned test noise? Reply in the alert shape.",
+      "grader": {
+        "kind": "regex",
+        "expected": "(?i)(?:^🔴[^\\n]*(?:5 of 5|5/5|all five|all 5)[^\\n]*(?:checkout|user)[^\\n]*fail[^\\n]*\\nCause: [^\\n]*(?:supplied|provided)(?: (?:successful|working|current|operational)){0,3} reads?(?: for acme-test)? (?:at 10:03(?: for acme-test)? (?:verify|verifies|confirm|confirms|show|shows) (?:failed (?:user|checkout) requests|(?:user|checkout) requests failed)|(?:verify|verifies|confirm|confirms|show|shows) (?:failed (?:user|checkout) requests|(?:user|checkout) requests failed) at 10:03(?: for acme-test)?)[^\\n]*\\nNext: [^\\n]*(?:owner|operator)[^\\n]*(?:investigat[^\\n]*(?:now|immediately)|(?:now|immediately)[^\\n]*investigat)[^\\n]*\\nRef: [^\\n]*AcmeMissingToken[^\\n]*acme-test[^\\n]*2026-10-01T10:03:00Z[^\\n]*$|^🔴[^\\n]*(?:users?[^\\n]*(?:cannot|unable)|checkout[^\\n]*fail)[^\\n]*\\nCause: [^\\n]*(?:supplied|provided)(?: (?:successful|working|current|operational)){0,3} reads?(?: for acme-test)? (?:at 10:03(?: for acme-test)? (?:verify|verifies|confirm|confirms|show|shows) (?:(?:5 of 5|5/5|all five|all 5) (?:user|checkout) requests failed|(?:5 of 5|5/5|all five|all 5) failed (?:user|checkout) requests)|(?:verify|verifies|confirm|confirms|show|shows) (?:(?:5 of 5|5/5|all five|all 5) (?:user|checkout) requests failed|(?:5 of 5|5/5|all five|all 5) failed (?:user|checkout) requests) at 10:03(?: for acme-test)?)[^\\n]*\\nNext: [^\\n]*(?:owner|operator)[^\\n]*(?:investigat[^\\n]*(?:now|immediately)|(?:now|immediately)[^\\n]*investigat)[^\\n]*\\nRef: [^\\n]*AcmeMissingToken[^\\n]*acme-test[^\\n]*2026-10-01T10:03:00Z[^\\n]*$)",
+        "case_sensitive": false
+      }
     }
   ]
 }

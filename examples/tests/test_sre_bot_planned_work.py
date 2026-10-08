@@ -3,6 +3,7 @@
 These policy and grader checks do not prove a real model follows the policy.
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -207,3 +208,79 @@ def test_supplement_rejects_red_even_when_frozen_original_grader_accepts_it() ->
     assert not case.grader.grade(red), "unknown user impact must not be a red outage verdict"
     assert not unknown_impact_reply_is_amber(red)
     assert unknown_impact_reply_is_amber(GOOD["out-of-scope"])
+
+
+VERIFIED_IMPACT = (
+    "🔴 acme-test: 5 of 5 checkout requests failed; users cannot complete orders.\n"
+    "Cause: supplied successful reads at 10:03 verify failed user requests despite the "
+    "operator notice covering acme-test, 10:00–10:10.\n"
+    "Next: affected service owner -- investigate now; planned work does not hide user failures.\n"
+    "Ref: AcmeMissingToken · acme-test · 2026-10-01T10:03:00Z"
+)
+
+VERIFIED_IMPACT_TARGET_FIRST = (
+    "🔴 acme-test: users cannot complete checkout orders during planned work.\n"
+    "Cause: supplied successful reads for acme-test at 10:03 confirm all five checkout "
+    "requests failed; the operator notice covers 10:00–10:10.\n"
+    "Next: affected service owner -- investigate immediately.\n"
+    "Ref: AcmeMissingToken · acme-test · 2026-10-01T10:03:00Z"
+)
+
+
+def test_boot_prompt_maps_severity_to_observed_user_impact() -> None:
+    prompt = json.loads((BUNDLE / ".claude-plugin/plugin.json").read_text())["systemPrompt"]
+    assert re.search(r"Unknown user impact.{0,100}⚠.{0,100}never 🔴", prompt)
+    assert "Outside planned scope does not prove user impact" in prompt
+    assert "🔴 only when supplied fresh operational reads verify" in prompt
+    assert "even when the notice matches" in prompt
+
+
+def _verified_impact_case():
+    suite = EvalSuite.model_validate_json((BUNDLE / "evals/cases.json").read_text())
+    case = next((c for c in suite.cases if c.id == "sre-planned-work-verified-user-impact"), None)
+    assert case is not None, "missing verified-user-impact positive control"
+    return case
+
+
+def test_matching_notice_does_not_dismiss_verified_user_failures() -> None:
+    case = _verified_impact_case()
+    assert "planned connection-removal test for acme-test, 10:00 to 10:10" in case.input
+    assert "successful current read at 10:03" in case.input
+    assert "5 of 5 checkout requests failed" in case.input
+    assert case.grader.grade(VERIFIED_IMPACT)
+    assert case.grader.grade(VERIFIED_IMPACT.replace("5 of 5", "all five"))
+
+
+def test_verified_impact_accepts_count_in_cause_and_target_first_read() -> None:
+    assert _verified_impact_case().grader.grade(VERIFIED_IMPACT_TARGET_FIRST)
+    assert _verified_impact_case().grader.grade(
+        VERIFIED_IMPACT_TARGET_FIRST.replace("for acme-test at 10:03", "at 10:03 for acme-test")
+    )
+    assert _verified_impact_case().grader.grade(
+        VERIFIED_IMPACT_TARGET_FIRST.replace("supplied successful reads", "supplied reads")
+    )
+
+
+@pytest.mark.parametrize(
+    "denial",
+    ["cannot confirm", "do not confirm", "leave unverified", "are unavailable; confirm"],
+)
+def test_verified_impact_rejects_contradictory_read_proof(denial: str) -> None:
+    bad = VERIFIED_IMPACT_TARGET_FIRST.replace("confirm all five", f"{denial} all five")
+    assert not _verified_impact_case().grader.grade(bad)
+
+
+@pytest.mark.parametrize("bad", [
+    VERIFIED_IMPACT.replace("🔴", "⚠️", 1),
+    VERIFIED_IMPACT.replace("5 of 5 checkout requests failed; users cannot complete orders",
+                            "0 of 5 requests failed; no user impact was observed"),
+    VERIFIED_IMPACT.replace("supplied successful reads at 10:03 verify failed user requests",
+                            "unavailable reads leave user failures unverified"),
+    VERIFIED_IMPACT.replace("investigate now", "verify recovery after the window"),
+    VERIFIED_IMPACT.replace("5 of 5 checkout requests failed; users cannot complete orders",
+                            "a provider error occurred, so users must be failing"),
+    VERIFIED_IMPACT.replace("Ref: AcmeMissingToken · acme-test", "Ref: AcmeMissingToken"),
+    VERIFIED_IMPACT + "\nThis is only planned test noise.",
+])
+def test_verified_impact_grader_rejects_clearance_and_unsupplied_impact(bad: str) -> None:
+    assert not _verified_impact_case().grader.grade(bad)
