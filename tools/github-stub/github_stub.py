@@ -478,6 +478,10 @@ class GithubStub:
                 "permissions": PERMISSIONS,
             }
         prefix = f"/repos/{REPOSITORY}"
+        # GitHub serves /repositories/{id}/... as the same resource tree.
+        by_id = f"/repositories/{self._repository_row()['id']}"
+        if path == by_id or path.startswith(by_id + "/"):
+            path = prefix + path[len(by_id) :]
         if path != prefix and not path.startswith(prefix + "/"):
             return None
         tail = path[len(prefix) :].strip("/")

@@ -125,8 +125,12 @@ def test_advertised_service_dns_uses_a_trusted_certificate_and_separate_bind_add
 ) -> None:
     hostname = "github-stub.test-3815.svc.cluster.local"
     server = _stub_type()(
-        tmp_path, recording, seed_tree=SEED_TREE, issue_file=issue_file,
-        host=hostname, bind="127.0.0.1",
+        tmp_path,
+        recording,
+        seed_tree=SEED_TREE,
+        issue_file=issue_file,
+        host=hostname,
+        bind="127.0.0.1",
     )
     try:
         server.start()
@@ -162,8 +166,12 @@ def test_advertised_host_refuses_userinfo_and_paths(
 ) -> None:
     with pytest.raises(ValueError):
         _stub_type()(
-            tmp_path, recording, seed_tree=SEED_TREE, issue_file=issue_file,
-            host=host, bind="127.0.0.1",
+            tmp_path,
+            recording,
+            seed_tree=SEED_TREE,
+            issue_file=issue_file,
+            host=host,
+            bind="127.0.0.1",
         )
 
 
@@ -363,4 +371,15 @@ def test_git_smart_http_clones_pushes_and_exposes_the_pushed_ref(
     verifier = tmp_path / "verifier"
     git("clone", "--branch", "factory/example", stub.clone_url, str(verifier))
     assert (verifier / "example.txt").read_text() == "A real Git object pushed over HTTPS.\n"
+    assert stub.unknown_requests == []
+
+
+def test_repository_id_paths_serve_the_same_repository(github: httpx.Client, stub: Any) -> None:
+    """GitHub serves /repositories/{id}/... like /repos/{owner}/{repo}/...; a
+    factory recording run read its issue through the id form."""
+
+    issue = _ok(github.get(f"/repos/{REPO}/issues", params={"labels": "factory"}))[0]
+    by_id = _ok(github.get(f"/repositories/4401/issues/{issue['number']}"))
+    assert by_id == _ok(github.get(f"/repos/{REPO}/issues/{issue['number']}"))
+    assert _ok(github.get("/repositories/4401"))["full_name"] == REPO
     assert stub.unknown_requests == []
