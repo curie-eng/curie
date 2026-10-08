@@ -1027,7 +1027,7 @@ fn fake_model_and_inline_set_override_lower_priority_file_choices() {
     for fake in [true, false] {
         let fixture = Fixture::new(&serde_json::json!({}));
         let file = fixture.temp.path().join("runner-flags.yaml");
-        fs::write(&file, "security:\n  gvisor:\n    mode: 'off'\nagentSandbox:\n  controller:\n    deploy: false\n  runner:\n    fakeModel: false\n    credentialsExistingSecret: file-provider\n    credentialsExistingSecretKey: token\n").unwrap();
+        fs::write(&file, "security:\n  gvisor:\n    mode: 'off'\nagentSandbox:\n  controller:\n    deploy: false\n  runner:\n    fakeModel: false\n    credentialsExistingSecret: file-provider\n    credentialsExistingSecretKey: token\npostgres:\n  existingSecret: file-postgres\n").unwrap();
         let mut args = vec!["-f", file.to_str().unwrap()];
         if fake {
             args.push("--fake-model");
@@ -1035,6 +1035,8 @@ fn fake_model_and_inline_set_override_lower_priority_file_choices() {
             args.extend([
                 "--set",
                 "agentSandbox.runner.credentials=sk-ant-api03-PLACEHOLDER-set-credential",
+                "--set",
+                "postgres.auth.password=PLACEHOLDER-set-db-password",
             ]);
         }
         let output = fixture.cluster_up_with_args(&[("CURIE_TEST_REAL_HELM", &helm)], &args);
@@ -1046,6 +1048,15 @@ fn fake_model_and_inline_set_override_lower_priority_file_choices() {
                 Some(&Value::Bool(true))
             );
         } else {
+            assert_eq!(
+                values
+                    .pointer("/postgres/auth/password")
+                    .and_then(Value::as_str),
+                Some("PLACEHOLDER-set-db-password")
+            );
+            assert!(values
+                .pointer("/postgres/existingSecret")
+                .is_none_or(|value| value.as_str() == Some("")));
             assert_eq!(
                 values
                     .pointer("/agentSandbox/runner/credentialsExistingSecret")
