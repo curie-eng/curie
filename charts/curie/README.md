@@ -351,6 +351,38 @@ are operator-configured collector exporters; installing Grafana, Loki, Tempo,
 Prometheus, or another retained backend is deliberately separate from this
 chart's OTLP write path.
 
+### Optional trace processors
+
+`otelCollector.extraProcessors` defines additional Collector processors by
+component ID. `otelCollector.extraTracePipelineProcessors` selects their IDs in
+execution order for the traces pipeline. Selected processors run after
+`memory_limiter` and before `batch`; with both values empty, the rendered
+Collector configuration and all three pipelines retain their existing defaults.
+For example, an operator can suppress routine spans before batching and export
+while retaining user, state, and action spans:
+
+```yaml
+otelCollector:
+  extraProcessors:
+    filter/routine_spans:
+      error_mode: ignore
+      traces:
+        span:
+          - 'IsMatch(name, "^(health|background)")'
+  extraTracePipelineProcessors: [filter/routine_spans]
+```
+
+The chart refuses an extra processor that replaces a built-in processor, a
+malformed component ID or non-map configuration, an undefined pipeline
+reference, a duplicate selected ID, or a selected built-in ID. The selection
+affects traces only; logs and metrics keep their existing processor order.
+The operator owns the filter expression and must validate it against the
+pinned Collector image and representative spans before applying it. On
+Collector contrib 0.119.0, `otelcol-contrib validate --config=...` accepted
+the example filter; an OTLP/HTTP input with `health.check`,
+`background.poll`, `user.message`, `state.update`, and `action.execute`
+produced exactly the final three spans at a detailed debug exporter.
+
 The SRE bot Prometheus overlay includes alerts for dead lettered messages,
 slow sandbox claims, refused capacity reclamation, and transcript persistence
 failures. It counts a counter's first observed sample so failures are visible
