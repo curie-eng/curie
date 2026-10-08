@@ -8,6 +8,7 @@ dependencies = [
     "curie-channel-protocol",
     "curie-protected-hooks",
     "curie-telemetry-schema",
+    "curie-upgrade-pause",
     "plugin-format",
     "curie-api",
     "curie-dispatcher",
@@ -29,6 +30,7 @@ members = [
     "packages/protected-hooks",
     "packages/plugin-format",
     "packages/telemetry-schema",
+    "packages/upgrade-pause",
     "packages/test-support",
     "packages/telemetry",
     "apps/api",
@@ -47,6 +49,7 @@ aci-protocol = { workspace = true }
 curie-channel-protocol = { workspace = true }
 curie-protected-hooks = { workspace = true }
 curie-telemetry-schema = { workspace = true }
+curie-upgrade-pause = { workspace = true }
 plugin-format = { workspace = true }
 curie-test-support = { workspace = true }
 curie-api = { workspace = true }
@@ -96,6 +99,7 @@ root_packages = [
     "curie_e2e_connector",
     "curie_runner",
     "curie_telemetry_schema",
+    "curie_upgrade_pause",
     # The frozen contract packages (#961). Outside the graph, no contract could
     # ever fire on them, which left the worst possible place for an SDK import
     # ungated. Clean today; the contract below keeps them that way.
@@ -189,6 +193,7 @@ testpaths = [
     "packages/channel-protocol/tests",
     "packages/plugin-format/tests",
     "packages/test-support/tests",
+    "packages/upgrade-pause/tests",
     "packages/telemetry/tests",
     "apps/api/tests",
     "apps/dispatcher/tests",
@@ -275,6 +280,7 @@ mypy_path = [
     "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
+    "packages/upgrade-pause/src",
     "packages/test-support/src",
     "packages/telemetry/src",
     "apps/api/src",
@@ -293,6 +299,7 @@ files = [
     "packages/protected-hooks/src",
     "packages/plugin-format/src",
     "packages/telemetry-schema/src",
+    "packages/upgrade-pause/src",
     "packages/test-support/src",
     "packages/telemetry/src",
     "apps/api/src",

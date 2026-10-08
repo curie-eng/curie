@@ -1,0 +1,13 @@
+[project]
+name = "curie-upgrade-pause"
+version = "0.0.0"
+description = "Shared Curie upgrade pause keys and renew-only authority"
+requires-python = ">=3.13"
+dependencies = ["redis>=5.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/curie_upgrade_pause"]

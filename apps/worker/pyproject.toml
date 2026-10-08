@@ -11,6 +11,7 @@ dependencies = [
     "aci-protocol",
     # @spec PROTECTED-HOOK-LANE-1: shared internal source/transport authority.
     "curie-protected-hooks",
+    "curie-upgrade-pause",
     "curie-telemetry",
     "curie-channel-protocol",
     "plugin-format",

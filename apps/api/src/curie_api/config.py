@@ -24,6 +24,7 @@ from aci_protocol import (
     derive_dead_letter_stream_name,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_upgrade_pause import authoritative_key
 from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -805,15 +806,7 @@ class Settings(BaseSettings):
         return f"{scheme}://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
 
     def upgrade_quiesce_key(self) -> str:
-        # Mirrors WorkerConfig.upgrade_quiesce_key (#2374, #3127): one
-        # authoritative "stop taking new work" marker per Helm installation,
-        # written by the worker with the same key_prefix and installation_id.
-        # A blank installation_id (standalone or Compose) keeps the legacy
-        # release-wide key.
-        legacy_key = f"{self.worker_key_prefix}:upgrade:quiesce"
-        if not self.installation_id:
-            return legacy_key
-        return f"{legacy_key}:{self.installation_id}"
+        return authoritative_key(self.worker_key_prefix, self.installation_id)
 
     @field_validator("github_factory_python_ci", mode="before")
     @classmethod
