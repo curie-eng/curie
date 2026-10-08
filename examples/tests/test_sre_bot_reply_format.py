@@ -409,3 +409,14 @@ def test_manifest_boot_context_does_not_turn_notice_into_recovery_or_approval() 
     assert re.search(r"outside.{0,50}(scope|window).{0,70}investigate", prompt, re.I)
     assert re.search(r"never.{0,50}(approval|permission).{0,100}recovery", prompt, re.I)
     assert re.search(r"pending.{0,100}nothing.{0,100}deny.{0,60}verified", prompt, re.I)
+
+
+def test_resolved_alert_case_uses_anonymous_operational_scope() -> None:
+    """Public evals retain approval semantics with obvious example identities."""
+    cases = json.loads((REPO / "examples/sre-bot/evals/cases.json").read_text())["cases"]
+    case = next(
+        c for c in cases if c["id"] == "resolved-alert-reports-pending-approval-not-an-action"
+    )
+    assert "deployment acme-mail-adapter in namespace acme-system" in case["input"]
+    assert "resources_scale with scale: 1 on that deployment" in case["input"]
+    assert "Nobody has acted on that card since" in case["input"]
