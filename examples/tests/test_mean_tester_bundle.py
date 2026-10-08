@@ -240,19 +240,8 @@ def test_every_platform_text_the_skill_judges_by_still_exists_in_the_platform():
         assert text in joined, f"{text!r} no longer appears in the platform; update SKILL.md"
 
 
-def test_every_installation_is_read_or_ask_only():
-    # @spec #3043
-    skill = _skill()
-    rule = re.search(r"^## Every probe only reads or asks\n(.*?)(?=^## )", skill, re.M | re.S)
-    assert rule, "SKILL.md must keep an '## Every probe only reads or asks' section"
-    text = " ".join(rule.group(1).split())
-    for phrase in (
-        "same for production and test installations",
-        "Send only probes that read or ask",
-        "even on a test installation",
-        "Never attach a file, create an approval card, or resolve one",
-    ):
-        assert phrase in text, phrase
+# ADR 0202 supersedes the universal prose restriction. The CLI controls in
+# test_mean_tester_actions.py test default refusal and actual admission evidence.
 
 
 def test_a_round_waits_by_the_clock_and_posts_only_probes():
@@ -467,7 +456,7 @@ def test_validator_ux_rules_have_context_and_no_false_go():
         assert phrase in verdicts, phrase
     report = _section("Validation result")
     for phrase in ("NO-GO", "UNCLEAR", "BLOCKED", "NOT RUN", "P0", "configuration diff",
-                   "post-deploy", "never full GO", "criterion"):
+                   "post-deploy", "criterion"):
         assert phrase in report, phrase
 
 
@@ -600,7 +589,7 @@ def test_the_runner_layer_installs_the_gate_as_an_executable():
 def test_the_ship_verdict_is_the_gates_and_copied_verbatim():
     result = _section("Validation result")
     for phrase in ("mean-tester-gate verdict", "`Ship:`", "`Ledger:`", "verbatim",
-                   "GO (read-only scope)", "never full GO"):
+                   "GO (read-only scope)"):
         assert phrase in result, phrase
     assert re.search(r"never writes? (a|the|any) ship verdict", result, re.I), result
 
@@ -613,10 +602,10 @@ def test_the_skill_drives_every_gate_subcommand():
     assert "mean-tester-gate import" in _section('"continue"')
 
 
-def test_the_validator_doc_allows_only_a_read_only_scope_go():
+def test_the_validator_doc_preserves_readonly_go_and_requires_action_evidence():
     ship = _doc_section(BUNDLE / "docs" / "VALIDATOR.md", "Ship verdict")
     assert "GO (read-only scope)" in ship
-    # Full GO for an action-bearing suite still needs slice 2.
+    # Full GO for admitted actions has additional slice 2 evidence requirements.
     assert "slice 2" in ship and "full GO" in ship and "action" in ship
 
 
