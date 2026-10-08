@@ -43,6 +43,7 @@ from ..publication_truth import (
     PRECHECK_TIMEOUT_SECONDS,
     PublicationPrecheckRefused,
     PublicationPrecheckUnavailable,
+    PublicationPullRequestNotAdopted,
     read_publication_authority,
     read_publication_metadata,
 )
@@ -128,6 +129,12 @@ async def mint_publication_context(
                 raise PublicationPrecheckUnavailable
             if current != authority or int(current.execution_deadline.timestamp()) <= time.time():
                 raise PublicationPrecheckRefused
+    except PublicationPullRequestNotAdopted:
+        raise precheck_error(
+            409,
+            "pull_request_not_adopted",
+            "an earlier pull request on this issue could not be continued",
+        ) from None
     except PublicationPrecheckRefused:
         raise precheck_error(
             409, "invalid_context", "publication execution authority is no longer current"
@@ -398,9 +405,7 @@ async def create_publication(
                 )
             )
         ).all()
-        changed_paths = [
-            path for paths in prior_paths for path in paths
-        ] + data.changed_paths
+        changed_paths = [path for paths in prior_paths for path in paths] + data.changed_paths
         python_ci = factory_ci.python_ci_policy(settings, data.repo_full_name)
         unselected = factory_ci._unselected_python_path(changed_paths, python_ci)
         if unselected is not None:
@@ -695,9 +700,7 @@ async def advance_publication_lineage(
     return await _publication_lineage_out(session, lineage)
 
 
-async def _replay_held_review_feedback(
-    request: Request, lineage: ThreadPublicationLineage
-) -> None:
+async def _replay_held_review_feedback(request: Request, lineage: ThreadPublicationLineage) -> None:
     """Admit review feedback held while this lineage awaited identity (#2962).
 
     Best effort: the reconciler retries every pass, so a failure here only

@@ -104,6 +104,7 @@ from .approvals import (
     PublicationCreateRequest,
     PublicationCreator,
     PublicationLineage,
+    PullRequestNotAdopted,
     ReviewAuthorityUnavailable,
     SettledApproval,
     VerifiedReviewFeedback,
@@ -615,6 +616,7 @@ WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
         "runner-timeout-unconfirmed",
         "sandbox-capacity",
         "sandbox-terminated",
+        "pull-request-not-adopted",
     }
 )
 
@@ -641,6 +643,7 @@ _ESCALATION_CAUSES = {
     "runner-timeout-unconfirmed": "runner_timeout",
     "sandbox-terminated": "sandbox_terminated",
     "workspace-error": "workspace_error",
+    "pull-request-not-adopted": "pull_request_not_adopted",
     "history-persistence-error": "history_capacity",
     # #3401: max-turns and an unclassified runner failure used to collapse into
     # runner_escalated, so a consumer that only read the terminus cause could
@@ -5749,6 +5752,15 @@ class Kernel:
             )
             await self._reply_for(qevent, route, _UNAVAILABLE_ATTACHMENT_REPLY)
             return TurnOutcome(terminal_ok=True, start_failed=True)
+        except PullRequestNotAdopted as exc:
+            record_reclaimed_retry()
+            release_order()
+            logger.info("turn start refused for %s: %s", qevent.event_id, exc)
+            return TurnOutcome(
+                terminal_ok=False,
+                classification="pull-request-not-adopted",
+                error_message=str(exc),
+            )
         except ToolAccessUnenforced as exc:
             # @spec WORKER-TOOL-ACCESS-2: a failed turn, escalated under its own
             # class and never retried (the class is not retryable); the model
@@ -5992,8 +6004,7 @@ class Kernel:
                         )
                         if (
                             snapshot_remaining_s is not None
-                            and snapshot_remaining_s
-                            <= _MIN_ATTEMPT_BUDGET_S + snapshot_attempts
+                            and snapshot_remaining_s <= _MIN_ATTEMPT_BUDGET_S + snapshot_attempts
                         ):
                             break
                         await asyncio.sleep(float(snapshot_attempts))
@@ -9148,6 +9159,17 @@ class Kernel:
             if memory_grant is not None:
                 self._record_turn_deadline(memory_grant, left)
             _note_live_memory_turn(turn)
+        except PullRequestNotAdopted as exc:
+            logger.info("work-item continuation refused for %s: %s", qevent.event_id, exc)
+            return TurnOutcome(
+                terminal_ok=False,
+                saw_side_effect=outcome.saw_side_effect,
+                classification="pull-request-not-adopted",
+                error_message=str(exc),
+                tools_called=outcome.tools_called,
+                assistant_text=outcome.assistant_text,
+                continued=True,
+            )
         except ToolAccessUnenforced as exc:
             logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
             return TurnOutcome(

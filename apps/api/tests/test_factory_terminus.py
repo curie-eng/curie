@@ -86,6 +86,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "runner_timeout",
         "workspace_error",
         "runner_escalated",
+        "pull_request_not_adopted",
         "unclassified",
         "max_turns",
         "runner_failed",
@@ -365,7 +366,8 @@ class _GitHubComments(BaseHTTPRequestHandler):
         if subject is not None:
             number = int(subject.group(1))
             payload: dict[str, Any] = {
-                "number": number, "title": server.titles.get(number, f"Issue {number}")
+                "number": number,
+                "title": server.titles.get(number, f"Issue {number}"),
             }
             if "/pulls/" in path:
                 # GitHub computes mergeability asynchronously and returns null:
@@ -886,6 +888,167 @@ def test_runner_escalation_posts_one_comment_and_completed_needs_a_pull_request(
     assert "runner_escalated" in sink.comments[0]["body"]
     _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
     assert _request(number)["version"] == version
+
+
+def _unadopted_pr_lineages(work_item_id: uuid.UUID, *, open_pr: bool, html_base: str) -> uuid.UUID:
+    """An earlier request's PR is deliberately unlinked from the work item."""
+
+    async def go() -> uuid.UUID:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                item = (
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT agent_id, conversation_id, repo_full_name "
+                                "FROM curie.work_items WHERE id = :id"
+                            ),
+                            {"id": work_item_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                version_id, deployment_id = uuid.uuid4(), uuid.uuid4()
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_versions "
+                        "(id, agent_id, version_label, created_by) "
+                        "VALUES (:id, :agent, 'v1', 'fixture')"
+                    ),
+                    {"id": version_id, "agent": item["agent_id"]},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.deployments "
+                        "(id, agent_id, version_id, environment, status) VALUES "
+                        "(:id, :agent, :version, CAST('dev' AS curie.environment), 'active')"
+                    ),
+                    {"id": deployment_id, "agent": item["agent_id"], "version": version_id},
+                )
+                # All offsets are distinct, so newest never depends on insertion
+                # order. A no-PR lineage and other scopes are newer than every
+                # eligible PR; neither can become the actionable link.
+                cases = [
+                    (71, "closed", 4, item["conversation_id"], item["repo_full_name"]),
+                    (
+                        72,
+                        "open" if open_pr else "merged",
+                        3,
+                        item["conversation_id"],
+                        item["repo_full_name"],
+                    ),
+                    (73, "closed", 2, item["conversation_id"], item["repo_full_name"]),
+                    (None, "closed", 1, item["conversation_id"], item["repo_full_name"]),
+                    (74, "open", 0, f"other-{uuid.uuid4().hex}", item["repo_full_name"]),
+                    (75, "open", 0, item["conversation_id"], "acme-corp/other"),
+                ]
+                for pr, status, age, conversation, repo in cases:
+                    lineage_id = uuid.uuid4()
+                    await conn.execute(
+                        text(
+                            "INSERT INTO curie.thread_publication_lineages "
+                            "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
+                            "base_sha, branch, pr_number, pr_url, head_sha, status, "
+                            "version, latest_revision, created_at) VALUES "
+                            "(:id, :agent, :deployment, :conversation, :repo, :base, "
+                            ":branch, :pr, :url, :head, :status, 1, 1, "
+                            "clock_timestamp() - :age * interval '1 day')"
+                        ),
+                        {
+                            "id": lineage_id,
+                            "agent": item["agent_id"],
+                            "deployment": deployment_id,
+                            "conversation": conversation,
+                            "repo": repo,
+                            "base": "a" * 40,
+                            "branch": f"curie/publication-{lineage_id.hex}",
+                            "pr": pr,
+                            "url": None if pr is None else f"{html_base}/{repo}/pull/{pr}",
+                            "head": None if pr is None else HEAD_A,
+                            "status": status,
+                            "age": age,
+                        },
+                    )
+                return deployment_id
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize(("open_pr", "selected_pr"), [(True, 72), (False, 73)])
+def test_an_unadopted_pr_notice_names_the_database_selected_conversation_pr(
+    admitted: Any, open_pr: bool, selected_pr: int
+) -> None:
+    client, github, sink = admitted
+    number = 9300
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    # The comments fixture configures this HTTP server as the forge API. Its
+    # canonical HTML origin is that same configured origin, as required by
+    # #3562, rather than public github.com.
+    host, port = sink.server_address
+    html_base = f"http://{host}:{port}"
+    deployment_id = _unadopted_pr_lineages(
+        row["work_item_id"], open_pr=open_pr, html_base=html_base
+    )
+    unlinked = _rows(
+        "SELECT publication_lineage_id FROM curie.work_items WHERE id = :id",
+        {"id": row["work_item_id"]},
+    )
+    assert unlinked == [{"publication_lineage_id": None}]
+    headers = {"X-Curie-Worker-Token": "factory-terminus-worker"}
+    refused = client.post(
+        "/v1/internal/publications/precheck/context",
+        headers=headers,
+        json={
+            "deployment_id": str(deployment_id),
+            "work_item_id": str(row["work_item_id"]),
+            "execution_request_id": str(row["id"]),
+            "runtime_epoch": epoch,
+            "queued_event_id": f"work-item-{row['id']}-execute-1",
+        },
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "pull_request_not_adopted"
+    worker_url = "https://attacker.example.com/pull/999"
+    failed = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/finish",
+        headers=headers,
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "pull_request_not_adopted",
+            "detail": f"Continue this pull request: {worker_url}",
+        },
+    )
+    assert failed.status_code == 200, failed.text
+
+    _reconcile()
+    _reconcile()
+
+    assert (_request(number)["status"], _request(number)["terminal_cause"]) == (
+        "failed",
+        "pull_request_not_adopted",
+    )
+    body = _assert_one_final_comment([comment["body"] for comment in sink.comments], row["id"])
+    assert f"{html_base}/{REPO}/pull/{selected_pr}" in body
+    for other_pr in {71, 72, 73, 74} - {selected_pr}:
+        assert f"{html_base}/{REPO}/pull/{other_pr}" not in body
+    assert f"{html_base}/acme-corp/other/pull/75" not in body
+    assert "Cause: pull_request_not_adopted" in body
+    assert "earlier pull request" in body
+    assert "close or merge" in body
+    assert "label" in body
+    # Supplied detail may be omitted or fenced as inert text, but must never
+    # become a link in the public status comment. The selected link is DB truth.
+    actionable = re.sub(r"(?ms)^`{3,}[^\n]*\n.*?^`{3,}\s*$", "", body)
+    assert worker_url not in actionable
+    assert _notices(row["id"])[0]["finalized_at"] is not None
+    assert sink.posts == 1
 
 
 def test_approval_create_failure_posts_terminal_issue_notice_and_clears_running_label(
