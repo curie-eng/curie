@@ -313,7 +313,7 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": "3.0"
+      "version": "3.1"
     },
     {
       "result": "PreflightOutput",

@@ -912,6 +912,7 @@
         {"field": "reviewer_model", "why": "Reviewer model selection belongs to the overrides command."},
         {"field": "thinking", "why": "Thinking depth belongs to the overrides command."},
         {"field": "execution_deadline_seconds", "why": "Execution deadline belongs to the overrides command."},
+        {"field": "max_turns", "why": "The runner step cap belongs to the overrides command."},
         {"field": "runner_resources", "why": "Runner resources belong to the overrides command."},
         {"field": "memory", "why": "The shared memory setting is unrelated to hook configuration."},
         {"field": "memory_writes", "why": "The memory tools switch belongs to the overrides command."},

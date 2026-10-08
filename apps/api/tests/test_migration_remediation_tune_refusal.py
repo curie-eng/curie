@@ -99,7 +99,11 @@ def test_one_hand_written_revision_on_the_escalations_revision_and_the_only_head
 
     revision, down = _revision()
     assert (revision, down) == (REVISION, BELOW)
-    assert ScriptDirectory.from_config(alembic_config()).get_heads() == [HEAD]
+    script = ScriptDirectory.from_config(alembic_config())
+    assert len(script.get_heads()) == 1
+    assert REVISION in {
+        rev.revision for rev in script.walk_revisions(base="base", head=script.get_heads()[0])
+    }
 
 
 def test_the_frozen_nomination_refusals_include_the_tune_refusal() -> None:

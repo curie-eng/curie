@@ -3631,6 +3631,8 @@ export interface components {
              * Format: uuid
              */
             id: string;
+            /** Max Turns */
+            max_turns?: number | null;
             /** Memory */
             memory: boolean;
             /**
@@ -3723,6 +3725,8 @@ export interface components {
             hook_partitions?: {
                 [key: string]: components["schemas"]["HookPartitionConfig"];
             } | null;
+            /** Max Turns */
+            max_turns?: number | null;
             /** Memory */
             memory?: boolean | null;
             /** Memory Writes */

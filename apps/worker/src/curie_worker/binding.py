@@ -70,7 +70,7 @@ import urllib.request
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 from urllib.parse import quote
 
 import aiohttp
@@ -324,6 +324,7 @@ SELECT a.id AS agent_id,
        a.model AS model,
        a.reviewer_model AS reviewer_model,
        a.thinking AS thinking,
+       a.max_turns AS max_turns,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
        a.secrets AS secrets,
@@ -359,6 +360,7 @@ SELECT a.id AS agent_id,
        a.model AS model,
        a.reviewer_model AS reviewer_model,
        a.thinking AS thinking,
+       a.max_turns AS max_turns,
        a.approval_required_tools AS approval_required_tools,
        a.approval_routes AS approval_routes,
        a.secrets AS secrets,
@@ -408,6 +410,20 @@ LIMIT 1
 """
 
 
+class AgentBootSettings(NamedTuple):
+    """The operator overrides an eval boot reads from the agent row.
+
+    Each is None when the agent keeps the platform (or installation) default.
+    """
+
+    model: str | None
+    reviewer_model: str | None
+    thinking: str | None
+    runner_resources: dict[str, Any] | None
+    # The runner step cap (#4175), forwarded as CURIE_MAX_TURNS.
+    max_turns: int | None
+
+
 class ResolvedDeployment(BaseModel):
     """The agent binding for a channel: which version to run and its budget."""
 
@@ -442,6 +458,11 @@ class ResolvedDeployment(BaseModel):
     # at boot. None falls back to the worker's configured default; unset at both
     # layers sends nothing and leaves the model's own default standing.
     thinking: str | None = None
+    # The agent's runner step cap (#4175), forwarded as CURIE_MAX_TURNS in its
+    # claim, where it wins over the installation's runner.extraEnv value. None
+    # writes no key, so the installation default (or the runner's own) stands.
+    # A work-item delivery replaces it with worker.workItemMaxTurns (ADR 0171).
+    max_turns: int | None = None
     # Per-agent runner resources (#3209). None means the chart block. A set
     # value is applied to the next claim, not to a sandbox that is already running.
     runner_resources: dict[str, Any] | None = None
@@ -1031,28 +1052,30 @@ class BindingResolver:
             return DEFAULT_EXECUTION_DEADLINE_SECONDS
         return int(row[0])
 
-    async def model_settings_for(
-        self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, str | None, dict[str, Any] | None]:
-        """Model, reviewer model, thinking, and resources for eval boots."""
+    async def model_settings_for(self, agent_id: uuid.UUID) -> AgentBootSettings:
+        """Model, reviewer model, thinking, resources and step cap for eval boots."""
         sql = text(
-            "SELECT model, reviewer_model, thinking, runner_resources "
+            "SELECT model, reviewer_model, thinking, runner_resources, max_turns "
             f"FROM {self._config.db_schema}.agents WHERE id = :id"
         )
         async with self._engine.connect() as conn:
             result = await conn.execute(sql, {"id": agent_id})
             row = result.first()
         if row is None:
-            return None, None, None, None
-        model: str | None = row[0]
-        reviewer_model: str | None = row[1]
-        thinking: str | None = row[2]
+            return AgentBootSettings(None, None, None, None, None)
         runner_resources = row[3]
         if isinstance(runner_resources, str):
             runner_resources = json.loads(runner_resources)
         if runner_resources is not None and not isinstance(runner_resources, dict):
             runner_resources = None
-        return model, reviewer_model, thinking, runner_resources
+        max_turns = row[4]
+        return AgentBootSettings(
+            model=row[0],
+            reviewer_model=row[1],
+            thinking=row[2],
+            runner_resources=runner_resources,
+            max_turns=int(max_turns) if max_turns is not None else None,
+        )
 
     def packs_for(self, resolved: ResolvedDeployment) -> BehaviorPacks:
         """The agent's parsed behavior packs (all-off when none are configured).
@@ -1314,6 +1337,15 @@ class BindingResolver:
         # keys, and stays the marker's sole writer -- see the
         # inject_connector_secrets docstring for the #457/#429 rationale.
         inject_connector_secrets(env, resolved.secrets, agent_label=resolved.agent_id)
+        # The agent's step cap (#4175). Not a render_worker kwarg: BootEnv
+        # declares CURIE_MAX_TURNS operator-produced, and the kernel's work-item
+        # budget writes it after the render the same way. The claim's env wins
+        # over the sandbox template's runner.extraEnv (envVarsInjectionPolicy
+        # Overrides; docker -e), so one agent can run longer turns while the
+        # installation default stays put for every other agent. Written after
+        # the connector secrets so no secret can carry this reserved name.
+        if resolved.max_turns is not None:
+            env[MAX_TURNS_ENV] = str(resolved.max_turns)
         # #1909: default local/cluster eval is a static bundle-plus-cases gate.
         # Ambient durable memory is per-agent, so a fresh thread still loaded
         # it and could change a committed case. The CLI marks those turns with

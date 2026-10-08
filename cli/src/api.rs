@@ -328,6 +328,11 @@ pub struct Agent {
     /// semantics as `model`.
     #[serde(default)]
     pub execution_deadline_seconds: Option<u32>,
+    /// Per-agent runner step cap (#4175), forwarded as `CURIE_MAX_TURNS` in
+    /// the agent's sandbox claim, 1 to 1000. `None` means the installation
+    /// default. Same three-way PATCH semantics as `model`.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
     /// Per-agent runner cpu, memory, and ephemeral-storage (#3209). `None`
     /// means the chart block. Same three-way PATCH semantics as `model`.
     #[serde(default)]

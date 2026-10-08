@@ -48,6 +48,13 @@ from .sealed_snapshot import is_sealed_envelope
 DEFAULT_EXECUTION_DEADLINE_SECONDS = 1800
 MIN_EXECUTION_DEADLINE_SECONDS = 60
 MAX_EXECUTION_DEADLINE_SECONDS = 10800
+# Per-agent runner step cap bounds (#4175). An agent's `max_turns` NULL means
+# the installation default (CURIE_MAX_TURNS from agentSandbox.runner.extraEnv,
+# else the runner's own default); a set value is bounded by these. The ceiling
+# matches the work-item turn budget default (ADR 0171), the largest budget the
+# platform itself hands a runner.
+MIN_MAX_TURNS = 1
+MAX_MAX_TURNS = 1000
 
 GIT_FLOW_CREATED_BY = "git-flow"
 
@@ -134,6 +141,10 @@ class Agent(Base):
             f"BETWEEN {MIN_EXECUTION_DEADLINE_SECONDS} AND {MAX_EXECUTION_DEADLINE_SECONDS}",
             name="agents_execution_deadline_seconds_ck",
         ),
+        CheckConstraint(
+            f"max_turns IS NULL OR max_turns BETWEEN {MIN_MAX_TURNS} AND {MAX_MAX_TURNS}",
+            name="agents_max_turns_ck",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -184,6 +195,11 @@ class Agent(Base):
     # Per-agent work-item execution deadline in seconds (#3071). Operator-owned
     # like `model`/`thinking`; NULL means DEFAULT_EXECUTION_DEADLINE_SECONDS.
     execution_deadline_seconds: Mapped[int | None] = mapped_column(default=None)
+    # Per-agent runner step cap (#4175). Forwarded as CURIE_MAX_TURNS in this
+    # agent's sandbox claim, where it wins over the installation-wide
+    # agentSandbox.runner.extraEnv value. NULL keeps that installation default.
+    # A work-item delivery still boots with worker.workItemMaxTurns (ADR 0171).
+    max_turns: Mapped[int | None] = mapped_column(default=None)
     # Per-agent runner cpu, memory, and ephemeral-storage (#3209). NULL means
     # the chart agentSandbox.runner.resources block. A set value is applied on
     # the next sandbox claim, not by resizing a sandbox that is already running.

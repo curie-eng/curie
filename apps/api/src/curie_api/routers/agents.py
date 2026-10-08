@@ -360,6 +360,8 @@ async def update_agent(
         agent = await crud_agents.update_agent_execution_deadline(
             session, agent, data.execution_deadline_seconds
         )
+    if "max_turns" in sent:
+        agent = await crud_agents.update_agent_max_turns(session, agent, data.max_turns)
     if "runner_resources" in sent:
         # Quota was judged above, before any field committed. Null clears.
         agent = await crud_agents.update_agent_runner_resources(

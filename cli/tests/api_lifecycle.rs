@@ -976,6 +976,7 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
     )
     .await
     .unwrap();
@@ -987,6 +988,7 @@ async fn overrides_inspect_reads_both_fields_and_writes_nothing() {
             reviewer_model: _,
             thinking,
             execution_deadline_seconds: _,
+            max_turns: _,
             runner_resources: _,
             memory_writes,
             changed,
@@ -1028,6 +1030,7 @@ async fn overrides_set_patches_only_the_field_named() {
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Set("enabled:2000".to_string()),
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
     )
@@ -1079,6 +1082,7 @@ async fn overrides_clear_sends_explicit_null_not_an_empty_string() {
         commands::OverrideChange::Clear,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Clear,
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
     )
@@ -1136,6 +1140,7 @@ async fn overrides_dry_run_makes_no_request_on_either_path() {
             thinking,
             commands::OverrideChange::Unchanged,
             commands::OverrideChange::Unchanged,
+            commands::OverrideChange::Unchanged,
         )
         .await
         .unwrap();
@@ -1170,6 +1175,7 @@ async fn overrides_set_execution_deadline_patches_only_that_field() {
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Set("120".to_string()),
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
     )
     .await
@@ -1212,6 +1218,7 @@ async fn overrides_clear_execution_deadline_sends_explicit_null_not_an_empty_str
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Clear,
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
     )
     .await
@@ -1280,6 +1287,7 @@ async fn overrides_set_runner_resources_patches_only_that_field() {
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
         runner_resources,
     )
     .await
@@ -1320,6 +1328,7 @@ async fn overrides_clear_runner_resources_sends_explicit_null_not_an_empty_strin
 
     let out = commands::overrides(
         opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
@@ -1374,6 +1383,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
+        commands::OverrideChange::Unchanged,
     )
     .await
     .unwrap();
@@ -1384,6 +1394,7 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         reviewer_model,
         thinking,
         execution_deadline_seconds,
+        max_turns,
         runner_resources,
         memory_writes,
         changed,
@@ -1407,6 +1418,15 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         "inspect JSON must keep execution_deadline_seconds: {json}"
     );
     assert!(json["execution_deadline_seconds"].is_null());
+    // #4175: an agent row from a platform older than the step cap carries no
+    // `max_turns` key; the inspect still reports it, as null.
+    assert!(max_turns.is_none());
+    assert!(
+        json.as_object()
+            .is_some_and(|obj| obj.contains_key("max_turns")),
+        "inspect JSON must keep max_turns: {json}"
+    );
+    assert!(json["max_turns"].is_null());
     // #1461: memory_writes is a plain boolean in the inspect JSON, never null.
     assert_eq!(
         json.get("memory_writes"),
@@ -1426,13 +1446,14 @@ async fn overrides_inspect_reports_null_runner_resources_as_platform_default() {
         reviewer_model,
         thinking,
         execution_deadline_seconds,
+        max_turns,
         runner_resources,
         *memory_writes,
         *changed,
     );
     assert_eq!(
         line,
-        "overrides for deal-desk: model kimi-k2, reviewer model credential default, thinking adaptive, execution deadline platform default, runner resources platform default, memory writes off"
+        "overrides for deal-desk: model kimi-k2, reviewer model credential default, thinking adaptive, execution deadline platform default, max turns installation default, runner resources platform default, memory writes off"
     );
 
     let rec = server.recorded();
@@ -1463,6 +1484,7 @@ async fn overrides_error_includes_the_api_quota_refusal_detail() {
 
     let err = commands::overrides(
         opts(&server.base_url, "deal-desk", false),
+        commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,
         commands::OverrideChange::Unchanged,

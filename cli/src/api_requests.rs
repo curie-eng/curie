@@ -55,7 +55,7 @@ pub struct ChannelBindingWrite {
 
 /// `PATCH /agents/{id}` (`AgentUpdate`). Every field is optional: an omitted
 /// key leaves the stored value unchanged. `model`, `thinking`,
-/// `execution_deadline_seconds`, `runner_resources` and
+/// `execution_deadline_seconds`, `max_turns`, `runner_resources` and
 /// `publication_branch_prefix` are three-state because the router reads
 /// `model_fields_set` for them, so an explicit `null` clears the value.
 ///
@@ -72,6 +72,8 @@ pub struct AgentUpdate {
     pub hook_partitions: Option<BTreeMap<String, HookPartitionInput>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_writes: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<Option<u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

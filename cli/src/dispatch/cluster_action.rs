@@ -1088,6 +1088,8 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             clear_thinking,
             execution_deadline,
             clear_execution_deadline,
+            max_turns,
+            clear_max_turns,
             runner_resources,
             clear_runner_resources,
             memory_writes,
@@ -1109,6 +1111,8 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 execution_deadline,
                 clear_execution_deadline,
             )?;
+            let max_turns =
+                commands::OverrideChange::resolve_max_turns(max_turns, clear_max_turns)?;
             let runner_resources = commands::OverrideChange::resolve_runner_resources(
                 runner_resources,
                 clear_runner_resources,
@@ -1126,6 +1130,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     reviewer_model,
                     thinking,
                     execution_deadline,
+                    max_turns,
                     runner_resources,
                     commands::memory_writes_flag(memory_writes.as_deref()),
                 )

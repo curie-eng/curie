@@ -377,6 +377,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 reviewer_model: Some("claude-opus-5-5".to_string()),
                 thinking: Some("adaptive".to_string()),
                 execution_deadline_seconds: Some(90),
+                max_turns: Some(300),
                 runner_resources: None,
                 memory_writes: true,
                 changed: true,

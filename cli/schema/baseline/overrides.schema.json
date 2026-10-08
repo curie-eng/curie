@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/overrides/v3.json",
+  "$id": "https://schemas.curietech.ai/cli/overrides/v3.1.json",
   "title": "curie <tier> overrides --json",
-  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's nullable operator overrides as the API stored them. `model`, `thinking`, `execution_deadline_seconds`, and `runner_resources` are null when the platform default applies; `reviewer_model` is null when the credential's default applies. `memory_writes` is the agent's memory-tools switch, always a boolean. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
+  "description": "The agent-facing payload of `curie <tier> overrides <agent>`: the dry-run plan, or the agent's nullable operator overrides as the API stored them. `model`, `thinking`, `execution_deadline_seconds`, and `runner_resources` are null when the platform default applies; `max_turns` (the runner step cap, 1 to 1000) is null when the installation default applies; `reviewer_model` is null when the credential's default applies. `memory_writes` is the agent's memory-tools switch, always a boolean. `changed` is false for an inspect (no change flags passed) and true when this invocation wrote, so a consumer can tell \"this is what it is\" from \"this is what it now is\" without diffing.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -60,6 +60,14 @@
           ],
           "minimum": 60,
           "maximum": 10800
+        },
+        "max_turns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "maximum": 1000
         },
         "runner_resources": {
           "type": [

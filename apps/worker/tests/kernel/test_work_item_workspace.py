@@ -883,8 +883,98 @@ def test_chat_max_turns_escalation_names_the_runner_budget(make_harness) -> None
             assert text is not None and "max-turns" in text, text
             assert "raise CURIE_MAX_TURNS through runner.extraEnv" in text, text
             assert "runner default 20 when unset" in text, text
+            # #4175: the operator can also raise it for this one agent.
+            assert "--max-turns" in text, text
             assert "CURIE_WORK_ITEM_MAX_TURNS" not in text, text
             assert "currently 5" not in text, text
+
+    asyncio.run(exercise())
+
+
+class _AgentStepCapBinding(_Binding):
+    """A binding whose agent row carries a per-agent step cap (#4175).
+
+    The real ``BindingResolver.boot_env`` writes the override as
+    CURIE_MAX_TURNS; this double hands the kernel the same env.
+    """
+
+    def boot_env(self, _resolved: object, thread_key: str, **kw: object) -> dict[str, str]:
+        env = super().boot_env(_resolved, thread_key, **kw)
+        env["CURIE_MAX_TURNS"] = "300"
+        return env
+
+
+def test_agent_step_cap_reaches_a_chat_sandbox(make_harness) -> None:
+    """#4175: an agent's step cap override boots its chat sandbox with that
+    CURIE_MAX_TURNS, where it wins over the installation's runner default."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_AgentStepCapBinding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            h.runner.default_script = [Final(text="Noted.", status=SessionStatus.DONE)]
+
+            await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "hello there"))
+
+            envs = h.fake_k8s.claim_envs
+            assert len(envs) == 1 and envs[0] is not None
+            assert envs[0].get("CURIE_MAX_TURNS") == "300"
+
+    asyncio.run(exercise())
+
+
+def test_work_item_budget_wins_over_the_agent_step_cap(make_harness) -> None:
+    """#4175 with ADR 0171: a work-item delivery boots with the worker's
+    work-item turn budget even when its agent carries a step cap override."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_AgentStepCapBinding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            h.kernel._work_items = _WorkItems()
+            h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
+
+            await h.kernel.process_event(
+                _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+
+            envs = h.fake_k8s.claim_envs
+            assert len(envs) == 1 and envs[0] is not None
+            assert envs[0].get("CURIE_MAX_TURNS") == "5"
+
+    asyncio.run(exercise())
+
+
+def test_chat_max_turns_escalation_names_the_agent_step_cap(make_harness) -> None:
+    """#4175: a chat delivery that ran under its agent's step cap override
+    names that override and the operator command that raises it, not the
+    installation-wide extraEnv default it did not run under."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_AgentStepCapBinding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            h.runner.default_script = _max_turns_script()
+
+            await h.kernel.process_event(
+                _turn(f"slack-{uuid.uuid4()}", f"Please look at {ISSUE_URL}")
+            )
+
+            text = h.sink.last_text
+            assert text is not None and "max-turns" in text, text
+            assert "step cap of 300 turns" in text, text
+            assert "--max-turns" in text, text
+            assert "through runner.extraEnv" not in text, text
+            assert "CURIE_WORK_ITEM_MAX_TURNS" not in text, text
 
     asyncio.run(exercise())
 

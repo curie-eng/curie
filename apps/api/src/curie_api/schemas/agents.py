@@ -9,11 +9,16 @@ from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
 from plugin_format.connector_render import agent_forges_join
 from plugin_format.connectors import ADMITS_SELF
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from ..config import get_settings
 from ..hook_partition import HOOK_NAME, validate_pointer_syntax
-from ..models import MAX_EXECUTION_DEADLINE_SECONDS, MIN_EXECUTION_DEADLINE_SECONDS
+from ..models import (
+    MAX_EXECUTION_DEADLINE_SECONDS,
+    MAX_MAX_TURNS,
+    MIN_EXECUTION_DEADLINE_SECONDS,
+    MIN_MAX_TURNS,
+)
 from ..publication_policy import POLICY_APPROVE, POLICY_AUTO, validate_branch_prefix
 from ..repo_full_name import RepoFullName
 from ..source_binding import validate_revision, validate_source_binding_keys, validate_workload_key
@@ -575,6 +580,11 @@ class AgentUpdate(BaseModel):
         ]
         | None
     ) = None
+    # New per-agent runner step cap (#4175), forwarded as CURIE_MAX_TURNS in the
+    # agent's sandbox claim. Same three-way semantics as `model`: omitted is
+    # unchanged, explicit null clears to the installation default. Strict, so a
+    # string, fraction or boolean is refused rather than coerced.
+    max_turns: Annotated[StrictInt, Field(ge=MIN_MAX_TURNS, le=MAX_MAX_TURNS)] | None = None
     # Per-agent runner resources (#3209). Same three-way semantics as `model`:
     # omitted is unchanged, explicit null clears to the chart block, and an
     # object sets requests and limits.
@@ -661,6 +671,8 @@ class AgentOut(BaseModel):
     thinking: str | None
     # Null means the platform default execution deadline (1800 s) (#3071).
     execution_deadline_seconds: int | None = None
+    # Null means the installation's runner step cap (#4175).
+    max_turns: int | None = None
     # Null means the chart runner resource block (#3209).
     runner_resources: dict[str, Any] | None = None
     approval_required_tools: list[str] | None

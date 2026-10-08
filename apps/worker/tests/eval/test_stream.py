@@ -53,6 +53,7 @@ from curie_worker.binding import (
     BUNDLE_REF_ENV,
     MODEL_ENV,
     THINKING_ENV,
+    AgentBootSettings,
     BindingResolver,
 )
 from curie_worker.bundle_store import BundleStore
@@ -107,10 +108,12 @@ class _StubRepo:
         model: str | None = None,
         reviewer_model: str | None = None,
         thinking: str | None = None,
+        max_turns: int | None = None,
     ) -> None:
         self._model = model
         self._reviewer_model = reviewer_model
         self._thinking = thinking
+        self._max_turns = max_turns
         self.model_settings_agent_ids: list[uuid.UUID] = []
 
     async def repo_full_name(self, _agent_id: uuid.UUID) -> str:
@@ -124,11 +127,11 @@ class _StubRepo:
     async def name_for(self, _agent_id: uuid.UUID) -> str | None:
         return None
 
-    async def model_settings_for(
-        self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
+    async def model_settings_for(self, agent_id: uuid.UUID) -> AgentBootSettings:
         self.model_settings_agent_ids.append(agent_id)
-        return self._model, self._reviewer_model, self._thinking, None
+        return AgentBootSettings(
+            self._model, self._reviewer_model, self._thinking, None, self._max_turns
+        )
 
 
 class _ObservedBindingResolver(BindingResolver):
@@ -138,9 +141,7 @@ class _ObservedBindingResolver(BindingResolver):
         super().__init__(engine, config)
         self.model_settings_agent_ids: list[uuid.UUID] = []
 
-    async def model_settings_for(
-        self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
+    async def model_settings_for(self, agent_id: uuid.UUID) -> AgentBootSettings:
         self.model_settings_agent_ids.append(agent_id)
         return await super().model_settings_for(agent_id)
 
@@ -981,8 +982,9 @@ def test_provisioned_runner_reviewer_model_end_to_end(
                 await conn.execute(
                     text(
                         f"INSERT INTO {_DB_SCHEMA}.agents "
-                        "(id, name, model, reviewer_model, thinking, repo_full_name) "
-                        "VALUES (:id, :name, :model, :reviewer_model, :thinking, :repo)"
+                        "(id, name, model, reviewer_model, thinking, max_turns, "
+                        "repo_full_name) VALUES (:id, :name, :model, :reviewer_model, "
+                        ":thinking, :max_turns, :repo)"
                     ),
                     {
                         "id": agent_id,
@@ -990,6 +992,8 @@ def test_provisioned_runner_reviewer_model_end_to_end(
                         "model": stored_model,
                         "reviewer_model": "acme-reviewer-model" if stored_model else None,
                         "thinking": agent_thinking,
+                        # #4175: the agent's step cap boots the eval runner too.
+                        "max_turns": 300 if stored_model else None,
                         "repo": "acme-corp/acme-bot",
                     },
                 )
@@ -1109,6 +1113,9 @@ def test_provisioned_runner_reviewer_model_end_to_end(
                         assert claim_env[THINKING_ENV] == expected_thinking
                     assert claim_env.get("CURIE_REVIEWER_MODEL") == (
                         "acme-reviewer-model" if stored_model else None
+                    )
+                    assert claim_env.get("CURIE_MAX_TURNS") == (
+                        "300" if stored_model else None
                     )
                     assert repo_lookup.model_settings_agent_ids == [agent_id]
                     assert fake_k8s.deleted, "provisioned sandbox was never released"
@@ -1604,6 +1611,40 @@ def test_eval_fake_model_install_refuses_to_label_a_model_never_called(
         suite="s", sha="d", bundle_ref=None, target_url="http://runner", model="claude-y"
     )
     assert consumer._eval_model(remote, "claude-y") == "claude-y"
+
+
+class _EnvCapturingSubstrate:
+    """A substrate that records the boot env each claim carried."""
+
+    def __init__(self) -> None:
+        self.envs: list[dict[str, str]] = []
+
+    def claim(
+        self, _key: str, *, env: dict[str, str] | None = None, **_: object
+    ) -> _FakeHandle:
+        self.envs.append(dict(env or {}))
+        return _FakeHandle(base_url="http://sandbox.local:8080", token="t")
+
+
+@pytest.mark.parametrize("max_turns", [300, None], ids=["override", "installation-default"])
+def test_eval_claim_carries_the_agents_step_cap(max_turns: int | None) -> None:
+    """#4175: an eval boots with the agent's step cap like a bound run does,
+    and with no key at all when the agent keeps the installation default."""
+    substrate = _EnvCapturingSubstrate()
+    consumer = _consumer(_cfg("s", "g"), substrate=substrate, repo_lookup=_StubRepo())
+    item = _item(suite="s", sha="sha1", bundle_ref="bundles/x.zip", target_url=None)
+
+    asyncio.run(
+        consumer._acquire_target(
+            item, model=None, reviewer_model=None, thinking=None, max_turns=max_turns
+        )
+    )
+
+    assert len(substrate.envs) == 1
+    if max_turns is None:
+        assert "CURIE_MAX_TURNS" not in substrate.envs[0]
+    else:
+        assert substrate.envs[0]["CURIE_MAX_TURNS"] == str(max_turns)
 
 
 class _ConcurrencyProbeSubstrate:
