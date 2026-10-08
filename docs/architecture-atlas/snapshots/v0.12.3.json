@@ -4,8 +4,8 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "main",
-    "commit": "b57d120f2c31cdb7633bd5c01e1115919fecbf61",
-    "shortCommit": "b57d120f",
+    "commit": "eb581f3801232335e4b92b775124b62991ad1f28",
+    "shortCommit": "eb581f38",
     "release": "v0.12.3"
   },
   "title": "Curie architecture atlas",
@@ -2815,224 +2815,224 @@
       "type": "implementation",
       "title": "Delivery lease renewal and bounded ownership",
       "path": "apps/worker/src/curie_worker/delivery_lease.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/worker/src/curie_worker/delivery_lease.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/worker/src/curie_worker/delivery_lease.py"
     },
     {
       "id": "worker-stream-v0123",
       "type": "implementation",
       "title": "Shared stream ownership and consumer liveness",
       "path": "apps/worker/src/curie_worker/stream_consumer.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/worker/src/curie_worker/stream_consumer.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/worker/src/curie_worker/stream_consumer.py"
     },
     {
       "id": "worker-kernel-v0123",
       "type": "implementation",
       "title": "Capacity continuation, settlement and publication snapshot recovery",
       "path": "apps/worker/src/curie_worker/kernel.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/worker/src/curie_worker/kernel.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/worker/src/curie_worker/kernel.py"
     },
     {
       "id": "worker-acquire-v0123",
       "type": "implementation",
       "title": "Renewable factory acquire and API settlement",
       "path": "apps/worker/src/curie_worker/workitem_dispatch.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/worker/src/curie_worker/workitem_dispatch.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/worker/src/curie_worker/workitem_dispatch.py"
     },
     {
       "id": "worker-api-retry-v0123",
       "type": "implementation",
       "title": "Bounded idempotent worker API writes",
       "path": "apps/worker/src/curie_worker/api_retry.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/worker/src/curie_worker/api_retry.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/worker/src/curie_worker/api_retry.py"
     },
     {
       "id": "runner-snapshot-v0123",
       "type": "implementation",
       "title": "Complete bounded runner snapshot reads",
       "path": "apps/worker/src/curie_worker/runner_client.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/worker/src/curie_worker/runner_client.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/worker/src/curie_worker/runner_client.py"
     },
     {
       "id": "substrate-v0123",
       "type": "implementation",
       "title": "Transient Kubernetes claim observations",
       "path": "apps/worker/src/curie_worker/sandbox/substrate.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/worker/src/curie_worker/sandbox/substrate.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/worker/src/curie_worker/sandbox/substrate.py"
     },
     {
       "id": "k8s-log-tail-v0123",
       "type": "implementation",
       "title": "Redacted runner startup log tail",
       "path": "apps/worker/src/curie_worker/sandbox/k8s.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/worker/src/curie_worker/sandbox/k8s.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/worker/src/curie_worker/sandbox/k8s.py"
     },
     {
       "id": "workitems-v0123",
       "type": "implementation",
       "title": "Owner-loss successors and cancellation settlement",
       "path": "apps/api/src/curie_api/workitems.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/api/src/curie_api/workitems.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/api/src/curie_api/workitems.py"
     },
     {
       "id": "workitem-dispatch-v0123",
       "type": "implementation",
       "title": "Start deferral cap and runtime heartbeat grace",
       "path": "apps/api/src/curie_api/workitem_dispatch.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/api/src/curie_api/workitem_dispatch.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/api/src/curie_api/workitem_dispatch.py"
     },
     {
       "id": "factory-status-v0123",
       "type": "implementation",
       "title": "Leased status synchronization outside provider I/O",
       "path": "apps/api/src/curie_api/factory_notices.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/api/src/curie_api/factory_notices.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/api/src/curie_api/factory_notices.py"
     },
     {
       "id": "factory-progress-v0123",
       "type": "implementation",
       "title": "Immutable verification replay and retry presentation",
       "path": "apps/api/src/curie_api/factory_progress.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/api/src/curie_api/factory_progress.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/api/src/curie_api/factory_progress.py"
     },
     {
       "id": "factory-ci-v0123",
       "type": "implementation",
       "title": "Explicit unavailable checks and merge conflicts",
       "path": "apps/api/src/curie_api/factory_ci.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/api/src/curie_api/factory_ci.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/api/src/curie_api/factory_ci.py"
     },
     {
       "id": "publication-backoff-v0123",
       "type": "implementation",
       "title": "Charged publication reconciliation backoff",
       "path": "apps/worker/src/curie_worker/publication_store.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/worker/src/curie_worker/publication_store.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/worker/src/curie_worker/publication_store.py"
     },
     {
       "id": "runner-usage-v0123",
       "type": "implementation",
       "title": "Measured usage of unfinished turns",
       "path": "runner/src/curie_runner/usage_report.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/runner/src/curie_runner/usage_report.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/runner/src/curie_runner/usage_report.py"
     },
     {
       "id": "runner-session-v0123",
       "type": "implementation",
       "title": "History authority after classified terminal failure",
       "path": "runner/src/curie_runner/session.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/runner/src/curie_runner/session.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/runner/src/curie_runner/session.py"
     },
     {
       "id": "runner-reviewer-v0123",
       "type": "implementation",
       "title": "Default factory reviewer selection",
       "path": "runner/src/curie_runner/adapter.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/runner/src/curie_runner/adapter.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/runner/src/curie_runner/adapter.py"
     },
     {
       "id": "controller-preflight-v0123",
       "type": "implementation",
       "title": "Stable serving controller leader proof",
       "path": "charts/curie/templates/preflight-controller.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/charts/curie/templates/preflight-controller.yaml"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/charts/curie/templates/preflight-controller.yaml"
     },
     {
       "id": "factory-config-v0123",
       "type": "implementation",
       "title": "Operator-controlled factory metadata CI and start limits",
       "path": "apps/api/src/curie_api/config.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/api/src/curie_api/config.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/api/src/curie_api/config.py"
     },
     {
       "id": "chart-api-v0123",
       "type": "implementation",
       "title": "Factory policy chart wiring",
       "path": "charts/curie/templates/api.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/charts/curie/templates/api.yaml"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/charts/curie/templates/api.yaml"
     },
     {
       "id": "schema-v0123",
       "type": "implementation",
       "title": "Candidate API schema compatibility",
       "path": "apps/api/src/curie_api/schema_compat.json",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/api/src/curie_api/schema_compat.json"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/api/src/curie_api/schema_compat.json"
     },
     {
       "id": "schema-catalog-v0123",
       "type": "implementation",
       "title": "Immutable release schema windows and open candidate",
       "path": "cli/src/application_schema_windows.json",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/cli/src/application_schema_windows.json"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/cli/src/application_schema_windows.json"
     },
     {
       "id": "schema-rollback-v0123",
       "type": "implementation",
       "title": "Rollback declared-window upper bound",
       "path": "cli/src/ops/verbs.rs",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/cli/src/ops/verbs.rs"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/cli/src/ops/verbs.rs"
     },
     {
       "id": "schema-tag-check-v0123",
       "type": "implementation",
       "title": "Release-tag schema window consistency",
       "path": "scripts/check-schema-window.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/scripts/check-schema-window.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/scripts/check-schema-window.py"
     },
     {
       "id": "migration-0091-v0123",
       "type": "implementation",
       "title": "Owner-loss retry marker",
       "path": "apps/api/alembic/versions/0091_execution_request_owner_lost_retry.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/api/alembic/versions/0091_execution_request_owner_lost_retry.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/api/alembic/versions/0091_execution_request_owner_lost_retry.py"
     },
     {
       "id": "migration-0092-v0123",
       "type": "implementation",
       "title": "Bounded start deferral counter",
       "path": "apps/api/alembic/versions/0092_execution_request_start_deferrals.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/api/alembic/versions/0092_execution_request_start_deferrals.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/api/alembic/versions/0092_execution_request_start_deferrals.py"
     },
     {
       "id": "migration-0093-v0123",
       "type": "implementation",
       "title": "Factory status synchronization lease",
       "path": "apps/api/alembic/versions/0093_factory_status_sync_lease.py",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/apps/api/alembic/versions/0093_factory_status_sync_lease.py"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/apps/api/alembic/versions/0093_factory_status_sync_lease.py"
     },
     {
       "id": "factory-alert-v0123",
       "type": "implementation",
       "title": "One stale-turn alert per installation",
       "path": "examples/sre-bot/observability/prometheus-values.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/examples/sre-bot/observability/prometheus-values.yaml"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/examples/sre-bot/observability/prometheus-values.yaml"
     },
     {
       "id": "adr-0206-v0123",
       "type": "documentation",
       "title": "A factory run lost with its worker is re-admitted as a new attempt",
       "path": "docs/adr/0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/docs/adr/0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/docs/adr/0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md"
     },
     {
       "id": "adr-0207-v0123",
       "type": "documentation",
       "title": "A delivery owner rides through an ownership store outage shorter than its lease",
       "path": "docs/adr/0207-a-delivery-owner-rides-through-an-ownership-store-outage-shorter-than-its-lease.md",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/docs/adr/0207-a-delivery-owner-rides-through-an-ownership-store-outage-shorter-than-its-lease.md"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/docs/adr/0207-a-delivery-owner-rides-through-an-ownership-store-outage-shorter-than-its-lease.md"
     },
     {
       "id": "adr-0208-v0123",
       "type": "documentation",
       "title": "A factory PR opened after its request was cancelled is adopted by the next run",
       "path": "docs/adr/0208-a-factory-pr-opened-after-its-request-was-cancelled-is-adopted-by-the-next-run.md",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/docs/adr/0208-a-factory-pr-opened-after-its-request-was-cancelled-is-adopted-by-the-next-run.md"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/docs/adr/0208-a-factory-pr-opened-after-its-request-was-cancelled-is-adopted-by-the-next-run.md"
     },
     {
       "id": "adr-0209-v0123",
       "type": "documentation",
       "title": "Pause authority after a drain is a lease held by a live upgrade step",
       "path": "docs/adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md",
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/docs/adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/docs/adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md"
     }
   ],
   "documentationDrift": [
@@ -8536,7 +8536,7 @@
         "queue-stream",
         "relational-db"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/docs/adr/0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/docs/adr/0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md"
     },
     {
       "id": "ADR-0207",
@@ -8552,7 +8552,7 @@
       "seamIds": [
         "queue-stream"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/docs/adr/0207-a-delivery-owner-rides-through-an-ownership-store-outage-shorter-than-its-lease.md"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/docs/adr/0207-a-delivery-owner-rides-through-an-ownership-store-outage-shorter-than-its-lease.md"
     },
     {
       "id": "ADR-0208",
@@ -8569,7 +8569,7 @@
       "seamIds": [
         "relational-db"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/docs/adr/0208-a-factory-pr-opened-after-its-request-was-cancelled-is-adopted-by-the-next-run.md"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/docs/adr/0208-a-factory-pr-opened-after-its-request-was-cancelled-is-adopted-by-the-next-run.md"
     },
     {
       "id": "ADR-0209",
@@ -8586,7 +8586,7 @@
       "seamIds": [
         "cluster-lifecycle"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/b57d120f2c31cdb7633bd5c01e1115919fecbf61/docs/adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md"
+      "href": "https://github.com/curie-eng/curie/blob/eb581f3801232335e4b92b775124b62991ad1f28/docs/adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md"
     }
   ],
   "investments": [
