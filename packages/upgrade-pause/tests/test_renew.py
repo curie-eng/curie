@@ -164,3 +164,16 @@ def test_standalone_renew_uses_one_existing_marker(
     assert _renew((keys[1],), revision=0) == "renewed"
     assert client.pttl(keys[1]) > 1_000
     assert client.exists(keys[0]) == 0
+
+
+def test_wrong_type_authority_is_foreign_and_leaves_the_bridge_untouched(
+    markers: tuple[Redis, tuple[str, str]],
+) -> None:
+    client, keys = markers
+    client.rpush(keys[0], "not-a-string-marker")
+    client.pexpire(keys[0], 30_000)
+    client.set(keys[1], '{"revision":17}', px=30_000)
+    assert _renew(keys, ttl_ms=60_000) == "foreign"
+    assert client.lrange(keys[0], 0, -1) == ["not-a-string-marker"]
+    assert client.get(keys[1]) == '{"revision":17}'
+    assert all(29_000 < client.pttl(key) <= 30_000 for key in keys)
