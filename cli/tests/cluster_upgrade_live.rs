@@ -4164,3 +4164,39 @@ fn upgrade_file_inline_credentials_replace_retained_secret_references() {
         assert_eq!(admitted, applied);
     }
 }
+
+#[test]
+fn upgrade_refuses_before_render_when_captured_overlay_cannot_be_materialized() {
+    // @spec CLUSTER-VALUES-FILES c3, CLUSTER-VALUES-FILES c4
+    let fixture = Fixture::new(Some(r#"{"worker":{"deliveryBudgetSeconds":600}}"#));
+    let tmp = fixture.0.path().join("owned-temp");
+    fs::create_dir(&tmp).unwrap();
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &[],
+        &[
+            ("TMPDIR", tmp.to_str().unwrap()),
+            (
+                "VALUES_FILES_REMOVE_TMP_AFTER_SCHEMA_PROBE",
+                tmp.to_str().unwrap(),
+            ),
+        ],
+    );
+    assert!(!tmp.exists(), "fixture did not inject the failure");
+    assert!(!output.status.success());
+    assert!(
+        visible(&output).contains("could not prepare target metadata values"),
+        "{}",
+        visible(&output)
+    );
+    assert!(
+        !fixture
+            .argv()
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "templates/schema-compat.yaml")),
+        "metadata was admitted without its overlay"
+    );
+    assert!(mutating_calls(&fixture).is_empty());
+}

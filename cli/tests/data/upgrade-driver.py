@@ -915,6 +915,10 @@ if program == "kubectl":
                 file=sys.stderr,
             )
             sys.exit(1)
+        # @spec CLUSTER-VALUES-FILES c3: invalidate only this test-owned temp path.
+        removed_tmp = os.environ.get("VALUES_FILES_REMOVE_TMP_AFTER_SCHEMA_PROBE")
+        if removed_tmp:
+            os.rmdir(removed_tmp)
         print(scenario["alembic_current"])
         sys.exit(0)
 
