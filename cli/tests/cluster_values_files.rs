@@ -58,6 +58,10 @@ fn ordered_files_are_accepted_and_never_expose_their_secret_contents() {
         "file secret leaked"
     );
     assert!(
+        !output.contains("a GitHub credential passed with --set"),
+        "file credential was misclassified as an argv credential"
+    );
+    assert!(
         !output.contains("ui.service.type=NodePort"),
         "CLI default overrode the later file"
     );
