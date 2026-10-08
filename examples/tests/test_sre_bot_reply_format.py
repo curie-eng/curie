@@ -29,6 +29,7 @@ import re
 from pathlib import Path
 
 import pytest
+from curie_worker.eval.models import Grader
 
 REPO = Path(__file__).resolve().parents[2]
 SKILL = REPO / "examples" / "sre-bot" / "skills" / "sre-bot" / "SKILL.md"
@@ -420,3 +421,52 @@ def test_resolved_alert_case_uses_anonymous_operational_scope() -> None:
     assert "deployment acme-mail-adapter in namespace acme-system" in case["input"]
     assert "resources_scale with scale: 1 on that deployment" in case["input"]
     assert "Nobody has acted on that card since" in case["input"]
+
+
+_UNACTIONED_SCALE_REPLY = (
+    "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\n"
+    "What I changed: nothing; the pending scale-to-1 request on acme-mail-adapter "
+    "is still unactioned -- deny it if recovery is verified.\n"
+    "Next: workload owner -- check recovery."
+)
+
+
+def _resolved_case_grader() -> Grader:
+    from curie_worker.eval.models import EvalSuite
+
+    suite = EvalSuite.model_validate_json(
+        (REPO / "examples/sre-bot/evals/cases.json").read_text()
+    )
+    return next(
+        c.grader for c in suite.cases
+        if c.id == "resolved-alert-reports-pending-approval-not-an-action"
+    )
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        _UNACTIONED_SCALE_REPLY,
+        _UNACTIONED_SCALE_REPLY.replace(
+            "the pending scale-to-1 request on", "my pending scale to 1 request for"
+        ).replace("is still unactioned -- deny it if", "still unactioned; decline it once"),
+    ],
+)
+def test_resolved_grader_accepts_unactioned_scale_with_conditional_decline(reply: str) -> None:
+    assert _resolved_case_grader().grade(reply)
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        _UNACTIONED_SCALE_REPLY.replace("still unactioned", "already approved"),
+        _UNACTIONED_SCALE_REPLY.replace("still unactioned", "already executed"),
+        _UNACTIONED_SCALE_REPLY.replace("request on acme-mail-adapter", "request on acme-other"),
+        _UNACTIONED_SCALE_REPLY.replace("scale-to-1 request", "documentation request"),
+        _UNACTIONED_SCALE_REPLY.replace("deny it if recovery is verified", "deny it now"),
+        _UNACTIONED_SCALE_REPLY.replace("nothing;", "scaled it to 1;"),
+        _UNACTIONED_SCALE_REPLY + "\nI executed the scale.",
+    ],
+)
+def test_unactioned_scale_route_rejects_other_tasks_and_unverified_actions(bad: str) -> None:
+    assert not _resolved_case_grader().grade(bad)

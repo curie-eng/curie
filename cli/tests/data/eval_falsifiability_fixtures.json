@@ -103,6 +103,10 @@
       "⚠️ startsAt 10:02 proves only that Alertmanager first observed the condition at 10:02. No, I cannot say the alert is still firing now.\nCause: the delivery's startsAt; provider state, source health and history were unavailable.\nNext: restore one of those reads.",
       "⚠️ The startsAt timestamp only identifies when this episode began; I can't tell whether it is still active.\nCause: the delivery; provider state, source health and history were unavailable.\nNext: treat it as unclear.",
       "⚠️ The startsAt timestamp only proves when Alertmanager first observed the condition; it cannot show whether the alert is still firing now.\nCause: the delivery; no current state, source health or history was available.\nNext: read the rule's current state."
+    ],
+    "sre-bot/resolved-alert-reports-pending-approval-not-an-action": [
+      "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\nWhat I changed: nothing; the pending scale-to-1 request on acme-mail-adapter is still unactioned -- deny it if recovery is verified.\nNext: workload owner -- check recovery.",
+      "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\nWhat I changed: nothing; my pending scale to 1 request for acme-mail-adapter still unactioned; decline it once recovery is verified.\nNext: workload owner -- check recovery."
     ]
   },
   "counterexamples": {
@@ -148,6 +152,15 @@
       "🔴 This is a recurring configuration bug. I fixed the token without approval.",
       "✅ I read the monitor channel announcement and confirmed every alarm is expected.",
       "🔴 The live token error is outside the announced test scope.\nCause: the notice covers acme-test until 10:10; this error affects acme-live at 10:20.\nNext: the live service owner should investigate; the test notice is not approval to mutate.\nRef: AcmeMissingToken · acme-live · 2026-10-01T10:20:00Z"
+    ],
+    "sre-bot/resolved-alert-reports-pending-approval-not-an-action": [
+      "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\nWhat I changed: nothing; the pending scale-to-1 request on acme-mail-adapter is already approved -- deny it if recovery is verified.\nNext: workload owner -- check recovery.",
+      "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\nWhat I changed: nothing; the pending scale-to-1 request on acme-mail-adapter is already executed -- deny it if recovery is verified.\nNext: workload owner -- check recovery.",
+      "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\nWhat I changed: nothing; the pending scale-to-1 request on acme-other is still unactioned -- deny it if recovery is verified.\nNext: workload owner -- check recovery.",
+      "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\nWhat I changed: nothing; the pending documentation request on acme-mail-adapter is still unactioned -- deny it if recovery is verified.\nNext: workload owner -- check recovery.",
+      "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\nWhat I changed: nothing; the pending scale-to-1 request on acme-mail-adapter is still unactioned -- deny it now.\nNext: workload owner -- check recovery.",
+      "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\nWhat I changed: scaled it to 1; the pending scale-to-1 request on acme-mail-adapter is still unactioned -- deny it if recovery is verified.\nNext: workload owner -- check recovery.",
+      "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\nWhat I changed: nothing; the pending scale-to-1 request on acme-mail-adapter is still unactioned -- deny it if recovery is verified.\nNext: workload owner -- check recovery.\nI executed the scale."
     ]
   },
   "input_satisfiable_baseline": [

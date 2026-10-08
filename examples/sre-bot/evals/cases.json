@@ -42,7 +42,7 @@
       "input": "Alertmanager delivery, status: resolved. Alert CurieMailAdapterNotReady for deployment acme-mail-adapter in namespace acme-system has resolved. Earlier in this thread, on the firing delivery for the same alert, you called resources_scale with scale: 1 on that deployment, which raised an approval card. Nobody has acted on that card since. Reply to this resolved notification.",
       "grader": {
         "kind": "regex",
-        "expected": "(?is)^[\\s*_]*(✅|⚠|🔴)[^\\n]*\\n.*(still pending|still awaiting|awaiting (your |an? )?approval|pending approval|approval is (still )?pending|request is (still )?pending|not (been |yet )?approved|never (been )?approved).*(deny|denied|decline|reject)",
+        "expected": "(?is)^[\\s*_]*(✅|⚠|🔴)[^\\n]*\\n.*(still pending|still awaiting|awaiting (your |an? )?approval|pending approval|approval is (still )?pending|request is (still )?pending|not (been |yet )?approved|never (been )?approved).*(deny|denied|decline|reject)|^⚠[^\\n]*\\nWhat I changed:[ \\t]+nothing[ ;—–-]+(?:my|the)[ \\t]+pending[ \\t]+(?:scale-to-1|scale to 1)[ \\t]+request[ \\t]+(?:on|for)[ \\t]+acme-mail-adapter[ \\t]+(?:is[ \\t]+)?still[ \\t]+unactioned[ ;—–-]+(?:deny|decline|reject)[ \\t]+it[ \\t]+(?:if|once)[ \\t]+recovery[ \\t]+is[ \\t]+verified[.]?\\nNext:[ \\t]+[^\\n]+$",
         "case_sensitive": false
       }
     },
