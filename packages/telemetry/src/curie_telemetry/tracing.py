@@ -91,6 +91,13 @@ PLATFORM_SPAN_ATTRIBUTE_KEYS = {
     "outcome": "curie.outcome",
     "retry_class": "curie.retry_class",
     "event_id": "curie.channel.event_id",
+    # AUTOMATED-REMEDIATION-21: the receipt span's closed attributes. The ids
+    # are admitted on spans only, as event_id is.
+    "stage": "curie.remediation.stage",
+    "kind": "curie.remediation.kind",
+    "authority": "curie.remediation.authority",
+    "code": "curie.remediation.code",
+    "nomination_id": "curie.remediation.nomination_id",
 }
 PLATFORM_EVENT_ATTRIBUTE_KEYS = {
     "outcome": "curie.outcome",

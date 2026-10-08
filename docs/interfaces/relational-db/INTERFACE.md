@@ -223,6 +223,14 @@ alert rule tuning request ends with (it executes nothing). The downgrade moves
 such rows to `finished` with the code in `execution_code`, then restores the
 narrower check.
 
+Migration `0097_remediation_receipts.py` (automated remediation,
+AUTOMATED-REMEDIATION-20) adds the nullable
+`remediation_delivery_surfaces.reply_conversation`, the thread the protected
+hook ingress records for the receipts, and `remediation_receipt_posts`, one row
+per (nomination, stage) the worker receipt loop has claimed: its lease, attempt
+count and `posted_at`. The row holds no message text, argument or reason and
+cascades with its nomination. The downgrade drops both.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.

@@ -196,6 +196,23 @@ fn cluster_cases() -> Vec<ClusterCase> {
             name: "remediation-policy",
             args: &["remediation-policy", "show", "acme-bot", "alerts"],
         },
+        // @spec AUTOMATED-REMEDIATION-20: the receipt read has no dry run.
+        ClusterCase {
+            name: "remediation",
+            args: &["remediation", "list"],
+        },
+        // @spec AUTOMATED-REMEDIATION-22: the run read needs no principal, so
+        // the target is the first thing refused.
+        ClusterCase {
+            name: "remediation-qualification",
+            args: &[
+                "remediation-qualification",
+                "show-run",
+                "acme-bot",
+                "88888888-8888-4888-8888-888888888888",
+                "99999999-9999-4999-8999-999999999999",
+            ],
+        },
     ]
 }
 
@@ -299,7 +316,7 @@ fn coverage_inventory_names_every_cluster_verb() {
     let covered_names: BTreeSet<&str> = cluster_cases().iter().map(|case| case.name).collect();
 
     assert_eq!(covered_names, manifest_names);
-    assert_eq!(covered_names.len(), 34);
+    assert_eq!(covered_names.len(), 36);
 }
 
 #[test]

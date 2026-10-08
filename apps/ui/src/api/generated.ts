@@ -599,6 +599,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Remediation Breakers
+         * @description The hook's breakers, newest opened first: how an operator finds an id to close.
+         *
+         *     Scoped as the close route is: only breakers on a connector and tool the
+         *     hook's policy declares. A read needs the platform key and no operator
+         *     principal.
+         */
+        get: operations["list_remediation_breakers_agents__agent_id__hooks__hook__remediation_policy_breakers_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close": {
         parameters: {
             query?: never;
@@ -2313,6 +2337,46 @@ export interface paths {
         };
         /** Ready */
         get: operations["ready_ready_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/remediation-nominations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Remediation Nominations
+         * @description Nominations, newest first: the operator receipt list.
+         */
+        get: operations["list_remediation_nominations_remediation_nominations_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/remediation-nominations/{nomination_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Show Remediation Nomination
+         * @description One nomination's receipt.
+         */
+        get: operations["show_remediation_nomination_remediation_nominations__nomination_id__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -6889,6 +6953,57 @@ export interface components {
             nomination_ids: string[];
         };
         /**
+         * RemediationNominationOut
+         * @description One nomination as the operator receipt: its stage, authority and code.
+         *
+         *     @spec AUTOMATED-REMEDIATION-20. Exactly these fields; the arguments (past
+         *     the target key), the model's reason, any read result and the alert body are
+         *     never part of it. ``stage``, ``authority`` and ``code`` are derived from the
+         *     row by ``curie_api.remediation_receipts``, the one derivation the worker's
+         *     thread receipts and the CLI share.
+         */
+        RemediationNominationOut: {
+            /** Action */
+            action: string | null;
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Approval Id */
+            approval_id: string | null;
+            /** Authority */
+            authority: string;
+            /** Code */
+            code: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Decided At */
+            decided_at: string | null;
+            /** Execution Id */
+            execution_id: string | null;
+            /** Hook */
+            hook: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Kind */
+            kind: string | null;
+            /** Stage */
+            stage: string;
+            /** State */
+            state: string;
+            /** Target */
+            target: string | null;
+            /** Verification Outcome */
+            verification_outcome: string | null;
+        };
+        /**
          * RemediationNominationRefusal
          * @description @spec AUTOMATED-REMEDIATION-6.
          */
@@ -9637,6 +9752,51 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    list_remediation_breakers_agents__agent_id__hooks__hook__remediation_policy_breakers_get: {
+        parameters: {
+            query?: {
+                state?: "open" | "closed" | "all";
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationBreakerOut"][];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -13428,6 +13588,81 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_remediation_nominations_remediation_nominations_get: {
+        parameters: {
+            query?: {
+                agent_id?: string | null;
+                state?: ("received" | "refused" | "precondition_pending" | "admitted" | "approval_requested" | "approved" | "rejected" | "expired" | "executing" | "verifying" | "finished") | null;
+                limit?: number;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationNominationOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    show_remediation_nomination_remediation_nominations__nomination_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                nomination_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationNominationOut"];
+                };
+            };
+            /** @description No such nomination */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };

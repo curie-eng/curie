@@ -8767,6 +8767,153 @@
         "title": "RemediationNominationAccepted",
         "type": "object"
       },
+      "RemediationNominationOut": {
+        "additionalProperties": false,
+        "description": "One nomination as the operator receipt: its stage, authority and code.\n\n@spec AUTOMATED-REMEDIATION-20. Exactly these fields; the arguments (past\nthe target key), the model's reason, any read result and the alert body are\nnever part of it. ``stage``, ``authority`` and ``code`` are derived from the\nrow by ``curie_api.remediation_receipts``, the one derivation the worker's\nthread receipts and the CLI share.",
+        "properties": {
+          "action": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Action"
+          },
+          "agent_id": {
+            "format": "uuid",
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "approval_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval Id"
+          },
+          "authority": {
+            "title": "Authority",
+            "type": "string"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "decided_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided At"
+          },
+          "execution_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Execution Id"
+          },
+          "hook": {
+            "title": "Hook",
+            "type": "string"
+          },
+          "id": {
+            "format": "uuid",
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Kind"
+          },
+          "stage": {
+            "title": "Stage",
+            "type": "string"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "target": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target"
+          },
+          "verification_outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verification Outcome"
+          }
+        },
+        "required": [
+          "id",
+          "agent_id",
+          "hook",
+          "kind",
+          "action",
+          "target",
+          "state",
+          "stage",
+          "authority",
+          "code",
+          "verification_outcome",
+          "approval_id",
+          "execution_id",
+          "created_at",
+          "decided_at"
+        ],
+        "title": "RemediationNominationOut",
+        "type": "object"
+      },
       "RemediationNominationRefusal": {
         "additionalProperties": false,
         "description": "@spec AUTOMATED-REMEDIATION-6.",
@@ -14675,6 +14822,103 @@
           }
         },
         "summary": "Arm Remediation Policy",
+        "tags": [
+          "remediation-policy"
+        ]
+      }
+    },
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers": {
+      "get": {
+        "description": "The hook's breakers, newest opened first: how an operator finds an id to close.\n\nScoped as the close route is: only breakers on a connector and tool the\nhook's policy declares. A read needs the platform key and no operator\nprincipal.",
+        "operationId": "list_remediation_breakers_agents__agent_id__hooks__hook__remediation_policy_breakers_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "hook",
+            "required": true,
+            "schema": {
+              "title": "Hook",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "default": "open",
+              "enum": [
+                "open",
+                "closed",
+                "all"
+              ],
+              "title": "State",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RemediationBreakerOut"
+                  },
+                  "title": "Response List Remediation Breakers Agents  Agent Id  Hooks  Hook  Remediation Policy Breakers Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationPolicyRefusal"
+                }
+              }
+            },
+            "description": "Policy refusal"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Remediation Breakers",
         "tags": [
           "remediation-policy"
         ]
@@ -22225,6 +22469,181 @@
         "summary": "Ready",
         "tags": [
           "health"
+        ]
+      }
+    },
+    "/remediation-nominations": {
+      "get": {
+        "description": "Nominations, newest first: the operator receipt list.",
+        "operationId": "list_remediation_nominations_remediation_nominations_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "received",
+                    "refused",
+                    "precondition_pending",
+                    "admitted",
+                    "approval_requested",
+                    "approved",
+                    "rejected",
+                    "expired",
+                    "executing",
+                    "verifying",
+                    "finished"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 200,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RemediationNominationOut"
+                  },
+                  "title": "Response List Remediation Nominations Remediation Nominations Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Remediation Nominations",
+        "tags": [
+          "remediation-nominations"
+        ]
+      }
+    },
+    "/remediation-nominations/{nomination_id}": {
+      "get": {
+        "description": "One nomination's receipt.",
+        "operationId": "show_remediation_nomination_remediation_nominations__nomination_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "nomination_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Nomination Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemediationNominationOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "description": "No such nomination"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Show Remediation Nomination",
+        "tags": [
+          "remediation-nominations"
         ]
       }
     },

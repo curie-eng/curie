@@ -13,7 +13,8 @@ use crate::api_requests::{
     ChannelBindingWrite, ChannelCallersWrite, ChannelTokenRequest, ConsoleLoginCodeMint,
     DeploymentCreate, EvalTriggerRequest, MemoryEntryCreate, MemoryGuidanceIn,
     RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
-    ResolveTargetRequest, RoutingCheckRequest, VersionCreate,
+    RemediationQualificationWrite, RemediationVerifierRunStart, ResolveTargetRequest,
+    RoutingCheckRequest, VersionCreate,
 };
 
 pub struct ApiClient {
@@ -1224,6 +1225,74 @@ pub struct RemediationBreaker {
     pub closed_at: Option<String>,
     pub closed_by: Option<String>,
     pub close_reason: Option<String>,
+}
+
+// @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-20 @spec AUTOMATED-REMEDIATION-22
+/// What a `404` from a remediation route tells the operator to check.
+const POLICY_NOT_FOUND_FIX: &str =
+    "check the agent and hook names; the hook must be a protected hook";
+const NOMINATION_FIX: &str = "check the nomination id with `remediation list`";
+const QUALIFICATION_FIX: &str =
+    "check the agent, qualification id and run id; the agent must exist";
+
+// @spec AUTOMATED-REMEDIATION-20
+/// One nomination as the operator receipt (`RemediationNominationOut`): the
+/// fields `GET /remediation-nominations` and `.../{id}` answer with, never the
+/// arguments or the model's reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationNomination {
+    pub id: String,
+    pub agent_id: String,
+    pub hook: String,
+    pub kind: Option<String>,
+    pub action: Option<String>,
+    pub target: Option<String>,
+    pub state: String,
+    pub stage: String,
+    pub authority: String,
+    pub code: Option<String>,
+    pub verification_outcome: Option<String>,
+    pub approval_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub created_at: String,
+    pub decided_at: Option<String>,
+}
+
+// @spec AUTOMATED-REMEDIATION-22
+/// One qualification record (`RemediationQualificationOut`). The operator
+/// principal that recorded it is its subject, never a token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationQualificationOut {
+    pub id: String,
+    pub agent_id: String,
+    pub hook: Option<String>,
+    pub action: Option<String>,
+    pub generation: Option<String>,
+    pub connector: String,
+    pub tool: String,
+    pub connector_digest: String,
+    pub verifier_sha256: String,
+    pub reversibility: String,
+    pub recorded_by: String,
+    pub worst_case: String,
+    pub evidence: serde_json::Value,
+    pub created_at: String,
+}
+
+// @spec AUTOMATED-REMEDIATION-22
+/// One qualification verifier run (`RemediationVerifierRunOut`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemediationVerifierRunOut {
+    pub id: String,
+    pub qualification_id: String,
+    pub hook: String,
+    pub action: String,
+    pub target: serde_json::Value,
+    pub generation: String,
+    pub started_by: String,
+    pub started_at: String,
+    pub outcome: Option<String>,
+    pub decided_at: Option<String>,
 }
 
 // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3
@@ -4167,6 +4236,178 @@ impl ApiClient {
             .context("decoding the circuit breaker")
     }
 
+    // @spec AUTOMATED-REMEDIATION-11
+    /// A hook's breakers, newest opened first:
+    /// `GET .../remediation-policy/breakers[?state=..]`, on the platform key.
+    /// Reads need no principal.
+    pub async fn list_remediation_breakers(
+        &self,
+        agent_id: &str,
+        hook: &str,
+        state: Option<&str>,
+    ) -> Result<Vec<RemediationBreaker>> {
+        let mut request = self
+            .http
+            .get(format!(
+                "{}/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
+                self.base_url
+            ))
+            .header("X-API-Key", &self.api_key);
+        if let Some(state) = state {
+            request = request.query(&[("state", state)]);
+        }
+        let resp = self
+            .send_request(
+                request,
+                "GET /agents/{id}/hooks/{hook}/remediation-policy/breakers",
+            )
+            .await?;
+        Self::expect_remediation_policy_ok(resp, "listing the circuit breakers")
+            .await?
+            .json()
+            .await
+            .context("decoding the circuit breakers")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-20
+    /// Nominations, newest first: `GET /remediation-nominations`, on the
+    /// platform key, with the optional agent, state and limit filters.
+    pub async fn list_remediation_nominations(
+        &self,
+        agent_id: Option<&str>,
+        state: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<RemediationNomination>> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(agent_id) = agent_id {
+            query.push(("agent_id", agent_id.to_string()));
+        }
+        if let Some(state) = state {
+            query.push(("state", state.to_string()));
+        }
+        if let Some(limit) = limit {
+            query.push(("limit", limit.to_string()));
+        }
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/remediation-nominations", self.base_url))
+                    .header("X-API-Key", &self.api_key)
+                    .query(&query),
+                "GET /remediation-nominations",
+            )
+            .await?;
+        Self::expect_remediation_ok(resp, "listing remediation nominations", NOMINATION_FIX)
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation nominations")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-20
+    /// One nomination's receipt: `GET /remediation-nominations/{id}`.
+    pub async fn get_remediation_nomination(&self, id: &str) -> Result<RemediationNomination> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!("{}/remediation-nominations/{id}", self.base_url))
+                    .header("X-API-Key", &self.api_key),
+                "GET /remediation-nominations/{id}",
+            )
+            .await?;
+        Self::expect_remediation_ok(resp, "reading the remediation nomination", NOMINATION_FIX)
+            .await?
+            .json()
+            .await
+            .context("decoding the remediation nomination")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-22
+    /// Record a qualification: `PUT /agents/{agent_id}/remediation-qualifications/{id}`
+    /// on the platform key and the operator principal.
+    pub async fn put_remediation_qualification(
+        &self,
+        agent_id: &str,
+        qualification_id: &str,
+        body: &RemediationQualificationWrite,
+        principal_token: &str,
+    ) -> Result<RemediationQualificationOut> {
+        let resp = self
+            .send_request(
+                self.http
+                    .put(format!(
+                        "{}/agents/{agent_id}/remediation-qualifications/{qualification_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationQualificationWrite>(body),
+                "PUT /agents/{id}/remediation-qualifications/{qualification_id}",
+            )
+            .await?;
+        Self::expect_remediation_ok(resp, "recording the qualification", QUALIFICATION_FIX)
+            .await?
+            .json()
+            .await
+            .context("decoding the qualification record")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-22
+    /// Start a verifier run: `POST .../remediation-qualifications/{id}/verifier-runs`
+    /// on the platform key and the operator principal.
+    pub async fn start_remediation_verifier_run(
+        &self,
+        agent_id: &str,
+        qualification_id: &str,
+        body: &RemediationVerifierRunStart,
+        principal_token: &str,
+    ) -> Result<RemediationVerifierRunOut> {
+        let resp = self
+            .send_request(
+                self.http
+                    .post(format!(
+                        "{}/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key)
+                    .header("X-Curie-Approval-Principal", principal_token)
+                    .json::<RemediationVerifierRunStart>(body),
+                "POST /agents/{id}/remediation-qualifications/{qualification_id}/verifier-runs",
+            )
+            .await?;
+        Self::expect_remediation_ok(resp, "starting the verifier run", QUALIFICATION_FIX)
+            .await?
+            .json()
+            .await
+            .context("decoding the verifier run")
+    }
+
+    // @spec AUTOMATED-REMEDIATION-22
+    /// Read a verifier run: `GET .../verifier-runs/{run_id}`; no principal.
+    pub async fn get_remediation_verifier_run(
+        &self,
+        agent_id: &str,
+        qualification_id: &str,
+        run_id: &str,
+    ) -> Result<RemediationVerifierRunOut> {
+        let resp = self
+            .send_request(
+                self.http
+                    .get(format!(
+                        "{}/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
+                        self.base_url
+                    ))
+                    .header("X-API-Key", &self.api_key),
+                "GET /agents/{id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}",
+            )
+            .await?;
+        Self::expect_remediation_ok(resp, "reading the verifier run", QUALIFICATION_FIX)
+            .await?
+            .json()
+            .await
+            .context("decoding the verifier run")
+    }
+
     // @spec AUTOMATED-REMEDIATION-3
     /// ADR-0021 status classes for the remediation policy routes, whose every
     /// refusal is `{"detail": {"code", "path"?, "message"?}}`. The code (and
@@ -4175,6 +4416,17 @@ impl ApiClient {
     async fn expect_remediation_policy_ok(
         resp: reqwest::Response,
         what: &str,
+    ) -> Result<reqwest::Response> {
+        Self::expect_remediation_ok(resp, what, POLICY_NOT_FOUND_FIX).await
+    }
+
+    // @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-20 @spec AUTOMATED-REMEDIATION-22
+    /// The same classes for any remediation route; `not_found_fix` is what a
+    /// `404` without a policy code tells the operator to check.
+    async fn expect_remediation_ok(
+        resp: reqwest::Response,
+        what: &str,
+        not_found_fix: &str,
     ) -> Result<reqwest::Response> {
         use crate::exit::CliError;
         use reqwest::StatusCode;
@@ -4222,8 +4474,7 @@ impl ApiClient {
                      --expected-generation 0`",
                 )
             }
-            (StatusCode::NOT_FOUND, _) => CliError::failure(message)
-                .with_fix("check the agent and hook names; the hook must be a protected hook"),
+            (StatusCode::NOT_FOUND, _) => CliError::failure(message).with_fix(not_found_fix),
             (StatusCode::FORBIDDEN, _) => CliError::failure(message).with_fix(
                 "export an operator principal as CURIE_APPROVAL_PRINCIPAL_TOKEN (mint one with \
                  `curie <local|cluster> approvals <AGENT> --mint-operator-principal <SUBJECT>`)",
