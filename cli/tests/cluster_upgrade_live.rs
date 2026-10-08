@@ -3557,6 +3557,82 @@ fn upgrade_rebinds_a_stock_layer_to_the_published_target_layer_and_retires_its_c
     );
 }
 
+/// #4321 AC1-AC2 with @spec CLUSTER-VALUES-FILES c1-c4: the stock binding
+/// supplied by an operator file participates in the target rebind, while its
+/// unrelated values remain in the one overlay used by admission and Apply.
+#[test]
+fn operator_file_stock_binding_is_rebound_in_the_admitted_apply_overlay() {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success(), "real Helm required");
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let registry = stock_registry(true);
+    let retained = serde_json::json!({
+        "agentSandbox": {
+            "runnerImages": {"acme-bot": LAYER_BOT},
+            "connectorSecrets": {"dark-factory": {"GITHUB_APP_KEY": "dark-factory-app"}}
+        }
+    });
+    let fixture = Fixture::new(Some(&retained.to_string()));
+    fixture.set_chart_values(&serde_json::json!({
+        "agentSandbox": {"runner": {
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "digest": index_digest(STOCK_BASE_INDEX)
+        }}
+    }));
+    let file = fixture.0.path().join("stock-values.yaml");
+    fs::write(
+        &file,
+        format!(
+            "agentSandbox:\n  runnerImages:\n    dark-factory: {STOCK_OLD}\nworker:\n  deliveryBudgetSeconds: 777\n"
+        ),
+    )
+    .unwrap();
+
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["--values-file", file.to_str().unwrap()],
+        &[
+            ("CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT", &registry.base_url),
+            ("VALUES_FILES_REAL_HELM", helm.trim()),
+        ],
+    );
+    assert!(output.status.success(), "{}", visible(&output));
+    let applied = values_doc(&fixture.values(1));
+    assert_eq!(
+        applied
+            .pointer("/agentSandbox/runnerImages/dark-factory")
+            .and_then(Value::as_str),
+        Some(stock_new().as_str()),
+        "the file-provided stock binding is rebound: {applied}"
+    );
+    assert!(
+        applied
+            .pointer("/agentSandbox/runnerImages/acme-bot")
+            .is_none(),
+        "the retained owner-built binding is still cleared: {applied}"
+    );
+    assert_eq!(
+        applied.pointer("/worker/deliveryBudgetSeconds"),
+        Some(&serde_json::json!(777)),
+        "the unrelated file value survives the rebind: {applied}"
+    );
+    for path in fixture.captured_paths("render-values") {
+        let admitted: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            admitted, applied,
+            "admission and Apply used different overlays"
+        );
+    }
+    let rebound = plan_line(&json(&output), "runner layers rebound:");
+    assert!(rebound.contains("dark-factory"), "{rebound}");
+    assert_retired_after_apply(&fixture, &["acme-bot", "dark-factory"]);
+}
+
 /// #4321 AC3: the dry run reads the registry, lists the rebound agent with
 /// its digest-pinned image apart from the cleared owner-built agent, prints
 /// both retirements, and mutates nothing.
