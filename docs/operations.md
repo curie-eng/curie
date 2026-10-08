@@ -1185,7 +1185,7 @@ until chart-owned values land):
 | `CURIE_WORK_ITEM_BATCH_LIMIT` | `50` | Due rows claimed per pass |
 | `CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS` | `86400` | Waiting deadline from admission |
 | `CURIE_WORK_ITEM_DISPATCH_LEASE_SECONDS` | `30` | Reconciler publish lease |
-| `CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS` | `300` | Worker acquire lease |
+| `CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS` | `60` | Worker acquire lease; the worker renews it every 20 s until start or defer, so a dead worker's unstarted requests re-dispatch within about 75 s. Minimum 40 |
 | `CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS` | `45` | Runtime heartbeat expiry; interval is ttl / 3 |
 | `CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS` | `120` | A cancellation with no worker teardown receipt settles as cancelled after this |
 | `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` | `10` | Defer backoff base |
