@@ -24,6 +24,7 @@ neither may be the only place a rule lives.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -375,3 +376,36 @@ def test_front_partial_notice_does_not_claim_notice_text_is_absent() -> None:
     assert "cannot verify" in unavailable and "notice" in unavailable
     assert "target/window" in unavailable
     assert "no operator notice text" not in unavailable
+
+
+def _manifest_reply_contract() -> str:
+    from curie_runner.plugin import load_bundle_system_prompt
+
+    manifest = SKILL.parents[2] / ".claude-plugin" / "plugin.json"
+    prompt = json.loads(manifest.read_text()).get("systemPrompt")
+    assert isinstance(prompt, str) and prompt.strip(), "reply protocol is absent from boot context"
+    assert load_bundle_system_prompt(str(SKILL.parents[2])) == prompt
+    return " ".join(prompt.split())
+
+
+def test_manifest_boot_context_keeps_alert_protocol_above_followup_questions() -> None:
+    prompt = _manifest_reply_contract()
+    assert len(prompt) < 3000
+    assert re.search(r"first.{0,40}alert.{0,120}four.{0,30}lines", prompt, re.I)
+    assert "Cause:" in prompt and "Next:" in prompt and "Ref:" in prompt
+    assert re.search(
+        r"extra question.{0,100}(Cause:|Next:).{0,100}never.{0,80}(paragraph|appendix)",
+        prompt,
+        re.I,
+    )
+    assert re.search(r"Read.{0,100}SKILL.md.{0,100}(path|location)", prompt, re.I)
+
+
+def test_manifest_boot_context_does_not_turn_notice_into_recovery_or_approval() -> None:
+    prompt = _manifest_reply_contract()
+    assert re.search(r"confirmed.{0,40}error.{0,100}attribution.{0,100}impact", prompt, re.I)
+    assert re.search(r"notice.{0,60}target.{0,40}window.{0,70}(reads|evidence)", prompt, re.I)
+    assert re.search(r"missing.{0,50}notice.{0,60}unverified.{0,100}provide", prompt, re.I)
+    assert re.search(r"outside.{0,50}(scope|window).{0,70}investigate", prompt, re.I)
+    assert re.search(r"never.{0,50}(approval|permission).{0,100}recovery", prompt, re.I)
+    assert re.search(r"pending.{0,100}nothing.{0,100}deny.{0,60}verified", prompt, re.I)
