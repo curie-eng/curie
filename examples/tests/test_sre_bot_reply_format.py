@@ -162,7 +162,8 @@ def test_what_i_changed_is_dropped_by_default() -> None:
     assert re.search(r"\b(omit|drop|dropped|only when|only if|no such line)\b", joined, re.I), (
         "`What I changed:` must be omitted by default, not written as 'nothing'"
     )
-    assert re.search(r"\bapprov\w* (call|action|change)?[^.]{0,60}\bran\b|\bactually ran\b", joined, re.I), (
+    ran = r"\bapprov\w* (call|action|change)?[^.]{0,60}\bran\b|\bactually ran\b"
+    assert re.search(ran, joined, re.I), (
         "`What I changed:` appears when an approved action actually ran"
     )
     assert re.search(r"\bpending\b", joined, re.I) and re.search(r"\bdeni", joined, re.I), (
