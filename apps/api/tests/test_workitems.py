@@ -1086,6 +1086,232 @@ def test_publication_link_is_unique_idempotent_and_restricts_deletion(
     with_session(body)
 
 
+async def _nonrunning_publication_link_case(
+    session: AsyncSession, *, status: str = "cancellation_requested"
+) -> tuple[workitems.WorkItemOutcome, uuid.UUID]:
+    running = await _request(session, (await _item(session, await _agent(session))).work_item)
+    assert running.request is not None
+    await _attach_own_publication(
+        session, running.work_item.id, running.request.id, status="succeeded"
+    )
+    lineage_id = await session.scalar(
+        text("SELECT lineage_id FROM curie.publications WHERE execution_request_id = :id"),
+        {"id": running.request.id},
+    )
+    assert isinstance(lineage_id, uuid.UUID)
+    await session.execute(
+        text(
+            "UPDATE curie.thread_publication_lineages SET github_repository_id = 101, "
+            "github_installation_id = 202, github_pr_node_id = 'PR_example_4298', "
+            "base_ref = 'main' WHERE id = :id"
+        ),
+        {"id": lineage_id},
+    )
+    await session.execute(
+        text(
+            "UPDATE curie.execution_requests SET status = :status, terminal_cause = :cause, "
+            "execution_attempts = 1, "
+            "started_at = clock_timestamp() - interval '2 hours', "
+            "execution_deadline = clock_timestamp() - interval '1 hour', "
+            "terminal_at = CASE WHEN :terminal THEN clock_timestamp() ELSE NULL END, "
+            "termination_observation = CASE WHEN :terminal THEN :observation ELSE NULL END "
+            "WHERE id = :id"
+        ),
+        {
+            "id": running.request.id,
+            "status": status,
+            "terminal": status != "cancellation_requested",
+            "cause": "owner_lost" if status == "failed" else "issue_cancelled",
+            "observation": FIXTURE_TERMINATION,
+        },
+    )
+    await session.commit()
+    return running, lineage_id
+
+
+@pytest.mark.parametrize("status", ["cancellation_requested", "cancelled", "failed"])
+def test_nonrunning_publisher_can_link_its_existing_pr_after_its_deadline(
+    clean_db: None, status: str
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        running, lineage_id = await _nonrunning_publication_link_case(session, status=status)
+        assert running.request is not None
+        before_request = (
+            (
+                await session.execute(
+                    text("SELECT * FROM curie.execution_requests WHERE id = :id"),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        before_publication = (
+            (
+                await session.execute(
+                    text("SELECT * FROM curie.publications WHERE execution_request_id = :id"),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+        linked = await workitems.link_publication_lineage(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=running.request.id,
+            publication_lineage_id=lineage_id,
+            expected_work_item_version=running.work_item.version,
+            expected_request_version=running.request.version,
+        )
+
+        assert isinstance(linked, workitems.WorkItemOutcome), linked
+        assert linked.work_item.publication_lineage_id == lineage_id
+        assert linked.work_item.version == running.work_item.version + 1
+        assert linked.request is not None
+        assert (linked.request.status, linked.request.version) == (status, running.request.version)
+        assert dict(
+            (
+                await session.execute(
+                    text("SELECT * FROM curie.execution_requests WHERE id = :id"),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        ) == dict(before_request)
+        assert dict(
+            (
+                await session.execute(
+                    text("SELECT * FROM curie.publications WHERE execution_request_id = :id"),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        ) == dict(before_publication)
+        replay = await workitems.link_publication_lineage(
+            session,
+            work_item_id=linked.work_item.id,
+            request_id=linked.request.id,
+            publication_lineage_id=lineage_id,
+            expected_work_item_version=linked.work_item.version,
+            expected_request_version=linked.request.version,
+        )
+        assert isinstance(replay, workitems.WorkItemOutcome), replay
+        assert replay.replayed is True
+        assert replay.work_item.version == linked.work_item.version
+
+    with_session(body)
+
+
+@pytest.mark.parametrize(
+    ("refusal", "code"),
+    [
+        ("cancelled_item", "work_item_cancelled"),
+        ("stale_item", "stale_version"),
+        ("stale_request", "stale_version"),
+        ("no_own_publication", "publication_ineligible"),
+        ("closed", "publication_ineligible"),
+        ("merged", "publication_ineligible"),
+        ("no_pr", "publication_ineligible"),
+        ("another_owner", "lineage_already_owned"),
+        ("repository_id", "lineage_mismatch"),
+        ("installation_id", "lineage_mismatch"),
+    ],
+)
+def test_nonrunning_publication_link_preserves_cancellation_ownership_and_version_guards(
+    clean_db: None, refusal: str, code: workitems.ConflictCode
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        running, lineage_id = await _nonrunning_publication_link_case(session)
+        assert running.request is not None
+        expected_item_version = running.work_item.version
+        expected_request_version = running.request.version
+        if refusal == "cancelled_item":
+            await session.execute(
+                text("UPDATE curie.work_items SET cancelled_at = clock_timestamp() WHERE id = :id"),
+                {"id": running.work_item.id},
+            )
+        elif refusal == "stale_item":
+            expected_item_version -= 1
+        elif refusal == "stale_request":
+            expected_request_version -= 1
+        elif refusal == "no_own_publication":
+            await session.execute(
+                text(
+                    "UPDATE curie.publications SET execution_request_id = NULL "
+                    "WHERE lineage_id = :id"
+                ),
+                {"id": lineage_id},
+            )
+        elif refusal == "another_owner":
+            other = await _item(
+                session, running.work_item.agent_id, issue=2574, conversation="other-conversation"
+            )
+            await session.execute(
+                text(
+                    "UPDATE curie.work_items SET publication_lineage_id = :lineage WHERE id = :id"
+                ),
+                {"id": other.work_item.id, "lineage": lineage_id},
+            )
+        else:
+            changes = {
+                "closed": "status = 'closed'",
+                "merged": "status = 'merged'",
+                "no_pr": (
+                    "pr_number = NULL, pr_url = NULL, head_sha = NULL, "
+                    "github_repository_id = NULL, github_installation_id = NULL, "
+                    "github_pr_node_id = NULL, base_ref = NULL"
+                ),
+                "repository_id": "github_repository_id = 999",
+                "installation_id": "github_installation_id = 999",
+            }
+            await session.execute(
+                text(
+                    f"UPDATE curie.thread_publication_lineages SET {changes[refusal]} "
+                    "WHERE id = :id"
+                ),
+                {"id": lineage_id},
+            )
+        await session.commit()
+        before = {
+            table: [
+                dict(row)
+                for row in (
+                    await session.execute(text(f"SELECT * FROM curie.{table} ORDER BY id"))
+                ).mappings()
+            ]
+            for table in ("work_items", "execution_requests", "publications")
+        }
+
+        _conflict(
+            await workitems.link_publication_lineage(
+                session,
+                work_item_id=running.work_item.id,
+                request_id=running.request.id,
+                publication_lineage_id=lineage_id,
+                expected_work_item_version=expected_item_version,
+                expected_request_version=expected_request_version,
+            ),
+            code,
+        )
+
+        after = {
+            table: [
+                dict(row)
+                for row in (
+                    await session.execute(text(f"SELECT * FROM curie.{table} ORDER BY id"))
+                ).mappings()
+            ]
+            for table in before
+        }
+        assert after == before
+
+    with_session(body)
+
+
 def test_cancellation_seals_idle_waiting_terminal_and_running_work(
     clean_db: None,
 ) -> None:

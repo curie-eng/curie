@@ -1148,7 +1148,7 @@ async def _render(
         word = "revision" if pending_count == 1 else "revisions"
         waiting_line = f"{pending_count} {word} waiting on this run."
     base = settings.github_factory_card_base_url
-    return status_body(
+    body = status_body(
         request_id=row.execution_request_id,
         card_url=f"{base}/v1/factory/cards/{row.card_token}.svg" if base else None,
         pill_label=pill_label,
@@ -1158,6 +1158,26 @@ async def _render(
         waiting_line=waiting_line,
         base_line=render_base_line(work_item),
     )
+    if (
+        request.status in {"queued", "waiting", "running", "cancellation_requested"}
+        and work_item.publication_lineage_id is not None
+        and pr_url
+        and await session.scalar(
+            select(Publication.id)
+            .join(ExecutionRequest, ExecutionRequest.id == Publication.execution_request_id)
+            .where(
+                Publication.lineage_id == work_item.publication_lineage_id,
+                ExecutionRequest.work_item_id == work_item.id,
+                ExecutionRequest.sequence < request.sequence,
+            )
+            .limit(1)
+        )
+        is not None
+    ):
+        body = _redact_factory_comment(
+            f"Continuing on the existing pull request: {pr_url}\n\n{body}"
+        )
+    return body
 
 
 async def _superseded(
