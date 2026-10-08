@@ -640,6 +640,86 @@ def test_transitive_dependency_lockfile_addition_is_refused(tmp_path: Path, base
     )
 
 
+@pytest.mark.parametrize("basename", ["package-lock.json", "pnpm-lock.yaml"])
+@pytest.mark.parametrize("source", ["registry", "git"])
+def test_dependency_lock_structural_identity_cannot_hide_behind_name_metadata(
+    tmp_path: Path, basename: str, source: str
+) -> None:
+    path = f"nested/{basename}"
+    before = _DEPENDENCY_FILES[basename][0]
+    if basename == "package-lock.json":
+        document = json.loads(before)
+        resolved = (
+            "https://registry.npmjs.org/acme-new/"
+            if source == "registry"
+            else "git+https://example.com/acme.git"
+        )
+        document["packages"]["node_modules/acme-new"] = {
+            "name": "acme-base",
+            "version": "1.0.0",
+            "resolved": resolved,
+        }
+        after = json.dumps(document) + "\n"
+    else:
+        resolution = (
+            {"tarball": "https://registry.npmjs.org/acme-new/"}
+            if source == "registry"
+            else {"type": "git", "repo": "https://example.com/acme.git"}
+        )
+        after = before + (
+            f"  acme-new@1.0.0:\n    name: acme-base\n    resolution: {json.dumps(resolution)}\n"
+        )
+    _assert_dependency_refusal(tmp_path, {path: before}, {path: after}, path)
+
+
+@pytest.mark.parametrize("basename", ["package-lock.json", "pnpm-lock.yaml"])
+def test_existing_dependency_lock_alias_version_change_publishes(
+    tmp_path: Path, basename: str
+) -> None:
+    path = f"nested/{basename}"
+    if basename == "package-lock.json":
+        before = (
+            json.dumps(
+                {
+                    "packages": {
+                        "node_modules/acme-alias": {
+                            "name": "acme-base",
+                            "version": "1.0.0",
+                            "resolved": "https://registry.npmjs.org/acme-base/1.0.0",
+                        }
+                    }
+                }
+            )
+            + "\n"
+        )
+    else:
+        before = (
+            "lockfileVersion: '9.0'\npackages:\n  acme-alias@1.0.0:\n"
+            "    name: acme-base\n"
+            "    resolution: {tarball: 'https://registry.npmjs.org/acme-base/1.0.0'}\n"
+        )
+    _validate_dependency_snapshot(
+        tmp_path, {path: before}, {path: before.replace("1.0.0", "2.0.0")}
+    )
+
+
+@pytest.mark.parametrize(
+    ("basename", "contents"),
+    [
+        (
+            "pyproject.toml",
+            '[project]\ndependencies = ["acme-local"]\n'
+            "[tool.uv.sources]\nacme-local = { virtual = true }\n",
+        ),
+        ("uv.lock", '[[package]]\nname = "acme-local"\nsource = { virtual = true }\n'),
+    ],
+)
+def test_standalone_virtual_dependency_sources_publish(
+    tmp_path: Path, basename: str, contents: str
+) -> None:
+    _validate_dependency_snapshot(tmp_path, {}, {f"nested/{basename}": contents})
+
+
 @pytest.mark.parametrize(
     ("basename", "contents"),
     [
