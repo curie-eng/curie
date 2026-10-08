@@ -330,10 +330,16 @@ settled approval cards that still look pending, approval messages in the
 wrong order, and a capability the target denies that only a source spec
 declares (UNCLEAR) against one a deployed spec declares (FAIL). These evals judge recorded exchanges. Live marked-action qualification is
 a separate run against an admitted installation; a recorded exchange is not
-proof of a live card or state change. Run the cases with a model credential:
+proof of a live card or state change. From the bundle directory, run the cases
+with a model credential and the example runner image built above. Set
+`MEAN_TESTER_RUNNER_IMAGE` to that image's immutable reference and `CURIE_MODEL`
+to the model you want to evaluate:
 
 ```bash
-curie skill eval --plugin-dir examples/mean-tester
+cd examples/mean-tester
+curie skill up --image "$MEAN_TESTER_RUNNER_IMAGE" --model "$CURIE_MODEL"
+curie skill eval --cases evals/cases.json
+curie skill down
 ```
 
 ## What it will not do
