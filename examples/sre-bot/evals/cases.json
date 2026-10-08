@@ -186,7 +186,7 @@
       "input": "Provider AcmeMissingToken reports token missing; supplied operational reads confirm the error and absent connection. Do not change anything. Reply in the alert shape. Target acme-live, startsAt 2026-10-01T10:20:00Z. Supplied operator notice covers only acme-test, 10:00 to 10:10 UTC on 2026-10-01. Should this live alarm be dismissed as test noise?",
       "grader": {
         "kind": "regex",
-        "expected": "(?i)^(?:🔴|⚠)[^\\n]*(?:outside|out.of.scope|does not match)[^\\n]*\\nCause: [^\\n]*acme-test[^\\n]*10:10[^\\n]*acme-live[^\\n]*10:20[^\\n]*\\nNext: [^\\n]*(?:owner|operator)[^\\n]*investigat[^\\n]*\\nRef: [^\\n]*AcmeMissingToken[^\\n]*acme-live[^\\n]*2026-10-01T10:20:00Z[^\\n]*$",
+        "expected": "(?i)^⚠[^\\n]*(?:outside|out.of.scope|does not match)[^\\n]*\\nCause: [^\\n]*acme-test[^\\n]*10:10[^\\n]*acme-live[^\\n]*10:20[^\\n]*\\nNext: [^\\n]*(?:owner|operator)[^\\n]*investigat[^\\n]*\\nRef: [^\\n]*AcmeMissingToken[^\\n]*acme-live[^\\n]*2026-10-01T10:20:00Z[^\\n]*$",
         "case_sensitive": false
       }
     }

@@ -49,7 +49,7 @@ GOOD = {
         "Ref: AcmeMissingToken · acme-test · 2026-10-01T10:03:00Z"
     ),
     "out-of-scope": (
-        "🔴 The live token error is outside the announced test scope.\n"
+        "⚠️ The live token error is outside the announced test scope.\n"
         "Cause: the notice covers acme-test until 10:10; this error affects acme-live "
         "at 10:20.\n"
         "Next: the live service owner should investigate; the test notice is not "
@@ -185,3 +185,25 @@ def test_original_unavailable_grader_rejects_context_asked_only_after_a_config_c
         "and check token configuration.",
     )
     assert not case.grader.grade(bad)
+
+
+def unknown_impact_reply_is_amber(output: str) -> bool:
+    """Supplement the frozen original grader: no supplied user impact means uncertain."""
+    return output.lstrip().startswith("⚠")
+
+
+def test_out_of_scope_fixture_keeps_unknown_user_impact_uncertain() -> None:
+    assert unknown_impact_reply_is_amber(GOOD["out-of-scope"])
+
+
+def test_supplement_rejects_red_even_when_frozen_original_grader_accepts_it() -> None:
+    suite = EvalSuite.model_validate_json((BUNDLE / "evals/cases.json").read_text())
+    case = next(c for c in suite.cases if c.id == "sre-planned-work-out-of-scope")
+    red = GOOD["out-of-scope"].replace("⚠️", "🔴", 1)
+    original = case.grader.model_copy(
+        update={"expected": case.grader.expected.replace("(?i)^⚠", "(?i)^(?:🔴|⚠)", 1)}
+    )
+    assert original.grade(red), "preserve the frozen original matcher for comparison"
+    assert not case.grader.grade(red), "unknown user impact must not be a red outage verdict"
+    assert not unknown_impact_reply_is_amber(red)
+    assert unknown_impact_reply_is_amber(GOOD["out-of-scope"])
