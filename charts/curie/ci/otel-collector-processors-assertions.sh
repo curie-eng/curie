@@ -27,6 +27,17 @@ grep -Fxq '      processors: [memory_limiter, batch]' "$TMP/default.config" || f
 [[ $(grep -Fxc '      processors: [memory_limiter, batch]' "$TMP/default.config") -eq 2 ]] || fail 'default trace/log pipelines changed'
 grep -Fxq '      processors: [memory_limiter, transform/runner_identity, batch]' "$TMP/default.config" || fail 'default metrics processor order changed'
 
+# @spec charts/curie/README.md: Optional trace processors. A retained release
+# supplies its own values.yaml on --reuse-values, without the new keys.
+cp -R "$CHART" "$TMP/reuse-chart"
+sed '/^  extraProcessors: {}$/d; /^  extraTracePipelineProcessors: \[\]$/d' \
+  "$CHART/values.yaml" > "$TMP/reuse-chart/values.yaml"
+helm template curie "$TMP/reuse-chart" --is-upgrade -s templates/otel-collector.yaml \
+  | awk '/^  collector-config.yaml: \|$/ { config=1; next } config && /^    / { sub(/^    /, ""); print; next } config { exit }' \
+  > "$TMP/reuse.config"
+grep -Fxq '      processors: [memory_limiter, batch]' "$TMP/reuse.config" || fail 'retained release without processor keys changed traces'
+grep -Fxq '      processors: [memory_limiter, transform/runner_identity, batch]' "$TMP/reuse.config" || fail 'retained release without processor keys changed metrics'
+
 cat > "$TMP/selected.yaml" <<'YAML'
 otelCollector:
   extraProcessors:
@@ -89,5 +100,17 @@ otelCollector:
     filter/example: disabled
 YAML
 refuses nonmap 'must be a map'
+
+cat > "$TMP/nonmap-top-level.yaml" <<'YAML'
+otelCollector:
+  extraProcessors: disabled
+YAML
+refuses nonmap-top-level 'otelCollector.extraProcessors must be a map'
+
+cat > "$TMP/nonlist-top-level.yaml" <<'YAML'
+otelCollector:
+  extraTracePipelineProcessors: disabled
+YAML
+refuses nonlist-top-level 'otelCollector.extraTracePipelineProcessors must be a list'
 
 echo 'otel collector processor assertions passed'
