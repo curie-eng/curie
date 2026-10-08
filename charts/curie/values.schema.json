@@ -317,6 +317,7 @@
               "type": "array",
               "items": {"type": "string", "minLength": 1, "maxLength": 512}
             },
+            "allowDependencyAdditions": {"type": "boolean"},
             "githubHttpsCidrs": {
               "type": "array",
               "minItems": 1,

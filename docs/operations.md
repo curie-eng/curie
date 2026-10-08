@@ -1240,7 +1240,9 @@ not edited again. A comment a person deletes is re-created once on the next
 pass; unlabel the issue to stop the run instead.
 
 When publication succeeds, the result names the exact pull request
-URL. When the run cannot complete, the result starts with `Could not complete:`
+URL. A follow-up that needs no change ends with `Status: SUCCEEDED` and a result
+starting `No changes needed:` that names the open pull request.
+When the run cannot complete, the result starts with `Could not complete:`
 and a plain sentence for the cause. A request lost with its worker and retried
 as a new run shows `Status: RETRYING` and its result starts with `Retrying:`.
 When the model provider refused the run,

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import Select, SQLColumnExpression, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 from starlette.concurrency import run_in_threadpool
@@ -29,6 +29,10 @@ _MAX_RESPONSE_BYTES = 1_048_576
 
 class PublicationPrecheckRefused(RuntimeError):
     """The durable execution no longer grants this read authority."""
+
+
+class PublicationPullRequestNotAdopted(PublicationPrecheckRefused):
+    """An existing conversation PR cannot be continued by this execution."""
 
 
 class PublicationPrecheckUnavailable(RuntimeError):
@@ -64,6 +68,32 @@ class PublicationMetadata:
     observed_at: datetime
 
 
+def conversation_pr_lineage_id(
+    *,
+    agent_id: uuid.UUID | SQLColumnExpression[uuid.UUID],
+    conversation_id: str | SQLColumnExpression[str],
+    repo_full_name: str | SQLColumnExpression[str],
+) -> Select[tuple[uuid.UUID]]:
+    """Select this conversation's open PR, otherwise its newest PR lineage."""
+
+    lineage = aliased(ThreadPublicationLineage)
+    return (
+        select(lineage.id)
+        .where(
+            lineage.agent_id == agent_id,
+            lineage.conversation_id == conversation_id,
+            func.lower(lineage.repo_full_name) == func.lower(repo_full_name),
+            lineage.pr_number.is_not(None),
+        )
+        .order_by(
+            (lineage.status == "open").desc(),
+            lineage.created_at.desc(),
+            lineage.id.desc(),
+        )
+        .limit(1)
+    )
+
+
 async def read_publication_authority(
     session: AsyncSession,
     *,
@@ -80,17 +110,14 @@ async def read_publication_authority(
     map can preserve authority that expired while awaiting GitHub.
     """
 
-    other_lineage = aliased(ThreadPublicationLineage)
     existing_pr = (
-        select(other_lineage.id)
-        .where(
-            other_lineage.agent_id == WorkItem.agent_id,
-            other_lineage.conversation_id == WorkItem.conversation_id,
-            func.lower(other_lineage.repo_full_name) == func.lower(WorkItem.repo_full_name),
-            other_lineage.pr_number.is_not(None),
+        conversation_pr_lineage_id(
+            agent_id=WorkItem.agent_id,
+            conversation_id=WorkItem.conversation_id,
+            repo_full_name=WorkItem.repo_full_name,
         )
         .correlate(WorkItem)
-        .exists()
+        .scalar_subquery()
     )
     result = await session.execute(
         select(
@@ -113,7 +140,7 @@ async def read_publication_authority(
     row = result.one_or_none()
     if row is None:
         raise PublicationPrecheckRefused
-    deployment, item, execution, lineage, now, has_existing_pr = row
+    deployment, item, execution, lineage, now, existing_pr_id = row
     if (
         deployment.agent_id != item.agent_id
         or item.cancelled_at is not None
@@ -135,8 +162,10 @@ async def read_publication_authority(
         raise PublicationPrecheckRefused
     if lineage is None or lineage.pr_number is None:
         # An absent WorkItem link must not hide an existing conversation PR.
-        # The correlated existence check uses the same snapshot as the lease.
-        if has_existing_pr or (lineage is None and item.publication_lineage_id is not None):
+        # The correlated selector uses the same snapshot as the lease.
+        if existing_pr_id is not None:
+            raise PublicationPullRequestNotAdopted
+        if lineage is None and item.publication_lineage_id is not None:
             raise PublicationPrecheckRefused
         return None
     if (

@@ -291,3 +291,32 @@ async def test_ledger_transport_failure_exhausts_only_the_requested_window(retry
     assert sum(retry_clock.sleeps) == 3
     assert retry_clock.now == 3
     assert len(seen) == 4
+
+
+@pytest.mark.parametrize("operation", ["record", "complete"])
+async def test_ledger_empty_timeout_message_retains_the_exception_type(
+    operation, retry_clock
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("", request=request)
+
+    client, seen = _client(handler)
+    async with client:
+        actions = ActionClient(api_base_url="http://api", api_key="k", client=client)
+        frame = SideEffectFlag(tool="deploy", call_id="call-1")
+        with pytest.raises(ActionBackendError, match="ReadTimeout") as caught:
+            if operation == "record":
+                await actions.record(
+                    frame,
+                    event_id="event",
+                    conversation_id="thread",
+                    agent_id=None,
+                    budget_s=3,
+                )
+            else:
+                await actions.complete("a1", frame, budget_s=3)
+
+    assert isinstance(caught.value.__cause__, httpx.ReadTimeout)
+    assert str(caught.value.__cause__) == ""
+    assert retry_clock.sleeps == [0.5, 1.0, 1.5]
+    assert len(seen) == 4

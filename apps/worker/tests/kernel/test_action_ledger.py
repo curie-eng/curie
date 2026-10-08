@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 import time
 from dataclasses import dataclass, field
@@ -224,6 +225,36 @@ def test_a_ledger_that_refuses_the_write_fails_the_turn(make_harness) -> None:
             # exactly one attempt was made.
             assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
             assert h.runner.opened == ["scale it"]
+
+    asyncio.run(go())
+
+
+def test_ledger_empty_backend_error_is_named_in_the_log(make_harness, caplog) -> None:
+    class EmptyErrorRecorder(FakeRecorder):
+        async def record(self, *args, **kwargs) -> RecordedAction:
+            raise ActionBackendError("")
+
+    async def go() -> None:
+        async with make_harness(actions=EmptyErrorRecorder()) as h:
+            h.runner.default_script = [*_call("toolu_01"), Final(text="done", status=DONE)]
+            event = _qevent("scale it")
+            with caplog.at_level(logging.ERROR, logger="curie_worker.kernel"):
+                await h.kernel.process_event(event)
+
+            records = [
+                record
+                for record in caplog.records
+                if record.getMessage().startswith("action ledger write failed for ")
+            ]
+            assert len(records) == 1
+            assert records[0].levelno == logging.ERROR
+            assert records[0].getMessage() == (
+                f"action ledger write failed for {event.event_id}: ActionBackendError: "
+            )
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+            assert h.runner.opened == ["scale it"]
+            assert h.sink.last_text is not None
+            assert "human" in h.sink.last_text.lower()
 
     asyncio.run(go())
 

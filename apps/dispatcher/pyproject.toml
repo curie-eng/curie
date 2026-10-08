@@ -6,6 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "aci-protocol",
     "curie-telemetry",
+    "curie-upgrade-pause",
     "slack-bolt>=1.30.0",
     "redis>=5.2",
     "pydantic>=2.10",

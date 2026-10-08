@@ -7,6 +7,7 @@ dependencies = [
     "aci-protocol",
     "curie-channel-protocol",
     "curie-telemetry",
+    "curie-upgrade-pause",
     "pydantic>=2.10",
     "pydantic-settings>=2.7",
 ]

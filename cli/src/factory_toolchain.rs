@@ -543,6 +543,7 @@ pub struct AppPreflight {
     pub api: GithubApi,
     pub app: InstalledApp,
     pub pem: String,
+    pub publication: crate::factory_app::PublicationIdentity,
 }
 
 pub async fn preflight(
@@ -555,5 +556,11 @@ pub async fn preflight(
     let app = crate::factory_app::inspect_app(&api, app_id, &pem).await?;
     let repos = crate::factory_app::resolve_allowlist(requested, &app)?;
     announce(&api, &app, &repos).await?;
-    Ok(AppPreflight { api, app, pem })
+    let publication = api.bot_publication_identity(&app.slug).await?;
+    Ok(AppPreflight {
+        api,
+        app,
+        pem,
+        publication,
+    })
 }

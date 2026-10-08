@@ -86,6 +86,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "runner_timeout",
         "workspace_error",
         "runner_escalated",
+        "pull_request_not_adopted",
         "unclassified",
         "max_turns",
         "runner_failed",
@@ -365,7 +366,8 @@ class _GitHubComments(BaseHTTPRequestHandler):
         if subject is not None:
             number = int(subject.group(1))
             payload: dict[str, Any] = {
-                "number": number, "title": server.titles.get(number, f"Issue {number}")
+                "number": number,
+                "title": server.titles.get(number, f"Issue {number}"),
             }
             if "/pulls/" in path:
                 # GitHub computes mergeability asynchronously and returns null:
@@ -888,6 +890,167 @@ def test_runner_escalation_posts_one_comment_and_completed_needs_a_pull_request(
     assert _request(number)["version"] == version
 
 
+def _unadopted_pr_lineages(work_item_id: uuid.UUID, *, open_pr: bool, html_base: str) -> uuid.UUID:
+    """An earlier request's PR is deliberately unlinked from the work item."""
+
+    async def go() -> uuid.UUID:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                item = (
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT agent_id, conversation_id, repo_full_name "
+                                "FROM curie.work_items WHERE id = :id"
+                            ),
+                            {"id": work_item_id},
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                version_id, deployment_id = uuid.uuid4(), uuid.uuid4()
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.agent_versions "
+                        "(id, agent_id, version_label, created_by) "
+                        "VALUES (:id, :agent, 'v1', 'fixture')"
+                    ),
+                    {"id": version_id, "agent": item["agent_id"]},
+                )
+                await conn.execute(
+                    text(
+                        "INSERT INTO curie.deployments "
+                        "(id, agent_id, version_id, environment, status) VALUES "
+                        "(:id, :agent, :version, CAST('dev' AS curie.environment), 'active')"
+                    ),
+                    {"id": deployment_id, "agent": item["agent_id"], "version": version_id},
+                )
+                # All offsets are distinct, so newest never depends on insertion
+                # order. A no-PR lineage and other scopes are newer than every
+                # eligible PR; neither can become the actionable link.
+                cases = [
+                    (71, "closed", 4, item["conversation_id"], item["repo_full_name"]),
+                    (
+                        72,
+                        "open" if open_pr else "merged",
+                        3,
+                        item["conversation_id"],
+                        item["repo_full_name"],
+                    ),
+                    (73, "closed", 2, item["conversation_id"], item["repo_full_name"]),
+                    (None, "closed", 1, item["conversation_id"], item["repo_full_name"]),
+                    (74, "open", 0, f"other-{uuid.uuid4().hex}", item["repo_full_name"]),
+                    (75, "open", 0, item["conversation_id"], "acme-corp/other"),
+                ]
+                for pr, status, age, conversation, repo in cases:
+                    lineage_id = uuid.uuid4()
+                    await conn.execute(
+                        text(
+                            "INSERT INTO curie.thread_publication_lineages "
+                            "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
+                            "base_sha, branch, pr_number, pr_url, head_sha, status, "
+                            "version, latest_revision, created_at) VALUES "
+                            "(:id, :agent, :deployment, :conversation, :repo, :base, "
+                            ":branch, :pr, :url, :head, :status, 1, 1, "
+                            "clock_timestamp() - :age * interval '1 day')"
+                        ),
+                        {
+                            "id": lineage_id,
+                            "agent": item["agent_id"],
+                            "deployment": deployment_id,
+                            "conversation": conversation,
+                            "repo": repo,
+                            "base": "a" * 40,
+                            "branch": f"curie/publication-{lineage_id.hex}",
+                            "pr": pr,
+                            "url": None if pr is None else f"{html_base}/{repo}/pull/{pr}",
+                            "head": None if pr is None else HEAD_A,
+                            "status": status,
+                            "age": age,
+                        },
+                    )
+                return deployment_id
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize(("open_pr", "selected_pr"), [(True, 72), (False, 73)])
+def test_an_unadopted_pr_notice_names_the_database_selected_conversation_pr(
+    admitted: Any, open_pr: bool, selected_pr: int
+) -> None:
+    client, github, sink = admitted
+    number = 9300
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    # The comments fixture configures this HTTP server as the forge API. Its
+    # canonical HTML origin is that same configured origin, as required by
+    # #3562, rather than public github.com.
+    host, port = sink.server_address
+    html_base = f"http://{host}:{port}"
+    deployment_id = _unadopted_pr_lineages(
+        row["work_item_id"], open_pr=open_pr, html_base=html_base
+    )
+    unlinked = _rows(
+        "SELECT publication_lineage_id FROM curie.work_items WHERE id = :id",
+        {"id": row["work_item_id"]},
+    )
+    assert unlinked == [{"publication_lineage_id": None}]
+    headers = {"X-Curie-Worker-Token": "factory-terminus-worker"}
+    refused = client.post(
+        "/v1/internal/publications/precheck/context",
+        headers=headers,
+        json={
+            "deployment_id": str(deployment_id),
+            "work_item_id": str(row["work_item_id"]),
+            "execution_request_id": str(row["id"]),
+            "runtime_epoch": epoch,
+            "queued_event_id": f"work-item-{row['id']}-execute-1",
+        },
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "pull_request_not_adopted"
+    worker_url = "https://attacker.example.com/pull/999"
+    failed = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/finish",
+        headers=headers,
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "pull_request_not_adopted",
+            "detail": f"Continue this pull request: {worker_url}",
+        },
+    )
+    assert failed.status_code == 200, failed.text
+
+    _reconcile()
+    _reconcile()
+
+    assert (_request(number)["status"], _request(number)["terminal_cause"]) == (
+        "failed",
+        "pull_request_not_adopted",
+    )
+    body = _assert_one_final_comment([comment["body"] for comment in sink.comments], row["id"])
+    assert f"{html_base}/{REPO}/pull/{selected_pr}" in body
+    for other_pr in {71, 72, 73, 74} - {selected_pr}:
+        assert f"{html_base}/{REPO}/pull/{other_pr}" not in body
+    assert f"{html_base}/acme-corp/other/pull/75" not in body
+    assert "Cause: pull_request_not_adopted" in body
+    assert "earlier pull request" in body
+    assert "close or merge" in body
+    assert "label" in body
+    # Supplied detail may be omitted or fenced as inert text, but must never
+    # become a link in the public status comment. The selected link is DB truth.
+    actionable = re.sub(r"(?ms)^`{3,}[^\n]*\n.*?^`{3,}\s*$", "", body)
+    assert worker_url not in actionable
+    assert _notices(row["id"])[0]["finalized_at"] is not None
+    assert sink.posts == 1
+
+
 def test_approval_create_failure_posts_terminal_issue_notice_and_clears_running_label(
     admitted: Any,
 ) -> None:
@@ -1073,7 +1236,13 @@ def _relabelled_after_publication(client: Any, github: GitHubAPI, number: int) -
     return second
 
 
-def _finish_unpublished(client: Any, request_id: uuid.UUID) -> Any:
+def _finish_unpublished(
+    client: Any,
+    request_id: uuid.UUID,
+    *,
+    cause: str,
+    detail: str,
+) -> Any:
     epoch = _rows(
         "SELECT runtime_epoch FROM curie.execution_requests WHERE id = :id", {"id": request_id}
     )[0]["runtime_epoch"]
@@ -1083,8 +1252,8 @@ def _finish_unpublished(client: Any, request_id: uuid.UUID) -> Any:
         json={
             "runtime_epoch": epoch,
             "outcome": "failed",
-            "cause": "no_pull_request",
-            "detail": "I read the issue and stopped.",
+            "cause": cause,
+            "detail": detail,
         },
     )
 
@@ -1098,7 +1267,12 @@ def test_a_relabelled_request_without_its_own_publication_ends_failed(
     number = 9296
     second = _relabelled_after_publication(client, github, number)
 
-    finished = _finish_unpublished(client, second["id"])
+    finished = _finish_unpublished(
+        client,
+        second["id"],
+        cause="no_pull_request",
+        detail="I read the issue and stopped.",
+    )
 
     assert finished.status_code == 200, finished.text
     rows = {row["id"]: row for row in _requests(number)}
@@ -1120,7 +1294,12 @@ def test_a_relabelled_request_defers_to_its_own_in_flight_publication(
     second = _relabelled_after_publication(client, github, number)
     _attach_revision_publication(second["work_item_id"], second["id"], status="pending")
 
-    finished = _finish_unpublished(client, second["id"])
+    finished = _finish_unpublished(
+        client,
+        second["id"],
+        cause="no_pull_request",
+        detail="I read the issue and stopped.",
+    )
 
     assert finished.status_code == 409, finished.text
     assert "publication_pending" in finished.text
@@ -1153,7 +1332,12 @@ def test_a_relabelled_request_defers_to_an_earlier_in_flight_publication_on_its_
 
     asyncio.run(reopen())
 
-    finished = _finish_unpublished(client, second["id"])
+    finished = _finish_unpublished(
+        client,
+        second["id"],
+        cause="no_pull_request",
+        detail="I read the issue and stopped.",
+    )
 
     assert finished.status_code == 409, finished.text
     assert "publication_pending" in finished.text
@@ -1171,7 +1355,12 @@ def test_a_request_whose_own_publication_succeeded_defers_an_unpublished_finish(
     _start_running(row["id"])
     _attach_publication(row["work_item_id"], status="succeeded", pr=number)
 
-    finished = _finish_unpublished(client, row["id"])
+    finished = _finish_unpublished(
+        client,
+        row["id"],
+        cause="no_pull_request",
+        detail="I read the issue and stopped.",
+    )
 
     assert finished.status_code == 409, finished.text
     assert "publication_pending" in finished.text
@@ -1833,6 +2022,312 @@ def _assert_one_final_comment(bodies: list[str], request_id: uuid.UUID) -> str:
     assert len(marked) == 1, marked
     assert FINAL_MARKER in marked[0]
     return marked[0]
+
+
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+@pytest.mark.parametrize("padding", ["", " \n"])
+def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
+    admitted: Any, cause: str, padding: str
+) -> None:
+    """#4297 AC1/AC3: finish, notice and labels agree on an unchanged open PR."""
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number, pr, first = _published_issue(client, github, sink)
+    sink.requests.clear()
+    sink.ci_observations.clear()
+    objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88120"
+    revision = _insert_revision(first["work_item_id"], number, objective)
+    _start_running(revision)
+    detail = f"{padding}No changes needed: the existing tests already cover this request."
+
+    finished = _finish_unpublished(client, revision, cause=cause, detail=detail)
+
+    assert finished.status_code == 200, finished.text
+    terminal = {row["id"]: row for row in _requests(number)}[revision]
+    assert (terminal["status"], terminal["terminal_cause"]) == ("completed", "completed")
+    notices = _notices(revision)
+    assert len(notices) == 1
+    assert notices[0]["terminal_cause"] == "completed"
+    assert notices[0]["detail"].strip() == detail.strip()
+    assert (
+        _rows(
+            "SELECT count(*) AS count FROM curie.publications WHERE execution_request_id = :id",
+            {"id": revision},
+        )[0]["count"]
+        == 0
+    )
+
+    _reconcile()
+    posts = _posts(sink)
+    path = f"/repos/{REPO}/issues/{number}/comments"
+    assert [posted_path for posted_path, _body in posts] == [path]
+    body = _assert_one_final_comment([comment["body"] for comment in sink.lists[path]], revision)
+    assert "Status: SUCCEEDED" in body
+    assert (
+        "No changes needed: the open pull request already covers this request: "
+        f"https://github.com/{REPO}/pull/{pr}"
+    ) in body
+    assert detail.strip() in body
+    assert "Could not complete:" not in body
+    assert "NEEDS HUMAN" not in body
+    assert "Cause:" not in body
+    assert "curie-factory:pr-open" in sink.issue_labels[number]
+    assert "curie-factory:needs-human" not in sink.issue_labels[number]
+    assert _notices(revision)[0]["posted_at"] is not None
+    assert sink.ci_observations == []
+    _reconcile()
+    assert len(_posts(sink)) == 1
+    assert len(_notices(revision)) == 1
+    assert sink.ci_observations == []
+
+
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+def test_a_review_revision_with_no_changes_completes_in_its_thread(
+    admitted: Any, cause: str
+) -> None:
+    """#4297 AC2: the unchanged result reaches the original review thread."""
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number, pr, first = _published_issue(client, github, sink)
+    sink.requests.clear()
+    objective = _revision_objective(pr, "discussion_r88121")
+    revision = _insert_revision(first["work_item_id"], number, objective)
+    _start_running(revision)
+    detail = "No changes needed: this helper already has the requested name."
+
+    finished = _finish_unpublished(client, revision, cause=cause, detail=detail)
+
+    assert finished.status_code == 200, finished.text
+    terminal = {row["id"]: row for row in _requests(number)}[revision]
+    assert (terminal["status"], terminal["terminal_cause"]) == ("completed", "completed")
+    _reconcile()
+    posts = _posts(sink)
+    path = f"/repos/{REPO}/pulls/{pr}/comments/88121/replies"
+    assert [posted_path for posted_path, _body in posts] == [path]
+    body = posts[0][1] or ""
+    assert "Status: SUCCEEDED" in body
+    assert "No changes needed: this pull request already covers the requested revision." in body
+    assert f"In response to https://github.com/{REPO}/pull/{pr}#discussion_r88121" in body
+    assert "Agent's last message:" in body
+    assert detail in body
+    assert "Could not complete:" not in body
+    assert "NEEDS HUMAN" not in body
+    assert "Cause:" not in body
+    assert _notices(revision)[0]["comment_list"] == "review"
+    assert _notices(revision)[0]["posted_at"] is not None
+    _reconcile()
+    assert len(_posts(sink)) == 1
+
+
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+@pytest.mark.parametrize(
+    "case",
+    [
+        "could_not_complete",
+        "lowercase_marker",
+        "marker_after_prose",
+        "missing_colon",
+        "merged",
+        "closed",
+        "first_request",
+        "relabelled",
+        "missing_pr_url",
+        "empty_pr_url",
+        "mismatched_pr",
+    ],
+)
+def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
+    admitted: Any, cause: str, case: str
+) -> None:
+    """#4297 AC4: only the exact marker and an eligible open follow-up succeed."""
+
+    client, github, sink = admitted
+    sink.by_path = True
+    detail = "No changes needed: the request is already covered."
+    if case == "first_request":
+        number = next(_REVISION_ISSUES)
+        _label(client, github, number)
+        first = _request(number)
+        request_id = first["id"]
+    else:
+        number, pr, first = _published_issue(client, github, sink)
+        objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88122"
+        if case == "relabelled":
+            objective = f"https://github.com/{REPO}/issues/{number}"
+        elif case == "mismatched_pr":
+            objective = _revision_objective(pr + 1, "discussion_r88122")
+        request_id = _insert_revision(first["work_item_id"], number, objective)
+    _start_running(request_id)
+    sink.requests.clear()
+    if case == "could_not_complete":
+        detail = "Could not complete: the requested change needs a design decision."
+    elif case == "lowercase_marker":
+        detail = "no changes needed: the request is already covered."
+    elif case == "marker_after_prose":
+        detail = "I checked the request. No changes needed: it is already covered."
+    elif case == "missing_colon":
+        detail = "No changes needed because the request is already covered."
+
+    if case in {"merged", "closed", "missing_pr_url", "empty_pr_url"}:
+
+        async def change_lineage() -> None:
+            engine = create_async_engine(get_settings().database_url)
+            try:
+                async with engine.begin() as conn:
+                    assignment = {
+                        "merged": "status = 'merged'",
+                        "closed": "status = 'closed'",
+                        "missing_pr_url": "pr_number = NULL, pr_url = NULL",
+                        "empty_pr_url": "pr_url = '   '",
+                    }[case]
+                    changed = await conn.execute(
+                        text(
+                            f"UPDATE curie.thread_publication_lineages SET {assignment} "
+                            "WHERE id = (SELECT publication_lineage_id "
+                            "FROM curie.work_items WHERE id = :id)"
+                        ),
+                        {"id": first["work_item_id"]},
+                    )
+                    assert changed.rowcount == 1
+            finally:
+                await engine.dispose()
+
+        asyncio.run(change_lineage())
+
+    finished = _finish_unpublished(client, request_id, cause=cause, detail=detail)
+
+    assert finished.status_code == 200, finished.text
+    terminal = {row["id"]: row for row in _requests(number)}[request_id]
+    assert (terminal["status"], terminal["terminal_cause"]) == ("failed", cause)
+    notices = _notices(request_id)
+    assert len(notices) == 1
+    assert notices[0]["terminal_cause"] == cause
+    _reconcile()
+    bodies = [body or "" for _path, body in _posts(sink)]
+    body = _assert_one_final_comment(bodies, request_id)
+    assert "Status: NEEDS HUMAN" in body
+    assert "Could not complete:" in body
+    assert f"Cause: {cause}" in body
+    assert "curie-factory:needs-human" in sink.issue_labels[number]
+    assert "curie-factory:pr-open" not in sink.issue_labels[number]
+
+
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+def test_a_no_change_follow_up_defers_to_its_in_flight_publication(
+    admitted: Any, cause: str
+) -> None:
+    """#4297 AC5: the marker cannot bypass an unfinished revision publication."""
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number, _pr, first = _published_issue(client, github, sink)
+    objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88123"
+    revision = _insert_revision(first["work_item_id"], number, objective)
+    _start_running(revision)
+    _attach_revision_publication(first["work_item_id"], revision, status="pending")
+
+    finished = _finish_unpublished(
+        client, revision, cause=cause, detail="No changes needed: the request is already covered."
+    )
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    terminal = {row["id"]: row for row in _requests(number)}[revision]
+    assert (terminal["status"], terminal["terminal_cause"]) == ("running", None)
+    assert all(notice["terminal_cause"] is None for notice in _notices(revision))
+
+
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+def test_a_no_change_follow_up_cannot_complete_after_its_execution_deadline(
+    admitted: Any, cause: str
+) -> None:
+    """The old PR does not grant an unpublished revision the opened-PR deadline exception."""
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number, _pr, first = _published_issue(client, github, sink)
+    objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88124"
+    revision = _insert_revision(first["work_item_id"], number, objective)
+
+    async def expired_runtime() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                # Write the deadline once while building an already-expired
+                # runtime. The live owner lease isolates the deadline guard.
+                changed = await conn.execute(
+                    text(
+                        "UPDATE curie.execution_requests SET status = 'running', "
+                        "started_at = clock_timestamp() - interval '2 seconds', "
+                        "execution_deadline = clock_timestamp() - interval '1 second', "
+                        "execution_attempts = 1, runtime_epoch = 1, "
+                        "runtime_owner = 'factory-owner', "
+                        "runtime_heartbeat_expires_at = clock_timestamp() + interval '60 seconds' "
+                        "WHERE id = :id"
+                    ),
+                    {"id": revision},
+                )
+                assert changed.rowcount == 1
+        finally:
+            await engine.dispose()
+
+    asyncio.run(expired_runtime())
+    finished = _finish_unpublished(
+        client, revision, cause=cause, detail="No changes needed: the request is already covered."
+    )
+
+    assert finished.status_code == 409, finished.text
+    assert "not_running" in finished.text
+    terminal = {row["id"]: row for row in _requests(number)}[revision]
+    assert (terminal["status"], terminal["terminal_cause"]) == ("running", None)
+    assert all(notice["terminal_cause"] is None for notice in _notices(revision))
+
+
+@pytest.mark.parametrize("stale", ["work_item", "request"])
+def test_a_no_change_follow_up_preserves_stale_version_fencing(admitted: Any, stale: str) -> None:
+    """Both optimistic versions fence the unchanged completion at the state boundary."""
+
+    from curie_api.workitems import WorkItemConflict, _terminalize_execution
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number, _pr, first = _published_issue(client, github, sink)
+    objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88125"
+    revision = _insert_revision(first["work_item_id"], number, objective)
+    _start_running(revision)
+    versions = _rows(
+        "SELECT w.version AS work_version, r.version AS request_version "
+        "FROM curie.work_items w JOIN curie.execution_requests r "
+        "ON r.work_item_id = w.id WHERE r.id = :id",
+        {"id": revision},
+    )[0]
+
+    async def stale_finish() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with AsyncSession(engine) as session:
+                result = await _terminalize_execution(
+                    session,
+                    work_item_id=first["work_item_id"],
+                    request_id=revision,
+                    expected_work_item_version=versions["work_version"] - (stale == "work_item"),
+                    expected_request_version=versions["request_version"] - (stale == "request"),
+                    status="failed",
+                    cause="no_pull_request",
+                    detail="No changes needed: the request is already covered.",
+                    extra_where=(),
+                )
+                assert isinstance(result, WorkItemConflict), result
+                assert result.code == "stale_version"
+        finally:
+            await engine.dispose()
+
+    asyncio.run(stale_finish())
+    terminal = {row["id"]: row for row in _requests(number)}[revision]
+    assert (terminal["status"], terminal["terminal_cause"]) == ("running", None)
+    assert all(notice["terminal_cause"] is None for notice in _notices(revision))
 
 
 def test_a_completed_first_request_posts_one_comment_naming_its_pull_request(

@@ -22,6 +22,7 @@ members = [
     "curie-telemetry",
     "curie-telemetry-schema",
     "curie-test-support",
+    "curie-upgrade-pause",
     "curie-wire-tolerance-gate",
     "curie-worker",
     "curie-workspace",
@@ -712,6 +713,7 @@ dependencies = [
     { name = "curie-protected-hooks" },
     { name = "curie-telemetry" },
     { name = "curie-telemetry-schema" },
+    { name = "curie-upgrade-pause" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "kubernetes" },
@@ -736,6 +738,7 @@ requires-dist = [
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
+    { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
     { name = "fastapi", specifier = ">=0.139.2" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "kubernetes", specifier = ">=36.0.3" },
@@ -792,6 +795,7 @@ source = { editable = "apps/dispatcher" }
 dependencies = [
     { name = "aci-protocol" },
     { name = "curie-telemetry" },
+    { name = "curie-upgrade-pause" },
     { name = "httpx" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -803,6 +807,7 @@ dependencies = [
 requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
+    { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
@@ -850,6 +855,7 @@ dependencies = [
     { name = "aci-protocol" },
     { name = "curie-channel-protocol" },
     { name = "curie-telemetry" },
+    { name = "curie-upgrade-pause" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
 ]
@@ -859,6 +865,7 @@ requires-dist = [
     { name = "aci-protocol", editable = "packages/aci-protocol" },
     { name = "curie-channel-protocol", editable = "packages/channel-protocol" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
+    { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.7" },
 ]
@@ -955,6 +962,17 @@ requires-dist = [
 ]
 
 [[package]]
+name = "curie-upgrade-pause"
+version = "0.0.0"
+source = { editable = "packages/upgrade-pause" }
+dependencies = [
+    { name = "redis" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "redis", specifier = ">=5.0" }]
+
+[[package]]
 name = "curie-wire-tolerance-gate"
 version = "0.0.0"
 source = { editable = "tools/wire-tolerance-gate" }
@@ -974,11 +992,14 @@ dependencies = [
     { name = "curie-e2e-connector" },
     { name = "curie-protected-hooks" },
     { name = "curie-telemetry" },
+    { name = "curie-upgrade-pause" },
     { name = "httpx" },
     { name = "kubernetes" },
+    { name = "packaging" },
     { name = "plugin-format" },
     { name = "pydantic-settings" },
     { name = "pynacl" },
+    { name = "pyyaml" },
     { name = "redis" },
     { name = "slack-sdk" },
     { name = "sqlalchemy", extra = ["asyncio"] },
@@ -996,11 +1017,14 @@ requires-dist = [
     { name = "curie-e2e-connector", editable = "apps/e2e-connector" },
     { name = "curie-protected-hooks", editable = "packages/protected-hooks" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
+    { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "kubernetes", specifier = ">=36.0.3" },
+    { name = "packaging", specifier = ">=26.3" },
     { name = "plugin-format", editable = "packages/plugin-format" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "pynacl", specifier = ">=1.5" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "redis", specifier = ">=5.2" },
     { name = "slack-sdk", specifier = ">=3.43" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.51" },
@@ -1022,6 +1046,7 @@ dependencies = [
     { name = "curie-runner" },
     { name = "curie-telemetry" },
     { name = "curie-telemetry-schema" },
+    { name = "curie-upgrade-pause" },
     { name = "curie-worker" },
     { name = "plugin-format" },
 ]
@@ -1056,6 +1081,7 @@ requires-dist = [
     { name = "curie-runner", editable = "runner" },
     { name = "curie-telemetry", editable = "packages/telemetry" },
     { name = "curie-telemetry-schema", editable = "packages/telemetry-schema" },
+    { name = "curie-upgrade-pause", editable = "packages/upgrade-pause" },
     { name = "curie-worker", editable = "apps/worker" },
     { name = "plugin-format", editable = "packages/plugin-format" },
 ]

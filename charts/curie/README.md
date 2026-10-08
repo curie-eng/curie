@@ -1760,6 +1760,20 @@ the changed files with the repository's Actions secrets before a person
 reviews the pull request. Keep those secrets in GitHub environments that
 require reviewers.
 
+The worker also refuses new third-party dependency names by default, including
+new transitive lockfile entries. It compares `pyproject.toml`, `uv.lock`,
+`Cargo.toml`, `Cargo.lock`, `package.json`, `pnpm-lock.yaml` and
+`package-lock.json` by basename at any repository depth after applying the patch
+to the base tree. Version changes to existing names are allowed. Path, workspace,
+editable, virtual and directory sources are ignored; Git sources count as
+third-party. A new file has an empty dependency set before the patch, and an
+in-scope file that cannot be parsed is refused. Set
+`worker.publication.allowDependencyAdditions: true` to allow additions across
+every publication in the install, including factory work and human-approved
+requests. The default is `false`, rendered as
+`CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS` on the worker. This opt-in keeps
+the `.github/` and `worker.publication.protectedPaths` refusals.
+
 One allowed root `https://github.com/owner/repository` URL in the initial
 message establishes the thread's selection and causes the worker to acquire its
 managed workspace at claim time. An initial message without a repository URL
