@@ -295,33 +295,24 @@ Drain task or launch a second copy to apply the guidance.
 
 ### Preflight checks
 
-The full and fast preflight requirements in this section apply only when the
-checkout being checked contains both the `curie dev preflight` command and
-`tools/preflight/preflight.py`. Check the selected release train and worktree,
-even when these instructions were loaded from a different launch checkout.
-If that train does not contain preflight, run its applicable required checks
-directly using its own instructions and CI workflow, and require current-head
-PR checks to pass. Do not run another checkout's preflight against it or port
-preflight into the train to satisfy this section. Missing prerequisites or a
-failing preflight in a checkout that supports it remain failures.
+There is no required pre-PR preflight. Do not run the full tier (`curie dev
+preflight` without `--fast`) while implementing a change or before opening or
+updating a pull request. It starts a private Compose project with the full
+Langfuse, ClickHouse, and OTel stack and runs the changed Python suites, and
+several agent runs doing that at once overload the shared host. CI runs those
+suites and the PR body and Fix pin guards on every pull request; require
+current-head PR checks to pass instead. Run the full tier only when a person
+asks for it explicitly.
 
-Before opening or updating a pull request, run the full tier from the source
-checkout: `curie dev preflight --pr-body <file> --title <text>`. The full tier
-is the default. It fetches the base and refuses a head that does not contain
-its current tip, printing `git merge origin/<base>` without merging for you.
-Failing required checks on the base produce a warning. It runs the PR body and
-Fix pin guards, then tests the changed Python workspace members and their
-transitive dependents in a private Compose project that it tears down on exit.
-Without `--pr-body`, the body and Fix pin checks are reported as skipped.
-Selected end to end tiers and kind jobs are listed as runs in CI only.
-
-After committing and before pushing, run `curie dev preflight --fast` from the
-source checkout. It selects the cheap PR gates for the committed change and
-runs their CI commands. The default base is `main`; use `--base <branch>`
-to compare against another fetched `origin/<branch>`. Use `--dry-run` to inspect
-the selected commands and `--json` for one structured report. A failing gate
-includes its output tail. This fast tier does not replace any required
-verification below.
+The fast tier starts no services. The tracked pre-push hook runs it on every
+push, so do not run it separately. It selects the cheap PR gates for the
+committed change and runs their CI commands. To run it by hand, use
+`curie dev preflight --fast` from the source checkout. The default base is
+`main`; use `--base <branch>` to compare against another fetched
+`origin/<branch>`. Use `--dry-run` to inspect the selected commands and
+`--json` for one structured report. A failing gate includes its output tail
+and is a failure to fix before pushing. This fast tier does not replace any
+required verification below.
 
 `curie install`, `curie update`, and `curie dev hooks install` configure the
 shared relative `core.hooksPath=.githooks`. Each linked worktree runs its own
