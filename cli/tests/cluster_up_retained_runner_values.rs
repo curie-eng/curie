@@ -132,10 +132,22 @@ impl Fixture {
             r#"#!/bin/sh
 printf 'helm %s\n' "$*" >> "$CURIE_TEST_CALLS_LOG"
 if [ "$1" = "get" ] && [ "$2" = "values" ]; then
+    if [ -n "${CURIE_TEST_FIRST_INSTALL:-}" ]; then
+        printf '%s\n' 'Error: release: not found' >&2
+        exit 1
+    fi
     printf '%s\n' "$CURIE_TEST_EXISTING_VALUES"
     exit 0
 fi
 if [ "$1" = "template" ]; then
+    if [ "$2" = "curie-values-lint" ] && [ -n "${CURIE_TEST_REAL_HELM:-}" ]; then
+        "$CURIE_TEST_REAL_HELM" "$@"
+        result=$?
+        if [ "$result" = 0 ] && [ -n "${CURIE_TEST_MUTATE_VALUES:-}" ]; then
+            printf '%s\n' 'worker: {extraEnv: [{name: NUMERIC_STRING, value: MUTATED}]}' > "$CURIE_TEST_MUTATE_VALUES"
+        fi
+        exit "$result"
+    fi
     case " $* " in
         *" --show-only templates/priorityclass.yaml "*|*" --show-only=templates/priorityclass.yaml "*)
             printf '%s\n' 'Error: could not find template templates/priorityclass.yaml in chart' >&2
@@ -240,6 +252,11 @@ exit 64
     }
 
     fn cluster_up(&self, environment: &[(&str, &str)]) -> Output {
+        self.cluster_up_with_args(environment, &[])
+    }
+
+    // @spec CLUSTER-VALUES-FILES c1-c4
+    fn cluster_up_with_args(&self, environment: &[(&str, &str)], args: &[&str]) -> Output {
         let mut paths = vec![self.bin_dir.clone()];
         if let Some(current) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&current));
@@ -275,6 +292,7 @@ exit 64
             .env_remove("CURIE_GITHUB_TOKEN")
             .env_remove("CURIE_MODEL")
             .env_remove("CURIE_FAKE_MODEL");
+        command.args(args);
         for (key, value) in environment {
             command.env(key, value);
         }
@@ -846,4 +864,87 @@ fn worker_secret_refs(rendered: &[Value]) -> BTreeMap<String, Value> {
             })
         })
         .collect()
+}
+
+#[test]
+fn ordered_operator_files_reach_real_helm_typed_and_unchanged_after_source_edit() {
+    // @spec CLUSTER-VALUES-FILES c1-c4
+    let helm = real_helm().expect("real Helm required for ordered values proof");
+    let fixture = Fixture::new(&recorded_values());
+    let first = fixture.temp.path().join("first.yaml");
+    let second = fixture.temp.path().join("second.yaml");
+    fs::write(&first, "worker:\n  extraEnv:\n    - name: NUMERIC_STRING\n      value: '1000'\n  adapterCredentials: {}\nagentSandbox:\n  connectorSecrets:\n    acme-a:\n      GRAFANA_TOKEN: PLACEHOLDER-new-file-secret\n").unwrap();
+    fs::write(&second, "worker:\n  extraEnv:\n    - name: NUMERIC_STRING\n      value: '8080'\napi:\n  podLabels:\n    example.com/key: 'off'\n").unwrap();
+    let out = fixture.cluster_up_with_args(
+        &[
+            ("CURIE_TEST_REAL_HELM", &helm),
+            ("CURIE_TEST_MUTATE_VALUES", second.to_str().unwrap()),
+        ],
+        &[
+            "-f",
+            first.to_str().unwrap(),
+            "--values-file",
+            second.to_str().unwrap(),
+        ],
+    );
+    fixture.assert_succeeded(&out);
+    let captured = merged_file_values(&fixture.captured_files());
+    assert_eq!(
+        captured.pointer("/worker/extraEnv/0/value"),
+        Some(&json!("8080"))
+    );
+    assert_eq!(
+        captured.pointer("/worker/adapterCredentials"),
+        Some(&json!({}))
+    );
+    assert_eq!(
+        captured.pointer("/api/podLabels/example.com~1key"),
+        Some(&json!("off"))
+    );
+    assert_eq!(
+        captured.pointer("/agentSandbox/connectorSecrets/acme-a/GRAFANA_TOKEN"),
+        Some(&json!("PLACEHOLDER-new-file-secret"))
+    );
+    assert!(fs::read_to_string(second).unwrap().contains("MUTATED"));
+    assert!(!all_output(&out).contains("PLACEHOLDER-new-file-secret"));
+    assert!(!fixture
+        .upgrade_argv()
+        .iter()
+        .any(|arg| arg.contains("PLACEHOLDER-new-file-secret")));
+    let rendered = render(&helm, &value_arguments(&fixture.upgrade_argv()));
+    assert_eq!(
+        worker_env(&rendered, "NUMERIC_STRING").unwrap(),
+        json!("8080")
+    );
+}
+
+#[test]
+fn fresh_install_with_files_still_generates_required_store_credentials() {
+    // @spec CLUSTER-VALUES-FILES c1-c3
+    let helm = real_helm().expect("real Helm required");
+    let fixture = Fixture::new(&serde_json::json!({}));
+    let file = fixture.temp.path().join("fresh.yaml");
+    fs::write(
+        &file,
+        "security:\n  gvisor:\n    mode: 'off'\nagentSandbox:\n  controller:\n    deploy: false\n",
+    )
+    .unwrap();
+    let output = fixture.cluster_up_with_args(
+        &[
+            ("CURIE_TEST_REAL_HELM", &helm),
+            ("CURIE_TEST_FIRST_INSTALL", "1"),
+        ],
+        &["--fake-model", "-f", file.to_str().unwrap()],
+    );
+    fixture.assert_succeeded(&output);
+    let values = merged_file_values(&fixture.captured_files());
+    for path in ["/postgres/auth/password", "/valkey/password", "/api/apiKey"] {
+        assert!(
+            values
+                .pointer(path)
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.len() >= 32),
+            "missing generated credential: {path}"
+        );
+    }
 }

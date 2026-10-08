@@ -708,6 +708,10 @@ if program == "helm":
         )
         sys.exit(0)
     if args[0] == "template":
+        # @spec CLUSTER-VALUES-FILES c2: outside-boundary Helm parsing is real.
+        if args[1] == "curie-values-lint" and os.environ.get("VALUES_FILES_REAL_HELM"):
+            import subprocess
+            sys.exit(subprocess.call([os.environ["VALUES_FILES_REAL_HELM"], *args]))
         show_only = flag_value("--show-only")
         if show_only is None:
             for arg in args:

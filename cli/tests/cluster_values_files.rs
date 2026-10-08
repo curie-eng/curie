@@ -115,6 +115,8 @@ fn file_credentials_cannot_bypass_the_provider_contradiction_guard() {
         "up",
         "--dry-run",
         "--dev",
+        "--chart",
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie"),
         "--allow-egress-host",
         "openrouter",
         "-f",

@@ -4004,3 +4004,72 @@ fn printed_apply_line_matches_executed_helm_argv() {
         );
     }
 }
+
+#[test]
+fn operator_files_override_retained_values_in_admission_and_apply() {
+    // @spec CLUSTER-VALUES-FILES c1-c4
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success(), "real Helm required");
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    for reverse in [false, true] {
+        let fixture = Fixture::new(Some(
+            r#"{"worker":{"deliveryBudgetSeconds":600,"extraEnv":[{"name":"OLD","value":"old"}]}}"#,
+        ));
+        let first = fixture.0.path().join("first.yaml");
+        let second = fixture.0.path().join("second.yaml");
+        fs::write(&first, "worker:\n  deliveryBudgetSeconds: 700\n  extraEnv:\n    - name: NUMERIC_STRING\n      value: '8080'\napi:\n  podLabels:\n    example.com/key: 'off'\n").unwrap();
+        fs::write(&second, "worker:\n  deliveryBudgetSeconds: 800\n  extraEnv: []\napi:\n  githubToken: PLACEHOLDER-file-secret\n").unwrap();
+        let files = if reverse {
+            [&second, &first]
+        } else {
+            [&first, &second]
+        };
+        let output = fixture.run_with_env(
+            "healthy",
+            "0.9.0",
+            "charts/curie",
+            &[
+                "-f",
+                files[0].to_str().unwrap(),
+                "--values-file",
+                files[1].to_str().unwrap(),
+            ],
+            &[("VALUES_FILES_REAL_HELM", helm.trim())],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let applied: Value = serde_json::from_str(&fixture.values(1)).unwrap();
+        assert_eq!(
+            applied.pointer("/worker/deliveryBudgetSeconds"),
+            Some(&serde_json::json!(if reverse { 700 } else { 800 }))
+        );
+        assert_eq!(
+            applied.pointer("/worker/extraEnv"),
+            Some(&if reverse {
+                serde_json::json!([{"name":"NUMERIC_STRING","value":"8080"}])
+            } else {
+                serde_json::json!([])
+            })
+        );
+        assert_eq!(
+            applied.pointer("/api/podLabels/example.com~1key"),
+            Some(&serde_json::json!("off"))
+        );
+        for path in fixture.captured_paths("render-values") {
+            let admitted: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(
+                admitted, applied,
+                "admission and Apply used different overlays"
+            );
+        }
+        assert!(!stderr(&output).contains("PLACEHOLDER-file-secret"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("PLACEHOLDER-file-secret"));
+        assert!(!fixture
+            .argv()
+            .iter()
+            .flatten()
+            .any(|arg| arg.contains("PLACEHOLDER-file-secret")));
+    }
+}
