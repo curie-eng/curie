@@ -30,10 +30,10 @@ def test_first_alert_reply_preserves_the_exact_provider_identity() -> None:
     assert any(
         all(
             re.search(term, item, re.IGNORECASE)
-            for term in (r"alarm name", r"fingerprint", r"startsAt", r"What I checked:")
+            for term in (r"alarm name", r"fingerprint", r"startsAt", r"`Ref:`")
         )
         for item in _policy_items()
-    ), "Preserve the provider alarm name, fingerprint and reported start in What I checked."
+    ), "Preserve the provider alarm name, fingerprint and reported start on the Ref: line."
 
 
 def test_missing_alarm_identity_cannot_be_replaced_with_a_similar_live_rule() -> None:
@@ -130,9 +130,10 @@ def assert_alert_identity_reply(case_id: str, answer: str) -> None:
     if case_id == "hook-root":
         lines = [line for line in answer.splitlines() if line.strip()]
         assert len(lines) <= 4, "first notification reply exceeds four lines"
-        checked = next((line for line in lines if "What I checked:" in line), "")
+        ref = next((line for line in lines if line.startswith("Ref:")), "")
+        assert lines[-1] == ref, "the Ref: line is not the last line of the first reply"
         assert all(
-            value in checked
+            value in ref
             for value in (
                 "AcmeCloudWatchAlarm",
                 "acme-dev-sandbox-turn-refused",
@@ -294,11 +295,11 @@ def test_authority_eval_grader_itself_rejects_observed_false_authentication() ->
 
 
 HOOK_ROOT = (
-    "⚠️ Sandbox turns were refused; I cannot confirm the current state.\n"
-    "What I checked: reported AcmeCloudWatchAlarm alarm acme-dev-sandbox-turn-refused, "
-    "fingerprint 0123456789abcdef, startsAt 2026-09-30T10:02:03Z; this is the reported episode.\n"
-    "What to do: the platform on-call should read the provider alarm and its history.\n"
-    "What I changed: nothing."
+    "⚠️ Sandbox turns were refused, and I cannot confirm whether they are still failing.\n"
+    "Cause: unknown so far; I could not read the provider alarm or its history.\n"
+    "Next: platform on-call — read the provider alarm and its history.\n"
+    "Ref: AcmeCloudWatchAlarm · acme-dev-sandbox-turn-refused · fingerprint 0123456789abcdef · "
+    "started 2026-09-30T10:02:03Z (reported episode data)"
 )
 
 
@@ -332,9 +333,30 @@ def test_hook_root_rejects_omitted_alarm_fingerprint_or_start(omitted: str) -> N
 
 
 def test_hook_root_replay_rejects_identity_hidden_in_verbose_later_detail() -> None:
-    reply = HOOK_ROOT.replace("What I checked:", "Later detail:") + "\nExtra detail."
+    reply = HOOK_ROOT.replace("Ref:", "Later detail:") + "\nExtra detail."
     with pytest.raises(AssertionError):
         assert_alert_identity_reply("hook-root", reply)
+
+
+def test_hook_root_rejects_identity_that_is_not_the_last_line() -> None:
+    reply = HOOK_ROOT + "\nOne more thing."
+    assert not _grader("hook-root").grade(reply)
+    with pytest.raises(AssertionError):
+        assert_alert_identity_reply("hook-root", reply)
+
+
+def test_hook_root_rejects_identity_in_the_old_what_i_checked_line() -> None:
+    reply = HOOK_ROOT.replace("Ref:", "What I checked:")
+    assert not _grader("hook-root").grade(reply)
+
+
+def test_followup_cases_quote_a_prior_reply_in_the_new_shape() -> None:
+    suite = EvalSuite.model_validate_json((BUNDLE / "evals/cases.json").read_text())
+    quoted = [c for c in suite.cases if "<prior_assistant_reply>" in c.input]
+    assert len(quoted) == 5
+    for case in quoted:
+        assert "What I checked:" not in case.input, case.id
+        assert "\nRef: AcmeCloudWatchAlarm" in case.input, case.id
 
 
 def test_quoted_prior_authentication_is_allowed_when_explicitly_disclaimed() -> None:
