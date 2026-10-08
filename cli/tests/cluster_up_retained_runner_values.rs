@@ -1057,18 +1057,17 @@ fn fake_model_and_inline_set_override_lower_priority_file_choices() {
             assert!(values
                 .pointer("/postgres/existingSecret")
                 .is_none_or(|value| value.as_str() == Some("")));
-            assert_eq!(
-                values
-                    .pointer("/agentSandbox/runner/credentialsExistingSecret")
-                    .and_then(Value::as_str),
-                Some("")
-            );
-            assert_eq!(
-                values
-                    .pointer("/agentSandbox/runner/credentialsExistingSecretKey")
-                    .and_then(Value::as_str),
-                Some("")
-            );
+            for path in [
+                "/agentSandbox/runner/credentialsExistingSecret",
+                "/agentSandbox/runner/credentialsExistingSecretKey",
+            ] {
+                assert!(
+                    values
+                        .pointer(path)
+                        .is_none_or(|value| value.as_str() == Some("")),
+                    "lower-priority source is still active: {path}"
+                );
+            }
         }
     }
 }
@@ -1135,4 +1134,29 @@ fn inline_file_credential_replaces_a_retained_secret_reference() {
         .upgrade_argv()
         .join(" ")
         .contains("sk-ant-api03-PLACEHOLDER-file-replacement"));
+}
+
+#[test]
+fn file_without_schema_cannot_mask_an_unsupported_retained_configuration() {
+    // @spec CLUSTER-VALUES-FILES c3
+    let helm = real_helm().expect("real Helm required");
+    let fixture = Fixture::new(
+        &serde_json::json!({"config":{"schemaVersion":"0.7.0"},"security":{"gvisor":{"mode":"off"}},"agentSandbox":{"controller":{"deploy":false}}}),
+    );
+    let file = fixture.temp.path().join("unrelated-values.yaml");
+    fs::write(&file, "worker:\n  deliveryBudgetSeconds: 600\n").unwrap();
+    let output = fixture.cluster_up_with_args(
+        &[("CURIE_TEST_REAL_HELM", &helm)],
+        &["--fake-model", "-f", file.to_str().unwrap()],
+    );
+    assert!(
+        !output.status.success(),
+        "file masked unsupported retained source"
+    );
+    assert!(
+        all_output(&output).contains("not a supported"),
+        "{}",
+        all_output(&output)
+    );
+    assert!(fixture.upgrade_argv().is_empty());
 }
