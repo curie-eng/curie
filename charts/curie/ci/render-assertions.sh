@@ -2045,12 +2045,13 @@ def fail(message):
     raise SystemExit(message)
 
 
-# The API schema-wait init and the schema-migrate Job share one Postgres
-# readiness loop; both run through this checker (#2865).
+# The API schema-wait init and legacy migrate fallback use the bounded shell
+# readiness loop. The current migrate image delegates readiness to Python;
+# this checker verifies all three dispatch paths (#2865, #4295).
 MODE = sys.argv[2] if len(sys.argv) > 2 else "api"
-if MODE not in {"api", "migrate"}:
+if MODE not in {"api", "migrate", "legacy"}:
     fail(f"unknown readiness checker mode {MODE!r}")
-EXEC_VERB = "wait" if MODE == "api" else "upgrade"
+EXEC_VERB = "wait" if MODE == "api" else "upgrade" if MODE == "migrate" else "-c alembic.ini upgrade head"
 WAIT_LINE = "Waiting for Postgres readiness"
 STILL_LINE = "Still waiting for Postgres readiness"
 
@@ -2058,7 +2059,7 @@ STILL_LINE = "Still waiting for Postgres readiness"
 def migrate_container(manifest):
     matches = []
     for doc in yaml.safe_load_all(pathlib.Path(manifest).read_text()):
-        if MODE == "migrate":
+        if MODE in {"migrate", "legacy"}:
             if isinstance(doc, dict) and doc.get("kind") == "Job":
                 containers = doc["spec"]["template"]["spec"].get("containers", [])
                 matches.extend(
@@ -2092,7 +2093,7 @@ def shell_process(container):
     if process[1] != "-c":
         fail("schema-wait init container shell command must use -c")
     script = process[2]
-    if MODE == "migrate":
+    if MODE in {"migrate", "legacy"}:
         return process
     if "alembic" in script:
         fail("schema-wait init must not invoke Alembic; migrations belong on the upgrade Job")
@@ -2127,10 +2128,12 @@ def run_case(process, readiness_failures, error_class="InvalidPasswordError"):
         compat_pkg = fake_modules / "curie_api"
         compat_pkg.mkdir()
         (compat_pkg / "__init__.py").write_text("")
-        (compat_pkg / "schema_compat.py").write_text(
-            "import os, pathlib, sys\n"
-            "pathlib.Path(os.environ['WAIT_CALLS']).write_text(' '.join(sys.argv[1:]) + '\\n')\n"
-        )
+        if MODE != "legacy":
+            (compat_pkg / "schema_compat.py").write_text(
+                "import os, pathlib, sys\n"
+                "pathlib.Path(os.environ['WAIT_CALLS']).write_text(' '.join(sys.argv[1:]) + '\\n')\n"
+            )
+        write_program(fake_bin / "alembic", 'printf "%s\\n" "$*" > "$WAIT_CALLS"\n')
         (fake_modules / "asyncpg.py").write_text(
             """\
 import os
@@ -2203,6 +2206,19 @@ async def connect(database_url, timeout):
 
 container = migrate_container(sys.argv[1])
 process = shell_process(container)
+
+if MODE == "migrate":
+    # The current image owns readiness in Python. Any shell probe before this
+    # dispatch would run before the supervisor can confirm pause ownership.
+    for failures in (0, 2, 60):
+        result, attempts, calls = run_case(process, failures)
+        if result.returncode != 0 or attempts or calls != ["upgrade"]:
+            fail(
+                "current-image migrate must delegate readiness before any shell probe; "
+                f"exit={result.returncode}, attempts={len(attempts)}, calls={calls!r}"
+            )
+    print("  ok (migrate): current image delegates readiness immediately to schema_compat upgrade")
+    raise SystemExit(0)
 
 ready, ready_attempts, ready_calls = run_case(process, 0)
 if ready.returncode != 0:
@@ -2288,7 +2304,35 @@ python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_RENDER" \
 SCHEMA_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/schema-migrate.yaml"
 [[ -f "$SCHEMA_MIGRATE_RENDER" ]] || fail "schema-migrate.yaml did not render"
 python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_RENDER" migrate \
-  || fail "schema-migrate Job does not implement the same readiness diagnostics contract."
+  || fail "schema-migrate Job must delegate current-image readiness before any shell probe."
+python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_RENDER" legacy \
+  || fail "schema-migrate legacy fallback lost its bounded readiness diagnostics contract."
+
+echo "=== Assertion 14 negative control: a current-image shell probe before dispatch FAILS ==="
+SCHEMA_MIGRATE_ORDER_MUTANT="$TMP/schema-migrate-order-mutant.yaml"
+python3 - "$SCHEMA_MIGRATE_RENDER" "$SCHEMA_MIGRATE_ORDER_MUTANT" <<'PYEOF'
+import pathlib
+import sys
+import yaml
+
+docs = list(yaml.safe_load_all(pathlib.Path(sys.argv[1]).read_text()))
+for doc in docs:
+    if isinstance(doc, dict) and doc.get("kind") == "Job":
+        container = doc["spec"]["template"]["spec"]["containers"][0]
+        container["args"][0] = (
+            "python -c 'import asyncio, asyncpg; asyncio.run(asyncpg.connect(\"unused\", timeout=2))'\n"
+            + container["args"][0]
+        )
+pathlib.Path(sys.argv[2]).write_text(yaml.safe_dump_all(docs))
+PYEOF
+schema_migrate_order_negative_output=""
+if schema_migrate_order_negative_output="$(python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_ORDER_MUTANT" migrate 2>&1)"; then
+  fail "negative control did not fire: current-image readiness ran before the supervisor."
+fi
+if [[ "$schema_migrate_order_negative_output" != *"before any shell probe"* ]]; then
+  fail "migrate-order negative control failed unexpectedly: $schema_migrate_order_negative_output"
+fi
+echo "  ok: a shell probe before current-image dispatch is rejected"
 
 echo "=== Assertion 14 negative control: changed readiness bound FAILS ==="
 API_MIGRATE_BOUND_MUTANT="$TMP/mutant-api-migrate-bound"

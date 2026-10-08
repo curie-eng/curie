@@ -27,6 +27,7 @@ dependencies = [
     "curie-channel-protocol",
     "curie-telemetry",
     "curie-telemetry-schema",
+    "curie-upgrade-pause",
 ]
 
 [build-system]

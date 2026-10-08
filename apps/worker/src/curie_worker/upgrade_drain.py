@@ -82,6 +82,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, NotRequired, TypedDict
 
+from curie_upgrade_pause import marker_keys
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
@@ -254,12 +255,11 @@ class UpgradeDrainGate:
         return self._config.upgrade_revision or 0
 
     def _marker_keys(self) -> tuple[str, ...]:
-        authoritative = self._config.upgrade_quiesce_key()
-        if self._config.installation_id and self._config.upgrade_legacy_quiesce:
-            # Scoped first so a same revision retry repairs a legacy key that an
-            # old hook rewrote while retaining the authoritative marker's time.
-            return (authoritative, self._config.upgrade_legacy_quiesce_key())
-        return (authoritative,)
+        return marker_keys(
+            self._config.key_prefix,
+            self._config.installation_id,
+            self._config.upgrade_legacy_quiesce,
+        )
 
     async def request_quiesce(self, *, ttl_s: float | None = None) -> None:
         """Ask every replica to stop taking new work.
