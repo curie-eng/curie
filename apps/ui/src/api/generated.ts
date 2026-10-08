@@ -3836,7 +3836,7 @@ export interface components {
              */
             id: string;
             /** Principal Kind */
-            principal_kind: ("chat" | "console" | "operator" | "adapter" | "platform") | null;
+            principal_kind: ("chat" | "console" | "operator" | "adapter" | "platform" | "test_driver") | null;
             /** Principal Subject */
             principal_subject: string | null;
             /** Reason */

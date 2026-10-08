@@ -576,7 +576,9 @@ class ApprovalAuditOut(BaseModel):
     action: str
     actor: str
     actor_channel: str | None
-    principal_kind: Literal["chat", "console", "operator", "adapter", "platform"] | None
+    principal_kind: (
+        Literal["chat", "console", "operator", "adapter", "platform", "test_driver"] | None
+    )
     authenticated: bool
     # The adapter that transported an `adapter` principal's decision
     # (ADR-0154); `actor` is the sender it authenticated. NULL otherwise.

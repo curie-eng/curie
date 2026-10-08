@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import time
+from typing import Literal
 
 _PREFIX = "apr"
 _SCOPE = "approval.resolve"
@@ -23,15 +24,16 @@ def _b64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
 
 
-def mint_chat_principal(
+def _mint_attestation(
     secret: str,
     *,
     subject: str,
     actor_channel: str,
     approval_id: str,
+    kind: Literal["chat", "test_driver"],
     now: int | None = None,
 ) -> str:
-    """Mint a 60-second chat attestation for one approval resolution."""
+    """Mint a 60-second attestation bound to one approval and channel."""
 
     if not secret.strip():
         raise ValueError("chat attester secret must be non-blank")
@@ -48,7 +50,7 @@ def mint_chat_principal(
             "actor_channel": actor_channel,
             "approval_id": approval_id,
             "exp": issued_at + _CHAT_PRINCIPAL_TTL_SECONDS,
-            "kind": "chat",
+            "kind": kind,
             "scope": _SCOPE,
             "sub": subject,
         },
@@ -61,3 +63,41 @@ def mint_chat_principal(
         hmac.new(secret.encode(), signing_input.encode(), hashlib.sha256).digest()
     )
     return f"{signing_input}.{signature}"
+
+
+def mint_chat_principal(
+    secret: str,
+    *,
+    subject: str,
+    actor_channel: str,
+    approval_id: str,
+    now: int | None = None,
+) -> str:
+    """Mint a 60-second chat attestation for one approval resolution."""
+    return _mint_attestation(
+        secret,
+        subject=subject,
+        actor_channel=actor_channel,
+        approval_id=approval_id,
+        kind="chat",
+        now=now,
+    )
+
+
+def mint_test_driver_principal(
+    secret: str,
+    *,
+    subject: str,
+    actor_channel: str,
+    approval_id: str,
+    now: int | None = None,
+) -> str:
+    """Mint a 60-second declared-driver attestation (ADR 0202)."""
+    return _mint_attestation(
+        secret,
+        subject=subject,
+        actor_channel=actor_channel,
+        approval_id=approval_id,
+        kind="test_driver",
+        now=now,
+    )

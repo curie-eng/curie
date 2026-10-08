@@ -82,6 +82,9 @@ class ApproverSet(Protocol):
     def chat_eligible(self) -> bool: ...
 
     @property
+    def test_driver_eligible(self) -> bool: ...
+
+    @property
     def ineligible_reason(self) -> str | None:
         """What to tell an ineligible principal, or None for the authorizer's
         per-kind default. A set whose eligibility is not about Slack evidence
@@ -111,6 +114,7 @@ class ExplicitUsers:
     # listed ID would let any adapter serving the binding approve as that
     # person (ADR-0177, "A separate finding").
     adapter_eligible = False
+    test_driver_eligible = True
     chat_eligible = True
     ineligible_reason = None
 
@@ -158,6 +162,7 @@ class InvalidApprovers:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 
@@ -207,6 +212,7 @@ class UnboundRoute:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 
@@ -303,6 +309,7 @@ class EmailApprovers:
     operator_eligible = False
     console_eligible = False
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = False
     ineligible_reason = (
         "on email, only an address on this approval's approver list may answer, "
@@ -362,6 +369,7 @@ class NoVerifiableApprovers:
     operator_eligible = True
     console_eligible = True
     adapter_eligible = True
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 

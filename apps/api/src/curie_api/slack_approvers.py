@@ -74,6 +74,7 @@ class SlackChannelMembers:
     console_eligible = False
     # Only the dispatcher's attested click proves Slack channel membership.
     adapter_eligible = False
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 
@@ -121,6 +122,7 @@ class SlackUserGroupMembers:
     console_eligible = True
     # Group members are Slack IDs, which only the dispatcher vouches for.
     adapter_eligible = False
+    test_driver_eligible = False
     chat_eligible = True
     ineligible_reason = None
 

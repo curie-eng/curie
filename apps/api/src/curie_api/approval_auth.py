@@ -31,7 +31,7 @@ APPROVAL_ACTOR_HEADER = "X-Curie-Approval-Actor"
 _SAFE_ORIGIN_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _DEFAULT_ORIGIN_PORTS = {"http": 80, "https": 443}
 
-AuthenticatedPrincipalKind = Literal["chat", "console", "operator", "adapter"]
+AuthenticatedPrincipalKind = Literal["chat", "console", "operator", "adapter", "test_driver"]
 
 
 def set_console_session_cookie(response: Response, token: str) -> None:
@@ -249,7 +249,7 @@ async def authenticate_principal(
     assert x_curie_approval_principal is not None
     settings = get_settings()
     kind = approval_principal.unverified_kind(x_curie_approval_principal)
-    if kind == "chat":
+    if kind in ("chat", "test_driver"):
         attester_secret = settings.approval_chat_attester_secret
         if (
             approval_id is None
@@ -273,6 +273,11 @@ async def authenticate_principal(
         claims = None
     if claims is None or claims.kind != kind:
         raise _unauthorized()
+    if (
+        kind == "test_driver"
+        and getattr(request.scope.get("route"), "name", None) != "resolve_approval"
+    ):
+        raise _unauthorized("test driver principal is limited to approval resolution")
     return AuthenticatedApprovalPrincipal(
         subject=claims.subject,
         kind=claims.kind,
