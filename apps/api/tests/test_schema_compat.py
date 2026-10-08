@@ -521,6 +521,10 @@ def downgrade():
     assert [r[0] for r in rows] == ["compat_probe_first", "compat_probe_second"]
 
 
+_PAUSE_TEST_LEASE_S = 3.0
+_PAUSE_TEST_INTERVAL_S = 1.0
+
+
 @pytest.fixture
 def pause_config(monkeypatch: pytest.MonkeyPatch, valkey: Redis) -> Iterator[dict[str, str]]:
     """Compress the real renewal clocks without replacing time or a store."""
@@ -538,8 +542,8 @@ def pause_config(monkeypatch: pytest.MonkeyPatch, valkey: Redis) -> Iterator[dic
     monkeypatch.delenv("VALKEY_URL", raising=False)
     for name, value in settings.items():
         monkeypatch.setenv(name, value)
-    monkeypatch.setattr(schema_compat, "PAUSE_LEASE_S", 0.6)
-    monkeypatch.setattr(schema_compat, "PAUSE_RENEW_INTERVAL_S", 0.2)
+    monkeypatch.setattr(schema_compat, "PAUSE_LEASE_S", _PAUSE_TEST_LEASE_S)
+    monkeypatch.setattr(schema_compat, "PAUSE_RENEW_INTERVAL_S", _PAUSE_TEST_INTERVAL_S)
     get_settings.cache_clear()
     keys = {
         "authoritative": f"{prefix}:upgrade:quiesce:acme-test",
@@ -559,7 +563,7 @@ def _pause_probe(
     *,
     kind: str = KIND_EXPAND,
     noop: bool = False,
-) -> threading.Event:
+) -> tuple[threading.Event, threading.Event]:
     """Drive the real CLI planner and a real, deliberately slow Alembic effect."""
     db.at(HEAD)
     copy = tmp_path / "pause-alembic"
@@ -571,7 +575,7 @@ down_revision = {HEAD!r}
 
 def upgrade():
     from alembic import op
-    op.execute("SELECT pg_sleep(0.9)")
+    op.execute("SELECT pg_sleep(4.5)")
     op.execute("CREATE TABLE curie.compat_pause_probe (value integer primary key)")
     op.execute("INSERT INTO curie.compat_pause_probe (value) VALUES (17)")
 
@@ -594,15 +598,19 @@ def downgrade():
         )
 
     started = threading.Event()
+    finished = threading.Event()
     original_upgrade = command.upgrade
 
     def upgrade(*args: Any, **kwargs: Any) -> Any:
         started.set()
-        return original_upgrade(*args, **kwargs)
+        try:
+            return original_upgrade(*args, **kwargs)
+        finally:
+            finished.set()
 
     monkeypatch.setattr(schema_compat, "apply_upgrade", apply)
     monkeypatch.setattr(command, "upgrade", upgrade)
-    return started
+    return started, finished
 
 
 def _capture_pause_client(
@@ -630,6 +638,54 @@ async def _repoint_pause_client(client: AsyncRedis, port: int) -> None:
     client.connection_pool.reset()
 
 
+def _observe_pause_renewals(
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: tuple[threading.Event, threading.Event] | None,
+) -> dict[str, Any]:
+    """Record real Lua results, transport errors and independent expiry."""
+    observed: dict[str, Any] = {
+        "renewed": [],
+        "during_apply": [],
+        "errors": [],
+        "inflight": False,
+        "expired": [],
+        "transport_failed": asyncio.Event(),
+        "deadline_expired": asyncio.Event(),
+    }
+    original_renew = schema_compat.renew_pause
+    original_lose = schema_compat._PauseAuthority.lose
+
+    async def renew(*args: Any, **kwargs: Any) -> Any:
+        observed["inflight"] = True
+        try:
+            result = await original_renew(*args, **kwargs)
+        except asyncio.CancelledError:
+            observed["errors"].append("CancelledError")
+            raise
+        except Exception as error:
+            observed["errors"].append(type(error).__name__)
+            observed["transport_failed"].set()
+            raise
+        else:
+            if result == "renewed":
+                observed["renewed"].append(time.monotonic())
+                if boundary and boundary[0].is_set() and not boundary[1].is_set():
+                    observed["during_apply"].append(time.monotonic())
+            return result
+        finally:
+            observed["inflight"] = False
+
+    def lose(authority: Any, reason: str) -> None:
+        if reason == "expired":
+            observed["expired"].append((time.monotonic(), observed["inflight"]))
+            observed["deadline_expired"].set()
+        original_lose(authority, reason)
+
+    monkeypatch.setattr(schema_compat, "renew_pause", renew)
+    monkeypatch.setattr(schema_compat._PauseAuthority, "lose", lose)
+    return observed
+
+
 def test_upgrade_renews_before_the_first_unreachable_postgres_probe_and_while_waiting(
     pause_config: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -637,17 +693,18 @@ def test_upgrade_renews_before_the_first_unreachable_postgres_probe_and_while_wa
 ) -> None:
     key = pause_config["authoritative"]
     raw = '{"revision":17,"since":"retained"}'
-    valkey.set(key, raw, px=200)
+    valkey.set(key, raw, px=30_000)
+    renewals = _observe_pause_renewals(monkeypatch, None)
     observed: list[int] = []
     original = asyncpg.connect
 
     async def connect(*args: Any, **kwargs: Any) -> Any:
-        observed.append(valkey.pttl(key))
+        observed.append(len(renewals["renewed"]))
         return await original(*args, **kwargs)
 
     monkeypatch.setattr(asyncpg, "connect", connect)
     monkeypatch.setattr(schema_compat, "POSTGRES_ATTEMPTS", 3)
-    monkeypatch.setattr(schema_compat, "POSTGRES_RETRY_S", 0.25)
+    monkeypatch.setattr(schema_compat, "POSTGRES_RETRY_S", _PAUSE_TEST_INTERVAL_S * 1.25)
     with socket.socket() as unreachable:
         unreachable.bind(("127.0.0.1", 0))
         monkeypatch.setenv(
@@ -658,7 +715,8 @@ def test_upgrade_renews_before_the_first_unreachable_postgres_probe_and_while_wa
         get_settings.cache_clear()
         assert schema_compat.main(["upgrade"]) == 1
     assert len(observed) == 3
-    assert all(ttl > 300 for ttl in observed), observed
+    assert observed[0] >= 1, "a real same-revision renewal must precede the first probe"
+    assert observed[1] > observed[0] and observed[2] > observed[1], observed
     assert valkey.get(key) == raw
 
 
@@ -695,13 +753,16 @@ def test_upgrade_keeps_renewing_during_real_apply(
     monkeypatch: pytest.MonkeyPatch,
     valkey: Redis,
 ) -> None:
-    _pause_probe(isolated_migration_db, tmp_path, monkeypatch)
+    boundary = _pause_probe(isolated_migration_db, tmp_path, monkeypatch)
+    renewals = _observe_pause_renewals(monkeypatch, boundary)
     key = pause_config["authoritative"]
-    valkey.set(key, '{"revision":17}', px=200)
+    valkey.set(key, '{"revision":17}', px=30_000)
     assert schema_compat.main(["upgrade"]) == 0
     assert current_revision() == "compat_pause_probe"
     assert sql_rows("SELECT value FROM curie.compat_pause_probe") == [(17,)]
-    assert valkey.pttl(key) > 0, "a 0.9-second apply must outlive its 0.6-second initial renewal"
+    assert len(renewals["during_apply"]) >= 2, (
+        "real renewal must continue during the 4.5-second apply"
+    )
 
 
 def test_upgrade_losing_authority_during_started_apply_joins_the_real_effect(
@@ -711,9 +772,9 @@ def test_upgrade_losing_authority_during_started_apply_joins_the_real_effect(
     monkeypatch: pytest.MonkeyPatch,
     valkey: Redis,
 ) -> None:
-    started = _pause_probe(isolated_migration_db, tmp_path, monkeypatch)
+    started, _finished = _pause_probe(isolated_migration_db, tmp_path, monkeypatch)
     key = pause_config["authoritative"]
-    valkey.set(key, '{"revision":17}', px=200)
+    valkey.set(key, '{"revision":17}', px=30_000)
 
     async def replace_authority(_client: AsyncRedis) -> None:
         while not started.is_set():
@@ -739,7 +800,7 @@ def test_upgrade_checks_authority_after_planning_and_before_apply(
     outcome: str,
     lose_authority: bool,
 ) -> None:
-    started = _pause_probe(
+    started, _finished = _pause_probe(
         isolated_migration_db,
         tmp_path,
         monkeypatch,
@@ -747,14 +808,14 @@ def test_upgrade_checks_authority_after_planning_and_before_apply(
         noop=outcome == "noop",
     )
     key = pause_config["authoritative"]
-    valkey.set(key, '{"revision":17}', px=200)
+    valkey.set(key, '{"revision":17}', px=30_000)
     if lose_authority:
         original = schema_compat.current_revision
 
         def revision() -> str | None:
             actual = original()
             valkey.set(key, '{"revision":18}', px=30_000)
-            time.sleep(0.5)  # Real scheduling lets the renewal task observe loss.
+            time.sleep(_PAUSE_TEST_LEASE_S)  # The real loop observes foreign authority.
             return actual
 
         monkeypatch.setattr(schema_compat, "current_revision", revision)
@@ -775,6 +836,7 @@ def test_initial_real_valkey_connection_failure_never_grants_permission_to_probe
     recover: bool,
 ) -> None:
     isolated_migration_db.at(HEAD)
+    renewals = _observe_pause_renewals(monkeypatch, None)
     key = pause_config["authoritative"]
     valkey.set(key, '{"revision":17}', px=30_000)
     recovered = False
@@ -808,6 +870,7 @@ def test_initial_real_valkey_connection_failure_never_grants_permission_to_probe
         assert schema_compat.main(["upgrade"]) == (0 if recover else 1)
     assert all(probes), "an initial transport exception is never confirmed pause ownership"
     assert bool(probes) is recover
+    assert renewals["errors"], "the initial real connection attempt must actually fail"
     assert current_revision() == HEAD
 
 
@@ -820,7 +883,9 @@ def test_real_valkey_transport_failure_respects_the_last_confirmation_deadline(
     valkey: Redis,
     mode: str,
 ) -> None:
-    started = _pause_probe(isolated_migration_db, tmp_path, monkeypatch)
+    boundary = _pause_probe(isolated_migration_db, tmp_path, monkeypatch)
+    started, _finished = boundary
+    renewals = _observe_pause_renewals(monkeypatch, boundary)
     key = pause_config["authoritative"]
     valkey.set(key, '{"revision":17}', px=30_000)
     interrupted = False
@@ -833,18 +898,37 @@ def test_real_valkey_transport_failure_respects_the_last_confirmation_deadline(
             nonlocal interrupted
             while not started.is_set():
                 await asyncio.sleep(0.01)
+            # Begin at a real confirmation after apply starts, so planning and
+            # host scheduling cannot consume this test's outage budget.
+            count = len(renewals["renewed"])
+            while len(renewals["renewed"]) == count:
+                await asyncio.sleep(0.01)
+            if mode == "stall":
+                client.connection_pool.connection_kwargs["socket_timeout"] = 15
             await _repoint_pause_client(client, outage.getsockname()[1])
             interrupted = True
-            if mode in {"recover", "late_recover"}:
-                await asyncio.sleep(0.25 if mode == "recover" else 0.55)
+            if mode == "recover":
+                await renewals["transport_failed"].wait()
+                await asyncio.sleep(_PAUSE_TEST_INTERVAL_S / 10)
+                await _repoint_pause_client(client, VALKEY_PORT)
+            elif mode == "late_recover":
+                await renewals["deadline_expired"].wait()
                 await _repoint_pause_client(client, VALKEY_PORT)
 
         tasks = _capture_pause_client(monkeypatch, interrupt)
-        before = time.monotonic()
         assert schema_compat.main(["upgrade"]) == (0 if mode == "recover" else 1)
-        elapsed = time.monotonic() - before
     assert interrupted and tasks and tasks[0].done() and tasks[0].exception() is None
-    assert elapsed < 1.8, "a stalled store must not postpone the independent authority deadline"
+    if mode == "recover":
+        assert renewals["errors"], "the successful neighbor must contain a real transport failure"
+        assert not renewals["expired"]
+    else:
+        assert renewals["expired"], "unconfirmed authority must expire independently of apply"
+    if mode == "stall":
+        assert any(inflight for _, inflight in renewals["expired"])
+        assert "CancelledError" in renewals["errors"]
+        assert "TimeoutError" not in renewals["errors"], (
+            "expiry must precede the stalled read timeout"
+        )
     assert current_revision() == "compat_pause_probe"
     assert sql_rows("SELECT value FROM curie.compat_pause_probe") == [(17,)]
 
@@ -877,7 +961,8 @@ def test_moved_postgres_wait_preserves_safe_periodic_diagnostics_and_attempt_bou
     lines = (output.out + output.err).splitlines()
     error_class = "ConnectionRefusedError"
     assert lines == [f"Waiting for Postgres readiness; probe error class: {error_class}"] + [
-        f"Still waiting for Postgres readiness after {n} of 60 attempts; probe error class: {error_class}"
+        f"Still waiting for Postgres readiness after {n} of 60 attempts; "
+        f"probe error class: {error_class}"
         for n in (10, 20, 30, 40, 50)
     ] + [
         "Postgres unavailable after 60 readiness attempts; "

@@ -2045,8 +2045,9 @@ def fail(message):
     raise SystemExit(message)
 
 
-# The API schema-wait init and the schema-migrate Job share one Postgres
-# readiness loop; both run through this checker (#2865).
+# The API schema-wait init and legacy migrate fallback use the bounded shell
+# readiness loop. The current migrate image delegates readiness to Python;
+# this checker verifies all three dispatch paths (#2865, #4295).
 MODE = sys.argv[2] if len(sys.argv) > 2 else "api"
 if MODE not in {"api", "migrate", "legacy"}:
     fail(f"unknown readiness checker mode {MODE!r}")
