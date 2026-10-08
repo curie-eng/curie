@@ -175,6 +175,7 @@ from .reply_sink import (
 from .runner_client import (
     RunnerClient,
     RunnerError,
+    RunnerSnapshotReadError,
     RunnerStreamTimeout,
     RunnerWorkspaceSnapshot,
     TurnStream,
@@ -609,7 +610,12 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
 )
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
-    {"runner-timeout-unconfirmed", "sandbox-capacity", "sandbox-terminated"}
+    {
+        "ownership-store-unavailable",
+        "runner-timeout-unconfirmed",
+        "sandbox-capacity",
+        "sandbox-terminated",
+    }
 )
 
 _ESCALATION_DETAIL_MAX = 300
@@ -3571,6 +3577,8 @@ class Kernel:
                 )
             termination_detail: str | None = None
             attempt = 0
+            capacity_refusals = 0
+            capacity_wait_run: WorkItemRun | None = None
             while True:
                 attempt += 1
                 hook_carry = _HOOK_RUN_CARRY.get()
@@ -3578,8 +3586,8 @@ class Kernel:
                     hook_carry.this_attempt_started = False
                 # The delivery's overall deadline gates every attempt, and the
                 # attempts CONSUME it: a retry never restarts it.
-                if lease is not None:
-                    if lease.lost.is_set():
+                if lease is not None or capacity_wait_run is not None:
+                    if lease is not None and lease.lost.is_set():
                         # Fenced out between attempts. Start nothing: a
                         # replacement holds this delivery and is entitled to run
                         # it. Returning without completing leaves the entry
@@ -3592,8 +3600,10 @@ class Kernel:
                             event_id,
                         )
                         return
-                    remaining = lease.remaining_s()
-                    if remaining <= _MIN_ATTEMPT_BUDGET_S:
+                    remaining = _remaining_budget(lease)
+                    if capacity_wait_run is not None:
+                        remaining = capacity_wait_run.bound_remaining_s(remaining)
+                    if remaining is not None and remaining <= _MIN_ATTEMPT_BUDGET_S:
                         # DISTINCT from the model-spend ``budget-exceeded``
                         # classification: this is the wall-clock delivery
                         # deadline, and conflating the two would make both
@@ -3854,6 +3864,19 @@ class Kernel:
                     return
 
                 retryable = outcome.classification in RETRYABLE_CLASSIFICATIONS
+                capacity_continuation = None
+                if outcome.classification == "sandbox-capacity" and (
+                    (parsed_work_item is not None and parsed_work_item.is_ci_fix)
+                    or self._is_approval_resume(event_id)
+                ):
+                    capacity_continuation = self._run_for_event(event_id)
+                if capacity_continuation is not None:
+                    # The execution already started, so SQL defer cannot hold
+                    # this continuation. Waiting for quota consumes its delivery
+                    # and execution deadlines, never a runner attempt (#4275).
+                    capacity_wait_run = capacity_continuation
+                    capacity_refusals += 1
+                    attempt -= 1
                 if outcome.classification == "sandbox-terminated":
                     termination_detail = outcome.error_message
                 if (
@@ -3937,13 +3960,25 @@ class Kernel:
                         "retry_class": cast("str", outcome.classification),
                     },
                 )
-                backoff_s = self._backoff(attempt)
-                if lease is not None:
+                backoff_s = self._backoff(
+                    capacity_refusals if capacity_continuation is not None else attempt
+                )
+                remaining = _remaining_budget(lease)
+                if capacity_continuation is not None:
+                    remaining = capacity_continuation.bound_remaining_s(remaining)
+                if remaining is not None:
                     # The backoff CONSUMES the delivery budget; it never extends
                     # it. Clamped, because an unclamped backoff longer than the
                     # remaining deadline burns the whole thing asleep and then
                     # escalates without ever having retried -- the worst of both.
-                    backoff_s = min(backoff_s, max(0.0, lease.remaining_s()))
+                    backoff_s = min(backoff_s, max(0.0, remaining))
+                if capacity_continuation is not None:
+                    logger.info(
+                        "sandbox capacity retry for event %s: refusal=%d backoff=%.3fs",
+                        event_id,
+                        capacity_refusals,
+                        backoff_s,
+                    )
                 await asyncio.sleep(backoff_s)
         finally:
             if owned_work_item_id is not None:
@@ -4776,7 +4811,11 @@ class Kernel:
                 elif outcome == "delivered":
                     ci_fix = parsed is not None and parsed.is_ci_fix
                     if ci_fix:
-                        cause = "ci_fix_unpublished"
+                        cause = (
+                            "runner_escalated"
+                            if turn is not None and turn.start_failed
+                            else "ci_fix_unpublished"
+                        )
                     elif turn is None or self._is_approval_resume(qevent.event_id):
                         cause = "no_pull_request"
                     else:
@@ -5574,10 +5613,14 @@ class Kernel:
                     raise _WorkItemDeferred() from None
 
             async def capacity_refusal() -> TurnOutcome:
-                # An approval resume has no capacity reply to send or queue to
-                # wait in: it fails as sandbox-capacity and the driving loop
-                # retries it (#3693). Every other turn answers the person.
-                if self._is_approval_resume(qevent.event_id):
+                # Started factory continuations wait in the driving loop:
+                # their running request cannot use SQL defer (#4275). An
+                # interactive approval keeps its bounded retry policy (#3693).
+                if (
+                    parsed_execute is not None
+                    and parsed_execute.is_ci_fix
+                    and self._run_for_event(qevent.event_id) is not None
+                ) or self._is_approval_resume(qevent.event_id):
                     release_order()
                     return TurnOutcome(terminal_ok=False, classification="sandbox-capacity")
                 return await capacity_response()
@@ -5899,38 +5942,93 @@ class Kernel:
                 outcome.approval_gate_kind,
                 outcome.approval_granted_tool,
             ):
-                try:
-                    snapshot = await self._runner.snapshot(
-                        routed.handle.base_url,
-                        token=routed.handle.token or None,
-                        remaining_s=remaining_s,
+                snapshot = None
+                snapshot_started = time.monotonic()
+                snapshot_budget_s = (
+                    None
+                    if remaining_s is None
+                    else remaining_s - (snapshot_started - attempt_started)
+                )
+                snapshot_attempts = 0
+                snapshot_failure_text = "remaining budget is 5 s or less"
+                while snapshot_attempts < 3:
+                    snapshot_remaining_s = (
+                        None
+                        if snapshot_budget_s is None
+                        else snapshot_budget_s - (time.monotonic() - snapshot_started)
                     )
-                    if self._workspace is None:
-                        raise WorkspacePreparationError(
-                            "publication-validation",
-                            "managed workspace coordinator is unavailable",
+                    if (
+                        snapshot_remaining_s is not None
+                        and snapshot_remaining_s <= _MIN_ATTEMPT_BUDGET_S
+                    ):
+                        break
+                    snapshot_attempts += 1
+                    try:
+                        snapshot = await self._runner.snapshot(
+                            routed.handle.base_url,
+                            token=routed.handle.token or None,
+                            remaining_s=snapshot_remaining_s,
                         )
-                    await asyncio.to_thread(
-                        validate_snapshot_against_base,
-                        self._workspace,
-                        thread_key=thread_key,
-                        snapshot=snapshot,
-                        max_patch_bytes=self._config.publication_patch_max_bytes,
-                        scratch_root=Path(self._config.workspace_scratch_root),
-                        git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
-                        protected_paths=self._config.publication_protected_paths,
-                    )
-                    outcome.publication_snapshot = snapshot
-                except (
-                    RunnerError,
-                    aiohttp.ClientError,
-                    TimeoutError,
-                    WorkspacePreparationError,
-                ) as exc:
+                    except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
+                        snapshot_failure_text = str(exc)
+                        if not isinstance(exc, RunnerError):
+                            snapshot_failure_text = type(exc).__name__ + (
+                                f": {snapshot_failure_text}" if snapshot_failure_text else ""
+                            )
+                        logger.warning(
+                            "publication snapshot read failed for %s: attempt %s of 3: %s",
+                            qevent.event_id,
+                            snapshot_attempts,
+                            snapshot_failure_text,
+                        )
+                        if snapshot_attempts == 3 or not isinstance(
+                            exc, (RunnerSnapshotReadError, aiohttp.ClientError, TimeoutError)
+                        ):
+                            break
+                        snapshot_remaining_s = (
+                            None
+                            if snapshot_budget_s is None
+                            else snapshot_budget_s - (time.monotonic() - snapshot_started)
+                        )
+                        if (
+                            snapshot_remaining_s is not None
+                            and snapshot_remaining_s
+                            <= _MIN_ATTEMPT_BUDGET_S + snapshot_attempts
+                        ):
+                            break
+                        await asyncio.sleep(float(snapshot_attempts))
+                    else:
+                        break
+                if snapshot is None:
                     # A trusted publication request never falls through into an
                     # ordinary approval when snapshotting fails. The pause path
                     # reports this error and creates neither durable row.
-                    outcome.publication_snapshot_error = str(exc)
+                    outcome.publication_snapshot_error = (
+                        "publication snapshot could not be read after "
+                        f"{snapshot_attempts} attempt(s): {snapshot_failure_text}"
+                    )
+                else:
+                    try:
+                        if self._workspace is None:
+                            raise WorkspacePreparationError(
+                                "publication-validation",
+                                "managed workspace coordinator is unavailable",
+                            )
+                        await asyncio.to_thread(
+                            validate_snapshot_against_base,
+                            self._workspace,
+                            thread_key=thread_key,
+                            snapshot=snapshot,
+                            max_patch_bytes=self._config.publication_patch_max_bytes,
+                            scratch_root=Path(self._config.workspace_scratch_root),
+                            git_timeout_seconds=(
+                                self._config.publication_git_command_timeout_seconds
+                            ),
+                            protected_paths=self._config.publication_protected_paths,
+                        )
+                        outcome.publication_snapshot = snapshot
+                    except WorkspacePreparationError as exc:
+                        outcome.publication_snapshot_error = f"publication snapshot failed: {exc}"
             return outcome
         finally:
             self._unregister_run(agent_id, thread_key)
@@ -8420,9 +8518,7 @@ class Kernel:
                 if outcome.publication_snapshot_error is not None:
                     # #4121: carry the message as the refusal so the factory run
                     # shows why the snapshot failed, not only the cause.
-                    snapshot_failure = (
-                        f"publication snapshot failed: {outcome.publication_snapshot_error}"
-                    )
+                    snapshot_failure = outcome.publication_snapshot_error
                     raise ApprovalBackendError(snapshot_failure, refusal=snapshot_failure)
                 if deployment_id is None or snapshot is None:
                     raise ApprovalBackendError(
@@ -9304,7 +9400,12 @@ class Kernel:
             # Unchanged by ADR-0117: this latches on the FIRST frame and the rule
             # reads presence, so a stream carrying one frame per call rather than
             # one per turn is the same signal to it.
-            await self._markers.mark_side_effect(qevent.event_id)
+            lease = _DELIVERY_LEASE.get()
+            if _is_fenced(lease):
+                assert lease is not None
+                await self._mark_side_effect_with_retry(qevent.event_id, acc, lease)
+            else:
+                await self._markers.mark_side_effect(qevent.event_id)
             await self._record_action(frame, acc, qevent, agent_id)
         elif isinstance(frame, ErrorEvent):
             if frame.classification:
@@ -9319,6 +9420,38 @@ class Kernel:
             acc.approval_granted_tool = frame.approval_granted_tool
             acc.approval_granted_arguments = frame.approval_granted_arguments
             acc.approval_display = frame.approval_display
+
+    async def _mark_side_effect_with_retry(
+        self, event_id: str, acc: _StreamAccumulator, lease: DeliveryLease
+    ) -> None:
+        """Hold a side-effect frame until its marker is durable (ADR 0207)."""
+
+        backoff_s = 0.5
+        while True:
+            lease.raise_if_lost()
+            remaining_s = lease.local_deadline_monotonic - time.monotonic()
+            if remaining_s <= 0:
+                break
+            try:
+                async with asyncio.timeout(remaining_s):
+                    await self._markers.mark_side_effect(event_id)
+            except Exception as exc:
+                remaining_s = lease.local_deadline_monotonic - time.monotonic()
+                if remaining_s <= 0:
+                    break
+                logger.warning(
+                    "side-effect marker write for %s raised %s; retrying while ownership is held",
+                    event_id,
+                    _exception_reason(exc),
+                )
+                await asyncio.sleep(min(backoff_s, remaining_s))
+                backoff_s = min(5.0, backoff_s * 2)
+            else:
+                lease.raise_if_lost()
+                return
+
+        acc.classification = "ownership-store-unavailable"
+        raise TimeoutError("ownership store unreachable past the local lease deadline")
 
     async def _record_action(
         self,

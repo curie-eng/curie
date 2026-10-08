@@ -220,4 +220,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0203 | [Automated remediation is a pre-qualified action the platform executes and verifies](0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md) | Accepted |
 | 0206 | [A factory run lost with its worker is re-admitted as a new attempt](0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md) | Accepted |
 | 0207 | [A delivery owner rides through an ownership store outage shorter than its lease](0207-a-delivery-owner-rides-through-an-ownership-store-outage-shorter-than-its-lease.md) | Accepted |
+| 0208 | [A factory PR opened after its request was cancelled is adopted by the next run](0208-a-factory-pr-opened-after-its-request-was-cancelled-is-adopted-by-the-next-run.md) | Accepted |
+| 0209 | [Pause authority after a drain is a lease held by a live upgrade step](0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md) | Accepted |
 <!-- END GENERATED: adr-index -->

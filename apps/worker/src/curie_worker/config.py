@@ -839,12 +839,12 @@ class WorkerConfig(BaseSettings):
     # ``read_block_ms`` to avoid probing peers during ordinary read blocking.
     dead_consumer_idle_ms: int = Field(default=15000, ge=0)
     # Independent stream-consumer liveness. A capable worker publishes the
-    # short alive lease before it reads and refreshes it throughout graceful
+    # 45-second alive lease before it reads and refreshes it throughout graceful
     # in-flight drain. A replacement requires two absent observations separated
     # by a full heartbeat TTL before prompt claim, so neither consumer idle nor
     # one transient Redis read can manufacture process death.
     consumer_heartbeat_ttl_ms: int = Field(
-        default=15000,
+        default=45000,
         gt=0,
         validation_alias="CURIE_CONSUMER_HEARTBEAT_TTL_MS",
     )

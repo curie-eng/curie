@@ -21,8 +21,36 @@ import json
 import pytest
 from curie_api.config import Settings
 from curie_dispatcher.config import DispatcherConfig
+from curie_worker import workitem_dispatch as worker_workitem_dispatch
 from curie_worker.config import WorkerConfig
 from pydantic import ValidationError
+
+
+def test_work_item_acquire_lease_defaults_to_sixty_seconds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS", raising=False)
+    monkeypatch.delenv("WORK_ITEM_ACQUIRE_LEASE_SECONDS", raising=False)
+
+    assert Settings().work_item_acquire_lease_seconds == 60
+
+
+def test_work_item_acquire_lease_rejects_less_than_two_renewal_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS", "39")
+
+    with pytest.raises(ValidationError, match="CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS"):
+        Settings()
+
+
+def test_minimum_work_item_acquire_lease_covers_two_worker_renewal_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS", "40")
+
+    assert Settings().work_item_acquire_lease_seconds == 40
+    assert 40 >= 2 * worker_workitem_dispatch._ACQUIRE_RENEW_INTERVAL_S
 
 
 def _clear_stream_env(monkeypatch: pytest.MonkeyPatch) -> None:

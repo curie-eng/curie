@@ -35,7 +35,9 @@ from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from curie_worker import capacity_wait as capacity_wait_module
 from curie_worker import consumer as consumer_module
+from curie_worker import delivery_lease as delivery_lease_module
 from curie_worker import kernel as kernel_module
+from curie_worker import stream_consumer as stream_consumer_module
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.capacity_wait import (
     WAIT_GENERATION_FIELD,
@@ -49,7 +51,7 @@ from curie_worker.consumer_liveness import (
     consumer_heartbeat_key,
 )
 from curie_worker.cron_loop import CronSchedulerLoop, _Target
-from curie_worker.delivery_lease import DeliveryLeaseStore
+from curie_worker.delivery_lease import DeliveryBudget, DeliveryLeaseStore, LeaseLostError
 from curie_worker.hook_source_guard import CronHookSourceGuard
 from curie_worker.runner_client import TurnStream
 from curie_worker.sandbox import QuotaRejection
@@ -72,6 +74,545 @@ from queue_fixtures import wait_until as _wait_until  # noqa: E402
 DONE = SessionStatus.DONE
 
 HEARTBEAT_TTL_MS = 15_000
+
+# ADR 0207 production clocks scaled by 0.1, including the one-heartbeat
+# safety margin. The 70ms tolerance is 2% of the 3.5s ownership window.
+_OUTAGE_KNOBS: dict[str, object] = {
+    "delivery_lease_ttl_s": 4.5,
+    "delivery_lease_heartbeat_s": 1.0,
+    "consumer_heartbeat_ttl_ms": 4500,
+    "consumer_capability_ttl_ms": 9000,
+    "delivery_budget_s": 60.0,
+    "runner_total_timeout_s": 30.0,
+}
+
+
+async def _outage_delivery(h: Any) -> tuple[Consumer, DeliveryLeaseStore, str, dict[str, str]]:
+    store = DeliveryLeaseStore(h.async_redis, h.config)
+    consumer = Consumer(redis=h.async_redis, kernel=h.kernel, config=h.config, leases=store)
+    await consumer.ensure_group()
+    await h.async_redis.xadd(
+        h.config.stream, to_stream_fields(_qevent("outage", event_id=uuid.uuid4().hex))
+    )
+    rows = await h.async_redis.xreadgroup(
+        h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
+    )
+    entry_id, fields = rows[0][1][0]
+    return consumer, store, entry_id, dict(fields)
+
+
+def test_delivery_transport_outage_loses_at_thirty_five_seconds_not_first_error(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, store, entry_id, fields = await _outage_delivery(h)
+            attempts: list[float] = []
+            real_heartbeat = store.heartbeat
+            real_finish_loss = consumer._finish_lease_loss
+            real_on_lost = consumer._on_lease_lost
+            losses = {"finish": 0, "callback": 0}
+            outage_until = time.monotonic() + 5.0
+
+            async def finish_loss(*args: Any, **kwargs: Any) -> None:
+                losses["finish"] += 1
+                await real_finish_loss(*args, **kwargs)
+
+            async def on_lost(*args: Any, **kwargs: Any) -> None:
+                losses["callback"] += 1
+                assert real_on_lost is not None
+                await real_on_lost(*args, **kwargs)
+
+            async def unavailable(*args: Any, **kwargs: Any) -> Any:
+                attempts.append(time.monotonic())
+                if time.monotonic() < outage_until:
+                    raise redis.exceptions.ConnectionError("injected 50s ownership outage")
+                return await real_heartbeat(*args, **kwargs)
+
+            monkeypatch.setattr(store, "heartbeat", unavailable)
+            monkeypatch.setattr(consumer, "_finish_lease_loss", finish_loss)
+            assert real_on_lost is not None
+            consumer._on_lease_lost = on_lost
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                started = lease.local_deadline_monotonic - 3.5
+                await asyncio.sleep(max(0, started + 3.43 - time.monotonic()))
+                assert not lease.lost.is_set(), "a transient raise dropped a still-valid lease"
+                await asyncio.wait_for(lease.lost.wait(), timeout=0.2)
+                assert time.monotonic() - started == pytest.approx(3.5, abs=0.07)
+                assert len(attempts) == 3, "renewals must retry at 10, 20 and 30 seconds"
+                assert [instant - started for instant in attempts] == pytest.approx(
+                    [1.0, 2.0, 3.0], abs=0.07
+                )
+                await _wait_until(lambda: losses["callback"] == 1)
+                await asyncio.gather(*list(consumer._lease_loss_tasks))
+                assert losses == {"finish": 1, "callback": 1}
+                await asyncio.sleep(0.05)
+                assert len(attempts) == 3, "a lost lease continued attempting renewals"
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("outage_s", [2.5, 5.0], ids=["25s-survives", "50s-expires"])
+def test_liveness_transport_outage_uses_thirty_five_second_deadline(
+    make_harness, monkeypatch: pytest.MonkeyPatch, outage_s: float
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer = _capacity_consumer(h)
+            await consumer._publish_liveness()
+            started = consumer._last_liveness_renewal
+            assert started is not None
+            store = consumer._liveness_store
+            assert store is not None
+            real_renew = store.renew
+            attempts: list[float] = []
+
+            async def unavailable(**kwargs: Any) -> bool:
+                attempts.append(time.monotonic())
+                if time.monotonic() < started + outage_s:
+                    raise redis.exceptions.ConnectionError("injected liveness outage")
+                return await real_renew(**kwargs)
+
+            monkeypatch.setattr(store, "renew", unavailable)
+            task = asyncio.create_task(consumer._liveness_refresh_loop())
+            try:
+                if outage_s == 5.0:
+                    await asyncio.sleep(max(0, started + 3.43 - time.monotonic()))
+                    assert not task.done(), "liveness expired before its local deadline"
+                    with pytest.raises(ConsumerLivenessExpired):
+                        await asyncio.wait_for(task, timeout=0.2)
+                    assert time.monotonic() - started == pytest.approx(3.5, abs=0.07)
+                    assert len(attempts) == 3
+                else:
+                    await asyncio.sleep(max(0, started + 2.5 - time.monotonic()))
+                    assert not task.done(), "a 25s transport outage killed the generation"
+                    await _wait_until(lambda: consumer._last_liveness_renewal > started)
+                    assert not task.done()
+                    assert await store.is_alive(
+                        stream=h.config.stream,
+                        group=h.config.consumer_group,
+                        consumer=h.config.consumer_name,
+                    )
+                    assert [instant - started for instant in attempts[:3]] == pytest.approx(
+                        [1.0, 2.0, 3.0], abs=0.07
+                    )
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, ConsumerLivenessExpired):
+                    await task
+                await consumer._cleanup_alive()
+
+    asyncio.run(go())
+
+
+def test_delivery_and_liveness_deadlines_anchor_before_sending_delayed_calls(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness(consumer_heartbeat_ttl_ms=45000) as h:
+            consumer, store, entry_id, fields = await _outage_delivery(h)
+            real_eval = h.async_redis.eval
+            clock = SimpleNamespace(now=100.0)
+            calls = 0
+            phase = "delivery"
+            delivery_done = asyncio.Event()
+            liveness_done = asyncio.Event()
+            never = asyncio.Event()
+
+            async def delayed_reply(*args: Any, **kwargs: Any) -> Any:
+                nonlocal calls
+                result = await real_eval(*args, **kwargs)
+                calls += 1
+                clock.now += 3.0
+                if phase == "delivery" and calls == 2:
+                    delivery_done.set()
+                return result
+
+            async def virtual_sleep(delay: float) -> None:
+                if delivery_done.is_set():
+                    await never.wait()
+                clock.now += delay
+                await asyncio.sleep(0)
+
+            async def virtual_generation_sleep(delay: float) -> None:
+                if liveness_done.is_set():
+                    await never.wait()
+                clock.now += delay
+                await asyncio.sleep(0)
+
+            # Replace module references, preserving the real server TIME and
+            # the process-wide asyncio/time modules used by other tests.
+            for module in (delivery_lease_module, stream_consumer_module):
+                monkeypatch.setattr(
+                    module,
+                    "time",
+                    SimpleNamespace(**{**vars(time), "monotonic": lambda: clock.now}),
+                )
+            monkeypatch.setattr(
+                stream_consumer_module,
+                "asyncio",
+                SimpleNamespace(**{**vars(asyncio), "sleep": virtual_sleep}),
+            )
+            monkeypatch.setattr(h.async_redis, "eval", delayed_reply)
+            sent = clock.now
+            lease = await store.acquire(
+                h.config.stream,
+                h.config.consumer_group,
+                entry_id,
+                consumer=h.config.consumer_name,
+            )
+            assert clock.now == sent + 3.0
+            assert lease.local_deadline_monotonic == sent + 35.0
+            previous_deadline = lease.local_deadline_monotonic
+            heartbeat = asyncio.create_task(consumer._heartbeat_lease(lease, entry_id, fields))
+            try:
+                await asyncio.wait_for(delivery_done.wait(), timeout=1.0)
+                assert lease.budget.anchor_monotonic == sent + 10.0
+                assert clock.now == sent + 13.0
+                assert lease.local_deadline_monotonic == sent + 10.0 + 35.0
+                assert lease.local_deadline_monotonic != clock.now + 35.0
+                assert lease.local_deadline_monotonic > previous_deadline
+            finally:
+                heartbeat.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat
+            # The liveness adapter is a real transaction. Delay its confirmed
+            # response, retaining its true pre-send anchor in the consumer.
+            phase = "liveness"
+            liveness = consumer._liveness_store
+            assert liveness is not None
+            real_publish = liveness.publish
+            real_renew = liveness.renew
+            renewed_sends: list[float] = []
+
+            async def delayed_publish(**kwargs: Any) -> str:
+                token = await real_publish(**kwargs)
+                clock.now += 3.0
+                return token
+
+            async def delayed_renew(**kwargs: Any) -> bool:
+                renewed_sends.append(clock.now)
+                result = await real_renew(**kwargs)
+                liveness_done.set()
+                return result
+
+            monkeypatch.setattr(liveness, "publish", delayed_publish)
+            monkeypatch.setattr(liveness, "renew", delayed_renew)
+            monkeypatch.setattr(consumer, "_sleep_generation", virtual_generation_sleep)
+            sent = clock.now
+            await consumer._publish_liveness()
+            assert clock.now == sent + 3.0
+            assert consumer._last_liveness_renewal == sent
+            previous = consumer._last_liveness_renewal
+            task = asyncio.create_task(consumer._liveness_refresh_loop())
+            try:
+                await asyncio.wait_for(liveness_done.wait(), timeout=1.0)
+                confirmed = consumer._last_liveness_renewal
+                assert confirmed is not None
+                assert renewed_sends == [sent + 10.0]
+                assert confirmed == renewed_sends[0]
+                assert clock.now == confirmed + 3.0
+                assert confirmed + 35.0 < clock.now + 35.0
+                assert confirmed > previous
+            finally:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                await consumer._cleanup_alive()
+                await store.release(
+                    lease.stream,
+                    lease.group,
+                    lease.entry_id,
+                    owner=lease.owner,
+                    resume_event_id=None,
+                )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("refusal", ["key-gone", "wrong-token", "wrong-generation", "pel-gone"])
+def test_delivery_confirmed_refusals_drop_authority_on_the_first_renewal(
+    make_harness, refusal: str
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, store, entry_id, fields = await _outage_delivery(h)
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                key = h.config.delivery_lease_key(lease.stream, lease.group, entry_id)
+                started = time.monotonic()
+                if refusal == "key-gone":
+                    await h.async_redis.delete(key)
+                elif refusal == "wrong-token":
+                    await h.async_redis.set(key, "another-owner", px=4500)
+                elif refusal == "wrong-generation":
+                    await h.async_redis.hincrby(
+                        h.config.delivery_state_key(lease.stream, lease.group, entry_id), "gen", 1
+                    )
+                else:
+                    await h.async_redis.xack(lease.stream, lease.group, entry_id)
+                await asyncio.wait_for(lease.lost.wait(), timeout=1.25)
+                assert time.monotonic() - started < 1.2
+                with pytest.raises(LeaseLostError):
+                    lease.raise_if_lost()
+                # A separate valid delivery still renews through the same store.
+                await h.async_redis.xadd(
+                    lease.stream, to_stream_fields(_qevent("control", event_id=uuid.uuid4().hex))
+                )
+                rows = await h.async_redis.xreadgroup(
+                    lease.group, h.config.consumer_name, {lease.stream: ">"}, count=1
+                )
+                control_id = rows[0][1][0][0]
+                control = await store.acquire(
+                    lease.stream, lease.group, control_id, consumer=h.config.consumer_name
+                )
+                assert (
+                    await store.heartbeat(
+                        control.stream,
+                        control.group,
+                        control.entry_id,
+                        consumer=h.config.consumer_name,
+                        owner=control.owner,
+                        generation=control.generation,
+                        resume_event_id=None,
+                    )
+                    is not None
+                )
+                await store.release(
+                    control.stream,
+                    control.group,
+                    control.entry_id,
+                    owner=control.owner,
+                    resume_event_id=None,
+                )
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("refusal", ["key-gone", "new-generation"])
+def test_liveness_token_refusal_never_resurrects_or_overwrites_a_generation(
+    make_harness, refusal: str
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer = _capacity_consumer(h)
+            await consumer._publish_liveness()
+            store = consumer._liveness_store
+            assert store is not None
+            old_token = consumer._liveness_token
+            assert isinstance(old_token, str) and len(old_token) == 32
+            key = consumer_heartbeat_key(
+                h.config.stream, h.config.consumer_group, h.config.consumer_name
+            )
+            capable = consumer_heartbeat_capable_key(
+                h.config.stream, h.config.consumer_group, h.config.consumer_name
+            )
+            kwargs = dict(
+                stream=h.config.stream,
+                group=h.config.consumer_group,
+                consumer=h.config.consumer_name,
+                heartbeat_ttl_ms=4500,
+                capability_ttl_ms=9000,
+            )
+            replacement = None
+            if refusal == "key-gone":
+                await h.async_redis.delete(key)
+            else:
+                replacement = await store.publish(**kwargs)
+                assert replacement != old_token
+            # Give the capability key a distinguishable value and TTL. A CAS
+            # refusal must change neither key, even the longer-lived marker.
+            await h.async_redis.set(capable, "sentinel", px=2000)
+            assert await store.renew(**kwargs, token=old_token) is False
+            assert await h.async_redis.get(key) == replacement
+            assert await h.async_redis.get(capable) == "sentinel"
+            assert 0 < await h.async_redis.pttl(capable) <= 2000
+            started = time.monotonic()
+            with pytest.raises(ConsumerLivenessExpired):
+                await asyncio.wait_for(consumer._liveness_refresh_loop(), timeout=1.25)
+            assert time.monotonic() - started < 1.2
+            assert await h.async_redis.get(key) == replacement
+            assert await h.async_redis.get(capable) == "sentinel"
+            # The newly published generation is valid, including after a
+            # durable key loss, and refreshes both TTLs through the real Lua.
+            if replacement is None:
+                replacement = await store.publish(**kwargs)
+            assert await store.renew(**kwargs, token=replacement) is True
+            assert await h.async_redis.get(key) == replacement
+            assert await h.async_redis.pttl(key) > 4300
+            assert await h.async_redis.pttl(capable) > 8800
+            await consumer._cleanup_alive()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("failure", ["connection-error", "hung-call"])
+def test_terminal_xack_retries_without_starving_the_delivery_heartbeat(
+    make_harness, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, store, entry_id, fields = await _outage_delivery(h)
+            real_xack = h.async_redis.xack
+            real_heartbeat = store.heartbeat
+            attempted = asyncio.Event()
+            confirmed = asyncio.Event()
+            cancelled = asyncio.Event()
+            calls = 0
+            outage_until: float | None = None
+            retry_sleeps: list[float] = []
+
+            async def observe_heartbeat(*args: Any, **kwargs: Any) -> Any:
+                result = await real_heartbeat(*args, **kwargs)
+                if result is not None:
+                    confirmed.set()
+                return result
+
+            async def flaky_xack(*args: Any, **kwargs: Any) -> Any:
+                nonlocal calls, outage_until
+                calls += 1
+                attempted.set()
+                if failure == "connection-error":
+                    if outage_until is None:
+                        outage_until = time.monotonic() + 2.0
+                    if time.monotonic() < outage_until:
+                        raise redis.exceptions.ConnectionError("injected 20s terminal XACK outage")
+                if failure == "hung-call" and calls == 1:
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        cancelled.set()
+                assert confirmed.is_set(), "XACK retries retained the heartbeat lock"
+                return await real_xack(*args, **kwargs)
+
+            async def settlement_sleep(delay: float) -> None:
+                task = asyncio.current_task()
+                if (
+                    failure == "connection-error"
+                    and task is not None
+                    and task.get_name() == "test:terminal-xack"
+                ):
+                    retry_sleeps.append(delay)
+                    await asyncio.sleep(delay * 0.1)
+                else:
+                    await asyncio.sleep(delay)
+
+            monkeypatch.setattr(store, "heartbeat", observe_heartbeat)
+            monkeypatch.setattr(h.async_redis, "xack", flaky_xack)
+            monkeypatch.setattr(
+                stream_consumer_module,
+                "asyncio",
+                SimpleNamespace(**{**vars(asyncio), "sleep": settlement_sleep}),
+            )
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                task = asyncio.create_task(consumer._ack(entry_id), name="test:terminal-xack")
+                try:
+                    await attempted.wait()
+                    if failure == "connection-error":
+                        # Sleep/backoff must happen after releasing the lock.
+                        async with asyncio.timeout(0.1), lease.settlement_lock:
+                            assert not task.done()
+                    await asyncio.wait_for(confirmed.wait(), timeout=1.25)
+                    await asyncio.wait_for(task, timeout=2.0)
+                    assert not lease.lost.is_set()
+                    assert lease.acknowledged.is_set()
+                    assert calls == (8 if failure == "connection-error" else 2)
+                    if failure == "connection-error":
+                        assert outage_until is not None and time.monotonic() >= outage_until
+                        assert retry_sleeps == [0.5, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0]
+                    assert cancelled.is_set() is (failure == "hung-call")
+                    assert (await h.async_redis.xpending(lease.stream, lease.group))["pending"] == 0
+                finally:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+
+    asyncio.run(go())
+
+
+def test_terminal_xack_stops_retrying_after_a_confirmed_lease_loss(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, _store, entry_id, fields = await _outage_delivery(h)
+            attempts = 0
+            failed = asyncio.Event()
+
+            async def unavailable(*_args: Any, **_kwargs: Any) -> Any:
+                nonlocal attempts
+                attempts += 1
+                failed.set()
+                raise redis.exceptions.ConnectionError("injected settlement outage")
+
+            monkeypatch.setattr(h.async_redis, "xack", unavailable)
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                task = asyncio.create_task(consumer._ack(entry_id))
+                try:
+                    await failed.wait()
+                    lease.lost.set()
+                    with pytest.raises(LeaseLostError):
+                        await asyncio.wait_for(task, timeout=0.75)
+                    assert attempts == 1
+                    assert not lease.acknowledged.is_set()
+                    assert (await h.async_redis.xpending(lease.stream, lease.group))["pending"] == 1
+                finally:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, LeaseLostError):
+                        await task
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("first_attempt", ["success", "transport-error", "lost-fence"])
+def test_expired_delivery_budget_allows_only_the_initial_fenced_terminal_ack(
+    make_harness, monkeypatch: pytest.MonkeyPatch, first_attempt: str
+) -> None:
+    """Exhaustion bars settlement retries while preserving the first fenced ACK."""
+
+    async def go() -> None:
+        async with make_harness(**_OUTAGE_KNOBS) as h:
+            consumer, _store, entry_id, fields = await _outage_delivery(h)
+            real_xack = h.async_redis.xack
+            attempts = 0
+
+            async def acknowledge(*args: Any, **kwargs: Any) -> Any:
+                nonlocal attempts
+                attempts += 1
+                if first_attempt == "transport-error":
+                    raise redis.exceptions.ConnectionError("injected first terminal ACK failure")
+                return await real_xack(*args, **kwargs)
+
+            monkeypatch.setattr(h.async_redis, "xack", acknowledge)
+            async with consumer._delivery_lease(entry_id, fields) as lease:
+                assert lease is not None
+                lease.budget = DeliveryBudget(
+                    deadline_ms=lease.budget.anchor_server_ms - 1,
+                    anchor_server_ms=lease.budget.anchor_server_ms,
+                    anchor_monotonic=time.monotonic(),
+                )
+                assert lease.remaining_s() <= 0
+                assert lease.local_deadline_monotonic > time.monotonic()
+                if first_attempt == "lost-fence":
+                    lease.lost.set()
+                    with pytest.raises(LeaseLostError):
+                        await consumer._ack(entry_id)
+                    assert attempts == 0
+                elif first_attempt == "transport-error":
+                    with pytest.raises(TimeoutError, match="delivery budget exhausted"):
+                        await consumer._ack(entry_id)
+                    assert attempts == 1, "an exhausted delivery retried its terminal ACK"
+                else:
+                    await consumer._ack(entry_id)
+                    assert attempts == 1
+                assert lease.acknowledged.is_set() is (first_attempt == "success")
+                pending = await h.async_redis.xpending(lease.stream, lease.group)
+                assert pending["pending"] == (0 if first_attempt == "success" else 1)
+
+    asyncio.run(go())
 
 
 @pytest.fixture
@@ -440,10 +981,10 @@ class _RenewalProbeStore:
         self.slow_completed = 0
         self._never = asyncio.Event()
 
-    async def publish(self, **kwargs: Any) -> None:
-        await self._delegate.publish(**kwargs)
+    async def publish(self, **kwargs: Any) -> str:
+        return await self._delegate.publish(**kwargs)
 
-    async def renew(self, **kwargs: Any) -> None:
+    async def renew(self, **kwargs: Any) -> bool:
         self.renew_calls += 1
         if self.renew_calls <= self._fail_renewals:
             raise redis.exceptions.ConnectionError("injected transient renewal failure")
@@ -454,7 +995,7 @@ class _RenewalProbeStore:
         if self._slow_renewal_s > 0:
             await asyncio.sleep(self._slow_renewal_s)
             self.slow_completed += 1
-        await self._delegate.renew(**kwargs)
+        return await self._delegate.renew(**kwargs)
 
     async def is_alive(self, **kwargs: Any) -> bool:
         return await self._delegate.is_alive(**kwargs)
@@ -3343,7 +3884,7 @@ def test_alive_restoration_resets_two_absence_proof(make_harness) -> None:
             )
             assert await consumer._prompt_reclaim_once() == 0
 
-            await store.renew(
+            await store.publish(
                 stream=h.config.stream,
                 group=h.config.consumer_group,
                 consumer="peer",
@@ -3533,6 +4074,9 @@ def test_transient_liveness_renewal_failure_recovers_before_lease_expiry(
             reclaim_min_idle_ms=300,
             consumer_heartbeat_ttl_ms=150,
             consumer_capability_ttl_ms=450,
+            # Normal cadence retries at 80ms before the 110ms local deadline;
+            # a TTL/3 cadence would put its retry exactly at the deadline.
+            delivery_lease_heartbeat_s=0.04,
             read_block_ms=10,
         ) as h:
             consumer = Consumer(
@@ -3565,8 +4109,9 @@ def test_timed_out_liveness_renewal_retries_before_lease_expiry(make_harness) ->
     async def go() -> None:
         async with make_harness(
             reclaim_min_idle_ms=300,
-            consumer_heartbeat_ttl_ms=150,
+            consumer_heartbeat_ttl_ms=450,
             consumer_capability_ttl_ms=450,
+            delivery_lease_heartbeat_s=0.1,
             read_block_ms=10,
         ) as h:
             consumer = Consumer(

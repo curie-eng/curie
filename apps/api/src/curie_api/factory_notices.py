@@ -148,8 +148,14 @@ _CAUSE_TEXT = {
         "pull request stays open."
     ),
     "ci_unverified": (
-        "the pull request's checks could not be read, so CI is unverified. The pull "
+        "the pull request's CI could not be verified, so the run did not complete. "
+        "The Reason line below says why. The pull "
         "request stays open; check it yourself."
+    ),
+    "merge_conflict": (
+        "the pull request has merge conflicts with its base branch, so GitHub ran "
+        "no pull request checks. The pull request stays open; resolve the conflicts "
+        "to continue."
     ),
     "ci_fix_unpublished": (
         "a CI fix round ended without pushing a fix. The pull request stays open."
@@ -158,7 +164,14 @@ _CAUSE_TEXT = {
 
 # Infrastructure and CI causes carry details, not a provider message.
 _DETAIL_CAUSES = frozenset(
-    {"sandbox_terminated", "ci_failed", "ci_timeout", "ci_unverified", "approval_create_failed"}
+    {
+        "sandbox_terminated",
+        "ci_failed",
+        "ci_timeout",
+        "ci_unverified",
+        "merge_conflict",
+        "approval_create_failed",
+    }
 )
 # A run that ended without publishing carries the agent's own last message
 # (#3128). That text is model-authored, so it renders inert inside a code fence.
@@ -470,12 +483,24 @@ def result_section(
         )
     else:
         sentence = cause_text(cause)
-        if cause == "owner_lost" and lost_streak == OWNER_LOST_RETRY_LIMIT:
+        prefix = "Could not complete: "
+        if (
+            cause == "approval_create_failed"
+            and detail is not None
+            and detail.startswith("publication snapshot could not be read")
+        ):
+            sentence = (
+                "Curie could not read the finished changes from the sandbox, so no pull request "
+                "was opened. This was an infrastructure failure, not a refusal of the change; "
+                "retry the run."
+            )
+        elif cause == "owner_lost" and lost_streak == OWNER_LOST_RETRY_LIMIT:
             sentence = (
                 "the worker running this request stopped responding "
                 f"{OWNER_LOST_RETRY_LIMIT} times."
             )
         elif cause == "owner_lost" and lost_retried and 1 <= lost_streak < OWNER_LOST_RETRY_LIMIT:
+            prefix = "Retrying: "
             sentence = (
                 "the worker running this request stopped responding. Curie started "
                 "the work again as a new run "
@@ -513,7 +538,7 @@ def result_section(
             # Curie writes this sentence (#4170), but it quotes the worker's
             # deferral reason: one line, and no HTML comment opener.
             sentence = _inert_line(detail)
-        text = f"Could not complete: {sentence}\n"
+        text = f"{prefix}{sentence}\n"
         if cause in _AGENT_MESSAGE_CAUSES and detail is not None and detail.strip():
             text += _agent_message_block(detail.strip())
         elif cause == "approval_create_failed" and detail is not None and detail.strip():
@@ -994,6 +1019,7 @@ async def _render(
 ) -> str:
     cause = row.terminal_cause or request.terminal_cause
     result: str | None = None
+    retrying = False
     if request.terminal_at is not None and cause:
         cause = cause.strip()
         # A completed issue run waits for its PR link before it is final.
@@ -1009,6 +1035,9 @@ async def _render(
                     session, work_item.id, through_sequence=request.sequence
                 )
                 retried = await owner_lost_successor_admitted(session, request)
+                retrying = (
+                    request.status == "failed" and retried and 1 <= streak < OWNER_LOST_RETRY_LIMIT
+                )
             result = result_section(
                 cause,
                 pr_url=pr_url,
@@ -1017,7 +1046,7 @@ async def _render(
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),
                 lost_streak=streak,
-                lost_retried=retried,
+                lost_retried=retrying,
             )
             # Tokens and estimated cost over every round of the work item
             # (#3223), after the Cause line so its parse is unchanged.
@@ -1044,7 +1073,7 @@ async def _render(
             )
         )
         view = phase_view(row.declaration, reports, request.status, cause)
-    pill_label, _color, _live = pill_for(request.status, publishing)
+    pill_label, _color, _live = pill_for(request.status, publishing, retrying=retrying)
     pending_count = await session.scalar(
         select(func.count(ExecutionRequest.id)).where(
             ExecutionRequest.work_item_id == work_item.id,

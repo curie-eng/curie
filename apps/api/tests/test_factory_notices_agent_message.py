@@ -160,6 +160,34 @@ def test_approval_create_snapshot_mismatch_renders_one_details_line() -> None:
     assert body.endswith("Cause: approval_create_failed\n")
 
 
+def test_approval_create_snapshot_read_failure_names_infrastructure_failure() -> None:
+    detail = (
+        "publication snapshot could not be read after 3 attempt(s): "
+        "/v1/snapshot returned an invalid bounded payload after 4096 bytes: "
+        "JSONDecodeError: incomplete JSON"
+    )
+    body = result_section("approval_create_failed", pr_url=None, detail=detail)
+
+    assert body == (
+        "Could not complete: Curie could not read the finished changes from the sandbox, "
+        "so no pull request was opened. This was an infrastructure failure, "
+        "not a refusal of the change; retry the run.\n"
+        f"Details: {detail}\n"
+        "Cause: approval_create_failed\n"
+    )
+    assert "was refused" not in body
+
+
+def test_approval_create_snapshot_validation_failure_keeps_the_refusal_sentence() -> None:
+    detail = "publication snapshot failed: workspace publication-validation failed: protected path"
+    body = result_section("approval_create_failed", pr_url=None, detail=detail)
+
+    assert body.startswith(f"Could not complete: {cause_text('approval_create_failed')}\n")
+    assert "was refused" in body
+    assert f"Details: {detail}\n" in body
+    assert body.endswith("Cause: approval_create_failed\n")
+
+
 def test_approval_create_refusal_with_hostile_characters_is_inert() -> None:
     refusal = (
         "publication.required_python_ci_unselected: path acme/a.py\n"
@@ -295,10 +323,10 @@ def test_a_spoofed_cause_line_cannot_end_the_section() -> None:
     assert "Cause: completed" in fenced
 
 
-
 def test_factory_notices_usage_limit_names_the_reset_remedy() -> None:
     body = result_section(
-        "model_usage_limited", pr_url=None,
+        "model_usage_limited",
+        pr_url=None,
         detail="You've hit your session limit · resets 3pm (UTC)",
     )
     assert "the model provider's usage limit for this credential was reached" in body
