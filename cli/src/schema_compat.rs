@@ -193,97 +193,88 @@ fn parse_metadata_object(value: &serde_json::Value) -> Result<TargetMetadata, St
         .map_err(|e| format!("schema compatibility metadata is invalid: {e}"))
 }
 
-/// Walk pending revisions from `live` (or empty-DB base) to `schema_head`.
-///
-/// Live walk follows the unique child (parent reverse). Live not in the graph
-/// is an incompatible refuse whose reason names the revision.
+/// Plan every target ancestor not already applied at the live revision.
+/// Merge revisions require the missing ancestors of every parent branch;
+/// following only one child or one parent would omit a sibling's migrations.
 pub fn pending_revisions(
     live: Option<&str>,
     target: &TargetMetadata,
 ) -> Result<Vec<PendingStep>, String> {
-    match live {
-        Some(current) => pending_from_live(current, target),
-        None => Ok(pending_from_empty(target)),
-    }
-}
-
-fn pending_from_empty(target: &TargetMetadata) -> Vec<PendingStep> {
     let by_id: BTreeMap<&str, &RevisionNode> = target
         .revisions
         .iter()
         .map(|node| (node.revision.as_str(), node))
         .collect();
-    let mut chain = Vec::new();
-    let mut current = Some(target.schema_head.as_str());
-    let mut seen = BTreeSet::new();
-    while let Some(rev) = current {
-        if !seen.insert(rev) {
-            break;
-        }
-        let Some(node) = by_id.get(rev) else {
-            break;
-        };
-        chain.push(PendingStep {
-            revision: node.revision.clone(),
-            kind: node.kind.clone(),
-        });
-        current = node
-            .parents
-            .first()
-            .map(String::as_str)
-            .filter(|parent| by_id.contains_key(parent));
-    }
-    chain.reverse();
-    chain
-}
-
-fn pending_from_live(live: &str, target: &TargetMetadata) -> Result<Vec<PendingStep>, String> {
-    let by_id: BTreeMap<&str, &RevisionNode> = target
-        .revisions
-        .iter()
-        .map(|node| (node.revision.as_str(), node))
-        .collect();
-    if !by_id.contains_key(live) {
+    if !by_id.contains_key(target.schema_head.as_str()) {
         return Err(format!(
-            "live database revision {live} is not in the target application's schema graph"
+            "target head {} is not in the target application's schema graph",
+            target.schema_head
         ));
     }
-    if live == target.schema_head {
-        return Ok(Vec::new());
-    }
-    let mut children: BTreeMap<&str, Vec<&RevisionNode>> = BTreeMap::new();
-    for node in &target.revisions {
-        for parent in &node.parents {
-            children.entry(parent.as_str()).or_default().push(node);
-        }
-    }
-    let mut pending = Vec::new();
-    let mut current = live;
-    let mut seen = BTreeSet::new();
-    while current != target.schema_head {
-        if !seen.insert(current) {
-            return Err(format!("schema graph cycle at revision {current}"));
-        }
-        let Some(nexts) = children.get(current) else {
+    let mut ordered = Vec::new();
+    let mut required = BTreeSet::new();
+    visit_ancestors(
+        &target.schema_head,
+        &by_id,
+        &mut required,
+        &mut BTreeSet::new(),
+        &mut ordered,
+    )?;
+    let mut applied = BTreeSet::new();
+    if let Some(current) = live {
+        let Some(node) = by_id.get(current) else {
             return Err(format!(
-                "live database revision {live} cannot reach target head {}",
-                target.schema_head
+                "live database revision {current} is not in the target application's schema graph"
             ));
         };
-        if nexts.len() != 1 {
+        if !required.contains(current) {
             return Err(format!(
-                "schema graph has {} children of revision {current}; expected a unique child",
-                nexts.len()
+                "live database revision {current} cannot reach target head {}",
+                target.schema_head
             ));
         }
-        let next = nexts[0];
-        pending.push(PendingStep {
-            revision: next.revision.clone(),
-            kind: next.kind.clone(),
-        });
-        current = next.revision.as_str();
+        visit_ancestors(
+            &node.revision,
+            &by_id,
+            &mut applied,
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        )?;
     }
-    Ok(pending)
+    Ok(ordered
+        .into_iter()
+        .filter(|node| !applied.contains(node.revision.as_str()))
+        .map(|node| PendingStep {
+            revision: node.revision.clone(),
+            kind: node.kind.clone(),
+        })
+        .collect())
+}
+
+fn visit_ancestors<'a>(
+    revision: &'a str,
+    by_id: &BTreeMap<&'a str, &'a RevisionNode>,
+    seen: &mut BTreeSet<&'a str>,
+    active: &mut BTreeSet<&'a str>,
+    ordered: &mut Vec<&'a RevisionNode>,
+) -> Result<(), String> {
+    if seen.contains(revision) {
+        return Ok(());
+    }
+    let Some(node) = by_id.get(revision) else {
+        // A retained metadata graph can start after its oldest parent.
+        return Ok(());
+    };
+    if !active.insert(revision) {
+        return Err(format!("schema graph cycle at revision {revision}"));
+    }
+    for parent in &node.parents {
+        visit_ancestors(parent, by_id, seen, active, ordered)?;
+    }
+    active.remove(revision);
+    seen.insert(revision);
+    ordered.push(node);
+    Ok(())
 }
 
 /// Pure planner: no database mutation. Matches Python `plan_upgrade`.
@@ -473,6 +464,68 @@ mod tests {
                 node("0017", Some("0016")),
             ],
         }
+    }
+
+    fn merged_target() -> TargetMetadata {
+        let mut merge = node("merge", Some("feature"));
+        merge.parents.push("stable".into());
+        let mut stable = node("stable", Some("base"));
+        stable.kind = KIND_CONTRACT.into();
+        TargetMetadata {
+            schema_min: "feature".into(),
+            schema_head: "merge".into(),
+            revisions: vec![
+                node("base", None),
+                node("feature", Some("base")),
+                stable,
+                merge,
+            ],
+        }
+    }
+
+    #[test]
+    fn merged_history_plans_missing_ancestors_from_both_branches_once() {
+        let target = merged_target();
+        for (live, expected) in [
+            (None, vec!["base", "feature", "stable", "merge"]),
+            (Some("base"), vec!["feature", "stable", "merge"]),
+            (Some("stable"), vec!["feature", "merge"]),
+            (Some("feature"), vec!["stable", "merge"]),
+            (Some("merge"), vec![]),
+        ] {
+            let pending = pending_revisions(live, &target).expect("both branches reach the merge");
+            assert_eq!(
+                pending
+                    .iter()
+                    .map(|step| step.revision.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "live revision {live:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_sibling_contract_is_a_forward_only_gate() {
+        let target = merged_target();
+        let pending = pending_revisions(Some("feature"), &target).expect("feature reaches merge");
+        let refused = plan_upgrade(Some("feature"), &target, &pending, false, None);
+        assert_eq!(refused.action, "refuse");
+        assert!(refused.reason.contains("stable"));
+        let accepted = plan_upgrade(Some("feature"), &target, &pending, true, None);
+        assert_eq!(accepted.action, "apply");
+        assert!(!accepted.rollback_compatible);
+    }
+
+    #[test]
+    fn merged_history_refuses_cycles_and_live_revisions_outside_target_ancestry() {
+        let mut target = merged_target();
+        target.revisions.push(node("unrelated", Some("base")));
+        let error = pending_revisions(Some("unrelated"), &target).expect_err("unrelated branch");
+        assert!(error.contains("cannot reach target head"));
+        target.revisions[0].parents.push("merge".into());
+        let error = pending_revisions(None, &target).expect_err("cyclic graph");
+        assert!(error.contains("cycle"));
     }
 
     #[test]

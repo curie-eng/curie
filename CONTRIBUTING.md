@@ -245,11 +245,16 @@ CURIE_E2E_TIERS=local-release curie dev e2e-ladder
 ```
 
 The schema window gate requires the candidate window to match the Alembic head
-and the API window in `apps/api/src/curie_api/schema_compat.json`. It also
-requires the chart version's window to match the candidate. If a migration
-lands after the chart version is registered in the architecture atlas, bump
-the chart and CLI to a new version first. While the version is unregistered,
-rerun `curie dev bump-version` after the migration to refresh its window.
+and the API window in `apps/api/src/curie_api/schema_compat.json`. After adding
+a migration, append it to `revisions` in `cli/src/application_schema_windows.json`,
+classify it in `apps/api/src/curie_api/revision_kinds.json`, and move the
+candidate to the new head. Then run
+`uv run python scripts/check-alembic-revisions.py --write-upgrade-metadata` to
+refresh the mirrors, followed by `uv run python scripts/check-schema-window.py`.
+Never change the version number or a released window for a migration. A
+released version's window must match its release tag, so fetch tags with
+`git fetch --tags origin` before running the gate. `curie dev bump-version`
+writes the version and its window at release.
 
 Tag v0.7.0 from `main` only after both commands pass. Only an administrator may
 retire `next`. Before deleting it, the administrator must merge one release

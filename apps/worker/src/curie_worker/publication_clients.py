@@ -108,13 +108,9 @@ class PublicationTranscriptClient:
         try:
             value = current.json()["value"]
         except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError(
-                "publication transcript response was unusable"
-            ) from exc
+            raise PublicationReconcileError("publication transcript response was unusable") from exc
         if not isinstance(value, list):
-            raise PublicationReconcileError(
-                "publication transcript is not an append-only log"
-            )
+            raise PublicationReconcileError("publication transcript is not an append-only log")
         return any(
             isinstance(existing, dict) and existing.get("publication_id") == marker
             for existing in value
@@ -164,9 +160,7 @@ class PublicationCredentialClient:
             clone_url = str(body["clone_url"])
             authorization = str(body["authorization_header"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise PublicationReconcileError(
-                "publication credential response was unusable"
-            ) from exc
+            raise PublicationReconcileError("publication credential response was unusable") from exc
         parsed = urlsplit(clone_url)
         if (
             parsed.scheme != "https"
@@ -231,9 +225,7 @@ class PublicationLineageClient:
                     "pr_url": pr_url,
                     "head_sha": head_sha,
                     "metadata_updated_at": (
-                        metadata_updated_at.isoformat()
-                        if metadata_updated_at is not None
-                        else None
+                        metadata_updated_at.isoformat() if metadata_updated_at is not None else None
                     ),
                 },
                 follow_redirects=False,
@@ -296,9 +288,7 @@ class GitHubPublicationLookup:
         authorization_header: str,
     ) -> PublicationPullState:
         if not authorization_header:
-            raise PublicationReconcileError(
-                "stored pull request lookup requires authorization"
-            )
+            raise PublicationReconcileError("stored pull request lookup requires authorization")
         if pr_number <= 0:
             raise PublicationReconcileError("stored pull request lookup is invalid")
         try:
@@ -411,7 +401,7 @@ class GitHubPublicationLookup:
             return None
         if response.status_code != 200:
             raise PublicationReconcileError(
-                f"GitHub branch lookup returned HTTP {response.status_code}"
+                f"GitHub branch lookup returned {self._response_error(response)}"
             )
         try:
             head_sha = str(response.json()["object"]["sha"])
@@ -477,8 +467,7 @@ class GitHubPublicationLookup:
             return None
         if ref_response.status_code != 200:
             raise PublicationReconcileError(
-                "GitHub deterministic branch lookup returned HTTP "
-                f"{ref_response.status_code}"
+                f"GitHub deterministic branch lookup returned {self._response_error(ref_response)}"
             )
         try:
             ref_head_sha = str(ref_response.json()["object"]["sha"])
@@ -533,8 +522,22 @@ class GitHubPublicationLookup:
         )
         if recovered is not None:
             return recovered
-        status = "unreachable" if created is None else f"HTTP {created.status_code}"
+        status = "unreachable" if created is None else self._response_error(created)
         raise PublicationReconcileError(f"GitHub pull request creation returned {status}")
+
+    @staticmethod
+    def _response_error(response: httpx.Response) -> str:
+        details = [f"HTTP {response.status_code}"]
+        request_id = response.headers.get("X-GitHub-Request-Id")
+        if request_id:
+            details.append(f"request id {request_id}")
+        try:
+            message = response.json().get("message")
+        except (ValueError, AttributeError):
+            message = None
+        if isinstance(message, str) and message.strip():
+            details.append(f"message: {message.strip()[:200]}")
+        return "; ".join(details)
 
     @staticmethod
     def _headers(authorization_header: str) -> dict[str, str]:
@@ -614,30 +617,20 @@ class GitHubPublicationLookup:
                 else None
             ),
             "head_sha": head.get("sha") if isinstance(head, dict) else None,
-            "base_ref": (
-                base_payload.get("ref") if isinstance(base_payload, dict) else None
-            ),
+            "base_ref": (base_payload.get("ref") if isinstance(base_payload, dict) else None),
             "base_repo": (
                 (base_payload.get("repo") or {}).get("full_name")
-                if isinstance(base_payload, dict)
-                and isinstance(base_payload.get("repo"), dict)
+                if isinstance(base_payload, dict) and isinstance(base_payload.get("repo"), dict)
                 else None
             ),
         }
 
         def same_repository(value: object, expected_value: object) -> bool:
-            return isinstance(value, str) and value.casefold() == str(
-                expected_value
-            ).casefold()
+            return isinstance(value, str) and value.casefold() == str(expected_value).casefold()
 
         repo_fields = ("head_repo", "base_repo")
-        if any(
-            not same_repository(actual[field], expected[field])
-            for field in repo_fields
-        ) or any(
-            actual[field] != expected[field]
-            for field in expected
-            if field not in repo_fields
+        if any(not same_repository(actual[field], expected[field]) for field in repo_fields) or any(
+            actual[field] != expected[field] for field in expected if field not in repo_fields
         ):
             raise PublicationReconcileError(
                 "GitHub pull request does not match the approved publication contract"

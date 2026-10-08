@@ -580,10 +580,8 @@ fn assert_short_pass(code: i32, shown: &str, second: bool, surface: &str) {
         assert_eq!(
             shown
                 .lines()
-                .filter(
-                    |line| line.contains("Reviewers run anthropic/claude-opus-5.5")
-                        && line.contains("5 USD")
-                )
+                .filter(|line| line.contains("Reviewers run openai/gpt-6.1-sol")
+                    && line.contains("5 USD"))
                 .count(),
             1,
             "{shown}"
@@ -1184,7 +1182,7 @@ fn low_openrouter_credit_warns_before_the_factory_deploys() {
     let warning = lines
         .iter()
         .position(|line| {
-            line.contains("OpenRouter credit left") && line.contains("anthropic/claude-opus-5.5")
+            line.contains("OpenRouter credit left") && line.contains("openai/gpt-6.1-sol")
         })
         .unwrap_or_else(|| panic!("no credit warning: {shown}"));
     let deploy = lines
@@ -1246,7 +1244,7 @@ fn factory_quickstart_direct_anthropic_credentials_select_native_sonnet_and_skip
         assert_eq!(ready["phase"], "ready");
         assert_eq!(ready["credit_remaining_usd"], Value::Null);
         // The settled display value remains the OpenRouter reviewer id.
-        assert_eq!(ready["reviewer_model"], "anthropic/claude-opus-5.5");
+        assert_eq!(ready["reviewer_model"], "openai/gpt-6.1-sol");
         let values: Value =
             serde_json::from_slice(&fs::read(fixture.dir.path().join("values")).unwrap()).unwrap();
         assert_eq!(
@@ -1344,10 +1342,7 @@ fn a_json_ready_object_names_the_reviewer_model_and_run_credit() {
     );
     let body: Value = serde_json::from_slice(&output.stdout).expect("one JSON object");
     assert_eq!(body["phase"], "ready", "{body}");
-    assert_eq!(
-        body["reviewer_model"], "anthropic/claude-opus-5.5",
-        "{body}"
-    );
+    assert_eq!(body["reviewer_model"], "openai/gpt-6.1-sol", "{body}");
     assert_eq!(body["run_credit_usd"], json!(5.0), "{body}");
     let remaining = body["credit_remaining_usd"]
         .as_f64()

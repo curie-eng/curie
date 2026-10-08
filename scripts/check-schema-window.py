@@ -1,7 +1,9 @@
 import argparse
 import ast
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -97,6 +99,48 @@ def _semantic_version_key(version: str) -> tuple[int, int, int, int, int] | None
         return None
     major, minor, patch, rc = match.groups()
     return int(major), int(minor), int(patch), int(rc is None), int(rc or 0)
+
+
+def _released_window(repo_root: Path, app_version: str) -> dict | None:
+    """Return ``windows[app_version]`` as recorded at the ``v<app_version>`` tag.
+
+    The release tag is the source because release tags are ancestors of main
+    and the architecture atlas does not record schema windows. None means the
+    tag is not readable, which happens between the release commit that
+    registers the atlas and the tag push, or in a clone without tags.
+    """
+    env = dict(os.environ)
+    # A non-git repo root must not resolve an enclosing repository.
+    env["GIT_CEILING_DIRECTORIES"] = str(repo_root.parent)
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo_root),
+                "show",
+                f"refs/tags/v{app_version}:cli/src/application_schema_windows.json",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        tagged: object = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(tagged, dict):
+        return None
+    tagged_windows = tagged.get("windows")
+    if not isinstance(tagged_windows, dict):
+        return None
+    window = tagged_windows.get(app_version)
+    return window if isinstance(window, dict) else None
 
 
 def main() -> int:
@@ -257,13 +301,26 @@ def main() -> int:
         for item in atlas_versions
     ):
         return _fail("architecture atlas versions manifest is malformed")
-    if chart_min != schema_min or chart_head != schema_head:
-        if any(item["id"] == f"v{app_version}" for item in atlas_versions):
+    released = any(item["id"] == f"v{app_version}" for item in atlas_versions)
+    tagged_window = _released_window(repo_root, app_version) if released else None
+    matches_candidate = chart_min == schema_min and chart_head == schema_head
+    if tagged_window is not None:
+        # A released window is immutable; only the candidate may move.
+        if chart_window != tagged_window:
             return _fail(
-                f"windows[{app_version!r}] differs from candidate; "
-                "the chart appVersion is registered in the architecture atlas, "
-                "so bump to the next version"
+                f"windows[{app_version!r}] differs from its v{app_version} "
+                "release tag; a released window is immutable, so move only "
+                "the candidate"
             )
+    elif released and not matches_candidate:
+        # The release commit registers the atlas before the tag is pushed,
+        # and the window still equals the candidate in that interval.
+        return _fail(
+            f"windows[{app_version!r}] differs from candidate and the "
+            f"v{app_version} release tag is not readable; "
+            "run git fetch --tags origin"
+        )
+    elif not matches_candidate:
         return _fail(
             f"windows[{app_version!r}] differs from candidate; "
             f"rerun curie dev bump-version {app_version} for the same version"

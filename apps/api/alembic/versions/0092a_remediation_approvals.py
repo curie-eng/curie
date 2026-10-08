@@ -1,7 +1,7 @@
 """Remediation approval requests (AUTOMATED-REMEDIATION-15)
 
-Revision ID: 0092
-Revises: 0091
+Revision ID: 0092a
+Revises: 0091a
 Create Date: 2026-10-07
 
 Hand-written and additive (ADR 0117 found autogenerate unsafe against the
@@ -33,8 +33,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0092"
-down_revision: str | None = "0091"
+revision: str = "0092a"
+down_revision: str | None = "0091a"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

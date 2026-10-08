@@ -495,9 +495,7 @@ async def _prepare_thread_attachments(
     deadline_epoch = clock.time.time() + budget
     try:
         async with asyncio.timeout(budget):
-            ledger_refs = tuple(
-                await ledger.query(agent_id=str(agent_id), thread_key=thread_key)
-            )
+            ledger_refs = tuple(await ledger.query(agent_id=str(agent_id), thread_key=thread_key))
     except LedgerNotDeployed:
         # Mixed rollout: the API does not serve the ledger yet. Behave exactly
         # as a worker with no ledger wired: this message's files only, and no
@@ -573,9 +571,7 @@ async def _prepare_boot_thread_set(
     ledger_unavailable = False
     try:
         async with asyncio.timeout(budget):
-            ledger_refs = tuple(
-                await ledger.query(agent_id=str(agent_id), thread_key=thread_key)
-            )
+            ledger_refs = tuple(await ledger.query(agent_id=str(agent_id), thread_key=thread_key))
     except LedgerNotDeployed:
         # Mixed rollout: no ledger yet, so the boot is exactly today's.
         logger.warning(
@@ -587,8 +583,7 @@ async def _prepare_boot_thread_set(
     except Exception as exc:  # noqa: BLE001 - a text boot proceeds without earlier files
         ledger_unavailable = True
         logger.warning(
-            "thread attachment ledger read failed for thread %s; booting without "
-            "earlier files: %s",
+            "thread attachment ledger read failed for thread %s; booting without earlier files: %s",
             thread_key,
             redact_text(failures._exception_reason(exc))[: constants._ESCALATION_DETAIL_MAX],
         )

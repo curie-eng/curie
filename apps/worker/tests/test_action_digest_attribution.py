@@ -511,7 +511,7 @@ async def test_completing_an_action_this_wrapper_never_opened_records_null() -> 
     assert len(apps.reads) <= 1
 
 
-async def test_a_ledger_failure_still_propagates() -> None:
+async def test_a_ledger_failure_still_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
     """Swallowing digest failures is not swallowing the ledger.
 
     The kernel's ``_record_action`` is deliberately not best effort: losing the
@@ -519,9 +519,25 @@ async def test_a_ledger_failure_still_propagates() -> None:
     a success.
     """
 
+    from curie_worker import api_retry
+
+    now = 0.0
+
+    async def sleep(delay: float) -> None:
+        nonlocal now
+        now += delay
+
+    monkeypatch.setattr(api_retry, "_clock", lambda: now)
+    monkeypatch.setattr(api_retry, "_sleep", sleep)
     apps = FakeAppsV1Api(deployment(), deployment())
+    ledger = Ledger(fail_complete=True)
     with pytest.raises(ActionBackendError):
-        await _round_trip(apps, ledger=Ledger(fail_complete=True))
+        await _round_trip(apps, ledger=ledger)
+    completions = [post["body"] for post in ledger.posts if post["path"].endswith("/complete")]
+    assert len(completions) > 1
+    assert all(body == completions[0] for body in completions)
+    assert _attributed(completions[0]) == (CONNECTOR, DIGEST)
+    assert now == pytest.approx(120.0, abs=0.1)
 
 
 # -- the time bound -----------------------------------------------------------

@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from curie_telemetry.redact import redact_text
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,6 +71,8 @@ IN_FLIGHT_PUBLICATION = ("pending", "approved", "launching", "running")
 _UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop"})
 # Longest provider message a factory notice keeps (#3073).
 _NOTICE_DETAIL_MAX = 1200
+# Consecutive owner_lost requests a WorkItem runs before a person is needed (ADR 0206).
+OWNER_LOST_RETRY_LIMIT = 3
 
 _NO_READMIT: dict[str, Any] = {
     "readmit_request_id": None,
@@ -286,7 +288,7 @@ def _notice_detail(detail: str | None) -> str | None:
     return text or None
 
 
-async def _settle_terminal(
+async def settle_terminal(
     session: AsyncSession,
     work_item: WorkItem,
     request: ExecutionRequest,
@@ -296,21 +298,23 @@ async def _settle_terminal(
     """Stage everything a terminal request owes in its own transaction.
 
     That is the factory comment and, per ADR-0170, deleting the thread's
-    transcript: a terminal WorkItem's history is not resumed again.
+    transcript: a terminal WorkItem's history is not resumed again. A queued
+    revision, an active request (an owner_lost successor, ADR 0206) or a
+    pending relabel continues the WorkItem, so its transcript survives.
     """
 
     if request.terminal_at is None:
         return
     await _queue_notice(session, work_item, request, detail=detail)
-    pending = await session.scalar(
+    continuing = await session.scalar(
         select(ExecutionRequest.id)
         .where(
             ExecutionRequest.work_item_id == work_item.id,
-            ExecutionRequest.status == "queued",
+            ExecutionRequest.status.in_(("queued", *_ACTIVE_STATUSES)),
         )
         .limit(1)
     )
-    if pending is None and work_item.readmit_request_id is None:
+    if continuing is None and work_item.readmit_request_id is None:
         await transcripts.expire_for_work_item(session, work_item)
 
 
@@ -355,12 +359,26 @@ async def _opened_pull_request(
     return succeeded is not None
 
 
-async def _publication_owns_terminus(session: AsyncSession, work_item: WorkItem) -> bool:
+async def _publication_owns_terminus(
+    session: AsyncSession, work_item: WorkItem, request: ExecutionRequest
+) -> bool:
+    """Whether a publication can still settle this request (#4158).
+
+    This request's own publication, in any status, or one still in flight on
+    the work item's lineage or conversation, owns the terminus. An earlier
+    request's settled publication on the same lineage does not.
+    """
+    scope = Publication.workspace_conversation_id == work_item.conversation_id
     if work_item.publication_lineage_id is not None:
-        return True
+        scope = or_(scope, Publication.lineage_id == work_item.publication_lineage_id)
     found = await session.scalar(
         select(Publication.id)
-        .where(Publication.workspace_conversation_id == work_item.conversation_id)
+        .where(
+            or_(
+                Publication.execution_request_id == request.id,
+                and_(scope, Publication.status.in_(IN_FLIGHT_PUBLICATION)),
+            )
+        )
         .limit(1)
     )
     return found is not None
@@ -510,6 +528,62 @@ async def create_or_get_work_item(
     return await outcome(session, work_item, None, replayed=inserted_id is None)
 
 
+async def _insert_waiting_request(
+    session: AsyncSession,
+    work_item: WorkItem,
+    *,
+    request_id: uuid.UUID,
+    wait_deadline: datetime,
+    expected_work_item_version: int,
+    columns: Mapping[str, Any] | None = None,
+) -> bool:
+    """Allocate the next sequence and insert a waiting request; the caller commits.
+
+    False when the WorkItem moved past ``expected_work_item_version`` or was
+    cancelled. An ``IntegrityError`` leaves the savepoint rolled back.
+    """
+
+    sequence = work_item.next_sequence
+    async with session.begin_nested():
+        changed_id: uuid.UUID | None = await session.scalar(
+            update(WorkItem)
+            .where(
+                WorkItem.id == work_item.id,
+                WorkItem.version == expected_work_item_version,
+                WorkItem.cancelled_at.is_(None),
+            )
+            .values(
+                version=WorkItem.version + 1,
+                next_sequence=WorkItem.next_sequence + 1,
+                updated_at=func.clock_timestamp(),
+            )
+            .returning(WorkItem.id)
+        )
+        if changed_id is None:
+            return False
+        session.add(
+            ExecutionRequest(
+                id=request_id,
+                work_item_id=work_item.id,
+                sequence=sequence,
+                status="waiting",
+                wait_deadline=wait_deadline,
+                version=1,
+                **(columns or {}),
+            )
+        )
+        # The live status comment's row exists from admission (#3077).
+        session.add(
+            FactoryStatusComment(
+                execution_request_id=request_id,
+                work_item_id=work_item.id,
+                applied_label=None,
+            )
+        )
+        await session.flush()
+    return True
+
+
 async def create_execution_request(
     session: AsyncSession,
     *,
@@ -538,44 +612,14 @@ async def create_execution_request(
     if active is not None:
         return await _conflict(session, "active_request", work_item=work_item, request=active)
 
-    sequence = work_item.next_sequence
-    allocation_changed = False
     try:
-        async with session.begin_nested():
-            changed_id: uuid.UUID | None = await session.scalar(
-                update(WorkItem)
-                .where(
-                    WorkItem.id == work_item_id,
-                    WorkItem.version == expected_work_item_version,
-                    WorkItem.cancelled_at.is_(None),
-                )
-                .values(
-                    version=WorkItem.version + 1,
-                    next_sequence=WorkItem.next_sequence + 1,
-                    updated_at=func.clock_timestamp(),
-                )
-                .returning(WorkItem.id)
-            )
-            allocation_changed = changed_id is not None
-            if allocation_changed:
-                request = ExecutionRequest(
-                    id=request_id,
-                    work_item_id=work_item_id,
-                    sequence=sequence,
-                    status="waiting",
-                    wait_deadline=wait_deadline,
-                    version=1,
-                )
-                session.add(request)
-                # The live status comment's row exists from admission (#3077).
-                session.add(
-                    FactoryStatusComment(
-                        execution_request_id=request_id,
-                        work_item_id=work_item_id,
-                        applied_label=None,
-                    )
-                )
-                await session.flush()
+        allocation_changed = await _insert_waiting_request(
+            session,
+            work_item,
+            request_id=request_id,
+            wait_deadline=wait_deadline,
+            expected_work_item_version=expected_work_item_version,
+        )
     except IntegrityError:
         work_item = await reload_work_item(session, work_item_id)
         existing = await lock_request_by_id(session, request_id)
@@ -686,6 +730,31 @@ async def create_revision_request(
     return await outcome(session, work_item, request)
 
 
+async def _lineage_closed_for(
+    session: AsyncSession, work_item: WorkItem, objective: str | None
+) -> bool:
+    """Whether ``objective`` targets a pull request the WorkItem no longer has open.
+
+    The lineage must exist, be open, and carry that pull request's number.
+    """
+
+    if objective is None:
+        return False
+    target = parse_reply_target(
+        objective,
+        repo_full_name=work_item.repo_full_name,
+        clone_base=get_settings().github_clone_base,
+    )
+    if target.pr_number is None:
+        return False
+    lineage = (
+        await session.get(ThreadPublicationLineage, work_item.publication_lineage_id)
+        if work_item.publication_lineage_id is not None
+        else None
+    )
+    return lineage is None or lineage.status != "open" or lineage.pr_number != target.pr_number
+
+
 async def admit_next_revision(
     session: AsyncSession,
     *,
@@ -719,22 +788,8 @@ async def admit_next_revision(
     cause: str | None = None
     if work_item.cancelled_at is not None:
         cause = "issue_cancelled"
-    elif request.objective is not None:
-        target = parse_reply_target(
-            request.objective,
-            repo_full_name=work_item.repo_full_name,
-            clone_base=get_settings().github_clone_base,
-        )
-        if target.pr_number is not None:
-            lineage = await session.get(
-                ThreadPublicationLineage, work_item.publication_lineage_id
-            ) if work_item.publication_lineage_id is not None else None
-            if (
-                lineage is None
-                or lineage.status != "open"
-                or lineage.pr_number != target.pr_number
-            ):
-                cause = "lineage_closed"
+    elif await _lineage_closed_for(session, work_item, request.objective):
+        cause = "lineage_closed"
     if cause is not None:
         status = "cancelled"
         values: dict[str, Any] = {"terminal_at": now, "terminal_cause": cause}
@@ -763,7 +818,7 @@ async def admit_next_revision(
     work_item = await reload_work_item(session, work_item_id)
     request = await reload_request(session, request.id)
     if cause is not None:
-        await _settle_terminal(session, work_item, request, detail=None)
+        await settle_terminal(session, work_item, request, detail=None)
     return await outcome(session, work_item, request)
 
 
@@ -946,7 +1001,7 @@ async def expire_waiting(
         request = await reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await reload_request(session, request_id)
-    await _settle_terminal(session, work_item, request, detail=None)
+    await settle_terminal(session, work_item, request, detail=None)
     return await outcome(session, work_item, request)
 
 
@@ -1140,7 +1195,7 @@ async def terminalize_execution(
     # The CI gate's causes (#3097) end a request whose pull request already
     # opened, so they share the opened-PR deadline exception. Keep this literal
     # equal to ``factory_ci.CI_CAUSES`` (importing it here would be circular).
-    ci_cause = cause.strip() in {"ci_failed", "ci_timeout", "ci_unverified"}
+    ci_cause = cause.strip() in {"ci_failed", "ci_timeout", "ci_unverified", "merge_conflict"}
     opened = (status == "completed" or ci_cause) and await _opened_pull_request(
         session, work_item, request
     )
@@ -1190,7 +1245,7 @@ async def terminalize_execution(
                 session, "publication_pending", work_item=work_item, request=request
             )
     if status == "failed" and cause.strip() in _UNPUBLISHED_CAUSES:
-        if await _publication_owns_terminus(session, work_item):
+        if await _publication_owns_terminus(session, work_item, request):
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
@@ -1248,7 +1303,7 @@ async def terminalize_execution(
             )
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await reload_request(session, request_id)
-    await _settle_terminal(session, work_item, request, detail=detail)
+    await settle_terminal(session, work_item, request, detail=detail)
     return await outcome(session, work_item, request)
 
 
@@ -1500,7 +1555,7 @@ async def request_cancellation(
             )
         )
         active = await reload_request(session, active.id)
-        await _settle_terminal(session, work_item, active, detail=None)
+        await settle_terminal(session, work_item, active, detail=None)
     elif active is not None and active.status == "running":
         await session.execute(
             update(ExecutionRequest)
@@ -1627,7 +1682,7 @@ async def readmit(
     if active is not None:
         # Superseded, not stopped: the new request speaks for the issue. The
         # old run's status comment is still finalized, with the superseded
-        # text. Not _settle_terminal: the WorkItem continues, so its
+        # text. Not settle_terminal: the WorkItem continues, so its
         # transcript must survive.
         await session.execute(
             update(ExecutionRequest)
@@ -1816,7 +1871,7 @@ async def settle_overdue_cancellation(
         request = await reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await reload_request(session, request_id)
-    await _settle_terminal(session, work_item, request, detail=None)
+    await settle_terminal(session, work_item, request, detail=None)
     return await outcome(session, work_item, request)
 
 
@@ -1921,7 +1976,7 @@ async def request_owner_lost_cancellation(
     ttl = timedelta(seconds=get_settings().work_item_runtime_ttl_seconds)
     heartbeat_lapsed = (
         request.runtime_heartbeat_expires_at is not None
-        and request.runtime_heartbeat_expires_at <= now
+        and request.runtime_heartbeat_expires_at + ttl <= now
     )
     owner_absent = (
         request.runtime_owner is None
@@ -1957,7 +2012,7 @@ async def request_owner_lost_cancellation(
                     ExecutionRequest.runtime_heartbeat_expires_at.is_not(None)
                     & (
                         ExecutionRequest.runtime_heartbeat_expires_at
-                        <= func.clock_timestamp()
+                        <= func.clock_timestamp() - ttl
                     )
                 )
                 | (
@@ -2086,8 +2141,107 @@ async def record_runtime_termination_where(
         request = await reload_request(session, request_id)
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     request = await reload_request(session, request_id)
-    await _settle_terminal(session, work_item, request, detail=None)
+    # Before settlement, so the successor keeps the transcript (ADR 0206).
+    if await _admit_owner_lost_successor(session, work_item, request):
+        work_item = await reload_work_item(session, work_item_id)
+    await settle_terminal(session, work_item, request, detail=None)
     return await outcome(session, work_item, request)
+
+
+async def owner_lost_streak(
+    session: AsyncSession,
+    work_item_id: uuid.UUID,
+    *,
+    through_sequence: int | None = None,
+) -> int:
+    """Consecutive owner_lost terminals on a WorkItem, newest first (ADR 0206).
+
+    Requests that have not ended, such as a queued revision, are skipped.
+    ``through_sequence`` counts back from that request instead of the newest.
+    """
+
+    query = (
+        select(ExecutionRequest.terminal_cause)
+        .where(
+            ExecutionRequest.work_item_id == work_item_id,
+            ExecutionRequest.terminal_at.is_not(None),
+        )
+        .order_by(ExecutionRequest.sequence.desc())
+    )
+    if through_sequence is not None:
+        query = query.where(ExecutionRequest.sequence <= through_sequence)
+    streak = 0
+    for cause in await session.scalars(query):
+        if cause != "owner_lost":
+            break
+        streak += 1
+    return streak
+
+
+async def owner_lost_successor_admitted(session: AsyncSession, request: ExecutionRequest) -> bool:
+    """Whether settling this owner_lost request admitted its successor.
+
+    The successor is inserted in the settling transaction, so its created_at
+    (that transaction's start) is not after the request's terminal_at. A later
+    loss's successor is created in a later transaction.
+    """
+
+    if request.terminal_at is None:
+        return False
+    found = await session.scalar(
+        select(ExecutionRequest.id)
+        .where(
+            ExecutionRequest.work_item_id == request.work_item_id,
+            ExecutionRequest.sequence > request.sequence,
+            ExecutionRequest.owner_lost_retry.is_(True),
+            ExecutionRequest.created_at <= request.terminal_at,
+        )
+        .limit(1)
+    )
+    return found is not None
+
+
+async def _admit_owner_lost_successor(
+    session: AsyncSession, work_item: WorkItem, lost: ExecutionRequest
+) -> bool:
+    """Admit a new waiting request for work its lost owner took down (ADR 0206).
+
+    Call with the WorkItem locked, after ``lost`` settled failed/owner_lost and
+    in the same transaction. The successor re-runs the lost request's snapshot
+    on the WorkItem's recorded base. A cancelled WorkItem, a pending relabel, a
+    closed pull request lineage, a request waiting on its publication, or the
+    third loss in a row admits nothing.
+    """
+
+    if (
+        lost.status != "failed"
+        or lost.terminal_cause != "owner_lost"
+        or work_item.cancelled_at is not None
+        or work_item.readmit_request_id is not None
+        or await _publication_owns_terminus(session, work_item, lost)
+        or await _lineage_closed_for(session, work_item, lost.objective)
+        or await owner_lost_streak(session, work_item.id) >= OWNER_LOST_RETRY_LIMIT
+    ):
+        return False
+    budget = timedelta(seconds=get_settings().work_item_wait_budget_seconds)
+    admitted = await _insert_waiting_request(
+        session,
+        work_item,
+        request_id=uuid.uuid4(),
+        wait_deadline=await database_now(session) + budget,
+        expected_work_item_version=work_item.version,
+        columns={
+            "owner_lost_retry": True,
+            "objective": lost.objective,
+            "requester": lost.requester,
+            "reply_kind": lost.reply_kind,
+            "reply_address": lost.reply_address,
+            "reply_conversation_id": lost.reply_conversation_id,
+        },
+    )
+    # The WorkItem is locked and was checked above, so its version holds.
+    assert admitted
+    return True
 
 
 async def _confirm_settled_teardown(

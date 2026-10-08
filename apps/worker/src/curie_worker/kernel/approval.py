@@ -712,9 +712,7 @@ async def _pause_for_approval(
             if outcome.publication_snapshot_error is not None:
                 # #4121: carry the message as the refusal so the factory run
                 # shows why the snapshot failed, not only the cause.
-                snapshot_failure = (
-                    f"publication snapshot failed: {outcome.publication_snapshot_error}"
-                )
+                snapshot_failure = outcome.publication_snapshot_error
                 raise ApprovalBackendError(snapshot_failure, refusal=snapshot_failure)
             if deployment_id is None or snapshot is None:
                 raise ApprovalBackendError(
@@ -781,7 +779,8 @@ async def _pause_for_approval(
                     observed_lineage_version=(
                         observation.lineage_version if observation is not None else None
                     ),
-                )
+                ),
+                budget_s=routing._api_write_budget_s(),
             )
             created = CreatedApproval(
                 id=published.approval_id,
@@ -827,7 +826,8 @@ async def _pause_for_approval(
                     granted_tool=outcome.approval_granted_tool,
                     granted_arguments=outcome.approval_granted_arguments,
                     expires_in_seconds=constants._SESSION_APPROVAL_EXPIRES_IN_SECONDS,
-                )
+                ),
+                budget_s=routing._api_write_budget_s(),
             )
     except WorkspaceSelectionRefused as exc:
         logger.info(
@@ -858,6 +858,10 @@ async def _pause_for_approval(
         # not constrain. The API rejected these with a 422 before the model
         # was shared, which surfaced here as ApprovalBackendError; both still
         # escalate to a human rather than stranding the turn.
+        refusal = exc.refusal if isinstance(exc, ApprovalBackendError) else None
+        if refusal is not None and refusal.startswith("publication.work_item_cancelled:"):
+            logger.info("approval create refused for cancelled work item %s", qevent.event_id)
+            return _ApprovalPause.refused(refusal)
         logger.warning("approval create failed for %s: %s", qevent.event_id, exc)
         await self._escalate(
             qevent,
@@ -866,7 +870,6 @@ async def _pause_for_approval(
             "not be created; flagging for a human instead of pausing.",
             failure_class="approval-create-failed",
         )
-        refusal = exc.refusal if isinstance(exc, ApprovalBackendError) else None
         return _ApprovalPause.refused(refusal)
 
     progress_plan = constants._TURN_PROGRESS.get()

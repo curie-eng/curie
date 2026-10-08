@@ -118,6 +118,8 @@ async def _complete(
         (parsed is not None and parsed.is_ci_fix) or self._is_approval_resume(qevent.event_id)
     ):
         run = self._run_for_event(qevent.event_id)
+    if run is not None and run.request_id in self._settling_work_items:
+        run = None
     if run is not None and run.started and not run.finished:
         try:
             if outcome == "awaiting-approval":
@@ -138,13 +140,18 @@ async def _complete(
             elif outcome == "delivered":
                 ci_fix = parsed is not None and parsed.is_ci_fix
                 if ci_fix:
-                    cause = "ci_fix_unpublished"
+                    cause = (
+                        "runner_escalated"
+                        if turn is not None and turn.start_failed
+                        else "ci_fix_unpublished"
+                    )
                 elif turn is None or self._is_approval_resume(qevent.event_id):
                     cause = "no_pull_request"
                 else:
                     cause = failures._unpublished_cause(turn.tools_called)
                 try:
-                    await run.finish(
+                    await self._finish_or_settle(
+                        run,
                         outcome="failed",
                         cause=cause,
                         detail=(
@@ -161,13 +168,16 @@ async def _complete(
                     # the stored patch, not the sandbox.
                     run.finished = True
             elif outcome == "escalated":
-                await run.finish(
+                await self._finish_or_settle(
+                    run,
                     outcome="failed",
                     cause=failures._escalation_cause(turn),
                     detail=turn.error_message if turn is not None else None,
                 )
             else:
-                await run.finish(outcome="failed", cause="runner_failed", detail=None)
+                await self._finish_or_settle(
+                    run, outcome="failed", cause="runner_failed", detail=None
+                )
         except WorkItemConflict as exc:
             logger.warning(
                 "work-item finish refused for %s: %s; writing no marker",

@@ -101,6 +101,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "ci_failed",
         "ci_timeout",
         "ci_unverified",
+        "merge_conflict",
         "ci_fix_unpublished",
     ],
 )
@@ -151,7 +152,7 @@ def test_ci_failed_notice_labels_its_details_not_a_provider_message() -> None:
 def test_ci_unverified_notice_says_it_is_not_a_success() -> None:
     body = result_section("ci_unverified", pr_url=None, detail="Reason: github_forbidden")
     assert body.startswith("Could not complete:")
-    assert "unverified" in body.splitlines()[0]
+    assert "CI could not be verified" in body.splitlines()[0]
     assert "Reason: github_forbidden" in body
     assert "Completed:" not in body
 
@@ -298,13 +299,19 @@ class _GitHubComments(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
-    def _send(self, status: int, payload: object) -> None:
+    def _send(self, status: int, payload: object, *, headers: dict[str, str] | None = None) -> None:
         body = payload.encode() if isinstance(payload, str) else json.dumps(payload).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Cancelling a lifespan task can abandon an in-flight HTTP read.
+            return
 
     def _payload(self) -> Any:
         length = int(self.headers.get("Content-Length", "0"))
@@ -318,12 +325,57 @@ class _GitHubComments(BaseHTTPRequestHandler):
         if self._ci_get(server, path):
             return
         server.requests.append(("GET", path, None))
+        barrier = server.get_barrier
+        if barrier is not None and path == barrier[0]:
+            # The HTTP fake waits on the test's event loop, keeping real HTTP
+            # and database operations in flight until the test releases it.
+            server.get_barrier = None
+            _, loop, entered, released = barrier
+            loop.call_soon_threadsafe(entered.set)
+            asyncio.run_coroutine_threadsafe(released.wait(), loop).result(timeout=15)
+        label = _LABELS.match(path)
+        if label is not None and label.group(2) is None:
+            # List labels for an issue:
+            # https://docs.github.com/en/rest/issues/labels#list-labels-for-an-issue
+            # Pagination uses the provider's Link relation:
+            # https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api
+            number = int(label.group(1))
+            params = parse_qs(parsed.query)
+            page = int(params.get("page", ["1"])[0])
+            per_page = int(params.get("per_page", ["30"])[0])
+            server.label_pages.append((number, page))
+            status = server.label_page_statuses.get((number, page), 200)
+            if status != 200:
+                self._send(status, {"message": "injected label list refusal"})
+                return
+            names = sorted(server.issue_labels.get(number, set()))
+            start = (page - 1) * per_page
+            headers = {}
+            if start + per_page < len(names):
+                host, port = server.server_address
+                next_page = f"http://{host}:{port}{path}?per_page={per_page}&page={page + 1}"
+                headers["Link"] = f'<{next_page}>; rel="next"'
+            self._send(
+                200,
+                [{"name": value} for value in names[start : start + per_page]],
+                headers=headers,
+            )
+            return
         subject = _ISSUE_OR_PR.match(path)
         if subject is not None:
             number = int(subject.group(1))
+            payload: dict[str, Any] = {
+                "number": number, "title": server.titles.get(number, f"Issue {number}")
+            }
+            if "/pulls/" in path:
+                # GitHub computes mergeability asynchronously and returns null:
+                # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+                index = min(len(server.pull_observations), len(server.pull_script) - 1)
+                server.pull_observations.append(number)
+                payload.update(server.pull_script[index])
             self._send(
                 200,
-                {"number": number, "title": server.titles.get(number, f"Issue {number}")},
+                payload,
             )
             return
         single = _COMMENT.match(path)
@@ -443,9 +495,7 @@ class _GitHubComments(BaseHTTPRequestHandler):
                 server.lost_response_paths.discard(path)
                 self.close_connection = True
                 return
-            status = (
-                server.rerun_statuses.pop(0) if server.rerun_statuses else server.rerun_status
-            )
+            status = server.rerun_statuses.pop(0) if server.rerun_statuses else server.rerun_status
             self._send(status, {} if status == 201 else {"message": "refused"})
             return
         server.requests.append(("POST", path, payload.get("body", "")))
@@ -499,6 +549,12 @@ class _CommentServer(ThreadingHTTPServer):
         self.ci_scripts: dict[str, list[CiEntry]] = {}
         self.ci_cursor: dict[str, int] = {}
         self.ci_observations: list[str] = []
+        # #4263. Pull reads default to a mergeable head; scripts can replay the
+        # provider's null computation window or a dirty head without checks.
+        self.pull_script: list[dict[str, Any]] = [
+            {"mergeable": True, "mergeable_state": "clean", "merged": False}
+        ]
+        self.pull_observations: list[int] = []
         self.annotations: dict[int, list[dict[str, Any]]] = {}
         # #4105. Branch name -> the sha it points to; empty means every base read 404s.
         self.branches: dict[str, str] = {}
@@ -511,8 +567,13 @@ class _CommentServer(ThreadingHTTPServer):
         self.patch_statuses: list[int] = []
         # Issue number -> label names currently on it.
         self.issue_labels: dict[int, set[str]] = {}
+        self.label_pages: list[tuple[int, int]] = []
+        self.label_page_statuses: dict[tuple[int, int], int] = {}
         # Issue or pull request number -> title the subject read returns.
         self.titles: dict[int, str] = {}
+        self.get_barrier: (
+            tuple[str, asyncio.AbstractEventLoop, asyncio.Event, asyncio.Event] | None
+        ) = None
 
     def find(self, comment_id: int) -> dict[str, Any] | None:
         for comment in self.comments:
@@ -688,6 +749,7 @@ def _reconcile() -> None:
         reconciler = WorkItemReconciler(maker, client, get_settings())
         try:
             await reconciler.run_once()
+            await reconciler._sync_status_comments()
         finally:
             await client.aclose()
             await engine.dispose()
@@ -954,9 +1016,7 @@ def test_an_unpublished_finish_comments_the_agents_redacted_last_message(
 
 
 @pytest.mark.parametrize("cause", ["early_stop", "approval_create_failed"])
-def test_an_early_stop_finish_defers_to_an_in_flight_publication(
-    admitted: Any, cause: str
-) -> None:
+def test_an_early_stop_finish_defers_to_an_in_flight_publication(admitted: Any, cause: str) -> None:
     """#3128: like ``no_pull_request``, publication owns the terminus."""
 
     client, github, sink = admitted
@@ -976,6 +1036,142 @@ def test_an_early_stop_finish_defers_to_an_in_flight_publication(
             "detail": "stopping",
         },
     )
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    assert _request(number)["status"] == "running"
+
+
+def _requests(number: int) -> list[dict[str, Any]]:
+    return _rows(
+        "SELECT r.id, r.status, r.terminal_cause, w.id AS work_item_id "
+        "FROM curie.execution_requests r "
+        "JOIN curie.work_items w ON w.id = r.work_item_id "
+        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "ORDER BY r.created_at",
+        {"repo": REPO_ID, "number": number},
+    )
+
+
+def _relabelled_after_publication(client: Any, github: GitHubAPI, number: int) -> dict[str, Any]:
+    """#4158: request 1 published a PR and was cancelled; request 2 is running."""
+
+    _label(client, github, number)
+    first = _request(number)
+    _start_running(first["id"])
+    _attach_publication(first["work_item_id"], status="succeeded", pr=number)
+    github.labels = []
+    removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
+    assert removed.json()["status"] == "factory_cancellation_requested"
+    _observe_termination(client, first["id"])
+    github.labels = [LABEL]
+    _label(client, github, number)
+    first_row, second = _requests(number)
+    assert first_row["id"] == first["id"]
+    assert (first_row["status"], first_row["terminal_cause"]) == ("cancelled", "issue_cancelled")
+    _start_running(second["id"])
+    return second
+
+
+def _finish_unpublished(client: Any, request_id: uuid.UUID) -> Any:
+    epoch = _rows(
+        "SELECT runtime_epoch FROM curie.execution_requests WHERE id = :id", {"id": request_id}
+    )[0]["runtime_epoch"]
+    return client.post(
+        f"/v1/internal/work-items/requests/{request_id}/finish",
+        headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "no_pull_request",
+            "detail": "I read the issue and stopped.",
+        },
+    )
+
+
+def test_a_relabelled_request_without_its_own_publication_ends_failed(
+    admitted: Any,
+) -> None:
+    """#4158: an earlier request's settled PR does not own this request's terminus."""
+
+    client, github, sink = admitted
+    number = 9296
+    second = _relabelled_after_publication(client, github, number)
+
+    finished = _finish_unpublished(client, second["id"])
+
+    assert finished.status_code == 200, finished.text
+    rows = {row["id"]: row for row in _requests(number)}
+    assert (rows[second["id"]]["status"], rows[second["id"]]["terminal_cause"]) == (
+        "failed",
+        "no_pull_request",
+    )
+    notices = _notices(second["id"])
+    assert len(notices) == 1
+    assert notices[0]["terminal_cause"] == "no_pull_request"
+    assert "I read the issue and stopped." in notices[0]["detail"]
+
+
+def test_a_relabelled_request_defers_to_its_own_in_flight_publication(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9297
+    second = _relabelled_after_publication(client, github, number)
+    _attach_revision_publication(second["work_item_id"], second["id"], status="pending")
+
+    finished = _finish_unpublished(client, second["id"])
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    rows = {row["id"]: row for row in _requests(number)}
+    assert rows[second["id"]]["status"] == "running"
+
+
+def test_a_relabelled_request_defers_to_an_earlier_in_flight_publication_on_its_lineage(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9299
+    second = _relabelled_after_publication(client, github, number)
+    first_id = _requests(number)[0]["id"]
+
+    async def reopen() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                changed = await conn.execute(
+                    text(
+                        "UPDATE curie.publications SET status = 'running', terminal_at = NULL "
+                        "WHERE execution_request_id = :id"
+                    ),
+                    {"id": first_id},
+                )
+                assert changed.rowcount == 1
+        finally:
+            await engine.dispose()
+
+    asyncio.run(reopen())
+
+    finished = _finish_unpublished(client, second["id"])
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    rows = {row["id"]: row for row in _requests(number)}
+    assert rows[second["id"]]["status"] == "running"
+
+
+def test_a_request_whose_own_publication_succeeded_defers_an_unpublished_finish(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9298
+    _label(client, github, number)
+    row = _request(number)
+    _start_running(row["id"])
+    _attach_publication(row["work_item_id"], status="succeeded", pr=number)
+
+    finished = _finish_unpublished(client, row["id"])
 
     assert finished.status_code == 409, finished.text
     assert "publication_pending" in finished.text
@@ -1108,10 +1304,15 @@ def test_owner_lost_posts_one_comment(admitted: Any) -> None:
                     text(
                         "UPDATE curie.execution_requests "
                         "SET runtime_heartbeat_expires_at = clock_timestamp() "
-                        "- interval '1 second' "
+                        "- CAST(:elapsed AS interval) "
                         "WHERE id = :id AND status = 'running'"
                     ),
-                    {"id": row["id"]},
+                    {
+                        "id": row["id"],
+                        "elapsed": timedelta(
+                            seconds=get_settings().work_item_runtime_ttl_seconds + 5
+                        ),
+                    },
                 )
                 assert changed.rowcount == 1
         finally:
@@ -1126,12 +1327,16 @@ def test_owner_lost_posts_one_comment(admitted: Any) -> None:
     )
     assert _notices(row["id"])[0]["terminal_cause"] is None
     _observe_termination(client, row["id"])
-    terminal = _request(number)
-    assert (terminal["status"], terminal["terminal_cause"]) == ("failed", "owner_lost")
+    lost = [r for r in _requests(number) if r["id"] == row["id"]]
+    assert len(lost) == 1, lost
+    assert (lost[0]["status"], lost[0]["terminal_cause"]) == ("failed", "owner_lost")
+    successors = [r for r in _requests(number) if r["id"] != row["id"]]
+    assert len(successors) == 1, successors
+    assert successors[0]["status"] == "waiting"
     _reconcile()
-    assert sink.posts == 1
-    assert "owner_lost" in sink.comments[0]["body"]
-    _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
+    final = _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
+    assert "Cause: owner_lost" in final
+    assert "(attempt 2 of 3)" in final
 
 
 def test_runner_failure_posts_one_comment(admitted: Any) -> None:
@@ -1492,7 +1697,11 @@ def _insert_revision(work_item_id: uuid.UUID, number: int, objective: str) -> uu
 
 
 def _attach_revision_publication(
-    work_item_id: uuid.UUID, request_id: uuid.UUID, *, head_sha: str = HEAD_B
+    work_item_id: uuid.UUID,
+    request_id: uuid.UUID,
+    *,
+    head_sha: str = HEAD_B,
+    status: str = "succeeded",
 ) -> None:
     item = _work_item_row(work_item_id)
     approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
@@ -1527,7 +1736,7 @@ def _attach_revision_publication(
                         "status, base_sha, changed_paths, title, body, reply_kind, "
                         "reply_channel, result_url, terminal_at) "
                         "VALUES (:id, :approval, :deployment, :conversation, :lineage, "
-                        ":request_id, 2, :repo, 'succeeded', :base, "
+                        ":request_id, 2, :repo, :status, :base, "
                         "CAST('[\"README.md\"]' AS jsonb), "
                         "'Rename the helper', 'Approved platform publication.', 'github', "
                         ":channel, :result, clock_timestamp())"
@@ -1540,6 +1749,7 @@ def _attach_revision_publication(
                         "lineage": item["publication_lineage_id"],
                         "request_id": request_id,
                         "repo": REPO,
+                        "status": status,
                         "base": "0123456789abcdef0123456789abcdef01234567",
                         "channel": REPO,
                         "result": pr_url,
@@ -1801,7 +2011,6 @@ def test_an_issue_originated_notice_still_comments_on_the_issue(admitted: Any) -
     assert marker_for(row["id"]) in (posts[0][1] or "")
 
 
-
 def test_factory_notices_usage_limited_finish_posts_the_reset_remedy_once(
     admitted: Any,
 ) -> None:
@@ -1814,7 +2023,9 @@ def test_factory_notices_usage_limited_finish_posts_the_reset_remedy_once(
         f"/v1/internal/work-items/requests/{row['id']}/finish",
         headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
         json={
-            "runtime_epoch": epoch, "outcome": "failed", "cause": "model_usage_limited",
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "model_usage_limited",
             "detail": "You've hit your session limit · resets 3pm (UTC)",
         },
     )

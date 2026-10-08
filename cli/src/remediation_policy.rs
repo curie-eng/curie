@@ -823,9 +823,9 @@ fn validate_action<'a>(action: &'a Value, path: &str) -> Checked<&'a str> {
 pub fn validate_policy_document(document: &Value) -> Result<(), PolicyRefusal> {
     let document = closed(document, "", TOP_KEYS)?;
     require(document, "", TOP_KEYS)?;
-    if !document["route"]
+    if document["route"]
         .as_str()
-        .is_some_and(|route| !python_strip(route).is_empty())
+        .is_none_or(|route| python_strip(route).is_empty())
     {
         return Err(invalid("/route", "must name an approval route"));
     }

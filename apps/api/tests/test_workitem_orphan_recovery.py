@@ -9,6 +9,10 @@ claims termination, reads the stored claim and sandbox names, tears them down
 through the substrate, and records the observation. Only the substrate (the
 cluster) is faked. The runtime lease is a few seconds and the whole recovery
 must finish inside it.
+
+Settling the lost request admits its successor (ADR 0206). The reconciler wakes
+the successor; a redelivered wake for the lost request is refused by the real
+worker client's acquire, and the successor is acquired exactly once.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ import pytest
 import redis
 import redis.asyncio as aredis
 from aci_protocol import STREAM_PAYLOAD_FIELD, QueuedTurn
+from channel_protocol.work_item_events import execute_event_id
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
@@ -33,7 +38,11 @@ from curie_worker.kernel.core import Kernel
 from curie_worker.markers import Markers
 from curie_worker.runner_client import RunnerClient
 from curie_worker.threadlock import ThreadLock
-from curie_worker.workitem_dispatch import TerminationObservation, WorkItemDispatchClient
+from curie_worker.workitem_dispatch import (
+    TerminationObservation,
+    WorkItemConflict,
+    WorkItemDispatchClient,
+)
 from curie_worker.workitem_orphans import WorkItemOrphanSweeper
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -251,18 +260,59 @@ async def _recover(app: Any, request_id: uuid.UUID, old: str) -> dict[str, Any]:
             for wake in wakes:
                 await kernel.process_event(wake)
             final = await client.get_request(request_id)
+            elapsed = time.monotonic() - started_at
+
+            # ADR 0206: the settlement admitted a successor on the same WorkItem.
+            async with AsyncSession(engine) as session:
+                successors = [
+                    tuple(row)
+                    for row in await session.execute(
+                        text(
+                            "SELECT s.id, s.status, s.dispatch_generation "
+                            "FROM curie.execution_requests s "
+                            "JOIN curie.execution_requests l ON l.work_item_id = s.work_item_id "
+                            "WHERE l.id = :id AND s.id <> l.id ORDER BY s.sequence"
+                        ),
+                        {"id": request_id},
+                    )
+                ]
+            # The SQL dispatch path wakes it; nothing else publishes (ADR 0157).
+            await reconciler._publish_execute_wakes()
+            redispatched = (await _published_turns(valkey))[len(wakes) :]
+            # A redelivered wake for the lost request reaches acquire and is refused.
+            lost_refusal: str | None = None
+            try:
+                await client.acquire(request_id, owner=old, generation=1)
+            except WorkItemConflict as exc:
+                lost_refusal = exc.code
+            successor_grant = None
+            duplicate_refusal: str | None = None
+            if len(successors) == 1:
+                successor_id, _status, generation = successors[0]
+                successor_grant = await client.acquire(
+                    successor_id, owner=old, generation=generation
+                )
+                try:
+                    await client.acquire(successor_id, owner=f"{old}-peer", generation=generation)
+                except WorkItemConflict as exc:
+                    duplicate_refusal = exc.code
     finally:
         if kernel is not None:
             await kernel._runner.close()
         await valkey.aclose()
         await engine.dispose()
     return {
-        "elapsed": time.monotonic() - started_at,
+        "elapsed": elapsed,
         "wakes_before": wakes_before,
         "declared": declared,
         "wakes": wakes,
         "cluster": cluster,
         "final": final,
+        "successors": successors,
+        "redispatched": redispatched,
+        "lost_refusal": lost_refusal,
+        "successor_grant": successor_grant,
+        "duplicate_refusal": duplicate_refusal,
     }
 
 
@@ -311,13 +361,39 @@ def test_restarted_worker_recovers_its_orphaned_run(
     assert f"claims={CLAIM_NAME}" in observation
     assert f"sandboxes={SANDBOX_NAME}" in observation
     assert observation.endswith(f"observer={old}")
+
+    # ADR 0206: exactly one successor waits, flagged as the owner_lost retry.
+    successors = result["successors"]
+    assert len(successors) == 1, successors
+    successor_id, successor_status, generation = successors[0]
+    assert successor_status == "waiting"
+    retry_rows = asyncio.run(
+        _db("SELECT owner_lost_retry FROM curie.execution_requests WHERE id = :id", successor_id)
+    )
+    [(retry,)] = [tuple(r) for r in retry_rows]
+    assert retry is True
+    # The reconciler published the successor's execute wake and nothing else.
+    redispatched = result["redispatched"]
+    assert [w.event_id for w in redispatched] == [execute_event_id(successor_id, generation)]
+    assert (redispatched[0].text, redispatched[0].author) == (
+        "Recover the orphaned run",
+        "U0REQUEST1",
+    )
+    assert result["lost_refusal"] == "not_dispatchable"
+    grant = result["successor_grant"]
+    assert grant is not None
+    assert grant.generation == generation
+    assert result["duplicate_refusal"] == "duplicate"
+
+    # The lost request's notice is still owner_lost; the successor has its own row.
     notices = asyncio.run(
         _db(
-            "SELECT terminal_cause FROM curie.factory_terminal_notices "
-            "WHERE execution_request_id = :id",
+            "SELECT execution_request_id, terminal_cause FROM curie.factory_terminal_notices "
+            "WHERE work_item_id = "
+            "(SELECT work_item_id FROM curie.execution_requests WHERE id = :id)",
             request_id,
         )
     )
-    assert [r[0] for r in notices] == ["owner_lost"]
+    assert {r[0]: r[1] for r in notices} == {request_id: "owner_lost", successor_id: None}
     # Recovery never waited for the runtime lease to lapse.
     assert result["elapsed"] < RUNTIME_TTL_S

@@ -45,6 +45,7 @@ from test_factory_progress import (
     _constraint_statuses,
     report,
 )
+from test_factory_status_comment import _issue_requests, _lose_owner
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     REPO,
     _label,
@@ -295,7 +296,11 @@ def test_platform_wait_ci_keeps_the_latest_agent_note_in_the_card(admitted: Any)
 
 @pytest.mark.parametrize(
     ("cause", "pill"),
-    [("ci_failed", "NEEDS HUMAN"), ("runner_failed", "FAILED")],
+    [
+        ("ci_failed", "NEEDS HUMAN"),
+        ("runner_failed", "NEEDS HUMAN"),
+        ("publication_failed", "NEEDS HUMAN"),
+    ],
 )
 def test_terminal_cause_selects_the_card_pill_at_the_route(
     admitted: Any, cause: str, pill: str  # noqa: F811
@@ -321,7 +326,44 @@ def test_terminal_cause_selects_the_card_pill_at_the_route(
     assert response.status_code == 200, response.text
     root = _parse(response.text)
     assert pill in _all_text(root)
+    assert "#bf8700" in response.text
     assert "blocked" in _classes(_stage(root, "implement"))
+
+
+def test_owner_lost_cards_show_retrying_until_the_retry_limit(admitted: Any) -> None:  # noqa: F811
+    client, github, _sink = admitted
+    number = 9808
+    _label(client, github, number)
+    current = _request(number)["id"]
+    _reconcile()
+    lost: list[uuid.UUID] = []
+    for attempt in (2, 3):
+        _lose_owner(client, current)
+        lost.append(current)
+        requests = _issue_requests(number)
+        assert len(requests) == attempt, requests
+        current = requests[-1]["id"]
+    _lose_owner(client, current)
+    lost.append(current)
+
+    # A late image fetch still describes each request's own settlement,
+    # even after the newest request exhausted the WorkItem's retry budget.
+    for request_id, label, color in zip(
+        lost,
+        ("RETRYING", "RETRYING", "NEEDS HUMAN"),
+        ("#2f81f7", "#2f81f7", "#bf8700"),
+        strict=True,
+    ):
+        response = client.get(f"/v1/factory/cards/{_token(request_id)}.svg")
+        assert response.status_code == 200, response.text
+        root = _parse(response.text)
+        (pill,) = _with_class(root, "pill-text")
+        assert pill.text == label
+        assert any(
+            _local(element.tag) == "rect" and element.get("fill") == color
+            for element in root.iter()
+        )
+        assert not _with_class(root, "live")
 
 
 # --- the pure renderer ------------------------------------------------------------
@@ -351,7 +393,6 @@ def _card(
     started_at: datetime | None = NOW - timedelta(minutes=12, seconds=4),
     terminal_at: datetime | None = None,
     revision_pr: int | None = None,
-    needs_human: bool = False,
 ) -> str:
     terminal_cause = None if status in LIVE else ("completed" if status == "completed" else "x")
     view = phase_view(declaration or DECLARATION, reports or [], status, terminal_cause)
@@ -370,7 +411,6 @@ def _card(
             note=note,
             phase_view=view,
             cause_text=cause_text,
-            needs_human=needs_human,
         )
     )
 
@@ -592,16 +632,15 @@ def test_staged_header_uses_recorded_activity_and_the_declared_reviewer() -> Non
 
 
 @pytest.mark.parametrize(
-    ("status", "needs_human", "pill"),
-    [("failed", False, "FAILED"), ("failed", True, "NEEDS HUMAN")],
+    ("status", "pill"),
+    [("failed", "NEEDS HUMAN"), ("expired", "NEEDS HUMAN")],
 )
 def test_terminal_failure_marks_its_stage_with_an_amber_cross(
-    status: str, needs_human: bool, pill: str
+    status: str, pill: str
 ) -> None:
     root = _parse(
         _card(
             status=status,
-            needs_human=needs_human,
             declaration=STAGED_DECLARATION,
             reports=_reports(("implement", 1)),
             cause_text="Review did not pass",
@@ -611,6 +650,13 @@ def test_terminal_failure_marks_its_stage_with_an_amber_cross(
     assert "blocked" in _classes(_stage(root, "implement"))
     assert _with_class(_stage(root, "implement"), "icon-blocked")
     assert not _with_class(root, "live")
+
+
+@pytest.mark.parametrize("status", ["failed", "expired"])
+def test_failed_and_expired_cards_show_the_amber_needs_human_pill(status: str) -> None:
+    svg = _card(status=status)
+    assert "NEEDS HUMAN" in _all_text(_parse(svg))
+    assert "#bf8700" in svg
 
 
 def test_elapsed_is_minutes_and_padded_seconds_and_a_hyphen_before_start() -> None:

@@ -12,6 +12,7 @@ from aci_protocol import (
 )
 from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
+from ..delivery_lease import DeliveryLease
 from ..reply_sink import (
     TargetRoute,
 )
@@ -212,6 +213,7 @@ UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
     {
+        "ownership-store-unavailable",
         "runner-timeout-unconfirmed",
         "sandbox-capacity",
         "sandbox-terminated",
@@ -280,6 +282,9 @@ TURN_FAILURE_REPLY_PREFIX = "curie-turn-failure:"
 # guaranteed to be cut off mid-flight -- it buys nothing and spends the last of
 # the deadline that the escalation and the terminal settle still need.
 _MIN_ATTEMPT_BUDGET_S = 5.0
+
+# Bound request status reads so continuations cannot stall (#4191).
+_REQUEST_STATUS_READ_TIMEOUT_S = 5.0
 
 # Start-refusal codes that mean the work item settled terminally, so the
 # execution is over and the delivering worker is the only one that can release
@@ -524,6 +529,10 @@ _HOOK_RUN_CARRY: ContextVar[hooks._HookRunCarry | None] = ContextVar(
 # kernel-global: concurrent executions each start their own request (#3069).
 _OWNED_WORK_ITEM: ContextVar[uuid.UUID | None] = ContextVar(
     "curie_worker_owned_work_item", default=None
+)
+
+_DELIVERY_LEASE: ContextVar[DeliveryLease | None] = ContextVar(
+    "curie_worker_delivery_lease", default=None
 )
 
 _PUBLICATION_CONTEXT: ContextVar[PublicationContext | None] = ContextVar(

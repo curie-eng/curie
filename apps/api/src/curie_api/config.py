@@ -540,8 +540,8 @@ class Settings(BaseSettings):
         ),
     )
     work_item_acquire_lease_seconds: int = Field(
-        default=300,
-        gt=0,
+        default=60,
+        ge=40,
         validation_alias=AliasChoices(
             "CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS",
             "WORK_ITEM_ACQUIRE_LEASE_SECONDS",
@@ -577,6 +577,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS",
             "WORK_ITEM_BACKOFF_MAX_SECONDS",
+        ),
+    )
+    work_item_start_deferral_limit: int = Field(
+        default=5,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_START_DEFERRAL_LIMIT",
+            "WORK_ITEM_START_DEFERRAL_LIMIT",
         ),
     )
     work_item_terminate_retry_seconds: int = Field(

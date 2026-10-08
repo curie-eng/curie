@@ -7,14 +7,16 @@ is what TurnStream.close (called from __aexit__) invokes."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import json
 import logging
 import tracemalloc
 from typing import Any
 
 import pytest
 from aci_protocol import Event, Final, SessionStatus, SideEffectFlag, TextDelta
-from aiohttp import web
+from aiohttp import ClientError, web
 from aiohttp.test_utils import TestServer
 from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock, ToolUseBlock
 from curie_runner import RunTracer, SideEffectClassifier, create_app
@@ -293,9 +295,178 @@ def test_snapshot_refuses_an_oversized_body_before_json_decoding() -> None:
         client = RunnerClient(total_timeout_s=30.0, snapshot_patch_max_bytes=16)
         try:
             with pytest.raises(RunnerError, match="invalid bounded payload"):
-                await client.snapshot(
-                    f"http://127.0.0.1:{server.port}", token="runner-token"
-                )
+                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_snapshot_reads_the_whole_chunked_400kb_body() -> None:
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    async def go() -> None:
+        patch = b"x" * 300_000
+        body = json.dumps(
+            {
+                "repo_full_name": "acme-corp/acme-bot",
+                "base_sha": "a1" * 20,
+                "patch_base64": base64.b64encode(patch).decode("ascii"),
+                "patch_size_bytes": len(patch),
+                "changed_paths": ["src/widget.py"],
+                "contains_workflow_files": False,
+                "publication_title": "Fix the widget parser",
+                "publication_body": "Fixes the parser.",
+            }
+        ).encode("utf-8")
+        assert len(body) >= 400_000
+        app = web.Application()
+
+        async def chunked(request: web.Request) -> web.StreamResponse:
+            response = web.StreamResponse(headers={"Content-Type": "application/json"})
+            response.enable_chunked_encoding()
+            await response.prepare(request)
+            for offset in range(0, len(body), 4096):
+                await response.write(body[offset : offset + 4096])
+                # aiohttp read(n) returns buffered bytes, rather than waiting
+                # for n bytes or EOF: https://docs.aiohttp.org/en/stable/streams.html
+                await response.drain()
+                await asyncio.sleep(0)
+                await asyncio.sleep(0.001)
+            await response.write_eof()
+            return response
+
+        app.add_routes([web.post("/v1/snapshot", chunked)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=30.0)
+        try:
+            snapshot = await client.snapshot(
+                f"http://127.0.0.1:{server.port}", token="runner-token"
+            )
+            assert isinstance(snapshot, RunnerWorkspaceSnapshot)
+            assert snapshot.patch == patch
+            assert snapshot.changed_paths == ("src/widget.py",)
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_snapshot_short_content_length_raises_a_client_error() -> None:
+    async def go() -> None:
+        app = web.Application()
+
+        async def truncated(request: web.Request) -> web.StreamResponse:
+            response = web.StreamResponse(
+                headers={"Content-Type": "application/json", "Content-Length": "1000"}
+            )
+            await response.prepare(request)
+            await response.write(b'{"patch_base64":"')
+            assert request.transport is not None
+            request.transport.close()
+            return response
+
+        app.add_routes([web.post("/v1/snapshot", truncated)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0)
+        try:
+            # aiohttp reports an incomplete Content-Length body as
+            # ClientPayloadError, a ClientError subclass, when read to EOF:
+            # https://docs.aiohttp.org/en/stable/client_reference.html#client-exceptions
+            with pytest.raises(ClientError):
+                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_snapshot_malformed_json_names_the_inner_error_and_byte_count() -> None:
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    async def go() -> None:
+        body = b'{"patch_base64":'
+        app = web.Application()
+
+        async def malformed(_request: web.Request) -> web.Response:
+            return web.Response(body=body, content_type="application/json")
+
+        app.add_routes([web.post("/v1/snapshot", malformed)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0)
+        try:
+            with pytest.raises(RunnerSnapshotReadError) as caught:
+                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+            assert str(caught.value).startswith(
+                f"/v1/snapshot returned an invalid bounded payload after {len(body)} bytes: "
+                "JSONDecodeError: "
+            )
+            assert isinstance(caught.value.__cause__, json.JSONDecodeError)
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+def test_snapshot_oversized_body_keeps_the_byte_cap_and_named_validation_error() -> None:
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    async def go() -> None:
+        patch_limit = 16
+        encoded_body_limit = 4 * ((patch_limit + 2) // 3) + 131_072
+        body = b"x" * (encoded_body_limit + 1)
+        app = web.Application()
+
+        async def oversized(_request: web.Request) -> web.Response:
+            return web.Response(body=body, content_type="application/json")
+
+        app.add_routes([web.post("/v1/snapshot", oversized)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0, snapshot_patch_max_bytes=patch_limit)
+        try:
+            with pytest.raises(RunnerSnapshotReadError) as caught:
+                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+            assert str(caught.value) == (
+                f"/v1/snapshot returned an invalid bounded payload after {len(body)} bytes: "
+                "ValueError: snapshot response exceeds its encoded byte limit"
+            )
+            assert isinstance(caught.value.__cause__, ValueError)
+        finally:
+            await client.close()
+            await server.close()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("status", [503, 403])
+def test_snapshot_http_status_distinguishes_retryable_reads_from_refusals(status: int) -> None:
+    from curie_worker.runner_client import RunnerSnapshotReadError
+
+    async def go() -> None:
+        app = web.Application()
+
+        async def unavailable(_request: web.Request) -> web.Response:
+            return web.Response(status=status, text="snapshot unavailable")
+
+        app.add_routes([web.post("/v1/snapshot", unavailable)])
+        server = TestServer(app)
+        await server.start_server()
+        client = RunnerClient(total_timeout_s=5.0)
+        try:
+            with pytest.raises(RunnerError, match=f"/v1/snapshot -> {status}") as caught:
+                await client.snapshot(f"http://127.0.0.1:{server.port}", token="runner-token")
+            if status == 503:
+                assert isinstance(caught.value, RunnerSnapshotReadError)
+            else:
+                assert type(caught.value) is RunnerError
         finally:
             await client.close()
             await server.close()
@@ -408,9 +579,7 @@ class _PostFinalRunner:
         self.handler_errors: list[BaseException] = []
 
     async def _event(self, request: web.Request) -> web.StreamResponse:
-        response = web.StreamResponse(
-            status=200, headers={"Content-Type": "application/x-ndjson"}
-        )
+        response = web.StreamResponse(status=200, headers={"Content-Type": "application/x-ndjson"})
         await response.prepare(request)
         try:
             await response.write(
@@ -634,8 +803,7 @@ def test_start_turn_without_a_remaining_budget_uses_the_session_default(
             ]
             assert budget_records == [], caplog.text
             assert not any(
-                "remaining" in record.getMessage()
-                and "effective" in record.getMessage()
+                "remaining" in record.getMessage() and "effective" in record.getMessage()
                 for record in caplog.records
                 if record.name == "curie_worker.runner_client"
             ), caplog.text
@@ -739,9 +907,7 @@ def test_budgeted_status_does_not_log_the_turn_timeout_bound(caplog) -> None:
 
             assert status["turn_active"] is False
             records = [
-                record
-                for record in caplog.records
-                if record.name == "curie_worker.runner_client"
+                record for record in caplog.records if record.name == "curie_worker.runner_client"
             ]
             assert not any(
                 record.levelno == logging.INFO
@@ -909,9 +1075,7 @@ def test_turn_deadline_covers_buffered_frame_handling_after_http_eof(
                 headers_elapsed = loop.time() - started
                 with pytest.raises(RunnerStreamTimeout) as excinfo:
                     await asyncio.wait_for(
-                        _consume_with_stalled_side_effect(
-                            turn, runner, entered, release
-                        ),
+                        _consume_with_stalled_side_effect(turn, runner, entered, release),
                         timeout=2.0,
                     )
             elapsed = loop.time() - started
@@ -979,8 +1143,7 @@ def test_external_cancellation_during_buffered_frame_handling_stays_cancelled(
 
             assert runner.timeout_calls == 0
             assert not any(
-                "runner turn stream exceeded" in record.getMessage()
-                for record in caplog.records
+                "runner turn stream exceeded" in record.getMessage() for record in caplog.records
             )
         finally:
             release.set()
@@ -1075,9 +1238,7 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
             client = RunnerClient(total_timeout_s=5.0)
             try:
                 with caplog.at_level(logging.WARNING, logger="curie_worker.runner_client"):
-                    turn = await client.start_turn(
-                        handle.base_url, _event(), remaining_s=0.2
-                    )
+                    turn = await client.start_turn(handle.base_url, _event(), remaining_s=0.2)
                     with pytest.raises(TimeoutError) as excinfo:
                         async with turn:
                             async for _frame in turn:
@@ -1102,9 +1263,9 @@ def test_stream_timeout_raises_a_named_timeout_and_logs_the_expired_budget(
                     and record.levelno >= logging.WARNING
                 ]
                 assert warnings, caplog.text
-                assert any(
-                    "Timeout" in message and "0.2" in message for message in warnings
-                ), warnings
+                assert any("Timeout" in message and "0.2" in message for message in warnings), (
+                    warnings
+                )
                 assert all("5.0s" not in message for message in warnings)
             finally:
                 hold.set()
@@ -1131,9 +1292,7 @@ def test_timeout_callback_preserves_the_runner_confirmation(
         await server.start_server()
         client = RunnerClient(total_timeout_s=5.0)
         try:
-            result = await client._notify_timeout(
-                f"http://127.0.0.1:{server.port}", "e" * 32, None
-            )
+            result = await client._notify_timeout(f"http://127.0.0.1:{server.port}", "e" * 32, None)
             assert result == expected
         finally:
             await client.close()
@@ -1175,9 +1334,7 @@ def test_timeout_callback_control_timeout_is_unconfirmed() -> None:
         client = RunnerClient(total_timeout_s=5.0, interrupt_timeout_s=0.05)
         try:
             notifying = asyncio.create_task(
-                client._notify_timeout(
-                    f"http://127.0.0.1:{server.port}", "e" * 32, None
-                )
+                client._notify_timeout(f"http://127.0.0.1:{server.port}", "e" * 32, None)
             )
             await asyncio.wait_for(entered.wait(), timeout=1.0)
             assert not notifying.done()
@@ -1383,11 +1540,7 @@ async def _assert_real_timeout_boundary(
     )
     assert parent_rpc.name == "curie.runner.rpc"
     assert parent_rpc.attributes["curie.operation"] == "event"
-    for phase in (
-        span
-        for span in spans
-        if span.name in {"llm.generation", "execute_tool"}
-    ):
+    for phase in (span for span in spans if span.name in {"llm.generation", "execute_tool"}):
         assert phase.end_time is not None
         assert "curie.phase.end_kind" in phase.attributes
     tool = next(span for span in spans if span.name == "execute_tool")
@@ -1395,11 +1548,7 @@ async def _assert_real_timeout_boundary(
     assert tool.attributes["curie.tool.outcome"] == "cancelled"
     assert tool.status.status_code is StatusCode.ERROR
 
-    completed = [
-        attributes
-        for name, attributes in metrics
-        if name == "curie.turn.completed"
-    ]
+    completed = [attributes for name, attributes in metrics if name == "curie.turn.completed"]
     assert completed == [
         {
             "service.name": "curie-runner",
@@ -1426,9 +1575,7 @@ async def _assert_real_timeout_boundary(
 def test_real_http_timeout_unblocks_live_consumer_with_first_failure_terminal(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    metrics = asyncio.run(
-        _assert_real_timeout_boundary(monkeypatch, release_on_interrupt=True)
-    )
+    metrics = asyncio.run(_assert_real_timeout_boundary(monkeypatch, release_on_interrupt=True))
     timeout_rpc_attributes = {
         "service.name": "curie-worker",
         "operation": "timeout",
@@ -1449,9 +1596,7 @@ def test_real_http_timeout_unblocks_live_consumer_with_first_failure_terminal(
 def test_real_http_timeout_terminalizes_before_released_body_write_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    asyncio.run(
-        _assert_real_timeout_boundary(monkeypatch, release_on_interrupt=False)
-    )
+    asyncio.run(_assert_real_timeout_boundary(monkeypatch, release_on_interrupt=False))
 
 
 class _ProductionTimeoutPostureSession:
@@ -1617,8 +1762,7 @@ def test_production_http_timeout_handler_holds_next_query_until_ack(
             assert isinstance(second_frames[-1], Final)
             assert second_frames[-1].status is SessionStatus.DONE
             assert any(
-                "runner timeout terminal notification failed"
-                in record.getMessage()
+                "runner timeout terminal notification failed" in record.getMessage()
                 for record in caplog.records
             )
         finally:

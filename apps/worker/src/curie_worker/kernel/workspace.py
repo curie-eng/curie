@@ -158,6 +158,7 @@ async def _cold_handoff_readiness(
     if status.get("status") not in {
         SessionStatus.DONE.value,
         SessionStatus.IDLE_AWAITING_INPUT.value,
+        SessionStatus.CLASSIFIED_FAILURE.value,
     }:
         logger.warning("cold handoff refused a runner outside a safe idle status")
         return "unsafe"
@@ -172,7 +173,14 @@ async def _workspace_handoff_ready(
     lineage_reconciliation: bool = False,
     pending_publication_approval: bool = False,
 ) -> bool:
-    """Fail closed unless the old runner is idle with durable replay state."""
+    """Fail closed unless the old runner is idle with durable replay state.
+
+    A runner idle in ``classified-failure`` is at a boundary too (#4188).
+    The transcript never records a failed turn, so a replacement rehydrates
+    everything replay holds; ``history_durable`` still has to say so.
+    Refusing that status locked the thread: nothing moves a failed runner
+    to another status except a new turn, which this fence blocks.
+    """
 
     if not handle.token:
         logger.warning(
@@ -198,6 +206,7 @@ async def _workspace_handoff_ready(
             in {
                 SessionStatus.DONE.value,
                 SessionStatus.IDLE_AWAITING_INPUT.value,
+                SessionStatus.CLASSIFIED_FAILURE.value,
             }
             or (
                 lineage_reconciliation

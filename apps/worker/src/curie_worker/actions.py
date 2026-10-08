@@ -16,12 +16,14 @@ only one that knows the answer.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
 from aci_protocol import SideEffectFlag
 
+from .api_retry import DEFAULT_BUDGET_S, post_with_retry
 from .sealed_snapshot import carries_placeholder, is_post_version, is_sealed_envelope
 
 logger = logging.getLogger(__name__)
@@ -65,9 +67,12 @@ class ActionRecorder(Protocol):
         conversation_id: str,
         agent_id: str | None,
         gate_approval_id: str | None = None,
+        budget_s: float = DEFAULT_BUDGET_S,
     ) -> RecordedAction: ...
 
-    async def complete(self, action_id: str, frame: SideEffectFlag) -> dict[str, Any]: ...
+    async def complete(
+        self, action_id: str, frame: SideEffectFlag, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -173,6 +178,7 @@ class ActionClient:
         conversation_id: str,
         agent_id: str | None,
         gate_approval_id: str | None = None,
+        budget_s: float = DEFAULT_BUDGET_S,
     ) -> RecordedAction:
         """Open the record for a call that was just made.
 
@@ -193,7 +199,7 @@ class ActionClient:
             "gate_approval_id": gate_approval_id,
             "dedupe_key": f"{event_id}:{frame.call_id}",
         }
-        payload = await self._post(self._url, body, "action record")
+        payload = await self._post(self._url, body, "action record", budget_s=budget_s)
         return RecordedAction(id=str(payload["id"]), status=str(payload["status"]))
 
     async def complete(
@@ -203,6 +209,7 @@ class ActionClient:
         *,
         connector: str | None = None,
         connector_digest: str | None = None,
+        budget_s: float = DEFAULT_BUDGET_S,
     ) -> dict[str, Any]:
         """Close the record with what came back, and return the row as stored.
 
@@ -219,6 +226,7 @@ class ActionClient:
         digest costs only the digest, never the turn.
         """
 
+        deadline = time.monotonic() + max(0.0, budget_s)
         body = completion_body(frame)
         url = f"{self._url}/{action_id}/complete"
         if connector is not None and connector_digest is not None:
@@ -228,6 +236,7 @@ class ActionClient:
                 attributed,
                 "action complete",
                 {**self._headers, **self._worker_headers},
+                budget_s=budget_s,
             )
             if response.status_code not in _ATTRIBUTION_REFUSALS:
                 return self._accepted(response, "action complete")
@@ -242,13 +251,23 @@ class ActionClient:
             )
         elif connector is not None or connector_digest is not None:
             logger.warning("action %s: half a connector attribution dropped", action_id)
-        return await self._post(url, body, "action complete")
+        return await self._post(
+            url, body, "action complete", budget_s=max(0.0, deadline - time.monotonic())
+        )
 
     async def _send(
-        self, url: str, body: dict[str, Any], what: str, headers: dict[str, str]
+        self,
+        url: str,
+        body: dict[str, Any],
+        what: str,
+        headers: dict[str, str],
+        *,
+        budget_s: float,
     ) -> httpx.Response:
         try:
-            return await self._client.post(url, json=body, headers=headers)
+            return await post_with_retry(
+                self._client, url, json=body, headers=headers, budget_s=budget_s
+            )
         except httpx.HTTPError as exc:
             raise ActionBackendError(f"{what} failed: {exc}") from exc
 
@@ -257,8 +276,10 @@ class ActionClient:
         url: str,
         body: dict[str, Any],
         what: str,
+        *,
+        budget_s: float,
     ) -> dict[str, Any]:
-        response = await self._send(url, body, what, self._headers)
+        response = await self._send(url, body, what, self._headers, budget_s=budget_s)
         return self._accepted(response, what)
 
     @staticmethod

@@ -1627,7 +1627,7 @@ def _unknown_tool_policy_server_message(
 
 
 def _validate_secrets(manifest: PluginManifest, c: _Collector) -> None:
-    """Validate the manifest secret policy (deploy-time gate, ADR-0009 / #429, ADR 0209).
+    """Validate the manifest secret policy (deploy-time gate, ADR-0009 / #429, ADR 0210).
 
     ``secrets`` lists the named connector secrets the bundle requires and
     ``optionalSecrets`` the ones it can use but does not need (the NAMES only,

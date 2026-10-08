@@ -7,7 +7,7 @@ a not-admitted nomination creates one ``Approval`` with ``purpose``
 ``remediation`` ("the ``approvals_purpose_ck`` constraint gains the value").
 
 Revision assumed (see ``.projects/plans/task-remediation-approvals.tests.md``):
-``0092``, revising plan task 11's execution code revision ``0091``. If
+``0092a``, revising plan task 11's execution code revision ``0091a``. If
 another revision lands first, renumber and move ``BELOW`` and
 ``HEAD`` here and the head pins. The revision is otherwise
 found by its source (``approvals_purpose_ck`` and ``remediation``), so a
@@ -28,8 +28,8 @@ from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy.exc import IntegrityError
 
-BELOW = "0091"
-HEAD = "0092"
+BELOW = "0091a"
+HEAD = "0092a"
 
 
 def _revision() -> tuple[str, str]:
@@ -75,7 +75,7 @@ def test_one_hand_written_revision_on_the_assumed_parent() -> None:
     revision, down = _revision()
     assert (revision, down) == (HEAD, BELOW)
     script = ScriptDirectory.from_config(alembic_config())
-    # The admission revision (task 9, 0093) follows this one; the head pin lives
+    # The admission revision (task 9, 0093a) follows this one; the head pin lives
     # in test_migration_remediation_admission.py.
     assert HEAD in {rev.revision for rev in script.iterate_revisions(script.get_heads()[0], BELOW)}
 

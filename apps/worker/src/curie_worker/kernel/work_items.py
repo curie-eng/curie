@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -27,6 +28,20 @@ from . import clock, constants, failures, memory, routing
 from .log import logger
 
 
+async def _settle_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
+@dataclass
+class _SettlingWorkItem:
+    run: WorkItemRun
+    outcome: str
+    cause: str
+    detail: str | None
+    task: asyncio.Task[None] | None = None
+    cleaned: bool = False
+
+
 def owns_work_item(self: Kernel, request_id: uuid.UUID) -> bool:
     """Whether this process still holds the WorkItem run (#3076).
 
@@ -37,11 +52,125 @@ def owns_work_item(self: Kernel, request_id: uuid.UUID) -> bool:
     (#3564).
     """
 
+    if request_id in self._settling_work_items:
+        return True
     self._evict_expired_held_work_items()
     run = self._work_item_runs.get(request_id)
     if run is not None and not run.finished:
         return True
     return any(held.request_id == request_id for held in self._held_work_items.values())
+
+
+def _begin_settling(
+    self: Kernel, run: WorkItemRun, *, outcome: str, cause: str, detail: str | None
+) -> None:
+    """Hand off only the report, synchronously retaining ownership (#4174)."""
+
+    if run.request_id in self._settling_work_items:
+        return
+    pending = _SettlingWorkItem(run=run, outcome=outcome, cause=cause, detail=detail)
+    self._settling_work_items[run.request_id] = pending
+    if self._work_item_runs.get(run.request_id) is run:
+        self._work_item_runs.pop(run.request_id)
+    pending.task = asyncio.create_task(
+        self._settle_work_item(pending), name=f"work-item-settle-{run.request_id}"
+    )
+
+
+async def _finish_or_settle(
+    self: Kernel, run: WorkItemRun, *, outcome: str, cause: str, detail: str | None
+) -> None:
+    try:
+        await run.finish(outcome=outcome, cause=cause, detail=detail)
+    except WorkItemConflict as exc:
+        if exc.code != "not_running":
+            raise
+        # The preceding attempt may have committed before its response was
+        # lost. Nothing remains to own; do not redeliver the ended turn.
+        run.finished = True
+    except WorkItemTransportError:
+        self._begin_settling(run, outcome=outcome, cause=cause, detail=detail)
+
+
+async def _settle_work_item(self: Kernel, pending: _SettlingWorkItem) -> None:
+    run = pending.run
+    try:
+        while run.heartbeat_running and self._settling_before_deadline(run):
+            delay = run.bound_remaining_s(15.0)
+            assert delay is not None
+            await _settle_sleep(delay)
+            if not run.heartbeat_running or not self._settling_before_deadline(run):
+                return
+            try:
+                await run.finish(
+                    outcome=pending.outcome, cause=pending.cause, detail=pending.detail
+                )
+            except WorkItemConflict as exc:
+                if exc.code in {"not_running", "publication_pending"}:
+                    run.finished = True
+                return
+            except WorkItemTransportError:
+                logger.warning("work-item finish still unavailable for %s", run.request_id)
+            else:
+                return
+    finally:
+        await self._clean_settling_work_item(pending)
+
+
+async def _clean_settling_work_item(self: Kernel, pending: _SettlingWorkItem) -> None:
+    if pending.cleaned:
+        return
+    run = pending.run
+    if self._settling_work_items.get(run.request_id) is pending:
+        self._settling_work_items.pop(run.request_id)
+    # A heartbeat's shielded stop callback can cancel this task. Joining
+    # that heartbeat here would deadlock against the callback's join.
+    if run.heartbeat_running:
+        await run.close()
+    if run.finished:
+        await self._release_work_item_sandbox(run.thread_key)
+    pending.cleaned = True
+
+
+def _settling_before_deadline(run: WorkItemRun) -> bool:
+    return run.execution_deadline is None or run.execution_deadline > datetime.now(UTC)
+
+
+async def _cancel_settling_work_items(
+    self: Kernel,
+    *,
+    request_id: uuid.UUID | None = None,
+    thread_key: str | None = None,
+    agent_id: uuid.UUID | None = None,
+) -> None:
+    """Join reports before a termination or reset changes their runtime."""
+
+    tasks: list[asyncio.Task[None]] = []
+    cancelled: list[_SettlingWorkItem] = []
+    current = asyncio.current_task()
+    for key, pending in list(self._settling_work_items.items()):
+        if request_id is not None and key != request_id:
+            continue
+        if thread_key is not None and pending.run.thread_key != thread_key:
+            continue
+        if agent_id is not None and pending.run.agent_id != agent_id:
+            continue
+        self._settling_work_items.pop(key)
+        if pending.task is not None and pending.task is not current:
+            pending.task.cancel()
+            tasks.append(pending.task)
+            cancelled.append(pending)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    # A task cancelled before its first instruction never enters finally.
+    for pending in cancelled:
+        await self._clean_settling_work_item(pending)
+
+
+async def close(self: Kernel) -> None:
+    """Cancel and join terminal reports before their runtime clients close."""
+
+    await self._cancel_settling_work_items()
 
 
 def _evict_expired_held_work_items(self: Kernel) -> None:
@@ -415,6 +544,7 @@ async def _terminate_work_item(self: Kernel, qevent: QueuedTurn, request_id: uui
     # Cleared only once the claim succeeds, so a refused claim leaves the
     # held run in place for whoever does own the termination (#3564).
     self._forget_held_work_items(thread_key=thread_key, reason="terminated")
+    await self._cancel_settling_work_items(request_id=request_id)
     claim_name: str | None = None
     sandbox_name: str | None = None
     try:
@@ -457,6 +587,7 @@ async def _stop_owned_work_item(self: Kernel, thread_key: str, run: WorkItemRun)
     """Heartbeat saw cancellation_requested: interrupt, observe, record."""
 
     self._forget_held_run(thread_key, run, reason="cancellation requested")
+    await self._cancel_settling_work_items(request_id=run.request_id)
     if self._work_items is None or run.runtime_epoch is None:
         return
     observation = await self._halt_work_item_runtime(
@@ -488,6 +619,7 @@ async def _stop_owned_work_item(self: Kernel, thread_key: str, run: WorkItemRun)
 async def _abandon_stale_work_item(self: Kernel, thread_key: str, run: WorkItemRun) -> None:
     """Heartbeat 409 stale_owner: drop local ownership without touching the current route."""
 
+    await self._cancel_settling_work_items(request_id=run.request_id)
     run.finished = True
     self._forget_held_run(thread_key, run, reason="stale owner")
     logger.warning(

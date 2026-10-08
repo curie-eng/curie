@@ -59,6 +59,7 @@ from . import (
     work_items,
     workspace,
 )
+from .work_items import _SettlingWorkItem
 
 
 class Kernel:
@@ -180,6 +181,7 @@ class Kernel:
         # thread and must not see or remove this run.
         self._work_item_runs: dict[uuid.UUID, WorkItemRun] = {}
         self._held_work_items: dict[str, WorkItemRun] = {}
+        self._settling_work_items: dict[uuid.UUID, _SettlingWorkItem] = {}
         # Approval resume ids that were mapped to a factory execution.
         # The live run can be removed before a later delivery failure reaches
         # ``notify_turn_not_started``, so the exact event identity survives to
@@ -256,6 +258,7 @@ class Kernel:
     _consume = attempt._consume
     _start_progress_pump = attempt._start_progress_pump
     _apply_frame = attempt._apply_frame
+    _mark_side_effect_with_retry = attempt._mark_side_effect_with_retry
     _record_action = attempt._record_action
     _finish = attempt._finish
     _escalate = attempt._escalate
@@ -312,6 +315,7 @@ class Kernel:
     _close_channel_read = channel_read._close_channel_read
     _require_channel_read = channel_read._require_channel_read
     _bind_publication_context = publication._bind_publication_context
+    _request_not_running = publication._request_not_running
     _continue_unpublished = publication._continue_unpublished
     _target_for = routing._kernel_target_for
     _adopt_ref = routing._adopt_ref
@@ -320,6 +324,13 @@ class Kernel:
     _drop_ambiguous_route = routing._drop_ambiguous_route
     _drop_sibling_turn = routing._drop_sibling_turn
     _reply = routing._reply
+    _begin_settling = work_items._begin_settling
+    _finish_or_settle = work_items._finish_or_settle
+    _settle_work_item = work_items._settle_work_item
+    _clean_settling_work_item = work_items._clean_settling_work_item
+    _settling_before_deadline = staticmethod(work_items._settling_before_deadline)
+    _cancel_settling_work_items = work_items._cancel_settling_work_items
+    close = work_items.close
     owns_work_item = work_items.owns_work_item
     _evict_expired_held_work_items = work_items._evict_expired_held_work_items
     _forget_held_work_items = work_items._forget_held_work_items

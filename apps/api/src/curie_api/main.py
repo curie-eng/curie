@@ -34,7 +34,12 @@ from . import __version__
 from .channel_identities import start_static_slack_bootstrap
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
-from .db import create_engine, create_sessionmaker, create_source_gate_engine
+from .db import (
+    create_engine,
+    create_liveness_engine,
+    create_sessionmaker,
+    create_source_gate_engine,
+)
 from .evalqueue import EvalQueue
 from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
@@ -219,6 +224,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.work_item_reconciler_enabled
         else None
     )
+    app.state.work_item_status_comments_task = (
+        asyncio.create_task(work_item_reconciler.run_status_comments_forever())
+        if settings.work_item_reconciler_enabled
+        else None
+    )
     app.state.resume_reconciler_task = (
         asyncio.create_task(reconciler.run_forever())
         if settings.resume_reconciler_enabled
@@ -304,6 +314,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             },
         )
     async with AsyncExitStack() as source_resources:
+        liveness_engine = create_liveness_engine()
+        source_resources.push_async_callback(liveness_engine.dispose)
+        app.state.liveness_engine = liveness_engine
+        app.state.liveness_sessionmaker = create_sessionmaker(liveness_engine)
         source_gate_engine = create_source_gate_engine()
         source_resources.push_async_callback(source_gate_engine.dispose)
         app.state.source_gate = SourceGate(source_gate_engine)
@@ -340,9 +354,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     await review_task
                 except asyncio.CancelledError:
                     pass
-            # Both background loops enqueue via resume_queue (which uses the valkey
-            # client) and read via the sessionmaker, so both are stopped BEFORE
-            # valkey.aclose()/engine.dispose() below.
+            # These background loops use Valkey and the database, so stop them
+            # before closing either resource.
+            status_task = getattr(app.state, "work_item_status_comments_task", None)
+            if status_task is not None:
+                status_task.cancel()
+                try:
+                    await status_task
+                except asyncio.CancelledError:
+                    pass
             work_item_task = getattr(app.state, "work_item_reconciler_task", None)
             if work_item_task is not None:
                 work_item_task.cancel()
@@ -473,7 +493,7 @@ def create_app() -> FastAPI:
     async def ready(request: Request) -> dict[str, str]:
         try:
             async with asyncio.timeout(2):
-                async with request.app.state.sessionmaker() as session:
+                async with request.app.state.liveness_sessionmaker() as session:
                     await crud_agents.list_agents(session)
         except Exception:  # noqa: BLE001 - existing broad catch retained
             raise HTTPException(

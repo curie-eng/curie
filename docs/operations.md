@@ -1028,8 +1028,12 @@ installation discovery.
 
 Give the App **Checks: Read** and **Commit statuses: Read** (the factory
 preflight names whichever of those two the installation does not grant), and
-**Actions: Read**.
-The Actions permission lets repair rounds include the failing job's log tail.
+**Actions: Read and write**.
+The Actions permission lets the factory rerun failed jobs once before entering
+a repair round and include the failing job's log tail.
+Existing App owners must raise Actions to **Read and write** in the App's
+permissions settings, then have the updated permissions accepted on every
+installation.
 Without it, CI verdicts still use checks and commit statuses; the repair prompt
 keeps the check summary and says `Job log unavailable.` After a factory
 run publishes, it waits on the pull request's checks inside its execution
@@ -1043,18 +1047,26 @@ otherwise green completes with the note `Also failing on the base branch, not
 caused by this change: <names>`. The required Python check and any check a
 sandbox check delegated to are the exception: failing on the base too leaves
 the run `ci_unverified`. When the base branch cannot be read, every failure
-counts. No checks within 120 s of the push completes with a
-note only when no required check applies. A factory Python publication needs
-in-sandbox verification evidence; beyond that it is judged on the repository's
+counts. With no required check, zero checks after the 120 s grace complete with
+a note only when GitHub reports the pull request mergeable or already merged.
+A pull request with merge conflicts waits through that grace, then ends as
+`merge_conflict`, regardless of any checks, without a CI fix round. The pull
+request stays open for a person to resolve the conflicts. Unknown mergeability,
+including GitHub's `null` while it computes the result, keeps a zero-check run
+waiting with reason `mergeability_unknown` until the CI deadline, then ends as
+`ci_unverified` with that reason. Each observation reads mergeability again;
+check-backed verdicts do not depend on unknown mergeability.
+A factory Python publication needs in-sandbox verification evidence; beyond
+that it is judged on the repository's
 own checks unless the repository has a required Python CI policy (below).
 Checks still pending when the CI wait (by default 1200 s from the push, or the
 execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
 `api.githubFactoryCiWaitSeconds` (API env `GITHUB_FACTORY_CI_WAIT_S`, default
 1200, 1 to 10800, checked at boot) when the repository's required checks take
 longer than 20 minutes; the wait still ends at the execution deadline if that
-comes first. Unreadable CI, such as missing Checks or Commit statuses permission,
-ends as `ci_unverified`, which is never success;
-the pull request stays open either way. The work item detail route still
+comes first. CI that cannot be verified, including unreadable checks or missing
+required evidence, ends as `ci_unverified`, which is never success. The notice's
+Reason line explains why. The pull request stays open. The work item detail route still
 reports CI as `unavailable` / `github_forbidden` without the permission.
 
 Required Python CI is set per repository with `api.githubFactoryPythonCi` (API
@@ -1079,8 +1091,9 @@ api:
 ```
 
 Checks that must rerun after a pull request metadata edit are configured per
-repository with API env `GITHUB_FACTORY_METADATA_CI`, a JSON object, default
-`{}`, checked at boot. Each `owner/name` key is matched case insensitively.
+repository with `api.githubFactoryMetadataCi` (API env
+`GITHUB_FACTORY_METADATA_CI`, a JSON object, default `{}`, checked at boot).
+Each `owner/name` key is matched case insensitively.
 Each value supplies `checks` for check run names and `statuses` for commit
 status contexts. An omitted list is empty, but at least one name is required.
 Every configured guard must appear with a timestamp after the metadata edit;
@@ -1089,8 +1102,11 @@ Checks on the unchanged commit retain their passing, pending or failing evidence
 Without a repository policy, a metadata revision ends as `ci_unverified` with
 reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
 
-Set this environment value through the chart's existing `api.extraEnv` or in
-the Compose environment. For Curie's own repository, the value is:
+Set the chart value with a values file or `--set-json`. Installs that previously
+set `GITHUB_FACTORY_METADATA_CI` through `api.extraEnv` must move the JSON object
+to `api.githubFactoryMetadataCi` and remove that extraEnv entry; the chart now
+reserves the environment variable. Compose installs set it in the environment.
+For Curie's own repository, the value is:
 
 ```json
 {"curie-eng/curie":{"checks":["PR body (real newlines)","Fix pin verification"],"statuses":[]}}
@@ -1239,11 +1255,12 @@ until chart-owned values land):
 | `CURIE_WORK_ITEM_BATCH_LIMIT` | `50` | Due rows claimed per pass |
 | `CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS` | `86400` | Waiting deadline from admission |
 | `CURIE_WORK_ITEM_DISPATCH_LEASE_SECONDS` | `30` | Reconciler publish lease |
-| `CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS` | `300` | Worker acquire lease |
+| `CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS` | `60` | Worker acquire lease; the worker renews it every 20 s until start or defer, so a dead worker's unstarted requests re-dispatch within about 75 s. Minimum 40 |
 | `CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS` | `45` | Runtime heartbeat expiry; interval is ttl / 3 |
 | `CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS` | `120` | A cancellation with no worker teardown receipt settles as cancelled after this |
 | `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` | `10` | Defer backoff base |
-| `CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS` | `120` | Capacity defer backoff cap |
+| `CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS` | `120` | Defer backoff cap |
+| `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` | `5` | The `not_started` defer that reaches this count fails the request with cause `start_failed`; only `not_started` defers count, and other non-capacity waits (such as `thread_busy`) keep the flat base backoff |
 | `CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS` | `30` | Terminate wake republish window |
 | `CURIE_CONSUMER_GROUP` | `curie-workers` | Runs consumer group the reconciler ensures |
 
@@ -1265,6 +1282,16 @@ Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
 dead-letter graveyard.
 
+A delivery whose sandbox did not start defers with a `not_started` reason on
+the same backoff curve as capacity, counted separately. Only `not_started`
+defers count toward the limit. The one that reaches
+`CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` ends the request as `failed` /
+`start_failed`, frees its quota slot, and names the attempt count and the last
+deferral reason on the status comment. Every other non-capacity defer is a
+wait rather than a failed start, such as `thread_busy` while another turn holds
+the work item's thread: it waits `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` and
+never counts.
+
 Each factory execution request owns exactly one App-authored status comment.
 The reconciler creates it on its first pass after admission and then edits it
 in place; there is no separate final comment. While the run is live the
@@ -1276,7 +1303,9 @@ pass; unlabel the issue to stop the run instead.
 
 When publication succeeds, the result names the exact pull request
 URL. When the run cannot complete, the result starts with `Could not complete:`
-and a plain sentence for the cause. When the model provider refused the run,
+and a plain sentence for the cause. A request lost with its worker and retried
+as a new run shows `Status: RETRYING` and its result starts with `Retrying:`.
+When the model provider refused the run,
 a `Provider message:` line follows with the provider's own error text, redacted
 of keys and tokens. An execute turn that ends without publishing is prompted
 once more in the same session. If it still does not publish, it ends as
@@ -1284,7 +1313,7 @@ once more in the same session. If it still does not publish, it ends as
 `no_pull_request`, and an `Agent's last message:` block carries the agent's
 final reply, redacted and shown inside a code fence so none of it renders.
 A last `Cause:` line names the platform cause code
-(`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
+(`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
@@ -1615,7 +1644,9 @@ request, a `state` and an `actionable_cause`. The states:
   request already opened is kept.
 - `expired`: `capacity_wait_expired` or `execution_deadline`.
 - `failed`: the cause names the terminal cause verbatim. For
-  `deadline_halted`, raise `worker.deliveryBudgetSeconds`.
+  `deadline_halted`, raise `worker.deliveryBudgetSeconds`. For `start_failed`,
+  the sandbox never started; the cause names the attempt count and the last
+  deferral reason.
 - `awaiting_approval`: a publication approval or a tool approval on the same
   conversation is pending.
 - `publishing`: the publication is approved and in flight.

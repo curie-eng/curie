@@ -9,8 +9,8 @@ the execution code." A refused forward execution has no ledger row, so the code
 is recorded on the nomination: ``remediation_nominations.execution_code``
 (nullable text, no default; existing rows read NULL).
 
-The revision is the next free one on this stack: ``0091``, revising the read
-executions revision ``0090`` (``0092`` is taken by another branch). It is found
+The revision is the next free one on this stack: ``0091a``, revising the read
+executions revision ``0090`` (``0092a`` is taken by another branch). It is found
 by its id and checked to add ``execution_code``, so a renumbering at merge only
 moves the two constants below. Every identifier is a placeholder.
 """
@@ -32,7 +32,7 @@ from alembic import command
 from alembic.script import ScriptDirectory
 
 BELOW = "0090"
-HEAD = "0091"
+HEAD = "0091a"
 
 
 def _revision() -> tuple[str, str]:
@@ -86,7 +86,7 @@ def test_one_hand_written_revision_on_the_read_executions_head() -> None:
     assert down == BELOW, f"revision {revision} revises {down}, expected {BELOW}"
     assert revision == HEAD
     script = ScriptDirectory.from_config(alembic_config())
-    # The remediation approvals revision (task 10, 0092) follows this one; the
+    # The remediation approvals revision (task 10, 0092a) follows this one; the
     # head pin lives in test_migration_remediation_approvals.py.
     assert HEAD in {rev.revision for rev in script.iterate_revisions(script.get_heads()[0], BELOW)}
 

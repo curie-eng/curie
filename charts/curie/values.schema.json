@@ -185,6 +185,33 @@
             }
           }
         },
+        "githubFactoryMetadataCi": {
+          "type": "object",
+          "description": "Checks and commit statuses that rerun after a pull request metadata edit, keyed by owner/name.",
+          "propertyNames": {
+            "pattern": "^[^/]+/[^/]+$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "checks": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "statuses": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        },
         "githubFactoryPythonCi": {
           "type": "object",
           "description": "Required Python CI per repository, keyed by owner/name. A repository without an entry is judged on its own checks.",
