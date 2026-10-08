@@ -568,3 +568,32 @@ def test_identity_paraphrases_still_require_specific_conditional_pending_action(
     assert not _resolved_case_grader().grade(immediate)
     assert not _resolved_case_grader().grade(reply.replace("still pending", "already executed"))
     assert not _resolved_case_grader().grade(reply.replace("acme-mail-adapter", "acme-other"))
+
+
+def _sre_oracle_fixture_controls() -> list[tuple[str, str, bool]]:
+    fixtures = json.loads((REPO / "cli/tests/data/eval_falsifiability_fixtures.json").read_text())
+    keys = [
+        "resolved-alert-reports-pending-approval-not-an-action",
+        "sre-planned-work-matched",
+        "sre-planned-work-unavailable",
+        "sre-planned-work-out-of-scope",
+        "sre-planned-work-verified-user-impact",
+        "sre-resolved-verified-recovery-pending-unneeded",
+    ]
+    return [
+        (case, reply, good)
+        for case in keys
+        for group, good in [("paraphrases", True), ("counterexamples", False)]
+        for reply in fixtures[group].get(f"sre-bot/{case}", [])
+    ]
+
+
+@pytest.mark.parametrize("case_id,reply,good", _sre_oracle_fixture_controls())
+def test_evidence_bounded_oracles_preserve_paraphrases_and_harmful_opposites(
+    case_id: str, reply: str, good: bool
+) -> None:
+    from curie_worker.eval.models import EvalSuite
+
+    suite = EvalSuite.model_validate_json((REPO / "examples/sre-bot/evals/cases.json").read_text())
+    case = next(c for c in suite.cases if c.id == case_id)
+    assert case.grader.grade(reply) == good
