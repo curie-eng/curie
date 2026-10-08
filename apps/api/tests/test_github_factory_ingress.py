@@ -81,6 +81,8 @@ class GitHubAPI:
         self.comment_app: dict[str, Any] | None = None
         self.repository_id = REPO_ID
         self.issue_number = 0
+        # Every rejection-label add a base refusal makes (ADR 0199).
+        self.label_writes: list[tuple[int, list[str]]] = []
         # @spec apps/api/README.md#factory-test-isolation
         # Timeline events retain identity inside this stand-in while independent
         # fixtures cannot address each other's request-derived Valkey keys.
@@ -133,6 +135,15 @@ class GitHubAPI:
                     }
                 ],
             )
+        if request.method == "POST" and (
+            path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/labels")
+        ):
+            # A base refusal applies the rejection label (ADR 0199 decision 5.1).
+            # https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue
+            number = int(path.split("/")[-2])
+            names = [str(name) for name in json.loads(request.content)["labels"]]
+            self.label_writes.append((number, names))
+            return httpx.Response(200, json=[{"name": name} for name in names])
         if path.startswith(f"/repos/{REPO}/issues/"):
             number = int(path.rsplit("/", 1)[1])
             return httpx.Response(

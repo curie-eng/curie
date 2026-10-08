@@ -12,6 +12,7 @@ https://docs.github.com/en/rest/branches/branches#get-a-branch
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -20,11 +21,13 @@ from urllib.parse import quote
 import httpx
 
 from .config import Settings
-from .factory_notices import code_span, upsert_issue_notice
+from .factory_notices import NOT_IMPLEMENTABLE_LABEL, code_span, upsert_issue_notice
 from .github_factory_events import BASE_LABEL_PREFIX
 from .github_review_events import FeedbackUnavailable
 from .github_review_truth import github_headers
 from .repo_full_name import entry_for_repo
+
+logger = logging.getLogger(__name__)
 
 REFUSAL_MARKER = "<!-- curie-factory-base-refusal -->"
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -196,11 +199,17 @@ async def comment_refusal(
     issue_number: int,
     refusal: BaseRefusal,
 ) -> None:
-    """Keep the one refusal comment current. It is edited, never duplicated."""
+    """Keep the one refusal comment current and label the issue rejected.
 
+    The comment is edited, never duplicated. The rejection label joins it once
+    the comment stands (ADR 0199 decisions 5.1 and 5.4); the state label pass
+    removes the label when the issue is later admitted.
+    """
+
+    api = settings.github_api_url.rstrip("/")
     outcome = await upsert_issue_notice(
         client,
-        api=settings.github_api_url.rstrip("/"),
+        api=api,
         repo_path=repo_path,
         headers=github_headers(token),
         issue_number=issue_number,
@@ -209,4 +218,22 @@ async def comment_refusal(
         app_id=settings.github_app_id,
     )
     if outcome == "unavailable":
+        raise FeedbackUnavailable("base_refusal_unavailable")
+    try:
+        added = await client.post(
+            f"{api}{repo_path}/issues/{issue_number}/labels",
+            headers=github_headers(token),
+            json={"labels": [NOT_IMPLEMENTABLE_LABEL]},
+            follow_redirects=False,
+        )
+    except httpx.HTTPError:
+        raise FeedbackUnavailable("base_refusal_unavailable") from None
+    if added.status_code in {401, 403, 404}:
+        # A refused write matches how _sync_labels treats one: logged, and the
+        # refusal stands so the ticket is not retried for the label alone.
+        logger.warning(
+            "factory base rejection label refused",
+            extra={"issue_number": issue_number, "status": added.status_code},
+        )
+    elif added.status_code not in {200, 201}:
         raise FeedbackUnavailable("base_refusal_unavailable")

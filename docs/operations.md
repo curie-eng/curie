@@ -1105,7 +1105,10 @@ to the repository default branch. A repository without an entry may only use its
 default branch. A ticket picks a base with a `base:<branch>` issue label; with no
 label it uses the default. Two `base:` labels, a base outside `bases`, or a base
 that does not exist are refused with an issue comment, and no other branch is
-substituted. The base is frozen when the work item is created: a later label
+substituted. The refusal also applies the `curie-factory:not-implementable`
+rejection label (ADR-0199), and the state-label pass removes that label when the
+issue is later admitted and its first state label is applied. The base is frozen
+when the work item is created: a later label
 change is ignored. The status comment shows it on a `Base:` line, for example
 ``Base: `next` (from label `base:next`)``, or `(deployment default)` when no label
 chose it.

@@ -379,14 +379,16 @@ async def mark_status_comment_stale(session: AsyncSession, work_item_id: uuid.UU
     )
 
 
-# The four state labels the pass owns (#3077, #3221). A closed set, never a
-# prefix match: human labels, including other ``curie:`` labels, are never
-# touched.
+# The four run state labels the pass owns (#3077, #3221), plus the ADR 0199
+# rejection label a base refusal applies: a closed set, never a prefix match.
+# Human labels, including other ``curie:`` labels, are never touched.
+NOT_IMPLEMENTABLE_LABEL = "curie-factory:not-implementable"
 STATE_LABELS = (
     "curie-factory:queued",
     "curie-factory:running",
     "curie-factory:pr-open",
     "curie-factory:needs-human",
+    NOT_IMPLEMENTABLE_LABEL,
 )
 LEGACY_STATE_LABELS = ("curie:queued", "curie:running", "curie:pr-open", "curie:needs-human")
 _DESIRED_LABEL = {
@@ -943,8 +945,10 @@ async def _sync_labels(
 ) -> int:
     """Add the desired state label and remove the others, on the issue.
 
-    Only the four state labels are ever written. A refused write is logged and
-    given up; any other failure is retried next pass.
+    Only the four run state labels are ever applied; the ADR 0199 rejection
+    label and the legacy names are only ever removed, so admitting a refused
+    issue clears its rejection label. A refused write is logged and given up;
+    any other failure is retried next pass.
     """
 
     if row.applied_label == "":
