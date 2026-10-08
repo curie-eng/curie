@@ -106,3 +106,71 @@ def test_planned_work_grader_rejects_missing_scope_and_invented_reads(
     suite = EvalSuite.model_validate_json((BUNDLE / "evals/cases.json").read_text())
     case = next(c for c in suite.cases if c.id == f"sre-planned-work-{case_id}")
     assert not case.grader.grade(bad)
+
+
+def _planned_work_prose() -> str:
+    text = (BUNDLE / "skills/sre-bot/SKILL.md").read_text()
+    text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
+    return text.split("**Planned tests and maintenance", 1)[1].split("\n- **", 1)[0]
+
+
+def test_planned_context_drives_severity_and_a_concrete_owner_request() -> None:
+    policy = " ".join(_planned_work_prose().split())
+    assert re.search(r"unknown.{0,90}(impact|people).{0,60}⚠", policy, re.I)
+    assert re.search(
+        r"unavailable.{0,100}Next:.{0,90}(provide|supply|share).{0,50}target.{0,30}window",
+        policy,
+        re.I,
+    )
+    assert re.search(r"out.of.scope.{0,100}Next:.{0,70}investigat", policy, re.I)
+    assert re.search(r"do not.{0,70}(restore|rotate).{0,60}(first|before)", policy, re.I)
+
+
+def test_planned_reply_preserves_target_window_and_unconfirmed_recovery() -> None:
+    policy = " ".join(_planned_work_prose().split())
+    assert re.search(r"Ref:.{0,80}(affected|delivery).{0,40}target.{0,50}startsAt", policy, re.I)
+    assert re.search(r"matched.{0,80}Next:.{0,60}verify.{0,30}recovery", policy, re.I)
+    assert re.search(r"unavailable.{0,60}(verdict|first line).{0,50}unverified", policy, re.I)
+    assert re.search(r"out.of.scope.{0,60}(verdict|first line).{0,50}outside", policy, re.I)
+
+
+@pytest.mark.parametrize(
+    "case_id,bad",
+    [
+        (
+            "matched",
+            GOOD["matched"].replace(
+                "Next: the test owner should restore it and verify recovery; "
+                "the notice is not approval to mutate.",
+                "Next: the test owner confirms the connection came back when the window closes.",
+            ),
+        ),
+        (
+            "unavailable",
+            GOOD["unavailable"].replace(
+                "Next: the owner should provide the notice target and window and check recovery.",
+                "Next: the owner should restore or rotate the token first.",
+            ),
+        ),
+        (
+            "out-of-scope",
+            GOOD["out-of-scope"].replace(
+                "Next: the live service owner should investigate; "
+                "the test notice is not approval to mutate.",
+                "Next: the live service owner should restore or rotate the token first.",
+            ),
+        ),
+        (
+            "matched",
+            GOOD["matched"].replace("Ref: AcmeMissingToken · acme-test", "Ref: AcmeMissingToken"),
+        ),
+        ("unavailable", GOOD["unavailable"].replace("⚠️", "🔴")),
+        ("out-of-scope", GOOD["out-of-scope"] + "\nNo changes made."),
+    ],
+)
+def test_original_graders_reject_observed_owner_request_and_identity_failures(
+    case_id: str, bad: str
+) -> None:
+    suite = EvalSuite.model_validate_json((BUNDLE / "evals/cases.json").read_text())
+    case = next(c for c in suite.cases if c.id == f"sre-planned-work-{case_id}")
+    assert not case.grader.grade(bad)

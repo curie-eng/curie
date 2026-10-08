@@ -9,7 +9,8 @@ the bundle's eval cases. It does not change the platform's hook authority.
 
 SRE-ALERT-4: Preserve the provider, exact alarm name, fingerprint when supplied,
 and reported episode start in the first alert reply. Fit this compact identity
-into the closing `Ref:` line (alertname, alarm name, fingerprint, exact startsAt,
+into the closing `Ref:` line (alertname, alarm name, affected target when supplied,
+fingerprint, exact startsAt,
 labelled as reported episode data), which is always the last line of the reply. A provider wrapper such as
 `AcmeCloudWatchAlarm` does not replace the underlying alarm name such as
 `acme-dev-sandbox-turn-refused`. The timestamp remains a historical observation.

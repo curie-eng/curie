@@ -113,7 +113,16 @@ def test_the_verdict_line_starts_with_one_of_three_markers(marker: str, meaning:
     [
         ("Cause:", [r"\bplain\b", r"\bunknown\b", r"\bwindow\b"]),
         ("Next:", [r"\bwho\b|\bowner\b", r"\bnothing\b"]),
-        ("Ref:", [r"\balertname\b", r"\balarm name\b", r"\bfingerprint\b", r"\bstartsAt\b"]),
+        (
+            "Ref:",
+            [
+                r"\balertname\b",
+                r"\balarm name\b",
+                r"\btarget\b",
+                r"\bfingerprint\b",
+                r"\bstartsAt\b",
+            ],
+        ),
     ],
     ids=["cause", "next", "ref"],
 )
@@ -295,4 +304,25 @@ def test_a_green_verdict_is_never_given_on_missing_data() -> None:
     assert [item for item in _items_with(GREEN) if no_data.search(item)], (
         f"SKILL.md's reply guidance must say an empty, failed or refused read never "
         f"earns {GREEN!r}; missing data is {AMBER!r}, not calm."
+    )
+
+
+def test_generic_detail_guidance_cannot_override_the_alert_shape() -> None:
+    """Later advice previously invited commands and bullets in first alert replies."""
+    guidance = _flat(_reply_guidance())
+    assert re.search(r"queries?.{0,70}only.{0,70}(detail|follow-up)", guidance, re.I)
+    bullets = _items_with("supporting detail")
+    assert bullets and all(
+        re.search(r"(non-alert|follow-up|asked for detail)", p, re.I) for p in bullets
+    )
+
+
+def test_resolved_uncertainty_and_pending_approval_have_three_short_lines() -> None:
+    text = _flat(_skill_prose())
+    assert re.search(
+        r"both.{0,60}(unconfirmed|uncertain).{0,60}pending.{0,100}three.{0,30}lines", text, re.I
+    )
+    assert re.search(r"each.{0,30}(short sentence|sentence).{0,90}(commands|queries)", text, re.I)
+    assert re.search(
+        r"do not.{0,50}(approve|approval).{0,90}(failed|unconfirmed|unavailable)", text, re.I
     )
