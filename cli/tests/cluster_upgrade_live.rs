@@ -4004,3 +4004,156 @@ fn printed_apply_line_matches_executed_helm_argv() {
         );
     }
 }
+
+// #4322 -- the v0.12.1/v0.12.2 guide had operators set the factory metadata CI
+// policy as `api.extraEnv` GITHUB_FACTORY_METADATA_CI. The target chart owns
+// that name (`api.githubFactoryMetadataCi`), so the Validate phase's overlay
+// migration must move it, show the move in the plan, and hand Helm the object.
+
+const METADATA_CI_SENTINEL: &str = "sentinel-4322-do-not-print";
+
+fn metadata_ci_policy() -> Value {
+    serde_json::json!({
+        "acme/widgets": {
+            "checks": ["pr-body", METADATA_CI_SENTINEL],
+            "statuses": ["ci/lint"]
+        },
+        "acme/gadgets": {"checks": ["Validate PR title"]}
+    })
+}
+
+/// Retained values from an install configured the way the v0.12.2 guide said,
+/// already on the versioned configuration schema.
+fn metadata_ci_retained(value: &str) -> Value {
+    serde_json::json!({
+        "config": {"schemaVersion": "0.9.0"},
+        "api": {
+            "extraEnv": [
+                {"name": "PROVIDER_BASE_URL", "value": "https://provider.example.com/v1"},
+                {"name": "GITHUB_FACTORY_METADATA_CI", "value": value}
+            ]
+        }
+    })
+}
+
+/// AC3: dry run passes Validate and the plan names the move, not the value.
+#[test]
+fn metadata_ci_extra_env_dry_run_plans_the_migration() {
+    let legacy = serde_json::to_string_pretty(&metadata_ci_policy()).unwrap();
+    let fixture = Fixture::new(Some(&metadata_ci_retained(&legacy).to_string()));
+    let output = fixture.run_with("healthy", "0.9.0", "charts/curie", &["--dry-run"]);
+    assert!(
+        output.status.success(),
+        "the legacy entry must migrate, not refuse: {}",
+        visible(&output)
+    );
+    let plan = json(&output)["plan"].clone();
+    let lines: Vec<String> = plan
+        .as_array()
+        .unwrap_or_else(|| panic!("plan must be a list of lines: {plan}"))
+        .iter()
+        .filter_map(|line| line.as_str().map(ToOwned::to_owned))
+        .collect();
+    assert!(
+        lines.iter().any(
+            |line| line == "extraEnv GITHUB_FACTORY_METADATA_CI -> api.githubFactoryMetadataCi"
+        ),
+        "the plan must carry the migration change line: {lines:#?}"
+    );
+    assert!(
+        !visible(&output).contains(METADATA_CI_SENTINEL),
+        "the plan and output must never carry the value: {}",
+        visible(&output)
+    );
+    assert!(
+        fixture.helm_upgrades().is_empty(),
+        "a dry run must mutate nothing: {:?}",
+        fixture.argv()
+    );
+}
+
+/// AC3: the `-f` document helm is HANDED carries the object successor and no
+/// legacy entry, and keeps the unrelated extraEnv override.
+#[test]
+fn metadata_ci_extra_env_reaches_helm_as_the_object_key() {
+    let legacy = serde_json::to_string_pretty(&metadata_ci_policy()).unwrap();
+    let fixture = Fixture::new(Some(&metadata_ci_retained(&legacy).to_string()));
+    let output = fixture.local("healthy");
+    assert_eq!(
+        fixture.helm_upgrades().len(),
+        1,
+        "the upgrade must reach Apply: {:?} / {}",
+        fixture.argv(),
+        visible(&output)
+    );
+    let values = values_doc(&fixture.values(1));
+    assert_eq!(
+        values.pointer("/api/githubFactoryMetadataCi"),
+        Some(&metadata_ci_policy()),
+        "helm must receive the parsed object at the successor key: {values}"
+    );
+    let names = extra_env_names(&values);
+    assert!(
+        !names.contains(&"GITHUB_FACTORY_METADATA_CI".to_string()),
+        "the legacy entry must be gone from every extraEnv list: {values}"
+    );
+    assert!(
+        names.contains(&"PROVIDER_BASE_URL".to_string()),
+        "an unrelated extraEnv override must survive: {values}"
+    );
+    assert!(
+        !visible(&output).contains(METADATA_CI_SENTINEL),
+        "the value must stay out of command output: {}",
+        visible(&output)
+    );
+}
+
+/// AC2/AC3 negative: a value that is not a JSON object refuses at Validate,
+/// before any Helm mutation, and neither the refusal nor the plan prints it.
+#[test]
+fn metadata_ci_extra_env_non_object_refuses_before_mutation() {
+    let not_an_object = serde_json::to_string(&serde_json::json!([METADATA_CI_SENTINEL])).unwrap();
+
+    let dry = Fixture::new(Some(&metadata_ci_retained(&not_an_object).to_string()));
+    let output = dry.run_with("healthy", "0.9.0", "charts/curie", &["--dry-run"]);
+    assert!(
+        !output.status.success(),
+        "a refusing dry run fails (#2862): {}",
+        visible(&output)
+    );
+    let plan = json(&output)["plan"].to_string();
+    assert!(
+        plan.contains("refusal at validate")
+            && plan.contains("GITHUB_FACTORY_METADATA_CI")
+            && plan.contains("api.githubFactoryMetadataCi"),
+        "the plan must carry the Validate refusal naming variable and key: {plan}"
+    );
+    assert!(
+        !visible(&output).contains(METADATA_CI_SENTINEL),
+        "the refusal must never print the value: {}",
+        visible(&output)
+    );
+
+    let live = Fixture::new(Some(&metadata_ci_retained(&not_an_object).to_string()));
+    let output = live.local("healthy");
+    assert!(
+        !output.status.success(),
+        "a non-object value must refuse: {}",
+        visible(&output)
+    );
+    assert!(
+        live.helm_upgrades().is_empty(),
+        "the refusal must precede mutation: {:?}",
+        live.argv()
+    );
+    assert!(
+        live.issued(&["helm", "get", "values"]),
+        "the refusal must come from the real retained-values consumer: {:?}",
+        live.argv()
+    );
+    let reachable = format!("{}{}", visible(&output), live.persisted_payloads());
+    assert!(
+        !reachable.contains(METADATA_CI_SENTINEL),
+        "the value reached output or the persisted record: {reachable}"
+    );
+}

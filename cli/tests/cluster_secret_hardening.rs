@@ -440,6 +440,7 @@ fn pure_up() -> UpOpts {
             UNCLOSED_LIST_EXPRESSION.to_string(),
         ],
         set_string: vec![SET_STRING_EXPRESSION.to_string()],
+        set_json: vec![],
         allow_egress_host: vec![],
         resolved_egress_cidrs: vec![],
         allow_web_egress: vec![],

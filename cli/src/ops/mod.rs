@@ -162,6 +162,7 @@ mod testsupport {
             common: common(),
             github_token: plan,
             set_string: vec![],
+            set_json: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             chart: "charts/curie".into(),

@@ -5976,6 +5976,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             no_expose,
                             set,
                             set_string: vec![],
+                            set_json: vec![],
                             allow_egress_host,
                             // Populated by ops::up (resolve named providers to host
                             // routes on a live run); empty here so the pure builder and

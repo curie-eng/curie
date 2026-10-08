@@ -1352,6 +1352,7 @@ fn plan_installation_inner(
         no_expose: false,
         set: cfg.helm_sets(),
         set_string: cfg.helm_set_strings(),
+        set_json: vec![],
         allow_egress_host: cfg.egress_hosts(),
         resolved_egress_cidrs: vec![],
         allow_web_egress: vec![],
