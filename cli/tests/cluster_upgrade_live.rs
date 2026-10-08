@@ -4073,3 +4073,34 @@ fn operator_files_override_retained_values_in_admission_and_apply() {
             .any(|arg| arg.contains("PLACEHOLDER-file-secret")));
     }
 }
+
+#[test]
+fn explicit_file_repairs_a_retained_config_conflict_before_admission() {
+    // @spec CLUSTER-VALUES-FILES c3
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success(), "real Helm required");
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let fixture = Fixture::new(Some(&conflict_values("999").to_string()));
+    let file = fixture.0.path().join("repair.yaml");
+    fs::write(&file, "worker:\n  extraEnv: []\n").unwrap();
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["-f", file.to_str().unwrap()],
+        &[("VALUES_FILES_REAL_HELM", helm.trim())],
+    );
+    assert!(
+        output.status.success(),
+        "admission used superseded retained values: {}",
+        stderr(&output)
+    );
+    let applied: Value = serde_json::from_str(&fixture.values(1)).unwrap();
+    assert_eq!(
+        applied.pointer("/worker/extraEnv"),
+        Some(&serde_json::json!([]))
+    );
+}
