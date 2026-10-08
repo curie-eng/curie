@@ -840,6 +840,7 @@ def test_initial_real_valkey_connection_failure_never_grants_permission_to_probe
     key = pause_config["authoritative"]
     valkey.set(key, '{"revision":17}', px=30_000)
     recovered = False
+    recovery_tasks: list[asyncio.Task[None]] = []
     probes: list[bool] = []
     original_connect = asyncpg.connect
 
@@ -863,13 +864,16 @@ def test_initial_real_valkey_connection_failure_never_grants_permission_to_probe
                 recovered = True
 
             if recover:
-                asyncio.create_task(restore())
+                recovery_tasks.append(asyncio.create_task(restore()))
             return client
 
         monkeypatch.setattr(AsyncRedis, "from_url", classmethod(from_url))
         assert schema_compat.main(["upgrade"]) == (0 if recover else 1)
     assert all(probes), "an initial transport exception is never confirmed pause ownership"
     assert bool(probes) is recover
+    if recover:
+        assert len(recovery_tasks) == 1
+        assert recovery_tasks[0].done() and recovery_tasks[0].exception() is None
     assert renewals["errors"], "the initial real connection attempt must actually fail"
     assert current_revision() == HEAD
 
@@ -939,6 +943,7 @@ def test_moved_postgres_wait_preserves_safe_periodic_diagnostics_and_attempt_bou
     assert schema_compat.POSTGRES_ATTEMPTS == 60
     assert schema_compat.POSTGRES_RETRY_S == 2
     assert schema_compat.POSTGRES_CONNECT_TIMEOUT_S == 2
+    assert schema_compat.PAUSE_RENEW_INTERVAL_S == 100
     attempts: list[dict[str, Any]] = []
     original = asyncpg.connect
 
