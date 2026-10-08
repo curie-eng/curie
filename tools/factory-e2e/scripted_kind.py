@@ -156,6 +156,7 @@ class ScriptedRun:
         self.forward: subprocess.Popen[str] | None = None
         self.cluster_attempted = False
         self.registry_attempted = False
+        self.local_tags: list[str] = []
         self.install_started: float | None = None
         self.deadline: float | None = None
         self.secrets = [os.environ.get("CURIE_FACTORY_RECORD_KEY")]
@@ -529,6 +530,13 @@ class ScriptedRun:
         bundle = self.workdir / "bundle"
         shutil.copytree(REPO_ROOT / "examples/dark-factory", bundle)
         self.check_disk("building the runner layer")
+        # curie build resolves the runner base with buildx imagetools, which
+        # reads a registry and never the local daemon, so the base goes to the
+        # run's own registry first.
+        runner_base = f"{registry_ref}/curie-runner:latest"
+        self.local_tags.append(runner_base)
+        self.command("docker", "tag", "curie-runner:latest", runner_base)
+        self.command("docker", "push", runner_base, timeout=900)
         self.command(
             self.curie,
             "build",
@@ -537,7 +545,7 @@ class ScriptedRun:
             "--registry",
             registry_ref,
             "--runner-image",
-            "curie-runner:latest",
+            runner_base,
             "--platform",
             "linux/amd64",
             timeout=900,
@@ -758,6 +766,13 @@ class ScriptedRun:
                     "docker", "ps", "-aq", "--filter", f"name=^/{self.registry}$"
                 ).strip():
                     errors.append("owned registry remains after teardown")
+            except Exception as exc:
+                errors.append(str(exc))
+        for tag in self.local_tags:
+            # The tag names a port of this run's deleted registry; the image
+            # itself stays under curie-runner:latest.
+            try:
+                self.command("docker", "image", "rm", tag)
             except Exception as exc:
                 errors.append(str(exc))
         # A killed key-generation docker client can leave its --rm container
