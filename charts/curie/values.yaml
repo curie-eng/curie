@@ -1021,6 +1021,12 @@ otelCollector:
   # Network exporters must opt into bounded retry and a persistent file_storage
   # sending queue. The chart rejects an exporter that omits either protection.
   extraExporters: {}
+  # @spec charts/curie/README.md: Optional trace processors.
+  # Additional Collector processor definitions. Select IDs for traces below;
+  # selected processors run after memory_limiter and before batch. Built-in
+  # names are reserved and both keys default to no change in any pipeline.
+  extraProcessors: {}
+  extraTracePipelineProcessors: []
   # Only awsemf exporters may bypass exporterhelper validation on contrib
   # 0.119.0. Map each configured awsemf name to a nonblank reason naming the
   # exporter and checked Collector version. Other network exporters retain
