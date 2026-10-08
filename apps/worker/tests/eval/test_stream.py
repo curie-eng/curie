@@ -13,6 +13,7 @@ provisioned-runner end-to-end (no ``target_url``) that tears the sandbox down.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -62,6 +63,7 @@ from curie_worker.consumer_liveness import (
     consumer_heartbeat_capable_key,
     consumer_heartbeat_key,
 )
+from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.eval import (
     EvalCase,
     EvalJob,
@@ -78,6 +80,7 @@ from curie_worker.eval import stream as eval_stream_module
 from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
 from curie_worker.sandbox.types import ClaimView, QuotaRejection, SandboxError, SandboxView
+from curie_worker.stream_consumer import ConsumerLivenessExpired
 from opentelemetry import trace
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -96,6 +99,212 @@ _DB_URL = os.environ.get(
     "TEST_DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
 )
 _DB_SCHEMA = os.environ.get("TEST_DB_SCHEMA", "curie")
+
+
+@pytest.mark.parametrize(
+    ("lane", "outage_s"),
+    [
+        pytest.param("delivery", 2.9, id="delivery-29s-survives"),
+        pytest.param("liveness", 2.9, id="liveness-29s-survives"),
+        pytest.param("delivery", 5.0, id="delivery-50s-expires"),
+        pytest.param("liveness", 5.0, id="liveness-50s-expires"),
+        pytest.param("delivery-key-gone", 0.0, id="delivery-key-gone-refused"),
+        pytest.param("delivery-wrong-token", 0.0, id="delivery-wrong-token-refused"),
+    ],
+)
+def test_eval_real_suite_shares_ownership_outage_recovery_and_expiry(
+    make_eval_harness,
+    bundles,
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+    outage_s: float,
+) -> None:
+    """Both shared leases fence a real eval suite, with production clocks at 0.1.
+
+    RustFS supplies the bundle and Langfuse records the score. Only model
+    responses and the platform's report HTTP are faked. The ownership adapters
+    delegate every successful operation to real Valkey.
+    """
+    bundles_store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _runner):
+            token = uuid.uuid4().hex
+            cfg = _lease_cfg(
+                token,
+                delivery_lease_ttl_s=4.5,
+                delivery_lease_heartbeat_s=1.0,
+                consumer_heartbeat_ttl_ms=4500,
+                consumer_capability_ttl_ms=9000,
+                reclaim_min_idle_ms=6000,
+                read_block_ms=10,
+            )
+            client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+            release = asyncio.Event()
+            fake.hold_inputs["ownership-outage"] = release
+            fake.responses["ownership-outage"] = "completed"
+            bundle_ref = upload(
+                EvalSuite(
+                    name="ownership-outage",
+                    cases=[
+                        EvalCase(
+                            id="held",
+                            input="ownership-outage",
+                            grader=Grader(kind=CONTAINS, expected="completed"),
+                        )
+                    ],
+                )
+            )
+            reports: list[dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                consumer = _build_consumer(
+                    redis_client=client,
+                    cfg=cfg,
+                    bundle_store=bundles_store,
+                    substrate=_UnusedSubstrate(),
+                    reports=reports,
+                    lf_client=lf_client,
+                )
+                leases = DeliveryLeaseStore(client, cfg)
+                # Same real store that production injects at construction.
+                consumer._leases = leases
+                liveness = consumer._liveness_store
+                assert liveness is not None
+                real_heartbeat = leases.heartbeat
+                real_renew = liveness.renew
+                outage_until: float | None = None
+                failures = 0
+                heartbeat_calls = 0
+                recovered = asyncio.Event()
+                loss_calls = 0
+                real_finish_loss = consumer._finish_lease_loss
+
+                def unavailable() -> None:
+                    nonlocal failures
+                    if outage_until is not None and time.monotonic() < outage_until:
+                        failures += 1
+                        raise redis.exceptions.ConnectionError("injected eval ownership outage")
+
+                async def heartbeat(*args: Any, **kwargs: Any) -> Any:
+                    nonlocal heartbeat_calls
+                    heartbeat_calls += 1
+                    unavailable()
+                    result = await real_heartbeat(*args, **kwargs)
+                    if outage_until is not None:
+                        recovered.set()
+                    return result
+
+                async def renew(**kwargs: Any) -> bool:
+                    unavailable()
+                    result = await real_renew(**kwargs)
+                    if outage_until is not None:
+                        recovered.set()
+                    return result
+
+                async def finish_loss(*args: Any, **kwargs: Any) -> None:
+                    nonlocal loss_calls
+                    loss_calls += 1
+                    await real_finish_loss(*args, **kwargs)
+
+                if lane.startswith("delivery"):
+                    monkeypatch.setattr(leases, "heartbeat", heartbeat)
+                    monkeypatch.setattr(consumer, "_finish_lease_loss", finish_loss)
+                else:
+                    monkeypatch.setattr(liveness, "renew", renew)
+                await consumer.ensure_group()
+                entry_id = await client.xadd(
+                    cfg.eval_stream,
+                    {
+                        STREAM_PAYLOAD_FIELD: _item(
+                            suite="ownership-outage",
+                            sha=f"sha-{token}",
+                            bundle_ref=bundle_ref,
+                            target_url=base_url,
+                        ).model_dump_json()
+                    },
+                )
+                task = asyncio.create_task(consumer.run())
+                try:
+                    await _wait_until(lambda: bool(fake.seen))
+                    lease = consumer._held_leases[entry_id]
+                    started = (
+                        lease.local_deadline_monotonic - 3.5
+                        if lane == "delivery"
+                        else consumer._last_liveness_renewal
+                    )
+                    assert started is not None
+                    if outage_s > 0:
+                        outage_until = time.monotonic() + outage_s
+                    if outage_s == 0:
+                        refused_at = time.monotonic()
+                        lease_key = cfg.delivery_lease_key(
+                            cfg.eval_stream, cfg.eval_consumer_group, entry_id
+                        )
+                        if lane == "delivery-key-gone":
+                            await client.delete(lease_key)
+                        else:
+                            await client.set(lease_key, "another-owner", px=4500)
+                        await asyncio.wait_for(lease.lost.wait(), timeout=1.25)
+                        assert time.monotonic() - refused_at < 1.2
+                        await asyncio.gather(*list(consumer._lease_loss_tasks))
+                        assert loss_calls == 1
+                        await asyncio.sleep(0.05)
+                        assert heartbeat_calls == 1
+                        consumer.request_stop()
+                        release.set()
+                        await asyncio.wait_for(task, timeout=5.0)
+                        assert not reports, "a refused eval owner published a report"
+                        assert entry_id in await _eval_pending(client, cfg)
+                    elif outage_s == 2.9:
+                        await asyncio.wait_for(recovered.wait(), timeout=3.3)
+                        assert failures == 2
+                        assert not lease.lost.is_set()
+                        assert not task.done()
+                        release.set()
+                        await _wait_until(lambda: bool(reports))
+                        await _wait_until(lambda: entry_id not in consumer._inflight_ids)
+                        assert reports[0]["passed_count"] == reports[0]["total"] == 1
+                        assert entry_id not in await _eval_pending(client, cfg)
+                        assert loss_calls == 0
+                    elif lane == "delivery":
+                        await asyncio.sleep(max(0, started + 3.43 - time.monotonic()))
+                        assert not lease.lost.is_set()
+                        await asyncio.wait_for(lease.lost.wait(), timeout=0.2)
+                        assert time.monotonic() - started == pytest.approx(3.5, abs=0.07)
+                        await asyncio.gather(*list(consumer._lease_loss_tasks))
+                        assert loss_calls == 1
+                        consumer.request_stop()
+                        release.set()
+                        await asyncio.wait_for(task, timeout=5.0)
+                        assert not reports, "a fenced eval owner published a report"
+                        assert entry_id in await _eval_pending(client, cfg)
+                        assert failures == 3
+                    else:
+                        await asyncio.sleep(max(0, started + 3.43 - time.monotonic()))
+                        assert not task.done()
+                        with pytest.raises(ConsumerLivenessExpired):
+                            await asyncio.wait_for(task, timeout=0.2)
+                        assert time.monotonic() - started == pytest.approx(3.5, abs=0.07)
+                        assert not reports
+                        assert entry_id in await _eval_pending(client, cfg)
+                        assert not consumer._inflight_ids
+                        assert failures == 3
+                finally:
+                    release.set()
+                    consumer.request_stop()
+                    with contextlib.suppress(ConsumerLivenessExpired):
+                        await asyncio.wait_for(task, timeout=5.0)
+                    await client.delete(
+                        consumer_heartbeat_key(
+                            cfg.eval_stream, cfg.eval_consumer_group, cfg.eval_consumer_name
+                        ),
+                        consumer_heartbeat_capable_key(
+                            cfg.eval_stream, cfg.eval_consumer_group, cfg.eval_consumer_name
+                        ),
+                    )
+                    await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
 
 
 class _StubRepo:

@@ -609,7 +609,12 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
 )
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
 WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
-    {"runner-timeout-unconfirmed", "sandbox-capacity", "sandbox-terminated"}
+    {
+        "ownership-store-unavailable",
+        "runner-timeout-unconfirmed",
+        "sandbox-capacity",
+        "sandbox-terminated",
+    }
 )
 
 _ESCALATION_DETAIL_MAX = 300
@@ -9304,7 +9309,12 @@ class Kernel:
             # Unchanged by ADR-0117: this latches on the FIRST frame and the rule
             # reads presence, so a stream carrying one frame per call rather than
             # one per turn is the same signal to it.
-            await self._markers.mark_side_effect(qevent.event_id)
+            lease = _DELIVERY_LEASE.get()
+            if _is_fenced(lease):
+                assert lease is not None
+                await self._mark_side_effect_with_retry(qevent.event_id, acc, lease)
+            else:
+                await self._markers.mark_side_effect(qevent.event_id)
             await self._record_action(frame, acc, qevent, agent_id)
         elif isinstance(frame, ErrorEvent):
             if frame.classification:
@@ -9319,6 +9329,38 @@ class Kernel:
             acc.approval_granted_tool = frame.approval_granted_tool
             acc.approval_granted_arguments = frame.approval_granted_arguments
             acc.approval_display = frame.approval_display
+
+    async def _mark_side_effect_with_retry(
+        self, event_id: str, acc: _StreamAccumulator, lease: DeliveryLease
+    ) -> None:
+        """Hold a side-effect frame until its marker is durable (ADR 0207)."""
+
+        backoff_s = 0.5
+        while True:
+            lease.raise_if_lost()
+            remaining_s = lease.local_deadline_monotonic - time.monotonic()
+            if remaining_s <= 0:
+                break
+            try:
+                async with asyncio.timeout(remaining_s):
+                    await self._markers.mark_side_effect(event_id)
+            except Exception as exc:
+                remaining_s = lease.local_deadline_monotonic - time.monotonic()
+                if remaining_s <= 0:
+                    break
+                logger.warning(
+                    "side-effect marker write for %s raised %s; retrying while ownership is held",
+                    event_id,
+                    _exception_reason(exc),
+                )
+                await asyncio.sleep(min(backoff_s, remaining_s))
+                backoff_s = min(5.0, backoff_s * 2)
+            else:
+                lease.raise_if_lost()
+                return
+
+        acc.classification = "ownership-store-unavailable"
+        raise TimeoutError("ownership store unreachable past the local lease deadline")
 
     async def _record_action(
         self,
