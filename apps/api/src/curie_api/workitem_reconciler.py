@@ -146,7 +146,6 @@ class WorkItemReconciler:
             ("settle_overdue_cancellations", self._settle_overdue_cancellations),
             ("readmit_pending", self._readmit_pending),
             ("reconcile_missed_labels", self._reconcile_missed_labels),
-            ("sync_status_comments", self._sync_status_comments),
             ("redispatch_lapsed_acquisitions", self._redispatch_lapsed_acquisitions),
             ("publish_execute_wakes", self._publish_execute_wakes),
         ):
@@ -181,6 +180,17 @@ class WorkItemReconciler:
                 raise
             except Exception:
                 logger.exception("work item reconciler pass failed")
+            await asyncio.sleep(self._settings.work_item_reconciler_interval_seconds)
+
+    async def run_status_comments_forever(self) -> None:
+        """Keep GitHub status I/O independent of dispatch and lease reconciliation."""
+        while True:
+            try:
+                await self._sync_status_comments()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("work item status comment pass failed")
             await asyncio.sleep(self._settings.work_item_reconciler_interval_seconds)
 
     async def _expire_waiting(self) -> None:
@@ -274,7 +284,7 @@ class WorkItemReconciler:
                                 )
                                 & (
                                     ExecutionRequest.runtime_heartbeat_expires_at
-                                    <= now
+                                    <= now - ttl
                                 )
                             )
                             | (
@@ -543,10 +553,12 @@ class WorkItemReconciler:
                 " treating the installation as not paused",
                 exc_info=True,
             )
-        async with self._sessionmaker() as session:
-            await factory_notices.sync_status_comments(
-                session, self._settings, paused_for_upgrade=paused_for_upgrade
-            )
+        await factory_notices.sync_status_comments(
+            self._sessionmaker,
+            self._settings,
+            owner=self._owner,
+            paused_for_upgrade=paused_for_upgrade,
+        )
 
     async def _publish_execute_wakes(self) -> None:
         async with self._sessionmaker() as session:

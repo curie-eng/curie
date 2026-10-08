@@ -447,8 +447,9 @@ async def create_publication(
                 )
             # A Python check can be declared under any id, so every stored check
             # counts: any failure refuses a Python change and any unavailable check
-            # stamps the unavailable disclosure. Only when nothing was unavailable
-            # does a missing ``python`` check stamp the not-declared pair.
+            # stamps the unavailable disclosure, which names each unavailable check
+            # in recorded order. Only when nothing was unavailable does a missing
+            # ``python`` check stamp the not-declared pair.
             if factory_progress.failed_verification(observations) is not None:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
@@ -467,9 +468,18 @@ async def create_publication(
                 )
             )
             statements: tuple[str, ...] = ()
-            if any(observation.outcome == "unavailable" for observation in observations):
+            unavailable = [
+                observation for observation in observations if observation.outcome == "unavailable"
+            ]
+            if unavailable:
+                named = ", ".join(
+                    f"{observation.check} (delegated to {observation.delegated_to})"
+                    if observation.delegated_to
+                    else f"{observation.check}"
+                    for observation in unavailable
+                )
                 statements = (
-                    "In-sandbox verification was unavailable.",
+                    f"In-sandbox verification was unavailable for: {named}.",
                     pending_proof,
                 )
             elif factory_progress.python_verification(observations) is None:

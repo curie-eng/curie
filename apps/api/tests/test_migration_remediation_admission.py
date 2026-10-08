@@ -17,8 +17,8 @@ docs/superpowers/specs/2026-10-07-automated-remediation.md:
   recorded on the nomination as ``approval_reason`` (nullable text), one of the
   frozen ``approval_reasons`` of ``tests/vectors/remediation-codes.json``.
 
-The revision is ``0093``, directly on the remediation approvals revision
-``0092`` (plan task 10). If another revision lands first, renumber: only
+The revision is ``0093a``, directly on the remediation approvals revision
+``0092a`` (plan task 10). If another revision lands first, renumber: only
 ``BELOW`` and ``HEAD`` move. The revision is located by its id and checked to
 carry this change. Hand-written and additive (ADR 0117). Every identifier is
 a placeholder.
@@ -43,8 +43,8 @@ from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy.exc import IntegrityError
 
-BELOW = "0092"
-HEAD = "0093"
+BELOW = "0092a"
+HEAD = "0093a"
 
 _CODES = json.loads(
     (

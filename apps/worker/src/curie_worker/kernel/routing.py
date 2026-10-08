@@ -22,6 +22,7 @@ from channel_protocol.reply import (
     ReplyUpdate,
 )
 
+from ..api_retry import DEFAULT_BUDGET_S
 from ..behaviorpacks import (
     NavPack,
 )
@@ -51,6 +52,11 @@ if TYPE_CHECKING:
 
 from . import approval_key, constants, log
 from .log import logger
+
+
+def _api_write_budget_s() -> float:
+    lease = constants._DELIVERY_LEASE.get()
+    return DEFAULT_BUDGET_S if lease is None else min(DEFAULT_BUDGET_S, lease.remaining_s())
 
 
 def _lifecycle_event(name: str, outcome: str) -> None:

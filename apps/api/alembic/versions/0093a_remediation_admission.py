@@ -1,7 +1,7 @@
 """Remediation admission: breakers, reservations, the approval reason (AR-8 to AR-11)
 
-Revision ID: 0093
-Revises: 0092
+Revision ID: 0093a
+Revises: 0092a
 Create Date: 2026-10-07
 
 Hand-written and additive (ADR 0117 found autogenerate unsafe against the
@@ -49,8 +49,8 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision: str = "0093"
-down_revision: str | None = "0092"
+revision: str = "0093a"
+down_revision: str | None = "0092a"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

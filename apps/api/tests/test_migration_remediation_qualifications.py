@@ -8,7 +8,7 @@ tool, connector_digest, verifier declaration digest)``, the evidence the API
 checked when the record was written. The verifier runs it references live
 beside it in ``remediation_qualification_verifier_runs``.
 
-Revision: ``0094`` on plan task 9's admission revision ``0093``. If another
+Revision: ``0094`` on plan task 9's admission revision ``0093a``. If another
 revision lands first, renumber and move ``BELOW`` and ``HEAD`` here and the
 head pins. The revision is otherwise found by its source (it creates
 ``remediation_qualifications``), so a renumbering only moves the two constants.
@@ -25,7 +25,7 @@ from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy.exc import DBAPIError
 
-BELOW = "0093"
+BELOW = "0093a"
 HEAD = "0094"
 TABLES = ("remediation_qualifications", "remediation_qualification_verifier_runs")
 
@@ -76,7 +76,7 @@ def test_one_hand_written_revision_on_the_assumed_parent() -> None:
 
     revision, down = _revision()
     assert (revision, down) == (HEAD, BELOW)
-    assert ScriptDirectory.from_config(alembic_config()).get_heads() == ["0098"]
+    assert ScriptDirectory.from_config(alembic_config()).get_heads() == ["0099"]
 
 
 def test_the_record_is_keyed_by_what_it_qualifies(

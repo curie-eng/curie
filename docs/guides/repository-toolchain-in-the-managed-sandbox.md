@@ -217,9 +217,11 @@ substitute test runner or shim. If the repository's checks cannot be installed
 from files already in the checkout, say that verification inside the sandbox is
 unavailable. For a factory Python change, publication is allowed only when the
 changed path selects the required Python CI job. The pull request must say
-"In-sandbox verification was unavailable." and that the required CI check had
-not reported when this pull request was opened; the issue status comment
-reports its result. The factory
+"In-sandbox verification was unavailable for: <check id> (delegated to <CI job>)."
+and that the required CI check had not reported when this pull request was
+opened; the issue status comment reports its result. The sentence names every
+unavailable check, comma separated in recorded order, and the parenthetical
+appears only when the check declares `delegated_to`. The factory
 does not report success until that job runs and passes. Other changes still
 need a runnable check before publication.
 
@@ -311,7 +313,7 @@ released. A `not_declared` record takes no route and still starts the model.
 
 For a factory Python change, any failed check refuses publication. A delegated
 check that could not run stamps the pull request with "In-sandbox verification
-was unavailable." and says that "<check> had not reported when this pull request
+was unavailable for: <check> (delegated to <delegated_to>)." and says that "<check> had not reported when this pull request
 was opened; the issue status comment reports its result." With no configured
 check, that sentence names Repository CI instead of the check. With no check
 named `python`, the stamp says "The repository declares no in-sandbox

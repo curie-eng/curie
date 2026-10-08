@@ -174,6 +174,10 @@ def _execute_failure_code(phase: str, status: int | None, refused: object) -> st
     return "runner_unavailable"
 
 
+class RunnerSnapshotReadError(RunnerError):
+    """The publication snapshot could not be read or validated at its boundary."""
+
+
 class RunnerStreamTimeout(TimeoutError):
     """The turn exceeded its deadline during transport or frame handling.
 
@@ -723,11 +727,15 @@ class RunnerClient:
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
+                if resp.status >= 500:
+                    raise RunnerSnapshotReadError(f"/v1/snapshot -> {resp.status}: {body}")
                 raise RunnerError(f"/v1/snapshot -> {resp.status}: {body}")
+            raw = bytearray()
             try:
-                raw = await resp.content.read(self._snapshot_body_max_bytes + 1)
-                if len(raw) > self._snapshot_body_max_bytes:
-                    raise ValueError("snapshot response exceeds its encoded byte limit")
+                async for chunk in resp.content.iter_chunked(65_536):
+                    raw.extend(chunk)
+                    if len(raw) > self._snapshot_body_max_bytes:
+                        raise ValueError("snapshot response exceeds its encoded byte limit")
                 body = json.loads(raw)
                 encoded = body["patch_base64"]
                 if not isinstance(encoded, str):
@@ -765,7 +773,10 @@ class RunnerClient:
                     publication_body=description,
                 )
             except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
-                raise RunnerError("/v1/snapshot returned an invalid bounded payload") from exc
+                raise RunnerSnapshotReadError(
+                    "/v1/snapshot returned an invalid bounded payload "
+                    f"after {len(raw)} bytes: {type(exc).__name__}: {str(exc)[:160]}"
+                ) from exc
 
     async def status(
         self,

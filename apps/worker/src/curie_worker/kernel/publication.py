@@ -30,7 +30,9 @@ from ..sandbox.types import (
     SandboxHandle,
 )
 from ..workitem_dispatch import (
+    WorkItemConflict,
     WorkItemRun,
+    WorkItemTransportError,
     parse_work_item_event_id,
 )
 
@@ -138,6 +140,19 @@ async def _bind_publication_context(
     return event.model_copy(update={"publication_context": context}), remaining_s
 
 
+async def _request_not_running(self: Kernel, run: WorkItemRun) -> str | None:
+    """The request status when it is readable and not running, else None."""
+
+    if self._work_items is None:
+        return None
+    try:
+        async with asyncio.timeout(constants._REQUEST_STATUS_READ_TIMEOUT_S):
+            view = await self._work_items.get_request(run.request_id)
+    except (WorkItemConflict, WorkItemTransportError, TimeoutError):
+        return None
+    return None if view.status == "running" else view.status
+
+
 async def _continue_unpublished(
     self: Kernel,
     qevent: QueuedTurn,
@@ -176,6 +191,12 @@ async def _continue_unpublished(
         return outcome
     left = run.bound_remaining_s(remaining_s)
     if left is not None and left <= constants._MIN_ATTEMPT_BUDGET_S:
+        return outcome
+    # #4191: the request status is the authority for a requested cancel; a
+    # cancelled request is not re-prompted.
+    status = await self._request_not_running(run)
+    if status is not None:
+        logger.info("work-item continuation skipped for %s: request %s", qevent.event_id, status)
         return outcome
     early = failures._unpublished_cause(outcome.tools_called) == "early_stop"
     prompt = constants._EARLY_STOP_PROMPT if early else constants._UNPUBLISHED_PROMPT
@@ -237,7 +258,14 @@ async def _continue_unpublished(
     except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
         # The agent never saw the prompt, so the ending is the runner's: the
         # normal failure policy (retry, or escalate after a side effect)
-        # decides, not early_stop.
+        # decides, not early_stop. A cancel that landed after the status
+        # read above stops the continuation instead (#4191).
+        status = await self._request_not_running(run)
+        if status is not None:
+            logger.info(
+                "work-item continuation stopped for %s: request %s", qevent.event_id, status
+            )
+            return outcome
         logger.warning(
             "work-item continuation failed to start for %s",
             qevent.event_id,

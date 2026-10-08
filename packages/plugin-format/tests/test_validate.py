@@ -704,7 +704,7 @@ def test_malformed_secrets_shape_is_rejected(tmp_path: Path) -> None:
     assert not validate_bundle(bundle).valid
 
 
-# ADR 0209: `optionalSecrets` names secrets a bundle can use but does not need.
+# ADR 0210: `optionalSecrets` names secrets a bundle can use but does not need.
 def test_valid_optional_secrets_pass(tmp_path: Path) -> None:
     bundle = _bundle(
         tmp_path,
@@ -752,7 +752,7 @@ def test_malformed_optional_secrets_shape_is_rejected(tmp_path: Path) -> None:
     (tmp_path / "b").mkdir()
     bundle = _bundle(tmp_path / "a", '{"name": "demo", "optionalSecrets": "nope"}')
     assert not validate_bundle(bundle).valid
-    # The object form ADR 0209 rejected is not accepted either.
+    # The object form ADR 0210 rejected is not accepted either.
     bundle = _bundle(tmp_path / "b", '{"name": "demo", "optionalSecrets": [{"name": "X"}]}')
     assert not validate_bundle(bundle).valid
 

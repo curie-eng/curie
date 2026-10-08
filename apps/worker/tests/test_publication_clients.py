@@ -149,7 +149,9 @@ async def test_enterprise_publication_credential_refuses_foreign_clone_origins(
             await credential_client.redeem(PUBLICATION_ID)
 
 
-@pytest.mark.parametrize("returned_base", ["https://github.example.com/forge", "https://github.com"])
+@pytest.mark.parametrize(
+    "returned_base", ["https://github.example.com/forge", "https://github.com"]
+)
 async def test_enterprise_lineage_lookup_validates_the_configured_html_origin(
     returned_base: str,
 ) -> None:
@@ -322,6 +324,183 @@ async def test_missing_job_recovery_reads_the_exact_lineage_branch_head() -> Non
         f"/repos/{REPO}/git/ref/heads/curie%2Fthread-lineage-example"
     )
     assert requests[0].headers["Authorization"] == "Bearer rotated-installation-token"
+
+
+async def _call_github_error_site(lookup: GitHubPublicationLookup, site: str) -> None:
+    if site == "branch_head":
+        await lookup.read_branch_head(REPO, BRANCH, "Bearer fixture-publication-token")
+    else:
+        await lookup.recover_pr_by_head(
+            REPO,
+            BRANCH,
+            "Update repository",
+            "Approved platform publication.",
+            expected_head_sha=REVISION_HEAD,
+            authorization_header="Bearer fixture-publication-token",
+            base="main",
+        )
+
+
+@pytest.mark.parametrize("site", ["branch_head", "deterministic_branch", "create_pull"])
+@pytest.mark.parametrize(
+    ("message", "request_id"),
+    [
+        ("Server Error", "ABCD:1234"),
+        ("Provider temporarily unavailable. " + "x" * 250, "EXAMPLE:REQUEST:ID"),
+    ],
+)
+async def test_github_publication_error_reports_status_request_id_and_clipped_message(
+    site: str,
+    message: str,
+    request_id: str,
+) -> None:
+    # GitHub documents JSON `message` errors and X-GitHub-Request-Id support:
+    # https://docs.github.com/en/rest/using-the-rest-api/troubleshooting-the-rest-api
+    # https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == f"/repos/{REPO}/pulls" and request.method == "GET":
+            return httpx.Response(200, json=[])
+        if site == "create_pull" and request.method == "GET":
+            return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
+        return httpx.Response(
+            500,
+            headers={"X-GitHub-Request-Id": request_id},
+            json={"message": f"  {message}  "},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError) as caught:
+            await _call_github_error_site(GitHubPublicationLookup(client), site)
+
+    assert str(caught.value).endswith(
+        f"HTTP 500; request id {request_id}; message: {message[:200]}"
+    )
+    if len(message) > 200:
+        assert message[:201] not in str(caught.value)
+    if site == "create_pull":
+        assert [request.method for request in requests] == ["GET", "GET", "POST", "GET"]
+    elif site == "deterministic_branch":
+        assert [request.method for request in requests] == ["GET", "GET"]
+    else:
+        assert [request.method for request in requests] == ["GET"]
+
+
+@pytest.mark.parametrize("site", ["branch_head", "deterministic_branch", "create_pull"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"not JSON",
+        b"[]",
+        b"null",
+        b"{}",
+        b'{"message": 17}',
+        b'{"message": "   "}',
+    ],
+)
+async def test_github_publication_error_survives_missing_or_unusable_message(
+    site: str,
+    content: bytes,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/pulls" and request.method == "GET":
+            return httpx.Response(200, json=[])
+        if site == "create_pull" and request.method == "GET":
+            return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
+        return httpx.Response(500, content=content)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(PublicationReconcileError) as caught:
+            await _call_github_error_site(GitHubPublicationLookup(client), site)
+
+    assert str(caught.value).endswith("returned HTTP 500")
+    assert "request id" not in str(caught.value)
+    assert "message:" not in str(caught.value)
+
+
+@pytest.mark.parametrize("site", ["branch_head", "deterministic_branch"])
+async def test_missing_github_branch_remains_a_normal_recovery_result(site: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/pulls":
+            return httpx.Response(200, json=[])
+        return httpx.Response(
+            404,
+            headers={"X-GitHub-Request-Id": "EXAMPLE:REQUEST:ID"},
+            json={"message": "Not Found"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        lookup = GitHubPublicationLookup(client)
+        if site == "branch_head":
+            assert (
+                await lookup.read_branch_head(REPO, BRANCH, "Bearer fixture-publication-token")
+                is None
+            )
+        else:
+            assert (
+                await lookup.recover_pr_by_head(
+                    REPO,
+                    BRANCH,
+                    "Update repository",
+                    "Approved platform publication.",
+                    expected_head_sha=REVISION_HEAD,
+                    authorization_header="Bearer fixture-publication-token",
+                    base="main",
+                )
+                is None
+            )
+
+
+@pytest.mark.parametrize("post_status", [201, 500])
+async def test_create_success_or_recovered_pull_wins_over_provider_error_details(
+    post_status: int,
+) -> None:
+    pull = {
+        "number": 123,
+        "html_url": PR_URL,
+        "state": "open",
+        "merged_at": None,
+        "title": "Update repository",
+        "body": "Approved platform publication.",
+        "head": {
+            "ref": BRANCH,
+            "sha": REVISION_HEAD,
+            "repo": {"full_name": REPO},
+        },
+        "base": {"ref": "main", "repo": {"full_name": REPO}},
+    }
+    post_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal post_calls
+        if request.method == "POST":
+            post_calls += 1
+            return httpx.Response(
+                post_status,
+                headers={"X-GitHub-Request-Id": "EXAMPLE:REQUEST:ID"},
+                json=pull if post_status == 201 else {"message": "Provider error"},
+            )
+        if request.url.path == f"/repos/{REPO}/pulls":
+            return httpx.Response(200, json=[pull] if post_calls else [])
+        return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        recovered = await GitHubPublicationLookup(client).recover_pr_by_head(
+            REPO,
+            BRANCH,
+            "Update repository",
+            "Approved platform publication.",
+            expected_head_sha=REVISION_HEAD,
+            authorization_header="Bearer fixture-publication-token",
+            base="main",
+        )
+
+    assert recovered is not None
+    assert recovered.url == PR_URL
+    assert recovered.head_sha == REVISION_HEAD
+    assert post_calls == 1
 
 
 @pytest.mark.parametrize(

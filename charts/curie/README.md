@@ -1083,23 +1083,38 @@ true`, gated also on `agentSandbox.controller.deploy` (also default true).
    crash-loops and no SandboxClaim ever binds. The Deployment has no
    readiness probe, so `rollout status` can pass while the manager still
    blocks on cache sync.
-2. Each poll checks current logs, pod restarts, and previous logs when available
-   before accepting a success signal. A forbidden-NetworkPolicy log, lost
-   leader-election lease, or pod restart fails the gate with its existing
-   cause-specific diagnostic.
-3. The Job passes when it observes "Starting workers" or a positive sum of
+2. Each poll first fails on a forbidden-NetworkPolicy line in the current
+   controller log.
+3. It then passes on a stable serving leader (issue #4197): the controller
+   Deployment has finished rolling out its current generation, the
+   leader-election Lease names a current Running, Ready, non-terminating
+   controller pod, the same holder has led for at least
+   `preflights.controllerReady.stableLeaderSeconds` (default 180, minimum 150),
+   and it renews the Lease while the hook watches. A manager whose informer
+   caches cannot sync exits after the 120s controller-runtime cache-sync
+   timeout and loses the lease, so a longer continuous term proves sync. This
+   is what lets an upgrade that does not restart the controller pass, even
+   when its startup log has rotated away, its metrics port is unreachable
+   from the control plane, or it restarted long before the upgrade. Both lease
+   timestamps come from the controller, so the hook node's clock does not
+   matter.
+4. Otherwise it checks pod restarts and previous logs. A lost leader-election
+   lease or a pod restart fails the gate with its existing cause-specific
+   diagnostic. A controller this upgrade restarted holds a fresh lease, so it
+   is judged here.
+5. The Job then passes when it observes "Starting workers" or a positive sum of
    `controller_runtime_reconcile_total` samples with `result="success"` from
    the current Running controller pod. It reads metrics on port 8080 through
    the Kubernetes pod proxy. Successful reconciles require synced informer
    caches, and their counter persists when the startup log rotates away.
    Failed metrics requests and zero successful reconciles keep polling within
    `preflights.controllerReady.timeoutSeconds` (default 180).
-4. An upgrade over a crash-looping controller may need a manual pod delete
+6. An upgrade over a crash-looping controller may need a manual pod delete
    plus `helm test`, because the hook waits for a healthy controller that
    never arrives.
-5. Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
+7. Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
    `preflights.controllerReady.enabled: false`.
-6. Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
+8. Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
 
 ## Single-node footprint (measured on a disposable single-node k3s cluster, 4 GB / 4 core)
 

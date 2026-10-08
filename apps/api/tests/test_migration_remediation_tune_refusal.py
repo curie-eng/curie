@@ -30,7 +30,7 @@ from sqlalchemy.exc import IntegrityError
 
 BELOW = "0095"
 REVISION = "0096"
-HEAD = "0098"
+HEAD = "0099"
 TUNE_REFUSAL = "tune_execution_not_automated"
 REFUSAL_CHECK = "remediation_nominations_refusal_ck"
 

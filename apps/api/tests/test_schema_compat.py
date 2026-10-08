@@ -87,6 +87,47 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert kinds["0016"] == KIND_IRREVERSIBLE
 
 
+@pytest.mark.parametrize("branch_head", ["0093", "0098"])
+def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_rows(
+    isolated_migration_db: IsolatedMigrationDb, branch_head: str
+) -> None:
+    """A released stable database and a feature database converge at the merge."""
+    isolated_migration_db.at(branch_head)
+    agent_id = uuid.uuid4()
+    _exec(
+        "INSERT INTO curie.agents(id,name) VALUES (:id,'merge-example')",
+        {"id": agent_id},
+    )
+    result = apply_upgrade(forward_only=False, alembic_config=alembic_config())
+    assert result.action == "apply"
+    assert result.outcome == "applied"
+    assert result.rollback_compatible is True
+    pending = {step.revision for step in result.pending}
+    if branch_head == "0093":
+        assert {"0082", "0091a", "0092a", "0093a", "0098", "0099"} <= pending
+        assert not pending & {"0091", "0092", "0093"}
+    else:
+        assert pending == {"0091", "0092", "0093", "0099"}
+    assert current_revision() == "0099"
+    assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
+        ("merge-example",)
+    ]
+    columns = {
+        (table, column)
+        for table, column in sql_rows(
+            "SELECT table_name,column_name FROM information_schema.columns "
+            "WHERE table_schema='curie'"
+        )
+    }
+    assert {
+        ("execution_requests", "owner_lost_retry"),
+        ("execution_requests", "start_deferrals"),
+        ("factory_terminal_notices", "sync_owner"),
+        ("remediation_nominations", "execution_code"),
+        ("remediation_nominations", "approval_reason"),
+    } <= columns
+
+
 def test_planner_refuses_0041_contract_without_forward_only() -> None:
     window = AppWindow(schema_min=CONTRACT, schema_head=CONTRACT)
     kinds = {PREV: KIND_EXPAND, CONTRACT: KIND_CONTRACT}

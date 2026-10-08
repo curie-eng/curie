@@ -270,7 +270,9 @@ def _pending_from_script(
         return ()
     lower = current or "base"
     try:
-        revisions = list(script.iterate_revisions(target_head, lower))
+        # Match Alembic's upgrade traversal: include missing sibling ancestors
+        # at a merge even when they are not descendants of the live branch.
+        revisions = list(script.iterate_revisions(target_head, lower, implicit_base=True))
     except Exception:  # noqa: BLE001 - existing broad catch retained
         if current is None:
             return (target_head,)

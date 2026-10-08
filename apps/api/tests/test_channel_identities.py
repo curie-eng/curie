@@ -377,7 +377,7 @@ def test_duplicate_tenant_provider_name_rejected(migrated: None) -> None:
     _rolled_back(body)
 
 
-def test_identities_can_share_an_installation_with_different_names(migrated: None) -> None:
+def test_identities_can_share_an_installation_with_different_names(clean_identities: None) -> None:
     """Two bots in one Slack workspace: one installation, two names.
 
     ADR 0168 decision 1's whole point -- a row is a channel identity, not a

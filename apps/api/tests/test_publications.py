@@ -2100,7 +2100,9 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
         def __init__(self, engine: Any) -> None:
             self.engine = engine
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest, *, budget_s: float = 120
+        ) -> CreatedPublication:
             sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 data = PublicationCreate.model_validate(request.to_json())
@@ -6813,6 +6815,9 @@ def _record_factory_verification(
     outcome: str = "unavailable",
     check: str = "python",
     command: str = "uv run pytest unitconv/tests -q",
+    delegated_to: str | None = None,
+    blocked_services: list[str] | None = None,
+    missing_binaries: list[str] | None = None,
 ) -> Any:
     observation: dict[str, Any]
     if outcome == "not_declared":
@@ -6830,9 +6835,15 @@ def _record_factory_verification(
             "command": command,
             "outcome": outcome,
             "exit_status": {"unavailable": None, "passed": 0}.get(outcome, 1),
-            "missing_binaries": ["uv"] if outcome == "unavailable" else [],
-            "blocked_services": [],
+            "missing_binaries": (
+                missing_binaries
+                if missing_binaries is not None
+                else (["uv"] if outcome == "unavailable" else [])
+            ),
+            "blocked_services": blocked_services or [],
         }
+        if delegated_to is not None:
+            observation["delegated_to"] = delegated_to
     token = sandbox_token.mint(
         get_settings().api_key,
         agent=str(request_id),
@@ -6883,7 +6894,7 @@ def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_bod
         {"id": publication_id},
     )[0]["body"]
     assert payload["body"] in body
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: python." in body
     assert (
         "Unit conversion suite had not reported when this pull request was opened; "
         "the issue status comment reports its result."
@@ -6924,7 +6935,7 @@ def test_factory_python_publication_with_no_declared_check_states_it_was_not_dec
     assert payload["body"] in body
     assert _NOT_DECLARED_STAMP in body
     assert _PENDING_PROOF_STAMP in body
-    assert "In-sandbox verification was unavailable." not in body
+    assert "In-sandbox verification was unavailable" not in body
     assert "pending proof" not in body
     assert "No in-sandbox Python verification check was declared." not in body
     assert "verification passed" not in body.casefold()
@@ -6950,7 +6961,7 @@ def test_factory_python_publication_with_only_a_rust_check_is_not_declared_for_p
     body = _factory_publication_body(created.json()["id"])
     assert _NOT_DECLARED_STAMP in body
     assert _PENDING_PROOF_STAMP in body
-    assert "In-sandbox verification was unavailable." not in body
+    assert "In-sandbox verification was unavailable" not in body
 
 
 def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
@@ -6986,7 +6997,7 @@ def test_factory_python_publication_uses_the_python_check_among_several(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: python." in body
     assert _PENDING_PROOF_STAMP in body
     assert _NOT_DECLARED_STAMP not in body
 
@@ -7053,11 +7064,81 @@ def test_factory_python_publication_stamps_an_unavailable_check_under_any_id(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: api." in body
     assert _PENDING_PROOF_STAMP in body
     assert _NOT_DECLARED_STAMP not in body
     assert "pending proof" not in body
     assert "No in-sandbox Python verification check was declared." not in body
+
+
+def test_factory_python_publication_names_only_the_unavailable_check_with_its_delegate(
+    _conversion_python_ci: None,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    passed = _record_factory_verification(client, request_id, outcome="passed")
+    assert passed.status_code == 201, passed.text
+    unavailable = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="pgstore",
+        command="uv run pytest pgstore/tests -q",
+        blocked_services=["postgres"],
+        missing_binaries=[],
+        delegated_to="pgstore (postgres)",
+    )
+    assert unavailable.status_code == 201, unavailable.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert (
+        "In-sandbox verification was unavailable for: pgstore (delegated to pgstore (postgres))."
+    ) in body
+    assert "In-sandbox verification was unavailable." not in body
+    assert "unavailable for: python" not in body
+    assert _PENDING_PROOF_STAMP in body
+    assert _NOT_DECLARED_STAMP not in body
+
+
+def test_factory_python_publication_names_every_unavailable_check_in_recorded_order(
+    _conversion_python_ci: None,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    passed = _record_factory_verification(client, request_id, outcome="passed")
+    assert passed.status_code == 201, passed.text
+    first = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="pgstore",
+        command="uv run pytest pgstore/tests -q",
+        blocked_services=["postgres"],
+        missing_binaries=[],
+        delegated_to="pgstore (postgres)",
+    )
+    assert first.status_code == 201, first.text
+    second = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="api",
+        command="uv run pytest tests -q",
+    )
+    assert second.status_code == 201, second.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert (
+        "In-sandbox verification was unavailable for: "
+        "pgstore (delegated to pgstore (postgres)), api."
+    ) in body
+    assert _PENDING_PROOF_STAMP in body
 
 
 def test_factory_python_publication_refuses_a_missing_preflight_observation(
@@ -7147,7 +7228,7 @@ def test_later_non_python_publication_keeps_prior_python_proof_pending(
     created = _post_factory_publication(client, later)
 
     assert created.status_code == 201, created.text
-    assert "In-sandbox verification was unavailable." in created.json()["body"]
+    assert "In-sandbox verification was unavailable for: python." in created.json()["body"]
     assert _PENDING_PROOF_STAMP in created.json()["body"]
 
 
@@ -7192,7 +7273,7 @@ def test_outside_python_layout_without_a_policy_accepts_any_python_path(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: python." in body
     assert _REPOSITORY_PENDING_PROOF in body
 
 

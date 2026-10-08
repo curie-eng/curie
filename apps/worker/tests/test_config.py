@@ -31,6 +31,39 @@ from pydantic import AliasChoices, ValidationError
 from redis.asyncio import Redis as AsyncRedis
 
 
+def test_default_ownership_clocks_share_a_thirty_five_second_failure_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    config = WorkerConfig()
+    store = DeliveryLeaseStore(None, config)  # type: ignore[arg-type]
+    consumer = Consumer(
+        redis=None,
+        kernel=None,
+        config=config,
+        leases=store,  # type: ignore[arg-type]
+    )
+    assert config.consumer_heartbeat_ttl_ms == 45000
+    assert config.delivery_lease_ttl_s == 45.0
+    assert store.heartbeat_interval_s == 10.0
+    assert store.ownership_window_s == 35.0
+    assert consumer._liveness_refresh_interval_s() == 10.0
+    assert config.consumer_heartbeat_ttl_ms / 1000 - consumer._liveness_refresh_interval_s() == 35.0
+
+    shorter = WorkerConfig(consumer_heartbeat_ttl_ms=9000)
+    short_consumer = Consumer(
+        redis=None,
+        kernel=None,
+        config=shorter,
+        leases=None,  # type: ignore[arg-type]
+    )
+    assert short_consumer._liveness_refresh_interval_s() == 3.0
+    assert (
+        shorter.consumer_heartbeat_ttl_ms / 1000 - short_consumer._liveness_refresh_interval_s()
+        == 6.0
+    )
+
+
 def _clear_all_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Delete every env var the config could read, for a clean-env baseline.
 
@@ -598,7 +631,7 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     # Crash recovery
     assert config.reclaim_min_idle_ms == 900000
     assert config.dead_consumer_idle_ms == 15000
-    assert config.consumer_heartbeat_ttl_ms == 15000
+    assert config.consumer_heartbeat_ttl_ms == 45000
     assert config.consumer_capability_ttl_ms == 1800000
     # Slack edit throttle
     assert config.slack_edit_min_interval_s == 0.7

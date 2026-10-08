@@ -664,6 +664,46 @@ def test_failed_names_terminal_cause_and_delivery_budget(
     _assert_common(body)
 
 
+def test_failed_start_failed_names_the_attempts_and_last_reason(
+    stack: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """#4170: the sandbox never started, so the fifth start deferral failed it."""
+
+    agent = _agent(stack, auth_headers)
+    facts = _facts(agent["agent_id"])
+    seeded = _admit(facts)
+
+    async def never_starts(session: AsyncSession) -> None:
+        for _ in range(5):
+            generation = await session.scalar(
+                text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
+                {"id": facts.request_id},
+            )
+            granted = await acquire(session, facts.request_id, owner=OWNER, generation=generation)
+            assert getattr(granted, "code", None) is None, granted
+            deferred = await defer(
+                session,
+                facts.request_id,
+                owner=OWNER,
+                generation=generation,
+                reason="not_started:classified_failure",
+                capacity=False,
+            )
+            assert getattr(deferred, "code", None) is None, deferred
+
+    with_session(never_starts)
+
+    body = _detail(stack, auth_headers, seeded.work_item_id)
+
+    assert body["state"] == "failed"
+    assert body["actionable_cause"] == (
+        "failed: start_failed, the sandbox did not start after 5 attempts. "
+        "Last reason: not_started:classified_failure."
+    )
+    assert body["requests"][-1]["terminal_cause"] == "start_failed"
+    _assert_common(body)
+
+
 def test_completion_without_a_pull_request_stays_running(
     stack: TestClient, auth_headers: dict[str, str]
 ) -> None:
@@ -1996,6 +2036,7 @@ def _observe_detail(
     *,
     creds: Any = None,
     client_options: dict[str, Any] | None = None,
+    pr_number: int | None = PR_NUMBER,
 ) -> tuple[Any, list[httpx.Request]]:
     from curie_api import workitem_outcomes
 
@@ -2008,6 +2049,7 @@ def _observe_detail(
         return handler(request)
 
     lineage, work_item = _ci_inputs()
+    lineage.pr_number = pr_number
 
     async def run() -> Any:
         async with httpx.AsyncClient(
@@ -2051,6 +2093,111 @@ def test_ci_detail_reads_check_runs_statuses_and_failing_annotations(
     for request in seen:
         assert request.method == "GET"
         assert request.headers["authorization"].lower() == f"bearer {SECRET_SENTINEL}".lower()
+
+
+def test_ci_detail_reads_pull_mergeability_with_the_check_run_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Provider response types, including nullable mergeable, are documented at:
+    # https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request
+    head = _detail_handler()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}":
+            return httpx.Response(
+                200, json={"mergeable": False, "mergeable_state": "dirty", "merged": False}
+            )
+        return head(request)
+
+    detail, seen = _observe_detail(monkeypatch, handle)
+
+    assert detail.state == "observed"
+    assert detail.reason is None
+    assert detail.mergeable is False
+    assert detail.mergeable_state == "dirty"
+    assert detail.merged is False
+    pulls = [r for r in seen if r.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}"]
+    assert len(pulls) == 1
+    checks = next(r for r in seen if r.url.path.endswith(f"/commits/{HEAD_SHA}/check-runs"))
+    assert pulls[0].method == "GET"
+    assert pulls[0].headers["authorization"] == checks.headers["authorization"]
+    assert pulls[0].headers["authorization"] == f"Bearer {SECRET_SENTINEL}"
+    paths = [r.url.path for r in seen]
+    status_at = paths.index(f"/repos/{REPO}/commits/{HEAD_SHA}/status")
+    assert paths[status_at + 1] == f"/repos/{REPO}/pulls/{PR_NUMBER}"
+    assert {run["name"] for run in detail.check_runs} == {"unit-tests", "build"}
+
+
+@pytest.mark.parametrize("failure", ["404", "500", "timeout", "malformed", "non_object"])
+def test_ci_detail_unreadable_pull_keeps_the_readable_ci(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    head = _detail_handler()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}":
+            if failure == "timeout":
+                raise httpx.ReadTimeout("pull read timed out", request=request)
+            if failure == "malformed":
+                return httpx.Response(200, content=b"not json")
+            if failure == "non_object":
+                return httpx.Response(200, json=[])
+            return httpx.Response(int(failure), json={"message": "fixture refusal"})
+        return head(request)
+
+    detail, seen = _observe_detail(monkeypatch, handle)
+
+    assert detail.state == "observed"
+    assert detail.reason is None
+    assert detail.mergeable is None
+    assert detail.mergeable_state is None
+    assert detail.merged is None
+    assert {run["name"] for run in detail.check_runs} == {"unit-tests", "build"}
+    assert _annotation_messages(detail.annotations) == ["AssertionError: expected 2, got 1"]
+    assert len([r for r in seen if r.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}"]) == 1
+
+
+def test_ci_detail_without_a_pull_number_keeps_the_readable_ci(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    detail, seen = _observe_detail(monkeypatch, _detail_handler(), pr_number=None)
+
+    assert detail.state == "observed"
+    assert detail.reason is None
+    assert detail.mergeable is None
+    assert detail.mergeable_state is None
+    assert detail.merged is None
+    assert {run["name"] for run in detail.check_runs} == {"unit-tests", "build"}
+    assert not any("/pulls/" in request.url.path for request in seen)
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"mergeable": 0, "mergeable_state": False, "merged": "false"}, (None, None, None)),
+        ({"mergeable": "true", "mergeable_state": 1, "merged": 1}, (None, None, None)),
+        (
+            {"mergeable": None, "mergeable_state": "unknown", "merged": False},
+            (None, "unknown", False),
+        ),
+        ({"mergeable": True, "mergeable_state": "clean", "merged": True}, (True, "clean", True)),
+    ],
+)
+def test_ci_detail_copies_only_json_typed_pull_fields(
+    monkeypatch: pytest.MonkeyPatch, payload: dict[str, Any], expected: tuple[Any, Any, Any],
+) -> None:
+    head = _detail_handler()
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path == f"/repos/{REPO}/pulls/{PR_NUMBER}":
+            return httpx.Response(200, json=payload)
+        return head(request)
+
+    detail, _seen = _observe_detail(monkeypatch, handle)
+
+    assert detail.state == "observed"
+    assert detail.reason is None
+    assert (detail.mergeable, detail.mergeable_state, detail.merged) == expected
 
 
 BASE_SHA = "b" * 40

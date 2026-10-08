@@ -28,8 +28,8 @@ pub const AGENT_NAME: &str = "dark-factory";
 pub const GVISOR_OFF_SET: &str = "security.gvisor.mode=off";
 pub const POLL_INTAKE: &str = "poll";
 /// Display model matching the dark-factory bundle's `progress/phases.json`.
-/// The runner resolves the reviewers' Opus alias from the credential and override.
-pub const REVIEWER_MODEL: &str = "anthropic/claude-opus-5.5";
+/// The runner resolves the reviewers' `opus` alias from the credential and override.
+pub const REVIEWER_MODEL: &str = "openai/gpt-6.1-sol";
 /// The OpenRouter credit one factory run should have available (#3935).
 pub const RUN_CREDIT_USD: f64 = 5.0;
 

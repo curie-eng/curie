@@ -135,7 +135,7 @@ class ReviewBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-    **_: object,
+        **_: object,
     ) -> dict[str, str]:
         assert (kind, address) == ("slack", CHANNEL)
         return {
@@ -261,7 +261,7 @@ class ReviewPublicationApi:
         )
 
     async def create_publication(
-        self, request: PublicationCreateRequest
+        self, request: PublicationCreateRequest, *, budget_s: float = 120
     ) -> CreatedPublication:
         self.operations.append("create")
         self.creates.append(request)
@@ -433,8 +433,7 @@ def test_final_reserve_refusal_stops_before_steer_or_model(make_harness) -> None
     async def exercise() -> None:
         turn = _review_turn()
         refusal = (
-            "The pull request changed after GitHub feedback verification; "
-            "no model turn started."
+            "The pull request changed after GitHub feedback verification; no model turn started."
         )
         api = ReviewPublicationApi(
             turn,

@@ -93,13 +93,11 @@ when the report trails it, and `curie_gate` lines record refusals.
 
 Both reviewers declare the `opus` alias. The runner resolves it to
 `claude-opus-5-5` for a direct Anthropic credential or
-`anthropic/claude-opus-5.5` for an OpenRouter credential, using the same
+`openai/gpt-6.1-sol` for an OpenRouter credential, using the same
 credential as the main loop. Pin a reviewer model with
 `curie cluster overrides dark-factory --reviewer-model <provider-model-id>`;
 `--clear-reviewer-model` restores the credential default without changing the
-bundle. The local overrides command accepts the same flags. Opus 5.5 needs
-the runner's bundled Claude Code CLI 2.1.280 or later (claude-agent-sdk
-0.2.158 or later).
+bundle. The local overrides command accepts the same flags.
 
 The runner image caps every model request at 16000 output tokens
 (`CLAUDE_CODE_MAX_OUTPUT_TOKENS` in [`runner.Dockerfile`](runner.Dockerfile)).

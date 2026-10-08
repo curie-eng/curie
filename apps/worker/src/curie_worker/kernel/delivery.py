@@ -551,6 +551,7 @@ async def release_thread(self: Kernel, thread_key: str) -> bool:
     True if a route existed to release."""
     # An operator release ends any run parked on the thread (#3564).
     self._forget_held_work_items(thread_key=thread_key, reason="operator release")
+    await self._cancel_settling_work_items(thread_key=thread_key)
     try:
         interrupted = await asyncio.wait_for(
             self.interrupt_thread(thread_key, "operator requested a sandbox reset"),
@@ -612,6 +613,7 @@ async def interrupt_agent(self: Kernel, agent_id: uuid.UUID) -> int:
     release to run afterward on this path (unlike `release_thread`), so the
     failure is surfaced via logging rather than swallowed."""
     threads = list(self._active_by_agent.get(agent_id, set()))
+    await self._cancel_settling_work_items(agent_id=agent_id)
 
     async def _interrupt_one(thread_key: str) -> bool:
         try:

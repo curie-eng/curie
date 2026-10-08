@@ -25,6 +25,7 @@ from curie_api.workitem_dispatch import (
     finish,
     heartbeat,
     record_termination,
+    redispatch_lapsed_acquisitions,
     start,
 )
 from curie_api.workitems import lifecycle as workitems
@@ -93,10 +94,7 @@ async def _agent_with_channel(
 ) -> uuid.UUID:
     agent_id = uuid.uuid4()
     await session.execute(
-        text(
-            "INSERT INTO curie.agents (id, name, repo_full_name) "
-            "VALUES (:id, :name, :repo)"
-        ),
+        text("INSERT INTO curie.agents (id, name, repo_full_name) VALUES (:id, :name, :repo)"),
         {
             "id": agent_id,
             "name": f"acme-bot-{agent_id.hex[:8]}",
@@ -141,26 +139,30 @@ def _facts_json(facts: SimpleNamespace) -> dict[str, Any]:
 
 async def _request_row(session: AsyncSession, request_id: uuid.UUID) -> Any:
     row = (
-        await session.execute(
-            text(
-                "SELECT r.id, r.work_item_id, r.status, r.wait_deadline, "
-                "r.started_at, r.execution_deadline, r.version, "
-                "r.execution_attempts, r.capacity_deferrals, "
-                "r.dispatch_generation, r.published_generation, "
-                "r.dispatch_not_before, r.last_deferral_reason, "
-                "r.runtime_owner, r.runtime_epoch, "
-                "r.runtime_heartbeat_expires_at, r.runtime_claim_name, "
-                "r.runtime_sandbox_name, r.terminal_cause, "
-                "r.termination_observation, r.acquire_owner, "
-                "r.acquired_generation, w.version AS work_item_version, "
-                "w.cancelled_at "
-                "FROM curie.execution_requests r "
-                "JOIN curie.work_items w ON w.id = r.work_item_id "
-                "WHERE r.id = :id"
-            ),
-            {"id": request_id},
+        (
+            await session.execute(
+                text(
+                    "SELECT r.id, r.work_item_id, r.status, r.wait_deadline, "
+                    "r.started_at, r.execution_deadline, r.version, "
+                    "r.execution_attempts, r.capacity_deferrals, "
+                    "r.dispatch_generation, r.published_generation, "
+                    "r.dispatch_not_before, r.last_deferral_reason, "
+                    "r.runtime_owner, r.runtime_epoch, "
+                    "r.runtime_heartbeat_expires_at, r.runtime_claim_name, "
+                    "r.runtime_sandbox_name, r.terminal_cause, "
+                    "r.termination_observation, r.acquire_owner, r.acquire_expires_at, "
+                    "r.acquired_generation, w.version AS work_item_version, "
+                    "w.cancelled_at "
+                    "FROM curie.execution_requests r "
+                    "JOIN curie.work_items w ON w.id = r.work_item_id "
+                    "WHERE r.id = :id"
+                ),
+                {"id": request_id},
+            )
         )
-    ).mappings().one()
+        .mappings()
+        .one()
+    )
     return row
 
 
@@ -173,9 +175,7 @@ def allowlisted(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture
-def dispatch_client(
-    clean_db: None, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[TestClient]:
+def dispatch_client(clean_db: None, monkeypatch: pytest.MonkeyPatch) -> Iterator[TestClient]:
     monkeypatch.setenv("INTERNAL_WORKER_TOKEN", WORKER_TOKEN)
     monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
     monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
@@ -192,9 +192,7 @@ def test_work_items_router_is_the_internal_worker_surface() -> None:
     assert work_items.router.prefix == INTERNAL_PREFIX
 
 
-def test_admit_replay_keeps_the_stored_deadline(
-    clean_db: None, allowlisted: None
-) -> None:
+def test_admit_replay_keeps_the_stored_deadline(clean_db: None, allowlisted: None) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent_with_channel(session)
         facts = _facts(agent_id)
@@ -211,9 +209,7 @@ def test_admit_replay_keeps_the_stored_deadline(
         assert row.wait_deadline == deadline
         assert row.execution_attempts == 0
         assert row.started_at is None
-        conversation = scoped_conversation_id(
-            "slack", ADDRESS, WIRE_CONVERSATION
-        )
+        conversation = scoped_conversation_id("slack", ADDRESS, WIRE_CONVERSATION)
         stored = await session.scalar(
             text("SELECT conversation_id FROM curie.work_items WHERE id = :id"),
             {"id": first.work_item.id},
@@ -223,9 +219,7 @@ def test_admit_replay_keeps_the_stored_deadline(
     with_session(body)
 
 
-def test_concurrent_same_uuid_admit_inserts_one_row(
-    clean_db: None, allowlisted: None
-) -> None:
+def test_concurrent_same_uuid_admit_inserts_one_row(clean_db: None, allowlisted: None) -> None:
     async def setup(session: AsyncSession) -> uuid.UUID:
         return await _agent_with_channel(session)
 
@@ -249,16 +243,17 @@ def test_concurrent_same_uuid_admit_inserts_one_row(
     results = asyncio.run(race())
     replayed = sorted(bool(getattr(result, "replayed", None)) for result in results)
     assert replayed == [False, True]
-    ids = {
-        getattr(getattr(result, "request", None), "id", None) for result in results
-    }
+    ids = {getattr(getattr(result, "request", None), "id", None) for result in results}
     assert ids == {facts.request_id}
 
     async def verify(session: AsyncSession) -> None:
-        assert await session.scalar(
-            text("SELECT count(*) FROM curie.execution_requests WHERE id = :id"),
-            {"id": facts.request_id},
-        ) == 1
+        assert (
+            await session.scalar(
+                text("SELECT count(*) FROM curie.execution_requests WHERE id = :id"),
+                {"id": facts.request_id},
+            )
+            == 1
+        )
 
     with_session(verify)
 
@@ -309,9 +304,7 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
         facts = _facts(agent_id)
         admitted = await admit(session, facts)
         assert admitted.request is not None
-        unpublished = await acquire(
-            session, facts.request_id, owner=OWNER, generation=1
-        )
+        unpublished = await acquire(session, facts.request_id, owner=OWNER, generation=1)
         assert unpublished.generation == 1
         assert unpublished.work_item_id == admitted.work_item.id
         assert unpublished.conversation_id == scoped_conversation_id(
@@ -320,17 +313,11 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
         assert unpublished.wait_deadline == admitted.request.wait_deadline
         assert unpublished.repo_full_name == facts.repo_full_name
 
-        stale = await acquire(
-            session, facts.request_id, owner=OWNER, generation=0
-        )
+        stale = await acquire(session, facts.request_id, owner=OWNER, generation=0)
         assert _code(stale) == "not_published"
-        future = await acquire(
-            session, facts.request_id, owner=OWNER, generation=2
-        )
+        future = await acquire(session, facts.request_id, owner=OWNER, generation=2)
         assert _code(future) in {"not_published", "not_dispatchable"}
-        duplicate = await acquire(
-            session, facts.request_id, owner=OTHER_OWNER, generation=1
-        )
+        duplicate = await acquire(session, facts.request_id, owner=OTHER_OWNER, generation=1)
         assert _code(duplicate) == "duplicate"
 
         cancelled = await cancel(
@@ -339,10 +326,105 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
             expected_version=admitted.work_item.version,
         )
         assert cancelled.work_item.cancelled_at is not None
-        refused = await acquire(
-            session, facts.request_id, owner=OWNER, generation=1
-        )
+        refused = await acquire(session, facts.request_id, owner=OWNER, generation=1)
         assert _code(refused) == "work_item_cancelled"
+
+    with_session(body)
+
+
+def test_default_acquire_lease_and_same_owner_renewal_use_database_time(
+    clean_db: None, allowlisted: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS", raising=False)
+    monkeypatch.delenv("WORK_ITEM_ACQUIRE_LEASE_SECONDS", raising=False)
+    get_settings.cache_clear()
+
+    async def body(session: AsyncSession) -> None:
+        facts = _facts(await _agent_with_channel(session))
+        await admit(session, facts)
+        first = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        assert isinstance(first, workitem_dispatch.AcquireGrant)
+        acquired = await _request_row(session, facts.request_id)
+        now = await _now(session)
+        assert 59 <= (acquired.acquire_expires_at - now).total_seconds() <= 61
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "acquire_expires_at = clock_timestamp() + interval '5 seconds' "
+                "WHERE id = :id"
+            ),
+            {"id": facts.request_id},
+        )
+        await session.commit()
+        shortened = await _request_row(session, facts.request_id)
+        renewed = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        assert renewed == first
+        after = await _request_row(session, facts.request_id)
+        now = await _now(session)
+        assert 59 <= (after.acquire_expires_at - now).total_seconds() <= 61
+        assert after.acquire_expires_at > shortened.acquire_expires_at
+        assert (after.acquire_owner, after.acquired_generation) == (OWNER, 1)
+        refused = await acquire(session, facts.request_id, owner=OTHER_OWNER, generation=1)
+        assert _code(refused) == "duplicate"
+
+    with_session(body)
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_default_acquire_lease_redispatches_only_after_expiry(
+    clean_db: None, allowlisted: None, monkeypatch: pytest.MonkeyPatch, expired: bool
+) -> None:
+    for name in (
+        "CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS",
+        "WORK_ITEM_ACQUIRE_LEASE_SECONDS",
+        "CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS",
+        "WORK_ITEM_BACKOFF_BASE_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    get_settings.cache_clear()
+
+    async def body(session: AsyncSession) -> None:
+        facts = _facts(await _agent_with_channel(session))
+        await admit(session, facts)
+        acquired = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        assert isinstance(acquired, workitem_dispatch.AcquireGrant)
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "acquire_expires_at = clock_timestamp() "
+                "+ (:seconds * interval '1 second') WHERE id = :id"
+            ),
+            {"id": facts.request_id, "seconds": -1 if expired else 1},
+        )
+        await session.commit()
+        before = await _request_row(session, facts.request_id)
+        count = await redispatch_lapsed_acquisitions(session)
+        after = await _request_row(session, facts.request_id)
+        now = await _now(session)
+        assert count == (1 if expired else 0)
+        if expired:
+            assert after.dispatch_generation == before.dispatch_generation + 1
+            assert after.acquire_owner is None
+            assert after.acquire_expires_at is None
+            assert after.acquired_generation is None
+            assert after.last_deferral_reason == "acquire_lost"
+            assert 9 <= (after.dispatch_not_before - now).total_seconds() <= 11
+            replacement = await acquire(
+                session,
+                facts.request_id,
+                owner=OTHER_OWNER,
+                generation=after.dispatch_generation,
+            )
+            assert isinstance(replacement, workitem_dispatch.AcquireGrant)
+            assert replacement.generation == before.dispatch_generation + 1
+        else:
+            assert after.dispatch_generation == before.dispatch_generation
+            assert after.acquire_owner == OWNER
+            assert after.acquire_expires_at == before.acquire_expires_at
+            refused = await acquire(
+                session, facts.request_id, owner=OTHER_OWNER, generation=after.dispatch_generation
+            )
+            assert _code(refused) == "duplicate"
 
     with_session(body)
 
@@ -355,9 +437,7 @@ def test_defer_preserves_deadline_version_start_and_attempts(
         facts = _facts(agent_id)
         admitted = await admit(session, facts)
         assert admitted.request is not None
-        granted = await acquire(
-            session, facts.request_id, owner=OWNER, generation=1
-        )
+        granted = await acquire(session, facts.request_id, owner=OWNER, generation=1)
         assert granted.generation == 1
         before = await _request_row(session, facts.request_id)
         now = await _now(session)
@@ -455,9 +535,7 @@ def test_heartbeat_and_finish_refuse_a_stale_runtime_epoch(
             sandbox_name=SANDBOX_NAME,
         )
         before = await _request_row(session, facts.request_id)
-        stale_heartbeat = await heartbeat(
-            session, facts.request_id, runtime_epoch=2
-        )
+        stale_heartbeat = await heartbeat(session, facts.request_id, runtime_epoch=2)
         assert _code(stale_heartbeat) == "stale_owner"
         stale_finish = await finish(
             session,
@@ -475,6 +553,142 @@ def test_heartbeat_and_finish_refuse_a_stale_runtime_epoch(
         assert after.started_at == before.started_at
         assert after.execution_deadline == before.execution_deadline
         assert after.terminal_cause is None
+
+    with_session(body)
+
+
+def test_late_running_heartbeat_renews_from_database_time(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _running(session, await _agent_with_channel(session))
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "runtime_heartbeat_expires_at = clock_timestamp() "
+                "- interval '5 seconds' WHERE id = :id"
+            ),
+            {"id": facts.request_id},
+        )
+        await session.commit()
+        before = await _request_row(session, facts.request_id)
+        called_at = await _now(session)
+        assert before.runtime_heartbeat_expires_at <= called_at - timedelta(seconds=5)
+        renewed = await heartbeat(session, facts.request_id, runtime_epoch=before.runtime_epoch)
+        returned_at = await _now(session)
+        assert isinstance(renewed, workitem_dispatch.HeartbeatResult), renewed
+        assert (
+            renewed.status,
+            renewed.terminal_cause,
+            renewed.work_item_cancelled,
+        ) == ("running", None, False)
+        after = await _request_row(session, facts.request_id)
+        ttl = timedelta(seconds=get_settings().work_item_runtime_ttl_seconds)
+        assert called_at + ttl <= after.runtime_heartbeat_expires_at <= returned_at + ttl
+        assert (
+            after.status,
+            after.runtime_owner,
+            after.runtime_epoch,
+            after.version,
+            after.work_item_version,
+            after.started_at,
+            after.execution_deadline,
+            after.execution_attempts,
+        ) == (
+            before.status,
+            before.runtime_owner,
+            before.runtime_epoch,
+            before.version,
+            before.work_item_version,
+            before.started_at,
+            before.execution_deadline,
+            before.execution_attempts,
+        )
+
+    with_session(body)
+
+
+@pytest.mark.parametrize("reason", ["stale_epoch", "execution_deadline"])
+def test_late_heartbeat_preserves_epoch_and_execution_deadline_fencing(
+    clean_db: None, allowlisted: None, reason: str
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _running(session, await _agent_with_channel(session))
+        original = await _request_row(session, facts.request_id)
+        now = await _now(session)
+        started_at = (
+            now - timedelta(seconds=1801) if reason == "execution_deadline" else original.started_at
+        )
+        if reason == "execution_deadline":
+            # Seed the historical window before restoring the immutable-field guard.
+            await session.execute(text("ALTER TABLE curie.execution_requests DISABLE TRIGGER USER"))
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET started_at = :started_at, "
+                "execution_deadline = :deadline, "
+                "runtime_heartbeat_expires_at = :expired WHERE id = :id"
+            ),
+            {
+                "id": facts.request_id,
+                "started_at": started_at,
+                "deadline": started_at + timedelta(seconds=1800),
+                "expired": now - timedelta(seconds=5),
+            },
+        )
+        if reason == "execution_deadline":
+            await session.execute(text("ALTER TABLE curie.execution_requests ENABLE TRIGGER USER"))
+        await session.commit()
+        before = await _request_row(session, facts.request_id)
+        refused = await heartbeat(
+            session,
+            facts.request_id,
+            runtime_epoch=before.runtime_epoch + (reason == "stale_epoch"),
+        )
+        assert _code(refused) == "stale_owner"
+        after = await _request_row(session, facts.request_id)
+        assert dict(after) == dict(before)
+
+    with_session(body)
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["on_time", "late"])
+def test_cancellation_heartbeat_reports_only_before_lease_expiry(
+    clean_db: None, allowlisted: None, late: bool
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        facts = await _running(session, await _agent_with_channel(session))
+        running = await _request_row(session, facts.request_id)
+        cancelled = await cancel(
+            session,
+            work_item_id=running.work_item_id,
+            expected_version=running.work_item_version,
+        )
+        assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
+        now = await _now(session)
+        expiry = now + timedelta(seconds=get_settings().work_item_runtime_ttl_seconds)
+        if late:
+            expiry = now - timedelta(seconds=5)
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "runtime_heartbeat_expires_at = :expiry WHERE id = :id"
+            ),
+            {"id": facts.request_id, "expiry": expiry},
+        )
+        await session.commit()
+        before = await _request_row(session, facts.request_id)
+        result = await heartbeat(session, facts.request_id, runtime_epoch=before.runtime_epoch)
+        if late:
+            assert _code(result) == "stale_owner"
+        else:
+            assert isinstance(result, workitem_dispatch.HeartbeatResult), result
+            assert (
+                result.status,
+                result.terminal_cause,
+                result.work_item_cancelled,
+            ) == ("cancellation_requested", "issue_cancelled", True)
+        after = await _request_row(session, facts.request_id)
+        assert dict(after) == dict(before)
 
     with_session(body)
 
@@ -501,9 +715,7 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
             expected_version=admitted.work_item.version,
         )
         assert cancelled.request is not None
-        live = await claim_termination(
-            session, facts.request_id, owner=OTHER_OWNER
-        )
+        live = await claim_termination(session, facts.request_id, owner=OTHER_OWNER)
         assert _code(live) == "duplicate"
 
         await session.execute(
@@ -515,16 +727,12 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
             {"id": facts.request_id},
         )
         await session.commit()
-        claimed = await claim_termination(
-            session, facts.request_id, owner=OTHER_OWNER
-        )
+        claimed = await claim_termination(session, facts.request_id, owner=OTHER_OWNER)
         assert claimed.runtime_epoch == 2
 
         owner_lost_facts = _facts(agent_id, github_issue_number=2574)
         owner_lost = await admit(session, owner_lost_facts)
-        await acquire(
-            session, owner_lost_facts.request_id, owner=OWNER, generation=1
-        )
+        await acquire(session, owner_lost_facts.request_id, owner=OWNER, generation=1)
         await start(
             session,
             owner_lost_facts.request_id,
@@ -536,10 +744,13 @@ def test_termination_claim_waits_for_heartbeat_expiry_and_maps_owner_lost(
         await session.execute(
             text(
                 "UPDATE curie.execution_requests SET "
-                "runtime_heartbeat_expires_at = clock_timestamp() "
-                "- interval '1 second' WHERE id = :id"
+                "runtime_heartbeat_expires_at = :expired WHERE id = :id"
             ),
-            {"id": owner_lost_facts.request_id},
+            {
+                "id": owner_lost_facts.request_id,
+                "expired": await _now(session)
+                - timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+            },
         )
         await session.commit()
         marked = await workitems.request_owner_lost_cancellation(
@@ -760,7 +971,6 @@ def test_http_admit_replay_acquire_start_heartbeat_and_stale_finish(
     assert unchanged.json()["runtime_epoch"] == 1
 
 
-
 # --- #3076: recover WorkItem runs orphaned by a worker restart -------------
 
 
@@ -810,9 +1020,9 @@ def test_declare_owner_lost_drives_the_terminate_chain_to_failed(
         assert before.runtime_heartbeat_expires_at > await _now(session)
 
         owners = await workitem_dispatch.list_runtime_owners(session, limit=50)
-        assert [
-            (o.request_id, o.runtime_owner, o.runtime_epoch) for o in owners
-        ] == [(facts.request_id, OWNER, 1)]
+        assert [(o.request_id, o.runtime_owner, o.runtime_epoch) for o in owners] == [
+            (facts.request_id, OWNER, 1)
+        ]
 
         await workitem_dispatch.declare_owner_lost(
             session, facts.request_id, owner=OWNER, runtime_epoch=1
@@ -829,9 +1039,7 @@ def test_declare_owner_lost_drives_the_terminate_chain_to_failed(
         )
         assert [p.request_id for p in published] == [facts.request_id]
 
-        claimed = await claim_termination(
-            session, facts.request_id, owner=OTHER_OWNER
-        )
+        claimed = await claim_termination(session, facts.request_id, owner=OTHER_OWNER)
         assert claimed.runtime_epoch == 2
         await record_termination(
             session,
@@ -866,9 +1074,7 @@ def test_declare_owner_lost_refuses_a_mismatched_owner_or_epoch(
     with_session(body)
 
 
-def test_declare_owner_lost_unknown_request_is_not_found(
-    clean_db: None, allowlisted: None
-) -> None:
+def test_declare_owner_lost_unknown_request_is_not_found(clean_db: None, allowlisted: None) -> None:
     async def body(session: AsyncSession) -> None:
         refused = await workitem_dispatch.declare_owner_lost(
             session, uuid.uuid4(), owner=OWNER, runtime_epoch=1
@@ -878,16 +1084,12 @@ def test_declare_owner_lost_unknown_request_is_not_found(
     with_session(body)
 
 
-def test_approval_hold_is_not_an_orphan(
-    clean_db: None, allowlisted: None
-) -> None:
+def test_approval_hold_is_not_an_orphan(clean_db: None, allowlisted: None) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent_with_channel(session)
         held = await _running(session, agent_id)
         live = await _running(session, agent_id, issue=2574)
-        await workitem_dispatch.hold_for_approval(
-            session, held.request_id, runtime_epoch=1
-        )
+        await workitem_dispatch.hold_for_approval(session, held.request_id, runtime_epoch=1)
         before = await _request_row(session, held.request_id)
         assert before.runtime_heartbeat_expires_at == before.execution_deadline
 
@@ -903,22 +1105,16 @@ def test_approval_hold_is_not_an_orphan(
     with_session(body)
 
 
-def test_expired_approval_hold_is_an_orphan(
-    clean_db: None, allowlisted: None
-) -> None:
+def test_expired_approval_hold_is_an_orphan(clean_db: None, allowlisted: None) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent_with_channel(session)
         held = await _running(session, agent_id)
-        await workitem_dispatch.hold_for_approval(
-            session, held.request_id, runtime_epoch=1
-        )
+        await workitem_dispatch.hold_for_approval(session, held.request_id, runtime_epoch=1)
         # Move the whole window into the past; the hold parks the lease at the
         # deadline, so both columns stay equal.
         past = (await _now(session)) - timedelta(minutes=5)
         # A trigger makes the deadline write once; lift it for this fixture only.
-        await session.execute(
-            text("ALTER TABLE curie.execution_requests DISABLE TRIGGER USER")
-        )
+        await session.execute(text("ALTER TABLE curie.execution_requests DISABLE TRIGGER USER"))
         await session.execute(
             text(
                 "UPDATE curie.execution_requests SET started_at = :started, "
@@ -931,9 +1127,7 @@ def test_expired_approval_hold_is_an_orphan(
                 "id": held.request_id,
             },
         )
-        await session.execute(
-            text("ALTER TABLE curie.execution_requests ENABLE TRIGGER USER")
-        )
+        await session.execute(text("ALTER TABLE curie.execution_requests ENABLE TRIGGER USER"))
         await session.commit()
         before = await _request_row(session, held.request_id)
         assert before.runtime_heartbeat_expires_at == before.execution_deadline
@@ -996,14 +1190,10 @@ def test_http_runtime_owners_and_owner_lost(
 
     unauth = dispatch_client.get(f"{INTERNAL_PREFIX}/runtime-owners")
     assert unauth.status_code in {401, 403}, unauth.text
-    listed = dispatch_client.get(
-        f"{INTERNAL_PREFIX}/runtime-owners", headers=WORKER_HEADERS
-    )
+    listed = dispatch_client.get(f"{INTERNAL_PREFIX}/runtime-owners", headers=WORKER_HEADERS)
     assert listed.status_code == 200, listed.text
     assert listed.json() == {
-        "requests": [
-            {"request_id": request_id, "runtime_owner": OWNER, "runtime_epoch": 1}
-        ]
+        "requests": [{"request_id": request_id, "runtime_owner": OWNER, "runtime_epoch": 1}]
     }
 
     past = dispatch_client.get(
@@ -1027,9 +1217,7 @@ def test_http_runtime_owners_and_owner_lost(
     assert bad.status_code == 422, bad.text
 
     path = f"{INTERNAL_PREFIX}/requests/{request_id}/owner-lost"
-    unauth_post = dispatch_client.post(
-        path, json={"owner": OWNER, "runtime_epoch": 1}
-    )
+    unauth_post = dispatch_client.post(path, json={"owner": OWNER, "runtime_epoch": 1})
     assert unauth_post.status_code in {401, 403}, unauth_post.text
     stale = dispatch_client.post(
         path, json={"owner": OTHER_OWNER, "runtime_epoch": 1}, headers=WORKER_HEADERS
@@ -1042,19 +1230,13 @@ def test_http_runtime_owners_and_owner_lost(
     assert declared.status_code == 200, declared.text
     assert declared.json()["status"] == "cancellation_requested"
     assert declared.json()["terminal_cause"] == "owner_lost"
-    viewed = dispatch_client.get(
-        f"{INTERNAL_PREFIX}/requests/{request_id}", headers=WORKER_HEADERS
-    )
+    viewed = dispatch_client.get(f"{INTERNAL_PREFIX}/requests/{request_id}", headers=WORKER_HEADERS)
     assert viewed.json()["status"] == "cancellation_requested"
-    after = dispatch_client.get(
-        f"{INTERNAL_PREFIX}/runtime-owners", headers=WORKER_HEADERS
-    )
+    after = dispatch_client.get(f"{INTERNAL_PREFIX}/runtime-owners", headers=WORKER_HEADERS)
     assert after.json() == {"requests": []}
 
 
-def test_list_runtime_owners_pages_by_request_id(
-    clean_db: None, allowlisted: None
-) -> None:
+def test_list_runtime_owners_pages_by_request_id(clean_db: None, allowlisted: None) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent_with_channel(session)
         running = [await _running(session, agent_id, issue=3000 + i) for i in range(5)]
@@ -1064,9 +1246,7 @@ def test_list_runtime_owners_pages_by_request_id(
         after: uuid.UUID | None = None
         pages = 0
         while True:
-            page = await workitem_dispatch.list_runtime_owners(
-                session, limit=2, after=after
-            )
+            page = await workitem_dispatch.list_runtime_owners(session, limit=2, after=after)
             if not page:
                 break
             pages += 1
@@ -1079,9 +1259,372 @@ def test_list_runtime_owners_pages_by_request_id(
         assert seen == expected
         assert pages == 3
 
-        tail = await workitem_dispatch.list_runtime_owners(
-            session, limit=50, after=expected[2]
-        )
+        tail = await workitem_dispatch.list_runtime_owners(session, limit=50, after=expected[2])
         assert [row.request_id for row in tail] == expected[3:]
 
     with_session(body)
+
+
+# --- #4170: a request whose sandbox never starts stops being retried --------
+
+START_REASONS = [f"not_started:classified_failure-{n}" for n in range(1, 6)]
+START_CURVE = [10, 20, 40, 80]
+
+
+async def _start_row(session: AsyncSession, request_id: uuid.UUID) -> Any:
+    return (
+        (
+            await session.execute(
+                text(
+                    "SELECT status, start_deferrals, capacity_deferrals, "
+                    "dispatch_generation, dispatch_not_before, started_at, "
+                    "execution_deadline, terminal_at, terminal_cause, "
+                    "last_deferral_reason, execution_attempts "
+                    "FROM curie.execution_requests WHERE id = :id"
+                ),
+                {"id": request_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+
+
+async def _acquire_and_defer(
+    session: AsyncSession,
+    request_id: uuid.UUID,
+    *,
+    reason: str,
+    capacity: bool,
+) -> tuple[Any, datetime, datetime]:
+    """Acquire the current generation, defer it, and bracket the defer's clock."""
+
+    row = await _start_row(session, request_id)
+    granted = await acquire(session, request_id, owner=OWNER, generation=row.dispatch_generation)
+    assert getattr(granted, "code", None) is None, granted
+    before = await _now(session)
+    result = await defer(
+        session,
+        request_id,
+        owner=OWNER,
+        generation=row.dispatch_generation,
+        reason=reason,
+        capacity=capacity,
+    )
+    after = await _now(session)
+    assert getattr(result, "code", None) is None, result
+    return result, before, after
+
+
+def _assert_delay(not_before: datetime, before: datetime, after: datetime, seconds: int) -> None:
+    delay = timedelta(seconds=seconds)
+    assert before + delay <= not_before <= after + delay, (not_before, before, after, seconds)
+
+
+def test_start_deferrals_back_off_exponentially_and_keep_the_request_waiting(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        for count, (reason, seconds) in enumerate(
+            zip(START_REASONS[:4], START_CURVE, strict=True), start=1
+        ):
+            result, before, after = await _acquire_and_defer(
+                session, facts.request_id, reason=reason, capacity=False
+            )
+            row = await _start_row(session, facts.request_id)
+            assert row.status == "waiting"
+            assert row.start_deferrals == count
+            assert row.capacity_deferrals == 0
+            assert row.last_deferral_reason == reason
+            assert row.started_at is None
+            assert row.terminal_cause is None
+            assert row.terminal_at is None
+            _assert_delay(row.dispatch_not_before, before, after, seconds)
+            assert result.not_before == row.dispatch_not_before
+            assert result.terminal_cause is None
+            assert result.dispatch_generation == row.dispatch_generation
+
+    with_session(body)
+
+
+def test_fifth_start_deferral_fails_the_request_as_start_failed(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        for reason in START_REASONS[:4]:
+            await _acquire_and_defer(session, facts.request_id, reason=reason, capacity=False)
+        result, before, after = await _acquire_and_defer(
+            session, facts.request_id, reason=START_REASONS[4], capacity=False
+        )
+        assert result.not_before is None
+        assert result.terminal_cause == "start_failed"
+        row = await _start_row(session, facts.request_id)
+        assert row.status == "failed"
+        assert row.terminal_cause == "start_failed"
+        assert row.start_deferrals == 5
+        assert row.capacity_deferrals == 0
+        assert row.execution_attempts == 0
+        assert row.started_at is None
+        assert row.execution_deadline is None
+        assert row.terminal_at is not None
+        assert before <= row.terminal_at <= after
+        assert row.last_deferral_reason == START_REASONS[4]
+
+        again = await defer(
+            session,
+            facts.request_id,
+            owner=OWNER,
+            generation=row.dispatch_generation,
+            reason="not_started:classified_failure",
+            capacity=False,
+        )
+        assert _code(again) == "not_dispatchable"
+        reacquired = await acquire(
+            session, facts.request_id, owner=OWNER, generation=row.dispatch_generation
+        )
+        assert _code(reacquired) == "not_dispatchable"
+        unchanged = await _start_row(session, facts.request_id)
+        assert unchanged.status == "failed"
+        assert unchanged.start_deferrals == 5
+
+    with_session(body)
+
+
+def test_capacity_defers_never_count_toward_the_start_deferral_cap(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        for reason in START_REASONS[:4]:
+            await _acquire_and_defer(session, facts.request_id, reason=reason, capacity=False)
+        for count, seconds in enumerate([10, 20, 40, 80, 120, 120], start=1):
+            result, before, after = await _acquire_and_defer(
+                session, facts.request_id, reason="capacity", capacity=True
+            )
+            row = await _start_row(session, facts.request_id)
+            assert row.status == "waiting"
+            assert row.start_deferrals == 4
+            assert row.capacity_deferrals == count
+            assert row.terminal_cause is None
+            _assert_delay(row.dispatch_not_before, before, after, seconds)
+            assert result.terminal_cause is None
+
+        fresh = _facts(agent_id, github_issue_number=4170)
+        await admit(session, fresh)
+        for count in range(1, 7):
+            await _acquire_and_defer(session, fresh.request_id, reason="capacity", capacity=True)
+            row = await _start_row(session, fresh.request_id)
+            assert row.status == "waiting"
+            assert row.start_deferrals == 0
+            assert row.capacity_deferrals == count
+
+    with_session(body)
+
+
+def test_thread_busy_defers_wait_flat_and_never_count_toward_the_start_cap(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        for _ in range(6):
+            result, before, after = await _acquire_and_defer(
+                session, facts.request_id, reason="thread_busy", capacity=False
+            )
+            row = await _start_row(session, facts.request_id)
+            assert row.status == "waiting"
+            assert row.start_deferrals == 0
+            assert row.capacity_deferrals == 0
+            assert row.terminal_cause is None
+            assert row.terminal_at is None
+            assert row.last_deferral_reason == "thread_busy"
+            _assert_delay(row.dispatch_not_before, before, after, 10)
+            assert result.not_before == row.dispatch_not_before
+            assert result.terminal_cause is None
+
+    with_session(body)
+
+
+def test_thread_busy_between_start_deferrals_neither_resets_nor_advances_the_cap(
+    clean_db: None, allowlisted: None
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        for reason in START_REASONS[:4]:
+            await _acquire_and_defer(session, facts.request_id, reason=reason, capacity=False)
+        busy, before, after = await _acquire_and_defer(
+            session, facts.request_id, reason="thread_busy", capacity=False
+        )
+        row = await _start_row(session, facts.request_id)
+        assert row.status == "waiting"
+        assert row.start_deferrals == 4
+        assert row.terminal_cause is None
+        assert busy.terminal_cause is None
+        _assert_delay(row.dispatch_not_before, before, after, 10)
+
+        final, _, _ = await _acquire_and_defer(
+            session, facts.request_id, reason=START_REASONS[4], capacity=False
+        )
+        assert final.terminal_cause == "start_failed"
+        row = await _start_row(session, facts.request_id)
+        assert (row.status, row.terminal_cause) == ("failed", "start_failed")
+        assert row.start_deferrals == 5
+
+    with_session(body)
+
+
+def test_only_non_capacity_not_started_reasons_count_toward_the_start_cap(
+    clean_db: None, allowlisted: None
+) -> None:
+    prefix = workitem_dispatch.START_DEFERRAL_REASON_PREFIX
+    assert prefix == "not_started:"
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        for _ in range(6):
+            result, before, after = await _acquire_and_defer(
+                session, facts.request_id, reason="runtime_unavailable", capacity=False
+            )
+            row = await _start_row(session, facts.request_id)
+            assert row.status == "waiting"
+            assert row.start_deferrals == 0
+            assert row.capacity_deferrals == 0
+            assert row.terminal_cause is None
+            assert row.terminal_at is None
+            assert row.last_deferral_reason == "runtime_unavailable"
+            _assert_delay(row.dispatch_not_before, before, after, 10)
+            assert result.terminal_cause is None
+
+        counted = _facts(agent_id, github_issue_number=4171)
+        await admit(session, counted)
+        for reason in START_REASONS[:4]:
+            assert reason.startswith(prefix)
+            await _acquire_and_defer(session, counted.request_id, reason=reason, capacity=False)
+        other, _, _ = await _acquire_and_defer(
+            session, counted.request_id, reason="runtime_unavailable", capacity=False
+        )
+        assert other.terminal_cause is None
+        row = await _start_row(session, counted.request_id)
+        assert (row.status, row.start_deferrals) == ("waiting", 4)
+
+        final, _, _ = await _acquire_and_defer(
+            session, counted.request_id, reason="not_started:classified_failure", capacity=False
+        )
+        assert final.terminal_cause == "start_failed"
+        row = await _start_row(session, counted.request_id)
+        assert (row.status, row.terminal_cause) == ("failed", "start_failed")
+        assert row.start_deferrals == 5
+
+    with_session(body)
+
+
+def test_start_deferral_limit_is_read_from_settings(
+    clean_db: None, allowlisted: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CURIE_WORK_ITEM_START_DEFERRAL_LIMIT", "2")
+    get_settings.cache_clear()
+    assert get_settings().work_item_start_deferral_limit == 2
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent_with_channel(session)
+        facts = _facts(agent_id)
+        await admit(session, facts)
+        first, _, _ = await _acquire_and_defer(
+            session, facts.request_id, reason=START_REASONS[0], capacity=False
+        )
+        assert first.terminal_cause is None
+        assert (await _start_row(session, facts.request_id)).status == "waiting"
+        second, _, _ = await _acquire_and_defer(
+            session, facts.request_id, reason=START_REASONS[1], capacity=False
+        )
+        assert second.terminal_cause == "start_failed"
+        assert second.not_before is None
+        row = await _start_row(session, facts.request_id)
+        assert (row.status, row.terminal_cause) == ("failed", "start_failed")
+        assert row.start_deferrals == 2
+        assert row.last_deferral_reason == START_REASONS[1]
+
+    with_session(body)
+
+
+def test_http_defer_reports_start_failed_on_the_fifth_start_deferral(
+    dispatch_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    created = dispatch_client.post(
+        "/agents",
+        json={
+            "name": f"acme-bot-{uuid.uuid4().hex[:8]}",
+            "channel": {"kind": "slack", "address": ADDRESS},
+            "repo_full_name": REPO,
+        },
+        headers=auth_headers,
+    )
+    assert created.status_code == 201, created.text
+    facts = _facts(UUID(created.json()["id"]))
+    admitted = dispatch_client.post(
+        f"{INTERNAL_PREFIX}/admissions",
+        json=_facts_json(facts),
+        headers=WORKER_HEADERS,
+    )
+    assert admitted.status_code == 200, admitted.text
+    request_id = admitted.json()["request"]["id"]
+
+    generation = 1
+    bodies: list[dict[str, Any]] = []
+    for reason in START_REASONS:
+        acquired = dispatch_client.post(
+            f"{INTERNAL_PREFIX}/requests/{request_id}/acquire",
+            json={"owner": OWNER, "generation": generation},
+            headers=WORKER_HEADERS,
+        )
+        assert acquired.status_code == 200, acquired.text
+        deferred = dispatch_client.post(
+            f"{INTERNAL_PREFIX}/requests/{request_id}/defer",
+            json={
+                "owner": OWNER,
+                "generation": generation,
+                "reason": reason,
+                "capacity": False,
+            },
+            headers=WORKER_HEADERS,
+        )
+        assert deferred.status_code == 200, deferred.text
+        bodies.append(deferred.json())
+        generation = deferred.json()["dispatch_generation"]
+
+    for body in bodies[:4]:
+        assert body["terminal_cause"] is None
+        assert body["not_before"] is not None
+    assert bodies[4]["terminal_cause"] == "start_failed"
+    assert bodies[4]["not_before"] is None
+
+    viewed = dispatch_client.get(f"{INTERNAL_PREFIX}/requests/{request_id}", headers=WORKER_HEADERS)
+    assert viewed.status_code == 200, viewed.text
+    view = viewed.json()
+    assert view["status"] == "failed"
+    assert view["terminal_cause"] == "start_failed"
+    assert view["started_at"] is None
+    assert view["execution_deadline"] is None
+    assert view["terminal_at"] is not None
+    assert view["last_deferral_reason"] == START_REASONS[4]
+
+    refused = dispatch_client.post(
+        f"{INTERNAL_PREFIX}/requests/{request_id}/acquire",
+        json={"owner": OWNER, "generation": generation},
+        headers=WORKER_HEADERS,
+    )
+    assert refused.status_code == 409, refused.text
+    assert _http_code(refused) == "not_dispatchable"
