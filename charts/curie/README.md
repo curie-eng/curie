@@ -358,6 +358,9 @@ component ID. `otelCollector.extraTracePipelineProcessors` selects their IDs in
 execution order for the traces pipeline. Selected processors run after
 `memory_limiter` and before `batch`; with both values empty, the rendered
 Collector configuration and all three pipelines retain their existing defaults.
+An upgrade using `--reuse-values` from a release whose values predate these
+keys also treats the omitted keys as empty. An explicitly supplied non-map
+`extraProcessors` or non-list `extraTracePipelineProcessors` is rejected.
 For example, an operator can suppress routine spans before batching and export
 while retaining user, state, and action spans:
 
