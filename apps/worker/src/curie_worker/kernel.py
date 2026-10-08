@@ -175,6 +175,7 @@ from .reply_sink import (
 from .runner_client import (
     RunnerClient,
     RunnerError,
+    RunnerSnapshotReadError,
     RunnerStreamTimeout,
     RunnerWorkspaceSnapshot,
     TurnStream,
@@ -5941,38 +5942,93 @@ class Kernel:
                 outcome.approval_gate_kind,
                 outcome.approval_granted_tool,
             ):
-                try:
-                    snapshot = await self._runner.snapshot(
-                        routed.handle.base_url,
-                        token=routed.handle.token or None,
-                        remaining_s=remaining_s,
+                snapshot = None
+                snapshot_started = time.monotonic()
+                snapshot_budget_s = (
+                    None
+                    if remaining_s is None
+                    else remaining_s - (snapshot_started - attempt_started)
+                )
+                snapshot_attempts = 0
+                snapshot_failure_text = "remaining budget is 5 s or less"
+                while snapshot_attempts < 3:
+                    snapshot_remaining_s = (
+                        None
+                        if snapshot_budget_s is None
+                        else snapshot_budget_s - (time.monotonic() - snapshot_started)
                     )
-                    if self._workspace is None:
-                        raise WorkspacePreparationError(
-                            "publication-validation",
-                            "managed workspace coordinator is unavailable",
+                    if (
+                        snapshot_remaining_s is not None
+                        and snapshot_remaining_s <= _MIN_ATTEMPT_BUDGET_S
+                    ):
+                        break
+                    snapshot_attempts += 1
+                    try:
+                        snapshot = await self._runner.snapshot(
+                            routed.handle.base_url,
+                            token=routed.handle.token or None,
+                            remaining_s=snapshot_remaining_s,
                         )
-                    await asyncio.to_thread(
-                        validate_snapshot_against_base,
-                        self._workspace,
-                        thread_key=thread_key,
-                        snapshot=snapshot,
-                        max_patch_bytes=self._config.publication_patch_max_bytes,
-                        scratch_root=Path(self._config.workspace_scratch_root),
-                        git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
-                        protected_paths=self._config.publication_protected_paths,
-                    )
-                    outcome.publication_snapshot = snapshot
-                except (
-                    RunnerError,
-                    aiohttp.ClientError,
-                    TimeoutError,
-                    WorkspacePreparationError,
-                ) as exc:
+                    except (RunnerError, aiohttp.ClientError, TimeoutError) as exc:
+                        snapshot_failure_text = str(exc)
+                        if not isinstance(exc, RunnerError):
+                            snapshot_failure_text = type(exc).__name__ + (
+                                f": {snapshot_failure_text}" if snapshot_failure_text else ""
+                            )
+                        logger.warning(
+                            "publication snapshot read failed for %s: attempt %s of 3: %s",
+                            qevent.event_id,
+                            snapshot_attempts,
+                            snapshot_failure_text,
+                        )
+                        if snapshot_attempts == 3 or not isinstance(
+                            exc, (RunnerSnapshotReadError, aiohttp.ClientError, TimeoutError)
+                        ):
+                            break
+                        snapshot_remaining_s = (
+                            None
+                            if snapshot_budget_s is None
+                            else snapshot_budget_s - (time.monotonic() - snapshot_started)
+                        )
+                        if (
+                            snapshot_remaining_s is not None
+                            and snapshot_remaining_s
+                            <= _MIN_ATTEMPT_BUDGET_S + snapshot_attempts
+                        ):
+                            break
+                        await asyncio.sleep(float(snapshot_attempts))
+                    else:
+                        break
+                if snapshot is None:
                     # A trusted publication request never falls through into an
                     # ordinary approval when snapshotting fails. The pause path
                     # reports this error and creates neither durable row.
-                    outcome.publication_snapshot_error = str(exc)
+                    outcome.publication_snapshot_error = (
+                        "publication snapshot could not be read after "
+                        f"{snapshot_attempts} attempt(s): {snapshot_failure_text}"
+                    )
+                else:
+                    try:
+                        if self._workspace is None:
+                            raise WorkspacePreparationError(
+                                "publication-validation",
+                                "managed workspace coordinator is unavailable",
+                            )
+                        await asyncio.to_thread(
+                            validate_snapshot_against_base,
+                            self._workspace,
+                            thread_key=thread_key,
+                            snapshot=snapshot,
+                            max_patch_bytes=self._config.publication_patch_max_bytes,
+                            scratch_root=Path(self._config.workspace_scratch_root),
+                            git_timeout_seconds=(
+                                self._config.publication_git_command_timeout_seconds
+                            ),
+                            protected_paths=self._config.publication_protected_paths,
+                        )
+                        outcome.publication_snapshot = snapshot
+                    except WorkspacePreparationError as exc:
+                        outcome.publication_snapshot_error = f"publication snapshot failed: {exc}"
             return outcome
         finally:
             self._unregister_run(agent_id, thread_key)
@@ -8462,9 +8518,7 @@ class Kernel:
                 if outcome.publication_snapshot_error is not None:
                     # #4121: carry the message as the refusal so the factory run
                     # shows why the snapshot failed, not only the cause.
-                    snapshot_failure = (
-                        f"publication snapshot failed: {outcome.publication_snapshot_error}"
-                    )
+                    snapshot_failure = outcome.publication_snapshot_error
                     raise ApprovalBackendError(snapshot_failure, refusal=snapshot_failure)
                 if deployment_id is None or snapshot is None:
                     raise ApprovalBackendError(

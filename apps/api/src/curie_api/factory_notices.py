@@ -484,7 +484,17 @@ def result_section(
     else:
         sentence = cause_text(cause)
         prefix = "Could not complete: "
-        if cause == "owner_lost" and lost_streak == OWNER_LOST_RETRY_LIMIT:
+        if (
+            cause == "approval_create_failed"
+            and detail is not None
+            and detail.startswith("publication snapshot could not be read")
+        ):
+            sentence = (
+                "Curie could not read the finished changes from the sandbox, so no pull request "
+                "was opened. This was an infrastructure failure, not a refusal of the change; "
+                "retry the run."
+            )
+        elif cause == "owner_lost" and lost_streak == OWNER_LOST_RETRY_LIMIT:
             sentence = (
                 "the worker running this request stopped responding "
                 f"{OWNER_LOST_RETRY_LIMIT} times."
