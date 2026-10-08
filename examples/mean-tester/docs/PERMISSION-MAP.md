@@ -21,8 +21,8 @@ credentials. Their own scope is the real bound.
 
 | Tool | What it writes | Bound |
 |---|---|---|
-| `slack/slack_post_message` | One new root message per read or ask probe that opens a campaign thread, `[mean test <id>] <@target> <probe>` | The channels the app is invited to. The read or ask rule, the mark, the new thread rate and the one campaign per turn rule are the skill's, not code. |
-| `slack/slack_reply_to_thread` | A follow-up inside a thread the tester's own probe opened, `[mean test <id>] <@target> <follow-up>` | Any thread in a channel the app is invited to. That it replies only in its own probes' threads, and the follow-ups-per-thread cap, are the skill's, not code. |
+| `slack/slack_post_message` | One own admission ping or campaign root; readonly `[mean test <id>] <@target> <probe>`, admitted action `<@target> [test action] [mean test <id>] <probe>` | The channels the app is invited to. The read or ask rule, the mark, the new thread rate and the one campaign per turn rule are the skill's, not code. |
+| `slack/slack_reply_to_thread` | An owned-thread follow-up or admitted `<@target> [test action] approve/reject <approval-id>` reply to the native target card | Any thread in a channel the app is invited to. That it replies only in its own probes' threads, and the follow-ups-per-thread cap, are the skill's, not code. |
 
 The tester's report is the turn's own reply, posted by the platform in the
 thread it was asked in.
@@ -50,6 +50,10 @@ Every other tool of both servers, among them:
   `create_or_update_file`, `push_files`, `create_pull_request`, …) and every
   other read.
 
-The allowed Slack post cannot make an action probe safe by itself. The skill
-permits only questions and reads, so it never asks a target to create an
-approval card or to change an external system.
+The allowed Slack post grants no action authority. Read-or-ask stays the
+fallback. The skill's own-ping check permits marked actions only on an admitted
+test installation; the platform independently enforces driver identity, channel
+and explicit-user approval eligibility (ADR 0202). No upload, button-click,
+platform API, arbitrary state-write or restore tool is added. Verification and
+restoration require an existing operator-declared scoped capability; missing
+capability is a NO-GO gap.
