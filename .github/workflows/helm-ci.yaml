@@ -170,6 +170,9 @@ jobs:
       - name: helm render assertions (NetworkPolicy warning)
         run: bash charts/curie/ci/networkpolicy-notes-assertions.sh
 
+      - name: helm render assertions (MCP connector Valkey ingress opt-out)
+        run: python3 charts/curie/ci/test_data_tier_mcp_valkey_peer.py
+
       # Prove the api reads runner pods for the Logs tab from the release
       # namespace, the same namespace the worker claims sandboxes in.
       - name: helm render assertions (api runner namespace)
