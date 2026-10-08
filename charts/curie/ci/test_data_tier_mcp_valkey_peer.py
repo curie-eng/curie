@@ -9,7 +9,6 @@ from pathlib import Path
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[3]
 CHART = ROOT / "charts" / "curie"
 VALKEY_ALLOW = "curie-valkey-allow-app-ingress"
@@ -35,9 +34,13 @@ def render(overlay: dict | None = None) -> dict[str, dict]:
 
 def peer_rule(policy: dict, component: str) -> dict:
     return next(
-        rule for rule in policy["spec"]["ingress"]
+        rule
+        for rule in policy["spec"]["ingress"]
         if any(
-            peer.get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/component") == component
+            peer.get("podSelector", {})
+            .get("matchLabels", {})
+            .get("app.kubernetes.io/component")
+            == component
             for peer in rule.get("from", [])
         )
     )
@@ -45,9 +48,13 @@ def peer_rule(policy: dict, component: str) -> dict:
 
 def app_rule(policy: dict) -> dict:
     return next(
-        rule for rule in policy["spec"]["ingress"]
+        rule
+        for rule in policy["spec"]["ingress"]
         if any(
-            peer.get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/name") == "curie"
+            peer.get("podSelector", {})
+            .get("matchLabels", {})
+            .get("app.kubernetes.io/name")
+            == "curie"
             and peer["podSelector"]["matchLabels"].get("app.kubernetes.io/instance") == "curie"
             for peer in rule.get("from", [])
         )
@@ -104,7 +111,16 @@ def test_explicit_non_boolean_values_fail_chart_validation():
                 "allowMcpConnectorValkeyIngress": value,
             }}}))
             result = subprocess.run(
-                ["helm", "template", "curie", str(CHART), "-f", str(CHART / "values-dev.yaml"), "-f", str(values)],
+                [
+                    "helm",
+                    "template",
+                    "curie",
+                    str(CHART),
+                    "-f",
+                    str(CHART / "values-dev.yaml"),
+                    "-f",
+                    str(values),
+                ],
                 check=False,
                 capture_output=True,
                 text=True,
