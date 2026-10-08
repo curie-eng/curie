@@ -100,8 +100,7 @@ def _python_source_is_local(value: object) -> bool:
         internal = any(key in source for key in ("path", "directory")) or bool(
             isinstance(source.get("editable"), str)
             and source["editable"]
-            or isinstance(source.get("virtual"), str)
-            and source["virtual"]
+            or source.get("virtual")
             or source.get("workspace")
         )
         if not remote and not internal:
@@ -235,7 +234,11 @@ def _npm_lock_names(document: dict[str, object]) -> set[str]:
             continue
         # Nested installs and scoped packages retain the suffix after the last
         # node_modules segment. The root and workspace directory entries are local.
-        names.add(_js_name(package.get("name", path.rsplit("node_modules/", 1)[1])))
+        # Metadata cannot hide a new installed entry, nor can an existing alias
+        # hide a newly named package. Compare both identities when present.
+        names.add(_js_name(path.rsplit("node_modules/", 1)[1]))
+        if "name" in package:
+            names.add(_js_name(package["name"]))
     return names
 
 
@@ -287,7 +290,12 @@ def _pnpm_lock_names(document: dict[str, object]) -> set[str]:
             )
         ):
             continue
-        names.add(_js_name(package.get("name", name)))
+        if name:
+            names.add(_js_name(name))
+        elif "name" not in package:
+            raise ValueError("dependency entry is malformed")
+        if "name" in package:
+            names.add(_js_name(package["name"]))
     return names
 
 
