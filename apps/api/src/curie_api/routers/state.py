@@ -24,6 +24,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal, NoReturn
+from urllib.parse import unquote
 
 import redis.asyncio as redis
 from curie_internal import sandbox_token
@@ -315,6 +316,17 @@ def _transcript_key_admitted(principal: StatePrincipal, agent_id: uuid.UUID, key
     return key_binding == principal.binding
 
 
+def _protected_transcript_key(key: str) -> bool:
+    """Reserve protected history from legacy compatibility, @spec PROTECTED-HOOK-LANE-7.
+
+    Decode the kind component independently of canonical parsing. A malformed
+    protected-shaped key must not regain the legacy token's unscoped reach.
+    Canonical protected credentials still use the existing binding predicate.
+    """
+    kind = unquote(key.partition(":")[0])
+    return kind == "@protected" or kind.startswith("@protected:")
+
+
 # Agents already warned about a legacy token in this process, oldest first.
 _LEGACY_WARNED_LIMIT = 1024
 _legacy_warned: OrderedDict[uuid.UUID, None] = OrderedDict()
@@ -361,14 +373,19 @@ def _check_transcript_reach(
     On a binding path, the path's binding must be the credential's; with a key,
     the key's binding must be too (``_transcript_key_admitted``), so neither
     can launder the other. A listing (``key`` None) is filtered afterwards by
-    ``_visible_transcripts``. A legacy token keeps its reach, with a warning and
-    a metric. The platform key is unaffected and the app token is already
-    fenced off by ``forbid_reserved_namespace``. Runs before any database read,
+    ``_visible_transcripts``. A legacy token keeps its ordinary reach, with a
+    warning and a metric; protected history is excluded. The platform key is
+    unaffected and the app token is already fenced off by ``forbid_reserved_namespace``.
+    Runs before any database read,
     so a refused read cannot trigger pre-identity adoption either."""
 
     if principal.caller is not StateCaller.STATE or namespace != TRANSCRIPT_NAMESPACE:
         return
     if principal.legacy:
+        if (key is not None and _protected_transcript_key(key)) or (
+            requested_binding is not None and requested_binding.startswith("@protected:")
+        ):
+            _refuse(principal, agent_id, path, "protected transcript requires a scoped credential")
         _note_legacy_transcript_use(agent_id, path)
         return
     if requested_binding is not None and principal.binding != requested_binding:
@@ -382,12 +399,10 @@ def _visible_transcripts(
 ) -> list[StateEntryOut]:
     """A transcript listing narrowed to the threads a sandbox credential reaches."""
 
-    if (
-        principal.caller is not StateCaller.STATE
-        or principal.legacy
-        or namespace != TRANSCRIPT_NAMESPACE
-    ):
+    if principal.caller is not StateCaller.STATE or namespace != TRANSCRIPT_NAMESPACE:
         return rows
+    if principal.legacy:
+        return [row for row in rows if not _protected_transcript_key(row.key)]
     return [row for row in rows if _transcript_key_admitted(principal, agent_id, row.key)]
 
 
