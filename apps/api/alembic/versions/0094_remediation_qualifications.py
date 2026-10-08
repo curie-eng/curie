@@ -1,7 +1,7 @@
 """Remediation qualification records and verifier runs (AUTOMATED-REMEDIATION-22)
 
 Revision ID: 0094
-Revises: 0093
+Revises: 0093a
 Create Date: 2026-10-07
 
 Hand-written and additive (ADR 0117 found autogenerate unsafe against the
@@ -36,7 +36,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0094"
-down_revision: str | None = "0093"
+down_revision: str | None = "0093a"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

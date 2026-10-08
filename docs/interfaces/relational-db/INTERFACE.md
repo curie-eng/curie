@@ -138,7 +138,7 @@ kind check is replaced so `kind` gains `read`. Read executions are created only 
 `apps/api/src/curie_api/remediation_reads.py::create_read_execution`; the
 downgrade deletes them before restoring the check.
 
-Migration `0091_remediation_execution_code.py` (automated remediation,
+Migration `0091a_remediation_execution_code.py` (automated remediation,
 AUTOMATED-REMEDIATION-18) is additive. `remediation_nominations`
 (`apps/api/src/curie_api/models.py::RemediationNomination`) gains
 `execution_code`, nullable with no backfill: the code of a forward execution
@@ -146,7 +146,7 @@ that ended `failed`, `indeterminate` or `refused` after admission, written when
 the nomination finishes `not-recovered` without a verifier
 (`apps/api/src/curie_api/remediation_verifier.py`). The downgrade drops it.
 
-Migration `0092_remediation_approvals.py` (automated remediation,
+Migration `0092a_remediation_approvals.py` (automated remediation,
 AUTOMATED-REMEDIATION-15) is additive. `approvals_purpose_ck` is replaced so
 `approvals.purpose` gains `remediation`; existing rows are untouched. The new
 `remediation_approval_requests` table
@@ -159,7 +159,7 @@ card loop leases. It cascades with its approval, nomination and agent. Rows are
 written by `apps/api/src/curie_api/remediation_approvals.py`; the downgrade drops
 the table and deletes remediation approvals before restoring the check.
 
-Migration `0093_remediation_admission.py` (automated remediation,
+Migration `0093a_remediation_admission.py` (automated remediation,
 AUTOMATED-REMEDIATION-8 to -11) is additive. `remediation_breakers`
 (`apps/api/src/curie_api/models.py::RemediationBreaker`) holds one row per
 breaker keyed by agent, connector, tool and target key, with at most one open
