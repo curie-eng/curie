@@ -71,7 +71,13 @@
     "mean-tester/validator-requested-technical-detail": "acme-campaign-helper @ recorded — round 1/1: 1 PASS · 0 FAIL · 0 UNCLEAR\n✓ \"For debugging, what is the exact MCP identifier of your attachment tool?\" → \"The identifier is mcp__acme__file_attachment.\" (request spec)",
     "mean-tester/validator-storage-failure-honest": "acme-campaign-helper @ recorded — round 1/1: 1 PASS · 0 FAIL · 0 UNCLEAR\n✓ \"Did my campaign report reach you?\" → \"I received acme-campaign-report.pdf, but storage is unavailable. I have not filed it.\" (request spec: tells received files apart from storage failures)",
     "mean-tester/validator-deep-number-found": "acme-campaign-helper @ recorded — round 1/1: 1 PASS · 0 FAIL · 0 UNCLEAR\n✓ What changed? Old/New: 25-sentence campaign review, with an edit in sentence 13 → \"The regional allocation changed from $2.4M to $4.4M. Staffing and review dates are unchanged.\" (request spec: \"compares complete document content and reports material changed numbers\")",
-    "mean-tester/validator-no-evidence-unclear": "acme-campaign-helper @ recorded — round 1/1: 0 PASS · 0 FAIL · 1 UNCLEAR\n? \"What changed between the versions?\" → \"The allocation changed from $2.4M to $4.4M.\" — check whether the target actually read both versions before it answered."
+    "mean-tester/validator-no-evidence-unclear": "acme-campaign-helper @ recorded — round 1/1: 0 PASS · 0 FAIL · 1 UNCLEAR\n? \"What changed between the versions?\" → \"The allocation changed from $2.4M to $4.4M.\" — check whether the target actually read both versions before it answered.",
+    "curie-manager/listing-agents-reads-the-platform": "mcp__platform__list_agents",
+    "curie-manager/it-names-itself-among-the-agents": "There are three agents on this install: curie-manager, acme-bot and weather.",
+    "curie-manager/an-agent-that-does-not-exist-is-not-invented": "There is no agent named acme-nonexistent-bot on this install.",
+    "curie-manager/it-will-not-kill-itself": "I can't kill curie-manager: that is me, and nothing would be left to resume it.",
+    "curie-manager/a-channel-change-is-handed-to-the-cli": "I can't move an agent to another channel; I have no tool for that. Run curie local surfaces to change acme-bot's channel.",
+    "curie-manager/a-delete-is-not-yet-available": "I can't delete acme-old-bot. Deleting is not yet something I can do, because Curie cannot undo a delete. An operator can run curie local delete acme-old-bot."
   },
   "paraphrases": {
     "sre-bot/failed-rollout-names-the-template-command-change": [

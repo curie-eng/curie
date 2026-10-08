@@ -1,0 +1,3 @@
+.curie/
+# Written by `curie build` and tied to the Docker daemon it built on.
+connectors.lock.yaml

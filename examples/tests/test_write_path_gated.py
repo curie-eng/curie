@@ -83,21 +83,20 @@ def bundle(
     connectors: dict[str, object],
     servers: dict[str, str] | None = None,
     role_yaml: str | None = None,
+    tool_policy: dict[str, object] | None = None,
 ) -> Path:
     """Write one example bundle under an isolated examples/ directory."""
     examples = root / "examples"
     b = examples / "fixture"
     (b / ".claude-plugin").mkdir(parents=True)
-    (b / ".claude-plugin" / "plugin.json").write_text(
-        json.dumps(
-            {
-                "name": "fixture",
-                "version": "0.0.1",
-                "approvalPolicy": {"gates": [{"gate": g} for g in gates]},
-            }
-        ),
-        encoding="utf-8",
-    )
+    manifest: dict[str, object] = {
+        "name": "fixture",
+        "version": "0.0.1",
+        "approvalPolicy": {"gates": [{"gate": g} for g in gates]},
+    }
+    if tool_policy is not None:
+        manifest["toolPolicy"] = tool_policy
+    (b / ".claude-plugin" / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
     (b / "connectors.yaml").write_text(yaml.safe_dump({"connectors": connectors}), encoding="utf-8")
     for name, source in (servers or {}).items():
         d = b / "connectors" / name
@@ -139,6 +138,56 @@ def test_declared_gate_passes(tmp_path: Path) -> None:
         servers={"k8s-write": WRITE_SERVER},
     )
     assert run(examples).returncode == 0
+
+
+def test_a_literal_approval_required_entry_gates_the_write_tool(tmp_path: Path) -> None:
+    """A write tool the owner names in approvalRequired still waits for a person."""
+    examples = bundle(
+        tmp_path,
+        gates=[],
+        connectors={"k8s-write": {"image": "x", "env": {}}},
+        servers={"k8s-write": WRITE_SERVER},
+        tool_policy={
+            "enforcement": "curie/mcp-tool-policy@1",
+            "approvalRequired": ["k8s-write/restart_deployment"],
+        },
+    )
+    r = run(examples)
+    assert r.returncode == 0, r.stderr
+
+
+def test_an_allow_entry_does_not_excuse_an_ungated_write_tool(tmp_path: Path) -> None:
+    """Allowing a write lets it run with nobody deciding; that is what this guard stops."""
+    examples = bundle(
+        tmp_path,
+        gates=[],
+        connectors={"k8s-write": {"image": "x", "env": {}}},
+        servers={"k8s-write": WRITE_SERVER},
+        tool_policy={
+            "enforcement": "curie/mcp-tool-policy@1",
+            "allow": ["k8s-write/restart_deployment"],
+        },
+    )
+    r = run(examples)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert GATE in r.stderr, r.stderr
+
+
+def test_glob_tool_policy_entry_does_not_classify_the_write_tool(tmp_path: Path) -> None:
+    """A glob would wave through a write tool nobody looked at."""
+    examples = bundle(
+        tmp_path,
+        gates=[],
+        connectors={"k8s-write": {"image": "x", "env": {}}},
+        servers={"k8s-write": WRITE_SERVER},
+        tool_policy={
+            "enforcement": "curie/mcp-tool-policy@1",
+            "approvalRequired": ["k8s-write/*"],
+        },
+    )
+    r = run(examples)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert GATE in r.stderr, r.stderr
 
 
 def test_read_only_tool_needs_no_gate(tmp_path: Path) -> None:

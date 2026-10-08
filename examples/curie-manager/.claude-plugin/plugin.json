@@ -1,0 +1,56 @@
+{
+  "name": "curie-manager",
+  "version": "0.1.0",
+  "description": "Example bundle: an agent that manages the Curie install it runs on. Through one connector that holds the platform key, it reads agents, deployments, schedules, budgets, approvals, traces and metrics, and it can pause or resume a schedule and kill or resume an agent, each only after a person approves. Deletes and other operator actions are deliberately absent until Curie can undo them. A weekday check posts the platform's health to its channel.",
+  "author": {
+    "name": "CurieTech"
+  },
+  "keywords": [
+    "example",
+    "operations",
+    "platform",
+    "admin",
+    "scheduled",
+    "approval-gated"
+  ],
+  "toolPolicy": {
+    "enforcement": "curie/mcp-tool-policy@1",
+    "allow": [
+      "platform/platform_health",
+      "platform/list_agents",
+      "platform/get_agent",
+      "platform/list_versions",
+      "platform/list_deployments",
+      "platform/list_schedules",
+      "platform/get_hook_run",
+      "platform/get_controls",
+      "platform/list_memory",
+      "platform/list_approvals",
+      "platform/metrics_summary",
+      "platform/list_traces",
+      "platform/get_trace"
+    ],
+    "approvalRequired": [
+      "platform/pause_schedule",
+      "platform/resume_schedule",
+      "platform/kill_agent",
+      "platform/resume_agent"
+    ]
+  },
+  "triggers": [
+    {
+      "type": "cron",
+      "name": "platform-check",
+      "schedule": "0 9 * * MON-FRI",
+      "timezone": "America/New_York",
+      "target": "C0YOURCHANNEL",
+      "prompt": "[scheduled: platform-check] Check the platform and post its health."
+    }
+  ],
+  "starterPrompts": [
+    "Is the platform healthy?",
+    "Which schedules failed their last run?",
+    "Pause acme-bot's nightly-cleanup hook.",
+    "Stop acme-bot now."
+  ]
+}

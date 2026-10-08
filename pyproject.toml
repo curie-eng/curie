@@ -214,6 +214,7 @@ testpaths = [
     # ships its own test_server.py outside every collection root above -- so
     # the only CI signal on the shipped images was "the Dockerfile builds"
     # (#2093).
+    "examples/curie-manager/connectors",
     "examples/sre-bot/connectors",
     "tools/preflight/tests",
     "tools/doclint/tests",
