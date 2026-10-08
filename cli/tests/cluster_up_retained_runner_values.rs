@@ -971,7 +971,7 @@ fn dedicated_flags_override_file_identity_and_service_choices() {
             &args,
         );
         fixture.assert_succeeded(&output);
-        let values = merged_file_values(&fixture.captured_files());
+        let values = effective_captured_values(&helm, &fixture);
         assert_eq!(
             values.pointer("/api/githubToken").and_then(Value::as_str),
             Some(if clear { "" } else { "PLACEHOLDER-flag-token" })
@@ -1018,4 +1018,70 @@ fn dedicated_flags_override_file_identity_and_service_choices() {
             assert!(!fixture.upgrade_argv().join(" ").contains(secret));
         }
     }
+}
+
+#[test]
+fn fake_model_and_inline_set_override_lower_priority_file_choices() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3
+    let helm = real_helm().expect("real Helm required");
+    for fake in [true, false] {
+        let fixture = Fixture::new(&serde_json::json!({}));
+        let file = fixture.temp.path().join("runner-flags.yaml");
+        fs::write(&file, "security:\n  gvisor:\n    mode: 'off'\nagentSandbox:\n  controller:\n    deploy: false\n  runner:\n    fakeModel: false\n    credentialsExistingSecret: file-provider\n    credentialsExistingSecretKey: token\n").unwrap();
+        let mut args = vec!["-f", file.to_str().unwrap()];
+        if fake {
+            args.push("--fake-model");
+        } else {
+            args.extend([
+                "--set-string",
+                "agentSandbox.runner.credentials=sk-ant-api03-PLACEHOLDER-set-credential",
+            ]);
+        }
+        let output = fixture.cluster_up_with_args(&[("CURIE_TEST_REAL_HELM", &helm)], &args);
+        fixture.assert_succeeded(&output);
+        let values = effective_captured_values(&helm, &fixture);
+        if fake {
+            assert_eq!(
+                values.pointer("/agentSandbox/runner/fakeModel"),
+                Some(&Value::Bool(true))
+            );
+        } else {
+            assert_eq!(
+                values
+                    .pointer("/agentSandbox/runner/credentialsExistingSecret")
+                    .and_then(Value::as_str),
+                Some("")
+            );
+            assert_eq!(
+                values
+                    .pointer("/agentSandbox/runner/credentialsExistingSecretKey")
+                    .and_then(Value::as_str),
+                Some("")
+            );
+        }
+    }
+}
+
+// @spec CLUSTER-VALUES-FILES c1-c3
+fn effective_captured_values(helm: &str, fixture: &Fixture) -> Value {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("templates")).unwrap();
+    fs::write(
+        temp.path().join("Chart.yaml"),
+        "apiVersion: v2\nname: effective-values\nversion: 0.0.0\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("templates/values.yaml"),
+        "{{ .Values | toJson }}",
+    )
+    .unwrap();
+    let output = Command::new(helm)
+        .args(["template", "effective-values"])
+        .arg(temp.path())
+        .args(value_arguments(&fixture.upgrade_argv()))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    serde_norway::from_slice(&output.stdout).unwrap()
 }
