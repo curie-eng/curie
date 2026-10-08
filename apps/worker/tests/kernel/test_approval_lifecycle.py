@@ -3557,6 +3557,38 @@ def test_approval_that_cannot_be_created_escalates_and_does_not_suspend(
     asyncio.run(go())
 
 
+def test_approval_empty_backend_error_is_named_in_the_log(make_harness, caplog) -> None:
+    class EmptyErrorApprovals(RecordingApprovals):
+        async def create(
+            self, request: ApprovalRequest, *, budget_s: float = 120
+        ) -> CreatedApproval:
+            raise ApprovalBackendError("")
+
+    async def go() -> None:
+        async with make_harness(approvals=EmptyErrorApprovals()) as h:
+            h.runner.default_script = _awaiting_script("Approve the bounded action")
+            event = _qevent("gate this")
+            with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
+                await h.kernel.process_event(event)
+
+            records = [
+                record
+                for record in caplog.records
+                if record.getMessage().startswith("approval create failed for ")
+            ]
+            assert len(records) == 1
+            assert records[0].levelno == logging.WARNING
+            assert records[0].getMessage() == (
+                f"approval create failed for {event.event_id}: ApprovalBackendError: "
+            )
+            assert h.sink.last_text is not None
+            assert "could not be created" in h.sink.last_text
+            assert [s.operating_mode for s in h.fake_k8s.sandboxes.values()] == ["Running"]
+            assert await h.async_redis.exists(h.config.done_key(event.event_id))
+
+    asyncio.run(go())
+
+
 def test_unknown_gate_kind_escalates_instead_of_stranding_the_turn(make_harness) -> None:
     """#492/#544: ``gate_kind`` is authority-bearing, so the shared wire model
     rejects an unrecognized value rather than degrading it to None (which would

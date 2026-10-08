@@ -85,6 +85,9 @@
 # terminating pods drain before shutdown. Removing either template block must
 # fail the same rendered-manifest assertion.
 #
+# Issue #4294, Assertion 23. Dependency additions require an explicit install
+# opt-in, with a typed chart value and a reserved worker environment name.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -2045,12 +2048,13 @@ def fail(message):
     raise SystemExit(message)
 
 
-# The API schema-wait init and the schema-migrate Job share one Postgres
-# readiness loop; both run through this checker (#2865).
+# The API schema-wait init and legacy migrate fallback use the bounded shell
+# readiness loop. The current migrate image delegates readiness to Python;
+# this checker verifies all three dispatch paths (#2865, #4295).
 MODE = sys.argv[2] if len(sys.argv) > 2 else "api"
-if MODE not in {"api", "migrate"}:
+if MODE not in {"api", "migrate", "legacy"}:
     fail(f"unknown readiness checker mode {MODE!r}")
-EXEC_VERB = "wait" if MODE == "api" else "upgrade"
+EXEC_VERB = "wait" if MODE == "api" else "upgrade" if MODE == "migrate" else "-c alembic.ini upgrade head"
 WAIT_LINE = "Waiting for Postgres readiness"
 STILL_LINE = "Still waiting for Postgres readiness"
 
@@ -2058,7 +2062,7 @@ STILL_LINE = "Still waiting for Postgres readiness"
 def migrate_container(manifest):
     matches = []
     for doc in yaml.safe_load_all(pathlib.Path(manifest).read_text()):
-        if MODE == "migrate":
+        if MODE in {"migrate", "legacy"}:
             if isinstance(doc, dict) and doc.get("kind") == "Job":
                 containers = doc["spec"]["template"]["spec"].get("containers", [])
                 matches.extend(
@@ -2092,7 +2096,7 @@ def shell_process(container):
     if process[1] != "-c":
         fail("schema-wait init container shell command must use -c")
     script = process[2]
-    if MODE == "migrate":
+    if MODE in {"migrate", "legacy"}:
         return process
     if "alembic" in script:
         fail("schema-wait init must not invoke Alembic; migrations belong on the upgrade Job")
@@ -2127,10 +2131,12 @@ def run_case(process, readiness_failures, error_class="InvalidPasswordError"):
         compat_pkg = fake_modules / "curie_api"
         compat_pkg.mkdir()
         (compat_pkg / "__init__.py").write_text("")
-        (compat_pkg / "schema_compat.py").write_text(
-            "import os, pathlib, sys\n"
-            "pathlib.Path(os.environ['WAIT_CALLS']).write_text(' '.join(sys.argv[1:]) + '\\n')\n"
-        )
+        if MODE != "legacy":
+            (compat_pkg / "schema_compat.py").write_text(
+                "import os, pathlib, sys\n"
+                "pathlib.Path(os.environ['WAIT_CALLS']).write_text(' '.join(sys.argv[1:]) + '\\n')\n"
+            )
+        write_program(fake_bin / "alembic", 'printf "%s\\n" "$*" > "$WAIT_CALLS"\n')
         (fake_modules / "asyncpg.py").write_text(
             """\
 import os
@@ -2203,6 +2209,19 @@ async def connect(database_url, timeout):
 
 container = migrate_container(sys.argv[1])
 process = shell_process(container)
+
+if MODE == "migrate":
+    # The current image owns readiness in Python. Any shell probe before this
+    # dispatch would run before the supervisor can confirm pause ownership.
+    for failures in (0, 2, 60):
+        result, attempts, calls = run_case(process, failures)
+        if result.returncode != 0 or attempts or calls != ["upgrade"]:
+            fail(
+                "current-image migrate must delegate readiness before any shell probe; "
+                f"exit={result.returncode}, attempts={len(attempts)}, calls={calls!r}"
+            )
+    print("  ok (migrate): current image delegates readiness immediately to schema_compat upgrade")
+    raise SystemExit(0)
 
 ready, ready_attempts, ready_calls = run_case(process, 0)
 if ready.returncode != 0:
@@ -2288,7 +2307,35 @@ python3 "$API_MIGRATE_CHECK" "$API_MIGRATE_RENDER" \
 SCHEMA_MIGRATE_RENDER="$API_MIGRATE_OUT/curie/templates/schema-migrate.yaml"
 [[ -f "$SCHEMA_MIGRATE_RENDER" ]] || fail "schema-migrate.yaml did not render"
 python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_RENDER" migrate \
-  || fail "schema-migrate Job does not implement the same readiness diagnostics contract."
+  || fail "schema-migrate Job must delegate current-image readiness before any shell probe."
+python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_RENDER" legacy \
+  || fail "schema-migrate legacy fallback lost its bounded readiness diagnostics contract."
+
+echo "=== Assertion 14 negative control: a current-image shell probe before dispatch FAILS ==="
+SCHEMA_MIGRATE_ORDER_MUTANT="$TMP/schema-migrate-order-mutant.yaml"
+python3 - "$SCHEMA_MIGRATE_RENDER" "$SCHEMA_MIGRATE_ORDER_MUTANT" <<'PYEOF'
+import pathlib
+import sys
+import yaml
+
+docs = list(yaml.safe_load_all(pathlib.Path(sys.argv[1]).read_text()))
+for doc in docs:
+    if isinstance(doc, dict) and doc.get("kind") == "Job":
+        container = doc["spec"]["template"]["spec"]["containers"][0]
+        container["args"][0] = (
+            "python -c 'import asyncio, asyncpg; asyncio.run(asyncpg.connect(\"unused\", timeout=2))'\n"
+            + container["args"][0]
+        )
+pathlib.Path(sys.argv[2]).write_text(yaml.safe_dump_all(docs))
+PYEOF
+schema_migrate_order_negative_output=""
+if schema_migrate_order_negative_output="$(python3 "$API_MIGRATE_CHECK" "$SCHEMA_MIGRATE_ORDER_MUTANT" migrate 2>&1)"; then
+  fail "negative control did not fire: current-image readiness ran before the supervisor."
+fi
+if [[ "$schema_migrate_order_negative_output" != *"before any shell probe"* ]]; then
+  fail "migrate-order negative control failed unexpectedly: $schema_migrate_order_negative_output"
+fi
+echo "  ok: a shell probe before current-image dispatch is rejected"
 
 echo "=== Assertion 14 negative control: changed readiness bound FAILS ==="
 API_MIGRATE_BOUND_MUTANT="$TMP/mutant-api-migrate-bound"
@@ -3358,6 +3405,79 @@ PYEOF
   fi
   echo "  ok: absent API $case_name block is rejected"
 done
+
+echo "=== Assertion 23: publication dependency additions require an explicit opt-in (#4294) ==="
+python3 - "$CHART" "$TMP/reuse-render/curie/templates/worker.yaml" <<'PYEOF'
+import json
+import pathlib
+import subprocess
+import sys
+
+import yaml
+
+chart = pathlib.Path(sys.argv[1])
+env_name = "CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS"
+value_key = "worker.publication.allowDependencyAdditions"
+
+
+def dependency_opt_in(documents):
+    workers = [
+        doc for doc in documents
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "worker"
+    ]
+    assert len(workers) == 1, f"expected one worker Deployment, found {len(workers)}"
+    containers = workers[0]["spec"]["template"]["spec"]["containers"]
+    worker = [container for container in containers if container["name"] == "worker"]
+    assert len(worker) == 1, f"expected one worker container, found {len(worker)}"
+    entries = [entry for entry in worker[0]["env"] if entry["name"] == env_name]
+    assert len(entries) == 1, f"expected exactly one {env_name}, found {entries!r}"
+    assert set(entries[0]) == {"name", "value"}, entries[0]
+    assert isinstance(entries[0]["value"], str), entries[0]
+    return entries[0]["value"]
+
+
+def render(*args):
+    return subprocess.run(
+        ["helm", "template", "acme", str(chart), *args],
+        text=True, capture_output=True,
+    )
+
+
+for args, expected in (
+    ([], "false"),
+    (["--set", f"{value_key}=true"], "true"),
+    (["--set", f"{value_key}=false"], "false"),
+):
+    result = render(*args)
+    assert result.returncode == 0, result.stderr
+    value = dependency_opt_in(yaml.safe_load_all(result.stdout))
+    assert value == expected, f"{env_name} rendered {value!r}, expected {expected!r}"
+
+retained = pathlib.Path(sys.argv[2]).read_text()
+assert dependency_opt_in(yaml.safe_load_all(retained)) == "false", (
+    "retained values must refuse dependency additions by default"
+)
+
+for malformed in ("true", "false", "enabled", 1, [], {}):
+    result = render("--set-json", f"{value_key}={json.dumps(malformed)}")
+    assert result.returncode != 0, f"accepted non-boolean {value_key}: {malformed!r}"
+    assert "schema(s)" in result.stderr, result.stderr
+    assert "allowDependencyAdditions" in result.stderr, result.stderr
+
+reserved = yaml.safe_load((chart / "files" / "reserved-env.yaml").read_text())
+assert reserved["worker"].get(env_name) == value_key, f"{env_name} must be registered as reserved"
+for publication_enabled in (True, False):
+    result = render(
+        "--set", f"worker.publication.enabled={str(publication_enabled).lower()}",
+        "--set", f"worker.extraEnv[0].name={env_name}",
+        "--set-string", "worker.extraEnv[0].value=true",
+    )
+    assert result.returncode != 0, f"accepted reserved worker.extraEnv {env_name}"
+    assert "worker.extraEnv" in result.stderr and value_key in result.stderr, result.stderr
+print("  ok: dependency additions default false, explicit true renders, schema and extraEnv refuse bypasses")
+PYEOF
 
 echo
 echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate, the API uses RollingUpdate with maxUnavailable 0 and maxSurge 1 plus a preStop sleep 5, proven by both removed-block negative controls, and other workloads keep their strategies; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls."

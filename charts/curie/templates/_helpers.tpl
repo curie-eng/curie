@@ -515,6 +515,50 @@ http
 
 {{- define "curie.otelCollector.config" -}}
 {{- $debugEnabled := .Values.otelCollector.debugExporter.enabled -}}
+{{- /* @spec charts/curie/README.md: Optional trace processors. */ -}}
+{{- $extraProcessors := dict -}}
+{{- if hasKey .Values.otelCollector "extraProcessors" -}}
+{{- $extraProcessors = get .Values.otelCollector "extraProcessors" -}}
+{{- end -}}
+{{- $traceProcessors := list -}}
+{{- if hasKey .Values.otelCollector "extraTracePipelineProcessors" -}}
+{{- $traceProcessors = get .Values.otelCollector "extraTracePipelineProcessors" -}}
+{{- end -}}
+{{- $builtInProcessors := dict "memory_limiter" true "batch" true "transform/runner_identity" true -}}
+{{- $componentIDPattern := "^[a-z][a-z0-9_]*(/[A-Za-z0-9_-]+)?$" -}}
+{{- if not (kindIs "map" $extraProcessors) -}}
+{{- fail "otelCollector.extraProcessors must be a map of Collector processor IDs to configuration maps." -}}
+{{- end -}}
+{{- if not (kindIs "slice" $traceProcessors) -}}
+{{- fail "otelCollector.extraTracePipelineProcessors must be a list of processor IDs." -}}
+{{- end -}}
+{{- range $name, $config := $extraProcessors -}}
+{{- if hasKey $builtInProcessors $name -}}
+{{- fail (printf "otelCollector.extraProcessors[%q] must not replace built-in processor %q." $name $name) -}}
+{{- end -}}
+{{- if not (regexMatch $componentIDPattern $name) -}}
+{{- fail (printf "otelCollector.extraProcessors[%q] has invalid component ID." $name) -}}
+{{- end -}}
+{{- if not (kindIs "map" $config) -}}
+{{- fail (printf "otelCollector.extraProcessors[%q] must be a map." $name) -}}
+{{- end -}}
+{{- end -}}
+{{- $seenTraceProcessors := dict -}}
+{{- range $processor := $traceProcessors -}}
+{{- if not (kindIs "string" $processor) -}}
+{{- fail "otelCollector.extraTracePipelineProcessors entries must be processor IDs." -}}
+{{- end -}}
+{{- if hasKey $builtInProcessors $processor -}}
+{{- fail (printf "otelCollector.extraTracePipelineProcessors must not select built-in processor %q." $processor) -}}
+{{- end -}}
+{{- if hasKey $seenTraceProcessors $processor -}}
+{{- fail (printf "otelCollector.extraTracePipelineProcessors duplicates processor %q." $processor) -}}
+{{- end -}}
+{{- if not (hasKey $extraProcessors $processor) -}}
+{{- fail (printf "otelCollector.extraTracePipelineProcessors references undefined processor %q." $processor) -}}
+{{- end -}}
+{{- $_ := set $seenTraceProcessors $processor true -}}
+{{- end -}}
 {{- $builtInExporters := dict "otlphttp/langfuse" true "nop/logs" true "nop/metrics" true -}}
 {{- /* Reserve built-in names even when the development-only debug exporter is disabled.
       An extra exporter with one of these keys would otherwise replace chart-owned
@@ -643,6 +687,9 @@ processors:
       - context: datapoint
         statements:
           - 'set(attributes["service.instance.id"], resource.attributes["service.instance.id"]) where resource.attributes["service.name"] == "curie-runner"'
+{{- with $extraProcessors }}
+{{ toYaml . | nindent 2 }}
+{{- end }}
 exporters:
   otlphttp/langfuse:
     endpoint: {{ include "curie.langfuse.url" . }}/api/public/otel
@@ -689,7 +736,7 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [memory_limiter, batch]
+      processors: [memory_limiter{{- range $traceProcessors }}, {{ . }}{{- end }}, batch]
       exporters: [otlphttp/langfuse{{- if $debugEnabled }}, debug{{- end }}{{- range .Values.otelCollector.extraPipelineExporters }}, {{ . }}{{- end }}]
     logs:
       receivers: [otlp{{- if $eventsEnabled }}, k8sobjects/events{{- end }}]

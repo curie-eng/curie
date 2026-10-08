@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -198,6 +199,83 @@ def _ledger_script():
         ErrorEvent(classification="server-error", message="Provider turn ended"),
         Final(text="Provider turn ended", status=SessionStatus.CLASSIFIED_FAILURE),
     ]
+
+
+def test_settling_empty_transport_error_is_named_in_the_log(
+    make_harness, monkeypatch, caplog
+) -> None:
+    from curie_worker import api_retry
+    from curie_worker import kernel as kernel_module
+
+    async def go() -> None:
+        clock = ApiClock()
+        request_id = uuid.uuid4()
+        api = Api(request_id, clock)
+        api.fail_finish = True
+        empty_failure_pending = True
+        waiting = asyncio.Event()
+        resume = asyncio.Event()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal empty_failure_pending
+            if request.url.path.endswith("/finish") and not api.fail_finish:
+                if empty_failure_pending:
+                    empty_failure_pending = False
+                    # The API-facing seam can raise an empty wrapper, independently
+                    # of the underlying httpx errors exercised by client tests.
+                    raise WorkItemTransportError("")
+            return api(request)
+
+        async def settle_sleep(delay: float) -> None:
+            waiting.set()
+            await resume.wait()
+            clock.now += delay
+            api.fail_finish = False
+
+        monkeypatch.setattr(api_retry, "_clock", clock)
+        monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
+        monkeypatch.setattr(kernel_module, "_settle_sleep", settle_sleep)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = WorkItemDispatchClient(
+                api_base_url="http://api.example", worker_token="example", client=http
+            )
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=_PublicationApi(),
+            ) as h:
+                api.kernel = h.kernel
+                h.kernel._work_items = client
+                h.runner.default_script = _ledger_script()
+                with caplog.at_level(logging.WARNING, logger="curie_worker.kernel"):
+                    await h.kernel.process_event(_event(request_id))
+                    await asyncio.wait_for(waiting.wait(), timeout=2)
+                    task = next(
+                        task
+                        for task in asyncio.all_tasks()
+                        if not task.done()
+                        and "settle" in task.get_name()
+                        and str(request_id) in task.get_name()
+                    )
+                    resume.set()
+                    await asyncio.wait_for(task, timeout=2)
+
+                records = [
+                    record
+                    for record in caplog.records
+                    if record.getMessage().startswith("work-item finish still unavailable for ")
+                ]
+                assert len(records) == 1
+                assert records[0].levelno == logging.WARNING
+                assert records[0].getMessage() == (
+                    f"work-item finish still unavailable for {request_id}: WorkItemTransportError: "
+                )
+                assert api.run.finished
+                assert not h.kernel.owns_work_item(request_id)
+                assert len(h.runner.opened) == 1
+                assert len(api.finished_posts) == 1
+
+    asyncio.run(go())
 
 
 @pytest.mark.parametrize(

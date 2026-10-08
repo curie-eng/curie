@@ -15,6 +15,7 @@ import pytest
 from channel_protocol import scoped_conversation_id
 from curie_api import crud
 from curie_api.config import get_settings
+from curie_api.models import ThreadPublicationLineage
 from curie_api.threadkeys import (
     pre_identity_thread_key,
     route_thread_key,
@@ -380,8 +381,10 @@ def test_refuse_fenced_work_item_still_fences_a_cancelled_legacy_work_item(
     _with_session(body)
 
 
-async def _bare_lineage(session: AsyncSession, agent_id: uuid.UUID) -> uuid.UUID:
-    """A lineage row that exists only to give `publication_lineage_id` a valid FK target."""
+async def _bare_lineage(
+    session: AsyncSession, agent_id: uuid.UUID, conversation_id: str
+) -> uuid.UUID:
+    """An open PR with the admitted WorkItem's verified repository identity."""
 
     version_id = uuid.uuid4()
     await session.execute(
@@ -403,17 +406,25 @@ async def _bare_lineage(session: AsyncSession, agent_id: uuid.UUID) -> uuid.UUID
     await session.execute(
         text(
             "INSERT INTO curie.thread_publication_lineages "
-            "(id, agent_id, deployment_id, conversation_id, repo_full_name, base_sha, branch) "
-            "VALUES (:id, :agent_id, :deployment_id, :conversation_id, :repo, :base_sha, :branch)"
+            "(id, agent_id, deployment_id, conversation_id, repo_full_name, base_sha, branch, "
+            "status, pr_number, pr_url, head_sha, github_repository_id, "
+            "github_installation_id, github_pr_node_id, base_ref) VALUES "
+            "(:id, :agent_id, :deployment_id, :conversation_id, :repo, :base_sha, :branch, "
+            "'open', 123, :pr_url, :head_sha, :repository_id, :installation_id, "
+            "'PR_example_123', 'main')"
         ),
         {
             "id": lineage_id,
             "agent_id": agent_id,
             "deployment_id": deployment_id,
-            "conversation_id": f"placeholder-{lineage_id.hex[:8]}",
+            "conversation_id": conversation_id,
             "repo": "acme-corp/acme-bot",
             "base_sha": "a" * 40,
             "branch": f"curie/bind-{lineage_id.hex[:8]}",
+            "pr_url": "https://github.com/acme-corp/acme-bot/pull/123",
+            "head_sha": "b" * 40,
+            "repository_id": _facts(agent_id).github_repository_id,
+            "installation_id": _facts(agent_id).github_installation_id,
         },
     )
     await session.commit()
@@ -422,24 +433,14 @@ async def _bare_lineage(session: AsyncSession, agent_id: uuid.UUID) -> uuid.UUID
 
 async def _bind_lineage(
     session: AsyncSession,
-    agent_id: uuid.UUID,
-    conversation_id: str,
     lineage_id: uuid.UUID,
     request_id: uuid.UUID,
 ) -> None:
     """Bind through the publication's own running request, as the API does."""
-    lineage: Any = SimpleNamespace(
-        id=lineage_id,
-        agent_id=agent_id,
-        conversation_id=conversation_id,
-        repo_full_name="acme-corp/acme-bot",
-        github_repository_id=None,
-        github_installation_id=None,
-    )
+    lineage = await session.get(ThreadPublicationLineage, lineage_id)
+    assert lineage is not None
     publication: Any = SimpleNamespace(execution_request_id=request_id)
-    await crud._bind_running_work_item_lineage(
-        session, publication=publication, lineage=lineage, identity=None
-    )
+    await crud._bind_running_work_item_lineage(session, publication=publication, lineage=lineage)
 
 
 def test_bind_running_work_item_lineage_finds_a_legacy_work_items_running_request(
@@ -463,8 +464,8 @@ def test_bind_running_work_item_lineage_finds_a_legacy_work_items_running_reques
             {"id": request_id},
         )
         await session.commit()
-        lineage_id = await _bare_lineage(session, agent_id)
-        await _bind_lineage(session, agent_id, NEW_KEY, lineage_id, request_id)
+        lineage_id = await _bare_lineage(session, agent_id, NEW_KEY)
+        await _bind_lineage(session, lineage_id, request_id)
         await session.commit()
         bound = await session.scalar(
             text("SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"),
@@ -496,12 +497,12 @@ def test_bind_running_work_item_lineage_does_not_adopt_a_legacy_key_under_anothe
             {"id": request_id},
         )
         await session.commit()
-        lineage_id = await _bare_lineage(session, agent_id)
         # The pair's binding is bound under ADAPTER, not this one: the old
         # key can only be ITS route's, so a write implying another route's
         # identity must not adopt it.
         other = scoped_conversation_id("email", ADDRESS, THREAD, identity="other-inbox")
-        await _bind_lineage(session, agent_id, other, lineage_id, request_id)
+        lineage_id = await _bare_lineage(session, agent_id, other)
+        await _bind_lineage(session, lineage_id, request_id)
         await session.commit()
         bound = await session.scalar(
             text("SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"),

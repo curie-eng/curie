@@ -22,10 +22,11 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from . import transcripts
 from .config import get_settings
-from .factory_reply_target import parse_reply_target
+from .factory_reply_target import is_follow_up, parse_reply_target
 from .models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     Agent,
+    Deployment,
     ExecutionRequest,
     FactoryStatusComment,
     Publication,
@@ -384,9 +385,7 @@ async def _publication_owns_terminus(
     return found is not None
 
 
-async def _lock_work_item(
-    session: AsyncSession, work_item_id: uuid.UUID
-) -> WorkItem | None:
+async def _lock_work_item(session: AsyncSession, work_item_id: uuid.UUID) -> WorkItem | None:
     row: WorkItem | None = await session.scalar(
         select(WorkItem)
         .where(WorkItem.id == work_item_id)
@@ -633,9 +632,7 @@ async def create_execution_request(
             )
         active = await _lock_active_request(session, work_item_id)
         if active is not None:
-            return await _conflict(
-                session, "active_request", work_item=work_item, request=active
-            )
+            return await _conflict(session, "active_request", work_item=work_item, request=active)
         return await _conflict(session, "stale_version", work_item=work_item)
 
     if not allocation_changed:
@@ -755,6 +752,44 @@ async def _lineage_closed_for(
     return lineage is None or lineage.status != "open" or lineage.pr_number != target.pr_number
 
 
+async def _unchanged_follow_up(
+    session: AsyncSession,
+    work_item: WorkItem,
+    request: ExecutionRequest,
+    detail: str | None,
+) -> bool:
+    """An explicit no-change reply can complete a follow-up on its open PR."""
+
+    if detail is None or not detail.strip().startswith("No changes needed:"):
+        return False
+    clone_base = get_settings().github_clone_base
+    if not is_follow_up(
+        request.objective,
+        repo_full_name=work_item.repo_full_name,
+        issue_number=work_item.github_issue_number,
+        clone_base=clone_base,
+    ):
+        return False
+    lineage = (
+        await session.get(ThreadPublicationLineage, work_item.publication_lineage_id)
+        if work_item.publication_lineage_id is not None
+        else None
+    )
+    if (
+        lineage is None
+        or lineage.status != "open"
+        or not isinstance(lineage.pr_url, str)
+        or not lineage.pr_url.strip()
+    ):
+        return False
+    target = parse_reply_target(
+        request.objective,
+        repo_full_name=work_item.repo_full_name,
+        clone_base=clone_base,
+    )
+    return target.pr_number is None or lineage.pr_number == target.pr_number
+
+
 async def admit_next_revision(
     session: AsyncSession,
     *,
@@ -842,27 +877,17 @@ async def _start_execution(
             session, "work_item_cancelled", work_item=work_item, request_id=request_id
         )
     if work_item.version != expected_work_item_version:
-        return await _conflict(
-            session, "stale_version", work_item=work_item, request_id=request_id
-        )
-    request = await _lock_request(
-        session, work_item_id=work_item_id, request_id=request_id
-    )
+        return await _conflict(session, "stale_version", work_item=work_item, request_id=request_id)
+    request = await _lock_request(session, work_item_id=work_item_id, request_id=request_id)
     if request is None:
-        return await _conflict(
-            session, "not_found", work_item=work_item, request_id=request_id
-        )
+        return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     if request.status != "waiting":
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     deadline = request.wait_deadline
     if deadline is None:
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
 
     now = await _database_now(session)
     if now >= deadline:
@@ -954,32 +979,20 @@ async def expire_waiting(
             session, "work_item_cancelled", work_item=work_item, request_id=request_id
         )
     if work_item.version != expected_work_item_version:
-        return await _conflict(
-            session, "stale_version", work_item=work_item, request_id=request_id
-        )
-    request = await _lock_request(
-        session, work_item_id=work_item_id, request_id=request_id
-    )
+        return await _conflict(session, "stale_version", work_item=work_item, request_id=request_id)
+    request = await _lock_request(session, work_item_id=work_item_id, request_id=request_id)
     if request is None:
-        return await _conflict(
-            session, "not_found", work_item=work_item, request_id=request_id
-        )
+        return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     if request.status != "waiting":
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     deadline = request.wait_deadline
     if deadline is None:
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     now = await _database_now(session)
     if now < deadline:
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -1005,6 +1018,125 @@ async def expire_waiting(
     return await _outcome(session, work_item, request)
 
 
+async def adopt_orphan_publication_lineage(
+    session: AsyncSession,
+    *,
+    deployment_id: uuid.UUID,
+    work_item_id: uuid.UUID,
+    execution_request_id: uuid.UUID,
+    runtime_epoch: int,
+) -> None:
+    """Commit an eligible predecessor's open PR link before any provider read.
+
+    Lock in lifecycle order: WorkItem, calling request, then lineage. Publication
+    provenance is read without locking its writer. Ineligible candidates leave
+    the existing publication authority reader to return its usual refusal.
+    """
+
+    work_item = await _lock_work_item(session, work_item_id)
+    if (
+        work_item is None
+        or work_item.cancelled_at is not None
+        or work_item.publication_lineage_id is not None
+    ):
+        await session.commit()
+        return
+    request = await _lock_request(
+        session, work_item_id=work_item_id, request_id=execution_request_id
+    )
+    deployment_agent_id = await session.scalar(
+        select(Deployment.agent_id).where(Deployment.id == deployment_id)
+    )
+    now = await _database_now(session)
+    if (
+        request is None
+        or deployment_agent_id != work_item.agent_id
+        or request.status != "running"
+        or request.runtime_epoch != runtime_epoch
+        or not request.runtime_owner
+        or request.runtime_heartbeat_expires_at is None
+        or request.runtime_heartbeat_expires_at <= now
+        or request.execution_deadline is None
+        or request.execution_deadline <= now
+    ):
+        await session.commit()
+        return
+    candidates = list(
+        await session.scalars(
+            select(ThreadPublicationLineage)
+            .where(
+                ThreadPublicationLineage.agent_id == work_item.agent_id,
+                ThreadPublicationLineage.conversation_id == work_item.conversation_id,
+                func.lower(ThreadPublicationLineage.repo_full_name)
+                == work_item.repo_full_name.casefold(),
+                ThreadPublicationLineage.status == "open",
+                ThreadPublicationLineage.pr_number.is_not(None),
+            )
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+    )
+    if len(candidates) != 1:
+        await session.commit()
+        return
+    lineage = candidates[0]
+    if (
+        lineage.github_repository_id != work_item.github_repository_id
+        or lineage.github_installation_id != work_item.github_installation_id
+    ):
+        await session.commit()
+        return
+    owner = await session.scalar(
+        select(WorkItem.id).where(WorkItem.publication_lineage_id == lineage.id)
+    )
+    predecessor_publication = await session.scalar(
+        select(Publication.id)
+        .join(ExecutionRequest, ExecutionRequest.id == Publication.execution_request_id)
+        .where(
+            Publication.lineage_id == lineage.id,
+            ExecutionRequest.work_item_id == work_item_id,
+            ExecutionRequest.sequence < request.sequence,
+        )
+        .limit(1)
+    )
+    if owner is not None or predecessor_publication is None:
+        await session.commit()
+        return
+    try:
+        async with session.begin_nested():
+            await session.execute(
+                update(WorkItem)
+                .where(
+                    WorkItem.id == work_item_id,
+                    WorkItem.version == work_item.version,
+                    WorkItem.cancelled_at.is_(None),
+                    WorkItem.publication_lineage_id.is_(None),
+                    select(ExecutionRequest.id)
+                    .where(
+                        ExecutionRequest.id == execution_request_id,
+                        ExecutionRequest.work_item_id == work_item_id,
+                        ExecutionRequest.version == request.version,
+                        ExecutionRequest.status == "running",
+                        ExecutionRequest.runtime_epoch == runtime_epoch,
+                        ExecutionRequest.runtime_heartbeat_expires_at > func.clock_timestamp(),
+                        ExecutionRequest.execution_deadline > func.clock_timestamp(),
+                    )
+                    .exists(),
+                )
+                .values(
+                    publication_lineage_id=lineage.id,
+                    version=WorkItem.version + 1,
+                    updated_at=func.clock_timestamp(),
+                )
+                .execution_options(synchronize_session=False)
+            )
+    except IntegrityError:
+        # A competing work item can claim the unique link under a shared
+        # lineage lock. Its committed ownership is handled by the reader.
+        pass
+    await session.commit()
+
+
 async def link_publication_lineage(
     session: AsyncSession,
     *,
@@ -1024,27 +1156,19 @@ async def link_publication_lineage(
             session, "work_item_cancelled", work_item=work_item, request_id=request_id
         )
     if work_item.version != expected_work_item_version:
-        return await _conflict(
-            session, "stale_version", work_item=work_item, request_id=request_id
-        )
-    request = await _lock_request(
-        session, work_item_id=work_item_id, request_id=request_id
-    )
+        return await _conflict(session, "stale_version", work_item=work_item, request_id=request_id)
+    request = await _lock_request(session, work_item_id=work_item_id, request_id=request_id)
     if request is None:
-        return await _conflict(
-            session, "not_found", work_item=work_item, request_id=request_id
-        )
+        return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
-    if request.status != "running":
-        return await _conflict(
-            session, "publication_ineligible", work_item=work_item, request=request
-        )
-    now = await _database_now(session)
-    if request.execution_deadline is None or now >= request.execution_deadline:
-        return await _conflict(
-            session, "execution_deadline_elapsed", work_item=work_item, request=request
-        )
+    running_request = request.status == "running"
+    if running_request:
+        now = await _database_now(session)
+        if request.execution_deadline is None or now >= request.execution_deadline:
+            return await _conflict(
+                session, "execution_deadline_elapsed", work_item=work_item, request=request
+            )
 
     if (
         work_item.publication_lineage_id is not None
@@ -1060,22 +1184,38 @@ async def link_publication_lineage(
         .with_for_update(read=True)
         .execution_options(populate_existing=True)
     )
+    if not running_request and (
+        lineage is None
+        or lineage.status != "open"
+        or lineage.pr_number is None
+        or await session.scalar(
+            select(Publication.id)
+            .where(
+                Publication.execution_request_id == request_id,
+                Publication.lineage_id == publication_lineage_id,
+                Publication.status == "succeeded",
+            )
+            .limit(1)
+        )
+        is None
+    ):
+        return await _conflict(
+            session, "publication_ineligible", work_item=work_item, request=request
+        )
     if lineage is None or (
         lineage.agent_id != work_item.agent_id
         or lineage.conversation_id != work_item.conversation_id
         or lineage.repo_full_name.casefold() != work_item.repo_full_name.casefold()
         or (
-            lineage.github_repository_id is not None
+            (not running_request or lineage.github_repository_id is not None)
             and lineage.github_repository_id != work_item.github_repository_id
         )
         or (
-            lineage.github_installation_id is not None
+            (not running_request or lineage.github_installation_id is not None)
             and lineage.github_installation_id != work_item.github_installation_id
         )
     ):
-        return await _conflict(
-            session, "lineage_mismatch", work_item=work_item, request=request
-        )
+        return await _conflict(session, "lineage_mismatch", work_item=work_item, request=request)
     if work_item.publication_lineage_id == publication_lineage_id:
         return await _outcome(session, work_item, request, replayed=True)
     owner = await session.scalar(
@@ -1087,6 +1227,14 @@ async def link_publication_lineage(
         )
 
     lineage_changed = False
+    request_predicates: list[ColumnElement[bool]] = [
+        ExecutionRequest.id == request_id,
+        ExecutionRequest.work_item_id == work_item_id,
+        ExecutionRequest.version == expected_request_version,
+        ExecutionRequest.status == request.status,
+    ]
+    if running_request:
+        request_predicates.append(ExecutionRequest.execution_deadline > func.clock_timestamp())
     try:
         async with session.begin_nested():
             changed_id: uuid.UUID | None = await session.scalar(
@@ -1096,16 +1244,7 @@ async def link_publication_lineage(
                     WorkItem.version == expected_work_item_version,
                     WorkItem.cancelled_at.is_(None),
                     WorkItem.publication_lineage_id.is_(None),
-                    select(ExecutionRequest.id)
-                    .where(
-                        ExecutionRequest.id == request_id,
-                        ExecutionRequest.work_item_id == work_item_id,
-                        ExecutionRequest.version == expected_request_version,
-                        ExecutionRequest.status == "running",
-                        ExecutionRequest.execution_deadline
-                        > func.clock_timestamp(),
-                    )
-                    .exists(),
+                    select(ExecutionRequest.id).where(*request_predicates).exists(),
                 )
                 .values(
                     publication_lineage_id=publication_lineage_id,
@@ -1132,7 +1271,7 @@ async def link_publication_lineage(
     if not lineage_changed:
         work_item = await _reload_work_item(session, work_item_id)
         request = await _reload_request(session, request_id)
-        if (
+        if running_request and (
             request.execution_deadline is None
             or await _database_now(session) >= request.execution_deadline
         ):
@@ -1146,9 +1285,7 @@ async def link_publication_lineage(
             return await _conflict(
                 session, "lineage_already_owned", work_item=work_item, request=request
             )
-        return await _conflict(
-            session, "stale_version", work_item=work_item, request=request
-        )
+        return await _conflict(session, "stale_version", work_item=work_item, request=request)
     work_item = await _reload_work_item(session, work_item_id)
     return await _outcome(session, work_item, request)
 
@@ -1175,22 +1312,14 @@ async def _terminalize_execution(
             session, "work_item_cancelled", work_item=work_item, request_id=request_id
         )
     if work_item.version != expected_work_item_version:
-        return await _conflict(
-            session, "stale_version", work_item=work_item, request_id=request_id
-        )
-    request = await _lock_request(
-        session, work_item_id=work_item_id, request_id=request_id
-    )
+        return await _conflict(session, "stale_version", work_item=work_item, request_id=request_id)
+    request = await _lock_request(session, work_item_id=work_item_id, request_id=request_id)
     if request is None:
-        return await _conflict(
-            session, "not_found", work_item=work_item, request_id=request_id
-        )
+        return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     if request.status != "running" or not cause.strip():
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     now = await _database_now(session)
     # The CI gate's causes (#3097) end a request whose pull request already
     # opened, so they share the opened-PR deadline exception. Keep this literal
@@ -1199,9 +1328,7 @@ async def _terminalize_execution(
     opened = (status == "completed" or ci_cause) and await _opened_pull_request(
         session, work_item, request
     )
-    deadline_elapsed = (
-        request.execution_deadline is None or now >= request.execution_deadline
-    )
+    deadline_elapsed = request.execution_deadline is None or now >= request.execution_deadline
     # A pull request that already opened is the terminus even if reconciliation
     # notices it after the execution deadline.
     if deadline_elapsed and not opened:
@@ -1209,9 +1336,7 @@ async def _terminalize_execution(
             session, "execution_deadline_elapsed", work_item=work_item, request=request
         )
     if status == "completed" and not opened:
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     if status == "failed" and cause.strip() == "ci_fix_unpublished":
         # A CI fix turn that ended without a new publication is terminal, unless
         # its publication is still in flight, or a fix publication already
@@ -1249,6 +1374,9 @@ async def _terminalize_execution(
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
+        if await _unchanged_follow_up(session, work_item, request, detail):
+            status = "completed"
+            cause = "completed"
     if status == "failed" and cause.strip() == "approval_create_failed":
         pending = await session.scalar(
             select(Publication.id)
@@ -1266,9 +1394,7 @@ async def _terminalize_execution(
     # complete after the deadline. The UPDATE has to use the same exception,
     # or the deadline predicate rejects the row and the next pass cancels it.
     deadline_guard = (
-        ()
-        if opened
-        else (ExecutionRequest.execution_deadline > func.clock_timestamp(),)
+        () if opened else (ExecutionRequest.execution_deadline > func.clock_timestamp(),)
     )
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
@@ -1420,8 +1546,12 @@ async def settle_ci_verdict(
         if work_item is not None
         else None
     )
-    if work_item is not None and request is not None and not await _ci_fence_holds(
-        session, work_item, request_id, expected_publication_id, expected_head_sha
+    if (
+        work_item is not None
+        and request is not None
+        and not await _ci_fence_holds(
+            session, work_item, request_id, expected_publication_id, expected_head_sha
+        )
     ):
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     return await _terminalize_execution(
@@ -1808,13 +1938,9 @@ async def settle_overdue_cancellation(
         return await _conflict(
             session, "not_found", work_item_id=work_item_id, request_id=request_id
         )
-    request = await _lock_request(
-        session, work_item_id=work_item_id, request_id=request_id
-    )
+    request = await _lock_request(session, work_item_id=work_item_id, request_id=request_id)
     if request is None:
-        return await _conflict(
-            session, "not_found", work_item=work_item, request_id=request_id
-        )
+        return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     window = timedelta(seconds=settle_seconds)
@@ -1833,9 +1959,7 @@ async def settle_overdue_cancellation(
             )
         )
     ):
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -1893,27 +2017,17 @@ async def request_execution_deadline_cancellation(
             session, "work_item_cancelled", work_item=work_item, request_id=request_id
         )
     if work_item.version != expected_work_item_version:
-        return await _conflict(
-            session, "stale_version", work_item=work_item, request_id=request_id
-        )
-    request = await _lock_request(
-        session, work_item_id=work_item_id, request_id=request_id
-    )
+        return await _conflict(session, "stale_version", work_item=work_item, request_id=request_id)
+    request = await _lock_request(session, work_item_id=work_item_id, request_id=request_id)
     if request is None:
-        return await _conflict(
-            session, "not_found", work_item=work_item, request_id=request_id
-        )
+        return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     if request.status != "running":
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     now = await _database_now(session)
     if request.execution_deadline is None or now < request.execution_deadline:
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -1956,22 +2070,14 @@ async def request_owner_lost_cancellation(
             session, "work_item_cancelled", work_item=work_item, request_id=request_id
         )
     if work_item.version != expected_work_item_version:
-        return await _conflict(
-            session, "stale_version", work_item=work_item, request_id=request_id
-        )
-    request = await _lock_request(
-        session, work_item_id=work_item_id, request_id=request_id
-    )
+        return await _conflict(session, "stale_version", work_item=work_item, request_id=request_id)
+    request = await _lock_request(session, work_item_id=work_item_id, request_id=request_id)
     if request is None:
-        return await _conflict(
-            session, "not_found", work_item=work_item, request_id=request_id
-        )
+        return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     if request.status != "running":
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     now = await _database_now(session)
     ttl = timedelta(seconds=get_settings().work_item_runtime_ttl_seconds)
     heartbeat_lapsed = (
@@ -1984,9 +2090,7 @@ async def request_owner_lost_cancellation(
         and request.started_at + ttl <= now
     )
     if not heartbeat_lapsed and not owner_absent:
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     published = await session.scalar(
         select(Publication.id)
         .where(
@@ -1997,9 +2101,7 @@ async def request_owner_lost_cancellation(
     )
     if published is not None:
         # A published request waits on CI; the CI gate owns its terminus.
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
         .where(
@@ -2018,10 +2120,7 @@ async def request_owner_lost_cancellation(
                 | (
                     ExecutionRequest.runtime_owner.is_(None)
                     & ExecutionRequest.started_at.is_not(None)
-                    & (
-                        ExecutionRequest.started_at
-                        <= func.clock_timestamp() - ttl
-                    )
+                    & (ExecutionRequest.started_at <= func.clock_timestamp() - ttl)
                 )
             ),
         )
@@ -2077,16 +2176,10 @@ async def _record_runtime_termination(
             session, "not_found", work_item_id=work_item_id, request_id=request_id
         )
     if work_item.version != expected_work_item_version:
-        return await _conflict(
-            session, "stale_version", work_item=work_item, request_id=request_id
-        )
-    request = await _lock_request(
-        session, work_item_id=work_item_id, request_id=request_id
-    )
+        return await _conflict(session, "stale_version", work_item=work_item, request_id=request_id)
+    request = await _lock_request(session, work_item_id=work_item_id, request_id=request_id)
     if request is None:
-        return await _conflict(
-            session, "not_found", work_item=work_item, request_id=request_id
-        )
+        return await _conflict(session, "not_found", work_item=work_item, request_id=request_id)
     if request.version != expected_request_version:
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     if request.status == "cancelled" and request.teardown_unconfirmed_at is not None:
@@ -2098,9 +2191,7 @@ async def _record_runtime_termination(
             extra_where=extra_where,
         )
     if request.status != "cancellation_requested":
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     if not termination_observation.strip():
         return await _conflict(
             session,
@@ -2115,9 +2206,7 @@ async def _record_runtime_termination(
     elif request.terminal_cause == "owner_lost":
         terminal_status = "failed"
     else:
-        return await _conflict(
-            session, "illegal_transition", work_item=work_item, request=request
-        )
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     now = await _database_now(session)
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
@@ -2286,9 +2375,7 @@ async def _confirm_settled_teardown(
     )
     if changed_id is None:
         reloaded = await _reload_request(session, request.id)
-        return await _conflict(
-            session, "stale_version", work_item=work_item, request=reloaded
-        )
+        return await _conflict(session, "stale_version", work_item=work_item, request=reloaded)
     request = await _reload_request(session, request.id)
     return await _outcome(session, work_item, request)
 

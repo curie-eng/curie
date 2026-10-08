@@ -174,6 +174,20 @@
         }
       }
     },
+    "security": {
+      "type": "object",
+      "properties": {
+        "dataTierNetworkPolicy": {
+          "type": "object",
+          "properties": {
+            "allowMcpConnectorValkeyIngress": {
+              "type": "boolean",
+              "description": "Keep the MCP connector peer in the in-chart Valkey allow-ingress policy (issue #4318)."
+            }
+          }
+        }
+      }
+    },
     "worker": {
       "type": "object",
       "properties": {
@@ -317,6 +331,7 @@
               "type": "array",
               "items": {"type": "string", "minLength": 1, "maxLength": 512}
             },
+            "allowDependencyAdditions": {"type": "boolean"},
             "githubHttpsCidrs": {
               "type": "array",
               "minItems": 1,

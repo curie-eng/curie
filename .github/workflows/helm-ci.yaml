@@ -170,6 +170,9 @@ jobs:
       - name: helm render assertions (NetworkPolicy warning)
         run: bash charts/curie/ci/networkpolicy-notes-assertions.sh
 
+      - name: helm render assertions (MCP connector Valkey ingress opt-out)
+        run: bash charts/curie/ci/mcp-valkey-ingress-optout-assertions.sh
+
       # Prove the api reads runner pods for the Logs tab from the release
       # namespace, the same namespace the worker claims sandboxes in.
       - name: helm render assertions (api runner namespace)
@@ -298,6 +301,11 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/otel-collector-durability-assertions.sh
+
+      - name: helm render assertions (otel collector trace processors)
+        run: |
+          set -euo pipefail
+          bash charts/curie/ci/otel-collector-processors-assertions.sh
 
       - name: helm render assertions (exporters without exporterhelper)
         run: |

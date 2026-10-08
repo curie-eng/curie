@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -41,6 +43,11 @@ from curie_worker.workitem_dispatch import (
     WorkItemRequestView,
     WorkItemStartGrant,
     WorkItemTransportError,
+)
+
+from apps.worker.tests.kernel.test_work_item_workspace import (
+    _PR_NOT_ADOPTED_RESPONSE,
+    _HttpPrecheckApi,
 )
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
@@ -334,6 +341,8 @@ def test_early_stop_and_unpublished_turns_get_different_continuation_prompts(
         )
 
         assert early[1] != worked[1]
+        assert "No changes needed:" in early[1]
+        assert "No changes needed:" in worked[1]
 
     asyncio.run(exercise())
 
@@ -665,6 +674,140 @@ def test_a_snapshot_base_mismatch_names_both_commits_on_the_factory_run(
             assert publications.creates == []
 
     asyncio.run(exercise())
+
+
+@pytest.fixture
+def dependency_publication_patch(tmp_path: Path) -> tuple[bytes, object]:
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    repo = tmp_path / "dependency-repository"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "publisher@example.test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Publisher"], cwd=repo, check=True)
+    manifest = repo / "crates" / "acme-tool" / "Cargo.toml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        '[package]\nname = "acme-tool"\nversion = "1.0.0"\n[dependencies]\nacme-base = "1.0.0"\n',
+        encoding="utf-8",
+    )
+    lockfile = manifest.with_name("Cargo.lock")
+    lockfile.write_text(
+        'version = 4\n[[package]]\nname = "acme-base"\nversion = "1.0.0"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    archive = subprocess.run(
+        ["git", "archive", "--format=tar.gz", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    ).stdout
+    manifest.write_text(manifest.read_text() + 'acme-new = "1.0.0"\n', encoding="utf-8")
+    lockfile.write_text(
+        lockfile.read_text() + '[[package]]\nname = "acme-new"\nversion = "1.0.0"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
+        encoding="utf-8",
+    )
+    patch = subprocess.run(
+        ["git", "diff", "--binary", "--no-renames"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert patch, "fixture must produce an actual Git patch"
+    return archive, RunnerWorkspaceSnapshot(
+        repo_full_name=WORK_ITEM_REPO,
+        base_sha=base_sha,
+        patch=patch,
+        changed_paths=("crates/acme-tool/Cargo.lock", "crates/acme-tool/Cargo.toml"),
+        contains_workflow_files=False,
+        publication_title="Update the widget implementation",
+        publication_body="Update the implementation and its dependency declarations.",
+    )
+
+
+@pytest.mark.parametrize("allow_dependency_additions", [False, True], ids=["default", "allow"])
+def test_dependency_publication_refusal_reaches_the_factory_finish(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dependency_publication_patch: tuple[bytes, object],
+    allow_dependency_additions: bool,
+) -> None:
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    archive, candidate = dependency_publication_patch
+    assert isinstance(candidate, RunnerWorkspaceSnapshot)
+    delays = _patch_snapshot_backoff(monkeypatch)
+
+    class DependencyWorkspace(_Workspace):
+        def __init__(self, substrate: object) -> None:
+            super().__init__(substrate)
+            self.preparer = SimpleNamespace(
+                limits=SimpleNamespace(max_archive_bytes=len(archive) + 1)
+            )
+
+        def current(self, _thread_key: str) -> object:
+            return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha=candidate.base_sha)
+
+        def stream_current_base(self, _thread_key: str) -> list[bytes]:
+            return [archive]
+
+    async def exercise() -> None:
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=DependencyWorkspace,
+            publication_creator=publications,
+            publication_allow_dependency_additions=allow_dependency_additions,
+            workspace_scratch_root=str(tmp_path),
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            snapshot_calls = 0
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                return candidate
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            h.runner.default_script = [_done("default script must not run")]
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert snapshot_calls == 1
+            assert len(h.runner.opened) == 1
+            assert await h.kernel._markers.is_terminal(event.event_id)
+            if allow_dependency_additions:
+                assert len(publications.creates) == 1
+                assert items.finishes == []
+                assert "hold_for_approval" in items.calls
+            else:
+                assert publications.creates == []
+                assert "hold_for_approval" not in items.calls
+                assert len(items.finishes) == 1
+                finish = items.finishes[0]
+                assert finish["outcome"] == "failed"
+                assert finish["cause"] == "approval_create_failed"
+                detail = finish["detail"]
+                assert isinstance(detail, str)
+                assert detail.startswith("publication snapshot failed: ")
+                assert "dependency additions cannot be published by this capability" in detail
+                assert "crates/acme-tool/Cargo.toml" in detail
+                assert "acme-new" not in detail
+
+    asyncio.run(exercise())
+    assert delays == [], "a policy refusal must not retry the snapshot"
+    assert not list(tmp_path.glob("publication-validate-*")), "validator leaked its checkout"
 
 
 def _patch_snapshot_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
@@ -1412,6 +1555,41 @@ class _CountingPrecheckApi(_PublicationApi):
 # The first turn worked (Bash) and never published, so the continuation, when it
 # opens, carries the unpublished prompt.
 WORKED_TURN: list[OutboundEvent] = [_tool("Bash"), _done("Edited the parser.")]
+
+
+def test_an_existing_pr_refusal_stops_the_unpublished_continuation_after_one_mint(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first turn ran; the refused continuation never reaches the runner."""
+
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([(204, None), _PR_NOT_ADOPTED_RESPONSE])
+        try:
+            opened, items, terminal = await _run_execute(
+                make_harness,
+                [WORKED_TURN, [_done("a refused continuation must not open")]],
+                publication_creator=publications,
+            )
+
+            assert opened == [ISSUE_PROMPT]
+            # One mint for the accepted first turn and one for the continuation.
+            # No further mint can be a retry of either entrypoint.
+            assert len(publications.mints) == 2
+            assert items.calls.count("start") == 1
+            assert items.calls.count("finish") == 1
+            assert items.finishes[0]["outcome"] == "failed"
+            assert items.finishes[0]["cause"] == "pull_request_not_adopted"
+            assert terminal
+            assert all("runner_escalated" not in record.getMessage() for record in caplog.records)
+            assert any(
+                "escalating event" in record.getMessage()
+                and "pull-request-not-adopted" in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
 
 
 def _continuation_noise(caplog: pytest.LogCaptureFixture) -> list[str]:

@@ -59,6 +59,7 @@ from .models import (
     ThreadPublicationLineage,
     WorkItem,
 )
+from .publication_truth import conversation_pr_lineage_id
 from .repo_full_name import repo_url_path
 from .workitems import OWNER_LOST_RETRY_LIMIT, owner_lost_streak, owner_lost_successor_admitted
 
@@ -114,6 +115,10 @@ _CAUSE_TEXT = {
         "Inspect the result and retry."
     ),
     "runner_escalated": "the run stopped on an error and was handed to a person.",
+    "pull_request_not_adopted": (
+        "an earlier pull request on this issue could not be continued. "
+        "A person should close or merge it, then re-add the label."
+    ),
     "unclassified": (
         "the run failed and Curie could not name a more specific cause. "
         "Read the worker log for the provider message, then retry or hand it to a person."
@@ -441,6 +446,7 @@ def result_section(
     pr_url: str | None,
     feedback_url: str | None = None,
     detail: str | None = None,
+    unchanged: bool = False,
     superseded: bool = False,
     lost_streak: int = 0,
     lost_retried: bool = False,
@@ -453,7 +459,21 @@ def result_section(
     """
 
     if cause == "completed":
-        if feedback_url is not None:
+        if unchanged:
+            if feedback_url is not None:
+                text = (
+                    "No changes needed: this pull request already covers the requested revision.\n"
+                )
+            elif isinstance(pr_url, str) and pr_url.strip():
+                text = (
+                    "No changes needed: the open pull request already covers this request: "
+                    f"{pr_url.strip()}\n"
+                )
+            else:
+                raise ValueError("a completed issue notice requires its pull request URL")
+            if detail is not None and detail.strip():
+                text += _agent_message_block(detail.strip())
+        elif feedback_url is not None:
             text = "The requested revision is pushed to this pull request.\n"
             if detail is not None and detail.strip():
                 text += f"Note: {detail.strip()}\n"
@@ -546,13 +566,15 @@ def result_section(
             # so it cannot add a ``Cause:`` line, and no HTML comment opener.
             text += f"Details: {_inert_line(detail)}\n"
         elif (
-            cause not in {"history_capacity", "start_failed"}
+            cause not in {"history_capacity", "start_failed", "pull_request_not_adopted"}
             and detail is not None
             and detail.strip()
         ):
             label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
+        if cause == "pull_request_not_adopted" and isinstance(pr_url, str) and pr_url.strip():
+            text += f"Pull request: {pr_url.strip()}\n"
         failure_class = _FAILURE_CLASS_BY_CAUSE.get(cause)
         if failure_class is not None:
             text += f"Failure class: {failure_class}\n"
@@ -1022,6 +1044,28 @@ async def _render(
     retrying = False
     if request.terminal_at is not None and cause:
         cause = cause.strip()
+        if cause == "pull_request_not_adopted":
+            selected_pr = (
+                await session.execute(
+                    select(
+                        ThreadPublicationLineage.repo_full_name,
+                        ThreadPublicationLineage.pr_number,
+                    ).where(
+                        ThreadPublicationLineage.id
+                        == conversation_pr_lineage_id(
+                            agent_id=work_item.agent_id,
+                            conversation_id=work_item.conversation_id,
+                            repo_full_name=work_item.repo_full_name,
+                        ).scalar_subquery()
+                    )
+                )
+            ).one_or_none()
+            pr_url = None
+            if selected_pr is not None:
+                lineage_repo, pr_number = selected_pr
+                if pr_number is not None and pr_number > 0:
+                    repo_path = repo_url_path(lineage_repo)
+                    pr_url = f"{settings.github_html_base}/{repo_path}/pull/{pr_number}"
         # A completed issue run waits for its PR link before it is final.
         if not (
             cause == "completed"
@@ -1038,11 +1082,26 @@ async def _render(
                 retrying = (
                     request.status == "failed" and retried and 1 <= streak < OWNER_LOST_RETRY_LIMIT
                 )
+            unchanged = (
+                request.status == "completed"
+                and (
+                    await session.scalar(
+                        select(Publication.id)
+                        .where(
+                            Publication.execution_request_id == request.id,
+                            Publication.status == "succeeded",
+                        )
+                        .limit(1)
+                    )
+                )
+                is None
+            )
             result = result_section(
                 cause,
                 pr_url=pr_url,
                 feedback_url=target.url,
                 detail=row.detail,
+                unchanged=unchanged,
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),
                 lost_streak=streak,
@@ -1089,7 +1148,7 @@ async def _render(
         word = "revision" if pending_count == 1 else "revisions"
         waiting_line = f"{pending_count} {word} waiting on this run."
     base = settings.github_factory_card_base_url
-    return status_body(
+    body = status_body(
         request_id=row.execution_request_id,
         card_url=f"{base}/v1/factory/cards/{row.card_token}.svg" if base else None,
         pill_label=pill_label,
@@ -1099,6 +1158,26 @@ async def _render(
         waiting_line=waiting_line,
         base_line=render_base_line(work_item),
     )
+    if (
+        request.status in {"queued", "waiting", "running", "cancellation_requested"}
+        and work_item.publication_lineage_id is not None
+        and pr_url
+        and await session.scalar(
+            select(Publication.id)
+            .join(ExecutionRequest, ExecutionRequest.id == Publication.execution_request_id)
+            .where(
+                Publication.lineage_id == work_item.publication_lineage_id,
+                ExecutionRequest.work_item_id == work_item.id,
+                ExecutionRequest.sequence < request.sequence,
+            )
+            .limit(1)
+        )
+        is not None
+    ):
+        body = _redact_factory_comment(
+            f"Continuing on the existing pull request: {pr_url}\n\n{body}"
+        )
+    return body
 
 
 async def _superseded(

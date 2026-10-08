@@ -434,22 +434,41 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
             await engine.dispose()
 
     publication_version = asyncio.run(lease())
-    advanced = client.patch(
-        f"/v1/internal/publications/{publication_id}/lineage",
-        json={
-            "expected_version": 1,
-            "expected_head_sha": None,
-            "expected_publication_version": publication_version,
-            "lease_owner": lease_owner,
-            "state": "open",
-            "pr_number": PR_NUMBER,
-            "pr_url": PR_URL,
-            "head_sha": HEAD_SHA,
-            "metadata_updated_at": None,
-        },
-        headers=WORKER_HEADERS,
-    )
-    assert advanced.status_code == 200, advanced.text
+
+    async def advance() -> None:
+        # Seed the verified publication fact through the same service used by
+        # the worker route while keeping this operator fixture PAT-only.
+        async with client.app.state.sessionmaker() as session:
+            lineage = await crud.advance_publication_lineage(
+                session,
+                uuid.UUID(publication_id),
+                PublicationLineageAdvance(
+                    expected_version=1,
+                    expected_head_sha=None,
+                    expected_publication_version=publication_version,
+                    lease_owner=lease_owner,
+                    state="open",
+                    pr_number=PR_NUMBER,
+                    pr_url=PR_URL,
+                    head_sha=HEAD_SHA,
+                    metadata_updated_at=None,
+                ),
+                identity=VerifiedPublicationIdentity(
+                    repository_id=101,
+                    installation_id=202,
+                    pr_node_id="PR_example_123",
+                    base_ref="main",
+                ),
+                github_html_base="https://github.com",
+            )
+            assert (lineage.status, lineage.pr_number, lineage.pr_url) == (
+                "open",
+                PR_NUMBER,
+                PR_URL,
+            )
+            assert (lineage.github_repository_id, lineage.github_installation_id) == (101, 202)
+
+    client.portal.call(advance)
 
 
 def _detail(
