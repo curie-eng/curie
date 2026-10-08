@@ -814,8 +814,10 @@ Ref: AcmeAgentLatencyHigh · fingerprint 4f2a9c1e07b3d856 · started 2026-09-30T
   doing the same reads as above. "✅ The mail adapter recovered: 1 of 1 ready,
   no restarts since. Nothing to do." No `Cause:`, `Next:` or `Ref:` lines.
   Add a line only in two cases. An approval this thread raised is still
-  pending: add the `What I changed:` line that says so and that it should be
-  denied. Or the reads could not confirm recovery: the verdict is then ⚠️, and
+  pending: add the `What I changed:` line that says so. Recommend denial
+  only after working reads verify it is no longer needed. If recovery is
+  unconfirmed, recommend denial conditionally, never claim the request was denied.
+  Or the reads could not confirm recovery: the verdict is then ⚠️, and
   the one line says what could not be confirmed ("I could not confirm it
   recovered: the pod list failed to load"), with a `Next:` line naming who
   looks.

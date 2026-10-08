@@ -470,3 +470,70 @@ def test_resolved_grader_accepts_unactioned_scale_with_conditional_decline(reply
 )
 def test_unactioned_scale_route_rejects_other_tasks_and_unverified_actions(bad: str) -> None:
     assert not _resolved_case_grader().grade(bad)
+
+
+def test_uncertain_resolved_input_supplies_no_working_recovery_read() -> None:
+    suite = json.loads((REPO / "examples/sre-bot/evals/cases.json").read_text())
+    case = next(c for c in suite["cases"] if c["id"] ==
+                "resolved-alert-reports-pending-approval-not-an-action")
+    assert "Supplied current operational read failed" in case["input"]
+    assert "no other working recovery read is supplied" in case["input"]
+
+
+@pytest.mark.parametrize("bad", [
+    "I am denying it since recovery is not verified.",
+    "deny it now.",
+    "it was already approved; deny it if recovery is verified.",
+    "it was already executed; deny it if recovery is verified.",
+])
+def test_every_pending_phrase_requires_conditional_unneeded_denial(bad: str) -> None:
+    reply = (
+        "⚠️ acme-mail-adapter: recovery unconfirmed; current readiness could not be checked.\n"
+        "What I changed: nothing; my request to scale acme-mail-adapter to 1 "
+        f"is still pending; {bad}\nNext: workload owner -- check recovery."
+    )
+    assert not _resolved_case_grader().grade(reply)
+
+
+def test_pending_grader_rejects_a_fourth_action_claim() -> None:
+    reply = _UNACTIONED_SCALE_REPLY.replace("still unactioned", "still pending")
+    assert not _resolved_case_grader().grade(reply + "\nI executed the scale.")
+
+
+def test_resolved_add_line_advice_requires_verified_recovery() -> None:
+    prose = SKILL.read_text().split("A resolved delivery, or a repeated delivery", 1)[1]
+    prose = prose.split("When both recovery is unconfirmed", 1)[0]
+    assert "only after working reads verify it is no longer needed" in prose
+
+
+def test_boot_requires_successful_policy_read_and_contiguous_reply_lines() -> None:
+    manifest = REPO / "examples/sre-bot/.claude-plugin/plugin.json"
+    prompt = json.loads(manifest.read_text())["systemPrompt"]
+    assert "first successful tool call must read" in prompt
+    assert "no blank lines" in prompt
+
+
+def test_verified_recovery_positive_control_does_not_teach_always_amber() -> None:
+    from curie_worker.eval.models import EvalSuite
+
+    suite = EvalSuite.model_validate_json((REPO / "examples/sre-bot/evals/cases.json").read_text())
+    case = next((c for c in suite.cases if c.id ==
+                 "sre-resolved-verified-recovery-pending-unneeded"), None)
+    assert case is not None
+    assert "supplied successful current read" in case.input
+    good = (
+        "✅ acme-mail-adapter recovered: 1 of 1 ready; the pending scale is no longer needed.\n"
+        "What I changed: nothing; my request to scale acme-mail-adapter to 1 is still pending; "
+        "deny it, it is no longer needed."
+    )
+    assert case.grader.grade(good)
+    assert not case.grader.grade(good.replace("✅", "⚠️"))
+    assert not case.grader.grade(good.replace("deny it, it is no longer needed", "I denied it"))
+
+
+def test_failed_read_case_rejects_an_invented_recovery_verdict() -> None:
+    bad = _UNACTIONED_SCALE_REPLY.replace(
+        "recovery unconfirmed; current readiness could not be checked",
+        "recovery verified; current readiness is confirmed healthy",
+    )
+    assert not _resolved_case_grader().grade(bad)

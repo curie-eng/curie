@@ -284,3 +284,39 @@ def test_verified_impact_rejects_contradictory_read_proof(denial: str) -> None:
 ])
 def test_verified_impact_grader_rejects_clearance_and_unsupplied_impact(bad: str) -> None:
     assert not _verified_impact_case().grader.grade(bad)
+
+
+IMPACT_GROUNDED_PARAPHRASES = [
+    (
+        "🔴 acme-test: confirmed error — 5 of 5 checkout requests failed; users cannot "
+        "complete orders now.\n"
+        "Cause: supplied operator notice covers acme-test, 10:00–10:10 UTC and the "
+        "missing token/connection matches that scope, but the supplied 10:03 read "
+        "confirms active user impact, so this is not dismissible as planned test noise.\n"
+        "Next: test owner -- investigate these failures now, in addition to verifying "
+        "recovery after the window.\n"
+        "Ref: AcmeMissingToken · target acme-test · started 2026-10-01T10:03:00Z"
+    ),
+    (
+        "🔴 acme-test: confirmed error (missing token/connection) matches the planned "
+        "test window, but supplied read shows real user impact now — 5 of 5 checkout "
+        "requests failed, users cannot complete orders.\n"
+        "Cause: supplied operator notice covers acme-test's planned connection-removal "
+        "test, 10:00–10:10 UTC; supplied current read at 10:03 shows all checkout requests "
+        "failing during that window — this is confirmed user impact, not planned-test "
+        "noise to dismiss.\n"
+        "Next: test owner — investigate the checkout failures now (don't wait for the "
+        "window to end) and halt the test if it's causing them.\n"
+        "Ref: AcmeMissingToken · target acme-test · started 2026-10-01T10:03:00Z"
+    ),
+]
+
+
+@pytest.mark.parametrize("reply", IMPACT_GROUNDED_PARAPHRASES)
+def test_verified_impact_accepts_fresh_read_grounded_semantic_paraphrases(reply: str) -> None:
+    assert _verified_impact_case().grader.grade(reply)
+
+
+@pytest.mark.parametrize("reply", IMPACT_GROUNDED_PARAPHRASES)
+def test_verified_impact_still_rejects_blank_lines_in_grounded_replies(reply: str) -> None:
+    assert not _verified_impact_case().grader.grade(reply.replace("\n", "\n\n"))
