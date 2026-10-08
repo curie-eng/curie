@@ -749,7 +749,7 @@ serverFiles:
             # unavailable as spec minus available, which is 0 - 0 there.
             # The regex is `.*mail-adapter.*` because matchers are fully
             # anchored and an installation names one adapter per mailbox
-            # with a suffix (`mail-adapter-brand`).
+            # with a suffix (`acme-mail-adapter-example`).
             expr: |
               (
                 kube_deployment_status_replicas_unavailable{
