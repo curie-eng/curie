@@ -1156,6 +1156,10 @@ class WorkerConfig(BaseSettings):
         default=(),
         validation_alias="CURIE_PUBLICATION_PROTECTED_PATHS",
     )
+    publication_allow_dependency_additions: bool = Field(
+        default=False,
+        validation_alias="CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS",
+    )
 
     @field_validator("publication_protected_paths")
     @classmethod

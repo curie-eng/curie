@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -665,6 +667,140 @@ def test_a_snapshot_base_mismatch_names_both_commits_on_the_factory_run(
             assert publications.creates == []
 
     asyncio.run(exercise())
+
+
+@pytest.fixture
+def dependency_publication_patch(tmp_path: Path) -> tuple[bytes, object]:
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    repo = tmp_path / "dependency-repository"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "publisher@example.test"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Publisher"], cwd=repo, check=True)
+    manifest = repo / "crates" / "acme-tool" / "Cargo.toml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        '[package]\nname = "acme-tool"\nversion = "1.0.0"\n[dependencies]\nacme-base = "1.0.0"\n',
+        encoding="utf-8",
+    )
+    lockfile = manifest.with_name("Cargo.lock")
+    lockfile.write_text(
+        'version = 4\n[[package]]\nname = "acme-base"\nversion = "1.0.0"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "base"], cwd=repo, check=True)
+    base_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout.strip()
+    archive = subprocess.run(
+        ["git", "archive", "--format=tar.gz", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    ).stdout
+    manifest.write_text(manifest.read_text() + 'acme-new = "1.0.0"\n', encoding="utf-8")
+    lockfile.write_text(
+        lockfile.read_text() + '[[package]]\nname = "acme-new"\nversion = "1.0.0"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n',
+        encoding="utf-8",
+    )
+    patch = subprocess.run(
+        ["git", "diff", "--binary", "--no-renames"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    ).stdout
+    assert patch, "fixture must produce an actual Git patch"
+    return archive, RunnerWorkspaceSnapshot(
+        repo_full_name=WORK_ITEM_REPO,
+        base_sha=base_sha,
+        patch=patch,
+        changed_paths=("crates/acme-tool/Cargo.lock", "crates/acme-tool/Cargo.toml"),
+        contains_workflow_files=False,
+        publication_title="Update the widget implementation",
+        publication_body="Update the implementation and its dependency declarations.",
+    )
+
+
+@pytest.mark.parametrize("allow_dependency_additions", [False, True], ids=["default", "allow"])
+def test_dependency_publication_refusal_reaches_the_factory_finish(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    dependency_publication_patch: tuple[bytes, object],
+    allow_dependency_additions: bool,
+) -> None:
+    from curie_worker.runner_client import RunnerWorkspaceSnapshot
+
+    archive, candidate = dependency_publication_patch
+    assert isinstance(candidate, RunnerWorkspaceSnapshot)
+    delays = _patch_snapshot_backoff(monkeypatch)
+
+    class DependencyWorkspace(_Workspace):
+        def __init__(self, substrate: object) -> None:
+            super().__init__(substrate)
+            self.preparer = SimpleNamespace(
+                limits=SimpleNamespace(max_archive_bytes=len(archive) + 1)
+            )
+
+        def current(self, _thread_key: str) -> object:
+            return SimpleNamespace(repo_full_name=WORK_ITEM_REPO, base_sha=candidate.base_sha)
+
+        def stream_current_base(self, _thread_key: str) -> list[bytes]:
+            return [archive]
+
+    async def exercise() -> None:
+        publications = _PublicationApi()
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=DependencyWorkspace,
+            publication_creator=publications,
+            publication_allow_dependency_additions=allow_dependency_additions,
+            workspace_scratch_root=str(tmp_path),
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            snapshot_calls = 0
+
+            async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+                nonlocal snapshot_calls
+                snapshot_calls += 1
+                return candidate
+
+            monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)
+            h.runner.turn_scripts = [[_tool(PUBLISH_TOOL), _publish_final()]]
+            h.runner.default_script = [_done("default script must not run")]
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert snapshot_calls == 1
+            assert len(h.runner.opened) == 1
+            assert await h.kernel._markers.is_terminal(event.event_id)
+            if allow_dependency_additions:
+                assert len(publications.creates) == 1
+                assert items.finishes == []
+                assert "hold_for_approval" in items.calls
+            else:
+                assert publications.creates == []
+                assert "hold_for_approval" not in items.calls
+                assert len(items.finishes) == 1
+                finish = items.finishes[0]
+                assert finish["outcome"] == "failed"
+                assert finish["cause"] == "approval_create_failed"
+                detail = finish["detail"]
+                assert isinstance(detail, str)
+                assert detail.startswith("publication snapshot failed: ")
+                assert "dependency additions cannot be published by this capability" in detail
+                assert "crates/acme-tool/Cargo.toml" in detail
+                assert "acme-new" not in detail
+
+    asyncio.run(exercise())
+    assert delays == [], "a policy refusal must not retry the snapshot"
+    assert not list(tmp_path.glob("publication-validate-*")), "validator leaked its checkout"
 
 
 def _patch_snapshot_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:

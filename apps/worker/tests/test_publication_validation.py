@@ -665,8 +665,13 @@ def test_transitive_dependency_lockfile_addition_is_refused(tmp_path: Path, base
             '{"packages":{"node_modules/acme-local":{"resolved":"file:../local"}}}\n',
         ),
         (
+            "package-lock.json",
+            '{"packages":{"node_modules/acme-local":{"resolved":"../local"}}}\n',
+        ),
+        (
             "pnpm-lock.yaml",
-            "packages:\n  acme-local@file:../local:\n    resolution: {directory: ../local, type: directory}\n",
+            "packages:\n  acme-local@file:../local:\n"
+            "    resolution: {directory: ../local, type: directory}\n",
         ),
         ("pnpm-lock.yaml", "packages:\n  acme-local@link:../local: {}\n"),
         ("pnpm-lock.yaml", "packages:\n  acme-local@workspace:*: {}\n"),
@@ -679,6 +684,11 @@ def test_transitive_dependency_lockfile_addition_is_refused(tmp_path: Path, base
             "pyproject.toml",
             '[project]\ndependencies = ["acme-local"]\n'
             '[tool.uv.sources]\nacme-local = { path = "../local", editable = true }\n',
+        ),
+        (
+            "pyproject.toml",
+            '[project]\ndependencies = ["acme-local"]\n'
+            '[tool.uv.sources]\nacme-local = { path = "../local", virtual = true }\n',
         ),
         ("pyproject.toml", '[project]\ndependencies = ["acme-local @ file:///tmp/acme-local"]\n'),
     ],
@@ -741,7 +751,8 @@ def test_cargo_dependency_identity_uses_the_renamed_package(
         (
             "pnpm-lock.yaml",
             "packages:\n  acme-new@1.0.0:\n"
-            "    resolution: {type: git, repo: 'https://example.com/acme.git', commit: '0123456'}\n",
+            "    resolution: {type: git, repo: 'https://example.com/acme.git', "
+            "commit: '0123456'}\n",
         ),
     ],
 )

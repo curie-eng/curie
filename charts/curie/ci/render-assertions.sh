@@ -85,6 +85,9 @@
 # terminating pods drain before shutdown. Removing either template block must
 # fail the same rendered-manifest assertion.
 #
+# Issue #4294, Assertion 23. Dependency additions require an explicit install
+# opt-in, with a typed chart value and a reserved worker environment name.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -3358,6 +3361,79 @@ PYEOF
   fi
   echo "  ok: absent API $case_name block is rejected"
 done
+
+echo "=== Assertion 23: publication dependency additions require an explicit opt-in (#4294) ==="
+python3 - "$CHART" "$TMP/reuse-render/curie/templates/worker.yaml" <<'PYEOF'
+import json
+import pathlib
+import subprocess
+import sys
+
+import yaml
+
+chart = pathlib.Path(sys.argv[1])
+env_name = "CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS"
+value_key = "worker.publication.allowDependencyAdditions"
+
+
+def dependency_opt_in(documents):
+    workers = [
+        doc for doc in documents
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "worker"
+    ]
+    assert len(workers) == 1, f"expected one worker Deployment, found {len(workers)}"
+    containers = workers[0]["spec"]["template"]["spec"]["containers"]
+    worker = [container for container in containers if container["name"] == "worker"]
+    assert len(worker) == 1, f"expected one worker container, found {len(worker)}"
+    entries = [entry for entry in worker[0]["env"] if entry["name"] == env_name]
+    assert len(entries) == 1, f"expected exactly one {env_name}, found {entries!r}"
+    assert set(entries[0]) == {"name", "value"}, entries[0]
+    assert isinstance(entries[0]["value"], str), entries[0]
+    return entries[0]["value"]
+
+
+def render(*args):
+    return subprocess.run(
+        ["helm", "template", "acme", str(chart), *args],
+        text=True, capture_output=True,
+    )
+
+
+for args, expected in (
+    ([], "false"),
+    (["--set", f"{value_key}=true"], "true"),
+    (["--set", f"{value_key}=false"], "false"),
+):
+    result = render(*args)
+    assert result.returncode == 0, result.stderr
+    value = dependency_opt_in(yaml.safe_load_all(result.stdout))
+    assert value == expected, f"{env_name} rendered {value!r}, expected {expected!r}"
+
+retained = pathlib.Path(sys.argv[2]).read_text()
+assert dependency_opt_in(yaml.safe_load_all(retained)) == "false", (
+    "retained values must refuse dependency additions by default"
+)
+
+for malformed in ("true", "false", "enabled", 1, [], {}):
+    result = render("--set-json", f"{value_key}={json.dumps(malformed)}")
+    assert result.returncode != 0, f"accepted non-boolean {value_key}: {malformed!r}"
+    assert "schema(s)" in result.stderr, result.stderr
+    assert "allowDependencyAdditions" in result.stderr, result.stderr
+
+reserved = yaml.safe_load((chart / "files" / "reserved-env.yaml").read_text())
+assert reserved["worker"].get(env_name) == value_key, f"{env_name} must be registered as reserved"
+for publication_enabled in (True, False):
+    result = render(
+        "--set", f"worker.publication.enabled={str(publication_enabled).lower()}",
+        "--set", f"worker.extraEnv[0].name={env_name}",
+        "--set-string", "worker.extraEnv[0].value=true",
+    )
+    assert result.returncode != 0, f"accepted reserved worker.extraEnv {env_name}"
+    assert "worker.extraEnv" in result.stderr and value_key in result.stderr, result.stderr
+print("  ok: dependency additions default false, explicit true renders, schema and extraEnv refuse bypasses")
+PYEOF
 
 echo
 echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate, the API uses RollingUpdate with maxUnavailable 0 and maxSurge 1 plus a preStop sleep 5, proven by both removed-block negative controls, and other workloads keep their strategies; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls."

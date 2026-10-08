@@ -5992,8 +5992,7 @@ class Kernel:
                         )
                         if (
                             snapshot_remaining_s is not None
-                            and snapshot_remaining_s
-                            <= _MIN_ATTEMPT_BUDGET_S + snapshot_attempts
+                            and snapshot_remaining_s <= _MIN_ATTEMPT_BUDGET_S + snapshot_attempts
                         ):
                             break
                         await asyncio.sleep(float(snapshot_attempts))
@@ -6025,6 +6024,9 @@ class Kernel:
                                 self._config.publication_git_command_timeout_seconds
                             ),
                             protected_paths=self._config.publication_protected_paths,
+                            allow_dependency_additions=(
+                                self._config.publication_allow_dependency_additions
+                            ),
                         )
                         outcome.publication_snapshot = snapshot
                     except WorkspacePreparationError as exc:

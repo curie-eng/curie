@@ -2008,6 +2008,9 @@ worker:
     # Each entry matches that exact path and anything under it. The worker
     # receives the list as a JSON array, so a path may contain a comma.
     protectedPaths: []
+    # Opt in to new third-party dependency names in manifests and lockfiles.
+    # Applies to every publication in this install, including factory work.
+    allowDependencyAdditions: false
     # GitHub publishes these address sets from https://api.github.com/meta.
     # Override for GitHub Enterprise or refresh when GitHub changes the set.
     githubHttpsCidrs:
