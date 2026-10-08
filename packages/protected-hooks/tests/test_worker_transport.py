@@ -193,8 +193,15 @@ def test_a_connected_client_holds_nothing_public_that_is_a_raw_client(owned_work
             assert isinstance(lane.affinity, Redis)
             assert lane.runs.get_encoder().decode_responses is True
             assert lane.affinity.get_encoder().decode_responses is True
-            for secret in (owned_worker.username, owned_worker.password):
-                assert secret not in repr(lane)
+            for representation in (repr(lane), repr(lane.runs), repr(lane.affinity)):
+                for secret in (
+                    owned_worker.username,
+                    owned_worker.password,
+                    "127.0.0.1",
+                    str(owned_worker.broker.port),
+                    owned_worker.broker.ca_pem.splitlines()[1],
+                ):
+                    assert secret not in representation
         finally:
             await client.close()
 
@@ -689,5 +696,141 @@ def test_the_unchanged_components_run_over_the_pinned_handles(owned_worker):
         finally:
             with contextlib.suppress(Exception):
                 await client.close()
+
+    run(go())
+
+
+def test_metadata_reads_preserve_non_utf8_bytes(owned_worker):
+    """Metadata identity is byte-exact despite decoded lane handles,
+    @spec PROTECTED-HOOK-LANE-3 PROTECTED-HOOK-LANE-6."""
+    blob = b"\xff\x00\x80\r\n"
+    owned_worker.broker.command("SET", wb.CONTROL, blob)
+    owned_worker.broker.command("SET", wb.BINDING, blob)
+
+    async def go():
+        client = await connected(owned_worker)
+        try:
+            assert await client.read_control(wb.CONTROL) == blob
+            assert await client.read_binding(wb.BINDING_EVENT) == blob
+            assert await client.lane().runs.ping()
+        finally:
+            await client.close()
+
+    run(go())
+
+
+def test_cancelled_inflight_read_closes_all_sessions_without_swallowing_cancellation(owned_worker):
+    """A cancelled five-second blocking read exceeds the two-second socket deadline;
+    actual timeout closes all sessions without reconnect, @spec PROTECTED-HOOK-LANE-3."""
+    broker = owned_worker.broker
+
+    async def go():
+        client = await connected(owned_worker)
+        lane = client.lane()
+        try:
+            await lane.runs.xgroup_create(wb.STREAM, wb.GROUP, id="0", mkstream=True)
+            read = asyncio.create_task(
+                lane.runs.xreadgroup(wb.GROUP, "cancelled-reader", {wb.STREAM: ">"}, block=5000)
+            )
+            await asyncio.sleep(0.03)
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+            accepted = connections(broker)
+            with pytest.raises(RedisConnectionError):
+                await lane.runs.ping()
+            with pytest.raises(RedisConnectionError):
+                lane.affinity.ping()
+            assert connections(broker) == accepted
+            await wait_for_no_sessions(owned_worker)
+        finally:
+            await client.close()
+
+    run(go())
+
+
+def test_cancelling_a_short_read_drains_reply_and_preserves_session_alignment(owned_worker):
+    """Graceful consumer shutdown is cancellation, not loss, when the pending reply
+    drains within the socket deadline, @spec PROTECTED-HOOK-LANE-3."""
+    broker = owned_worker.broker
+
+    async def go():
+        client = await connected(owned_worker)
+        lane = client.lane()
+        try:
+            await lane.runs.xgroup_create(wb.STREAM, wb.GROUP, id="0", mkstream=True)
+            accepted = connections(broker)
+            read = asyncio.create_task(
+                lane.runs.xreadgroup(wb.GROUP, "stopping-reader", {wb.STREAM: ">"}, block=100)
+            )
+            await asyncio.sleep(0.03)
+            read.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read
+            assert await lane.runs.set(wb.WORKER_PREFIX + ":aligned", "exact-answer")
+            assert await lane.runs.get(wb.WORKER_PREFIX + ":aligned") == "exact-answer"
+            assert lane.affinity.ping()
+            assert (await client.observe()).run_id == broker.command("INFO", "server")["run_id"]
+            assert connections(broker) == accepted
+            assert len(owned_worker.sessions()) == 2
+        finally:
+            await client.close()
+
+    run(go())
+
+
+def test_sync_eof_disables_async_operations_before_any_sync_command(owned_worker):
+    """The async lane passively observes affinity FIN before pool growth,
+    @spec PROTECTED-HOOK-LANE-3 PROTECTED-HOOK-LANE-7."""
+    broker = owned_worker.broker
+
+    async def go():
+        client = await connected(owned_worker)
+        lane = client.lane()
+        try:
+            lane.affinity.client_setname("pworker-affinity-fin")
+            session = next(
+                s for s in owned_worker.sessions() if s.get("name") == "pworker-affinity-fin"
+            )
+            broker.command("CLIENT", "KILL", "ID", session["id"])
+            await asyncio.sleep(0.03)
+            accepted = connections(broker)
+            with pytest.raises(BrokerMetadataUnavailable):
+                await client.observe()
+            with pytest.raises(RedisConnectionError):
+                await asyncio.gather(*[lane.runs.ping() for _ in range(4)])
+            assert connections(broker) == accepted
+            await wait_for_no_sessions(owned_worker)
+        finally:
+            await client.close()
+
+    run(go())
+
+
+def test_passive_sync_probe_does_not_race_a_thread_owned_reply_parser(owned_worker):
+    """Passive EOF checks skip an in-use affinity session rather than sharing its
+    parser with concurrent async commands, @spec PROTECTED-HOOK-LANE-3."""
+    broker = owned_worker.broker
+
+    async def go():
+        client = await connected(owned_worker)
+        lane = client.lane()
+        accepted = connections(broker)
+        try:
+
+            def affinity_reads():
+                for _ in range(100):
+                    assert lane.affinity.ping()
+
+            async def run_reads():
+                for _ in range(100):
+                    assert await lane.runs.ping()
+
+            await asyncio.gather(asyncio.to_thread(affinity_reads), run_reads())
+            assert (await client.observe()).run_id == broker.command("INFO", "server")["run_id"]
+            assert connections(broker) == accepted
+            assert owned_worker.denials() == []
+        finally:
+            await client.close()
 
     run(go())
