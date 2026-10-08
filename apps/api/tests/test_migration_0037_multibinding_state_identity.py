@@ -180,13 +180,18 @@ def _runner_state_url(*, kind: str, address: str) -> str:
         finally:
             await engine.dispose()
 
-    # The current resolver reads 0081's nullable override. Supply it only for
-    # this real resolver call, leaving the historical migration schema intact.
-    sql_rows("ALTER TABLE curie.agents ADD COLUMN reviewer_model character varying")
+    # The current resolver reads later nullable overrides. Supply them only
+    # for this real resolver call, leaving the historical migration schema intact.
+    sql_rows(
+        "ALTER TABLE curie.agents "
+        "ADD COLUMN reviewer_model character varying, ADD COLUMN max_turns integer"
+    )
     try:
         return asyncio.run(go())
     finally:
-        sql_rows("ALTER TABLE curie.agents DROP COLUMN reviewer_model")
+        sql_rows(
+            "ALTER TABLE curie.agents DROP COLUMN reviewer_model, DROP COLUMN max_turns"
+        )
 
 
 def _api_get(url: str) -> Any:

@@ -89,7 +89,11 @@ def test_0080_is_expand_after_0079_and_precedes_the_single_candidate_head() -> N
     revision = script.get_revision(REVISION)
     assert revision is not None
     assert revision.down_revision == BELOW
-    assert script.get_heads() == ["0098"]
+    heads = script.get_heads()
+    assert len(heads) == 1
+    assert "0081" in {
+        item.revision for item in script.walk_revisions(base="base", head=heads[0])
+    }
     candidate = script.get_revision("0081")
     assert candidate is not None
     assert candidate.down_revision == REVISION
