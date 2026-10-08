@@ -844,7 +844,9 @@ def test_running_factory_request_without_existing_pr_gets_authenticated_absence(
     assert _durable_snapshot() == before
 
 
-@pytest.mark.parametrize("precheck_case", [{"unlinked_work_item": True}], indirect=True, ids=["unlinked"])
+@pytest.mark.parametrize(
+    "precheck_case", [{"unlinked_work_item": True}], indirect=True, ids=["unlinked"]
+)
 def test_mint_names_an_existing_conversation_pr_without_a_work_item_link(
     precheck_case: dict[str, Any],
 ) -> None:
@@ -865,7 +867,9 @@ def test_mint_names_an_existing_conversation_pr_without_a_work_item_link(
 
 
 @pytest.mark.parametrize("authority_loss", ["epoch", "lease", "status"])
-@pytest.mark.parametrize("precheck_case", [{"unlinked_work_item": True}], indirect=True, ids=["unlinked"])
+@pytest.mark.parametrize(
+    "precheck_case", [{"unlinked_work_item": True}], indirect=True, ids=["unlinked"]
+)
 def test_unlinked_existing_pr_does_not_hide_a_generic_execution_refusal(
     precheck_case: dict[str, Any], authority_loss: str
 ) -> None:
@@ -900,7 +904,9 @@ def test_unlinked_existing_pr_does_not_hide_a_generic_execution_refusal(
 
 
 @pytest.mark.parametrize("other_scope", ["conversation", "repository"])
-@pytest.mark.parametrize("precheck_case", [{"unlinked_work_item": True}], indirect=True, ids=["unlinked"])
+@pytest.mark.parametrize(
+    "precheck_case", [{"unlinked_work_item": True}], indirect=True, ids=["unlinked"]
+)
 def test_an_unlinked_running_request_ignores_a_pr_outside_its_scope(
     precheck_case: dict[str, Any], other_scope: str
 ) -> None:
