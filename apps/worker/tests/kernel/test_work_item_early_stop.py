@@ -334,6 +334,8 @@ def test_early_stop_and_unpublished_turns_get_different_continuation_prompts(
         )
 
         assert early[1] != worked[1]
+        assert "No changes needed:" in early[1]
+        assert "No changes needed:" in worked[1]
 
     asyncio.run(exercise())
 

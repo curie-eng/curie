@@ -441,6 +441,7 @@ def result_section(
     pr_url: str | None,
     feedback_url: str | None = None,
     detail: str | None = None,
+    unchanged: bool = False,
     superseded: bool = False,
     lost_streak: int = 0,
     lost_retried: bool = False,
@@ -453,7 +454,21 @@ def result_section(
     """
 
     if cause == "completed":
-        if feedback_url is not None:
+        if unchanged:
+            if feedback_url is not None:
+                text = (
+                    "No changes needed: this pull request already covers the requested revision.\n"
+                )
+            elif isinstance(pr_url, str) and pr_url.strip():
+                text = (
+                    "No changes needed: the open pull request already covers this request: "
+                    f"{pr_url.strip()}\n"
+                )
+            else:
+                raise ValueError("a completed issue notice requires its pull request URL")
+            if detail is not None and detail.strip():
+                text += _agent_message_block(detail.strip())
+        elif feedback_url is not None:
             text = "The requested revision is pushed to this pull request.\n"
             if detail is not None and detail.strip():
                 text += f"Note: {detail.strip()}\n"
@@ -1038,11 +1053,26 @@ async def _render(
                 retrying = (
                     request.status == "failed" and retried and 1 <= streak < OWNER_LOST_RETRY_LIMIT
                 )
+            unchanged = (
+                request.status == "completed"
+                and (
+                    await session.scalar(
+                        select(Publication.id)
+                        .where(
+                            Publication.execution_request_id == request.id,
+                            Publication.status == "succeeded",
+                        )
+                        .limit(1)
+                    )
+                )
+                is None
+            )
             result = result_section(
                 cause,
                 pr_url=pr_url,
                 feedback_url=target.url,
                 detail=row.detail,
+                unchanged=unchanged,
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),
                 lost_streak=streak,

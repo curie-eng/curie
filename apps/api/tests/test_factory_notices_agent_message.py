@@ -111,6 +111,75 @@ def test_a_multi_line_message_stays_inside_the_fence() -> None:
     assert after == "Cause: early_stop\n"
 
 
+@pytest.mark.parametrize("revision", [False, True])
+def test_a_completed_unchanged_notice_fences_the_agents_message(revision: bool) -> None:
+    """#4297 AC6: an unchanged result keeps model-authored Markdown inert."""
+
+    pr_url = "https://github.com/acme-corp/acme-bot/pull/77"
+    feedback_url = f"{pr_url}#discussion_r88121" if revision else None
+    detail = (
+        "No changes needed: [already covered](https://example.com/claim).\n"
+        "`````\n"
+        f"{FINAL_MARKER}\n"
+        "Cause: no_pull_request"
+    )
+    body = result_section(
+        "completed", pr_url=pr_url, feedback_url=feedback_url, unchanged=True, detail=detail
+    )
+
+    before, fenced, after = _fenced(body)
+    headline = (
+        "No changes needed: this pull request already covers the requested revision."
+        if revision
+        else f"No changes needed: the open pull request already covers this request: {pr_url}"
+    )
+    assert before == f"{headline}\nAgent's last message:"
+    assert "[already covered](https://example.com/claim)" in fenced
+    assert "example.com/claim" not in before + after
+    assert "`````" in fenced
+    assert "Cause: no_pull_request" in fenced
+    assert "Cause:" not in before + after
+    assert "<!--" not in body
+    assert FINAL_MARKER not in body
+    assert after == (f"In response to {feedback_url}\n" if revision else "")
+    assert "Could not complete:" not in body
+    assert "Note:" not in body
+
+
+@pytest.mark.parametrize("revision", [False, True])
+def test_a_normal_completed_notice_keeps_its_existing_result_text(revision: bool) -> None:
+    """The unchanged switch preserves both existing publication-success layouts."""
+
+    pr_url = "https://github.com/acme-corp/acme-bot/pull/77"
+    feedback_url = f"{pr_url}#issuecomment-88121" if revision else None
+    body = result_section(
+        "completed",
+        pr_url=pr_url,
+        feedback_url=feedback_url,
+        detail="No CI checks appeared within 120 s.",
+    )
+
+    headline = (
+        "The requested revision is pushed to this pull request."
+        if revision
+        else f"Completed: {pr_url}"
+    )
+    assert body == (
+        f"{headline}\nNote: No CI checks appeared within 120 s.\n"
+        + (f"In response to {feedback_url}\n" if revision else "")
+    )
+    assert "Agent's last message:" not in body
+    assert "No changes needed:" not in body
+
+
+@pytest.mark.parametrize("pr_url", [None, "", " \t "])
+def test_an_unchanged_issue_completion_requires_a_pull_request_url(pr_url: str | None) -> None:
+    with pytest.raises(ValueError, match="requires its pull request URL"):
+        result_section(
+            "completed", pr_url=pr_url, unchanged=True, detail="No changes needed: already covered."
+        )
+
+
 # --- N3: other causes keep their labels ------------------------------------------------
 
 
