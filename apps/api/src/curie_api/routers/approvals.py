@@ -55,7 +55,7 @@ from ..approval_auth import (
 )
 from ..approvers import card_on_requesting_surface
 from ..auth import require_api_key, require_platform_key
-from ..authorizer import authorize_approval
+from ..authorizer import AuthzDecision, authorize_approval
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, ResumeQueueDep, SessionDep, get_store
 from ..models import Approval, ApprovalStatus
@@ -515,6 +515,29 @@ async def resolve_approval(
         approver_set=approver_set,
         principal_kind=principal.kind,
     )
+
+    if principal.kind == "test_driver":
+        settings = get_settings()
+        declared = any(
+            driver.bot_user_id == principal.subject and driver.channel_id == principal.actor_channel
+            for driver in settings.test_installation_drivers
+        )
+        card_channel = approval.card_channel or approval.reply_channel
+        if (
+            not settings.test_installation_enabled
+            or not declared
+            or principal.actor_channel != card_channel
+        ):
+            decision = AuthzDecision(
+                allowed=False,
+                reason="This installation does not accept this test driver approval.",
+                evidence={
+                    "kind": "test_driver_admission",
+                    "enabled": settings.test_installation_enabled,
+                    "declared": declared,
+                    "card_channel_matches": principal.actor_channel == card_channel,
+                },
+            )
 
     async def _audit(action: str, *, authorized: bool, reason: str | None) -> None:
         # The audit log (#247): every authorization-relevant event, with the

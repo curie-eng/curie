@@ -19,7 +19,12 @@ impl ClusterTargetSources {
         };
         let action_matches = if matches!(
             action_name,
-            "hooks" | "console" | "actions" | "remediation-policy"
+            "hooks"
+                | "console"
+                | "actions"
+                | "remediation-policy"
+                | "remediation"
+                | "remediation-qualification"
         ) {
             let Some((_, leaf_matches)) = action_matches.subcommand() else {
                 return Self::default();
@@ -140,6 +145,14 @@ pub(crate) fn cluster_action_target(action: &ClusterAction) -> (Option<&str>, Op
             (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
         }
         ClusterAction::RemediationPolicy { verb } => {
+            let conn = verb.conn();
+            (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
+        }
+        ClusterAction::Remediation { verb } => {
+            let conn = verb.conn();
+            (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
+        }
+        ClusterAction::RemediationQualification { verb } => {
             let conn = verb.conn();
             (Some(conn.namespace.as_str()), Some(conn.release.as_str()))
         }
@@ -283,6 +296,16 @@ pub(crate) fn retarget_cluster_action(
             replace(&mut conn.release, &release);
         }
         ClusterAction::RemediationPolicy { verb } => {
+            let conn = verb.conn_mut();
+            replace(&mut conn.namespace, &namespace);
+            replace(&mut conn.release, &release);
+        }
+        ClusterAction::Remediation { verb } => {
+            let conn = verb.conn_mut();
+            replace(&mut conn.namespace, &namespace);
+            replace(&mut conn.release, &release);
+        }
+        ClusterAction::RemediationQualification { verb } => {
             let conn = verb.conn_mut();
             replace(&mut conn.namespace, &namespace);
             replace(&mut conn.release, &release);

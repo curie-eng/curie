@@ -235,3 +235,40 @@ pub struct RemediationPolicyWrite {
 pub struct RemediationBreakerClose {
     pub reason: String,
 }
+
+// @spec AUTOMATED-REMEDIATION-22
+/// `PUT /agents/{agent_id}/remediation-qualifications/{id}`
+/// (`RemediationQualificationWrite`): the declaration it qualifies, the
+/// operator's evidence references exactly as the file holds them, and the
+/// worst case statement. `generation` is a canonical decimal string.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemediationQualificationWrite {
+    pub action: String,
+    pub evidence: serde_json::Map<String, serde_json::Value>,
+    pub generation: String,
+    pub hook: String,
+    pub worst_case: String,
+}
+
+// @spec AUTOMATED-REMEDIATION-22
+/// `POST .../remediation-qualifications/{id}/verifier-runs`
+/// (`RemediationVerifierRunStart`): exactly the hook, the action and one
+/// literal member of its allowed targets. No tool, argument or connector.
+#[derive(Debug, Clone, Serialize)]
+pub struct RemediationVerifierRunStart {
+    pub action: String,
+    pub hook: String,
+    pub target: TargetLiteral,
+}
+
+// @spec AUTOMATED-REMEDIATION-22
+/// A literal member of an action's `target.allowed`: a JSON scalar, sent as
+/// that type (never `null`, which a bare `serde_json::Value` could send).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum TargetLiteral {
+    Integer(i64),
+    Number(f64),
+    Bool(bool),
+    Text(String),
+}

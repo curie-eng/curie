@@ -512,6 +512,19 @@ pub(crate) enum LocalAction {
         #[command(subcommand)]
         verb: RemediationPolicyCommand<LocalObservabilityConn>,
     },
+    /// The operator receipt of each remediation nomination: list them, or show
+    /// one with its stage, authority and code. Read only.
+    Remediation {
+        #[command(subcommand)]
+        verb: RemediationCommand<LocalObservabilityConn>,
+    },
+    /// Record a remediation qualification and run its verifier against an
+    /// allowed target. Writes run as the operator principal in
+    /// CURIE_APPROVAL_PRINCIPAL_TOKEN.
+    RemediationQualification {
+        #[command(subcommand)]
+        verb: RemediationQualificationCommand<LocalObservabilityConn>,
+    },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an
     /// approval posts to, and who may resolve it, come from the agent's approval

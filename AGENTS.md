@@ -777,6 +777,12 @@ as a whole; remembered only):
   refusal codes the API returns (`POLICY_REFUSALS` in
   `apps/api/src/curie_api/remediation_codes.py`) are the set the CLI renders
   (`POLICY_REFUSALS` in `cli/src/remediation.rs`), frozen as `policy_refusals`.
+  The receipt vocabulary (AUTOMATED-REMEDIATION-20) is a third reader: the
+  worker's thread receipts (`apps/worker/src/curie_worker/remediation_receipts.py`:
+  `RECEIPT_STAGES`, `VERIFICATION_OUTCOMES`, `AUTHORITIES`, `RECEIPT_CODES`), the
+  API's nomination read (`remediation_codes.py`) and the CLI's `remediation list`
+  and `show` (`NOMINATION_STATES`, `RECEIPT_STAGES` and the rest in
+  `cli/src/remediation.rs`) all read the same frozen sets.
   [vector: `tests/vectors/remediation-policy.json`]
   [vector: `tests/vectors/remediation-codes.json`]
 - runner vs worker sealed envelope (ACTION-EXECUTOR-9, -10) -- the runner's

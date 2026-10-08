@@ -47,9 +47,24 @@ sends no auth header. The eighth authenticated control route, `GET /v1/status`, 
 the credential-free boot attestation (`session_id`, `sandbox_id`, `managed_workspace`,
 `cwd`) plus `history_durable` for the worker's replacement-authority check. `POST /v1/execute` is an optional, runner-private,
 bearer-authenticated route served only by a runner booted with `CURIE_RUNNER_MODE=execute`
-(ACTION-EXECUTOR-6, -24): it runs one connector action's `list`, `observe` and `call` phases
+(ACTION-EXECUTOR-6, -24): it runs one connector action's `list`, `observe`, `call` and `read` phases
 for the worker's executor, carries no ACI frame (like `/v1/turn-admit`) and changes no frozen
-contract (ACTION-EXECUTOR-25). In that mode the runner serves only `/healthz`, `/status`,
+contract (ACTION-EXECUTOR-25, AUTOMATED-REMEDIATION-27). The `read` phase
+(AUTOMATED-REMEDIATION-12, executor amendments E3 and E4;
+[`runner/src/curie_runner/executor.py::sample_of`](../../../runner/src/curie_runner/executor.py))
+is one sample for an automated-remediation precondition or verifier: after `list`, exactly one
+`tools/call` of a declared read tool with no grant, whose request adds an RFC 6901 `pointer` that
+no other phase carries. The runner answers only `{phase, sample, value}`: the scalar at the pointer
+(of at most 256 characters) in the structured content, or in the strict JSON of the result's one
+and only text block, never the result itself. Any other shape is an unsuccessful `sample`
+(`result_unstructured`, `pointer_absent`, `not_scalar`, `value_too_long`, `tool_error`). A tool the
+sandbox's own `list` did not advertise with `readOnlyHint: true` is refused `tool_not_read_only`
+before any dial; the hint is a fail-closed refusal on top of the policy that declares the read,
+never an authorization. In one sandbox the accepted orders are `list`; `list`, `observe`, then a
+restore `call`; `list` then a forward `call`; `list` then one `read`; and `list` then one
+`observe` with no `call`, which an automated-remediation verifier uses to see whether another
+change superseded its action. The request shape and refusal codes are frozen in `tests/vectors/runner-execute.json`, and
+the sample kinds and the predicate they feed in `tests/vectors/remediation-predicate.json`. In that mode the runner serves only `/healthz`, `/status`,
 `/v1/status` and `/v1/execute`, and answers every other control route `409` naming the mode.
 `run_conformance` does not cover it, and a server without it answers `404`, which the worker
 maps to `runner_unavailable`. The timeout

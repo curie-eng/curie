@@ -24,6 +24,7 @@ use crate::api_requests::{
     RemediationBreakerClose, RemediationPolicyMutation, RemediationPolicyWrite,
 };
 use crate::exit::CliError;
+use crate::remediation::BREAKER_STATES;
 
 // @spec AUTOMATED-REMEDIATION-3
 /// The CAS pair every write carries: the generation the operator read, and
@@ -63,6 +64,14 @@ pub enum RemediationPolicyVerb {
         write: PolicyWriteArgs,
     },
     // @spec AUTOMATED-REMEDIATION-11
+    /// List a hook's breakers; read only, so no principal.
+    Breakers {
+        agent: String,
+        hook: String,
+        /// `open` (the API's default), `closed` or `all`.
+        state: Option<String>,
+    },
+    // @spec AUTOMATED-REMEDIATION-11
     CloseBreaker {
         agent: String,
         hook: String,
@@ -89,6 +98,8 @@ pub enum RemediationPolicyAnswer {
     Policy(RemediationPolicyGeneration),
     /// The closed circuit breaker (`close-breaker`).
     Breaker(RemediationBreaker),
+    /// A hook's breakers (`breakers`).
+    Breakers(Vec<RemediationBreaker>),
 }
 
 // @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-11
@@ -109,6 +120,9 @@ impl crate::ui::CliOutput for RemediationPolicyOutput {
         let mut value = match &self.answer {
             RemediationPolicyAnswer::Policy(policy) => serde_json::to_value(policy),
             RemediationPolicyAnswer::Breaker(breaker) => serde_json::to_value(breaker),
+            RemediationPolicyAnswer::Breakers(breakers) => {
+                serde_json::to_value(serde_json::json!({ "breakers": breakers }))
+            }
         }
         .unwrap_or(serde_json::Value::Null);
         if let (Some(id), Some(object)) = (&self.operation_id, value.as_object_mut()) {
@@ -121,6 +135,23 @@ impl crate::ui::CliOutput for RemediationPolicyOutput {
         let line = |key: &str, value: &str| ui.payload_plain(&format!("{key:<12} {value}"));
         let policy = match &self.answer {
             RemediationPolicyAnswer::Policy(policy) => policy,
+            RemediationPolicyAnswer::Breakers(breakers) => {
+                if breakers.is_empty() {
+                    ui.payload_plain("no breakers");
+                }
+                for breaker in breakers {
+                    let state = if breaker.closed_at.is_some() {
+                        "closed"
+                    } else {
+                        "open"
+                    };
+                    ui.payload_plain(&format!(
+                        "{}  {state:<6} {}.{}  {}",
+                        breaker.id, breaker.connector, breaker.tool, breaker.target
+                    ));
+                }
+                return;
+            }
             RemediationPolicyAnswer::Breaker(breaker) => {
                 let or_dash = |value: &Option<String>| value.clone().unwrap_or("-".to_string());
                 line("breaker", &breaker.id);
@@ -162,7 +193,7 @@ impl crate::ui::CliOutput for RemediationPolicyOutput {
 }
 
 /// `[a-z0-9][a-z0-9._-]{0,62}`, the API's hook name.
-fn validated_hook(raw: &str) -> Result<String> {
+pub(super) fn validated_hook(raw: &str) -> Result<String> {
     let bytes = raw.as_bytes();
     let ok = !bytes.is_empty()
         && bytes.len() <= 63
@@ -242,6 +273,22 @@ fn validated_close_reason(reason: Option<String>) -> Result<RemediationBreakerCl
     Ok(RemediationBreakerClose { reason })
 }
 
+// @spec AUTOMATED-REMEDIATION-11
+/// `--state` is one of the API's `open`, `closed` or `all`; absent, the API's
+/// default (`open`) applies.
+fn validated_breaker_state(state: Option<String>) -> Result<Option<String>> {
+    match state {
+        Some(state) if !BREAKER_STATES.contains(&state.as_str()) => Err(anyhow::Error::from(
+            CliError::usage(format!(
+                "--state must be one of {}, got {state:?}",
+                BREAKER_STATES.join(", ")
+            ))
+            .with_fix("use --state open, closed or all"),
+        )),
+        other => Ok(other),
+    }
+}
+
 fn validated_write(write: PolicyWriteArgs) -> Result<RemediationPolicyMutation> {
     Ok(RemediationPolicyMutation {
         expected_generation: validated_generation(&write.expected_generation)?,
@@ -309,6 +356,7 @@ fn write_principal_token() -> Result<String> {
 
 enum Validated {
     Show,
+    Breakers(Option<String>),
     Apply {
         body: RemediationPolicyWrite,
     },
@@ -341,6 +389,11 @@ impl RemediationPolicyVerb {
     pub fn validate(self) -> Result<ValidatedRemediationPolicy> {
         let (agent, hook, verb) = match self {
             RemediationPolicyVerb::Show { agent, hook } => (agent, hook, Validated::Show),
+            RemediationPolicyVerb::Breakers { agent, hook, state } => (
+                agent,
+                hook,
+                Validated::Breakers(validated_breaker_state(state)?),
+            ),
             RemediationPolicyVerb::Apply {
                 agent,
                 hook,
@@ -386,7 +439,7 @@ impl RemediationPolicyVerb {
         };
         let hook = validated_hook(&hook)?;
         let principal = match verb {
-            Validated::Show => None,
+            Validated::Show | Validated::Breakers(_) => None,
             _ => Some(write_principal_token()?),
         };
         Ok(ValidatedRemediationPolicy {
@@ -412,7 +465,7 @@ pub async fn remediation_policy(
         principal,
     } = validated;
     let operation_id = match &verb {
-        Validated::Show => None,
+        Validated::Show | Validated::Breakers(_) => None,
         Validated::Apply { body } => Some(body.operation_id.clone()),
         Validated::Arm(cas) | Validated::Disarm(cas) | Validated::Remove(cas) => {
             Some(cas.operation_id.clone())
@@ -454,6 +507,16 @@ fn with_operation_id(error: anyhow::Error, id: &str) -> anyhow::Error {
     })
 }
 
+/// The platform client of a tier. A cluster tunnel is loopback too; its key is
+/// already the release's, so it must not trigger local key discovery.
+pub(super) fn api_client(opts: &RemediationPolicyOpts) -> Result<ApiClient> {
+    if opts.tier == "cluster" {
+        ApiClient::with_resolved_key(&opts.api_url, &opts.api_key)
+    } else {
+        ApiClient::new(&opts.api_url, &opts.api_key)
+    }
+}
+
 /// Resolve the agent and send the verb's request.
 async fn send(
     opts: RemediationPolicyOpts,
@@ -462,17 +525,20 @@ async fn send(
     verb: Validated,
     principal: Option<String>,
 ) -> Result<(&'static str, RemediationPolicyAnswer)> {
-    // A cluster tunnel is loopback too; its key is already the release's, so
-    // it must not trigger local key discovery.
-    let client = if opts.tier == "cluster" {
-        ApiClient::with_resolved_key(&opts.api_url, &opts.api_key)?
-    } else {
-        ApiClient::new(&opts.api_url, &opts.api_key)?
-    };
+    let client = api_client(&opts)?;
     let agent_id = client.find_agent(&agent).await?.id;
     let principal = principal.unwrap_or_default();
-    use RemediationPolicyAnswer::{Breaker, Policy};
+    use RemediationPolicyAnswer::{Breaker, Breakers, Policy};
     Ok(match verb {
+        // @spec AUTOMATED-REMEDIATION-11
+        Validated::Breakers(state) => (
+            "breakers",
+            Breakers(
+                client
+                    .list_remediation_breakers(&agent_id, &hook, state.as_deref())
+                    .await?,
+            ),
+        ),
         Validated::Show => (
             "show",
             Policy(client.get_remediation_policy(&agent_id, &hook).await?),

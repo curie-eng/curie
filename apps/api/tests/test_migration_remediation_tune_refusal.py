@@ -29,7 +29,8 @@ from alembic.script import ScriptDirectory
 from sqlalchemy.exc import IntegrityError
 
 BELOW = "0095"
-HEAD = "0096"
+REVISION = "0096"
+HEAD = "0098"
 TUNE_REFUSAL = "tune_execution_not_automated"
 REFUSAL_CHECK = "remediation_nominations_refusal_ck"
 
@@ -42,11 +43,11 @@ _CODES = json.loads(
 
 def _revision() -> tuple[str, str]:
     script = ScriptDirectory.from_config(alembic_config())
-    rev = script.get_revision(HEAD)
-    assert rev is not None and rev.path, f"no alembic revision {HEAD}"
+    rev = script.get_revision(REVISION)
+    assert rev is not None and rev.path, f"no alembic revision {REVISION}"
     source = Path(rev.path).read_text()
     assert REFUSAL_CHECK in source and TUNE_REFUSAL in source, (
-        f"revision {HEAD} does not widen {REFUSAL_CHECK} to {TUNE_REFUSAL} "
+        f"revision {REVISION} does not widen {REFUSAL_CHECK} to {TUNE_REFUSAL} "
         "(AUTOMATED-REMEDIATION-25)"
     )
     assert isinstance(rev.down_revision, str), rev.down_revision
@@ -97,7 +98,7 @@ def test_one_hand_written_revision_on_the_escalations_revision_and_the_only_head
     """@spec AUTOMATED-REMEDIATION-25"""
 
     revision, down = _revision()
-    assert (revision, down) == (HEAD, BELOW)
+    assert (revision, down) == (REVISION, BELOW)
     assert ScriptDirectory.from_config(alembic_config()).get_heads() == [HEAD]
 
 

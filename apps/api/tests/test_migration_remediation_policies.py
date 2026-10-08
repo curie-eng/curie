@@ -37,7 +37,7 @@ BELOW = "0086"
 # revision (task 8), the read executions revision (task 7), the execution code
 # revision (task 11) and the remediation approvals revision (task 10) follow the
 # policy one.
-HEAD = "0096"
+HEAD = "0097"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}
 GENERATION_COLUMNS = {
@@ -146,7 +146,10 @@ def test_one_hand_written_revision_on_the_next_head() -> None:
     revision, down = _revision()
     assert down == BELOW, f"revision {revision} revises {down}, expected {BELOW}"
     script = ScriptDirectory.from_config(alembic_config())
-    assert script.get_heads() == [HEAD]
+    assert len(script.get_heads()) == 1
+    assert HEAD in {
+        rev.revision for rev in script.walk_revisions(base="base", head=script.get_heads()[0])
+    }
     assert revision in {rev.revision for rev in script.iterate_revisions(HEAD, BELOW)}
 
 

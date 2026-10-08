@@ -461,6 +461,7 @@
           "/agents/{agent_id}/hooks/{hook}/remediation-policy",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
@@ -559,6 +560,8 @@
           "/v1/work-item-progress/{request_id}/verification",
           "/v1/turn-progress/{progress_id}",
           "/v1/factory/cards/{token}.svg",
+          "/remediation-nominations",
+          "/remediation-nominations/{nomination_id}",
           "/schedules",
           "/schedules/{agent}/{name}/pause",
           "/schedules/{agent}/{name}/resume",
@@ -585,7 +588,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 1176,
+      "cardinality_bound": 1200,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -635,6 +638,7 @@
           "/agents/{agent_id}/hooks/{hook}/remediation-policy",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
@@ -733,6 +737,8 @@
           "/v1/work-item-progress/{request_id}/verification",
           "/v1/turn-progress/{progress_id}",
           "/v1/factory/cards/{token}.svg",
+          "/remediation-nominations",
+          "/remediation-nominations/{nomination_id}",
           "/schedules",
           "/schedules/{agent}/{name}/pause",
           "/schedules/{agent}/{name}/resume",
@@ -766,7 +772,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5880,
+      "cardinality_bound": 6000,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -816,6 +822,7 @@
           "/agents/{agent_id}/hooks/{hook}/remediation-policy",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/arm",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm",
+          "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers",
           "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}",
           "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs",
@@ -914,6 +921,8 @@
           "/v1/work-item-progress/{request_id}/verification",
           "/v1/turn-progress/{progress_id}",
           "/v1/factory/cards/{token}.svg",
+          "/remediation-nominations",
+          "/remediation-nominations/{nomination_id}",
           "/schedules",
           "/schedules/{agent}/{name}/pause",
           "/schedules/{agent}/{name}/resume",
@@ -947,7 +956,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 5880,
+      "cardinality_bound": 6000,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",
@@ -1277,6 +1286,74 @@
       "monotonic": false,
       "type": "histogram",
       "unit": "s"
+    },
+    "curie.remediation.lifecycle": {
+      "attributes": {
+        "authority": [
+          "policy",
+          "approval",
+          "none"
+        ],
+        "code": [
+          "nomination_malformed",
+          "unknown_action",
+          "nomination_duplicate",
+          "arguments_schema_mismatch",
+          "agent_stopped",
+          "reply_surface_unavailable",
+          "tune_execution_not_automated",
+          "generation_not_current",
+          "policy_disarmed",
+          "not_automatic",
+          "qualification_missing",
+          "qualification_stale",
+          "verifier_not_independent",
+          "out_of_bounds",
+          "not_reversible_now",
+          "breaker_open",
+          "policy_rate_limit",
+          "action_rate_limit",
+          "incident_limit",
+          "turn_limit",
+          "target_live",
+          "precondition_not_met",
+          "precondition_unavailable",
+          "admission_unreadable",
+          "policy_changed",
+          "arguments_mismatch",
+          "verified",
+          "not-recovered",
+          "verifier-unavailable",
+          "superseded",
+          "none"
+        ],
+        "kind": [
+          "remediate",
+          "prevent",
+          "tune"
+        ],
+        "service.name": [
+          "curie-worker"
+        ],
+        "stage": [
+          "nominated",
+          "refused",
+          "approval_requested",
+          "executed",
+          "verified",
+          "not-recovered",
+          "verifier-unavailable",
+          "superseded",
+          "undo_requested",
+          "undone",
+          "escalated"
+        ]
+      },
+      "cardinality_bound": 3069,
+      "description": "Remediation lifecycle receipts posted, by stage, kind, authority and code.",
+      "monotonic": true,
+      "type": "counter",
+      "unit": "{receipt}"
     },
     "curie.reply.delivery": {
       "attributes": {

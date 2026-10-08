@@ -439,7 +439,7 @@ mod tests {
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
         assert_eq!(candidate.schema_min, "0082");
-        assert_eq!(candidate.schema_head, "0096");
+        assert_eq!(candidate.schema_head, "0098");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -462,6 +462,8 @@ mod tests {
         assert!(live_in_window("0094", &current));
         assert!(live_in_window("0095", &current));
         assert!(live_in_window("0096", &current));
+        assert!(live_in_window("0097", &current));
+        assert!(live_in_window("0098", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
@@ -484,6 +486,8 @@ mod tests {
         assert!(live_in_window("0094", &candidate_release));
         assert!(live_in_window("0095", &candidate_release));
         assert!(live_in_window("0096", &candidate_release));
+        assert!(live_in_window("0097", &candidate_release));
+        assert!(live_in_window("0098", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let published =
             window_for("0.12.1").expect("released source control window remains catalogued");

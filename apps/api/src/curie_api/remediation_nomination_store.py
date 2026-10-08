@@ -186,6 +186,7 @@ async def record_delivery_surface(
     hook: str,
     event_id: str,
     channel: AgentChannel,
+    conversation: str | None = None,
 ) -> None:
     """Record the reply surface the hook route chose for one protected delivery.
 
@@ -197,7 +198,9 @@ async def record_delivery_surface(
     ``SQLAlchemyError`` having rolled back, for the route to refuse the
     delivery. The row lives until a submission copies it (pruned then, by
     ``remediation_admission.reconcile_admissions``), like the binding, which
-    keeps no expiry.
+    keeps no expiry. ``conversation`` is the delivery's thread, in the channel's
+    own terms, that the receipts post into (AUTOMATED-REMEDIATION-20); the
+    submission's ``conversation_id`` carries it on once the surface is pruned.
     """
 
     try:
@@ -211,6 +214,7 @@ async def record_delivery_surface(
                 reply_channel=channel.address,
                 reply_endpoint=channel.endpoint,
                 reply_adapter=channel.adapter,
+                reply_conversation=conversation,
             )
             .on_conflict_do_nothing(index_elements=["event_id"])
         )

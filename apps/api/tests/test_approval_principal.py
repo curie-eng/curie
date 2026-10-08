@@ -233,3 +233,92 @@ def test_operator_principal_mint_rejects_blank_subject(
         json={"subject": "   "},
     )
     assert rejected.status_code == 422
+
+
+def test_test_driver_attestation_is_bound_and_matches_dispatcher_codec() -> None:
+    from curie_dispatcher import approval_principal as dispatcher_codec
+
+    token = dispatcher_codec.mint_test_driver_principal(
+        "test-attester-secret",
+        subject=SUBJECT,
+        actor_channel=CHANNEL,
+        approval_id=APPROVAL_ID,
+        now=100,
+    )
+    claims = approval_principal.verify_claims(
+        token,
+        "test-attester-secret",
+        scope=approval_principal.APPROVE_SCOPE,
+        approval_id=APPROVAL_ID,
+        now=100,
+    )
+    assert claims is not None
+    assert (claims.kind, claims.subject, claims.actor_channel) == ("test_driver", SUBJECT, CHANNEL)
+    assert approval_principal.unverified_kind(token) == "test_driver"
+    for key, approval, now in [
+        ("other-key", APPROVAL_ID, 100),
+        ("test-attester-secret", "other-approval", 100),
+        ("test-attester-secret", APPROVAL_ID, 160),
+    ]:
+        assert (
+            approval_principal.verify_claims(
+                token,
+                key,
+                scope=approval_principal.APPROVE_SCOPE,
+                approval_id=approval,
+                now=now,
+            )
+            is None
+        )
+    assert token == approval_principal.mint(
+        "test-attester-secret",
+        subject=SUBJECT,
+        kind="test_driver",
+        actor_channel=CHANNEL,
+        approval_id=APPROVAL_ID,
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=160,
+    )
+
+
+def test_test_driver_verifier_refuses_a_long_lived_attestation() -> None:
+    token = approval_principal.mint(
+        "example-attester",
+        subject=SUBJECT,
+        kind="test_driver",
+        actor_channel=CHANNEL,
+        approval_id=APPROVAL_ID,
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=161,
+    )
+    assert (
+        approval_principal.verify_claims(
+            token,
+            "example-attester",
+            scope=approval_principal.APPROVE_SCOPE,
+            approval_id=APPROVAL_ID,
+            now=100,
+        )
+        is None
+    )
+
+
+def test_api_verifies_shared_test_driver_wire_vector() -> None:
+    vector = json.loads(
+        (Path(__file__).parents[3] / "tests/vectors/approval-principal.json").read_text()
+    )
+    driver = vector["test_driver"]
+    claims = approval_principal.verify_claims(
+        driver["token"],
+        vector["secret"],
+        scope=approval_principal.APPROVE_SCOPE,
+        approval_id=driver["claims"]["approval_id"],
+        now=vector["issued_at"],
+    )
+    assert claims is not None
+    assert (claims.kind, claims.subject, claims.actor_channel, claims.approval_id) == (
+        "test_driver",
+        "U0EXAMPLE1",
+        "C0EXAMPLE1",
+        "00000000-0000-4000-8000-000000000153",
+    )

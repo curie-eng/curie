@@ -2083,6 +2083,277 @@ surface and boot gates live in
 [`apps/mail-adapter/README.md`](../apps/mail-adapter/README.md); to build an adapter for a
 different channel, see [Building a channel adapter](guides/building-a-channel-adapter.md).
 
+## Automated remediation
+
+Automated remediation lets a protected hook's turn nominate one bounded fix that
+the platform admits, executes without a model, and verifies
+([ARCHITECTURE.md](../ARCHITECTURE.md#automated-remediation),
+[ADR-0203](adr/0203-automated-remediation-is-a-pre-qualified-action-the-platform-executes-and-verifies.md),
+[specification](superpowers/specs/2026-10-07-automated-remediation.md)). It is
+off by default and runs on the cluster tier only, because the connector action
+executor does. The model's half is
+[Writing remediation nominations](writing-remediation-nominations.md); this
+section is the administrator's.
+
+### What must be true first
+
+- `actionExecutor.enabled: true` and `remediation.enabled: true` (compose:
+  `CURIE_ACTION_EXECUTOR_ENABLED`, `CURIE_REMEDIATION_ENABLED`). A chart render
+  with remediation on and the executor off fails. With remediation off the API
+  refuses every nomination `remediation_disabled`, but the policy routes stay
+  readable and writable, so a policy can be staged before you turn it on.
+- The hook is **protected**: it has an active protected source policy
+  ([protected hook source policy](superpowers/specs/2026-10-02-protected-hook-source-policy.md)).
+  Binding a policy to an ordinary or unconfigured hook is refused
+  `hook_not_protected`. A remediation policy never makes a hook protected.
+- The policy's approval route exists in the agent's `approval_routes` with an
+  **explicit** approver set. The channel-members fallback is refused
+  (`route_approvers_not_explicit`), because anyone in an alert channel would
+  approve. A user group set accepts chat and console principals but not an
+  operator principal, so a route you drive from the CLI needs `approvers.users`.
+- Policy writes, arming, disarming, removal, breaker close, qualification
+  records and verifier runs need an ADR 0106 operator principal in addition to
+  the administrative credential, and record it as the actor. Mint one as
+  [Driving it from the CLI](approvals.md#driving-it-from-the-cli) shows and
+  export it as `CURIE_APPROVAL_PRINCIPAL_TOKEN`. Over HTTP it is the
+  `X-Curie-Approval-Principal` header. A write without one is refused
+  `operator_principal_required`. Reads need none.
+- The protected worker is deployed. The capture of a nomination block from a
+  protected turn is its runner client wrapper (AUTOMATED-REMEDIATION-6); without
+  it no turn can submit a block, though the policy and qualification routes
+  work.
+
+### Policies
+
+A policy is one JSON document per `(agent, hook)`: the `route`, the `limits`
+and the `actions`. Each write makes a new immutable generation, compared and
+swapped on `--expected-generation` (`0` binds a hook with no policy) and made
+idempotent by `--operation-id`.
+
+```bash
+curie cluster remediation-policy show <agent> <hook>
+curie cluster remediation-policy apply <agent> <hook> --file policy.json --expected-generation 0
+curie cluster remediation-policy arm <agent> <hook> --expected-generation <N>
+curie cluster remediation-policy disarm <agent> <hook> --expected-generation <N>
+curie cluster remediation-policy remove <agent> <hook> --expected-generation <N>
+curie cluster remediation-policy close-breaker <agent> <hook> <breaker id> --reason "<why>"
+```
+
+`curie local remediation-policy` is the same group, for staging and inspecting
+a policy on a local stack; remediation executes on the cluster tier only. Every
+verb prints one JSON object under `--json`. `apply` validates the document with
+the platform's own rules first
+([`cli/src/remediation_policy.rs`](../cli/src/remediation_policy.rs)),
+and the API refuses with the same code and path.
+
+A minimal reversible action, with placeholder names:
+
+```json
+{
+  "route": "example-oncall",
+  "limits": {"per_policy_per_hour": 3, "per_incident_per_target": 1,
+             "incident_window_seconds": 3600, "approval_ttl_seconds": 14400},
+  "actions": [{
+    "name": "scale-out-api", "kind": "remediate",
+    "connector": "example-scale", "tool": "scale",
+    "arguments": {
+      "namespace":  {"type": "string", "allowed": ["example-ns"]},
+      "deployment": {"type": "string", "allowed": ["example-api", "example-web"]},
+      "replicas":   {"type": "integer", "minimum": 2, "maximum": 6}},
+    "target": {"argument": "deployment", "allowed": ["example-api"]},
+    "reversibility": "reversible",
+    "precondition": {"connector": "example-metrics", "tool": "query_value",
+      "arguments": {"query": "example_error_ratio"}, "pointer": "/data/value",
+      "comparator": "gt", "value": 0.5},
+    "verifier": {"connector": "example-metrics", "tool": "query_value",
+      "arguments": {"query": "example_error_ratio"}, "pointer": "/data/value",
+      "comparator": "lt", "value": 0.05,
+      "settle_seconds": 60, "deadline_seconds": 600, "interval_seconds": 30, "consecutive": 2},
+    "automatic": false, "qualification": null
+  }]
+}
+```
+
+What the document does and does not let you say:
+
+- **Limits only tighten.** The ceilings are three automatic actions per policy
+  per hour and one per incident per target; the incident window (default and
+  minimum 3600 seconds, measured from when the last action's verification
+  finished) may only be lengthened. A looser value is refused
+  `policy_limit_out_of_bounds`. The incident is a per-target window, never
+  derived from an alert body.
+- **Bounds are absolute.** An argument is a closed set or a numeric range. A
+  delta bound (`max_delta` and the like) is refused `delta_bound_unsupported`,
+  because the first release has no trusted baseline.
+- **A target is a literal.** The `target.allowed` list is matched exactly; a
+  value that is merely equivalent goes to approval.
+- **Reads are one pointer and one comparator.** `pointer` is an RFC 6901 JSON
+  pointer and `comparator` is one of `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `in`,
+  `absent`. Ordering comparators apply to numbers and strict decimal strings
+  (a Prometheus sample `"0.5"` is numeric). Use instant queries at
+  `/data/0/value/1` or `scalar(...)`; a range query's latest sample cannot be
+  addressed, so its samples are unsuccessful and verification ends
+  `verifier-unavailable`. A result must be structured content or exactly one
+  text block of strict JSON.
+- **A verifier must be independent.** Its connector must differ from the acting
+  connector and its connector's header secret names must be disjoint from the
+  acting connector's (`verifier_not_independent`, at write and again at
+  admission). Disjoint names do not prove distinct credentials: the
+  qualification's worst case statement is where you say so.
+- **Timing.** `settle_seconds` is at least `interval_seconds`, the interval is
+  at least 10, the deadline is at most 3600 and at most 60 intervals. Each
+  sample claims its own executor sandbox, so intervals of 60 seconds or more are
+  the guidance.
+- **Kinds.** `remediate` may be automatic. `prevent` always asks and is
+  executed and verified once approved; `tune` always asks and approving it
+  writes nothing (`tune_execution_not_automated`). `automatic: true` on either
+  is refused `kind_not_automatic`.
+- **Nothing automatic without a record.** `automatic: true` is refused
+  `qualification_required` unless the action's `qualification` is the id of a
+  valid record for the connector's current digest.
+
+A disarmed policy sends every nomination to approval. Disarming, or any write,
+takes effect for every nomination evaluated afterwards, including those from a
+delivery admitted earlier: a nomination is automatic only while the generation
+it was admitted under is still current and armed, and an execution already
+created is refused `policy_changed` at claim.
+
+### Qualifying an action: the drill order
+
+An action may run without a person only after the installation has observed it
+work. Evidence from another installation, a staging report, a fixture or a
+static review does not count. The order is fixed, and the drills run through the
+ordinary approval path on a **disposable target inside the policy's bounds**:
+
+1. **Bind with `automatic: false` and `qualification: null`.** Arm the policy so
+   the drills pass the same checks production will. Every nomination for the
+   action now becomes an approval request (`not_automatic`).
+2. **Choose a qualification id** (a UUID). Verifier runs and the record share it.
+3. **Run the forward drills through approvals.** Each drill is a protected
+   delivery to the bound hook against the disposable target, whose turn
+   nominates the action, and whose card a person approves. The approval executes
+   the call, and the verifier judges it. Read the outcomes with
+   `curie cluster approvals <agent> --list`, `curie cluster actions list` and
+   `curie cluster actions execution <id>`. What the record needs:
+   - a **reversible** action: a `confirmed` restore of a record this tool
+     produced at this digest (`curie cluster actions undo <action id>`), and a
+     restore `refused` with `version_conflict`, produced by changing the target
+     out of band after a forward drill and then asking for the undo;
+   - an **idempotent** action: two `confirmed` approved forward executions with
+     the same canonical arguments, the second leaving the same `post_version`.
+4. **Run the verifier twice** against a literal member of the action's allowed
+   targets, with the target recovered (outcome `verified`) and not recovered
+   (`not-recovered`), under the same verifier declaration:
+
+   ```bash
+   curl -X POST "$CURIE_API_URL/agents/<agent id>/remediation-qualifications/<qualification id>/verifier-runs" \
+     -H "X-API-Key: $CURIE_API_KEY" -H "X-Curie-Approval-Principal: $CURIE_APPROVAL_PRINCIPAL_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"hook": "<hook>", "action": "scale-out-api", "target": "example-api"}'
+   ```
+
+   The body is exactly those three fields: the route accepts no tool or
+   arguments and only schedules the declared verifier's reads. Poll
+   `GET .../verifier-runs/<run id>` until `outcome` is set.
+5. **Record the qualification** with the evidence references and a worst case
+   statement of at most 2000 characters that covers the read tools' residual
+   trust and credential distinctness:
+
+   ```bash
+   curl -X PUT "$CURIE_API_URL/agents/<agent id>/remediation-qualifications/<qualification id>" \
+     -H "X-API-Key: $CURIE_API_KEY" -H "X-Curie-Approval-Principal: $CURIE_APPROVAL_PRINCIPAL_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"hook": "<hook>", "action": "scale-out-api", "generation": "<N>",
+          "evidence": {"restore_execution_id": "<id>", "conflict_execution_id": "<id>",
+                       "verified_run_id": "<id>", "not_recovered_run_id": "<id>"},
+          "worst_case": "<statement>"}'
+   ```
+
+   Idempotent actions give `forward_execution_ids` (two ids) instead of the
+   restore and conflict ids. Each reference is checked by kind, state, digest
+   and action when written; a missing, wrong-state or other-digest reference is
+   refused with a named code (`evidence_incomplete`, `evidence_not_found`,
+   `evidence_wrong_state`, `evidence_other_digest`, `evidence_other_action`,
+   `evidence_not_idempotent`) and writes nothing.
+6. **Write a new generation with `automatic: true`** and `qualification` set to
+   the record id. The policy write checks the record (`qualification_required`
+   otherwise).
+
+**A drill relies on a model nominating.** A forward drill starts with a model
+turn that emits a block; the platform has no route that lets an administrator
+request a write or name a tool, and none will be added for drills. When the
+model does not nominate, **repeat the drill with a fresh protected delivery**
+(a new delivery id) until it does. Never substitute a direct write to the
+connector, a hand-created execution, or an edited row: evidence made that way is
+not observed through the path production will use, and the platform does not
+accept it. If a model repeatedly fails to nominate, fix the skill's
+instructions, then drill again.
+
+A connector upgrade changes the digest and makes the record stale: admission
+sends that action to approval (`qualification_stale`) until you run the drills
+again and record a new qualification.
+
+### Breakers, limits and the stop controls
+
+A breaker opens, keyed by agent, connector, tool and target, on any
+verification outcome other than `verified` (including `superseded`), whether
+the action ran under the policy or under an approval, and on an execution that
+ended `failed` or `indeterminate`. While it is open, every nomination for that
+action and target, from any hook of the agent, goes to approval
+(`breaker_open`). Nothing but the administrative route closes it: not a
+nomination, a delivery, a verifier or an approval.
+
+```bash
+curie cluster remediation-policy close-breaker <agent> <hook> <breaker id> \
+  --reason "target repaired by hand, verifier checked"
+```
+
+The reason is required and recorded with the closing operator. The breaker id is
+logged by the API when it opens (`remediation breaker opened breaker=<id>`) and
+is a `remediation_breakers` row; there is no list verb yet. Closing an already
+closed breaker changes nothing, and an id that is not under that hook's policy is
+`404`. Close a breaker only after you have looked at why the action did not
+recover.
+
+The other controls, in order of reach: kill the agent (a killed agent, or an
+unreadable kill switch, ends every nomination `agent_stopped` and asks nobody);
+`disarm` the policy (every later nomination goes to approval); `remove` the
+policy (a new, inactive generation with no actions); turn `remediation.enabled`
+off (the API refuses submissions). A kill does not stop a verifier that is
+already sampling: reads never dispatch, so it keeps sampling to its deadline.
+
+An unverified result never undoes anything by itself. For a reversible action
+whose record is undoable, the platform raises an undo approval on the policy's
+route; an approver's approval drives the existing undo path under that
+approver's identity. A policy-executed record can be undone only by a principal
+in the policy route's approver set.
+
+### Reading what happened
+
+`curie cluster actions list|show|undo|execution` read the ledger: a
+policy-executed record carries its authority, the generation, the delivery event
+and nomination ids, an `actor_kind` of `policy` and the verification outcome.
+Approval cards are posted by the worker to the route's card channel. Thread
+receipts for each nomination stage, a `remediation list|show` verb and the
+`curie.remediation.lifecycle` counter belong to plan task 13 and are not
+described here until they ship; until then read nomination rows from the
+database.
+
+### The honest policy boundary
+
+A remediation policy is the only thing that lets an action run unattended, and
+it applies only to a **protected** hook. It does not restrict an ordinary hook
+turn, and it does not make a turn safe: it bounds what the platform will
+execute on a nomination. The tool access of the turn itself is ADR 0190's
+`read-only`, and what that turn can read is what the agent can read.
+
+For the SRE example this means the following, and the
+[Slack Email intake](../examples/sre-bot/docs/SLACK-EMAIL-INTAKE.md#remediation-policy-boundary)
+says it at the point of use: the example's bundle and installer configure no
+protected source policy and no remediation policy, so its alert hooks are
+ordinary hooks, a fence in one of its turns is plain text, and nothing
+nominates, admits or executes.
+
 ## Upgrading the chart
 
 A chart upgrade is a **full** upgrade: anything the new chart does not render is
@@ -2131,6 +2402,46 @@ What changes for existing installs:
   Rename any existing secret that uses these names before upgrading.
 * `curie local actions` and `curie cluster actions` (`list`, `show`, `undo`,
   `execution`) are new; `execution <id>` is the receipt of a restore.
+
+### Automated remediation (0.13.0, unreleased)
+
+0.13.0 adds automated remediation for protected hooks
+([Automated remediation](#automated-remediation),
+[ARCHITECTURE.md](../ARCHITECTURE.md#automated-remediation)). It is off by
+default and an upgrade changes nothing you did not turn on, with two exceptions
+below.
+
+- **Switch.** `remediation.enabled` (default `false`; compose
+  `CURIE_REMEDIATION_ENABLED`) renders into the API and the worker. It requires
+  `actionExecutor.enabled`, and a render with remediation on and the executor off
+  fails.
+- **Executor concurrency changes even with remediation off.**
+  `actionExecutor.maxConcurrentSandboxes` (default `2`, at least `1`; compose
+  `CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES`) is new. The executor loop
+  previously ran one execution at a time and may now run up to that many, and the
+  API's claim route enforces the count across worker replicas, keeping one slot
+  for write-kind executions. It is what leaves sandbox quota to ordinary turns.
+  Set it to `1` to keep one-at-a-time behavior.
+- **Database.** Revisions 0087 to 0096 are hand-written and additive: they add the
+  policy, nomination, breaker, reservation, qualification and escalation tables
+  and new nullable columns on the ledger and the executions table, replace the
+  `agent_actions`/`action_executions` `authority_kind` and `kind` checks and the
+  approvals `purpose` check to admit the new values, and keep every existing row.
+  Nothing is written to the new tables until remediation is on and a policy is
+  bound. No forward-only flag is needed.
+- **Runner, worker and API together.** The runner's `/v1/execute` gains a `read`
+  phase (the [ACI producer interface](interfaces/aci-producer/INTERFACE.md)).
+  Roll the runner image with the worker and API: a read sent to an older runner is
+  refused, which makes that sample unsuccessful and leaves a verifier
+  `verifier-unavailable`.
+- **New surfaces.** The policy routes under
+  `/agents/{agent}/hooks/{hook}/remediation-policy`, the qualification routes under
+  `/agents/{agent}/remediation-qualifications/{id}`, the internal
+  `POST /v1/internal/remediation/nominations` route, `POST /action-executions/{id}/samples`,
+  and `curie local|cluster remediation-policy`. The approvals `purpose` gains
+  `remediation`, which resolves without waking a model.
+- **Nothing frozen changes.** `packages/aci-protocol` and `packages/plugin-format`
+  are untouched, and no bundle needs to change.
 
 ### Agent memory (0.12.0)
 
