@@ -177,3 +177,16 @@ def test_wrong_type_authority_is_foreign_and_leaves_the_bridge_untouched(
     assert client.lrange(keys[0], 0, -1) == ["not-a-string-marker"]
     assert client.get(keys[1]) == '{"revision":17}'
     assert all(29_000 < client.pttl(key) <= 30_000 for key in keys)
+
+
+def test_matching_negative_revision_is_foreign_and_changes_nothing(
+    markers: tuple[Redis, tuple[str, str]],
+) -> None:
+    client, keys = markers
+    raw = '{"revision":-1,"since":"retained"}'
+    client.set(keys[0], raw, px=30_000)
+    client.set(keys[1], '{"revision":17}', px=30_000)
+    assert _renew(keys, revision=-1, ttl_ms=60_000) == "foreign"
+    assert client.get(keys[0]) == raw
+    assert client.get(keys[1]) == '{"revision":17}'
+    assert all(29_000 < client.pttl(key) <= 30_000 for key in keys)
