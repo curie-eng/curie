@@ -421,6 +421,7 @@ fn assert_parser_edge_cases_are_masked(rendered: &str, surface: &str) {
 
 fn pure_up() -> UpOpts {
     UpOpts {
+        file_values: None,
         retained_mail_values: None,
         retained_runner_values: None,
         saved_credentials: None,

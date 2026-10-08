@@ -51,8 +51,9 @@ impl CliOutput for LintValuesOutput {
 
 /// Ask Helm to parse each pending file. Reading the copies through `fromYaml`
 /// keeps explicit nulls that Helm omits from its computed `.Values` template.
-/// The original files also go through `-f` so Helm validates the upgrade input.
-async fn pending_values(files: &[PathBuf]) -> Result<Value> {
+/// The same captured copies go through `-f` so Helm validates this input.
+pub(crate) async fn pending_values(files: &[PathBuf]) -> Result<Value> {
+    // @spec CLUSTER-VALUES-FILES c2: Helm parses only captured copies.
     let chart = tempfile::tempdir()
         .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
     let templates = chart.path().join("templates");
@@ -89,8 +90,9 @@ async fn pending_values(files: &[PathBuf]) -> Result<Value> {
         plain("curie-values-lint"),
         plain(chart.path().to_string_lossy().into_owned()),
     ];
-    for file in files {
-        let path = file
+    for index in 0..files.len() {
+        let snapshot = chart_files.join(format!("{index}.yaml"));
+        let path = snapshot
             .to_str()
             .ok_or_else(|| crate::exit::CliError::failure("values file path is not UTF-8"))?;
         args.push(plain("-f"));
@@ -156,7 +158,7 @@ pub async fn lint_values(common: CommonOpts, files: Vec<PathBuf>) -> Result<Lint
 }
 
 /// Helm merges maps recursively and replaces lists, scalars, and nulls.
-fn merge_values(previous: &mut Value, later: Value) {
+pub(crate) fn merge_values(previous: &mut Value, later: Value) {
     match (previous, later) {
         (Value::Object(previous), Value::Object(later)) => {
             for (key, value) in later {

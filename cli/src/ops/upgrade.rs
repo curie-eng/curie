@@ -123,6 +123,8 @@ impl std::fmt::Display for UpgradePhase {
 /// Flags for `curie cluster upgrade`.
 #[derive(Debug, Clone)]
 pub struct UpgradeOpts {
+    /// @spec CLUSTER-VALUES-FILES c1-c4: immutable operator values.
+    pub file_values: Option<super::PrivateHelmValues>,
     pub common: CommonOpts,
     pub to: String,
     pub chart: UpgradeChart,
@@ -2318,13 +2320,32 @@ impl LiveHost {
             if super::verbs::failure_reason(&err) != "Error: release: not found" {
                 bail!("could not read retained helm values: {}", err.trim());
             }
-            return Ok(None);
+            return if self.opts.file_values.is_some() {
+                self.migrate_effective_overlay(serde_json::json!({}))
+            } else {
+                Ok(None)
+            };
         }
         if out.trim().is_empty() {
-            return Ok(None);
+            return if self.opts.file_values.is_some() {
+                self.migrate_effective_overlay(serde_json::json!({}))
+            } else {
+                Ok(None)
+            };
         }
         let values: serde_json::Value =
             serde_norway::from_str(&out).context("retained helm values are malformed")?;
+        self.migrate_effective_overlay(values)
+    }
+
+    /// @spec CLUSTER-VALUES-FILES c3: admit the final merged input once.
+    fn migrate_effective_overlay(
+        &self,
+        mut values: serde_json::Value,
+    ) -> Result<Option<(String, String)>> {
+        if let Some(files) = &self.opts.file_values {
+            super::lint_values::merge_values(&mut values, files.0.clone());
+        }
         // Unlike `up.rs`, the installed chart version is known here, so
         // `infer_schema_version` is not guessing when the overlay predates
         // `config.schemaVersion`.
@@ -2906,6 +2927,7 @@ mod hook_tests {
 
     fn opts(namespace: &str, release: &str) -> UpgradeOpts {
         UpgradeOpts {
+            file_values: None,
             common: CommonOpts {
                 namespace: namespace.into(),
                 release: release.into(),

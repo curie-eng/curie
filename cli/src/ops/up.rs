@@ -46,6 +46,8 @@ impl std::fmt::Debug for PrivateHelmValues {
 }
 
 pub struct UpOpts {
+    /// @spec CLUSTER-VALUES-FILES c1-c4: captured operator values.
+    pub file_values: Option<PrivateHelmValues>,
     /// Existing mail lifecycle and paired worker credentials, with explicit
     /// operator overrides removed. Populated by the one release-values read.
     pub retained_mail_values: Option<PrivateHelmValues>,
@@ -122,7 +124,18 @@ pub struct UpOpts {
 
 impl UpOpts {
     pub(super) fn operator_sets(&self) -> Vec<String> {
-        self.set.iter().chain(&self.set_string).cloned().collect()
+        // @spec CLUSTER-VALUES-FILES c3: file keys are explicit overrides.
+        self.file_values
+            .iter()
+            .flat_map(|values| {
+                values
+                    .1
+                    .iter()
+                    .map(|(key, value)| format!("{key}={}", escape_helm_set_string_value(value)))
+            })
+            .chain(self.set.iter().cloned())
+            .chain(self.set_string.iter().cloned())
+            .collect()
     }
 }
 
@@ -3034,12 +3047,24 @@ impl UpValuePlan {
 /// update one path without updating the other.
 pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     let mut plan = UpValuePlan::default();
+    // @spec CLUSTER-VALUES-FILES c3-c4: explicit flags follow file inputs.
+    if let Some(values) = &o.file_values {
+        plan.entries
+            .push(PlannedHelmValues::Retained(values.clone()));
+    }
     if o.dev {
         plan.set(ALLOW_DEV_DEFAULTS_KEY, "true");
     }
     if !o.no_expose {
-        plan.set("ui.service.type", "NodePort");
-        plan.set("langfuse.web.service.type", "NodePort");
+        // @spec CLUSTER-VALUES-FILES c1: defaults do not override file choices.
+        for key in ["ui.service.type", "langfuse.web.service.type"] {
+            if o.file_values
+                .as_ref()
+                .is_none_or(|values| !values.1.contains_key(key))
+            {
+                plan.set(key, "NodePort");
+            }
+        }
     }
     if let Some(model) = &o.local_model {
         plan.set(INFERENCE_DEPLOY_KEY, "true");
@@ -3365,7 +3390,13 @@ fn final_operator_value<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
             .rev()
             .find_map(|(candidate, value)| (candidate.trim() == key).then_some(value.trim()))
     };
-    in_lane(&opts.set_string).or_else(|| in_lane(&opts.set))
+    in_lane(&opts.set_string)
+        .or_else(|| in_lane(&opts.set))
+        .or_else(|| {
+            opts.file_values
+                .as_ref()
+                .and_then(|values| values.1.get(key).map(String::as_str))
+        })
 }
 
 fn detected_provider_from_plan(opts: &UpOpts, plan: &UpValuePlan) -> Option<&'static str> {
@@ -5148,6 +5179,9 @@ pub async fn up(
     github_token: Option<String>,
     clear_github_token: bool,
 ) -> Result<ClusterUpOutput> {
+    // @spec CLUSTER-VALUES-FILES c1-c3
+    apply_flags_to_file_values(&mut opts, github_token.as_deref(), clear_github_token);
+    // @spec CLUSTER-VALUES-FILES c3: validation sees the captured files.
     validate_up_inputs(&opts, github_token.as_deref(), clear_github_token)?;
     validate_credential_egress_consistency(&opts)?;
     provider_contradiction(&opts, &up_value_plan(&opts))?;
@@ -5158,13 +5192,24 @@ pub async fn up(
     } else {
         None
     };
+    // @spec CLUSTER-VALUES-FILES c3: preserve completion, with explicit files winning.
+    let mut effective_existing = existing.clone();
+    if let Some(values) = &opts.file_values {
+        let merged = effective_existing.get_or_insert_with(|| serde_json::json!({}));
+        super::lint_values::merge_values(merged, values.0.clone());
+    }
     opts = complete_up_opts_without_runner_egress(
         opts,
-        existing.as_ref(),
+        effective_existing.as_ref(),
         github_token.as_deref(),
         clear_github_token,
         true,
     )?;
+    // @spec CLUSTER-VALUES-FILES c3: an overlay is not an installed release.
+    if existing.is_none() && opts.file_values.is_some() && !opts.dev {
+        opts.secrets
+            .extend(resolve_generated_secrets(None, &opts.operator_sets())?);
+    }
     validate_credential_egress_consistency(&opts)?;
     let completed_identity_plan = up_value_plan(&opts);
     let mut inferences = Vec::new();
@@ -5177,7 +5222,7 @@ pub async fn up(
     let (next_preserved_egress_index, recorded_egress_cidrs) =
         resolve_preserved_runner_egress_values(
             &mut opts,
-            existing.as_ref(),
+            effective_existing.as_ref(),
             &operator_sets,
             provider_was_inferred,
         );
@@ -5774,6 +5819,7 @@ mod tests {
 
     fn opts() -> UpOpts {
         UpOpts {
+            file_values: None,
             retained_mail_values: None,
             retained_runner_values: None,
             saved_credentials: None,
@@ -6653,6 +6699,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                file_values: None,
                 retained_mail_values: None,
                 retained_runner_values: None,
                 saved_credentials: None,
@@ -10280,4 +10327,129 @@ fn effective_existing_secret(
         return !value.is_empty();
     }
     preserved_value(existing, &reference).is_some()
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c3
+fn apply_flags_to_file_values(opts: &mut UpOpts, github_token: Option<&str>, clear: bool) {
+    let Some(values) = &mut opts.file_values else {
+        return;
+    };
+    let mut changes = Vec::new();
+    if opts.model.is_some() {
+        changes.push((RUNNER_MODEL_KEY.to_string(), None));
+    }
+    if clear || github_token.is_some_and(|value| !value.is_empty()) {
+        changes.push((GITHUB_TOKEN_KEY.to_string(), None));
+        changes.extend(
+            GITHUB_TOKEN_REFERENCE_KEYS
+                .iter()
+                .map(|key| ((*key).to_string(), Some(serde_json::json!("")))),
+        );
+    }
+    if opts.credentials.is_some() || opts.local_model.is_some() {
+        changes.push((MODEL_CREDENTIAL_KEY.to_string(), None));
+        changes.extend(
+            MODEL_CREDENTIAL_REFERENCE_KEYS
+                .iter()
+                .map(|key| ((*key).to_string(), Some(serde_json::json!("")))),
+        );
+    }
+    if opts.fake_model {
+        changes.push((FAKE_MODEL_KEY.to_string(), Some(serde_json::json!(true))));
+    }
+    if opts.no_expose {
+        for key in ["ui.service.type", "langfuse.web.service.type"] {
+            changes.push((key.to_string(), Some(serde_json::json!("ClusterIP"))));
+        }
+    }
+    // Keep the established inline replacement rule for actual --set lanes,
+    // while file references remain lower priority than those replacements.
+    let explicit: Vec<String> = opts.set.iter().chain(&opts.set_string).cloned().collect();
+    let explicit_keys = operator_set_keys(&explicit);
+    for key in values.1.keys() {
+        let Some(inline) = key
+            .strip_suffix("ExistingSecretKey")
+            .or_else(|| key.strip_suffix("ExistingSecret"))
+        else {
+            continue;
+        };
+        if !explicit_keys.contains(key.as_str())
+            && operator_set_entries(&explicit)
+                .into_iter()
+                .rev()
+                .find(|(name, _)| name.trim() == inline)
+                .is_some_and(|(_, value)| !value.is_empty())
+        {
+            changes.push((key.clone(), Some(serde_json::json!(""))));
+        }
+    }
+    for (key, replacement) in changes {
+        // These managed key paths are fixed chart paths, never file-authored
+        // dotted map keys. Leave absent file keys to existing completion.
+        let Some((parent, leaf)) = key.rsplit_once('.') else {
+            continue;
+        };
+        let pointer = format!("/{}", parent.replace('.', "/"));
+        let Some(object) = values
+            .0
+            .pointer_mut(&pointer)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if !object.contains_key(leaf) {
+            continue;
+        }
+        if let Some(replacement) = replacement {
+            object.insert(leaf.to_string(), replacement);
+        } else {
+            object.remove(leaf);
+        }
+    }
+    values.1.clear();
+    flatten_file_values(&values.0, "", &mut values.1);
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c4
+pub async fn load_values_files(files: &[std::path::PathBuf]) -> Result<Option<PrivateHelmValues>> {
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let parsed = super::lint_values::pending_values(files).await?;
+    let document = crate::config_migrate::migrate_installed_config(parsed, None)
+        .map_err(|_| crate::exit::CliError::failure("values files failed configuration admission"))?
+        .values;
+    let mut flattened = BTreeMap::new();
+    flatten_file_values(&document, "", &mut flattened);
+    Ok(Some(PrivateHelmValues(document, flattened)))
+}
+
+/// @spec CLUSTER-VALUES-FILES c2-c3
+fn flatten_file_values(
+    value: &serde_json::Value,
+    prefix: &str,
+    out: &mut BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            for (key, child) in map {
+                flatten_file_values(child, &join_escaped_helm_set_path(prefix, key), out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            out.insert(prefix.into(), value.to_string());
+            for (index, child) in items.iter().enumerate() {
+                flatten_file_values(child, &format!("{prefix}[{index}]"), out);
+            }
+        }
+        scalar => {
+            out.insert(
+                prefix.into(),
+                scalar
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| scalar.to_string()),
+            );
+        }
+    }
 }

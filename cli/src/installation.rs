@@ -1338,6 +1338,7 @@ fn plan_installation_inner(
         .as_ref()
         .and_then(|name| resolved.get(name).cloned());
     let up = crate::ops::UpOpts {
+        file_values: None,
         retained_mail_values: None,
         retained_runner_values: None,
         // The model credential is explicit here, named by `curie.yaml`; a
