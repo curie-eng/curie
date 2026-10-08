@@ -58,8 +58,19 @@ pub(crate) async fn pending_values(files: &[PathBuf]) -> Result<Value> {
 }
 
 /// @spec CLUSTER-VALUES-FILES c1-c3
-pub(crate) async fn pending_set_values(args: &[CmdArg]) -> Result<Value> {
+pub(crate) async fn pending_set_overlay(args: &[CmdArg]) -> Result<Value> {
     parsed_values(&[], args).await
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c3
+pub(crate) async fn pending_set_values(base: &Value, args: &[CmdArg]) -> Result<Value> {
+    let snapshot = tempfile::NamedTempFile::new()
+        .map_err(|_| crate::exit::CliError::failure("could not prepare values snapshot"))?;
+    let encoded = serde_json::to_vec(base)
+        .map_err(|_| crate::exit::CliError::failure("could not prepare values snapshot"))?;
+    std::fs::write(snapshot.path(), encoded)
+        .map_err(|_| crate::exit::CliError::failure("could not prepare values snapshot"))?;
+    parsed_values(&[snapshot.path().to_path_buf()], args).await
 }
 
 /// @spec CLUSTER-VALUES-FILES c2-c3

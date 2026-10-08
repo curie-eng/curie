@@ -5184,14 +5184,13 @@ pub async fn up(
     if opts.file_values.is_some() {
         // @spec CLUSTER-VALUES-FILES c1-c3: Helm supplies actual typed set semantics.
         let args = file_set_args(&opts);
-        let explicit = if args.is_empty() {
-            serde_json::json!({})
-        } else {
-            super::lint_values::pending_set_values(&args).await?
-        };
         if let Some(values) = &mut opts.file_values {
-            crate::config_migrate::clear_replaced_secret_refs(&mut values.0, &explicit);
-            super::lint_values::merge_values(&mut values.0, explicit);
+            if !args.is_empty() {
+                let explicit = super::lint_values::pending_set_overlay(&args).await?;
+                let mut combined = super::lint_values::pending_set_values(&values.0, &args).await?;
+                crate::config_migrate::clear_replaced_secret_refs(&mut combined, &explicit);
+                values.0 = combined;
+            }
             values.1.clear();
             flatten_file_values(&values.0, "", &mut values.1);
         }
