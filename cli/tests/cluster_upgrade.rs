@@ -12,8 +12,8 @@
 //! observed at Converge.
 
 use curie::ops::{
-    run_lifecycle, ClusterUpgradeOutput, CommonOpts, FakeUpgradeHost, UpgradeChart, UpgradeOpts,
-    UpgradePhase,
+    run_lifecycle, ClusterUpgradeOutput, CommonOpts, FakeUpgradeHost, LayerClearReason,
+    RunnerLayerPlan, UpgradeChart, UpgradeOpts, UpgradePhase,
 };
 use curie::ui::CliOutput;
 
@@ -651,4 +651,254 @@ async fn upgrade_retires_claims_of_every_cleared_runner_layer_after_apply() {
         .await
         .expect("upgrade");
     assert!(plain.retired_claims.is_empty());
+}
+
+const STOCK_LAYER: &str = "ghcr.io/curie-eng/curie-dark-factory-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const PLATFORM_RUNNER: &str = "ghcr.io/curie-eng/curie-runner@sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+/// One stock agent rebound to the layer published for `--to` (#4321).
+fn stock_rebind_plan() -> RunnerLayerPlan {
+    RunnerLayerPlan {
+        rebinds: vec![("dark-factory".into(), STOCK_LAYER.into())],
+        ..RunnerLayerPlan::default()
+    }
+}
+
+/// #4321 AC3: the plan lists rebound agents apart from cleared ones, the
+/// owner-built line keeps its v0.12.3 text for owner-built agents only, and
+/// every changed agent's claims are retired right after Apply.
+#[tokio::test]
+async fn dry_run_shows_rebinds_and_stock_clears_apart() {
+    let mut host = FakeUpgradeHost::installed("0.12.2")
+        .with_retained_values()
+        .with_runner_layer_plan(RunnerLayerPlan {
+            rebinds: vec![("dark-factory".into(), STOCK_LAYER.into())],
+            clears: vec![
+                ("acme-bot".into(), LayerClearReason::OwnerBuilt),
+                (
+                    "night-factory".into(),
+                    LayerClearReason::StockLayerUnpublished,
+                ),
+            ],
+            kept: Vec::new(),
+        });
+    let out = run_lifecycle(dry_opts("0.12.3"), &mut host)
+        .await
+        .expect("dry-run plan");
+    let ClusterUpgradeOutput::DryRun(plan) = &out else {
+        panic!("dry-run must not mutate: {out:?}");
+    };
+    let at = |prefix: &str| {
+        plan.lines
+            .iter()
+            .position(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no line starting {prefix:?}: {:?}", plan.lines))
+    };
+    let rebound_at = at("runner layers rebound:");
+    let owner_at = at("runner layers:");
+    let stock_at = at("stock runner layers:");
+    assert!(
+        rebound_at < owner_at && owner_at < stock_at,
+        "rebind line, owner notice, stock notice: {:?}",
+        plan.lines
+    );
+    let rebound = &plan.lines[rebound_at];
+    assert!(
+        rebound.contains(&format!("dark-factory={STOCK_LAYER}")),
+        "{rebound}"
+    );
+    assert!(
+        !rebound.contains("acme-bot") && !rebound.contains("night-factory"),
+        "{rebound}"
+    );
+    let owner = &plan.lines[owner_at];
+    assert!(owner.contains("agent(s) acme-bot will stop"), "{owner}");
+    assert!(!owner.contains("factory"), "{owner}");
+    let stock = &plan.lines[stock_at];
+    assert!(stock.contains("night-factory"), "{stock}");
+    assert!(stock.contains("curie cluster factory"), "{stock}");
+    assert!(!stock.contains("curie build --plugin-dir"), "{stock}");
+    assert!(!stock.contains("acme-bot"), "{stock}");
+
+    let apply_at = at("helm upgrade ");
+    assert_eq!(
+        &plan.lines[apply_at + 1..apply_at + 4],
+        &[
+            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=acme-bot --wait=true --ignore-not-found=true",
+            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=dark-factory --wait=true --ignore-not-found=true",
+            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=night-factory --wait=true --ignore-not-found=true",
+        ]
+    );
+    assert_eq!(host.mutate_calls, 0);
+    assert!(host.retired_claims.is_empty());
+
+    let json = output_json(&out);
+    let lines: Vec<&str> = json["plan"]
+        .as_array()
+        .expect("--json plan")
+        .iter()
+        .filter_map(|l| l.as_str())
+        .collect();
+    for prefix in [
+        "runner layers rebound:",
+        "runner layers:",
+        "stock runner layers:",
+    ] {
+        assert!(
+            lines.iter().any(|l| l.starts_with(prefix)),
+            "--json plan lacks {prefix:?}: {json}"
+        );
+    }
+}
+
+/// #4321 AC6: rendered templates that match the plan let the run commit
+/// known-good, and a rebound agent's claims are retired after Apply (AC2).
+#[tokio::test]
+async fn canary_commits_when_templates_match_the_plan() {
+    let mut host = FakeUpgradeHost::installed("0.12.2")
+        .with_runner_layer_plan(stock_rebind_plan())
+        .with_template_images(PLATFORM_RUNNER, &[("dark-factory", STOCK_LAYER)]);
+    let out = run_lifecycle(opts("0.12.3"), &mut host)
+        .await
+        .expect("upgrade");
+    let json = output_json(&out);
+    assert_eq!(json["status"], "succeeded", "{json}");
+    assert_eq!(json["phase"], "commit", "{json}");
+    assert_eq!(json["canary"]["passed"], true, "{json}");
+    assert_eq!(json["known_good_version"], "0.12.3", "{json}");
+    assert_eq!(host.retired_claims, vec!["dark-factory"]);
+}
+
+/// #4321 AC6: a template that renders something other than the plan fails
+/// the canary, the run does not commit known-good, and the reason names the
+/// agent, what the upgrade planned and what the template renders.
+#[tokio::test]
+async fn canary_fails_and_keeps_known_good_when_a_template_is_off_plan() {
+    let mut host = FakeUpgradeHost::installed("0.12.2")
+        .with_runner_layer_plan(stock_rebind_plan())
+        .with_template_images(PLATFORM_RUNNER, &[("dark-factory", PLATFORM_RUNNER)]);
+    let out = run_lifecycle(opts("0.12.3"), &mut host)
+        .await
+        .expect("failed canary is a completed failure payload");
+    let json = output_json(&out);
+    assert_eq!(json["canary"]["passed"], false, "{json}");
+    assert_eq!(json["status"], "failed", "{json}");
+    assert_eq!(json["phase"], "canary", "{json}");
+    assert_eq!(json["known_good_version"], "0.12.2", "{json}");
+    let reason = json["fail_forward"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("dark-factory"), "{json}");
+    assert!(reason.contains(STOCK_LAYER), "the planned image: {json}");
+    assert!(
+        reason.contains(PLATFORM_RUNNER),
+        "the rendered image: {json}"
+    );
+    let view = host.status_view();
+    assert_eq!(view.status, "failed");
+    assert_eq!(view.known_good_version.as_deref(), Some("0.12.2"));
+}
+
+const OWNER_LAYER: &str = "ghcr.io/acme/acme-bot-runner@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+/// #4321 review P1: the canary expectations are recorded in the checkpoint
+/// when the record is created, and a resumed run checks the recorded ones.
+/// After Apply cleared acme-bot, re-planning from the modified values no
+/// longer sees acme-bot at all (an empty host plan here), so only the
+/// recorded expectation can catch its stale per-agent template.
+#[tokio::test]
+async fn resumed_canary_uses_the_recorded_expectations_not_the_replanned_ones() {
+    let mut host = FakeUpgradeHost::installed("0.12.2")
+        .with_runner_layer_clears(&["acme-bot"])
+        .with_template_images(PLATFORM_RUNNER, &[("acme-bot", OWNER_LAYER)])
+        .interrupt_after(UpgradePhase::Apply);
+    let err = run_lifecycle(opts("0.12.3"), &mut host)
+        .await
+        .expect_err("interrupted after apply");
+    assert!(format!("{err:#}").contains("interrupted"), "{err:#}");
+    let persisted: serde_json::Value =
+        serde_json::from_str(&host.persisted_json()).expect("persisted record");
+    assert_eq!(
+        persisted["runner_canary"],
+        serde_json::json!([["acme-bot", "PlatformRunner"]]),
+        "the fresh record carries the plan's canary expectations: {persisted}"
+    );
+
+    // The resumed process re-plans from values Apply already changed.
+    let mut host = host.with_runner_layer_plan(RunnerLayerPlan::default());
+    host.clear_interrupt();
+    let out = run_lifecycle(opts("0.12.3"), &mut host)
+        .await
+        .expect("failed canary is a completed failure payload");
+    let json = output_json(&out);
+    assert_eq!(json["resumed"], true, "{json}");
+    assert_eq!(json["canary"]["passed"], false, "{json}");
+    assert_eq!(json["status"], "failed", "{json}");
+    assert_eq!(json["phase"], "canary", "{json}");
+    assert_eq!(json["known_good_version"], "0.12.2", "{json}");
+    let reason = json["fail_forward"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("acme-bot"), "{json}");
+    assert!(reason.contains(OWNER_LAYER), "the stale layer: {json}");
+    let persisted: serde_json::Value =
+        serde_json::from_str(&host.persisted_json()).expect("persisted record");
+    assert_eq!(
+        persisted["runner_canary"],
+        serde_json::json!([["acme-bot", "PlatformRunner"]]),
+        "a resumed run keeps the recorded expectations: {persisted}"
+    );
+}
+
+/// #4321 review round 2 P2: when a run stops before Apply, the plan Apply
+/// will actually execute is the one the resumed process computes. Here the
+/// first attempt could only clear acme-bot (say the registry was down), and
+/// the resumed one rebinds it to a published layer. The resumed run refreshes
+/// and persists the canary expectations from that plan, so the correctly
+/// rebound template passes. The post-Apply resume test above is the inverse
+/// control: once Apply has run, the recorded expectations win.
+#[tokio::test]
+async fn resume_before_apply_refreshes_the_canary_expectations_from_the_executed_plan() {
+    let mut host = FakeUpgradeHost::installed("0.12.2")
+        .with_runner_layer_clears(&["acme-bot"])
+        .interrupt_after(UpgradePhase::Checkpoint);
+    let err = run_lifecycle(opts("0.12.3"), &mut host)
+        .await
+        .expect_err("interrupted before apply");
+    assert!(format!("{err:#}").contains("interrupted"), "{err:#}");
+    let persisted: serde_json::Value =
+        serde_json::from_str(&host.persisted_json()).expect("persisted record");
+    assert_eq!(
+        persisted["runner_canary"],
+        serde_json::json!([["acme-bot", "PlatformRunner"]]),
+        "the first attempt records its own plan: {persisted}"
+    );
+    assert!(
+        !persisted["completed"]
+            .as_array()
+            .expect("completed phases")
+            .iter()
+            .any(|phase| phase == "apply"),
+        "Apply is still outstanding: {persisted}"
+    );
+
+    let mut host = host
+        .with_runner_layer_plan(RunnerLayerPlan {
+            rebinds: vec![("acme-bot".into(), STOCK_LAYER.into())],
+            ..RunnerLayerPlan::default()
+        })
+        .with_template_images(PLATFORM_RUNNER, &[("acme-bot", STOCK_LAYER)]);
+    host.clear_interrupt();
+    let out = run_lifecycle(opts("0.12.3"), &mut host)
+        .await
+        .expect("upgrade");
+    let json = output_json(&out);
+    assert_eq!(json["resumed"], true, "{json}");
+    assert_eq!(json["status"], "succeeded", "{json}");
+    assert_eq!(json["phase"], "commit", "{json}");
+    assert_eq!(json["canary"]["passed"], true, "{json}");
+    assert_eq!(json["known_good_version"], "0.12.3", "{json}");
+    let persisted: serde_json::Value =
+        serde_json::from_str(&host.persisted_json()).expect("persisted record");
+    assert_eq!(
+        persisted["runner_canary"],
+        serde_json::json!([["acme-bot", {"Image": STOCK_LAYER}]]),
+        "the resumed run persists the expectations of the plan Apply executed: {persisted}"
+    );
 }

@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
-from .. import crud, factory_ci, factory_progress
+from .. import crud, factory_ci, factory_progress, workitems
 from ..auth import (
     require_api_key,
     require_internal_worker_token,
@@ -100,6 +100,13 @@ async def mint_publication_context(
     settings = get_settings()
     try:
         async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):
+            await workitems.adopt_orphan_publication_lineage(
+                session,
+                deployment_id=data.deployment_id,
+                work_item_id=data.work_item_id,
+                execution_request_id=data.execution_request_id,
+                runtime_epoch=data.runtime_epoch,
+            )
             authority = await read_publication_authority(
                 session,
                 github_html_base=settings.github_html_base,

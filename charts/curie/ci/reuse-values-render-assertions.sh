@@ -170,6 +170,28 @@ assert_source() {
     fi
     echo "OK: v$version -> candidate --reuse-values render passes ($label)"
   done
+
+  if [[ "$version" == "$LATEST_VERSION" ]]; then
+    # @spec docs/superpowers/specs/2026-10-08-mcp-connector-valkey-ingress-optout.md
+    # The candidate's values.yaml is replaced with the actual released chart's
+    # values above. This proves an old release with no new key retains the
+    # connector peer, rather than being masked by candidate defaults.
+    local valkey_out="$TMP/$version-valkey-reuse.yaml"
+    render upgrade "$reuse" "$valkey_out"
+    python3 - "$valkey_out" <<'PY'
+import sys, yaml
+docs = [doc for doc in yaml.safe_load_all(open(sys.argv[1])) if doc]
+policy = next(doc for doc in docs if doc.get("kind") == "NetworkPolicy"
+              and doc.get("metadata", {}).get("name", "").endswith("-valkey-allow-app-ingress"))
+peer = next(peer for rule in policy["spec"]["ingress"]
+            for peer in rule.get("from", [])
+            if peer.get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/component") == "mcp-connector")
+assert any(port.get("port") == 6379 for rule in policy["spec"]["ingress"]
+           if any(peer.get("podSelector", {}).get("matchLabels", {}).get("app.kubernetes.io/component") == "mcp-connector"
+                  for peer in rule.get("from", [])) for port in rule.get("ports", []))
+PY
+    echo "OK: v$version released values retain the MCP Valkey peer under --reuse-values"
+  fi
 }
 
 fetch_release "$LATEST_VERSION"

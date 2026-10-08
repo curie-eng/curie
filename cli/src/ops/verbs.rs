@@ -3491,12 +3491,36 @@ impl ReleaseFullname {
 /// `cli/tests/chart_fullname_parity.rs` pins both the rule and its limit
 /// against the chart's own render.
 pub fn chart_fullname(release: &str) -> ReleaseFullname {
+    ReleaseFullname(release_fullname_from_values(
+        release,
+        &serde_json::Value::Null,
+    ))
+}
+
+/// The chart's `curie.fullname` (charts/curie/templates/_helpers.tpl) for
+/// `release` under `values`, the document Apply hands Helm (#4321). A nonempty
+/// `fullnameOverride` wins; otherwise the name is `nameOverride` or `curie`,
+/// and a release already containing it is used as is. Both branches then
+/// `trunc 63 | trimSuffix "-"`, which removes exactly one trailing dash.
+pub(crate) fn release_fullname_from_values(release: &str, values: &serde_json::Value) -> String {
     const CHART_NAME: &str = "curie";
 
-    let fullname = if release.contains(CHART_NAME) {
-        release.to_string()
-    } else {
-        format!("{release}-{CHART_NAME}")
+    let nonempty = |key: &str| {
+        values
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    let fullname = match nonempty("fullnameOverride") {
+        Some(over) => over.to_string(),
+        None => {
+            let name = nonempty("nameOverride").unwrap_or(CHART_NAME);
+            if release.contains(name) {
+                release.to_string()
+            } else {
+                format!("{release}-{name}")
+            }
+        }
     };
     // `trunc 63` first, then `trimSuffix "-"`, with sprig's exact semantics:
     // `trimSuffix` removes EXACTLY ONE trailing dash where
@@ -3505,8 +3529,10 @@ pub fn chart_fullname(release: &str) -> ReleaseFullname {
     // fullnameOverride=<61 a's>--<10 z's>` renders the api Service as
     // `<61 a's>--api`, so one dash survives for the component suffix to join to.
     let truncated: String = fullname.chars().take(63).collect();
-    let trimmed = truncated.strip_suffix('-').unwrap_or(truncated.as_str());
-    ReleaseFullname(trimmed.to_string())
+    truncated
+        .strip_suffix('-')
+        .unwrap_or(truncated.as_str())
+        .to_string()
 }
 
 /// The fullname a `--dry-run` plan prints, plus the caveat that goes with it.

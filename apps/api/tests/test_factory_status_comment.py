@@ -1186,9 +1186,7 @@ def test_owner_lost_shows_needs_human_status(admitted: Any) -> None:  # noqa: F8
 
     _lose_owner(client, current)
     requests = _issue_requests(number)
-    assert [(r["status"], r["terminal_cause"]) for r in requests] == [
-        ("failed", "owner_lost")
-    ] * 3
+    assert [(r["status"], r["terminal_cause"]) for r in requests] == [("failed", "owner_lost")] * 3
     (comment,) = _marked(sink, current)
     body = comment["body"]
     assert f"Could not complete: {EXHAUSTED}" in body
@@ -1595,6 +1593,105 @@ def test_a_comment_deleted_by_a_human_is_recreated_once(admitted: Any) -> None: 
 
 
 # --- 9: revision threads -------------------------------------------------------------------
+
+
+def test_first_request_status_comment_does_not_claim_to_continue_on_its_own_pr(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    request_id = _admit(client, github, sink, 9945)
+    _start_running(request_id)
+    _attach_publication(_request(9945)["work_item_id"], status="running", pr=78)
+
+    _reconcile()
+
+    (comment,) = _marked(sink, request_id)
+    assert "Continuing on the existing pull request:" not in comment["body"]
+    assert FINAL_MARKER not in comment["body"]
+    assert _rows(
+        "SELECT status FROM curie.execution_requests WHERE id = :id", {"id": request_id}
+    ) == [{"status": "running"}]
+
+
+@pytest.mark.parametrize("predecessor_status", ["completed", "cancelled"])
+def test_later_request_status_comments_continue_on_the_existing_pr_until_terminal(
+    admitted: Any,  # noqa: F811
+    predecessor_status: str,
+) -> None:
+    client, github, sink = admitted
+    sink.by_path = True
+    if predecessor_status == "completed":
+        number, pr, first = _published_issue(client, github, sink)
+    else:
+        number, pr = 9944, 77
+        previous_request_id = _admit(client, github, sink, number)
+        _start_running(previous_request_id)
+        first = _request(number)
+        _attach_publication(first["work_item_id"], status="succeeded", pr=pr)
+        _execute(
+            "UPDATE curie.execution_requests SET status = 'cancelled', "
+            "terminal_at = clock_timestamp(), terminal_cause = 'issue_cancelled', "
+            "termination_observation = 'fixture runtime termination observed' WHERE id = :id",
+            {"id": previous_request_id},
+        )
+        _reconcile()
+    continuation = f"Continuing on the existing pull request: https://github.com/{REPO}/pull/{pr}"
+    (previous_comment,) = _marked(sink, first["id"])
+    frozen_body = previous_comment["body"]
+    assert "Continuing on the existing pull request:" not in frozen_body
+    assert FINAL_MARKER in frozen_body
+    old_request = _rows(
+        "SELECT * FROM curie.execution_requests WHERE id = :id", {"id": first["id"]}
+    )
+    old_publication = _rows(
+        "SELECT * FROM curie.publications WHERE execution_request_id = :id",
+        {"id": first["id"]},
+    )
+    successor = _insert_revision(first["work_item_id"], number, "Continue the requested issue work")
+    _execute(
+        "INSERT INTO curie.factory_terminal_notices (execution_request_id, work_item_id) "
+        "VALUES (:request, :item)",
+        {"request": successor, "item": first["work_item_id"]},
+    )
+
+    _reconcile()
+
+    (queued_comment,) = _marked(sink, successor)
+    assert continuation in queued_comment["body"]
+    assert FINAL_MARKER not in queued_comment["body"]
+    comment_id = queued_comment["id"]
+    epoch = _start_running(successor)
+    assert report(client, successor, "implement").status_code == 201
+    _reconcile()
+
+    (running_comment,) = _marked(sink, successor)
+    assert running_comment["id"] == comment_id
+    assert "Status: RUNNING" in running_comment["body"]
+    assert continuation in running_comment["body"]
+    assert FINAL_MARKER not in running_comment["body"]
+    assert _rows(
+        "SELECT status FROM curie.execution_requests WHERE id = :id", {"id": successor}
+    ) == [{"status": "running"}]
+    _finish_failed(client, successor, epoch, "runner_escalated")
+    _reconcile()
+
+    (terminal_comment,) = _marked(sink, successor)
+    assert terminal_comment["id"] == comment_id
+    assert "Continuing on the existing pull request:" not in terminal_comment["body"]
+    assert FINAL_MARKER in terminal_comment["body"]
+    (previous_comment,) = _marked(sink, first["id"])
+    assert previous_comment["body"] == frozen_body
+    assert (
+        _rows("SELECT * FROM curie.execution_requests WHERE id = :id", {"id": first["id"]})
+        == old_request
+    )
+    assert (
+        _rows(
+            "SELECT * FROM curie.publications WHERE execution_request_id = :id",
+            {"id": first["id"]},
+        )
+        == old_publication
+    )
 
 
 def test_queued_review_revision_replies_that_it_waits_for_the_current_run(

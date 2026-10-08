@@ -19,9 +19,11 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use super::command::{mask_secret, plain, require_on_path, run_capture, CommonOpts, OpsCommand};
+use super::verbs::release_fullname_from_values;
 
 // These bound the DrainPreflight worker-reachability probe below, not the
 // real #2010 drain gate (that gate's own timeout is
@@ -227,6 +229,12 @@ struct UpgradeRecord {
     drain_completed: bool,
     convergence: Option<Convergence>,
     canary: Option<Canary>,
+    /// The runner each layered agent's SandboxTemplate must render, taken
+    /// from the layer plan when the record is created (#4321). A resume
+    /// re-plans from values Apply already changed, so a cleared agent would
+    /// drop out of a fresh plan; the Canary checks this recorded set instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runner_canary: Option<Vec<(String, ExpectedRunner)>>,
     fail_forward: Option<FailForward>,
     resumed: bool,
 }
@@ -410,7 +418,8 @@ pub struct FakeUpgradeHost {
     manifest_matches: bool,
     in_flight: Vec<String>,
     retained_values: bool,
-    runner_layer_clears: Vec<String>,
+    runner_layers: RunnerLayerPlan,
+    template_images: Option<ObservedTemplates>,
     apply_error: Option<String>,
     applied: bool,
     /// Agents whose claims Apply retired (#3422), in retirement order.
@@ -436,7 +445,8 @@ impl FakeUpgradeHost {
             manifest_matches: true,
             in_flight: Vec::new(),
             retained_values: false,
-            runner_layer_clears: Vec::new(),
+            runner_layers: RunnerLayerPlan::default(),
+            template_images: None,
             apply_error: None,
             applied: false,
             retired_claims: Vec::new(),
@@ -507,9 +517,34 @@ impl FakeUpgradeHost {
         self
     }
 
-    /// Agents whose layered runner the upgrade will stop matching (#3218).
+    /// Owner-built agents whose layered runner the upgrade will stop
+    /// matching, so it clears them (#3218).
     pub fn with_runner_layer_clears(mut self, agents: &[&str]) -> Self {
-        self.runner_layer_clears = agents.iter().map(|a| a.to_string()).collect();
+        self.runner_layers.clears = agents
+            .iter()
+            .map(|a| (a.to_string(), LayerClearReason::OwnerBuilt))
+            .collect();
+        self
+    }
+
+    /// What the upgrade does to each layered agent (#4321).
+    pub fn with_runner_layer_plan(mut self, plan: RunnerLayerPlan) -> Self {
+        self.runner_layers = plan;
+        self
+    }
+
+    /// The SandboxTemplate images the canary observes for release fullname
+    /// `curie`: the platform template, then each `(agent, image)` (#4321).
+    /// Unset, the canary compares no templates.
+    pub fn with_template_images(mut self, platform: &str, agents: &[(&str, &str)]) -> Self {
+        let mut items = vec![("curie-runner".to_string(), Some(platform.to_string()))];
+        items.extend(agents.iter().map(|(agent, image)| {
+            (
+                format!("curie-agent-{agent}-runner"),
+                Some(image.to_string()),
+            )
+        }));
+        self.template_images = Some(ObservedTemplates { items });
         self
     }
 
@@ -561,8 +596,8 @@ impl UpgradeDriver for FakeUpgradeHost {
     fn retained_values(&self) -> bool {
         self.retained_values
     }
-    fn runner_layer_clears(&self) -> Vec<String> {
-        self.runner_layer_clears.clone()
+    fn runner_layer_plan(&self) -> RunnerLayerPlan {
+        self.runner_layers.clone()
     }
     fn load_record(&self) -> Option<UpgradeRecord> {
         self.record.clone()
@@ -595,7 +630,7 @@ impl UpgradeDriver for FakeUpgradeHost {
     }
     fn retire_runner_layer_claims(&mut self) -> Result<()> {
         self.retired_claims
-            .extend(self.runner_layer_clears.iter().cloned());
+            .extend(self.runner_layers.retired_agents());
         Ok(())
     }
     fn observe_convergence(&self) -> Result<ConvergenceVerdict> {
@@ -610,9 +645,17 @@ impl UpgradeDriver for FakeUpgradeHost {
         }
         Ok(conv.into())
     }
-    fn run_canary(&self) -> Result<Canary> {
-        Ok(Canary {
-            passed: self.canary_ok,
+    fn run_canary(&self, expected: &[(String, ExpectedRunner)]) -> Result<CanaryVerdict> {
+        let issues = self
+            .template_images
+            .as_ref()
+            .map(|templates| template_canary_issues("curie", expected, templates))
+            .unwrap_or_default();
+        Ok(CanaryVerdict {
+            canary: Canary {
+                passed: self.canary_ok && issues.is_empty(),
+            },
+            issues,
         })
     }
     fn serving_previous(&self) -> bool {
@@ -664,7 +707,7 @@ fn plan_lines(
     secret: Option<&str>,
     schema_plan: Option<&str>,
     retained_values: bool,
-    runner_layer_clears: &[String],
+    runner_layers: &RunnerLayerPlan,
     helm_timeout_seconds: u64,
 ) -> Vec<String> {
     let apply = helm_upgrade_argv(
@@ -689,7 +732,7 @@ fn plan_lines(
         apply.join(" "),
     ];
     lines.extend(
-        runner_layer_retirements(&opts.common.namespace, runner_layer_clears)
+        runner_layer_retirements(&opts.common.namespace, &runner_layers.retired_agents())
             .iter()
             .map(OpsCommand::display),
     );
@@ -709,9 +752,10 @@ fn plan_lines(
             mask_secret(secret)
         ));
     }
-    if let Some(notice) = runner_layer_notice(runner_layer_clears) {
-        lines.push(notice);
+    if let Some(rebound) = runner_layer_rebind_line(runner_layers, &opts.to) {
+        lines.push(rebound);
     }
+    lines.extend(runner_layer_warnings(runner_layers, opts));
     if let Some((source_url, cache_path)) = opts.chart.pending_release() {
         lines.push(format!(
             "phase validate pending: chart metadata, schema compatibility, and Helm timeout after release chart download from {source_url} to {cache_path}"
@@ -748,14 +792,9 @@ pub(crate) fn target_runner_ref(
     crate::cluster_secrets::effective_runner_ref(&values, Some(to))
 }
 
-/// The pure part of [`Upgrade::compute_runner_layer_clears`] (#3218): once the
-/// current and target runner references are resolved (or known unknown), the
-/// layers an upgrade leaves stale is a function of just those two references
-/// and the layered agent list. Delegates to
-/// [`crate::cluster_secrets::layers_stopping_to_match`]; kept as a separate,
-/// directly testable seam here rather than inlined at the call site.
 /// One `kubectl delete sandboxclaim` per agent whose runner layer the upgrade
-/// clears (#3422), the same retirement `cluster deploy` runs (#3300).
+/// clears or rebinds (#3422, #4321), the same retirement `cluster deploy` runs
+/// (#3300).
 fn runner_layer_retirements(namespace: &str, agents: &[String]) -> Vec<OpsCommand> {
     agents
         .iter()
@@ -763,12 +802,392 @@ fn runner_layer_retirements(namespace: &str, agents: &[String]) -> Vec<OpsComman
         .collect()
 }
 
-fn layer_clears_from_refs(
-    layered: &[String],
+/// What an upgrade does to each `agentSandbox.runnerImages` binding (#3218,
+/// #4321), in agent name order. Rebinds and clears change in the same
+/// `helm upgrade`; kept bindings stay as they are.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunnerLayerPlan {
+    /// Stock agents rebound to the layer published for the target version.
+    pub rebinds: Vec<(String, String)>,
+    /// Agents whose binding is removed, so they run the platform runner.
+    pub clears: Vec<(String, LayerClearReason)>,
+    /// Bindings the upgrade leaves alone, because the runner does not change.
+    pub kept: Vec<(String, String)>,
+}
+
+impl RunnerLayerPlan {
+    /// Every agent whose binding changes, so whose live sandboxes are retired
+    /// after Apply, in name order.
+    pub fn retired_agents(&self) -> Vec<String> {
+        let mut agents: Vec<String> = self
+            .rebinds
+            .iter()
+            .map(|(agent, _)| agent.clone())
+            .chain(self.clears.iter().map(|(agent, _)| agent.clone()))
+            .collect();
+        agents.sort();
+        agents
+    }
+
+    /// The cleared agents whose layer their owner built.
+    pub fn owner_built_clears(&self) -> Vec<String> {
+        self.clears
+            .iter()
+            .filter(|(_, reason)| *reason == LayerClearReason::OwnerBuilt)
+            .map(|(agent, _)| agent.clone())
+            .collect()
+    }
+
+    /// The runner each layered agent's SandboxTemplate must render after the
+    /// upgrade, in name order.
+    pub fn canary_expectations(&self) -> Vec<(String, ExpectedRunner)> {
+        let mut expected: Vec<(String, ExpectedRunner)> = self
+            .rebinds
+            .iter()
+            .chain(self.kept.iter())
+            .map(|(agent, image)| (agent.clone(), ExpectedRunner::Image(image.clone())))
+            .chain(
+                self.clears
+                    .iter()
+                    .map(|(agent, _)| (agent.clone(), ExpectedRunner::PlatformRunner)),
+            )
+            .collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        expected
+    }
+
+    /// Whether the upgrade changes no binding.
+    pub fn is_empty(&self) -> bool {
+        self.rebinds.is_empty() && self.clears.is_empty()
+    }
+}
+
+/// Why an upgrade clears an agent's runner layer instead of rebinding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LayerClearReason {
+    /// The agent's owner built the layer, so only the owner can rebuild it.
+    OwnerBuilt,
+    /// No dark factory layer is published for the target version.
+    StockLayerUnpublished,
+    /// The layer published for the target version is built on another runner.
+    StockBaseMismatch {
+        published_base: String,
+        target: String,
+    },
+    /// The registry could not answer which layer is published.
+    StockRegistryUnreachable(String),
+    /// The target runner digest is unknown, so no published base can match it.
+    TargetRunnerUnknown,
+}
+
+/// The runner a layered agent's SandboxTemplate must render after the upgrade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExpectedRunner {
+    /// Exactly this digest-pinned layer.
+    Image(String),
+    /// The platform runner: no per-agent template, or one on the platform image.
+    PlatformRunner,
+}
+
+/// The registry's answer for the dark factory layer published for `--to`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StockRunnerLookup {
+    /// No affected binding is stock, so the registry was not asked.
+    NotNeeded,
+    Published(crate::examples::PublishedStockRunner),
+    Unpublished,
+    Unreachable(String),
+}
+
+/// Whether `binding` names the dark factory layer this project publishes:
+/// the repository before `@` is exactly the published one. A lookalike
+/// repository, another registry, or a tag-only binding is owner-built.
+pub(crate) fn is_stock_layer(binding: &str) -> bool {
+    binding.split_once('@').is_some_and(|(repository, _)| {
+        repository == crate::examples::DARK_FACTORY_RUNNER_REPOSITORY
+    })
+}
+
+/// The bindings the upgrade changes, given the current and target runners.
+fn affected_bindings<'a>(
+    bindings: &'a BTreeMap<String, String>,
     current: Option<&str>,
     target: Option<&str>,
+) -> Vec<&'a String> {
+    let layered: Vec<String> = bindings.keys().cloned().collect();
+    let affected = crate::cluster_secrets::layers_stopping_to_match(&layered, current, target);
+    bindings
+        .keys()
+        .filter(|agent| affected.contains(agent))
+        .collect()
+}
+
+/// Whether planning needs the registry: a target runner is known and some
+/// binding the upgrade changes is stock.
+pub(crate) fn needs_stock_lookup(
+    bindings: &BTreeMap<String, String>,
+    current: Option<&str>,
+    target: Option<&str>,
+) -> bool {
+    target.is_some()
+        && affected_bindings(bindings, current, target)
+            .into_iter()
+            .any(|agent| is_stock_layer(&bindings[agent]))
+}
+
+/// The pure part of [`LiveHost::compute_runner_layers`] (#3218, #4321). The
+/// affected set is [`crate::cluster_secrets::layers_stopping_to_match`]: the
+/// deploy guard holds every bound layer on the current runner, so all of them
+/// stop matching when the runner changes, and an unknown side counts as a
+/// change. An affected stock binding is rebound only to the registry's answer
+/// for `--to`, never to its own digest, and only when that layer's base is the
+/// target runner (ADR 0173 decision 5). Every other affected binding clears.
+pub(crate) fn plan_runner_layers(
+    bindings: &BTreeMap<String, String>,
+    current: Option<&str>,
+    target: Option<&str>,
+    stock: &StockRunnerLookup,
+) -> RunnerLayerPlan {
+    let affected = affected_bindings(bindings, current, target);
+    let mut plan = RunnerLayerPlan::default();
+    for (agent, binding) in bindings {
+        if !affected.contains(&agent) {
+            plan.kept.push((agent.clone(), binding.clone()));
+            continue;
+        }
+        if !is_stock_layer(binding) {
+            plan.clears
+                .push((agent.clone(), LayerClearReason::OwnerBuilt));
+            continue;
+        }
+        let Some(target) = target else {
+            plan.clears
+                .push((agent.clone(), LayerClearReason::TargetRunnerUnknown));
+            continue;
+        };
+        let reason = match stock {
+            StockRunnerLookup::Published(published)
+                if crate::cluster_secrets::same_runner(&published.base_image, target) =>
+            {
+                plan.rebinds
+                    .push((agent.clone(), published.layer_image.clone()));
+                continue;
+            }
+            StockRunnerLookup::Published(published) => LayerClearReason::StockBaseMismatch {
+                published_base: published.base_image.clone(),
+                target: target.to_string(),
+            },
+            StockRunnerLookup::Unpublished => LayerClearReason::StockLayerUnpublished,
+            StockRunnerLookup::Unreachable(detail) => {
+                LayerClearReason::StockRegistryUnreachable(detail.clone())
+            }
+            StockRunnerLookup::NotNeeded => LayerClearReason::StockRegistryUnreachable(
+                "the published layer was not looked up".into(),
+            ),
+        };
+        plan.clears.push((agent.clone(), reason));
+    }
+    plan
+}
+
+/// The plan line naming every agent rebound to the dark factory layer
+/// published for `to` (#4321). `None` when there are none.
+pub(crate) fn runner_layer_rebind_line(plan: &RunnerLayerPlan, to: &str) -> Option<String> {
+    if plan.rebinds.is_empty() {
+        return None;
+    }
+    let pairs: Vec<String> = plan
+        .rebinds
+        .iter()
+        .map(|(agent, image)| format!("{agent}={image}"))
+        .collect();
+    Some(format!(
+        "runner layers rebound: the platform runner changes, so this upgrade binds {} to the \
+         dark factory runner layer published for {to}, built on the target runner. Their live \
+         sandboxes are retired after the helm upgrade",
+        pairs.join(", ")
+    ))
+}
+
+/// The operator-facing line naming every stock agent the upgrade clears, why,
+/// and the stock remedy (#4321). Owner-built clears stay in
+/// [`runner_layer_notice`]. `None` when there are none.
+pub(crate) fn stock_runner_layer_notice(
+    plan: &RunnerLayerPlan,
+    namespace: &str,
+    release: &str,
+    to: &str,
+) -> Option<String> {
+    let stock: Vec<String> = plan
+        .clears
+        .iter()
+        .filter_map(|(agent, reason)| {
+            let why = match reason {
+                LayerClearReason::OwnerBuilt => return None,
+                LayerClearReason::StockLayerUnpublished => {
+                    format!("the dark factory runner layer for {to} is not published")
+                }
+                LayerClearReason::StockBaseMismatch {
+                    published_base,
+                    target,
+                } => format!(
+                    "the layer published for {to} is built on {published_base}, not the target \
+                     runner {target}"
+                ),
+                LayerClearReason::StockRegistryUnreachable(detail) => {
+                    format!(
+                        "the registry could not say which layer is published for {to}: {detail}"
+                    )
+                }
+                LayerClearReason::TargetRunnerUnknown => {
+                    "the target runner is unknown, so no published layer can be proven to match it"
+                        .to_string()
+                }
+            };
+            Some(format!(
+                "{agent} ({why}; rebind with `curie cluster factory --namespace {namespace} \
+                 --release {release} --runner-image \
+                 {agent}={}@sha256:<digest>` using the digest of the layer published for {to}, \
+                 or run `curie example dark-factory render --out <dir>` from a curie {to} CLI and \
+                 then `curie cluster deploy --namespace {namespace} --release {release} \
+                 --plugin-dir <dir> --agent {agent}`)",
+                crate::examples::DARK_FACTORY_RUNNER_REPOSITORY
+            ))
+        })
+        .collect();
+    if stock.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "stock runner layers: the platform runner changes and the dark factory runner layer of \
+         these agent(s) cannot be rebound for {to}, so this upgrade clears \
+         agentSandbox.runnerImages for them and they run the platform runner WITHOUT their \
+         layer until rebound: {}. Their live sandboxes are retired after the helm upgrade",
+        stock.join("; ")
+    ))
+}
+
+/// The owner-built notice, then the stock notice, for every cleared agent.
+fn runner_layer_warnings(plan: &RunnerLayerPlan, opts: &UpgradeOpts) -> Vec<String> {
+    runner_layer_notice(&plan.owner_built_clears())
+        .into_iter()
+        .chain(stock_runner_layer_notice(
+            plan,
+            &opts.common.namespace,
+            &opts.common.release,
+            &opts.to,
+        ))
+        .collect()
+}
+
+/// The SandboxTemplates of one release as `(name, first container image)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedTemplates {
+    items: Vec<(String, Option<String>)>,
+}
+
+/// Read `kubectl get sandboxtemplates -o json` into [`ObservedTemplates`].
+pub(crate) fn parse_sandbox_templates(raw: &str) -> Result<ObservedTemplates> {
+    let list: serde_json::Value =
+        serde_json::from_str(raw).context("SandboxTemplate list is not JSON")?;
+    let items = list
+        .get("items")
+        .and_then(|items| items.as_array())
+        .context("SandboxTemplate list has no items")?;
+    Ok(ObservedTemplates {
+        items: items
+            .iter()
+            .filter_map(|item| {
+                let name = item.pointer("/metadata/name")?.as_str()?.to_string();
+                let image = item
+                    .pointer("/spec/podTemplate/spec/containers/0/image")
+                    .and_then(|image| image.as_str())
+                    .map(str::to_string);
+                Some((name, image))
+            })
+            .collect(),
+    })
+}
+
+/// The effective `fullnameOverride` and `nameOverride`, as Helm merges values:
+/// a key present in the overlay (even `""` or null) wins over the chart default.
+pub(crate) fn effective_name_values(
+    chart_defaults: Option<&serde_json::Value>,
+    overlay: &serde_json::Value,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for key in ["fullnameOverride", "nameOverride"] {
+        if let Some(value) = overlay
+            .get(key)
+            .or_else(|| chart_defaults.and_then(|defaults| defaults.get(key)))
+        {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Compare each planned runner with the rendered SandboxTemplates (#4321).
+/// Names come from the release's `fullname`, never from the templates that
+/// happen to exist: the platform template is exactly `<fullname>-runner` and
+/// an agent's is exactly `<fullname>-agent-<agent>-runner`, so `bot` never
+/// matches `agent-bot`. A rebound or kept agent needs its template on the
+/// planned image. A cleared agent may have no template, but one it has must
+/// render the platform image.
+pub(crate) fn template_canary_issues(
+    fullname: &str,
+    expected: &[(String, ExpectedRunner)],
+    observed: &ObservedTemplates,
 ) -> Vec<String> {
-    crate::cluster_secrets::layers_stopping_to_match(layered, current, target)
+    let platform_name = format!("{fullname}-runner");
+    let platform = observed
+        .items
+        .iter()
+        .find(|(name, _)| *name == platform_name);
+    let shown = |image: Option<&String>| {
+        image
+            .cloned()
+            .unwrap_or_else(|| "no runner image".to_string())
+    };
+    let mut issues = Vec::new();
+    for (agent, runner) in expected {
+        if platform.is_none() {
+            issues.push(format!(
+                "agent {agent}: the platform SandboxTemplate {platform_name} is missing, so the \
+                 upgrade cannot confirm its runner"
+            ));
+            continue;
+        }
+        let name = format!("{fullname}-agent-{agent}-runner");
+        let found = observed.items.iter().find(|(item, _)| *item == name);
+        match (runner, found) {
+            (ExpectedRunner::Image(image), None) => issues.push(format!(
+                "agent {agent}: SandboxTemplate {name} is missing, but the upgrade planned {image}"
+            )),
+            (ExpectedRunner::Image(image), Some((_, rendered))) => {
+                if rendered.as_deref() != Some(image.as_str()) {
+                    issues.push(format!(
+                        "agent {agent}: SandboxTemplate {name} renders {}, but the upgrade \
+                         planned {image}",
+                        shown(rendered.as_ref())
+                    ));
+                }
+            }
+            (ExpectedRunner::PlatformRunner, None) => {}
+            (ExpectedRunner::PlatformRunner, Some((_, rendered))) => {
+                let platform_image = platform.and_then(|(_, image)| image.as_ref());
+                if rendered.is_none() || rendered.as_ref() != platform_image {
+                    issues.push(format!(
+                        "agent {agent}: SandboxTemplate {name} renders {}, but the upgrade \
+                         planned the platform runner {}",
+                        shown(rendered.as_ref()),
+                        shown(platform_image)
+                    ));
+                }
+            }
+        }
+    }
+    issues
 }
 
 /// The operator-facing line naming every agent whose layered runner stops
@@ -875,15 +1294,15 @@ trait UpgradeDriver {
     fn retained_values(&self) -> bool {
         false
     }
-    /// The agents whose layered runner will stop matching the installation's
-    /// runner after this upgrade (#3218). Apply clears each one's
-    /// `agentSandbox.runnerImages.<agent>` in the same `helm upgrade`.
-    fn runner_layer_clears(&self) -> Vec<String> {
-        Vec::new()
+    /// What this upgrade does to each layered agent (#3218, #4321). Apply
+    /// rebinds or clears each changed `agentSandbox.runnerImages.<agent>` in
+    /// the same `helm upgrade`.
+    fn runner_layer_plan(&self) -> RunnerLayerPlan {
+        RunnerLayerPlan::default()
     }
-    /// Retire the SandboxClaims of every agent in [`Self::runner_layer_clears`]
-    /// after Apply (#3422), so a live thread's next turn cold-starts on the
-    /// platform runner instead of keeping the old layer and old base.
+    /// Retire the SandboxClaims of every agent [`Self::runner_layer_plan`]
+    /// rebinds or clears after Apply (#3422, #4321), so a live thread's next
+    /// turn cold-starts on its new runner instead of keeping the old layer.
     fn retire_runner_layer_claims(&mut self) -> Result<()> {
         Ok(())
     }
@@ -920,7 +1339,9 @@ trait UpgradeDriver {
     fn drain_preflight_once(&mut self) -> Result<bool>;
     fn apply_target(&mut self, to: &str) -> Result<()>;
     fn observe_convergence(&self) -> Result<ConvergenceVerdict>;
-    fn run_canary(&self) -> Result<Canary>;
+    /// The Canary, checking each layered agent's template against `expected`
+    /// (the record's stored expectations, or the host plan's when it has none).
+    fn run_canary(&self, expected: &[(String, ExpectedRunner)]) -> Result<CanaryVerdict>;
     fn serving_previous(&self) -> bool;
     fn interrupt_after(&self) -> Option<UpgradePhase> {
         None
@@ -957,7 +1378,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         host.secret(),
         host.schema_plan().as_deref(),
         host.retained_values(),
-        &host.runner_layer_clears(),
+        &host.runner_layer_plan(),
         host.helm_timeout_seconds(),
     );
     if same_version {
@@ -1010,6 +1431,11 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         {
             let mut existing = existing;
             existing.resumed = true;
+            // Before Apply the plan may have been recomputed (a rerun can see a new
+            // chart or registry), so the recorded expectations would be stale.
+            if !existing.completed.contains(&UpgradePhase::Apply) {
+                existing.runner_canary = Some(host.runner_layer_plan().canary_expectations());
+            }
             existing
         }
         Some(existing)
@@ -1032,6 +1458,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             drain_completed: false,
             convergence: None,
             canary: None,
+            runner_canary: Some(host.runner_layer_plan().canary_expectations()),
             fail_forward: None,
             resumed: false,
         },
@@ -1112,6 +1539,22 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         None,
         host.compatibility_decision(),
     ))
+}
+
+/// The terminal failure for a phase whose observer reported `issues`: their
+/// redacted, truncated text becomes the reason.
+fn issues_fail_forward<H: UpgradeDriver>(
+    opts: &UpgradeOpts,
+    host: &H,
+    phase: &str,
+    issues: &[String],
+) -> FailForward {
+    let detail = truncate_reason(&host.redact(&issues.join("; ")));
+    fail_forward_for(
+        opts,
+        host.serving_previous(),
+        &format!("upgrade failed during {phase}: {detail}"),
+    )
 }
 
 enum PhaseOutcome {
@@ -1197,22 +1640,26 @@ fn execute_phase<H: UpgradeDriver>(
                 // cluster's recovery hint) instead of letting the generic
                 // "upgrade failed during converge" replace it.
                 if !verdict.issues.is_empty() {
-                    let detail = host.redact(&verdict.issues.join("; "));
-                    let detail = truncate_reason(&detail);
-                    record.fail_forward = Some(fail_forward_for(
-                        opts,
-                        host.serving_previous(),
-                        &format!("upgrade failed during converge: {detail}"),
-                    ));
+                    record.fail_forward =
+                        Some(issues_fail_forward(opts, host, "converge", &verdict.issues));
                 }
                 return Ok(PhaseOutcome::Failed);
             }
             Ok(PhaseOutcome::Continue)
         }
         UpgradePhase::Canary => {
-            let canary = host.run_canary()?;
-            record.canary = Some(canary.clone());
-            if !canary.passed {
+            let expected = record
+                .runner_canary
+                .clone()
+                .unwrap_or_else(|| host.runner_layer_plan().canary_expectations());
+            let verdict = host.run_canary(&expected)?;
+            record.canary = Some(verdict.canary.clone());
+            if !verdict.canary.passed {
+                // Name what the canary saw, as Converge does.
+                if !verdict.issues.is_empty() {
+                    record.fail_forward =
+                        Some(issues_fail_forward(opts, host, "canary", &verdict.issues));
+                }
                 return Ok(PhaseOutcome::Failed);
             }
             Ok(PhaseOutcome::Continue)
@@ -1264,6 +1711,14 @@ impl From<Convergence> for ConvergenceVerdict {
             issues: Vec::new(),
         }
     }
+}
+
+/// A Canary verdict: the reported `{passed}` plus the issue text the Canary
+/// phase puts in `fail_forward.reason` (#4321). The text is not part of the
+/// `--json` canary payload.
+pub struct CanaryVerdict {
+    pub canary: Canary,
+    pub issues: Vec<String>,
 }
 
 /// Map one convergence observation onto the reported sub-flags. Every field
@@ -1389,8 +1844,12 @@ struct LiveHost {
     schema_decision: Option<serde_json::Value>,
     /// Why the target schema was refused, if it was.
     schema_refusal: Option<String>,
-    /// Layered agents whose runner stops matching the target runner (#3218).
-    runner_layer_clears: Vec<String>,
+    /// What the upgrade does to each layered agent (#3218, #4321).
+    runner_layers: RunnerLayerPlan,
+    /// The target chart's own `fullnameOverride` and `nameOverride` defaults,
+    /// read once with the runner defaults; the canary names templates from
+    /// them under the retained overlay (#4321).
+    chart_name_defaults: Option<serde_json::Value>,
     /// The target chart's rendered drain budget, computed with the exact
     /// retained overlay that Apply will hand to Helm.
     helm_timeout_seconds: u64,
@@ -1588,7 +2047,8 @@ impl LiveHost {
             schema_plan: None,
             schema_decision: None,
             schema_refusal: None,
-            runner_layer_clears: Vec::new(),
+            runner_layers: RunnerLayerPlan::default(),
+            chart_name_defaults: None,
             helm_timeout_seconds: HELM_TIMEOUT_DEFAULT_SECS,
             timeout_refusal: None,
             holder: uuid::Uuid::new_v4().to_string(),
@@ -2018,10 +2478,10 @@ impl LiveHost {
                 }
             }
         }
-        self.compute_runner_layer_clears();
+        self.compute_runner_layers();
     }
 
-    /// Which layered agents the upgrade leaves on a stale base (#3218).
+    /// What the upgrade does to each layered agent (#3218, #4321).
     ///
     /// The deploy guard guarantees every bound layer was built on the current
     /// installation's runner, so they all stop matching exactly when the
@@ -2029,7 +2489,9 @@ impl LiveHost {
     /// layered agent costs no extra read. Either runner being unknown counts
     /// as a change: keeping an old layer under a new worker is the failure this
     /// exists to prevent, and running the platform runner is always servable.
-    fn compute_runner_layer_clears(&mut self) {
+    /// A stock dark factory binding asks the registry for the layer published
+    /// for `--to` and is rebound to it when its base is the target runner.
+    fn compute_runner_layers(&mut self) {
         let Some(overlay) = self
             .overlay
             .as_deref()
@@ -2037,8 +2499,26 @@ impl LiveHost {
         else {
             return;
         };
-        let layered = crate::cluster_secrets::layered_agents(&overlay);
-        if layered.is_empty() {
+        let bindings = crate::cluster_secrets::layered_bindings(&overlay);
+        if bindings.is_empty() {
+            return;
+        }
+        let chart_default = self.target_chart_values();
+        if let Some(defaults) = &chart_default {
+            self.chart_name_defaults = Some(effective_name_values(
+                Some(defaults),
+                &serde_json::Value::Null,
+            ));
+        }
+        // A same-version known-good rerun skips Apply, so no binding can
+        // change: every one is kept and Canary checks the retained ones. A
+        // transient runner or registry failure must not plan a clear here.
+        let to = Some(self.opts.to.as_str());
+        if self.current.as_deref() == to && self.known_good.as_deref() == to {
+            self.runner_layers = RunnerLayerPlan {
+                kept: bindings.into_iter().collect(),
+                ..RunnerLayerPlan::default()
+            };
             return;
         }
         let current = tokio::task::block_in_place(|| {
@@ -2047,7 +2527,6 @@ impl LiveHost {
         })
         .ok()
         .map(|(_, pinned)| pinned);
-        let chart_default = self.target_chart_runner_values();
         let target = target_runner_ref(chart_default.as_ref(), &overlay, &self.opts.to).and_then(
             |reference| {
                 tokio::task::block_in_place(|| {
@@ -2057,9 +2536,22 @@ impl LiveHost {
                 .ok()
             },
         );
-        self.runner_layer_clears =
-            layer_clears_from_refs(&layered, current.as_deref(), target.as_deref());
-        if self.runner_layer_clears.is_empty() {
+        let stock = if needs_stock_lookup(&bindings, current.as_deref(), target.as_deref()) {
+            let published = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(crate::examples::published_stock_runner(&self.opts.to))
+            });
+            match published {
+                Ok(Some(published)) => StockRunnerLookup::Published(published),
+                Ok(None) => StockRunnerLookup::Unpublished,
+                Err(error) => StockRunnerLookup::Unreachable(format!("{error:#}")),
+            }
+        } else {
+            StockRunnerLookup::NotNeeded
+        };
+        self.runner_layers =
+            plan_runner_layers(&bindings, current.as_deref(), target.as_deref(), &stock);
+        if self.runner_layers.is_empty() {
             return;
         }
         let Some(raw) = self.overlay.as_deref() else {
@@ -2078,7 +2570,17 @@ impl LiveHost {
                 return;
             }
         };
-        crate::cluster_secrets::omit_runner_image_bindings(&mut values, &self.runner_layer_clears);
+        let cleared: Vec<String> = self
+            .runner_layers
+            .clears
+            .iter()
+            .map(|(agent, _)| agent.clone())
+            .collect();
+        crate::cluster_secrets::omit_runner_image_bindings(&mut values, &cleared);
+        crate::cluster_secrets::rebind_runner_image_bindings(
+            &mut values,
+            &self.runner_layers.rebinds,
+        );
         match helm_values_document(&values) {
             Ok(next) => self.overlay = Some(next),
             Err(error) => {
@@ -2089,9 +2591,9 @@ impl LiveHost {
         }
     }
 
-    /// The target chart's own `agentSandbox.runner` defaults, when the chart
-    /// is available to read. A pending release asset is not.
-    fn target_chart_runner_values(&self) -> Option<serde_json::Value> {
+    /// The target chart's own default values document, when the chart is
+    /// available to read. A pending release asset is not.
+    fn target_chart_values(&self) -> Option<serde_json::Value> {
         if self.opts.chart.pending_release().is_some() {
             return None;
         }
@@ -2577,15 +3079,72 @@ impl LiveHost {
         })
     }
 
-    fn live_canary(&self) -> Result<Canary> {
+    fn live_canary(&self, expected: &[(String, ExpectedRunner)]) -> Result<CanaryVerdict> {
         // R4: re-read here. Apply already set `current` from its own
         // post-condition read, so comparing against `current` would be a
         // self-comparison, and the release can move between the two phases.
         // Convergence is not re-observed: the Converge phase has already
         // failed the run unless it was exact.
-        Ok(Canary {
-            passed: self.inspect_version().as_deref() == Some(self.opts.to.as_str()),
+        let version_ok = self.inspect_version().as_deref() == Some(self.opts.to.as_str());
+        let issues = if expected.is_empty() {
+            Vec::new()
+        } else {
+            // #4321: every layered agent's rendered template must carry the
+            // runner the upgrade planned. An unreadable list fails closed.
+            match self.read_sandbox_templates() {
+                Ok(observed) => {
+                    template_canary_issues(&self.release_fullname(), expected, &observed)
+                }
+                Err(error) => vec![format!(
+                    "could not read the release's SandboxTemplates to confirm the planned runner \
+                     layers: {error:#}"
+                )],
+            }
+        };
+        Ok(CanaryVerdict {
+            canary: Canary {
+                passed: version_ok && issues.is_empty(),
+            },
+            issues,
         })
+    }
+
+    /// The release's `curie.fullname` under the retained overlay Apply hands
+    /// Helm (#4321). No overlay, or one that does not parse, renders with the
+    /// chart defaults, as Helm would.
+    fn release_fullname(&self) -> String {
+        let overlay = self
+            .overlay
+            .as_deref()
+            .and_then(|raw| serde_norway::from_str::<serde_json::Value>(raw).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let values = effective_name_values(self.chart_name_defaults.as_ref(), &overlay);
+        release_fullname_from_values(&self.opts.common.release, &values)
+    }
+
+    /// The release's SandboxTemplates, read once for the canary (#4321).
+    fn read_sandbox_templates(&self) -> Result<ObservedTemplates> {
+        let cmd = OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("get"),
+                plain(crate::connectors::SANDBOX_TEMPLATE_KIND),
+                plain("-l"),
+                plain(format!(
+                    "app.kubernetes.io/instance={}",
+                    self.opts.common.release
+                )),
+                plain("-o"),
+                plain("json"),
+            ],
+        );
+        let (ok, out, err) = self.run(&cmd)?;
+        if !ok {
+            bail!("`{}` failed: {}", cmd.display(), err.trim());
+        }
+        parse_sandbox_templates(&out)
     }
 
     /// The DrainPreflight worker-reachability check. The real #2010 drain
@@ -2679,8 +3238,8 @@ impl UpgradeDriver for LiveHost {
     fn retained_values(&self) -> bool {
         self.overlay.is_some()
     }
-    fn runner_layer_clears(&self) -> Vec<String> {
-        self.runner_layer_clears.clone()
+    fn runner_layer_plan(&self) -> RunnerLayerPlan {
+        self.runner_layers.clone()
     }
 
     fn helm_timeout_seconds(&self) -> u64 {
@@ -2732,12 +3291,14 @@ impl UpgradeDriver for LiveHost {
         }
     }
     fn retire_runner_layer_claims(&mut self) -> Result<()> {
-        for cmd in runner_layer_retirements(&self.opts.common.namespace, &self.runner_layer_clears)
-        {
+        for cmd in runner_layer_retirements(
+            &self.opts.common.namespace,
+            &self.runner_layers.retired_agents(),
+        ) {
             let (ok, _, err) = self.run(&cmd)?;
             if !ok {
                 bail!(
-                    "helm upgrade cleared the runner layer, but retiring its sandboxes failed \
+                    "helm upgrade changed the runner layer, but retiring its sandboxes failed \
                      ({}): {}; run `{}` so live threads leave the old layer",
                     cmd.display(),
                     err.trim(),
@@ -2750,8 +3311,8 @@ impl UpgradeDriver for LiveHost {
     fn observe_convergence(&self) -> Result<ConvergenceVerdict> {
         self.live_convergence()
     }
-    fn run_canary(&self) -> Result<Canary> {
-        self.live_canary()
+    fn run_canary(&self, expected: &[(String, ExpectedRunner)]) -> Result<CanaryVerdict> {
+        self.live_canary(expected)
     }
     fn serving_previous(&self) -> bool {
         match (&self.current, &self.known_good) {
@@ -2812,7 +3373,7 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
                 .and_then(|record| record.known_good_version.clone())
                 .or_else(|| live.current.clone());
             live.compute_pre_mutation();
-            if let Some(notice) = runner_layer_notice(&live.runner_layer_clears) {
+            for notice in runner_layer_warnings(&live.runner_layers, &opts) {
                 crate::ui::ui().warn(&notice);
             }
             run_lifecycle_inner(opts, &mut live).await
@@ -3098,6 +3659,7 @@ mod drain_preflight_naming_tests {
 #[cfg(test)]
 mod runner_layer_guard_tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn runner_values(fields: serde_json::Value) -> serde_json::Value {
         serde_json::json!({"agentSandbox": {"runner": fields}})
@@ -3159,35 +3721,825 @@ mod runner_layer_guard_tests {
         assert_eq!(target_runner_ref(None, &overlay, "0.9.0"), None);
     }
 
+    const STOCK_OLD: &str = "ghcr.io/curie-eng/curie-dark-factory-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const STOCK_NEW: &str = "ghcr.io/curie-eng/curie-dark-factory-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const RUNNER_OLD: &str = "ghcr.io/curie-eng/curie-runner@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const RUNNER_NEW: &str = "ghcr.io/curie-eng/curie-runner@sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const RUNNER_OTHER: &str = "ghcr.io/curie-eng/curie-runner@sha256:3333333333333333333333333333333333333333333333333333333333333333";
+    const OWNER_LAYER: &str = "ghcr.io/acme/acme-bot-runner@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn bindings(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(agent, image)| (agent.to_string(), image.to_string()))
+            .collect()
+    }
+
+    fn published(base: &str) -> StockRunnerLookup {
+        StockRunnerLookup::Published(crate::examples::PublishedStockRunner {
+            layer_image: STOCK_NEW.to_string(),
+            base_image: base.to_string(),
+        })
+    }
+
+    fn agents(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    fn owner_clears(names: &[&str]) -> Vec<(String, LayerClearReason)> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), LayerClearReason::OwnerBuilt))
+            .collect()
+    }
+
+    /// The `kubectl get sandboxtemplates -o json` list for `(name, image)`.
+    fn templates(items: &[(&str, &str)]) -> String {
+        let items: Vec<serde_json::Value> = items
+            .iter()
+            .map(|(name, image)| {
+                serde_json::json!({
+                    "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+                    "kind": "SandboxTemplate",
+                    "metadata": {"name": name, "labels": {"app.kubernetes.io/instance": "rel"}},
+                    "spec": {"podTemplate": {"spec": {"containers": [
+                        {"name": "runner", "image": image}
+                    ]}}},
+                })
+            })
+            .collect();
+        serde_json::json!({"apiVersion": "v1", "kind": "List", "items": items}).to_string()
+    }
+
+    fn issues(expected: &[(String, ExpectedRunner)], items: &[(&str, &str)]) -> Vec<String> {
+        issues_for("rel-curie", expected, items)
+    }
+
+    /// [`issues`] for a release whose `curie.fullname` is `fullname`.
+    fn issues_for(
+        fullname: &str,
+        expected: &[(String, ExpectedRunner)],
+        items: &[(&str, &str)],
+    ) -> Vec<String> {
+        let observed = parse_sandbox_templates(&templates(items)).expect("template list parses");
+        template_canary_issues(fullname, expected, &observed)
+    }
+
+    // Migrated from the `layer_clears_from_refs` seam (#3218): the affected
+    // set is still `layers_stopping_to_match`, now carried by the planner.
     #[test]
-    fn layer_clears_from_refs_same_digest_clears_nothing() {
-        let layered = vec!["agent-a".to_string(), "agent-b".to_string()];
+    fn plan_same_runner_digest_clears_nothing() {
+        let layered = bindings(&[("agent-a", OWNER_LAYER), ("agent-b", OWNER_LAYER)]);
         let reference = "ghcr.io/curie-eng/curie-runner@sha256:aaaa";
-        assert!(layer_clears_from_refs(&layered, Some(reference), Some(reference)).is_empty());
+        let plan = plan_runner_layers(
+            &layered,
+            Some(reference),
+            Some(reference),
+            &StockRunnerLookup::NotNeeded,
+        );
+        assert!(
+            plan.rebinds.is_empty() && plan.clears.is_empty(),
+            "{plan:?}"
+        );
+        assert!(plan.retired_agents().is_empty());
     }
 
     #[test]
-    fn layer_clears_from_refs_differing_digest_clears_all_layered_agents() {
-        let layered = vec!["agent-a".to_string(), "agent-b".to_string()];
+    fn plan_differing_runner_digest_clears_every_owner_built_layer() {
+        let layered = bindings(&[("agent-a", OWNER_LAYER), ("agent-b", OWNER_LAYER)]);
         let current = "ghcr.io/curie-eng/curie-runner@sha256:aaaa";
         let target = "ghcr.io/curie-eng/curie-runner@sha256:bbbb";
+        let plan = plan_runner_layers(
+            &layered,
+            Some(current),
+            Some(target),
+            &StockRunnerLookup::NotNeeded,
+        );
+        assert_eq!(plan.clears, owner_clears(&["agent-a", "agent-b"]));
+        assert_eq!(plan.retired_agents(), agents(&["agent-a", "agent-b"]));
+    }
+
+    #[test]
+    fn plan_clears_every_layer_when_either_runner_is_unknown() {
+        let layered = bindings(&[("agent-a", OWNER_LAYER)]);
+        let reference = "ghcr.io/curie-eng/curie-runner@sha256:aaaa";
+        for (current, target) in [(None, Some(reference)), (Some(reference), None)] {
+            let plan = plan_runner_layers(&layered, current, target, &StockRunnerLookup::NotNeeded);
+            assert_eq!(
+                plan.clears,
+                owner_clears(&["agent-a"]),
+                "{current:?} {target:?}"
+            );
+            assert!(plan.rebinds.is_empty() && plan.kept.is_empty(), "{plan:?}");
+        }
+    }
+
+    /// #4321 AC1: a stock binding is rebound to the layer our registry
+    /// publishes for `--to`, never to the binding's own digest. Two stock
+    /// agents share the one answer.
+    #[test]
+    fn plan_rebinds_a_stock_layer_on_the_target_base() {
+        let layered = bindings(&[("dark-factory", STOCK_OLD), ("night-factory", STOCK_OLD)]);
+        let plan = plan_runner_layers(
+            &layered,
+            Some(RUNNER_OLD),
+            Some(RUNNER_NEW),
+            &published(RUNNER_NEW),
+        );
         assert_eq!(
-            layer_clears_from_refs(&layered, Some(current), Some(target)),
-            layered
+            plan,
+            RunnerLayerPlan {
+                rebinds: vec![
+                    ("dark-factory".into(), STOCK_NEW.into()),
+                    ("night-factory".into(), STOCK_NEW.into()),
+                ],
+                clears: Vec::new(),
+                kept: Vec::new(),
+            }
+        );
+        assert!(!plan.is_empty());
+        assert_eq!(
+            plan.retired_agents(),
+            agents(&["dark-factory", "night-factory"])
+        );
+        assert!(plan.owner_built_clears().is_empty());
+        assert_eq!(
+            plan.canary_expectations(),
+            vec![
+                (
+                    "dark-factory".to_string(),
+                    ExpectedRunner::Image(STOCK_NEW.into())
+                ),
+                (
+                    "night-factory".to_string(),
+                    ExpectedRunner::Image(STOCK_NEW.into())
+                ),
+            ]
+        );
+    }
+
+    /// #4321 AC4: a published layer built on another base would run a runner
+    /// the worker cannot serve (ADR 0173 decision 5), so it is cleared.
+    #[test]
+    fn plan_clears_a_stock_layer_built_on_another_base() {
+        let layered = bindings(&[("dark-factory", STOCK_OLD)]);
+        let plan = plan_runner_layers(
+            &layered,
+            Some(RUNNER_OLD),
+            Some(RUNNER_NEW),
+            &published(RUNNER_OTHER),
+        );
+        assert!(plan.rebinds.is_empty(), "{plan:?}");
+        assert_eq!(
+            plan.clears,
+            vec![(
+                "dark-factory".to_string(),
+                LayerClearReason::StockBaseMismatch {
+                    published_base: RUNNER_OTHER.into(),
+                    target: RUNNER_NEW.into(),
+                },
+            )]
+        );
+        assert!(plan.owner_built_clears().is_empty());
+        assert_eq!(
+            plan.canary_expectations(),
+            vec![("dark-factory".to_string(), ExpectedRunner::PlatformRunner)]
         );
     }
 
     #[test]
-    fn layer_clears_from_refs_unknown_reference_clears_all_layered_agents() {
-        let layered = vec!["agent-a".to_string()];
-        let reference = "ghcr.io/curie-eng/curie-runner@sha256:aaaa";
-        assert_eq!(
-            layer_clears_from_refs(&layered, None, Some(reference)),
-            layered
+    fn plan_clears_an_unpublished_stock_layer() {
+        let layered = bindings(&[("dark-factory", STOCK_OLD)]);
+        let plan = plan_runner_layers(
+            &layered,
+            Some(RUNNER_OLD),
+            Some(RUNNER_NEW),
+            &StockRunnerLookup::Unpublished,
         );
         assert_eq!(
-            layer_clears_from_refs(&layered, Some(reference), None),
-            layered
+            plan.clears,
+            vec![(
+                "dark-factory".to_string(),
+                LayerClearReason::StockLayerUnpublished
+            )]
         );
+        assert_eq!(plan.retired_agents(), agents(&["dark-factory"]));
+    }
+
+    #[test]
+    fn plan_clears_a_stock_layer_when_the_registry_is_unreachable() {
+        let layered = bindings(&[("dark-factory", STOCK_OLD)]);
+        let plan = plan_runner_layers(
+            &layered,
+            Some(RUNNER_OLD),
+            Some(RUNNER_NEW),
+            &StockRunnerLookup::Unreachable("connection refused".into()),
+        );
+        assert_eq!(
+            plan.clears,
+            vec![(
+                "dark-factory".to_string(),
+                LayerClearReason::StockRegistryUnreachable("connection refused".into()),
+            )]
+        );
+        assert!(plan.rebinds.is_empty(), "{plan:?}");
+    }
+
+    /// With no target digest there is nothing to prove a published base
+    /// against, so the planner clears without asking the registry.
+    #[test]
+    fn plan_clears_a_stock_layer_when_the_target_runner_is_unknown() {
+        let layered = bindings(&[("dark-factory", STOCK_OLD)]);
+        assert!(!needs_stock_lookup(&layered, Some(RUNNER_OLD), None));
+        let plan = plan_runner_layers(
+            &layered,
+            Some(RUNNER_OLD),
+            None,
+            &StockRunnerLookup::NotNeeded,
+        );
+        assert_eq!(
+            plan.clears,
+            vec![(
+                "dark-factory".to_string(),
+                LayerClearReason::TargetRunnerUnknown
+            )]
+        );
+    }
+
+    #[test]
+    fn plan_clears_an_owner_built_layer() {
+        let layered = bindings(&[("acme-bot", OWNER_LAYER), ("dark-factory", STOCK_OLD)]);
+        let plan = plan_runner_layers(
+            &layered,
+            Some(RUNNER_OLD),
+            Some(RUNNER_NEW),
+            &published(RUNNER_NEW),
+        );
+        assert_eq!(plan.clears, owner_clears(&["acme-bot"]));
+        assert_eq!(
+            plan.rebinds,
+            vec![("dark-factory".to_string(), STOCK_NEW.to_string())]
+        );
+        assert_eq!(plan.owner_built_clears(), agents(&["acme-bot"]));
+        // Rebinds and clears both retire claims, merged in name order.
+        assert_eq!(plan.retired_agents(), agents(&["acme-bot", "dark-factory"]));
+        assert_eq!(
+            plan.canary_expectations(),
+            vec![
+                ("acme-bot".to_string(), ExpectedRunner::PlatformRunner),
+                (
+                    "dark-factory".to_string(),
+                    ExpectedRunner::Image(STOCK_NEW.into())
+                ),
+            ]
+        );
+    }
+
+    /// A same-runner upgrade touches nothing, but the canary still checks
+    /// every binding it kept (edge case 3).
+    #[test]
+    fn plan_is_empty_when_the_runner_is_unchanged() {
+        let layered = bindings(&[("acme-bot", OWNER_LAYER), ("dark-factory", STOCK_OLD)]);
+        assert!(!needs_stock_lookup(
+            &layered,
+            Some(RUNNER_NEW),
+            Some(RUNNER_NEW)
+        ));
+        let plan = plan_runner_layers(
+            &layered,
+            Some(RUNNER_NEW),
+            Some(RUNNER_NEW),
+            &StockRunnerLookup::NotNeeded,
+        );
+        assert!(plan.is_empty(), "{plan:?}");
+        assert!(plan.rebinds.is_empty() && plan.clears.is_empty());
+        assert_eq!(
+            plan.kept,
+            vec![
+                ("acme-bot".to_string(), OWNER_LAYER.to_string()),
+                ("dark-factory".to_string(), STOCK_OLD.to_string()),
+            ]
+        );
+        assert!(plan.retired_agents().is_empty());
+        assert_eq!(
+            plan.canary_expectations(),
+            vec![
+                (
+                    "acme-bot".to_string(),
+                    ExpectedRunner::Image(OWNER_LAYER.into())
+                ),
+                (
+                    "dark-factory".to_string(),
+                    ExpectedRunner::Image(STOCK_OLD.into())
+                ),
+            ]
+        );
+        assert_eq!(runner_layer_rebind_line(&plan, "0.12.3"), None);
+        assert_eq!(runner_layer_notice(&plan.owner_built_clears()), None);
+        assert_eq!(
+            stock_runner_layer_notice(&plan, "ns", "rel", "0.12.3"),
+            None
+        );
+    }
+
+    #[test]
+    fn needs_stock_lookup_only_for_affected_stock_bindings() {
+        let stock = bindings(&[("dark-factory", STOCK_OLD)]);
+        let owner = bindings(&[("acme-bot", OWNER_LAYER)]);
+        assert!(needs_stock_lookup(
+            &stock,
+            Some(RUNNER_OLD),
+            Some(RUNNER_NEW)
+        ));
+        // An unknown installed runner counts as changed (edge case 1).
+        assert!(needs_stock_lookup(&stock, None, Some(RUNNER_NEW)));
+        assert!(!needs_stock_lookup(
+            &stock,
+            Some(RUNNER_NEW),
+            Some(RUNNER_NEW)
+        ));
+        assert!(!needs_stock_lookup(&stock, Some(RUNNER_OLD), None));
+        assert!(!needs_stock_lookup(
+            &owner,
+            Some(RUNNER_OLD),
+            Some(RUNNER_NEW)
+        ));
+        assert!(!needs_stock_lookup(
+            &BTreeMap::new(),
+            None,
+            Some(RUNNER_NEW)
+        ));
+    }
+
+    /// #4321 AC5: only the exact repository we publish to is stock. A
+    /// lookalike, another registry, or a tag-only binding is owner-built and
+    /// never triggers a lookup, even when the registry would answer.
+    #[test]
+    fn lookalike_repository_is_owner_built() {
+        assert!(is_stock_layer(STOCK_OLD));
+        for lookalike in [
+            "ghcr.io/curie-eng/curie-dark-factory-runner-fork@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ghcr.io/curie-eng/curie-dark-factory-runnerx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "docker.io/curie-eng/curie-dark-factory-runner@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ghcr.io/curie-eng/curie-dark-factory-runner:0.12.2",
+        ] {
+            assert!(!is_stock_layer(lookalike), "{lookalike}");
+            let layered = bindings(&[("dark-factory", lookalike)]);
+            assert!(
+                !needs_stock_lookup(&layered, Some(RUNNER_OLD), Some(RUNNER_NEW)),
+                "{lookalike}"
+            );
+            for lookup in [StockRunnerLookup::NotNeeded, published(RUNNER_NEW)] {
+                let plan =
+                    plan_runner_layers(&layered, Some(RUNNER_OLD), Some(RUNNER_NEW), &lookup);
+                assert_eq!(plan.clears, owner_clears(&["dark-factory"]), "{lookalike}");
+                assert!(plan.rebinds.is_empty(), "{lookalike}: {plan:?}");
+            }
+        }
+    }
+
+    /// AC7: the v0.12.3 owner-built notice, byte for byte.
+    #[test]
+    fn owner_notice_text_is_unchanged() {
+        assert_eq!(
+            runner_layer_notice(&["a".to_string()]).as_deref(),
+            Some(
+                "runner layers: the platform runner changes, so the layered runner of agent(s) a \
+                 will stop matching. This upgrade clears agentSandbox.runnerImages for them: they \
+                 run the platform runner WITHOUT their layer until their owners rebuild with \
+                 `curie build --plugin-dir <dir> --registry <ref>` against the upgraded CLI and \
+                 redeploy with `curie cluster deploy`. Their live sandboxes are retired after the \
+                 helm upgrade, so existing threads start fresh on the platform runner at their \
+                 next turn"
+            )
+        );
+        assert_eq!(runner_layer_notice(&[]), None);
+    }
+
+    #[test]
+    fn rebind_line_names_each_agent_and_its_digest_pinned_image() {
+        let plan = RunnerLayerPlan {
+            rebinds: vec![("dark-factory".into(), STOCK_NEW.into())],
+            clears: owner_clears(&["acme-bot"]),
+            kept: Vec::new(),
+        };
+        let line = runner_layer_rebind_line(&plan, "0.12.3").expect("one rebind");
+        assert!(line.starts_with("runner layers rebound:"), "{line}");
+        assert!(
+            !line.starts_with("runner layers:"),
+            "the owner notice prefix must stay unique: {line}"
+        );
+        assert!(
+            line.contains(&format!("dark-factory={STOCK_NEW}")),
+            "{line}"
+        );
+        assert!(!line.contains("acme-bot"), "{line}");
+    }
+
+    /// #4321 AC4: a stock agent that cannot be rebound is told its reason and
+    /// the stock remedy, never the owner-built `curie build` one.
+    #[test]
+    fn stock_notice_names_reason_and_stock_remedy_not_curie_build() {
+        let plan = RunnerLayerPlan {
+            rebinds: Vec::new(),
+            clears: vec![
+                ("acme-bot".into(), LayerClearReason::OwnerBuilt),
+                (
+                    "dark-factory".into(),
+                    LayerClearReason::StockLayerUnpublished,
+                ),
+                (
+                    "night-factory".into(),
+                    LayerClearReason::StockRegistryUnreachable("connection refused".into()),
+                ),
+                (
+                    "sky-factory".into(),
+                    LayerClearReason::StockBaseMismatch {
+                        published_base: RUNNER_OTHER.into(),
+                        target: RUNNER_NEW.into(),
+                    },
+                ),
+                ("sun-factory".into(), LayerClearReason::TargetRunnerUnknown),
+            ],
+            kept: Vec::new(),
+        };
+        let notice = stock_runner_layer_notice(&plan, "ns", "rel", "0.12.3").expect("stock clears");
+        assert!(notice.starts_with("stock runner layers:"), "{notice}");
+        for agent in [
+            "dark-factory",
+            "night-factory",
+            "sky-factory",
+            "sun-factory",
+        ] {
+            assert!(notice.contains(agent), "{agent}: {notice}");
+            assert!(
+                notice.contains(&format!(
+                    "--runner-image {agent}=ghcr.io/curie-eng/curie-dark-factory-runner@sha256:<digest>"
+                )),
+                "{agent}: {notice}"
+            );
+            assert!(
+                notice.contains(&format!("--agent {agent}")),
+                "{agent}: {notice}"
+            );
+        }
+        assert!(
+            !notice.contains("acme-bot"),
+            "owner-built stays in its own line: {notice}"
+        );
+        // Each reason.
+        assert!(notice.contains("not published"), "{notice}");
+        assert!(notice.contains("connection refused"), "{notice}");
+        assert!(notice.contains("registry"), "{notice}");
+        assert!(
+            notice.contains("sha256:3333"),
+            "the published base: {notice}"
+        );
+        assert!(
+            notice.contains("sha256:2222"),
+            "the target runner: {notice}"
+        );
+        assert!(notice.contains("target runner is unknown"), "{notice}");
+        assert!(notice.contains("0.12.3"), "{notice}");
+        // The stock remedy, spelled from `ClusterAction::Factory`,
+        // `DarkFactoryAction::Render` and `ClusterAction::Deploy`.
+        assert!(
+            notice.contains(
+                "curie cluster factory --namespace ns --release rel --runner-image \
+                 dark-factory=ghcr.io/curie-eng/curie-dark-factory-runner@sha256:<digest>"
+            ),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("curie example dark-factory render --out <dir>"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains(
+                "curie cluster deploy --namespace ns --release rel --plugin-dir <dir> --agent dark-factory"
+            ),
+            "{notice}"
+        );
+        assert!(!notice.contains("curie build --plugin-dir"), "{notice}");
+
+        // The owner line for the same plan lists only the owner-built agent.
+        let owner = runner_layer_notice(&plan.owner_built_clears()).expect("owner clear");
+        assert!(
+            owner.contains("agent(s) acme-bot will stop matching"),
+            "{owner}"
+        );
+        assert!(!owner.contains("factory"), "{owner}");
+
+        let owner_only = RunnerLayerPlan {
+            clears: owner_clears(&["acme-bot"]),
+            ..RunnerLayerPlan::default()
+        };
+        assert_eq!(
+            stock_runner_layer_notice(&owner_only, "ns", "rel", "0.12.3"),
+            None
+        );
+    }
+
+    /// #4321 AC6: the canary compares each planned runner with the rendered
+    /// SandboxTemplate, by exact template name.
+    #[test]
+    fn template_canary_accepts_a_rebound_template_on_the_planned_layer() {
+        let expected = [(
+            "dark-factory".to_string(),
+            ExpectedRunner::Image(STOCK_NEW.into()),
+        )];
+        assert!(issues(
+            &expected,
+            &[
+                ("rel-curie-runner", RUNNER_NEW),
+                ("rel-curie-agent-dark-factory-runner", STOCK_NEW),
+            ]
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn template_canary_flags_a_rebound_template_that_is_missing_or_off_plan() {
+        let expected = [(
+            "dark-factory".to_string(),
+            ExpectedRunner::Image(STOCK_NEW.into()),
+        )];
+        let missing = issues(&expected, &[("rel-curie-runner", RUNNER_NEW)]);
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(missing[0].contains("dark-factory"), "{missing:?}");
+        assert!(
+            missing[0].contains("rel-curie-agent-dark-factory-runner"),
+            "{missing:?}"
+        );
+        assert!(missing[0].contains("missing"), "{missing:?}");
+        assert!(missing[0].contains(STOCK_NEW), "{missing:?}");
+
+        let off_plan = issues(
+            &expected,
+            &[
+                ("rel-curie-runner", RUNNER_NEW),
+                ("rel-curie-agent-dark-factory-runner", RUNNER_NEW),
+            ],
+        );
+        assert_eq!(off_plan.len(), 1, "{off_plan:?}");
+        assert!(off_plan[0].contains("dark-factory"), "{off_plan:?}");
+        assert!(off_plan[0].contains(RUNNER_NEW), "observed: {off_plan:?}");
+        assert!(off_plan[0].contains(STOCK_NEW), "expected: {off_plan:?}");
+    }
+
+    /// A cleared agent whose only per-agent key was `runnerImages` gets no
+    /// template from `curie.agentSandboxPoolAgents` and runs the platform
+    /// template, so absence is fine. A per-agent template still on a layer is
+    /// not.
+    #[test]
+    fn template_canary_checks_cleared_agents_against_the_platform_runner() {
+        let expected = [("acme-bot".to_string(), ExpectedRunner::PlatformRunner)];
+        assert!(issues(&expected, &[("rel-curie-runner", RUNNER_NEW)]).is_empty());
+        assert!(issues(
+            &expected,
+            &[
+                ("rel-curie-runner", RUNNER_NEW),
+                ("rel-curie-agent-acme-bot-runner", RUNNER_NEW),
+            ]
+        )
+        .is_empty());
+        let stale = issues(
+            &expected,
+            &[
+                ("rel-curie-runner", RUNNER_NEW),
+                ("rel-curie-agent-acme-bot-runner", OWNER_LAYER),
+            ],
+        );
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert!(stale[0].contains("acme-bot"), "{stale:?}");
+        assert!(stale[0].contains(OWNER_LAYER), "{stale:?}");
+
+        let no_platform = issues(&expected, &[]);
+        assert!(
+            !no_platform.is_empty(),
+            "a cleared agent needs the platform template"
+        );
+    }
+
+    #[test]
+    fn template_canary_matches_template_names_exactly() {
+        let image = STOCK_NEW;
+        let items = [
+            ("rel-curie-runner", RUNNER_NEW),
+            ("rel-curie-agent-bot-runner", image),
+        ];
+        let bot = [("bot".to_string(), ExpectedRunner::Image(image.into()))];
+        assert!(issues(&bot, &items).is_empty());
+        // `agent-bot` must find `rel-curie-agent-agent-bot-runner`, not the
+        // `bot` agent's template whose name ends the same way.
+        let agent_bot = [("agent-bot".to_string(), ExpectedRunner::Image(image.into()))];
+        let found = issues(&agent_bot, &items);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("missing"), "{found:?}");
+        // And the reverse: only `rel-curie-agent-agent-bot-runner` exists.
+        let only_agent_bot = [
+            ("rel-curie-runner", RUNNER_NEW),
+            ("rel-curie-agent-agent-bot-runner", image),
+        ];
+        assert!(issues(&agent_bot, &only_agent_bot).is_empty());
+        assert_eq!(issues(&bot, &only_agent_bot).len(), 1);
+    }
+
+    #[test]
+    fn parse_sandbox_templates_rejects_malformed_json() {
+        assert!(parse_sandbox_templates("{").is_err());
+        assert!(parse_sandbox_templates("not json").is_err());
+    }
+
+    /// #4321 review: the canary names templates from the chart's own
+    /// `curie.fullname` (charts/curie/templates/_helpers.tpl), never from a
+    /// suffix heuristic over whatever templates happen to exist.
+    #[test]
+    fn release_fullname_follows_the_chart_helper() {
+        let none = serde_json::json!({});
+        assert_eq!(release_fullname_from_values("rel", &none), "rel-curie");
+        assert_eq!(release_fullname_from_values("curie", &none), "curie");
+        assert_eq!(
+            release_fullname_from_values("my-curie-prod", &none),
+            "my-curie-prod"
+        );
+        assert_eq!(
+            release_fullname_from_values("rel", &serde_json::json!({"nameOverride": "acme"})),
+            "rel-acme"
+        );
+        // `contains $name .Release.Name` uses the override name, not "curie".
+        assert_eq!(
+            release_fullname_from_values("acme-prod", &serde_json::json!({"nameOverride": "acme"})),
+            "acme-prod"
+        );
+        assert_eq!(
+            release_fullname_from_values(
+                "curie-prod",
+                &serde_json::json!({"nameOverride": "acme"})
+            ),
+            "curie-prod-acme"
+        );
+        assert_eq!(
+            release_fullname_from_values(
+                "rel",
+                &serde_json::json!({"fullnameOverride": "acme-runner"})
+            ),
+            "acme-runner"
+        );
+        // fullnameOverride wins over nameOverride.
+        assert_eq!(
+            release_fullname_from_values(
+                "rel",
+                &serde_json::json!({"fullnameOverride": "acme-runner", "nameOverride": "x"})
+            ),
+            "acme-runner"
+        );
+        // An empty override is falsy in the template, so it falls through.
+        assert_eq!(
+            release_fullname_from_values(
+                "rel",
+                &serde_json::json!({"fullnameOverride": "", "nameOverride": ""})
+            ),
+            "rel-curie"
+        );
+        // trunc 63, then trimSuffix "-" removes exactly one trailing dash.
+        let long = format!("{}-{}", "a".repeat(62), "b".repeat(7));
+        assert_eq!(long.len(), 70);
+        assert_eq!(
+            release_fullname_from_values("rel", &serde_json::json!({"fullnameOverride": long})),
+            "a".repeat(62)
+        );
+        let double_dash = format!("{}--{}", "a".repeat(61), "z".repeat(10));
+        assert_eq!(
+            release_fullname_from_values(
+                "rel",
+                &serde_json::json!({"fullnameOverride": double_dash})
+            ),
+            format!("{}-", "a".repeat(61))
+        );
+        let long_release = "r".repeat(70);
+        assert_eq!(
+            release_fullname_from_values(&long_release, &none),
+            "r".repeat(63)
+        );
+        // With no override it is exactly `cluster deploy`'s fullname.
+        let dash_at_63 = format!("{}-x", "p".repeat(62));
+        for release in [
+            "rel",
+            "curie",
+            "curieish",
+            "my-curie-prod",
+            "acme-prod",
+            "platform",
+            long_release.as_str(),
+            dash_at_63.as_str(),
+        ] {
+            assert_eq!(
+                release_fullname_from_values(release, &none),
+                super::super::verbs::chart_fullname(release).as_str(),
+                "{release}"
+            );
+        }
+    }
+
+    /// #4321 review P2: `fullnameOverride: acme-runner` renders
+    /// `acme-runner-runner` and `acme-runner-agent-<agent>-runner`. Exactly one
+    /// `-runner` belongs to the template, so a correct rebind passes.
+    #[test]
+    fn template_canary_honours_a_fullname_ending_in_runner() {
+        let expected = [(
+            "dark-factory".to_string(),
+            ExpectedRunner::Image(STOCK_NEW.into()),
+        )];
+        let rendered = [
+            ("acme-runner-runner", RUNNER_NEW),
+            ("acme-runner-agent-dark-factory-runner", STOCK_NEW),
+        ];
+        assert!(
+            issues_for("acme-runner", &expected, &rendered).is_empty(),
+            "{:?}",
+            issues_for("acme-runner", &expected, &rendered)
+        );
+
+        // And a cleared agent's real template is the one checked.
+        let cleared = [("acme-bot".to_string(), ExpectedRunner::PlatformRunner)];
+        let stale = issues_for(
+            "acme-runner",
+            &cleared,
+            &[
+                ("acme-runner-runner", RUNNER_NEW),
+                ("acme-runner-agent-acme-bot-runner", OWNER_LAYER),
+            ],
+        );
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert!(
+            stale[0].contains("acme-runner-agent-acme-bot-runner"),
+            "{stale:?}"
+        );
+        assert!(stale[0].contains(OWNER_LAYER), "{stale:?}");
+    }
+
+    /// #4321 review P1: with the platform template gone and a stale per-agent
+    /// template left behind, that agent template is not mistaken for the
+    /// platform one, so a cleared agent cannot pass on an absent name.
+    #[test]
+    fn template_canary_flags_a_missing_platform_template_beside_a_stale_agent_template() {
+        let expected = [("old".to_string(), ExpectedRunner::PlatformRunner)];
+        let found = issues_for(
+            "rel-curie",
+            &expected,
+            &[("rel-curie-agent-old-runner", OWNER_LAYER)],
+        );
+        assert!(
+            found.iter().any(|issue| issue.contains("missing")
+                && (issue.contains("rel-curie-runner") || issue.contains("platform"))),
+            "the missing platform template must be named: {found:?}"
+        );
+    }
+
+    fn effective_fullname(defaults: serde_json::Value, overlay: serde_json::Value) -> String {
+        release_fullname_from_values("rel", &effective_name_values(Some(&defaults), &overlay))
+    }
+
+    #[test]
+    fn empty_fullname_override_in_overlay_beats_chart_default() {
+        let defaults = serde_json::json!({"fullnameOverride": "acme-runner"});
+        let overlay = serde_json::json!({"fullnameOverride": ""});
+        assert_eq!(effective_fullname(defaults, overlay), "rel-curie");
+    }
+
+    #[test]
+    fn null_fullname_override_in_overlay_deletes_chart_default() {
+        let defaults = serde_json::json!({"fullnameOverride": "acme-runner"});
+        let overlay = serde_json::json!({"fullnameOverride": null});
+        assert_eq!(effective_fullname(defaults, overlay), "rel-curie");
+    }
+
+    #[test]
+    fn absent_fullname_override_in_overlay_falls_back_to_chart_default() {
+        let defaults = serde_json::json!({"fullnameOverride": "acme-runner"});
+        let overlay = serde_json::json!({"other": "x"});
+        assert_eq!(effective_fullname(defaults, overlay), "acme-runner");
+    }
+
+    #[test]
+    fn empty_name_override_in_overlay_beats_chart_default() {
+        let defaults = serde_json::json!({"nameOverride": "acme"});
+        let overlay = serde_json::json!({"nameOverride": ""});
+        assert_eq!(effective_fullname(defaults, overlay), "rel-curie");
+    }
+
+    #[test]
+    fn null_name_override_in_overlay_deletes_chart_default() {
+        let defaults = serde_json::json!({"nameOverride": "acme"});
+        let overlay = serde_json::json!({"nameOverride": null});
+        assert_eq!(effective_fullname(defaults, overlay), "rel-curie");
+    }
+
+    #[test]
+    fn absent_name_override_in_overlay_falls_back_to_chart_default() {
+        let defaults = serde_json::json!({"nameOverride": "acme"});
+        let overlay = serde_json::json!({});
+        assert_eq!(effective_fullname(defaults, overlay), "rel-acme");
     }
 }
