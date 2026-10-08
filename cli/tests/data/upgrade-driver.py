@@ -21,6 +21,16 @@ Behaviour is selected by ``$UPGRADE_DRIVER_SCENARIO`` from SCENARIOS below.
 Optional per-test inputs read from the root directory:
   * ``retained.json`` -- the document ``helm get values`` returns (JSON is YAML)
   * ``checkpoint.json`` -- the complete upgrade checkpoint ConfigMap
+  * ``chart-values.json`` -- the target chart's own values, which
+    ``helm show values`` prints. Absent, that read exits 64 as it always has,
+    so no existing test starts resolving a runner tag over the network.
+
+``kubectl get sandboxtemplates...`` renders the SandboxTemplates the chart
+would produce from the values Helm was last handed (the most recent
+``values-<n>.yaml``, else ``retained.json``) over ``chart-values.json``, the way
+``curie.sandboxTemplate`` and ``curie.agentSandboxPoolAgents`` in
+``charts/curie/templates/agent-sandbox.yaml`` do. It never reads the CLI's own
+plan back, so a canary that compares against it compares against the chart.
 
 Three observable moments drive the fixtures, derived from the argv log rather
 than from a call ordinal (the number of `helm get metadata` reads is an
@@ -105,6 +115,14 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #   alembic_fail      that exec exits 1 (unreadable live revision)
 #   compat_metadata   object served as ConfigMap data.compatibility.json from
 #                     `helm template --show-only templates/schema-compat.yaml`
+#   template_ignores_runner_images  the rendered per-agent SandboxTemplates run
+#                     the platform runner even where `runnerImages` binds a
+#                     layer, so a canary that checks the plan against the
+#                     rendered templates has something to catch (#4321)
+#   stale_agent_templates  {agent: image}. Each named agent's per-agent
+#                     SandboxTemplate exists and renders that image whatever the
+#                     values say, the way a template a failed or partial render
+#                     left behind survives (#4321)
 DEFAULT_COMPAT_METADATA = {
     "schema_min": "0043",
     "schema_head": "0043",
@@ -166,6 +184,8 @@ BASE = {
     "upgrade_fails": False,
     "history_after_upgrade": None,
     "revision_versions": None,
+    "template_ignores_runner_images": False,
+    "stale_agent_templates": {},
 }
 
 SCENARIOS = {
@@ -304,6 +324,20 @@ SCENARIOS = {
     # Drain's worker Deployment probe fails with a non-NotFound error, so
     # live_drain retries until the phase budget expires and returns false.
     "undrained-deploy": {},
+    # Helm accepts the rebound layer, but the per-agent SandboxTemplate still
+    # renders the platform runner. Only the canary's template read sees it.
+    "stock-layer-dropped": {"template_ignores_runner_images": True},
+    # Run as the RESUME of a `healthy` run interrupted after Apply cleared
+    # acme-bot's owner-built layer (the argv log already holds that run's
+    # `helm upgrade`), while acme-bot's per-agent SandboxTemplate still renders
+    # the old layer. Only a canary that remembers the original plan names
+    # acme-bot at all.
+    "stale-cleared-template": {
+        "stale_agent_templates": {
+            "acme-bot": "ghcr.io/acme/acme-bot-runner@sha256:"
+            + "a" * 64,
+        },
+    },
 }
 
 root = Path(os.environ["UPGRADE_DRIVER_ROOT"])
@@ -592,6 +626,129 @@ DRIFTED_VALUES = {
     "connectorCaller": {"existingSecret": "acme-caller-pair"},
 }
 
+# The SandboxTemplate CRD the chart renders one runner template per agent into.
+SANDBOX_TEMPLATES = "sandboxtemplates.extensions.agents.x-k8s.io"
+# `charts/curie/values.yaml` `agentSandbox.runner.image`.
+DEFAULT_RUNNER_IMAGE = "ghcr.io/curie-eng/curie-runner"
+# `.Chart.Name` of `charts/curie`.
+CHART_NAME = "curie"
+# The per-agent maps `curie.agentSandboxPoolAgents` unions; `poolAgents` is a
+# list and handled beside them.
+POOL_AGENT_MAPS = ("connectorSecrets", "registryEgress", "runnerImages", "workspaceSizeLimits")
+
+
+def chart_values():
+    path = root / "chart-values.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def release_values():
+    """What the release retains: the last overlay Helm applied, else retained.json."""
+    applied = captured("values", ".yaml")
+    source = applied[-1] if applied else root / "retained.json"
+    text = source.read_text() if source.exists() else "{}"
+    return json.loads(text or "{}")
+
+
+def helm_trunc_trim(text):
+    """`trunc 63 | trimSuffix "-"`: sprig's trimSuffix removes exactly one dash."""
+    text = text[:63]
+    return text[:-1] if text.endswith("-") else text
+
+
+def effective_name_value(values, key):
+    """`.Values.<key>` as Helm sees it: merged by key presence.
+
+    A release value that is present wins even when it is "" or None (Helm
+    deletes a null key, and an empty string renders as empty); only an absent
+    key falls back to the chart default.
+    """
+    if key in values:
+        return values[key]
+    return chart_values().get(key)
+
+
+def fullname(values):
+    """`curie.fullname` in `charts/curie/templates/_helpers.tpl` for RELEASE.
+
+    Reads the effective values: a `fullnameOverride` or `nameOverride` set only
+    in the target chart's defaults (`chart-values.json`) still names the
+    templates, the way Helm coalesces chart defaults beneath release values.
+    """
+    override = effective_name_value(values, "fullnameOverride")
+    if override:
+        return helm_trunc_trim(str(override))
+    name = effective_name_value(values, "nameOverride") or CHART_NAME
+    if name in RELEASE:
+        return helm_trunc_trim(RELEASE)
+    return helm_trunc_trim(f"{RELEASE}-{name}")
+
+
+def sandbox_template(name, image):
+    return {
+        "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+        "kind": "SandboxTemplate",
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "labels": {
+                "app.kubernetes.io/name": "curie",
+                "app.kubernetes.io/instance": RELEASE,
+                "app.kubernetes.io/component": "agent-sandbox",
+            },
+        },
+        "spec": {"podTemplate": {"spec": {"containers": [{"name": "runner", "image": image}]}}},
+    }
+
+
+def sandbox_templates():
+    """The SandboxTemplates `charts/curie/templates/agent-sandbox.yaml` renders."""
+    values = release_values()
+    sandbox = values.get("agentSandbox") or {}
+    prefix = fullname(values)
+    runner = {}
+    for source in (
+        (chart_values().get("agentSandbox") or {}).get("runner") or {},
+        sandbox.get("runner") or {},
+    ):
+        for key, value in source.items():
+            if value is None:
+                runner.pop(key, None)
+            else:
+                runner[key] = value
+    # `curie.image`: a digest wins, else the tag, else the chart appVersion.
+    image = runner.get("image") or DEFAULT_RUNNER_IMAGE
+    if runner.get("digest"):
+        platform = f"{image}@{runner['digest']}"
+    else:
+        platform = f"{image}:{runner.get('tag') or scenario['show_chart']}"
+    agents = set()
+    for key in POOL_AGENT_MAPS:
+        if isinstance(sandbox.get(key), dict):
+            agents.update(sandbox[key])
+    if isinstance(sandbox.get("poolAgents"), list):
+        agents.update(sandbox["poolAgents"])
+    layers = sandbox.get("runnerImages") or {}
+    stale = scenario["stale_agent_templates"]
+    agents.update(stale)
+    items = [sandbox_template(f"{prefix}-runner", platform)]
+    for agent in sorted(agents):
+        layer = layers.get(agent)
+        agent_image = platform if scenario["template_ignores_runner_images"] or not layer else layer
+        agent_image = stale.get(agent, agent_image)
+        items.append(sandbox_template(f"{prefix}-agent-{agent}-runner", agent_image))
+    return items
+
+
+def matches_selector(item, selector):
+    labels = item["metadata"].get("labels", {})
+    for term in filter(None, (selector or "").split(",")):
+        key, _, value = term.partition("=")
+        if labels.get(key) != value:
+            return False
+    return True
+
+
 HOOK_NAMES = {
     "upgrade-drain": f"{RELEASE}-upgrade-drain",
     "upgrade-drain-attest": f"{RELEASE}-upgrade-drain-attest",
@@ -707,6 +864,10 @@ if program == "helm":
             "name: curie\nversion: {v}\nappVersion: {v}".format(v=scenario["show_chart"])
         )
         sys.exit(0)
+    if args[:2] == ["show", "values"] and (root / "chart-values.json").exists():
+        # JSON is YAML. Without the file this falls through to exit 64 below.
+        print((root / "chart-values.json").read_text())
+        sys.exit(0)
     if args[0] == "template":
         show_only = flag_value("--show-only")
         if show_only is None:
@@ -795,6 +956,15 @@ if program == "kubectl":
     if args[:1] == ["-n"] and "delete" in args and "sandboxclaim" in args:
         print("sandboxclaim deleted")
         sys.exit(0)
+    if args[:2] == ["-n", NAMESPACE] and args[2:4] == ["get", SANDBOX_TEMPLATES]:
+        selector = flag_value("-l")
+        emit(
+            {
+                "apiVersion": "v1",
+                "kind": "List",
+                "items": [item for item in sandbox_templates() if matches_selector(item, selector)],
+            }
+        )
     if scenario["workloads_fail"] and args[:3] == ["get", WORKLOADS, "-n"]:
         print("Error from server (Forbidden): workloads is forbidden", file=sys.stderr)
         sys.exit(1)

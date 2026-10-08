@@ -184,6 +184,34 @@ pub fn bind_commands(opts: &BindOpts) -> Result<Vec<OpsCommand>> {
     ])
 }
 
+/// Bind `agent` to `image` as `agentSandbox.runnerImages.<agent>`, creating
+/// (or replacing a non-object) value, `agentSandbox`, and `runnerImages` maps.
+fn set_runner_image_binding(values: &mut serde_json::Value, agent: &str, image: &str) {
+    if !values.is_object() {
+        *values = serde_json::json!({});
+    }
+    let sandbox = values
+        .as_object_mut()
+        .expect("an object")
+        .entry("agentSandbox")
+        .or_insert_with(|| serde_json::json!({}));
+    if !sandbox.is_object() {
+        *sandbox = serde_json::json!({});
+    }
+    let images = sandbox
+        .as_object_mut()
+        .expect("an object")
+        .entry("runnerImages")
+        .or_insert_with(|| serde_json::json!({}));
+    if !images.is_object() {
+        *images = serde_json::json!({});
+    }
+    images.as_object_mut().expect("an object").insert(
+        agent.to_string(),
+        serde_json::Value::String(image.to_string()),
+    );
+}
+
 /// The release's supplied values with `agent`'s connector-secret binding
 /// removed, its runner image updated as `runner_image` says (#3260), and
 /// everything else untouched (#3021).
@@ -209,31 +237,7 @@ pub fn without_agent_binding(
                 all.remove(agent);
             }
         }
-        RunnerImageUpdate::Set(digest) => {
-            if !values.is_object() {
-                values = serde_json::json!({});
-            }
-            let sandbox = values
-                .as_object_mut()
-                .expect("an object")
-                .entry("agentSandbox")
-                .or_insert_with(|| serde_json::json!({}));
-            if !sandbox.is_object() {
-                *sandbox = serde_json::json!({});
-            }
-            let images = sandbox
-                .as_object_mut()
-                .expect("an object")
-                .entry("runnerImages")
-                .or_insert_with(|| serde_json::json!({}));
-            if !images.is_object() {
-                *images = serde_json::json!({});
-            }
-            images
-                .as_object_mut()
-                .expect("an object")
-                .insert(agent.to_string(), serde_json::Value::String(digest.clone()));
-        }
+        RunnerImageUpdate::Set(digest) => set_runner_image_binding(&mut values, agent, digest),
     }
     values
 }
@@ -614,6 +618,10 @@ pub async fn bind(opts: BindOpts) -> Result<()> {
 //   ([`layers_stopping_to_match`]). Leaving the old layer bound would run an
 //   old runner under a new worker; refusing the upgrade would let one bundle
 //   owner block every platform upgrade.
+//   A binding to the project's own published dark factory layer is instead
+//   rebound to the layer published for the target version when that layer's
+//   base is the target runner ([`rebind_runner_image_bindings`], #4321), and
+//   cleared with the stock remedy otherwise.
 //
 // When the installation's runner cannot be determined, deploy refuses and
 // upgrade treats every layered agent as affected: neither passes silently.
@@ -658,22 +666,27 @@ pub fn same_runner(a: &str, b: &str) -> bool {
     matches!((reference_digest(a), reference_digest(b)), (Some(x), Some(y)) if x == y)
 }
 
-/// The agents the release binds a layered runner to: every non-null
-/// `agentSandbox.runnerImages.<agent>`, in name order.
-pub fn layered_agents(values: &serde_json::Value) -> Vec<String> {
+/// The release's layered runner bindings: every non-blank string
+/// `agentSandbox.runnerImages.<agent>`, as `agent -> image` in name order.
+pub fn layered_bindings(values: &serde_json::Value) -> BTreeMap<String, String> {
     values
         .pointer("/agentSandbox/runnerImages")
         .and_then(|all| all.as_object())
         .map(|all| {
-            let mut agents: Vec<String> = all
-                .iter()
-                .filter(|(_, image)| image.as_str().is_some_and(|s| !s.trim().is_empty()))
-                .map(|(agent, _)| agent.clone())
-                .collect();
-            agents.sort();
-            agents
+            all.iter()
+                .filter_map(|(agent, image)| {
+                    let image = image.as_str().filter(|s| !s.trim().is_empty())?;
+                    Some((agent.clone(), image.to_string()))
+                })
+                .collect()
         })
         .unwrap_or_default()
+}
+
+/// The agents the release binds a layered runner to: every non-null
+/// `agentSandbox.runnerImages.<agent>`, in name order.
+pub fn layered_agents(values: &serde_json::Value) -> Vec<String> {
+    layered_bindings(values).into_keys().collect()
 }
 
 /// The layered agents an upgrade from `current` to `target` leaves on a base
@@ -714,6 +727,15 @@ pub fn omit_runner_image_bindings(values: &mut serde_json::Value, agents: &[Stri
         {
             sandbox.remove("runnerImages");
         }
+    }
+}
+
+/// Bind each `(agent, image)` as `agentSandbox.runnerImages.<agent>` in
+/// retained upgrade values (#4321), creating the maps when absent. Other
+/// agents and unrelated settings stay.
+pub fn rebind_runner_image_bindings(values: &mut serde_json::Value, rebinds: &[(String, String)]) {
+    for (agent, image) in rebinds {
+        set_runner_image_binding(values, agent, image);
     }
 }
 

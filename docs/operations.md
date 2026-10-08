@@ -1137,7 +1137,17 @@ It does not pass a null override. A null map entry is not a deletion, and the
 chart refuses it as a digest before Helm creates a revision. After that upgrade it deletes those agents'
 SandboxClaims, as `curie cluster deploy` does, so a live thread's next turn
 starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
-layer until their owners rebuild with `curie build` and redeploy. Both checks
+layer until their owners rebuild with `curie build` and redeploy. An agent bound
+to the project's published dark factory layer
+(`ghcr.io/curie-eng/curie-dark-factory-runner@...`) is instead rebound to the
+layer published for the target version when that layer's base is the target
+runner. The plan lists it separately, and its sandboxes are retired the same
+way. When it cannot be rebound (no published layer, another base, or an
+unreachable registry) it is cleared, and the notice names `curie cluster factory
+--runner-image <agent>=<repository>@sha256:<digest>`, or `curie example
+dark-factory render` then `curie cluster deploy`, instead of `curie build`. The
+canary then reads every layered agent's SandboxTemplate and fails the upgrade
+when its image is not the planned one. Both checks
 resolve runner digests by reading the registry directly, so the operator host
 needs no docker. A registry that refuses anonymous reads falls back to `docker
 buildx imagetools` and its registry login when docker is on PATH. When no digest
