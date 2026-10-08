@@ -61,13 +61,19 @@ def _signed_claim_change(token: str, **changes: Any) -> str:
     encoded = token.split(".")[1]
     claims = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
     claims.update(changes)
-    payload = base64.urlsafe_b64encode(
-        json.dumps(claims, sort_keys=True, separators=(",", ":")).encode()
-    ).rstrip(b"=").decode()
+    payload = (
+        base64.urlsafe_b64encode(json.dumps(claims, sort_keys=True, separators=(",", ":")).encode())
+        .rstrip(b"=")
+        .decode()
+    )
     signed = f"ppc.{payload}"
-    signature = base64.urlsafe_b64encode(
-        hmac.new(get_settings().api_key.encode(), signed.encode(), hashlib.sha256).digest()
-    ).rstrip(b"=").decode()
+    signature = (
+        base64.urlsafe_b64encode(
+            hmac.new(get_settings().api_key.encode(), signed.encode(), hashlib.sha256).digest()
+        )
+        .rstrip(b"=")
+        .decode()
+    )
     return f"{signed}.{signature}"
 
 
@@ -82,7 +88,7 @@ def precheck_case(
     client, _ = publication_stack
     forge = getattr(request, "param", None)
     html_base = "https://github.com"
-    if forge is not None:
+    if forge is not None and "api_url" in forge:
         html_base = forge["html_base"]
         monkeypatch.setenv("GITHUB_API_URL", forge["api_url"])
         monkeypatch.setenv("GITHUB_CLONE_BASE", html_base)
@@ -132,16 +138,24 @@ def precheck_case(
             "repo": (
                 "acme-corp/other"
                 if getattr(request.node, "callspec", None)
-                and request.node.callspec.params.get("mutation") == "repository"
+                and (
+                    request.node.callspec.params.get("mutation") == "repository"
+                    or request.node.callspec.params.get("other_scope") == "repository"
+                )
                 else REPO
             ),
             "conversation": (
                 "other-conversation"
                 if getattr(request.node, "callspec", None)
-                and request.node.callspec.params.get("mutation") == "conversation"
+                and (
+                    request.node.callspec.params.get("mutation") == "conversation"
+                    or request.node.callspec.params.get("other_scope") == "conversation"
+                )
                 else lineage["conversation_id"]
             ),
-            "lineage": uuid.UUID(lineage_id),
+            "lineage": None
+            if forge is not None and forge.get("unlinked")
+            else uuid.UUID(lineage_id),
         },
     )
     _execute(
@@ -214,9 +228,7 @@ def precheck_case(
         assert request.method == "GET"
         assert request.url.path.endswith(f"/repos/{REPO}/pulls/{PR_NUMBER}")
         if provider_status["value"] == 302:
-            return httpx.Response(
-                302, headers={"Location": "https://attacker.example.com/collect"}
-            )
+            return httpx.Response(302, headers={"Location": "https://attacker.example.com/collect"})
         return httpx.Response(provider_status["value"], json=copy.deepcopy(truth))
 
     real_client = httpx.Client
@@ -267,9 +279,7 @@ def _mint(case: dict[str, Any]) -> dict[str, Any]:
     return response.json()
 
 
-def _compare(
-    case: dict[str, Any], context: dict[str, Any], *, title: str, body: str
-) -> Any:
+def _compare(case: dict[str, Any], context: dict[str, Any], *, title: str, body: str) -> Any:
     return case["client"].post(
         COMPARE_URL,
         headers={CAPABILITY_HEADER: context["capability"]},
@@ -440,10 +450,13 @@ def test_metadata_only_admission_rechecks_current_pull_request(
         assert response.json()["changed_paths"] == []
     else:
         assert response.status_code == 409, response.text
-        assert _rows(
-            "SELECT id FROM curie.publications WHERE id <> :id",
-            {"id": uuid.UUID(case["publication_id"])},
-        ) == []
+        assert (
+            _rows(
+                "SELECT id FROM curie.publications WHERE id <> :id",
+                {"id": uuid.UUID(case["publication_id"])},
+            )
+            == []
+        )
 
 
 @pytest.mark.parametrize(
@@ -582,6 +595,86 @@ def test_running_factory_request_without_existing_pr_gets_authenticated_absence(
     assert _durable_snapshot() == before
 
 
+@pytest.mark.parametrize("precheck_case", [{"unlinked": True}], indirect=True, ids=["unlinked"])
+def test_mint_names_an_existing_conversation_pr_without_a_work_item_link(
+    precheck_case: dict[str, Any],
+) -> None:
+    case = precheck_case
+    assert _rows(
+        "SELECT publication_lineage_id FROM curie.work_items WHERE id = :id",
+        {"id": case["work_item_id"]},
+    ) == [{"publication_lineage_id": None}]
+    before = _durable_snapshot()
+
+    response = case["client"].post(MINT_URL, json=_mint_body(case), headers=WORKER_HEADERS)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "pull_request_not_adopted"
+    assert "capability" not in response.text
+    assert _pull_reads(case) == []
+    assert _durable_snapshot() == before
+
+
+@pytest.mark.parametrize("authority_loss", ["epoch", "lease", "status"])
+@pytest.mark.parametrize("precheck_case", [{"unlinked": True}], indirect=True, ids=["unlinked"])
+def test_unlinked_existing_pr_does_not_hide_a_generic_execution_refusal(
+    precheck_case: dict[str, Any], authority_loss: str
+) -> None:
+    case = precheck_case
+    assert _rows(
+        "SELECT publication_lineage_id FROM curie.work_items WHERE id = :id",
+        {"id": case["work_item_id"]},
+    ) == [{"publication_lineage_id": None}]
+    request = _mint_body(case)
+    if authority_loss == "epoch":
+        request["runtime_epoch"] += 1
+    elif authority_loss == "lease":
+        _execute(
+            "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
+            "clock_timestamp() - interval '1 second' WHERE id = :id",
+            {"id": case["request_id"]},
+        )
+    else:
+        _execute(
+            "UPDATE curie.execution_requests SET status = 'cancellation_requested', "
+            "terminal_cause = 'owner_lost' WHERE id = :id",
+            {"id": case["request_id"]},
+        )
+    before = _durable_snapshot()
+
+    response = case["client"].post(MINT_URL, json=request, headers=WORKER_HEADERS)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "invalid_context"
+    assert _pull_reads(case) == []
+    assert _durable_snapshot() == before
+
+
+@pytest.mark.parametrize("other_scope", ["conversation", "repository"])
+@pytest.mark.parametrize("precheck_case", [{"unlinked": True}], indirect=True, ids=["unlinked"])
+def test_an_unlinked_running_request_ignores_a_pr_outside_its_scope(
+    precheck_case: dict[str, Any], other_scope: str
+) -> None:
+    case = precheck_case
+    item = _rows(
+        "SELECT publication_lineage_id, conversation_id, repo_full_name "
+        "FROM curie.work_items WHERE id = :id",
+        {"id": case["work_item_id"]},
+    )[0]
+    assert item["publication_lineage_id"] is None
+    if other_scope == "conversation":
+        assert item["conversation_id"] != case["lineage"]["conversation_id"]
+    else:
+        assert item["repo_full_name"] != REPO
+    before = _durable_snapshot()
+
+    response = case["client"].post(MINT_URL, json=_mint_body(case), headers=WORKER_HEADERS)
+
+    assert response.status_code == 204, response.text
+    assert _pull_reads(case) == []
+    assert _durable_snapshot() == before
+
+
 @pytest.mark.parametrize("change", ["title", "body"])
 @pytest.mark.parametrize("proposed", ["old", "new"])
 def test_remote_metadata_change_refuses_both_old_and_new_proposals(
@@ -602,9 +695,7 @@ def test_remote_metadata_change_refuses_both_old_and_new_proposals(
     assert _durable_snapshot() == before
 
 
-def test_null_github_body_is_observed_as_empty_bytes(
-    precheck_case: dict[str, Any]
-) -> None:
+def test_null_github_body_is_observed_as_empty_bytes(precheck_case: dict[str, Any]) -> None:
     case = precheck_case
     case["truth"]["body"] = None
     context = _mint(case)
@@ -618,7 +709,7 @@ def test_null_github_body_is_observed_as_empty_bytes(
 
 
 def test_comparison_cannot_select_a_different_repository_or_pull_request(
-    precheck_case: dict[str, Any]
+    precheck_case: dict[str, Any],
 ) -> None:
     case = precheck_case
     context = _mint(case)
@@ -679,7 +770,7 @@ def test_changed_provider_identity_is_unavailable_and_does_not_change_lineage(
 
 
 def test_provider_failure_is_unavailable_and_charges_an_authorized_attempt(
-    precheck_case: dict[str, Any]
+    precheck_case: dict[str, Any],
 ) -> None:
     case = precheck_case
     context = _mint(case)
@@ -697,9 +788,7 @@ def test_provider_failure_is_unavailable_and_charges_an_authorized_attempt(
     second_context = _mint(case)
     for index in range(19):
         credential = context if index % 2 == 0 else second_context
-        accepted = _compare(
-            case, credential, title=OBSERVED_TITLE, body=OBSERVED_BODY
-        )
+        accepted = _compare(case, credential, title=OBSERVED_TITLE, body=OBSERVED_BODY)
         assert accepted.status_code == 200, accepted.text
         assert accepted.json() == {"result": "unchanged"}
     assert len(_pull_reads(case)) == 22
@@ -710,7 +799,7 @@ def test_provider_failure_is_unavailable_and_charges_an_authorized_attempt(
 
 
 def test_provider_redirect_does_not_forward_the_github_credential(
-    precheck_case: dict[str, Any]
+    precheck_case: dict[str, Any],
 ) -> None:
     case = precheck_case
     context = _mint(case)
@@ -723,9 +812,7 @@ def test_provider_redirect_does_not_forward_the_github_credential(
     assert all(request.url.host != "attacker.example.com" for request in case["calls"])
 
 
-def test_inflight_publication_makes_comparison_unavailable(
-    precheck_case: dict[str, Any]
-) -> None:
+def test_inflight_publication_makes_comparison_unavailable(precheck_case: dict[str, Any]) -> None:
     case = precheck_case
     context = _mint(case)
     _execute(
@@ -783,8 +870,7 @@ def test_mint_refuses_without_current_execution_and_lineage_authority(
     [
         (
             "new epoch",
-            "UPDATE curie.execution_requests SET runtime_epoch = runtime_epoch + 1 "
-            "WHERE id = :id",
+            "UPDATE curie.execution_requests SET runtime_epoch = runtime_epoch + 1 WHERE id = :id",
         ),
         (
             "lease lost",
@@ -802,8 +888,7 @@ def test_mint_refuses_without_current_execution_and_lineage_authority(
         ),
         (
             "lineage advanced",
-            "UPDATE curie.thread_publication_lineages SET version = version + 1 "
-            "WHERE id = :id",
+            "UPDATE curie.thread_publication_lineages SET version = version + 1 WHERE id = :id",
         ),
         (
             "lineage head moved",
@@ -880,7 +965,7 @@ def test_comparison_rechecks_authority_after_the_provider_read(
 
 
 def test_comparison_rejects_mismatched_event_observation_before_github(
-    precheck_case: dict[str, Any]
+    precheck_case: dict[str, Any],
 ) -> None:
     case = precheck_case
     context = _mint(case)
@@ -894,9 +979,7 @@ def test_comparison_rejects_mismatched_event_observation_before_github(
     assert len(_pull_reads(case)) == 1
 
 
-def test_capability_is_accepted_only_at_the_comparison_route(
-    precheck_case: dict[str, Any]
-) -> None:
+def test_capability_is_accepted_only_at_the_comparison_route(precheck_case: dict[str, Any]) -> None:
     case = precheck_case
     context = _mint(case)
     token = context["capability"]
@@ -918,9 +1001,12 @@ def test_capability_is_accepted_only_at_the_comparison_route(
         assert response.status_code == 401, response.text
     assert client.get("/publications", headers={"X-API-Key": token}).status_code == 401
     assert client.get("/approvals", headers={"X-API-Key": token}).status_code == 401
-    assert client.get(
-        f"/agents/{case['deployment']['agent_id']}/state", headers={"X-API-Key": token}
-    ).status_code == 401
+    assert (
+        client.get(
+            f"/agents/{case['deployment']['agent_id']}/state", headers={"X-API-Key": token}
+        ).status_code
+        == 401
+    )
     credential = client.post(
         f"/v1/internal/publications/{case['publication_id']}/credential",
         headers={"X-Curie-Worker-Token": token},
@@ -934,9 +1020,7 @@ def test_capability_is_accepted_only_at_the_comparison_route(
     assert _durable_snapshot() == before
 
 
-def test_invalid_capability_never_reaches_github(
-    precheck_case: dict[str, Any]
-) -> None:
+def test_invalid_capability_never_reaches_github(precheck_case: dict[str, Any]) -> None:
     case = precheck_case
     context = _mint(case)
     original = context["capability"]
@@ -978,7 +1062,7 @@ def test_validly_signed_but_unbound_claims_do_not_reach_github(
 
 
 def test_worker_mint_requires_its_own_credential_and_matching_deployment(
-    precheck_case: dict[str, Any]
+    precheck_case: dict[str, Any],
 ) -> None:
     case = precheck_case
     client = case["client"]

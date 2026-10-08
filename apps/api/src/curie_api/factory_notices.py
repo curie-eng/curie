@@ -59,6 +59,7 @@ from .models import (
     ThreadPublicationLineage,
     WorkItem,
 )
+from .publication_truth import conversation_pr_lineage_id
 from .repo_full_name import repo_url_path
 from .workitems import OWNER_LOST_RETRY_LIMIT, owner_lost_streak, owner_lost_successor_admitted
 
@@ -114,6 +115,10 @@ _CAUSE_TEXT = {
         "Inspect the result and retry."
     ),
     "runner_escalated": "the run stopped on an error and was handed to a person.",
+    "pull_request_not_adopted": (
+        "an earlier pull request on this issue could not be continued. "
+        "A person should close or merge it, then re-add the label."
+    ),
     "unclassified": (
         "the run failed and Curie could not name a more specific cause. "
         "Read the worker log for the provider message, then retry or hand it to a person."
@@ -546,13 +551,15 @@ def result_section(
             # so it cannot add a ``Cause:`` line, and no HTML comment opener.
             text += f"Details: {_inert_line(detail)}\n"
         elif (
-            cause not in {"history_capacity", "start_failed"}
+            cause not in {"history_capacity", "start_failed", "pull_request_not_adopted"}
             and detail is not None
             and detail.strip()
         ):
             label = "Details" if cause in _DETAIL_CAUSES else "Provider message"
             text += f"{label}: {detail.strip()}\n"
         text += f"Cause: {cause}\n"
+        if cause == "pull_request_not_adopted" and isinstance(pr_url, str) and pr_url.strip():
+            text += f"Pull request: {pr_url.strip()}\n"
         failure_class = _FAILURE_CLASS_BY_CAUSE.get(cause)
         if failure_class is not None:
             text += f"Failure class: {failure_class}\n"
@@ -1022,6 +1029,28 @@ async def _render(
     retrying = False
     if request.terminal_at is not None and cause:
         cause = cause.strip()
+        if cause == "pull_request_not_adopted":
+            selected_pr = (
+                await session.execute(
+                    select(
+                        ThreadPublicationLineage.repo_full_name,
+                        ThreadPublicationLineage.pr_number,
+                    ).where(
+                        ThreadPublicationLineage.id
+                        == conversation_pr_lineage_id(
+                            agent_id=work_item.agent_id,
+                            conversation_id=work_item.conversation_id,
+                            repo_full_name=work_item.repo_full_name,
+                        ).scalar_subquery()
+                    )
+                )
+            ).one_or_none()
+            pr_url = None
+            if selected_pr is not None:
+                lineage_repo, pr_number = selected_pr
+                if pr_number is not None and pr_number > 0:
+                    repo_path = repo_url_path(lineage_repo)
+                    pr_url = f"{settings.github_html_base}/{repo_path}/pull/{pr_number}"
         # A completed issue run waits for its PR link before it is final.
         if not (
             cause == "completed"

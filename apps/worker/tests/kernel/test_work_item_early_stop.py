@@ -43,6 +43,11 @@ from curie_worker.workitem_dispatch import (
     WorkItemTransportError,
 )
 
+from apps.worker.tests.kernel.test_work_item_workspace import (
+    _PR_NOT_ADOPTED_RESPONSE,
+    _HttpPrecheckApi,
+)
+
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
 DEPLOYMENT_ID = uuid.UUID("22222222-2222-4222-8222-222222222222")
 CHANNEL = "C0EXAMPLE1"
@@ -1412,6 +1417,41 @@ class _CountingPrecheckApi(_PublicationApi):
 # The first turn worked (Bash) and never published, so the continuation, when it
 # opens, carries the unpublished prompt.
 WORKED_TURN: list[OutboundEvent] = [_tool("Bash"), _done("Edited the parser.")]
+
+
+def test_an_existing_pr_refusal_stops_the_unpublished_continuation_after_one_mint(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first turn ran; the refused continuation never reaches the runner."""
+
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([(204, None), _PR_NOT_ADOPTED_RESPONSE])
+        try:
+            opened, items, terminal = await _run_execute(
+                make_harness,
+                [WORKED_TURN, [_done("a refused continuation must not open")]],
+                publication_creator=publications,
+            )
+
+            assert opened == [ISSUE_PROMPT]
+            # One mint for the accepted first turn and one for the continuation.
+            # No further mint can be a retry of either entrypoint.
+            assert len(publications.mints) == 2
+            assert items.calls.count("start") == 1
+            assert items.calls.count("finish") == 1
+            assert items.finishes[0]["outcome"] == "failed"
+            assert items.finishes[0]["cause"] == "pull_request_not_adopted"
+            assert terminal
+            assert all("runner_escalated" not in record.getMessage() for record in caplog.records)
+            assert any(
+                "escalating event" in record.getMessage()
+                and "pull-request-not-adopted" in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
 
 
 def _continuation_noise(caplog: pytest.LogCaptureFixture) -> list[str]:
