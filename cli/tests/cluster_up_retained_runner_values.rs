@@ -1085,3 +1085,43 @@ fn effective_captured_values(helm: &str, fixture: &Fixture) -> Value {
     assert!(output.status.success(), "{}", all_output(&output));
     serde_norway::from_slice(&output.stdout).unwrap()
 }
+
+#[test]
+fn inline_file_credential_replaces_a_retained_secret_reference() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3
+    let helm = real_helm().expect("real Helm required");
+    let fixture = Fixture::new(
+        &serde_json::json!({"agentSandbox":{"runner":{"fakeModel":false,"credentialsExistingSecret":"retained-provider","credentialsExistingSecretKey":"token"}}}),
+    );
+    let file = fixture.temp.path().join("inline-replacement.yaml");
+    fs::write(&file, "security:\n  gvisor:\n    mode: 'off'\nagentSandbox:\n  controller:\n    deploy: false\n  runner:\n    fakeModel: false\n    credentials: sk-ant-api03-PLACEHOLDER-file-replacement\n").unwrap();
+    let output = fixture.cluster_up_with_args(
+        &[("CURIE_TEST_REAL_HELM", &helm)],
+        &["-f", file.to_str().unwrap()],
+    );
+    fixture.assert_succeeded(&output);
+    let values = effective_captured_values(&helm, &fixture);
+    assert_eq!(
+        values
+            .pointer("/agentSandbox/runner/credentials")
+            .and_then(Value::as_str),
+        Some("sk-ant-api03-PLACEHOLDER-file-replacement")
+    );
+    assert_eq!(
+        values
+            .pointer("/agentSandbox/runner/credentialsExistingSecret")
+            .and_then(Value::as_str),
+        Some("")
+    );
+    assert_eq!(
+        values
+            .pointer("/agentSandbox/runner/credentialsExistingSecretKey")
+            .and_then(Value::as_str),
+        Some("")
+    );
+    assert!(!all_output(&output).contains("sk-ant-api03-PLACEHOLDER-file-replacement"));
+    assert!(!fixture
+        .upgrade_argv()
+        .join(" ")
+        .contains("sk-ant-api03-PLACEHOLDER-file-replacement"));
+}
