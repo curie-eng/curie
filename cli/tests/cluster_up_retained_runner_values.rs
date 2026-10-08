@@ -948,3 +948,74 @@ fn fresh_install_with_files_still_generates_required_store_credentials() {
         );
     }
 }
+
+#[test]
+fn dedicated_flags_override_file_identity_and_service_choices() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3
+    let helm = real_helm().expect("real Helm required");
+    for clear in [false, true] {
+        let fixture = Fixture::new(&serde_json::json!({}));
+        let file = fixture.temp.path().join("flag-overrides.yaml");
+        fs::write(&file, "security:\n  gvisor:\n    mode: 'off'\napi:\n  githubToken: PLACEHOLDER-file-token\n  githubTokenExistingSecret: file-github\nagentSandbox:\n  controller:\n    deploy: false\n  runner:\n    model: file-model\n    credentialsExistingSecret: file-model-secret\nui:\n  service:\n    type: NodePort\nlangfuse:\n  web:\n    service:\n      type: NodePort\n").unwrap();
+        let mut args = vec!["-f", file.to_str().unwrap(), "--model", "flag-model"];
+        if clear {
+            args.push("--clear-github-token");
+        } else {
+            args.extend(["--github-token", "PLACEHOLDER-flag-token"]);
+        }
+        let output = fixture.cluster_up_with_args(
+            &[
+                ("CURIE_TEST_REAL_HELM", &helm),
+                ("CURIE_CREDENTIALS", "sk-ant-api03-PLACEHOLDER-explicit"),
+            ],
+            &args,
+        );
+        fixture.assert_succeeded(&output);
+        let values = merged_file_values(&fixture.captured_files());
+        assert_eq!(
+            values.pointer("/api/githubToken").and_then(Value::as_str),
+            Some(if clear { "" } else { "PLACEHOLDER-flag-token" })
+        );
+        assert_eq!(
+            values
+                .pointer("/api/githubTokenExistingSecret")
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            values
+                .pointer("/agentSandbox/runner/model")
+                .and_then(Value::as_str),
+            Some("flag-model")
+        );
+        assert_eq!(
+            values
+                .pointer("/agentSandbox/runner/credentialsExistingSecret")
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            values
+                .pointer("/agentSandbox/runner/credentials")
+                .and_then(Value::as_str),
+            Some("sk-ant-api03-PLACEHOLDER-explicit")
+        );
+        assert_eq!(
+            values.pointer("/ui/service/type").and_then(Value::as_str),
+            Some("ClusterIP")
+        );
+        assert_eq!(
+            values
+                .pointer("/langfuse/web/service/type")
+                .and_then(Value::as_str),
+            Some("ClusterIP")
+        );
+        for secret in [
+            "PLACEHOLDER-flag-token",
+            "sk-ant-api03-PLACEHOLDER-explicit",
+        ] {
+            assert!(!all_output(&output).contains(secret));
+            assert!(!fixture.upgrade_argv().join(" ").contains(secret));
+        }
+    }
+}
