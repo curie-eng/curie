@@ -3,6 +3,7 @@
 //! platform API peers are fixtures. The Kubernetes wire shapes follow the
 //! Deployment and Pod references cited in `cluster_convergence.rs`; GitHub
 //! responses follow the REST App endpoints cited in `factory_github_app.rs`.
+//! Bot user ids follow https://docs.github.com/en/rest/users/users#get-a-user.
 //! OpenRouter responses follow the `/key` and `/credits` shapes recorded from
 //! the real API on 2026-10-04 and cited in `openrouter_credit.rs` (#3935).
 //! Namespace labels follow the Namespace metadata object, including the
@@ -268,6 +269,10 @@ impl Fixture {
     }
 
     fn with_credit(account_left: f64) -> Self {
+        Self::with_bot_lookup(account_left, 200, r#"{"id":123}"#)
+    }
+
+    fn with_bot_lookup(account_left: f64, bot_status: u16, bot_body: &'static str) -> Self {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("bin")).unwrap();
         for tool in ["helm", "kubectl", "kind", "docker"] {
@@ -315,13 +320,17 @@ impl Fixture {
                 .collect::<String>()
         );
         fs::write(dir.path().join("values"), json!({"security":{"allowDevDefaults":false},"agentSandbox":{"runner":{"fakeModel":false,"image":"ghcr.io/curie-eng/curie-runner","tag":env!("CARGO_PKG_VERSION"),"digest":digest}},"api":{"environment":"dev"}}).to_string()).unwrap();
-        let github = serve(|req| {
+        let github = serve(move |req| {
             let path = req.path.split('?').next().unwrap();
             match (req.method.as_str(), path) {
                 ("GET", "/app") => Response::json(
                     200,
                     r#"{"id":1234567,"slug":"acme-factory","name":"acme-factory"}"#,
                 ),
+                ("GET", "/users/acme-factory[bot]") => {
+                    assert!(req.header("authorization").is_none());
+                    Response::json(bot_status, bot_body)
+                }
                 ("GET", "/app/installations") => {
                     Response::json(200, r#"[{"id":42,"account":{"login":"acme"}}]"#)
                 }
@@ -643,6 +652,107 @@ fn intake_documents(fixture: &Fixture) -> Vec<Value> {
             (values.pointer("/api/githubFactoryIntake") == Some(&json!("poll"))).then_some(values)
         })
         .collect()
+}
+
+#[test]
+fn quickstart_second_pass_applies_the_app_bot_publication_identity() {
+    let fixture = Fixture::new();
+    let (code, shown) = fixture.run(true, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    let documents = intake_documents(&fixture);
+    assert!(!documents.is_empty(), "factory intake document missing");
+    for values in documents {
+        assert_eq!(
+            values.pointer("/worker/publication/gitUserName"),
+            Some(&json!("acme-factory[bot]"))
+        );
+        assert_eq!(
+            values.pointer("/worker/publication/gitUserEmail"),
+            Some(&json!("123+acme-factory[bot]@users.noreply.github.com"))
+        );
+    }
+}
+
+#[test]
+fn quickstart_second_pass_keeps_each_recorded_operator_publication_identity() {
+    for publication in [
+        json!({"gitUserName":"Operator"}),
+        json!({"gitUserEmail":"operator@example.com"}),
+        json!({"gitUserName":"Operator","gitUserEmail":"operator@example.com"}),
+    ] {
+        let fixture = Fixture::new();
+        let path = fixture.dir.path().join("values");
+        let mut values: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        values["worker"] = json!({"publication":publication});
+        fs::write(&path, values.to_string()).unwrap();
+        let (code, shown) = fixture.run(true, &["--color", "never"]);
+        assert_eq!(code, 0, "{shown}");
+        let applied: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(applied.pointer("/worker/publication"), Some(&publication));
+        assert!(
+            intake_documents(&fixture)
+                .iter()
+                .all(|values| values.pointer("/worker/publication").is_none()),
+            "factory intake must preserve both fields when either operator field is set"
+        );
+    }
+}
+
+#[test]
+fn quickstart_keeps_numeric_and_empty_operator_publication_values() {
+    for publication in [
+        json!({"gitUserName":123}),
+        json!({"gitUserName":""}),
+        json!({"gitUserEmail":""}),
+    ] {
+        let fixture = Fixture::new();
+        let (code, shown) = fixture.run(false, &["--color", "never"]);
+        assert_eq!(code, 0, "{shown}");
+        let path = fixture.dir.path().join("values");
+        let mut values: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        values["worker"] = json!({"publication":publication});
+        fs::write(&path, values.to_string()).unwrap();
+        let (code, shown) = fixture.run(true, &["--color", "never"]);
+        assert_eq!(code, 0, "{shown}");
+        let applied: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(applied.pointer("/worker/publication"), Some(&publication));
+        assert!(
+            intake_documents(&fixture)
+                .iter()
+                .all(|values| values.pointer("/worker/publication").is_none()),
+            "factory intake must preserve every explicit operator value"
+        );
+    }
+}
+
+#[test]
+fn quickstart_bot_lookup_failure_exits_three_before_any_helm_call() {
+    for (status, body) in [
+        // An invalid HTTP status line exercises the transport error path.
+        (0, "{}"),
+        (404, r#"{"message":"Not Found"}"#),
+        (503, r#"{"message":"Unavailable"}"#),
+        (200, "not JSON"),
+        (200, r#"{"login":"acme-factory[bot]"}"#),
+        (200, r#"{"id":"123"}"#),
+    ] {
+        let fixture = Fixture::with_bot_lookup(AMPLE_ACCOUNT_LEFT, status, body);
+        let (code, shown) = fixture.run(true, &["--color", "never"]);
+        assert_eq!(code, 3, "{shown}");
+        assert!(shown.contains("/users/acme-factory[bot]"), "{shown}");
+        assert!(
+            shown.contains("--set worker.publication.gitUserEmail="),
+            "{shown}"
+        );
+        let calls = fs::read_to_string(fixture.dir.path().join("calls")).unwrap_or_default();
+        assert!(
+            calls.lines().all(|line| {
+                let call: Vec<String> = serde_json::from_str(line).unwrap();
+                call.first().map(String::as_str) != Some("helm")
+            }),
+            "bot lookup failure must precede all Helm calls: {calls}"
+        );
+    }
 }
 
 #[test]
