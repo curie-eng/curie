@@ -516,8 +516,14 @@ http
 {{- define "curie.otelCollector.config" -}}
 {{- $debugEnabled := .Values.otelCollector.debugExporter.enabled -}}
 {{- /* @spec charts/curie/README.md: Optional trace processors. */ -}}
-{{- $extraProcessors := .Values.otelCollector.extraProcessors -}}
-{{- $traceProcessors := .Values.otelCollector.extraTracePipelineProcessors -}}
+{{- $extraProcessors := dict -}}
+{{- if hasKey .Values.otelCollector "extraProcessors" -}}
+{{- $extraProcessors = get .Values.otelCollector "extraProcessors" -}}
+{{- end -}}
+{{- $traceProcessors := list -}}
+{{- if hasKey .Values.otelCollector "extraTracePipelineProcessors" -}}
+{{- $traceProcessors = get .Values.otelCollector "extraTracePipelineProcessors" -}}
+{{- end -}}
 {{- $builtInProcessors := dict "memory_limiter" true "batch" true "transform/runner_identity" true -}}
 {{- $componentIDPattern := "^[a-z][a-z0-9_]*(/[A-Za-z0-9_-]+)?$" -}}
 {{- if not (kindIs "map" $extraProcessors) -}}
