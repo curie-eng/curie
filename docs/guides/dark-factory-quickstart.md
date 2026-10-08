@@ -218,6 +218,36 @@ The cluster factory command performs the same check for its allowlisted reposito
 Without `--app-id`, it prints `toolchain inference skipped: no --app-id`.
 Dry-run describes the inference without reading GitHub.
 
+Factory commits are authored by the GitHub App's bot identity. Before any Helm
+call, App setup resolves `<slug>[bot]` through GitHub's user API and configures
+`worker.publication.gitUserName=<slug>[bot]` and
+`worker.publication.gitUserEmail=<id>+<slug>[bot]@users.noreply.github.com`.
+The numeric id is the bot user's id, not the App ID. Both quickstart's second
+pass and `curie cluster factory` use this identity when neither author field
+has a recorded operator value. If either field is already set, both fields
+stay unchanged.
+
+For an App already connected to the release, pass its bare slug with
+`curie cluster factory --mention <slug>` to apply the same bot author identity.
+This public user lookup needs neither a new private key nor an installation
+token. Reconfiguring intake without App credentials or `--mention` keeps the
+release's existing author configuration.
+
+To choose another author identity, set it on the release before rerunning App
+setup:
+
+```bash
+curie cluster upgrade --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
+  --set worker.publication.gitUserName='Example Operator' \
+  --set worker.publication.gitUserEmail=operator@example.com
+```
+
+The bot lookup still runs before Helm reads, including when the release has an
+operator override. If GitHub cannot return a numeric bot user id, setup exits
+3 without calling Helm and prints an author override hint. Restore access to
+the bot user lookup before retrying setup.
+
 An explicit `--model <id>` selects the implementer model instead of the
 credential's default, even when it matches the OpenRouter default. Both
 reviewers use the `opus` alias; the runner resolves it to the credential's
