@@ -66,6 +66,18 @@ def test_omitted_and_old_release_values_preserve_the_mcp_connector_peer():
     assert connector["ports"] == [{"protocol": "TCP", "port": 6379}]
 
 
+def test_null_uses_the_same_default_on_behavior_as_omission():
+    """@spec docs/superpowers/specs/2026-10-08-mcp-connector-valkey-ingress-optout.md"""
+    omitted = render()
+    explicit_null = render({"security": {"dataTierNetworkPolicy": {
+        "allowMcpConnectorValkeyIngress": None,
+    }}})
+    assert explicit_null == omitted
+    assert peer_rule(explicit_null[VALKEY_ALLOW], "mcp-connector")["ports"] == [
+        {"protocol": "TCP", "port": 6379},
+    ]
+
+
 def test_false_removes_only_the_mcp_connector_valkey_peer():
     """@spec docs/superpowers/specs/2026-10-08-mcp-connector-valkey-ingress-optout.md"""
     current = render()
@@ -84,7 +96,7 @@ def test_false_removes_only_the_mcp_connector_valkey_peer():
 
 def test_explicit_non_boolean_values_fail_chart_validation():
     """@spec docs/superpowers/specs/2026-10-08-mcp-connector-valkey-ingress-optout.md"""
-    invalid = ("false", 0, [], {}, None)
+    invalid = ("false", 0, [], {})
     for value in invalid:
         with tempfile.TemporaryDirectory() as tmp:
             values = Path(tmp) / "values.yaml"
