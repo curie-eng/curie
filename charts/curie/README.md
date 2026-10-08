@@ -1305,6 +1305,17 @@ policy. Claim 5 of the security probe verifies it empirically (an app-labeled po
 reaches each store while a non-app-labeled pod is blocked), which also catches a
 non-enforcing CNI.
 
+The Valkey allow-ingress policy also admits MCP connector pods so connector
+proxies can spend one-shot grants. Set
+`security.dataTierNetworkPolicy.allowMcpConnectorValkeyIngress: false` when
+those proxies do not need this release's in-chart Valkey. The default is
+`true`, preserving the current policy for fresh installs and older release
+values reused during upgrade. This removes only the MCP connector peer and its
+Valkey port rule; the release app peer, Valkey default-deny policy, and all
+other NetworkPolicies remain. The value must be a boolean. It does not replace
+caller-proxy preflight or the chart's NetworkPolicy verification. See
+[issue #4318](https://github.com/curie-eng/curie/issues/4318).
+
 **gVisor needs runsc on the node**, and `security.gvisor.mode` is a tri-state
 (default `auto`):
 
