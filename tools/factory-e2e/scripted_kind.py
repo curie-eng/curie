@@ -63,6 +63,7 @@ def scripted_values(
     github_api: str,
     clone_base: str,
     ca_configmap: str,
+    runner_image: str,
 ) -> dict[str, Any]:
     """Candidate chart values using only the disposable external endpoints."""
 
@@ -106,9 +107,11 @@ def scripted_values(
     values["clickhouse"] = {"deploy": False}
     values["otelCollector"] = {"deploy": False, "telemetryDisabled": True}
     values["agentSandbox"]["deploy"] = True
-    values["agentSandbox"]["runner"]["prewarm"] = {"imagePullPolicy": "Never"}
-    # The platform runner is loaded locally. The bundle layer is pushed to the
-    # owned registry and must be pulled through the node's configured mirror.
+    # The platform runner and the bundle layer both live in the owned registry
+    # and are pulled through the node's configured mirror. Naming the runner by
+    # its registry lets `curie cluster deploy` prove the layer's base.
+    values["agentSandbox"]["runner"]["image"] = runner_image
+    values["agentSandbox"]["runner"]["prewarm"] = {"imagePullPolicy": "IfNotPresent"}
     values["agentSandbox"]["runner"]["imagePullPolicy"] = "IfNotPresent"
     allowed = values["security"]["networkPolicy"]["allowedEgress"]
     allowed.append(fe.model_proxy_egress(clone_base))
@@ -353,6 +356,13 @@ class ScriptedRun:
             self.check_disk("loading candidate image")
             self.command("kind", "load", "docker-image", image, "--name", self.cluster, timeout=600)
             self.check_disk("loaded candidate image")
+        # curie build resolves the runner base with buildx imagetools, which
+        # reads a registry and never the local daemon, so the base goes to the
+        # run's own registry before the chart names it.
+        runner_image = f"{registry_ref}/curie-runner"
+        self.local_tags.append(f"{runner_image}:latest")
+        self.command("docker", "tag", "curie-runner:latest", f"{runner_image}:latest")
+        self.command("docker", "push", f"{runner_image}:latest", timeout=900)
         github = _module("factory_github_stub", REPO_ROOT / "tools/github-stub/github_stub.py")
         model = _module("factory_model_script", REPO_ROOT / "tools/model-script/model_script.py")
         recording = json.loads(
@@ -403,6 +413,7 @@ class ScriptedRun:
             github_api=self.stub.base_url + "/api/v3",
             clone_base=self.stub.base_url,
             ca_configmap="github-stub-ca",
+            runner_image=runner_image,
         )
         # Direct Helm installation follows the existing factory preflight.
         # Generate the same sealed credential/caller inputs as cluster up,
@@ -546,13 +557,7 @@ class ScriptedRun:
         bundle = self.workdir / "bundle"
         shutil.copytree(REPO_ROOT / "examples/dark-factory", bundle)
         self.check_disk("building the runner layer")
-        # curie build resolves the runner base with buildx imagetools, which
-        # reads a registry and never the local daemon, so the base goes to the
-        # run's own registry first.
         runner_base = f"{registry_ref}/curie-runner:latest"
-        self.local_tags.append(runner_base)
-        self.command("docker", "tag", "curie-runner:latest", runner_base)
-        self.command("docker", "push", runner_base, timeout=900)
         self.command(
             self.curie,
             "build",

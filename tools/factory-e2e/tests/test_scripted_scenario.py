@@ -31,9 +31,7 @@ scenario = _load()
 
 
 def _load_kind():
-    spec = importlib.util.spec_from_file_location(
-        "curie_scripted_kind", ROOT / "scripted_kind.py"
-    )
+    spec = importlib.util.spec_from_file_location("curie_scripted_kind", ROOT / "scripted_kind.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -68,7 +66,9 @@ def test_scripted_values_put_the_proxy_on_the_worker() -> None:
         github_api="https://10.9.9.9:8443/api/v3",
         clone_base="https://10.9.9.9:8443",
         ca_configmap="github-stub-ca",
+        runner_image="localhost:24111/curie-runner",
     )
+    assert values["agentSandbox"]["runner"]["image"] == "localhost:24111/curie-runner"
     assert {"name": "CURIE_MODEL_BASE_URL", "value": "http://10.1.2.3:8080"} in values["worker"][
         "extraEnv"
     ]
