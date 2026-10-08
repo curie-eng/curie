@@ -1477,20 +1477,31 @@ def test_reads_reviewer_model_settings_for_eval_boots_by_agent_id() -> None:
                     "acme-reviewer-model",
                     "high",
                     None,
+                    None,
                 )
+
+                # #4175: the step cap rides with the other eval boot settings.
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        text(f"UPDATE {_SCHEMA}.agents SET max_turns = 300 WHERE id = :id"),
+                        {"id": agent_id},
+                    )
+                assert (await resolver.model_settings_for(agent_id)).max_turns == 300
 
                 async with engine.begin() as conn:
                     await conn.execute(
                         text(
                             f"UPDATE {_SCHEMA}.agents "
                             "SET model = NULL, reviewer_model = NULL, "
-                            "thinking = NULL WHERE id = :id"
+                            "thinking = NULL, max_turns = NULL WHERE id = :id"
                         ),
                         {"id": agent_id},
                     )
 
-                assert await resolver.model_settings_for(agent_id) == (None, None, None, None)
-                assert await resolver.model_settings_for(uuid.uuid4()) == (None, None, None, None)
+                assert await resolver.model_settings_for(agent_id) == (None, None, None, None, None)
+                assert await resolver.model_settings_for(uuid.uuid4()) == (
+                    None, None, None, None, None
+                )
             finally:
                 await _cleanup(engine, [agent_id])
         finally:
@@ -2046,6 +2057,67 @@ def test_reviewer_model_resolves_on_channel_and_agent_binding_paths(
         finally:
             if agent_id is not None:
                 await _cleanup(engine, [agent_id])
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("max_turns", [300, None], ids=["override", "installation-default"])
+def test_max_turns_override_reaches_boot_env_on_channel_and_agent_binding_paths(
+    max_turns: int | None,
+) -> None:
+    """#4175: the agent row's step cap is CURIE_MAX_TURNS in its boot env.
+
+    NULL writes no key at all, so the sandbox keeps the installation's
+    agentSandbox.runner.extraEnv value (or the runner's own default) rather
+    than a worker-chosen number. A sibling agent on the same installation is
+    unaffected by the first agent's override.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        agent_ids: list[uuid.UUID] = []
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-steps-{token}"
+            sibling_channel = f"C-steps-sibling-{token}"
+            agent_id = await _seed_agent(
+                engine, channel=channel, name=f"acme-steps-{token}",
+                max_usd=None, max_tokens=None,
+            )
+            agent_ids.append(agent_id)
+            sibling_id = await _seed_agent(
+                engine, channel=sibling_channel, name=f"acme-sibling-{token}",
+                max_usd=None, max_tokens=None,
+            )
+            agent_ids.append(sibling_id)
+            for seeded in (agent_id, sibling_id):
+                await _seed_deployment(
+                    engine, agent_id=seeded, environment="prod",
+                    bundle_ref=f"bundles/{seeded.hex}.zip",
+                )
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(f"UPDATE {_SCHEMA}.agents SET max_turns = :max_turns WHERE id = :id"),
+                    {"max_turns": max_turns, "id": agent_id},
+                )
+            resolver = _resolver(engine)
+            channel_bound = await resolver.resolve("slack", None, channel)
+            agent_bound = await resolver.resolve_agent(agent_id)
+            for resolved in (channel_bound, agent_bound):
+                assert resolved is not None
+                assert resolved.max_turns == max_turns
+                env = resolver.boot_env(resolved, "steps-thread")
+                if max_turns is None:
+                    assert "CURIE_MAX_TURNS" not in env
+                else:
+                    assert env["CURIE_MAX_TURNS"] == str(max_turns)
+            sibling = await resolver.resolve("slack", None, sibling_channel)
+            assert sibling is not None
+            assert "CURIE_MAX_TURNS" not in resolver.boot_env(sibling, "sibling-thread")
+        finally:
+            await _cleanup(engine, agent_ids)
             await engine.dispose()
 
     asyncio.run(go())

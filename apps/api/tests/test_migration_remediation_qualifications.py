@@ -76,7 +76,11 @@ def test_one_hand_written_revision_on_the_assumed_parent() -> None:
 
     revision, down = _revision()
     assert (revision, down) == (HEAD, BELOW)
-    assert ScriptDirectory.from_config(alembic_config()).get_heads() == ["0098"]
+    script = ScriptDirectory.from_config(alembic_config())
+    assert len(script.get_heads()) == 1
+    assert HEAD in {
+        rev.revision for rev in script.walk_revisions(base="base", head=script.get_heads()[0])
+    }
 
 
 def test_the_record_is_keyed_by_what_it_qualifies(

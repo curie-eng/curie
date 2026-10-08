@@ -865,6 +865,14 @@ pub(crate) enum ClusterAction {
         /// Clear the execution-deadline override back to the platform default.
         #[arg(long)]
         clear_execution_deadline: bool,
+        /// Pin this agent's runner step cap, forwarded as CURIE_MAX_TURNS
+        /// (1-1000). Wins over the installation's runner.extraEnv value for
+        /// this agent only; work items keep worker.workItemMaxTurns.
+        #[arg(long)]
+        max_turns: Option<String>,
+        /// Clear the step cap override back to the installation default.
+        #[arg(long)]
+        clear_max_turns: bool,
         /// Pin runner cpu, memory, and ephemeral-storage. JSON object with
         /// requests and limits. Null on the API means the chart block.
         #[arg(long)]

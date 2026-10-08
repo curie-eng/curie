@@ -531,6 +531,8 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             clear_thinking,
             execution_deadline,
             clear_execution_deadline,
+            max_turns,
+            clear_max_turns,
             runner_resources,
             clear_runner_resources,
             memory_writes,
@@ -556,6 +558,7 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
                     execution_deadline,
                     clear_execution_deadline,
                 )?,
+                commands::OverrideChange::resolve_max_turns(max_turns, clear_max_turns)?,
                 commands::OverrideChange::resolve_runner_resources(
                     runner_resources,
                     clear_runner_resources,

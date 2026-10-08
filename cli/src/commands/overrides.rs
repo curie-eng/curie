@@ -3,6 +3,11 @@
 use super::*;
 use crate::api_requests::AgentUpdate;
 
+/// The accepted `--max-turns` range (#4175), mirroring the API's
+/// `MIN_MAX_TURNS`/`MAX_MAX_TURNS` and the `agents_max_turns_ck` check.
+const MIN_MAX_TURNS: i64 = 1;
+const MAX_MAX_TURNS: i64 = 1000;
+
 /// Which nullable override a `<tier> overrides` invocation intends to change.
 ///
 /// Three states, because the API's PATCH semantics have three (#1310): omitted
@@ -80,13 +85,15 @@ impl OverrideChange {
     /// `thinking`, which are always strings. The value has already been range
     /// checked by [`resolve_execution_deadline`](Self::resolve_execution_deadline),
     /// so the parse here cannot fail for a `Set` this function is meant to see.
-    fn patch_value_as_seconds(&self) -> Option<Option<u32>> {
+    /// `max_turns` (#4175) is the same shape, range checked by
+    /// [`resolve_max_turns`](Self::resolve_max_turns).
+    fn patch_value_as_u32(&self) -> Option<Option<u32>> {
         match self {
             OverrideChange::Unchanged => None,
             OverrideChange::Clear => Some(None),
             OverrideChange::Set(v) => Some(Some(
                 v.parse::<u32>()
-                    .expect("execution deadline Set must already be a validated integer"),
+                    .expect("an integer override Set must already be a validated integer"),
             )),
         }
     }
@@ -126,6 +133,44 @@ impl OverrideChange {
                     )));
                 }
                 Ok(OverrideChange::Set(seconds.to_string()))
+            }
+            (None, true) => Ok(OverrideChange::Clear),
+            (None, false) => Ok(OverrideChange::Unchanged),
+        }
+    }
+
+    /// Resolve the `--max-turns`/`--clear-max-turns` pair into one intent
+    /// (#4175), with the same three-way semantics as [`resolve`](Self::resolve)
+    /// plus client-side range validation.
+    ///
+    /// Args:
+    ///   value: the `--max-turns` value, if the operator passed one.
+    ///   clear: whether `--clear-max-turns` was passed.
+    ///
+    /// Returns:
+    ///   The intent, or a usage error when both were passed, the value is not
+    ///   a whole number, or it falls outside 1..=1000.
+    pub fn resolve_max_turns(value: Option<String>, clear: bool) -> Result<Self> {
+        match (value, clear) {
+            (Some(_), true) => Err(crate::exit::usage(
+                "--max-turns and --clear-max-turns contradict each other; pass one. \
+                 --clear-max-turns restores the installation default"
+                    .to_string(),
+            )),
+            (Some(v), false) => {
+                let turns: i64 = v.trim().parse().map_err(|_| {
+                    crate::exit::usage(format!(
+                        "--max-turns must be a whole number of turns between \
+                         {MIN_MAX_TURNS} and {MAX_MAX_TURNS}, got {v:?}"
+                    ))
+                })?;
+                if !(MIN_MAX_TURNS..=MAX_MAX_TURNS).contains(&turns) {
+                    return Err(crate::exit::usage(format!(
+                        "--max-turns must be between {MIN_MAX_TURNS} and {MAX_MAX_TURNS} \
+                         turns, got {turns}"
+                    )));
+                }
+                Ok(OverrideChange::Set(turns.to_string()))
             }
             (None, true) => Ok(OverrideChange::Clear),
             (None, false) => Ok(OverrideChange::Unchanged),
@@ -195,6 +240,9 @@ impl OverrideChange {
 ///   model: the intent for the model override.
 ///   reviewer_model: the intent for the reviewer model override.
 ///   thinking: the intent for the thinking override.
+///   execution_deadline: the intent for the execution deadline.
+///   max_turns: the intent for the runner step cap.
+///   runner_resources: the intent for the runner resources override.
 ///
 /// Returns:
 ///   The body to PATCH, or `None` when every intent is `Unchanged`.
@@ -203,6 +251,7 @@ pub fn overrides_patch_body(
     reviewer_model: &OverrideChange,
     thinking: &OverrideChange,
     execution_deadline: &OverrideChange,
+    max_turns: &OverrideChange,
     runner_resources: &OverrideChange,
 ) -> Option<AgentUpdate> {
     let all_unchanged = [
@@ -210,6 +259,7 @@ pub fn overrides_patch_body(
         reviewer_model,
         thinking,
         execution_deadline,
+        max_turns,
         runner_resources,
     ]
     .iter()
@@ -221,7 +271,8 @@ pub fn overrides_patch_body(
         model: model.patch_value(),
         reviewer_model: reviewer_model.patch_value(),
         thinking: thinking.patch_value(),
-        execution_deadline_seconds: execution_deadline.patch_value_as_seconds(),
+        execution_deadline_seconds: execution_deadline.patch_value_as_u32(),
+        max_turns: max_turns.patch_value_as_u32(),
         runner_resources: runner_resources.patch_value_as_object(),
         ..AgentUpdate::default()
     })
@@ -251,6 +302,7 @@ fn patch_body_json(body: &AgentUpdate) -> Result<serde_json::Value> {
 ///   reviewer_model: the stored reviewer override, `None` when the credential default applies.
 ///   thinking: the stored thinking override, same convention.
 ///   execution_deadline_seconds: the stored deadline override, same convention.
+///   max_turns: the stored step cap override, `None` for the installation default.
 ///   runner_resources: the stored runner resources override, same convention.
 ///   memory_writes: whether the agent's memory tools are on (#1461).
 ///   changed: whether this invocation wrote, as opposed to inspecting.
@@ -264,6 +316,7 @@ pub fn overrides_summary(
     reviewer_model: &Option<String>,
     thinking: &Option<String>,
     execution_deadline_seconds: &Option<u32>,
+    max_turns: &Option<u32>,
     runner_resources: &Option<serde_json::Value>,
     memory_writes: bool,
     changed: bool,
@@ -273,6 +326,9 @@ pub fn overrides_summary(
     let deadline = execution_deadline_seconds
         .map(|s| format!("{s} s"))
         .unwrap_or_else(|| "platform default".to_string());
+    let steps = max_turns
+        .map(|n| format!("{n} turns"))
+        .unwrap_or_else(|| "installation default".to_string());
     let resources = runner_resources
         .as_ref()
         .map(|value| value.to_string())
@@ -282,7 +338,7 @@ pub fn overrides_summary(
     let verb = if changed { " now" } else { "" };
     let writes = if memory_writes { "on" } else { "off" };
     format!(
-        "overrides for {agent}{verb}: model {}, reviewer model {reviewer}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}",
+        "overrides for {agent}{verb}: model {}, reviewer model {reviewer}, thinking {}, execution deadline {deadline}, max turns {steps}, runner resources {resources}, memory writes {writes}",
         show(model),
         show(thinking)
     )
@@ -307,6 +363,7 @@ pub enum OverridesOutput {
         reviewer_model: Option<String>,
         thinking: Option<String>,
         execution_deadline_seconds: Option<u32>,
+        max_turns: Option<u32>,
         runner_resources: Option<serde_json::Value>,
         memory_writes: bool,
         changed: bool,
@@ -323,6 +380,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 reviewer_model,
                 thinking,
                 execution_deadline_seconds,
+                max_turns,
                 runner_resources,
                 memory_writes,
                 changed,
@@ -332,6 +390,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 "reviewer_model": reviewer_model,
                 "thinking": thinking,
                 "execution_deadline_seconds": execution_deadline_seconds,
+                "max_turns": max_turns,
                 "runner_resources": runner_resources,
                 "memory_writes": memory_writes,
                 "changed": changed,
@@ -348,6 +407,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 reviewer_model,
                 thinking,
                 execution_deadline_seconds,
+                max_turns,
                 runner_resources,
                 memory_writes,
                 changed,
@@ -358,6 +418,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                     reviewer_model,
                     thinking,
                     execution_deadline_seconds,
+                    max_turns,
                     runner_resources,
                     *memory_writes,
                     *changed,
@@ -367,7 +428,8 @@ impl crate::ui::CliOutput for OverridesOutput {
     }
 }
 
-/// `curie <tier> overrides <agent>` sets or clears model, reviewer and thinking overrides.
+/// `curie <tier> overrides <agent>` sets or clears the per-agent operator overrides:
+/// model, reviewer, thinking, execution deadline, step cap and runner resources.
 ///
 /// With no change flags this INSPECTS: one `GET`-resolved agent, no write. With
 /// any change flag it PATCHes only the fields named, then reports the row as the
@@ -386,6 +448,9 @@ impl crate::ui::CliOutput for OverridesOutput {
 ///   model: the intent for the model override.
 ///   reviewer_model: the intent for the reviewer model override.
 ///   thinking: the intent for the thinking override.
+///   execution_deadline: the intent for the execution deadline.
+///   max_turns: the intent for the runner step cap.
+///   runner_resources: the intent for the runner resources override.
 ///
 /// Returns:
 ///   The stored overrides, or the dry-run plan.
@@ -395,6 +460,7 @@ pub async fn overrides(
     reviewer_model: OverrideChange,
     thinking: OverrideChange,
     execution_deadline: OverrideChange,
+    max_turns: OverrideChange,
     runner_resources: OverrideChange,
 ) -> Result<OverridesOutput> {
     overrides_with_memory_writes(
@@ -403,6 +469,7 @@ pub async fn overrides(
         reviewer_model,
         thinking,
         execution_deadline,
+        max_turns,
         runner_resources,
         None,
     )
@@ -428,17 +495,20 @@ pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
 ///   reviewer_model: the intent for the reviewer model override.
 ///   thinking: the intent for the thinking override.
 ///   execution_deadline: the intent for the execution deadline.
+///   max_turns: the intent for the runner step cap.
 ///   runner_resources: the intent for the runner resources override.
 ///   memory_writes: the new memory-writes switch, if one was asked for.
 ///
 /// Returns:
 ///   The stored overrides, or the dry-run plan.
+#[allow(clippy::too_many_arguments)] // One intent per independently writable operator override.
 pub async fn overrides_with_memory_writes(
     opts: AgentActionOpts,
     model: OverrideChange,
     reviewer_model: OverrideChange,
     thinking: OverrideChange,
     execution_deadline: OverrideChange,
+    max_turns: OverrideChange,
     runner_resources: OverrideChange,
     memory_writes: Option<bool>,
 ) -> Result<OverridesOutput> {
@@ -448,6 +518,7 @@ pub async fn overrides_with_memory_writes(
         &reviewer_model,
         &thinking,
         &execution_deadline,
+        &max_turns,
         &runner_resources,
     );
     if let Some(on) = memory_writes {
@@ -481,6 +552,7 @@ pub async fn overrides_with_memory_writes(
             reviewer_model: agent.reviewer_model,
             thinking: agent.thinking,
             execution_deadline_seconds: agent.execution_deadline_seconds,
+            max_turns: agent.max_turns,
             runner_resources: agent.runner_resources,
             memory_writes: agent.memory_writes,
             changed: false,
@@ -504,6 +576,7 @@ pub async fn overrides_with_memory_writes(
         reviewer_model: saved.reviewer_model,
         thinking: saved.thinking,
         execution_deadline_seconds: saved.execution_deadline_seconds,
+        max_turns: saved.max_turns,
         runner_resources: saved.runner_resources,
         memory_writes: saved.memory_writes,
         changed: true,
@@ -704,6 +777,7 @@ mod overrides_tests {
             reviewer_model,
             thinking,
             execution_deadline,
+            &OverrideChange::Unchanged,
             runner_resources,
         )
         .map(|body| super::patch_body_json(&body).expect("encodes"))
@@ -794,12 +868,13 @@ mod overrides_tests {
             &None,
             &None,
             &None,
+            &None,
             false,
             false,
         );
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, reviewer model credential default, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off"
+            "overrides for a: model kimi-k2, reviewer model credential default, thinking platform default, execution deadline platform default, max turns installation default, runner resources platform default, memory writes off"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -813,11 +888,12 @@ mod overrides_tests {
                 &None,
                 &Some("adaptive".into()),
                 &Some(90),
+                &Some(300),
                 &None,
                 true,
                 true
             ),
-            "overrides for a now: model platform default, reviewer model credential default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on"
+            "overrides for a now: model platform default, reviewer model credential default, thinking adaptive, execution deadline 90 s, max turns 300 turns, runner resources platform default, memory writes on"
         );
     }
 
@@ -966,6 +1042,61 @@ mod overrides_tests {
         let msg = err.to_string();
         assert!(msg.contains("--execution-deadline"), "{msg}");
         assert!(msg.contains("--clear-execution-deadline"), "{msg}");
+    }
+
+    // --- `--max-turns`/`--clear-max-turns` (issue #4175) --------------------
+
+    fn max_turns_wire(max_turns: &OverrideChange) -> Option<serde_json::Value> {
+        overrides_patch_body(
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
+            max_turns,
+            &OverrideChange::Unchanged,
+        )
+        .map(|body| super::patch_body_json(&body).expect("encodes"))
+    }
+
+    #[test]
+    fn a_set_max_turns_is_a_json_number_alone_in_the_body() {
+        let body = max_turns_wire(
+            &OverrideChange::resolve_max_turns(Some(" 300 ".into()), false).unwrap(),
+        )
+        .expect("a set is a write");
+        assert_eq!(body, serde_json::json!({"max_turns": 300}));
+    }
+
+    #[test]
+    fn a_cleared_max_turns_is_present_and_null() {
+        let body = max_turns_wire(&OverrideChange::Clear).expect("a clear is a write");
+        assert_eq!(body, serde_json::json!({"max_turns": null}));
+    }
+
+    #[test]
+    fn max_turns_bounds_are_inclusive_and_outside_values_are_refused() {
+        for ok in ["1", "1000"] {
+            assert_eq!(
+                OverrideChange::resolve_max_turns(Some(ok.into()), false).unwrap(),
+                OverrideChange::Set(ok.into())
+            );
+        }
+        for bad in ["0", "1001", "-1", "many", "2.5", ""] {
+            let err = OverrideChange::resolve_max_turns(Some(bad.into()), false)
+                .expect_err("an out of range or non-integer cap must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains("--max-turns"), "{msg}");
+            assert!(msg.contains("1000"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn setting_and_clearing_max_turns_together_is_a_usage_error() {
+        let err = OverrideChange::resolve_max_turns(Some("300".into()), true)
+            .expect_err("contradictory flags must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("--max-turns"), "{msg}");
+        assert!(msg.contains("--clear-max-turns"), "{msg}");
     }
 }
 

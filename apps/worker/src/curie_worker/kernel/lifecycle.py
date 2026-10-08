@@ -893,12 +893,13 @@ async def _process_event(
             if self._config.shimmer:
                 await self._set_shimmer(qevent, route, packs)
 
-        # Work-item turn budget (#3071). A factory execution runs far more
-        # tool turns than a chat reply, so ONLY a work-item delivery raises
-        # the runner's turn cap; every other delivery carries no
-        # CURIE_MAX_TURNS and keeps the runner default. Placed after every
-        # boot-env build site so both the targetless and the bound paths
-        # carry it.
+        # Work-item turn budget (#3071, ADR 0171). A factory execution runs
+        # far more tool turns than a chat reply, so a work-item delivery boots
+        # with worker.workItemMaxTurns. Every other delivery keeps what the
+        # binding wrote: the agent's step cap override when it has one (#4175),
+        # otherwise no CURIE_MAX_TURNS and the runner's installation default.
+        # Placed after every boot-env build site so both the targetless and the
+        # bound paths carry it, and so it replaces an agent override.
         if owned_work_item_id is not None and boot_env is not None:
             boot_env[MAX_TURNS_ENV] = str(self._config.work_item_max_turns)
 
@@ -1317,6 +1318,7 @@ async def _process_event(
                             "not retrying automatically.",
                             token,
                             delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
+                            work_item=owned_work_item_id is not None,
                         ),
                         detail=outcome.error_message,
                     ),
@@ -1387,6 +1389,7 @@ async def _process_event(
                             f"The run failed ({token}) after {attempt} attempt(s).",
                             token,
                             delivered_max_turns=(boot_env or {}).get(MAX_TURNS_ENV),
+                            work_item=owned_work_item_id is not None,
                         ),
                         detail=outcome.error_message,
                     ),

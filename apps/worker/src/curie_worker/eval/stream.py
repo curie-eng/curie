@@ -63,6 +63,7 @@ from ..binding import (
     BUDGET_ENV,
     BUNDLE_REF_ENV,
     BUNDLE_VERSION_ENV,
+    MAX_TURNS_ENV,
     PLUGIN_DIR_ENV,
     RUNNER_TOKEN_ENV,
     SESSION_ID_ENV,
@@ -550,8 +551,9 @@ class EvalStreamConsumer(StreamConsumer):
         reviewer_model: str | None = None
         thinking: str | None = None
         runner_resources: dict[str, Any] | None = None
+        max_turns: int | None = None
         if item.target_url is None:
-            stored_model, reviewer_model, thinking, runner_resources = (
+            stored_model, reviewer_model, thinking, runner_resources, max_turns = (
                 await self._repo_lookup.model_settings_for(item.agent_id)
             )
             resolved_model = (
@@ -593,6 +595,7 @@ class EvalStreamConsumer(StreamConsumer):
             reviewer_model=reviewer_model,
             thinking=thinking,
             runner_resources=runner_resources,
+            max_turns=max_turns,
         )
         if base_url is None:
             return await self._report_failed(
@@ -713,6 +716,7 @@ class EvalStreamConsumer(StreamConsumer):
         reviewer_model: str | None,
         thinking: str | None,
         runner_resources: dict[str, Any] | None = None,
+        max_turns: int | None = None,
     ) -> tuple[str | None, str | None, str | None]:
         if item.target_url is not None:
             # dev/test shortcut: eval a given runner. Not a claim of ours, so no
@@ -724,7 +728,12 @@ class EvalStreamConsumer(StreamConsumer):
             name_for = getattr(self._repo_lookup, "name_for", None)
             agent_name = await name_for(item.agent_id) if name_for is not None else None
             env = self._boot_env(
-                item, connector_secrets, thinking, model=model, reviewer_model=reviewer_model
+                item,
+                connector_secrets,
+                thinking,
+                model=model,
+                reviewer_model=reviewer_model,
+                max_turns=max_turns,
             )
             # Hold a claim slot only across creation/binding (the flood source),
             # not the whole suite run: the semaphore is released the moment the
@@ -779,6 +788,7 @@ class EvalStreamConsumer(StreamConsumer):
         *,
         model: str | None,
         reviewer_model: str | None,
+        max_turns: int | None = None,
     ) -> dict[str, str]:
         budget = Budget(
             max_output_tokens_per_run=self._config.default_max_output_tokens_per_run,
@@ -811,6 +821,11 @@ class EvalStreamConsumer(StreamConsumer):
             reviewer_model_override=reviewer_model,
             thinking_override=thinking,
         )
+        # The agent's step cap (#4175), as the bound run's boot env carries it:
+        # written after the connector secrets, absent when the agent keeps the
+        # installation default.
+        if max_turns is not None:
+            env[MAX_TURNS_ENV] = str(max_turns)
         return env
 
     async def _report_failed(

@@ -1177,6 +1177,17 @@
             "title": "Id",
             "type": "string"
           },
+          "max_turns": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Turns"
+          },
           "memory": {
             "title": "Memory",
             "type": "boolean"
@@ -1434,6 +1445,19 @@
               }
             ],
             "title": "Hook Partitions"
+          },
+          "max_turns": {
+            "anyOf": [
+              {
+                "maximum": 1000.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Turns"
           },
           "memory": {
             "anyOf": [

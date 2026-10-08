@@ -74,31 +74,44 @@ def _display_error_classification(raw: str | None) -> str:
     return map_error_classification(raw)
 
 
-def _max_turns_guidance(delivered_max_turns: str | None) -> str:
-    """Name the turn limit this delivery actually ran under (#3403).
+def _max_turns_guidance(delivered_max_turns: str | None, *, work_item: bool) -> str:
+    """Name the turn limit this delivery actually ran under (#3403, #4175).
 
-    Only a work-item delivery writes CURIE_MAX_TURNS into the boot env, from
-    worker.workItemMaxTurns. Every other delivery runs under the runner's own
-    CURIE_MAX_TURNS, which the operator sets through runner.extraEnv.
+    A work-item delivery writes CURIE_MAX_TURNS into the boot env from
+    worker.workItemMaxTurns (ADR 0171). Any other delivery carries it only when
+    its agent has a step cap override (``curie <tier> overrides --max-turns``);
+    without one the runner keeps the installation's CURIE_MAX_TURNS from
+    runner.extraEnv, else its own default.
     """
 
-    if delivered_max_turns is not None:
+    if work_item and delivered_max_turns is not None:
         return (
             f"The work item used its whole turn budget of {delivered_max_turns} "
             "turns; raise worker.workItemMaxTurns (CURIE_WORK_ITEM_MAX_TURNS, "
             f"currently {delivered_max_turns}) to allow more turns."
         )
+    if delivered_max_turns is not None:
+        return (
+            f"The run used this agent's whole step cap of {delivered_max_turns} "
+            "turns; raise it with `curie <local|cluster> overrides <agent> --max-turns <n>` "
+            "(at most 1000), or clear it with --clear-max-turns to return to the "
+            "installation default."
+        )
     return (
         "The run used the runner's whole turn budget; raise CURIE_MAX_TURNS "
         "through runner.extraEnv (runner default "
-        f"{constants._RUNNER_DEFAULT_MAX_TURNS} when unset) to allow more turns. "
+        f"{constants._RUNNER_DEFAULT_MAX_TURNS} when unset) to allow more turns, "
+        "or raise it for this agent alone with "
+        "`curie <local|cluster> overrides <agent> --max-turns <n>`. "
         "worker.workItemMaxTurns applies only to work items."
     )
 
 
-def _with_guidance(lead: str, token: str, *, delivered_max_turns: str | None) -> str:
+def _with_guidance(
+    lead: str, token: str, *, delivered_max_turns: str | None, work_item: bool = False
+) -> str:
     if token == "max-turns":
-        guidance: str | None = _max_turns_guidance(delivered_max_turns)
+        guidance: str | None = _max_turns_guidance(delivered_max_turns, work_item=work_item)
     else:
         guidance = constants._CLASSIFICATION_GUIDANCE.get(token)
     return f"{lead} {guidance}" if guidance else lead

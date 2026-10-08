@@ -538,6 +538,185 @@ fn execution_deadline_above_the_maximum_is_refused_client_side() {
     );
 }
 
+// --- `--max-turns`/`--clear-max-turns` (issue #4175) -----------------------
+//
+// The runner step cap for one agent. The wire field is `max_turns`, a JSON
+// NUMBER in 1..=1000; clear is an explicit null that returns the agent to the
+// installation default (runner.extraEnv CURIE_MAX_TURNS, else the runner's 20).
+
+/// A step cap inside the accepted 1..=1000 range, and well above the runner's
+/// default of 20.
+const MAX_TURNS_SENTINEL: &str = "300";
+
+fn tier_args(tier: &'static str) -> Vec<&'static str> {
+    match tier {
+        "local" => vec!["local", "overrides", "deal-desk"],
+        _ => vec![
+            "cluster",
+            "overrides",
+            "deal-desk",
+            "--api-url",
+            "http://127.0.0.1:9",
+            "--api-key",
+            "curie-test-key",
+        ],
+    }
+}
+
+#[test]
+fn max_turns_set_and_clear_bind_to_their_own_patch_field_at_both_tiers() {
+    for tier in ["local", "cluster"] {
+        let mut set = tier_args(tier);
+        set.extend(["--max-turns", MAX_TURNS_SENTINEL, "--dry-run", "--json"]);
+        let plan = dry_run_plan_line(&set);
+        assert_eq!(
+            patch_body(&plan),
+            serde_json::json!({"max_turns": 300}),
+            "{tier}: --max-turns must send a JSON number under its own key: {plan}"
+        );
+
+        let mut clear = tier_args(tier);
+        clear.extend(["--clear-max-turns", "--dry-run", "--json"]);
+        let plan = dry_run_plan_line(&clear);
+        assert_eq!(
+            patch_body(&plan),
+            serde_json::json!({"max_turns": null}),
+            "{tier}: --clear-max-turns must null `max_turns`: {plan}"
+        );
+
+        let mut beside = tier_args(tier);
+        beside.extend([
+            "--max-turns",
+            MAX_TURNS_SENTINEL,
+            "--execution-deadline",
+            DEADLINE_SENTINEL,
+            "--dry-run",
+            "--json",
+        ]);
+        let plan = dry_run_plan_line(&beside);
+        assert_eq!(
+            patch_body(&plan),
+            serde_json::json!({"max_turns": 300, "execution_deadline_seconds": 120}),
+            "{tier}: --max-turns must not borrow the deadline's key: {plan}"
+        );
+    }
+}
+
+#[test]
+fn an_invalid_max_turns_is_refused_before_any_request_at_both_tiers() {
+    for tier in ["local", "cluster"] {
+        for bad in ["0", "1001", "-5", "lots", "2.5", ""] {
+            let mut argv = tier_args(tier);
+            argv.extend(["--max-turns", bad, "--dry-run", "--json"]);
+            usage_refused(&argv);
+        }
+        let mut both = tier_args(tier);
+        both.extend([
+            "--max-turns",
+            MAX_TURNS_SENTINEL,
+            "--clear-max-turns",
+            "--dry-run",
+            "--json",
+        ]);
+        usage_refused(&both);
+    }
+}
+
+#[test]
+fn max_turns_bounds_are_accepted() {
+    for value in ["1", "1000"] {
+        let mut argv = tier_args("local");
+        argv.extend(["--max-turns", value, "--dry-run", "--json"]);
+        let plan = dry_run_plan_line(&argv);
+        assert_eq!(
+            patch_body(&plan),
+            serde_json::json!({"max_turns": value.parse::<u32>().unwrap()}),
+            "{plan}"
+        );
+    }
+}
+
+#[test]
+fn max_turns_set_inspect_and_clear_round_trip_at_both_tiers() {
+    for tier in ["local", "cluster"] {
+        let mut initial: serde_json::Value = serde_json::from_str(&mw_agent_json(true)).unwrap();
+        initial["max_turns"] = serde_json::Value::Null;
+        let stored = std::sync::Arc::new(std::sync::Mutex::new(initial));
+        let state = std::sync::Arc::clone(&stored);
+        let server = serve(move |req| {
+            let mut state = state.lock().unwrap();
+            match (req.method.as_str(), req.path.as_str()) {
+                ("GET", "/agents") => {
+                    Response::json(200, &serde_json::json!([state.clone()]).to_string())
+                }
+                ("PATCH", p) if *p == format!("/agents/{MW_AGENT_ID}") => {
+                    let patch: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                    state
+                        .as_object_mut()
+                        .unwrap()
+                        .extend(patch.as_object().unwrap().clone());
+                    Response::json(200, &state.to_string())
+                }
+                _ => Response::json(404, r#"{"detail":"not found"}"#),
+            }
+        });
+        let run = |flags: &[&str]| {
+            let output = Command::new(bin())
+                .args([tier, "overrides", "deal-desk"])
+                .args(flags)
+                .args(["--api-url", &server.base_url, "--api-key", "k", "--json"])
+                .env_remove("CURIE_API_URL")
+                .env_remove("CURIE_API_KEY")
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("no_proxy", "127.0.0.1,localhost")
+                .output()
+                .expect("run max turns override");
+            assert!(
+                output.status.success(),
+                "{tier}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            json_of(&String::from_utf8_lossy(&output.stdout))
+        };
+
+        let before = run(&[]);
+        assert_eq!(before["max_turns"], serde_json::Value::Null);
+        assert_eq!(before["changed"], false);
+
+        let raised = run(&["--max-turns", MAX_TURNS_SENTINEL]);
+        assert_eq!(raised["max_turns"], 300);
+        assert_eq!(
+            raised["model"], "kimi-k2",
+            "a sibling override is untouched"
+        );
+        assert_eq!(raised["changed"], true);
+
+        let inspected = run(&[]);
+        assert_eq!(inspected["max_turns"], 300);
+        assert_eq!(inspected["changed"], false);
+
+        let cleared = run(&["--clear-max-turns"]);
+        assert_eq!(cleared["max_turns"], serde_json::Value::Null);
+        assert_eq!(cleared["changed"], true);
+
+        let patches: Vec<_> = server
+            .recorded()
+            .into_iter()
+            .filter(|request| request.method == "PATCH")
+            .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+            .collect();
+        assert_eq!(
+            patches,
+            vec![
+                serde_json::json!({"max_turns": 300}),
+                serde_json::json!({"max_turns": null}),
+            ],
+            "{tier}: only the two writes PATCH, each under its own key"
+        );
+    }
+}
+
 // --- `--memory-writes on|off` (issue #1461) ---------------------------------
 //
 // `memory_writes` is a NOT NULL boolean on the agent, so the flag takes an

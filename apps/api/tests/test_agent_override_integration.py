@@ -449,3 +449,86 @@ def test_reviewer_model_omission_and_clear_preserve_the_implementer_override(
     stored = _read(client, auth_headers, agent["id"])
     assert stored["reviewer_model"] is None
     assert stored["model"] == "acme-implementer-model"
+
+
+# --- max_turns (#4175): the runner step cap for one agent ---------------------
+#
+# Same three-way PATCH contract as `execution_deadline_seconds`: omitted leaves
+# it, explicit null clears it back to the installation default (the runner's
+# CURIE_MAX_TURNS from agentSandbox.runner.extraEnv, else the runner's own 20),
+# and an integer in 1..1000 pins it for this agent only.
+
+
+def _create_max_turns_agent(
+    client: Any,
+    auth_headers: dict[str, str],
+    *,
+    name: str = "acme-steps",
+    address: str = "C0EXAMPLESTEPS",
+) -> dict[str, Any]:
+    return _create_agent(client, auth_headers, name=name, address=address)
+
+
+def test_agent_defaults_to_null_max_turns(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent = _create_max_turns_agent(client, auth_headers)
+    assert agent["max_turns"] is None
+    assert _read(client, auth_headers, agent["id"])["max_turns"] is None
+
+
+def test_patch_sets_max_turns_for_one_agent_and_explicit_null_clears_it(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    raised = _create_max_turns_agent(client, auth_headers)
+    other = _create_max_turns_agent(
+        client, auth_headers, name="acme-other", address="C0EXAMPLEOTHER"
+    )
+    resp = _patch(client, auth_headers, raised["id"], {"max_turns": 300})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["max_turns"] == 300
+    assert _read(client, auth_headers, raised["id"])["max_turns"] == 300
+    # The override is per agent: a sibling on the same installation keeps the
+    # default.
+    assert _read(client, auth_headers, other["id"])["max_turns"] is None
+
+    resp = _patch(client, auth_headers, raised["id"], {"max_turns": None})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["max_turns"] is None
+    assert _read(client, auth_headers, raised["id"])["max_turns"] is None
+
+
+def test_patch_omitting_max_turns_leaves_it_unchanged(
+    client: Any, auth_headers: dict[str, str], clean_db: None
+) -> None:
+    agent = _create_max_turns_agent(client, auth_headers)
+    assert _patch(client, auth_headers, agent["id"], {"max_turns": 250}).status_code == 200
+    resp = _patch(client, auth_headers, agent["id"], {"execution_deadline_seconds": 90})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["max_turns"] == 250
+    assert _read(client, auth_headers, agent["id"])["max_turns"] == 250
+
+
+@pytest.mark.parametrize("value", [1, 1000], ids=["lower-bound", "upper-bound"])
+def test_patch_accepts_the_max_turns_bounds(
+    client: Any, auth_headers: dict[str, str], clean_db: None, value: int
+) -> None:
+    agent = _create_max_turns_agent(client, auth_headers)
+    resp = _patch(client, auth_headers, agent["id"], {"max_turns": value})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["max_turns"] == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, 1001, -1, "many", 2.5, True],
+    ids=["zero", "above-upper-bound", "negative", "string", "fraction", "boolean"],
+)
+def test_patch_rejects_an_invalid_max_turns_and_keeps_the_stored_value(
+    client: Any, auth_headers: dict[str, str], clean_db: None, value: Any
+) -> None:
+    agent = _create_max_turns_agent(client, auth_headers)
+    assert _patch(client, auth_headers, agent["id"], {"max_turns": 40}).status_code == 200
+    resp = _patch(client, auth_headers, agent["id"], {"max_turns": value})
+    assert resp.status_code == 422, resp.text
+    assert _read(client, auth_headers, agent["id"])["max_turns"] == 40

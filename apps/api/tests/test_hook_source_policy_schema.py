@@ -240,8 +240,9 @@ def test_source_policy_additive_upgrade_preserves_existing_agent(
     after = sql_dicts("SELECT * FROM curie.agents WHERE id = :id", {"id": agent_id})
     assert len(before) == len(after) == 1
     assert "deploy_notifications" not in before[0]
-    assert set(after[0]) == set(before[0]) | {"deploy_notifications", "reviewer_model"}
+    assert set(after[0]) == set(before[0]) | {"deploy_notifications", "reviewer_model", "max_turns"}
     assert {name: after[0][name] for name in before[0]} == before[0]
     assert after[0]["deploy_notifications"] is False
     assert after[0]["reviewer_model"] is None
+    assert after[0]["max_turns"] is None
     assert sql_dicts("SELECT * FROM curie.hook_source_policies") == []

@@ -139,6 +139,15 @@ async def update_agent_execution_deadline(
     return agent
 
 
+async def update_agent_max_turns(
+    session: AsyncSession, agent: Agent, max_turns: int | None
+) -> Agent:
+    agent.max_turns = max_turns
+    await session.commit()
+    await session.refresh(agent)
+    return agent
+
+
 async def update_agent_runner_resources(
     session: AsyncSession, agent: Agent, resources: dict[str, Any] | None
 ) -> Agent:
