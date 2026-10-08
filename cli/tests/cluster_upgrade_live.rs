@@ -3621,7 +3621,19 @@ fn operator_file_stock_binding_is_rebound_in_the_admitted_apply_overlay() {
         Some(&serde_json::json!(777)),
         "the unrelated file value survives the rebind: {applied}"
     );
-    for path in fixture.captured_paths("render-values") {
+    let schema_values = fixture.captured_paths("schema-values");
+    assert_eq!(
+        schema_values.len(),
+        1,
+        "schema admission did not capture exactly one overlay: {schema_values:?}"
+    );
+    let render_values = fixture.captured_paths("render-values");
+    assert_eq!(
+        render_values.len(),
+        1,
+        "timeout admission did not capture exactly one overlay: {render_values:?}"
+    );
+    for path in schema_values.into_iter().chain(render_values) {
         let admitted: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(
             admitted, applied,

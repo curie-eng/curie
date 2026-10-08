@@ -880,6 +880,9 @@ if program == "helm":
                     show_only = arg.split("=", 1)[1]
                     break
         if show_only == "templates/schema-compat.yaml":
+            values_file = flag_value("-f")
+            if values_file:
+                capture("schema-values", ".json", values_file)
             metadata = scenario["compat_metadata"] or DEFAULT_COMPAT_METADATA
             payload = (
                 metadata
