@@ -456,9 +456,12 @@ mod tests {
         assert!(live_in_window("0088", &current));
         assert!(live_in_window("0089", &current));
         assert!(live_in_window("0090", &current));
-        assert!(live_in_window("0091", &current));
-        assert!(live_in_window("0092", &current));
-        assert!(live_in_window("0093", &current));
+        assert!(live_in_window("0091a", &current));
+        assert!(live_in_window("0092a", &current));
+        assert!(live_in_window("0093a", &current));
+        assert!(!live_in_window("0091", &current));
+        assert!(!live_in_window("0092", &current));
+        assert!(!live_in_window("0093", &current));
         assert!(live_in_window("0094", &current));
         assert!(live_in_window("0095", &current));
         assert!(live_in_window("0096", &current));

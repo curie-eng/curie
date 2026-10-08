@@ -1,4 +1,6 @@
+import json
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -55,6 +57,28 @@ def test_real_migration_tree_has_one_reported_head() -> None:
     assert expected_head is not None
     assert result.returncode == 0, result.stderr
     assert expected_head in result.stdout
+
+
+def test_feature_chain_can_join_stable_execution_request_revisions(tmp_path: Path) -> None:
+    """Stable and feature migrations must retain distinct identities at the join."""
+    # Stable graph pinned at public commit 15ebb08a7. These declarations model
+    # graph identity only; the migration tests separately exercise real DDL.
+    tree = tmp_path / "alembic"
+    shutil.copytree(ALEMBIC_TREE, tree, ignore=shutil.ignore_patterns("__pycache__"))
+    _write_revision(tree, "0091_execution_request_owner_lost_retry.py", "0091", "0081")
+    _write_revision(tree, "0092_execution_request_start_deferrals.py", "0092", "0091")
+    _write_revision(tree, "0093_factory_status_sync_lease.py", "0093", "0092")
+    # Do not load the feature graph before the checker: a reversed rename can
+    # leave a missing parent, and the gate must diagnose collisions first.
+    feature_head = json.loads(
+        (REPO_ROOT / "cli/src/application_schema_windows.json").read_text()
+    )["candidate"]["schema_head"]
+    _write_revision(tree, "0098a_probe_merge.py", "0098a", ("0093", feature_head))
+
+    result = _run_gate(tree)
+
+    assert result.returncode == 0, result.stderr
+    assert "head 0098a" in result.stdout
 
 
 def test_duplicate_numeric_filename_prefix_fails_before_graph_validation(

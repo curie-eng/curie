@@ -47,7 +47,7 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.2"] == {"schema_min": "0076", "schema_head": "0081"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == candidate
-    assert catalog["revisions"][-7:] == ["0092", "0093", "0094", "0095", "0096", "0097", "0098"]
+    assert catalog["revisions"][-7:] == ["0092a", "0093a", "0094", "0095", "0096", "0097", "0098"]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(
         (Path(__file__).parent / "fixtures/source_schema_prior_windows.json").read_text()
