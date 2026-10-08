@@ -803,6 +803,41 @@ def test_cargo_dependency_identity_uses_the_renamed_package(
 
 
 @pytest.mark.parametrize(
+    ("basename", "before", "addition"),
+    [
+        (
+            "Cargo.toml",
+            '[dependencies]\nhyphen-alias = { package = "acme-base", version = "1.0.0", '
+            'git = "https://example.com/acme-hyphen.git" }\n',
+            'underscore-alias = { package = "acme_base", version = "1.0.0", '
+            'git = "https://example.com/acme-underscore.git" }\n',
+        ),
+        (
+            "Cargo.lock",
+            'version = 4\n[[package]]\nname = "acme-base"\nversion = "1.0.0"\n'
+            'source = "git+https://example.com/acme-hyphen.git#'
+            'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"\n',
+            '[[package]]\nname = "acme_base"\nversion = "1.0.0"\n'
+            'source = "git+https://example.com/acme-underscore.git#'
+            'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"\n',
+        ),
+    ],
+)
+@pytest.mark.parametrize("version_only", [False, True], ids=["new-name", "version-only"])
+def test_cargo_git_dependency_names_remain_exact(
+    tmp_path: Path, basename: str, before: str, addition: str, version_only: bool
+) -> None:
+    path = f"nested/{basename}"
+    if version_only:
+        before += addition
+        _validate_dependency_snapshot(
+            tmp_path, {path: before}, {path: before.replace("1.0.0", "2.0.0")}
+        )
+    else:
+        _assert_dependency_refusal(tmp_path, {path: before}, {path: before + addition}, path)
+
+
+@pytest.mark.parametrize(
     ("basename", "contents"),
     [
         (
