@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 _HEARTBEAT_TRANSPORT_FAILURES = 3
 _MIN_HEARTBEAT_INTERVAL_S = 1.0
+_ACQUIRE_RENEW_INTERVAL_S = 20.0
+_renew_sleep = asyncio.sleep
 
 
 class WorkItemConflict(Exception):
@@ -594,8 +596,14 @@ class WorkItemRun:
         self._on_stale = on_stale
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._stopping = False
+        self._deferred = False
+        self._acquire_renew_task: asyncio.Task[None] | None = asyncio.create_task(
+            self._acquire_renew_loop(),
+            name=f"work-item-acquire-renew-{self.request_id}",
+        )
 
     async def defer(self, reason: str, *, capacity: bool) -> None:
+        self._deferred = True
         terminal_cause = await self._client.defer(
             self.request_id,
             owner=self.owner,
@@ -675,7 +683,22 @@ class WorkItemRun:
         self.finished = True
 
     async def close(self) -> None:
-        """Drop the heartbeat. A stop already in flight is allowed to finish."""
+        """Drop renewal and heartbeat. A stop in flight is allowed to finish."""
+
+        renew_task = self._acquire_renew_task
+        self._acquire_renew_task = None
+        if renew_task is not None:
+            renew_task.cancel()
+            try:
+                await renew_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.warning(
+                    "work-item acquire renewal for %s ended with an error",
+                    self.request_id,
+                    exc_info=True,
+                )
 
         task = self._heartbeat_task
         self._heartbeat_task = None
@@ -693,6 +716,28 @@ class WorkItemRun:
                 self.request_id,
                 exc_info=True,
             )
+
+    async def _acquire_renew_loop(self) -> None:
+        while not (self.started or self.finished or self._stopping or self._deferred):
+            await _renew_sleep(_ACQUIRE_RENEW_INTERVAL_S)
+            if self.started or self.finished or self._stopping or self._deferred:
+                return
+            try:
+                await self._client.acquire(
+                    self.request_id, owner=self.owner, generation=self.generation
+                )
+            except WorkItemConflict as exc:
+                logger.info(
+                    "work-item acquire renewal refused for %s: %s",
+                    self.request_id,
+                    exc.code,
+                )
+                return
+            except WorkItemTransportError:
+                logger.warning(
+                    "work-item acquire renewal transport failed for %s",
+                    self.request_id,
+                )
 
     async def _heartbeat_loop(self, interval_s: float) -> None:
         failures = 0

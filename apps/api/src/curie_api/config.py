@@ -463,8 +463,8 @@ class Settings(BaseSettings):
         ),
     )
     work_item_acquire_lease_seconds: int = Field(
-        default=300,
-        gt=0,
+        default=60,
+        ge=40,
         validation_alias=AliasChoices(
             "CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS",
             "WORK_ITEM_ACQUIRE_LEASE_SECONDS",

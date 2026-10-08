@@ -25,6 +25,7 @@ from curie_api.workitem_dispatch import (
     finish,
     heartbeat,
     record_termination,
+    redispatch_lapsed_acquisitions,
     start,
 )
 from fastapi.testclient import TestClient
@@ -148,7 +149,7 @@ async def _request_row(session: AsyncSession, request_id: uuid.UUID) -> Any:
                     "r.runtime_owner, r.runtime_epoch, "
                     "r.runtime_heartbeat_expires_at, r.runtime_claim_name, "
                     "r.runtime_sandbox_name, r.terminal_cause, "
-                    "r.termination_observation, r.acquire_owner, "
+                    "r.termination_observation, r.acquire_owner, r.acquire_expires_at, "
                     "r.acquired_generation, w.version AS work_item_version, "
                     "w.cancelled_at "
                     "FROM curie.execution_requests r "
@@ -326,6 +327,103 @@ def test_acquire_wrong_generation_duplicate_owner_and_cancelled_item(
         assert cancelled.work_item.cancelled_at is not None
         refused = await acquire(session, facts.request_id, owner=OWNER, generation=1)
         assert _code(refused) == "work_item_cancelled"
+
+    with_session(body)
+
+
+def test_default_acquire_lease_and_same_owner_renewal_use_database_time(
+    clean_db: None, allowlisted: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS", raising=False)
+    monkeypatch.delenv("WORK_ITEM_ACQUIRE_LEASE_SECONDS", raising=False)
+    get_settings.cache_clear()
+
+    async def body(session: AsyncSession) -> None:
+        facts = _facts(await _agent_with_channel(session))
+        await admit(session, facts)
+        first = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        assert isinstance(first, workitem_dispatch.AcquireGrant)
+        acquired = await _request_row(session, facts.request_id)
+        now = await _now(session)
+        assert 59 <= (acquired.acquire_expires_at - now).total_seconds() <= 61
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "acquire_expires_at = clock_timestamp() + interval '5 seconds' "
+                "WHERE id = :id"
+            ),
+            {"id": facts.request_id},
+        )
+        await session.commit()
+        shortened = await _request_row(session, facts.request_id)
+        renewed = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        assert renewed == first
+        after = await _request_row(session, facts.request_id)
+        now = await _now(session)
+        assert 59 <= (after.acquire_expires_at - now).total_seconds() <= 61
+        assert after.acquire_expires_at > shortened.acquire_expires_at
+        assert (after.acquire_owner, after.acquired_generation) == (OWNER, 1)
+        refused = await acquire(session, facts.request_id, owner=OTHER_OWNER, generation=1)
+        assert _code(refused) == "duplicate"
+
+    with_session(body)
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_default_acquire_lease_redispatches_only_after_expiry(
+    clean_db: None, allowlisted: None, monkeypatch: pytest.MonkeyPatch, expired: bool
+) -> None:
+    for name in (
+        "CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS",
+        "WORK_ITEM_ACQUIRE_LEASE_SECONDS",
+        "CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS",
+        "WORK_ITEM_BACKOFF_BASE_SECONDS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    get_settings.cache_clear()
+
+    async def body(session: AsyncSession) -> None:
+        facts = _facts(await _agent_with_channel(session))
+        await admit(session, facts)
+        acquired = await acquire(session, facts.request_id, owner=OWNER, generation=1)
+        assert isinstance(acquired, workitem_dispatch.AcquireGrant)
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET "
+                "acquire_expires_at = clock_timestamp() "
+                "+ (:seconds * interval '1 second') WHERE id = :id"
+            ),
+            {"id": facts.request_id, "seconds": -1 if expired else 1},
+        )
+        await session.commit()
+        before = await _request_row(session, facts.request_id)
+        count = await redispatch_lapsed_acquisitions(session)
+        after = await _request_row(session, facts.request_id)
+        now = await _now(session)
+        assert count == (1 if expired else 0)
+        if expired:
+            assert after.dispatch_generation == before.dispatch_generation + 1
+            assert after.acquire_owner is None
+            assert after.acquire_expires_at is None
+            assert after.acquired_generation is None
+            assert after.last_deferral_reason == "acquire_lost"
+            assert 9 <= (after.dispatch_not_before - now).total_seconds() <= 11
+            replacement = await acquire(
+                session,
+                facts.request_id,
+                owner=OTHER_OWNER,
+                generation=after.dispatch_generation,
+            )
+            assert isinstance(replacement, workitem_dispatch.AcquireGrant)
+            assert replacement.generation == before.dispatch_generation + 1
+        else:
+            assert after.dispatch_generation == before.dispatch_generation
+            assert after.acquire_owner == OWNER
+            assert after.acquire_expires_at == before.acquire_expires_at
+            refused = await acquire(
+                session, facts.request_id, owner=OTHER_OWNER, generation=after.dispatch_generation
+            )
+            assert _code(refused) == "duplicate"
 
     with_session(body)
 
