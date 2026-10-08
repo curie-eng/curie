@@ -660,7 +660,7 @@ fn plan_lines(
     opts: &UpgradeOpts,
     from: Option<&str>,
     secret: Option<&str>,
-    schema_plan: Option<&str>,
+    schema_plan: &[String],
     retained_values: bool,
     runner_layer_clears: &[String],
     helm_timeout_seconds: u64,
@@ -697,10 +697,9 @@ fn plan_lines(
         "phase canary: target-version smoke".into(),
         "phase commit: record known-good version".into(),
     ]);
-    // #2299: the configuration schema version the upgrade moves from and to.
-    if let Some(schema_plan) = schema_plan {
-        lines.push(schema_plan.to_string());
-    }
+    // #2299: the configuration schema version the upgrade moves from and to,
+    // then every redacted migration change line (#4322).
+    lines.extend(schema_plan.iter().cloned());
     if let Some(secret) = secret {
         lines.push(format!(
             "preserved credential api.credentials={}",
@@ -864,10 +863,11 @@ trait UpgradeDriver {
     fn secret(&self) -> Option<&str> {
         None
     }
-    /// The redacted `config schema: <from> -> <to>` plan line (#2299), when a
-    /// retained configuration was read and migrated.
-    fn schema_plan(&self) -> Option<String> {
-        None
+    /// The redacted `config schema: <from> -> <to>` plan line (#2299) and the
+    /// migration change lines after it (#4322), when a retained configuration
+    /// was read and migrated.
+    fn schema_plan(&self) -> Vec<String> {
+        Vec::new()
     }
     /// Whether Apply hands Helm a retained values overlay via `-f` (#2863).
     fn retained_values(&self) -> bool {
@@ -953,7 +953,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         &opts,
         from.as_deref(),
         host.secret(),
-        host.schema_plan().as_deref(),
+        &host.schema_plan(),
         host.retained_values(),
         &host.runner_layer_clears(),
         host.helm_timeout_seconds(),
@@ -1381,8 +1381,8 @@ struct LiveHost {
     config_refusal: Option<String>,
     /// Why the chart cannot install `--to`, if it cannot (Ruling 2, R1).
     chart_refusal: Option<String>,
-    /// The redacted configuration schema plan line (#2299).
-    schema_plan: Option<String>,
+    /// The redacted configuration schema plan lines (#2299, #4322).
+    schema_plan: Vec<String>,
     /// Redacted schema compatibility decision (#2588).
     schema_decision: Option<serde_json::Value>,
     /// Why the target schema was refused, if it was.
@@ -1583,7 +1583,7 @@ impl LiveHost {
             overlay: None,
             config_refusal: None,
             chart_refusal: None,
-            schema_plan: None,
+            schema_plan: Vec::new(),
             schema_decision: None,
             schema_refusal: None,
             runner_layer_clears: Vec::new(),
@@ -1940,7 +1940,7 @@ impl LiveHost {
         match self.retained_overlay() {
             Ok(Some((overlay, schema_plan))) => {
                 self.overlay = Some(overlay);
-                self.schema_plan = Some(schema_plan);
+                self.schema_plan = schema_plan;
             }
             Ok(None) => {}
             Err(error) => self.config_refusal = Some(format!("{error:#}")),
@@ -2294,7 +2294,7 @@ impl LiveHost {
     /// R7: read the retained overlay, migrate it (#2299) and keep the result.
     /// `Ok(None)` means no values were returned; the installed version still
     /// distinguishes an empty release from a first install.
-    fn retained_overlay(&self) -> Result<Option<(String, String)>> {
+    fn retained_overlay(&self) -> Result<Option<(String, Vec<String>)>> {
         let values_cmd = OpsCommand::new(
             "helm",
             vec![
@@ -2330,10 +2330,9 @@ impl LiveHost {
         // `config.schemaVersion`.
         let outcome =
             crate::config_migrate::migrate_installed_config(values, self.current.as_deref())?;
-        let schema_plan = crate::config_migrate::redacted_upgrade_plan(&outcome)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        // Every line, not just the schema line: the change lines carry names
+        // only, and redaction is `redacted_upgrade_plan`'s contract (#4322).
+        let schema_plan = crate::config_migrate::redacted_upgrade_plan(&outcome);
         Ok(Some((helm_values_document(&outcome.values)?, schema_plan)))
     }
 
@@ -2646,7 +2645,7 @@ impl UpgradeDriver for LiveHost {
         self.record = Some(record);
         Ok(())
     }
-    fn schema_plan(&self) -> Option<String> {
+    fn schema_plan(&self) -> Vec<String> {
         self.schema_plan.clone()
     }
     fn retained_values(&self) -> bool {

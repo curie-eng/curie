@@ -1040,10 +1040,13 @@ Checks on the unchanged commit retain their passing, pending or failing evidence
 Without a repository policy, a metadata revision ends as `ci_unverified` with
 reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
 
-Set the chart value with a values file or `--set-json`. Installs that previously
-set `GITHUB_FACTORY_METADATA_CI` through `api.extraEnv` must move the JSON object
-to `api.githubFactoryMetadataCi` and remove that extraEnv entry; the chart now
-reserves the environment variable. Compose installs set it in the environment.
+Set the chart value with a values file or `--set-json`. The chart reserves the
+environment variable, so it cannot be set through `api.extraEnv`. On an install
+that set it there, `curie cluster upgrade` and `curie cluster up` move the JSON
+object to `api.githubFactoryMetadataCi`, drop the extraEnv entry, and list the
+move in the plan. A value that is not a JSON object, a `valueFrom` entry, or a
+different value already in `api.githubFactoryMetadataCi` stops the upgrade
+before any change. Compose installs set it in the environment.
 For Curie's own repository, the value is:
 
 ```json
