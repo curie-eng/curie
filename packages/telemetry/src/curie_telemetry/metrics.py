@@ -34,6 +34,9 @@ _TURN_OUTCOMES: Final = [
     # and leaves the stream entry pending.
     "deadline_halted",
     "capacity_wait_expired",
+    # "stale_owner" (#4331): an abandoned WorkItem run whose turn reached an
+    # approval gate drops the delivery; the API termination owns its outcome.
+    "stale_owner",
 ]
 
 
@@ -197,6 +200,8 @@ _SANDBOX_ATTRIBUTES = {
         "failed",
         "orphan-cleaned",
         "observed",
+        # A WorkItem release whose thread route names another claim (#4331).
+        "fenced",
         "terminated",
         "expiry-unsupported",
         "race-lost",

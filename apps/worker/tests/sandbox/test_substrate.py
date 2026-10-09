@@ -825,6 +825,71 @@ def test_release_deletes_claim_and_route(
     assert not substrate.release("T1")
 
 
+def _repoint_route_to_successor(
+    substrate: SandboxSubstrate, affinity: AffinityStore, thread_key: str
+) -> SandboxHandle:
+    """Claim a second real sandbox and point ``thread_key``'s route at it.
+
+    Mirrors a successor request admitted on the same thread (ADR 0206): its
+    claim is live in the cluster and the route names it, not the first claim.
+    """
+
+    successor = substrate.claim(f"{thread_key}-successor")
+    assert affinity.delete_if_claim(f"{thread_key}-successor", successor.claim_name)
+    affinity.replace(thread_key, RouteRecord(handle=successor), ttl_seconds=60)
+    return successor
+
+
+def test_release_if_claim_leaves_a_route_naming_another_claim_untouched(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
+) -> None:
+    # #4331: a lost owner's cleanup must not delete the successor's sandbox.
+    own = substrate.claim("T1")
+    successor = _repoint_route_to_successor(substrate, affinity, "T1")
+    route_before = affinity.get("T1")
+    deleted_before = list(fake_k8s.deleted)
+
+    assert substrate.release_if_claim("T1", own.claim_name) is False
+
+    assert fake_k8s.deleted == deleted_before
+    assert successor.claim_name in fake_k8s.claims
+    assert successor.sandbox_name in fake_k8s.sandboxes
+    assert own.claim_name in fake_k8s.claims
+    assert affinity.get("T1") == route_before
+    assert affinity.get("T1") == RouteRecord(handle=successor)
+
+
+def test_release_if_claim_deletes_the_named_claim_and_its_route(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
+) -> None:
+    handle = substrate.claim("T1")
+    other = substrate.claim("T2")
+
+    assert substrate.release_if_claim("T1", handle.claim_name) is True
+
+    assert handle.claim_name not in fake_k8s.claims
+    assert handle.sandbox_name not in fake_k8s.sandboxes
+    assert affinity.get("T1") is None
+    # Only the named claim went; an unrelated thread is untouched.
+    assert other.claim_name in fake_k8s.claims
+    assert affinity.get("T2") == RouteRecord(handle=other)
+
+
+def test_release_if_claim_without_a_route_deletes_nothing(
+    substrate: SandboxSubstrate, fake_k8s: FakeSandboxClient, affinity: AffinityStore
+) -> None:
+    unrelated = substrate.claim("T2")
+    claims_before = dict(fake_k8s.claims)
+    deleted_before = list(fake_k8s.deleted)
+
+    assert substrate.release_if_claim("T1", unrelated.claim_name) is False
+
+    assert fake_k8s.deleted == deleted_before
+    assert fake_k8s.claims == claims_before
+    assert affinity.get("T1") is None
+    assert affinity.get("T2") == RouteRecord(handle=unrelated)
+
+
 @dataclass
 class _DelayedDeleteClient(FakeSandboxClient):
     """A Kubernetes delete that returns before quota is free.

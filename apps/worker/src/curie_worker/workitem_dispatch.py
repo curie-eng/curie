@@ -583,6 +583,11 @@ class WorkItemRun:
         self.thread_key = thread_key
         self.started = False
         self.finished = False
+        # Set when the heartbeat gives the request up as a stale owner. A
+        # finished run may release its own claim; an abandoned one releases
+        # nothing and creates no approval, since the API termination chain owns
+        # the lost request's teardown (ADR 0206, #4331).
+        self.abandoned = False
         self.held = False
         self.runtime_epoch: int | None = None
         self.claim_name: str | None = None
@@ -622,6 +627,11 @@ class WorkItemRun:
             self.finished = True
 
     async def start(self, *, claim_name: str, sandbox_name: str) -> WorkItemStartGrant:
+        # Recorded before the API call so a start refused on a terminal code
+        # (#3208) still knows the claim it made, and its release stays fenced
+        # to that claim (#4331). runtime_epoch stays the started-ness signal.
+        self.claim_name = claim_name
+        self.sandbox_name = sandbox_name
         grant = await self._client.start(
             self.request_id,
             owner=self.owner,
@@ -631,8 +641,6 @@ class WorkItemRun:
         )
         self.started = True
         self.runtime_epoch = grant.runtime_epoch
-        self.claim_name = claim_name
-        self.sandbox_name = sandbox_name
         self.execution_deadline = grant.execution_deadline
         interval = max(_MIN_HEARTBEAT_INTERVAL_S, grant.heartbeat_interval_s)
         self._heartbeat_task = asyncio.create_task(

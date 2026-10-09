@@ -649,6 +649,39 @@ def test_failed_start_keeps_renewing_the_acquisition(
     asyncio.run(go())
 
 
+def test_a_refused_start_still_records_the_claim_and_sandbox_names(
+    acquire_renew_clock: _AcquireRenewClock,
+) -> None:
+    # #4331: a run whose start is refused on a terminal code (#3208) must still
+    # know the claim it made, so its sandbox release stays fenced to that claim.
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        verb = request.url.path.rsplit("/", 1)[-1]
+        seen.append(verb)
+        if verb == "start":
+            # HTTP 409 shape is defined by the API's internal start route.
+            return httpx.Response(409, json={"detail": {"code": "not_dispatchable"}})
+        return httpx.Response(200, json=BASE)
+
+    async def go() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            run = _renewing_run(_renewal_client(http))
+            try:
+                with pytest.raises(WorkItemConflict) as refused:
+                    await run.start(claim_name="acme-claim", sandbox_name="acme-sandbox")
+                assert refused.value.code == "not_dispatchable"
+                assert seen == ["start"]
+                assert run.claim_name == "acme-claim"
+                assert run.sandbox_name == "acme-sandbox"
+                assert not run.started
+                assert run.runtime_epoch is None
+            finally:
+                await run.close()
+
+    asyncio.run(go())
+
+
 def test_defer_stops_renewal_before_its_post_returns_or_raises(
     acquire_renew_clock: _AcquireRenewClock,
 ) -> None:
