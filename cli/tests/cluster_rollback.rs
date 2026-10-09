@@ -509,12 +509,10 @@ fn an_empty_history_is_refused_rather_than_panicking() {
     assert!(err.to_string().contains("no revisions"));
 }
 
-/// The current revision is the `deployed` one, NOT the highest one: a
-/// `pending-upgrade` row sits ABOVE `deployed` while a helm upgrade is in
-/// flight. Selecting from the top of the history instead would step the release
-/// back to where it already is and report the in-flight revision as skipped.
+/// A pending upgrade above the serving revision must be cleared by restoring
+/// that serving revision, preserving the newest version Helm finished applying.
 #[test]
-fn the_deployed_revision_is_current_even_when_a_newer_revision_sits_above_it() {
+fn a_pending_revision_above_the_serving_one_rolls_back_to_the_serving_revision() {
     let history = vec![
         revision(1, "superseded"),
         revision(2, "superseded"),
@@ -525,14 +523,147 @@ fn the_deployed_revision_is_current_even_when_a_newer_revision_sits_above_it() {
     let choice = eligible(&history);
 
     assert_eq!(
-        choice.from_revision, 3,
-        "3 is deployed; 4 is still in flight"
+        choice.from_revision, 4,
+        "4 is the pending revision being cleared"
     );
-    assert_eq!(choice.to_revision, 2, "selection happens below the current");
+    assert_eq!(
+        choice.to_revision, 3,
+        "3 is the known good serving revision"
+    );
     assert!(
         choice.skipped.is_empty(),
-        "4 is above the current revision, so it was never stepped over: {:?}",
+        "there is no revision between serving 3 and pending 4: {:?}",
         choice.skipped
+    );
+}
+
+#[test]
+fn a_pending_or_failed_newest_revision_rolls_back_to_the_serving_revision() {
+    for status in [
+        "pending-install",
+        "pending-upgrade",
+        "pending-rollback",
+        "failed",
+        "unknown",
+        "uninstalling",
+        "uninstalled",
+    ] {
+        let history = vec![
+            revision(3, "superseded"),
+            revision(4, "deployed"),
+            revision(5, status),
+        ];
+        assert_eq!(
+            eligible(&history),
+            RollbackChoice {
+                from_revision: 5,
+                to_revision: 4,
+                skipped: vec![],
+                forced: false,
+            },
+            "newest status {status} must restore serving 4 instead of downgrading to 3"
+        );
+    }
+
+    let cases = [
+        (
+            vec![
+                revision(3, "superseded"),
+                revision(4, "deployed"),
+                revision(5, "failed"),
+                revision(6, "pending-upgrade"),
+            ],
+            6,
+            4,
+            vec![5],
+        ),
+        (
+            vec![revision(3, "superseded"), revision(4, "deployed")],
+            4,
+            3,
+            vec![],
+        ),
+        (
+            vec![
+                revision(1, "superseded"),
+                revision(2, "superseded"),
+                revision(3, "failed"),
+            ],
+            3,
+            2,
+            vec![],
+        ),
+        (
+            vec![
+                revision(2, "deployed"),
+                revision(3, "failed"),
+                revision(4, "deployed"),
+            ],
+            4,
+            2,
+            vec![3],
+        ),
+        (
+            vec![
+                revision(2, "superseded"),
+                revision(3, "superseded"),
+                revision(4, "deployed"),
+                revision(5, "superseded"),
+            ],
+            4,
+            3,
+            vec![],
+        ),
+    ];
+    for (history, from_revision, to_revision, skipped) in cases {
+        assert_eq!(
+            eligible(&history),
+            RollbackChoice {
+                from_revision,
+                to_revision,
+                skipped,
+                forced: false,
+            },
+            "history: {history:?}"
+        );
+    }
+}
+
+#[test]
+fn explicit_selection_is_unchanged_when_a_newer_revision_is_pending() {
+    let history = vec![
+        revision(2, "superseded"),
+        revision(3, "failed"),
+        revision(4, "deployed"),
+        revision(5, "failed"),
+        revision(6, "pending-upgrade"),
+    ];
+
+    let choice = resolve_explicit_revision(&history, 2, false)
+        .expect("an explicit superseded target still uses the serving revision as current");
+    assert_eq!(
+        choice,
+        RollbackChoice {
+            from_revision: 4,
+            to_revision: 2,
+            skipped: vec![3],
+            forced: false,
+        }
+    );
+
+    let err = resolve_explicit_revision(&history, 5, false)
+        .expect_err("a failed explicit target still requires the override");
+    assert!(err.to_string().contains("--allow-failed-revision"));
+    let choice = resolve_explicit_revision(&history, 5, true)
+        .expect("the override still permits the operator's failed target");
+    assert_eq!(
+        choice,
+        RollbackChoice {
+            from_revision: 4,
+            to_revision: 5,
+            skipped: vec![],
+            forced: true,
+        }
     );
 }
 
@@ -654,7 +785,14 @@ fn fake_helm_dir(history_json: &str) -> tempfile::TempDir {
             history = history.display(),
         ),
     );
-    test_executable::install_in(dir.path(), "kubectl", "#!/bin/sh\necho '0039 (head)'\n");
+    test_executable::install_in(
+        dir.path(),
+        "kubectl",
+        &format!(
+            "#!/bin/sh\necho \"$*\" >> '{log}'\necho '0039 (head)'\n",
+            log = dir.path().join("kubectl-argv.log").display(),
+        ),
+    );
     dir
 }
 
@@ -677,6 +815,41 @@ fn run_rollback(dir: &Path, args: &[&str]) -> std::process::Output {
 
 fn helm_log(dir: &Path) -> String {
     fs::read_to_string(dir.join("helm-argv.log")).unwrap_or_default()
+}
+
+#[test]
+fn rollback_hands_helm_the_serving_revision_over_a_pending_one() {
+    let dir = fake_helm_dir(
+        r#"[
+          {"revision":3,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+          {"revision":4,"status":"deployed","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+          {"revision":5,"status":"pending-upgrade","chart":"curie-0.8.6","app_version":"0.8.6","description":"Preparing upgrade"}
+        ]"#,
+    );
+    let out = run_rollback(dir.path(), &["--yes", "--json"]);
+    assert!(
+        out.status.success(),
+        "rollback failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("rollback emits one JSON result");
+    assert_eq!(result["rolled_back"], true);
+    assert_eq!(result["from_revision"], 5);
+    assert_eq!(result["to_revision"], 4);
+    assert_eq!(result["skipped"], serde_json::json!([]));
+    assert_eq!(result["forced"], false);
+    assert_eq!(
+        helm_log(dir.path()),
+        "history prod-release -n agent-ns -o json --max 256\nrollback prod-release 4 -n agent-ns\n",
+        "the real path must pass the serving revision to Helm"
+    );
+    assert!(
+        fs::read_to_string(dir.path().join("kubectl-argv.log"))
+            .expect("the real path must probe the live schema")
+            .contains("alembic -c alembic.ini current"),
+        "the serving revision selection must still pass through the schema gate"
+    );
 }
 
 /// The AC2 note claims "a bare `helm rollback` would have targeted N" -- and
@@ -731,58 +904,237 @@ fn the_bare_helm_claim_is_made_only_when_the_skipped_revision_is_the_one_helm_wo
     );
 }
 
-/// `--dry-run` prints the plan and runs NOTHING: not even the `helm history`
-/// read, since the fake helm records every invocation it receives. Both
-/// spellings, because the plan can only name the target revision when the
-/// operator did -- deleting either half of the early return leaves the fake
-/// helm's log non-empty.
+/// A dry run resolves the same target as execution from one history read. The
+/// plan names that target and the live-schema probe, but never runs the probe
+/// or Helm rollback. Human and JSON output carry the same selection detail.
 #[test]
-fn dry_run_names_the_plan_and_runs_no_helm_command_at_all() {
-    let history = r#"[
+fn dry_run_reads_history_and_names_the_selected_revision() {
+    let original_history = r#"[
       {"revision":19,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
       {"revision":20,"status":"failed","chart":"curie-0.8.6","app_version":"0.8.6","description":"RuntimeClass \"gvisor\" not found"},
       {"revision":21,"status":"deployed","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"}
     ]"#;
+    let pending_history = r#"[
+      {"revision":3,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+      {"revision":4,"status":"deployed","chart":"curie-0.8.6","app_version":"0.8.6","description":"Upgrade complete"},
+      {"revision":5,"status":"pending-upgrade","chart":"curie-0.8.6","app_version":"0.8.6","description":"Preparing upgrade"}
+    ]"#;
 
-    // ----- No --revision: the target is a function of a history it has not read -----
+    let cases = [
+        (
+            original_history,
+            None,
+            "19",
+            "selected revision 19 (superseded, curie-0.8.6) from revision 21; skipped 20",
+        ),
+        (
+            original_history,
+            Some("19"),
+            "19",
+            "selected revision 19 (superseded, curie-0.8.6) from revision 21; skipped 20",
+        ),
+        (
+            pending_history,
+            None,
+            "4",
+            "selected revision 4 (deployed, curie-0.8.6) from revision 5; skipped none",
+        ),
+        (
+            pending_history,
+            Some("3"),
+            "3",
+            "selected revision 3 (superseded, curie-0.8.6) from revision 4; skipped none",
+        ),
+    ];
+    for (history, explicit, target, selection) in cases {
+        let mut human_plan = None;
+        for json in [false, true] {
+            let dir = fake_helm_dir(history);
+            let mut args = vec!["--dry-run"];
+            if let Some(explicit) = explicit {
+                args.extend(["--revision", explicit]);
+            }
+            if json {
+                args.push("--json");
+            }
+            let out = run_rollback(dir.path(), &args);
+            assert!(
+                out.status.success(),
+                "a dry run must exit clean: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let plan = if json {
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&out.stdout).expect("one JSON dry-run result");
+                assert_eq!(payload["dry_run"], true);
+                payload["plan"]
+                    .as_array()
+                    .expect("the existing DryRunPlan carries plan lines")
+                    .iter()
+                    .map(|line| line.as_str().expect("plan lines are strings"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            assert!(
+                plan.contains("helm history prod-release -n agent-ns -o json --max 256"),
+                "the plan must name the history read: {plan}"
+            );
+            assert!(
+                plan.contains(&format!("helm rollback prod-release {target} -n agent-ns")),
+                "the plan must name the resolved target revision: {plan}"
+            );
+            assert!(plan.contains(selection), "selection detail missing: {plan}");
+            assert!(!plan.contains("<selected-revision>"), "{plan}");
+            assert!(
+                plan.contains("kubectl exec") && plan.contains("alembic"),
+                "the plan must name the live-schema probe: {plan}"
+            );
+            assert_eq!(
+                helm_log(dir.path()),
+                "history prod-release -n agent-ns -o json --max 256\n",
+                "a dry run reads history once and invokes no Helm mutation"
+            );
+            assert!(
+                !dir.path().join("kubectl-argv.log").exists(),
+                "a dry run must not execute the live-schema probe"
+            );
+            if json {
+                assert_eq!(Some(plan), human_plan, "JSON and human plans must agree");
+            } else {
+                human_plan = Some(plan);
+            }
+        }
+    }
+}
+
+#[test]
+fn dry_run_returns_the_real_history_read_failure() {
+    let mut real_error = None;
+    for dry_run in [false, true] {
+        let dir = fake_helm_dir("[]");
+        test_executable::install_in(
+            dir.path(),
+            "helm",
+            &format!(
+                "#!/bin/sh\necho \"$*\" >> '{log}'\necho 'Error: release: not found' >&2\nexit 1\n",
+                log = dir.path().join("helm-argv.log").display(),
+            ),
+        );
+        let mut args = vec!["--json", "--yes"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let out = run_rollback(dir.path(), &args);
+        assert!(!out.status.success(), "an unreadable history must fail");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("one JSON failure result");
+        let shown = payload["error"]
+            .as_str()
+            .expect("the error carries its message");
+        assert!(
+            shown.contains("release: not found") && shown.contains("prod-release"),
+            "the real Helm failure must survive the dry run: {shown}"
+        );
+        assert_eq!(
+            helm_log(dir.path()),
+            "history prod-release -n agent-ns -o json --max 256\n"
+        );
+        assert!(!dir.path().join("kubectl-argv.log").exists());
+        if dry_run {
+            assert_eq!(Some(payload), real_error);
+        } else {
+            real_error = Some(payload);
+        }
+    }
+}
+
+#[test]
+fn dry_run_preserves_selection_refusals_and_the_explicit_override() {
+    let history = r#"[
+      {"revision":3,"status":"superseded","chart":"curie-0.8.6","app_version":"0.8.6"},
+      {"revision":4,"status":"deployed","chart":"curie-0.8.6","app_version":"0.8.6"},
+      {"revision":5,"status":"failed","chart":"curie-0.8.6","app_version":"0.8.6"}
+    ]"#;
+    let cases: [(&str, &[&str], &str); 5] = [
+        ("[]", &[], "no revisions"),
+        (
+            r#"[{"revision":1,"status":"deployed"}]"#,
+            &[],
+            "only revision",
+        ),
+        (
+            "not JSON",
+            &[],
+            "could not read `helm history -o json` output",
+        ),
+        (history, &["--revision", "99"], "99"),
+        (history, &["--revision", "5"], "--allow-failed-revision"),
+    ];
+    for (history, revision_args, expected_message) in cases {
+        let mut real_error = None;
+        for dry_run in [false, true] {
+            let dir = fake_helm_dir(history);
+            let mut args = vec!["--json", "--yes"];
+            args.extend_from_slice(revision_args);
+            if dry_run {
+                args.push("--dry-run");
+            }
+            let out = run_rollback(dir.path(), &args);
+            assert!(!out.status.success(), "a refused selection must fail");
+            let payload: serde_json::Value =
+                serde_json::from_slice(&out.stdout).expect("one JSON refusal result");
+            let shown = payload["error"]
+                .as_str()
+                .expect("the error carries its message");
+            assert!(shown.contains(expected_message), "{shown}");
+            assert_eq!(
+                helm_log(dir.path()),
+                "history prod-release -n agent-ns -o json --max 256\n"
+            );
+            assert!(!dir.path().join("kubectl-argv.log").exists());
+            if dry_run {
+                assert_eq!(Some(payload), real_error);
+            } else {
+                real_error = Some(payload);
+            }
+        }
+    }
+
     let dir = fake_helm_dir(history);
-    let out = run_rollback(dir.path(), &["--dry-run"]);
-    let plan = String::from_utf8_lossy(&out.stdout).to_string();
+    let out = run_rollback(
+        dir.path(),
+        &[
+            "--dry-run",
+            "--json",
+            "--revision",
+            "5",
+            "--allow-failed-revision",
+        ],
+    );
     assert!(
         out.status.success(),
-        "a dry run must exit clean: {}",
+        "the dry run must honor the explicit override: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        plan.contains("helm history prod-release -n agent-ns -o json --max 256"),
-        "the plan must name the history read: {plan}"
-    );
-    assert!(
-        plan.contains("helm rollback prod-release <selected-revision> -n agent-ns"),
-        "with no --revision the plan cannot name a revision it never read: {plan}"
-    );
-    assert!(
-        plan.contains("kubectl exec") && plan.contains("alembic"),
-        "the plan must name the live-schema probe that runs before helm mutates: {plan}"
-    );
+    let payload: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("one JSON dry-run result");
+    let plan = payload["plan"]
+        .as_array()
+        .expect("the existing DryRunPlan carries plan lines");
+    assert!(plan.iter().any(|line| {
+        line.as_str()
+            .unwrap()
+            .contains("helm rollback prod-release 5 -n agent-ns")
+    }));
+    assert!(plan.iter().any(|line| {
+        line.as_str().unwrap()
+            == "selected revision 5 (failed, curie-0.8.6) from revision 4; skipped none"
+    }));
     assert_eq!(
         helm_log(dir.path()),
-        "",
-        "a dry run must not invoke helm even to read the history"
+        "history prod-release -n agent-ns -o json --max 256\n"
     );
-
-    // ----- With --revision: the plan names the exact revision, still runs nothing -----
-    let dir = fake_helm_dir(history);
-    let out = run_rollback(dir.path(), &["--dry-run", "--revision", "19"]);
-    let plan = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(out.status.success());
-    assert!(
-        plan.contains("helm rollback prod-release 19 -n agent-ns"),
-        "an operator-named revision belongs in the plan: {plan}"
-    );
-    assert_eq!(
-        helm_log(dir.path()),
-        "",
-        "a dry run must mutate nothing, --revision or not"
-    );
+    assert!(!dir.path().join("kubectl-argv.log").exists());
 }
