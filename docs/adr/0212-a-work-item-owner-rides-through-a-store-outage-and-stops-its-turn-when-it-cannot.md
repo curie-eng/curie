@@ -9,9 +9,13 @@ This draft proposes extending
 from the Valkey delivery lease to the SQL runtime heartbeat that
 [ADR 0162](0162-work-items-own-durable-execution-identity.md) and
 [ADR 0157](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md)
-give each started factory `ExecutionRequest`. It builds on
-[ADR 0206](0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md).
-It does not authorize implementation.
+give each started factory `ExecutionRequest`, and deciding, for both
+ownership stores, how a factory run that fails closed on a store outage ends.
+That second part settles ADR 0207 consequence 6. It builds on
+[ADR 0206](0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md)
+and proposes amending
+[ADR 0013](0013-concurrency-and-delivery-model.md) for one case only, as
+point 9 states. It does not authorize implementation.
 
 ## Context
 
@@ -61,16 +65,51 @@ needing a person with no pull request, although the work itself was fine. Two
 other runs lost in the same window had no publication and recovered through
 ADR 0206 successors.
 
+The Valkey side has the opposite problem: one fault, two outcomes. ADR 0207
+lets a factory owner ride through a Valkey outage until a local deadline, 35
+seconds after its last confirmed renewal with the defaults, through three
+loops that each fail closed when that deadline passes. Two of them race on
+the same deadline during a factory turn:
+
+1. Path A, the side effect marker. `_mark_side_effect_with_retry` in
+   `kernel.py` retries the marker write while ownership is held (ADR 0207
+   point 4). When the local deadline passes it sets classification
+   `ownership-store-unavailable` and raises. Because the turn has already
+   flagged a side effect, the `saw_side_effect` branch of `_process_event`
+   escalates before the retry check, as ADR 0013 requires.
+   `_ESCALATION_CAUSES` has no entry for that class, so the request ends
+   `runner_escalated`, the issue needs a person, and no successor follows.
+2. Path B, consumer liveness. The consumer's liveness loop (ADR 0207 point 8)
+   reaches its own local deadline, raises `ConsumerLivenessExpired`, and
+   cancels its in flight handlers, so the kernel drops the run. The worker's
+   orphan sweep, `WorkItemOrphanSweeper` in
+   [`apps/worker/src/curie_worker/workitem_orphans.py`](../../apps/worker/src/curie_worker/workitem_orphans.py),
+   then sees a request carrying its own consumer name that the kernel no
+   longer holds, and declares it `owner_lost` through the API, which is
+   reachable because only Valkey is down. ADR 0206 admits a successor.
+
+Two factory resilience runs on disposable installs, driven the same way, each
+held Valkey unavailable for about 80 seconds during a live factory turn. On
+v0.12.3 Path B won: the request ended `owner_lost` and its successor
+completed. On main at b5bce2e5, with no change to either path in between,
+Path A won: the request ended `runner_escalated` and the issue needed a
+person. Which outcome an operator gets for a Valkey outage past the ride
+through bound depends on which loop observes the deadline first. Neither
+cause is truthful: the worker did not stop responding, and the runner did not
+fail.
+
 ADR 0207 consequence 6 left the truthful cause for a run that fails closed on
-a store outage undecided. This ADR decides it for the SQL heartbeat.
+a store outage undecided. This ADR decides it for both ownership stores.
 
 ## Decision
 
 **A work item owner rides through heartbeat transport failures until a local
 deadline that is always earlier than the API's lapse. At that deadline it
 stops its turn and its sandbox instead of abandoning them, so no turn outlives
-its owner. A request that ends this way records `store_unavailable`, not
-`owner_lost`.**
+its owner. A factory run that fails closed because an ownership store, the
+SQL work item store or Valkey, was unavailable records `store_unavailable`,
+not `owner_lost` or `runner_escalated`, and gets an ADR 0206 successor,
+whichever path observes the outage first.**
 
 1. A heartbeat refusal is handled as today: `stale_owner` abandons without
    touching the route, and `cancellation_requested` stops the owned run
@@ -106,22 +145,78 @@ its owner. A request that ends this way records `store_unavailable`, not
    `failed/store_unavailable` instead. If another terminator claimed it first,
    `owner_lost` stands. The status comment says the work item store was
    unavailable, not that the worker stopped responding.
-7. A `store_unavailable` request is followed by a successor under ADR 0206,
+7. The Valkey side converges on the same stop. For a factory WorkItem
+   execution, each ADR 0207 fail closed that comes from a local deadline
+   passing on transport failures, and not from a refusal, runs the fence in
+   point 4 and the report in point 6. That covers the delivery lease
+   deadline (ADR 0207 point 2), the side effect marker deadline (point 4)
+   and the consumer liveness deadline (point 8). Concretely:
+   1. The kernel maps classification `ownership-store-unavailable` to cause
+      `store_unavailable` in `_ESCALATION_CAUSES`, and for a factory
+      execution that class ends the request `failed/store_unavailable`
+      instead of taking the `saw_side_effect` escalation.
+   2. When the consumer cancels a factory handler on
+      `ConsumerLivenessExpired` from its local deadline, the kernel runs the
+      same fence and report rather than dropping the run.
+   3. The kernel keeps holding the run, so `owns_work_item` stays true, from
+      the moment it fails closed until its termination is recorded or
+      refused. The orphan sweep therefore cannot declare its own process's
+      run `owner_lost` while the stop is in progress. If the sweep or the
+      reconciler wins anyway, for example because the worker process died,
+      point 6's settlement rule applies and the outcome is still a
+      successor.
+   4. The fence must not depend on Valkey. It addresses the runtime by the
+      claim and sandbox names the `WorkItemRun` already holds. Where the
+      runner interrupt needs the Valkey route lookup (ADR 0207 consequence
+      5) and that lookup fails, halting the claim stops the turn.
+   5. The report goes to the API under the request's runtime epoch, which
+      ADR 0162 fences in SQL and which a Valkey outage does not block. The
+      status comment says the delivery store was unavailable.
+
+   A refusal (lease held by another token or generation, liveness held by
+   another generation, or the key gone after Valkey returns) is ownership
+   loss, not store unavailability, and keeps today's handling and cause.
+8. A `store_unavailable` request is followed by a successor under ADR 0206,
    with ADR 0206's refusals, and counts in the same consecutive loss streak as
    `owner_lost` (and as `sandbox_lost` if Draft ADR 0211 is accepted). The work
    did not fail on its own account, and the owner observed its sandbox gone
    before reporting.
-8. Scope. The rule applies to every work item runtime heartbeat, which is one
-   loop used by both run paths in the kernel. The acquire renewal between
-   acquire and start is unchanged: no turn runs in that window. Interactive,
-   cron and eval runs have no SQL heartbeat; ADR 0207 governs their Valkey
-   lease.
+9. ADR 0013 and replay. A successor reruns the whole run, including every
+   call that flagged a side effect, which ADR 0013 otherwise answers with
+   escalation. This ADR amends ADR 0013 for factory WorkItem executions that
+   end `store_unavailable` only, on the same footing as ADR 0206 already
+   does for `owner_lost`. It adds no replay exposure: Path B already reruns
+   these calls today under `owner_lost` on the same fault, so this ADR
+   removes the race, not a safeguard. It does not decide whether replay is
+   safe. That question is the one Draft ADR 0211 (pull request #4326) answers
+   for sandbox loss, and its point 6 replay safety bound applies to every
+   successor ADR 0206 admits. The boundary is:
+   1. If Draft ADR 0211 is accepted, its replay safety bound gates
+      `store_unavailable` successors exactly as it gates `owner_lost` and
+      `sandbox_lost` ones, and a run outside the bound ends for a person
+      with cause `store_unavailable` and the blocking tool named.
+   2. Until then, a `store_unavailable` successor carries exactly the
+      replay risk ADR 0206 carries for `owner_lost`, no more.
+
+   Non factory turns (interactive, cron, eval) keep ADR 0013 unchanged: a
+   turn that fails closed on `ownership-store-unavailable` after a side
+   effect still escalates, and its reply names that class.
+10. Scope. On the SQL side the rule applies to every work item runtime
+    heartbeat, which is one loop used by both run paths in the kernel. The
+    acquire renewal between acquire and start is unchanged: no turn runs in
+    that window. On the Valkey side point 7 applies only to factory WorkItem
+    executions, the only runs with a request to fail and a successor to
+    admit. Interactive, cron and eval runs keep ADR 0207 as written.
 
 When this ADR is accepted, the realizing paths are expected to be
 `WorkItemRun._heartbeat_loop` and `WorkItemDispatchClient.record_termination`
 in `apps/worker/src/curie_worker/workitem_dispatch.py`; a new stop callback
-beside `_stop_owned_work_item` in `apps/worker/src/curie_worker/kernel.py`;
-the heartbeat grant in `apps/api/src/curie_api/workitem_dispatch.py`;
+beside `_stop_owned_work_item`, `_mark_side_effect_with_retry`, the
+`saw_side_effect` branch of `_process_event`, `_ESCALATION_CAUSES` and
+`owns_work_item` in `apps/worker/src/curie_worker/kernel.py`; the handler
+cancellation in `StreamConsumer._liveness_refresh_loop` in
+`apps/worker/src/curie_worker/stream_consumer.py`; the heartbeat grant in
+`apps/api/src/curie_api/workitem_dispatch.py`;
 `_record_runtime_termination`, `_admit_owner_lost_successor` and
 `owner_lost_streak` in `apps/api/src/curie_api/workitems.py`; and
 `create_publication` in `apps/api/src/curie_api/crud.py`.
@@ -157,6 +252,21 @@ with or without them.
    store returns; it waits as today, bounded by the local deadline.
 6. A `store_unavailable` cause is new on requests and status comments, and a
    successor follows it.
+7. A Valkey outage past the ADR 0207 bound now has one outcome for a factory
+   run: `failed/store_unavailable` and a successor, the outcome Path B
+   reached by luck in the v0.12.3 run above. The 80 second hold in the
+   evidence would end that way on either path.
+8. Factory and non factory turns now differ on `ownership-store-unavailable`
+   after a side effect: a factory request gets a successor, an interactive
+   turn escalates. The difference is deliberate and matches the one ADR 0206
+   already draws for worker loss.
+9. A factory handler cancelled on `ConsumerLivenessExpired` now takes as long
+   as the fence takes before the kernel lets go of it, instead of being
+   dropped at once. A worker that restarts during that window leaves the run
+   to the orphan sweep and point 6, as today.
+10. The replay exposure of a `store_unavailable` successor is whatever ADR
+    0206 allows for `owner_lost`. Accepting Draft ADR 0211 narrows both
+    together; rejecting it leaves both where ADR 0206 put them.
 
 ## Alternatives considered
 
@@ -181,3 +291,21 @@ with or without them.
 6. Infer the cause on the API from its own record of the outage. Rejected: the
    API cannot write during the outage it would need to record, and the owner
    that stopped the turn is the only party that knows why.
+7. Map `ownership-store-unavailable` to a truthful cause but keep the
+   escalation. Rejected: the cause would be truthful, but the outcome would
+   still depend on which path won, a person on Path A and a successor on Path
+   B, for the same fault.
+8. Make Path B match Path A: treat any store outage after a side effect as an
+   ADR 0013 escalation, with no successor. Rejected: it is consistent, but
+   every Valkey outage past 35 seconds would end every running factory run
+   for a person, while a worker crash with the same replay exposure gets an
+   ADR 0206 successor. The safety question belongs in one replay bound for
+   every successor, which is Draft ADR 0211's point 6, not in which component
+   happened to fail.
+9. Leave the race to the orphan sweep, so Valkey loss always ends
+   `owner_lost`. Rejected: it keeps the false statement that the worker
+   stopped responding, which ADR 0207 consequence 6 set out to remove, and
+   it leaves Path A's escalation in place whenever the marker loop wins.
+10. Order the two paths with a shared lock. Rejected: the store that would
+    hold the lock is the one that is down, and point 7's rule that the
+    kernel keeps holding the run until it reports does the ordering locally.
