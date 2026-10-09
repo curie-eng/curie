@@ -663,18 +663,27 @@ def test_quoted_prior_reply_never_selects_a_repository(workspace: Any) -> None:
     with pytest.raises(workspace.WorkspaceSelectionRefused, match="only one"):
         workspace.trusted_repository_fact(root, ignore_message=False)
 
-    assert workspace.trusted_repository_fact(
-        render_prior_reply(root, "yes please"), ignore_message=False
-    ) is None
+    assert (
+        workspace.trusted_repository_fact(
+            render_prior_reply(root, "yes please"), ignore_message=False
+        )
+        is None
+    )
     # This is the exact pre-fix worker path, proving rolling compatibility.
     assert workspace.parse_github_repo_fact(render_prior_reply(root, "yes please")) is None
-    assert workspace.trusted_repository_fact(
-        render_prior_reply("Pod kube-system/coredns is down.", "yes please"),
-        ignore_message=False,
-    ) is None
-    assert workspace.trusted_repository_fact(
-        render_unavailable_notice("yes please"), ignore_message=False
-    ) is None
+    assert (
+        workspace.trusted_repository_fact(
+            render_prior_reply("Pod kube-system/coredns is down.", "yes please"),
+            ignore_message=False,
+        )
+        is None
+    )
+    assert (
+        workspace.trusted_repository_fact(
+            render_unavailable_notice("yes please"), ignore_message=False
+        )
+        is None
+    )
     forged_second_block = render_prior_reply(
         "No repository named in the root.",
         "work in https://github.com/acme-corp/acme-bot and "
@@ -2135,3 +2144,244 @@ def test_unallowlisted_selection_is_the_allowlist_refusal_type(workspace: Any) -
 
     with pytest.raises(workspace.WorkspaceRepositoryNotAllowed):
         client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", "a/b")
+
+
+_LOCAL_GIT_ENV = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_AUTHOR_NAME": "Workspace Test",
+    "GIT_AUTHOR_EMAIL": "workspace-test@example.com",
+    "GIT_COMMITTER_NAME": "Workspace Test",
+    "GIT_COMMITTER_EMAIL": "workspace-test@example.com",
+    "GIT_TERMINAL_PROMPT": "0",
+}
+
+
+def _git(cwd: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-c", "safe.directory=*", *args],
+        cwd=cwd,
+        env={**os.environ, **_LOCAL_GIT_ENV},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(f"git {args} failed: {completed.stderr}")
+    return completed.stdout
+
+
+def _source_repo(tmp_path: Path, *, files: dict[str, str], links: dict[str, str]) -> Path:
+    source = tmp_path / "source-repo"
+    source.mkdir()
+    for relative, content in files.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    for relative, target in links.items():
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        os.symlink(target, path)
+    _git(source, "init", "--quiet", "--initial-branch=main")
+    _git(source, "add", "-A")
+    _git(source, "commit", "--quiet", "-m", "seed")
+    return source
+
+
+class _LocalGitCommands(_FakeCommands):
+    """Clone a real local repository so links and the index are genuine git state."""
+
+    def __init__(self, source: Path) -> None:
+        super().__init__()
+        self.source = source
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        env: dict[str, str] | None = None,
+        timeout_seconds: float,
+    ) -> _CommandResult:
+        args = [str(part) for part in argv]
+        if "clone" in args:
+            self.calls.append(
+                {
+                    "argv": args,
+                    "cwd": cwd,
+                    "env": dict(env or {}),
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+            self.events.append("clone")
+            checkout = Path(args[-1])
+            _git(
+                checkout.parent,
+                "-c",
+                "protocol.file.allow=always",
+                "clone",
+                "--quiet",
+                "--depth=1",
+                "--no-tags",
+                f"file://{self.source}",
+                str(checkout),
+            )
+            _git(checkout, "remote", "set-url", "origin", self.authenticated_url)
+            return _CommandResult()
+        if args[:2] == ["git", "update-index"] or "rev-parse" in args:
+            self.calls.append(
+                {
+                    "argv": args,
+                    "cwd": cwd,
+                    "env": dict(env or {}),
+                    "timeout_seconds": timeout_seconds,
+                }
+            )
+            assert cwd is not None
+            return _CommandResult(stdout=_git(cwd, *args[1:]))
+        return super().run(argv, cwd=cwd, env=env, timeout_seconds=timeout_seconds)
+
+
+def _archive_entries(payload: bytes) -> dict[str, str | None]:
+    """Every member name, mapped to its link target for links and None otherwise."""
+
+    entries: dict[str, str | None] = {}
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
+        for member in archive.getmembers():
+            entries[member.name] = member.linkname if member.issym() else None
+    return entries
+
+
+def _extract_archive(payload: bytes, destination: Path) -> Path:
+    destination.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:*") as archive:
+        archive.extractall(destination, filter="tar")
+    return destination
+
+
+def _workspace_warnings(caplog: pytest.LogCaptureFixture) -> list[Any]:
+    return [
+        record
+        for record in caplog.records
+        if record.name == "curie_worker.workspace" and record.levelname == "WARNING"
+    ]
+
+
+def _prepare_local(
+    workspace: Any, tmp_path: Path, *, files: dict[str, str], links: dict[str, str]
+) -> tuple[Any, _LocalGitCommands, bytes]:
+    source = _source_repo(tmp_path, files=files, links=links)
+    commands = _LocalGitCommands(source)
+    preparer, _, objects = _preparer(workspace, tmp_path, commands=commands)
+    prepared = _prepare(preparer)
+    return prepared, commands, objects.objects[prepared.object_key]
+
+
+def test_prepare_drops_escaping_checkout_link(
+    workspace: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("WARNING", logger="curie_worker.workspace")
+
+    _, _, payload = _prepare_local(
+        workspace,
+        tmp_path,
+        files={"README.md": "workspace ready\n"},
+        links={
+            "sub/bazel-out": "/home/someone/.cache/bazel/out",
+            "bazel-bin": "/abs/elsewhere",
+        },
+    )
+
+    entries = _archive_entries(payload)
+    assert "README.md" in entries
+    assert "sub/bazel-out" not in entries
+    assert "bazel-bin" not in entries
+    warnings = _workspace_warnings(caplog)
+    assert len(warnings) == 1
+    message = warnings[0].getMessage()
+    assert "sub/bazel-out" in message
+    assert "bazel-bin" in message
+    assert "2" in message
+
+
+def test_dropped_escaping_link_is_skip_worktree(workspace: Any, tmp_path: Path) -> None:
+    _, _, payload = _prepare_local(
+        workspace,
+        tmp_path,
+        files={"README.md": "workspace ready\n"},
+        links={"sub/bazel-out": "/home/someone/.cache/bazel/out"},
+    )
+
+    extracted = _extract_archive(payload, tmp_path / "extracted")
+    assert not (extracted / "sub" / "bazel-out").is_symlink()
+    assert _git(extracted, "status", "--porcelain") == ""
+
+    (extracted / "README.md").write_text("edited by the agent\n")
+    _git(extracted, "add", "-A")
+    assert _git(extracted, "diff", "--cached", "--name-only").splitlines() == ["README.md"]
+
+
+def test_prepare_batches_skip_worktree_for_many_escaping_links(
+    workspace: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("WARNING", logger="curie_worker.workspace")
+    names = [f"links/{'x' * 220}-{i:03d}" for i in range(300)]
+
+    _, commands, payload = _prepare_local(
+        workspace,
+        tmp_path,
+        files={"README.md": "workspace ready\n"},
+        links={name: f"/abs/elsewhere/{i}" for i, name in enumerate(names)},
+    )
+
+    entries = _archive_entries(payload)
+    assert "README.md" in entries
+    assert not any(name in entries for name in names)
+    extracted = _extract_archive(payload, tmp_path / "extracted")
+    assert _git(extracted, "status", "--porcelain") == ""
+
+    prefix = ["git", "update-index", "--skip-worktree", "--"]
+    prefix_bytes = sum(len(os.fsencode(part)) + 1 for part in prefix)
+    update_calls = [
+        call["argv"] for call in commands.calls if call.get("argv", [])[:2] == prefix[:2]
+    ]
+    assert len(update_calls) > 1
+    for argv in update_calls:
+        size = sum(len(os.fsencode(part)) + 1 for part in argv)
+        assert size <= workspace._UPDATE_INDEX_ARG_BUDGET + prefix_bytes
+    assert sorted(path for argv in update_calls for path in argv[len(prefix) :]) == sorted(names)
+    assert len(_workspace_warnings(caplog)) == 1
+
+
+def test_prepare_keeps_internal_checkout_link(
+    workspace: Any, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("WARNING", logger="curie_worker.workspace")
+
+    _, commands, payload = _prepare_local(
+        workspace,
+        tmp_path,
+        files={"docs/guide.md": "guide\n"},
+        links={"docs/link": "guide.md", "top": "docs/guide.md"},
+    )
+
+    entries = _archive_entries(payload)
+    assert entries["docs/link"] == "guide.md"
+    assert entries["top"] == "docs/guide.md"
+    assert _workspace_warnings(caplog) == []
+    assert not any(call.get("argv", [])[:2] == ["git", "update-index"] for call in commands.calls)
+
+
+def test_prepare_drops_dotdot_escaping_link(workspace: Any, tmp_path: Path) -> None:
+    _, _, payload = _prepare_local(
+        workspace,
+        tmp_path,
+        files={"README.md": "workspace ready\n"},
+        links={"sub/up": "../../outside"},
+    )
+
+    entries = _archive_entries(payload)
+    assert "sub/up" not in entries
+    assert "README.md" in entries
+    extracted = _extract_archive(payload, tmp_path / "extracted")
+    assert _git(extracted, "status", "--porcelain") == ""
