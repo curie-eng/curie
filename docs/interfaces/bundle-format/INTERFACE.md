@@ -24,8 +24,8 @@ The frozen bundle/plugin manifest format: the **Claude Code plugin shape verbati
 distribution wedge. What is swappable is the harness that consumes a bundle; what stays fixed is
 the shape a bundle must have to be accepted. The base is the Claude Code plugin shape, and the
 models are lenient (`extra="allow"`) rather than strict so any bundle written for Claude Code
-validates unchanged. On top of that base the package **does add six Curie authoring
-extensions** — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`, `approvalPolicy`,
+validates unchanged. On top of that base the package **does add seven Curie authoring
+extensions** — `systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`, `approvalPolicy`,
 `toolPolicy` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
 fields Claude Code does not define. Leniency is what lets the Claude Code base and these
 extensions coexist; the earlier "does not invent format extensions" framing was wrong.
@@ -46,6 +46,8 @@ was built into. What a bundle actually is, then, is the Claude Code
 plugin shape verbatim plus a strict Curie-only overlay, not a Claude Code plugin end to end.
 
 ## Current contract
+
+The optional-secret contract follows the [accepted decision on the source release train](https://github.com/curie-eng/curie/blob/757ac40ff53af39622e0dc0fe09db4ea66dcf868/docs/adr/0209-a-bundle-may-declare-a-secret-optional.md) and #4129. This backport preserves that decision without assigning its number to a different decision on this release train.
 
 `validate_bundle(path) -> ValidationResult` is the single entry point every deploy path calls
 (`packages/plugin-format/src/plugin_format/validate.py::validate_bundle`). It returns path-qualified
@@ -234,7 +236,7 @@ script from `.github/workflows/plugin-compat.yaml` on two triggers, because drif
 directions: a path-filtered `pull_request` trigger catches our own drift when we touch the bundles
 or the format models, and a nightly `schedule` catches Claude Code changing the format under us,
 which no PR of ours would ever surface. The check is deliberately not `--strict`: strict mode
-promotes unknown-field warnings to errors, and the six Curie authoring extensions are
+promotes unknown-field warnings to errors, and the seven Curie authoring extensions are
 unknown-to-Claude-Code by design, so warnings are the expected steady state and only a non-zero
 exit is a failure.
 
@@ -293,8 +295,8 @@ Code keys still validate.
 
 By intent, the manifest, skill, and MCP surfaces are Claude-Code-shaped — that is the wedge, not a
 leak. What the wedge
-costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**. All six
-Curie authoring extensions — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`,
+costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**. All seven
+Curie authoring extensions — `systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`,
 `approvalPolicy`, `toolPolicy` — are unknown fields to Claude Code, which warns about each and then
 silently ignores it at load time. The manifest is accepted and the commands, agents, hooks, and MCP
 servers work; the agent's persona, its suggested openers, its secret declarations, its wake-up
@@ -318,7 +320,7 @@ model the key at all, and the lenient models accept and silently ignore it.
 
 The three Curie-only root files degrade **more quietly still**, and they belong on the same list. A
 manifest extension at least draws a warning: `claude plugin validate examples/compat-fixture` (the
-fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which exists to carry all six)
+fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which carries the original six)
 reports one `Unknown field ... Claude Code ignores it at load time` warning per extension.
 `connectors.yaml`, `connectors.lock.yaml`, and `deploy.yaml` are not manifest fields at all, so
 Claude Code neither loads them nor mentions them: validating `examples/weather` (which carries `examples/weather/connectors.yaml`)

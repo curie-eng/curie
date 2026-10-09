@@ -117,6 +117,55 @@ def test_bundle_mcp_servers_is_empty_without_a_bundle(tmp_path: Path) -> None:
     assert bundle_mcp_servers(str(_bundle(tmp_path / "b", inline=None, root_mcp=None))) == {}
 
 
+@pytest.mark.parametrize("surface", ["inline", "root"])
+@pytest.mark.parametrize("binding", [None, "", "bound-value"])
+def test_optional_secret_projection_preserves_other_references_and_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, surface: str, binding: str | None
+) -> None:
+    monkeypatch.delenv("OPTIONAL_TOKEN", raising=False)
+    if binding is not None:
+        monkeypatch.setenv("OPTIONAL_TOKEN", binding)
+    config = {
+        "stdio": {
+            "command": "node",
+            "args": ["${OPTIONAL_TOKEN}"],
+            "env": {
+                "TOKEN": "${OPTIONAL_TOKEN}",
+                "EMBEDDED": "prefix-${OPTIONAL_TOKEN}",
+                "REQUIRED": "${REQUIRED_TOKEN}",
+                "UNDECLARED": "${OTHER_TOKEN}",
+            },
+        },
+        "http": {
+            "type": "http",
+            "url": "https://example.com/${OPTIONAL_TOKEN}",
+            "headers": {"Authorization": "Bearer ${OPTIONAL_TOKEN}"},
+        },
+    }
+    root = _bundle(
+        tmp_path / "bundle",
+        inline=config if surface == "inline" else None,
+        root_mcp=config if surface == "root" else None,
+    )
+    manifest_path = root / ".claude-plugin" / "plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest.update(secrets=["REQUIRED_TOKEN"], optionalSecrets=["OPTIONAL_TOKEN"])
+    manifest_path.write_text(json.dumps(manifest))
+    artifacts = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+
+    servers = bundle_mcp_servers(str(root))
+
+    stdio = servers["plugin:probe-bundle:stdio"]
+    expected_env = dict(config["stdio"]["env"])
+    if binding is None:
+        del expected_env["TOKEN"]
+    expected_env["CLAUDE_PLUGIN_ROOT"] = str(root)
+    assert stdio["env"] == expected_env
+    assert stdio["args"] == ["${OPTIONAL_TOKEN}"]
+    assert servers["plugin:probe-bundle:http"] == config["http"]
+    assert {p: p.read_bytes() for p in artifacts} == artifacts
+
+
 def _write_server(tmp_path: Path) -> Path:
     script = tmp_path / "server.py"
     script.write_text(_SERVER)
@@ -157,6 +206,56 @@ def _session_under_test(tmp_path: Path) -> tuple[Path, Path]:
     workspace.mkdir()
     (workspace / ".mcp.json").write_text(json.dumps({"mcpServers": {"ambient": _stdio(script)}}))
     return plugin_dir, workspace
+
+
+@pytest.mark.skipif(not _CLI_AVAILABLE, reason="requires the Claude Code CLI the SDK spawns")
+@pytest.mark.parametrize("optional,binding", [(False, None), (True, None), (True, "bound-value")])
+def test_real_loader_optional_secret_child_environment(
+    tmp_path: Path,
+    isolated_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    optional: bool,
+    binding: str | None,
+) -> None:
+    monkeypatch.delenv("OPTIONAL_TOKEN", raising=False)
+    monkeypatch.delenv("CHILD_TOKEN", raising=False)
+    if binding is not None:
+        monkeypatch.setenv("OPTIONAL_TOKEN", binding)
+    observed = tmp_path / "observed.json"
+    script = tmp_path / "server.py"
+    script.write_text(
+        "import os, json\nfrom pathlib import Path\n"
+        f"Path({str(observed)!r}).write_text(json.dumps("
+        '{"present": "CHILD_TOKEN" in os.environ, "value": os.environ.get("CHILD_TOKEN")}))\n'
+        + _SERVER
+    )
+    root = _bundle(
+        tmp_path / "bundle",
+        inline={"own": {**_stdio(script), "env": {"CHILD_TOKEN": "${OPTIONAL_TOKEN}"}}},
+        root_mcp=None,
+    )
+    manifest_path = root / ".claude-plugin" / "plugin.json"
+    if optional:
+        manifest = json.loads(manifest_path.read_text())
+        manifest["optionalSecrets"] = ["OPTIONAL_TOKEN"]
+        manifest_path.write_text(json.dumps(manifest))
+    before = manifest_path.read_bytes()
+    registered = anyio.run(
+        _registered,
+        _options(mcp_servers=bundle_mcp_servers(str(root)), cwd=str(tmp_path)),
+    )
+    own = next(s for s in registered if s["name"] == "plugin:probe-bundle:own")
+    assert own["status"] == "connected", own
+    # Observed through the real bundled Claude Code loader: an unset variable
+    # is delivered as the literal placeholder. This control must not be inferred
+    # from our projection; the child process records its actual environment.
+    expected = (
+        {"present": False, "value": None}
+        if optional and binding is None
+        else {"present": True, "value": binding if binding is not None else "${OPTIONAL_TOKEN}"}
+    )
+    assert json.loads(observed.read_text()) == expected
+    assert manifest_path.read_bytes() == before
 
 
 @pytest.mark.skipif(not _CLI_AVAILABLE, reason="requires the Claude Code CLI the SDK spawns")
