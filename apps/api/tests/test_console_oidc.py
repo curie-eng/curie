@@ -940,12 +940,19 @@ def test_inactive_principal_is_refused_at_login_and_on_existing_sessions(
     token = _session_token(_login(oidc_client))
     principal_headers = _cookie(SESSION_COOKIE, token)
     assert oidc_client.get("/console/principal", headers=principal_headers).status_code == 200
+    assert oidc_client.get("/agents", headers=principal_headers).status_code == 200
 
     _sql("UPDATE curie.principals SET status = :status", {"status": status})
 
     existing = oidc_client.get("/console/principal", headers=principal_headers)
     assert existing.status_code == 401, existing.text
     assert existing.headers.get("cache-control") == "no-store"
+    # require_api_key takes the same session cookie on an ordinary route (#1045);
+    # a disabled principal must close that path too, not only /console/principal,
+    # on both a read and a write.
+    assert oidc_client.get("/agents", headers=principal_headers).status_code == 401
+    write_headers = {**principal_headers, "Origin": "http://testserver"}
+    assert oidc_client.post("/agents", json={}, headers=write_headers).status_code == 401
 
     sessions_before = len(_sql("SELECT id FROM curie.console_sessions"))
     _assert_refused(_login(oidc_client))
@@ -964,12 +971,14 @@ def test_reactivated_principal_readmits_its_existing_session(oidc_client: TestCl
 
     _sql("UPDATE curie.principals SET status = 'disabled'")
     assert oidc_client.get("/console/principal", headers=headers).status_code == 401
+    assert oidc_client.get("/agents", headers=headers).status_code == 401
     assert _sql("SELECT id FROM curie.console_sessions WHERE revoked_at IS NOT NULL") == []
 
     _sql("UPDATE curie.principals SET status = 'active'")
     restored = oidc_client.get("/console/principal", headers=headers)
     assert restored.status_code == 200, restored.text
     assert restored.json()["status"] == "active"
+    assert oidc_client.get("/agents", headers=headers).status_code == 200
 
 
 def test_suspended_tenant_is_refused(oidc_client: TestClient) -> None:
@@ -982,7 +991,44 @@ def test_suspended_tenant_is_refused(oidc_client: TestClient) -> None:
         )
         existing = oidc_client.get("/console/principal", headers=headers)
         assert existing.status_code == 401, existing.text
+        assert oidc_client.get("/agents", headers=headers).status_code == 401
+        write_headers = {**headers, "Origin": "http://testserver"}
+        assert oidc_client.post("/agents", json={}, headers=write_headers).status_code == 401
         _assert_refused(_login(oidc_client))
+    finally:
+        _sql(
+            "UPDATE curie.tenants SET status = 'active' WHERE id = :id",
+            {"id": uuid.UUID(DEFAULT_TENANT_ID)},
+        )
+    assert oidc_client.get("/agents", headers=headers).status_code == 200
+
+
+def test_login_code_session_is_unaffected_by_principal_or_tenant_status(
+    oidc_client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    """The principal/tenant check require_api_key now runs for a principal-bound
+    session (above) must not reach a login-code session, which has no
+    principal to check: disabling every principal and suspending the fixture
+    tenant leaves a login-code session's require_api_key access untouched."""
+
+    minted = oidc_client.post(
+        "/console/login-codes", json={"subject": "U0EXAMPLE1"}, headers=auth_headers
+    )
+    assert minted.status_code == 201, minted.text
+    exchanged = oidc_client.post("/console/session", json={"code": minted.json()["code"]})
+    assert exchanged.status_code == 200, exchanged.text
+    token = str(_set_cookies(exchanged)[SESSION_COOKIE].value)
+    oidc_client.cookies.clear()
+    headers = _cookie(SESSION_COOKIE, token)
+    assert oidc_client.get("/agents", headers=headers).status_code == 200
+
+    _sql("UPDATE curie.principals SET status = 'disabled'")
+    try:
+        _sql(
+            "UPDATE curie.tenants SET status = 'suspended' WHERE id = :id",
+            {"id": uuid.UUID(DEFAULT_TENANT_ID)},
+        )
+        assert oidc_client.get("/agents", headers=headers).status_code == 200
     finally:
         _sql(
             "UPDATE curie.tenants SET status = 'active' WHERE id = :id",
@@ -1824,6 +1870,10 @@ def test_session_is_refused_after_an_issuer_switch_and_readmitted_on_restore(
     with _rebooted({**enabled_env(idp), "CURIE_OIDC_ISSUER": other_issuer}) as switched:
         assert get_settings().oidc_issuer == other_issuer
         _assert_uniform_principal_401(switched, _principal_status(switched, token))
+        # require_api_key takes the same cookie on an ordinary route (#1045);
+        # the issuer mismatch must close that path too.
+        session = _cookie(SESSION_COOKIE, token)
+        assert switched.get("/agents", headers=session).status_code == 401
 
     # Nothing was revoked: the check compares issuers on every request.
     (row,) = _sql("SELECT revoked_at FROM curie.console_sessions")
@@ -1832,6 +1882,7 @@ def test_session_is_refused_after_an_issuer_switch_and_readmitted_on_restore(
         response = _principal_status(restored, token)
         assert response.status_code == 200, response.text
         assert response.json()["id"] == str(principal["id"])
+        assert restored.get("/agents", headers=_cookie(SESSION_COOKIE, token)).status_code == 200
 
 
 def test_session_is_refused_when_oidc_is_disabled_and_readmitted_on_restore(

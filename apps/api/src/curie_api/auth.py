@@ -7,13 +7,18 @@ replaces this with GitHub-App-scoped identities.
 `require_principal_session` (#2908, ADR 0155) is a separate, stricter
 dependency: it accepts only a session bound to a principal (a person), never a
 bare login-code session, and no route guarded by it widens through the
-``require_api_key`` fallback above.
+``require_api_key`` fallback above. But a principal-bound cookie IS one of the
+live sessions ``require_api_key`` accepts, so both dependencies run the same
+``_authorized_principal`` check on it: disabling the principal, suspending its
+tenant, or repointing the configured issuer closes every route that cookie
+reaches, not only the principal-only ones.
 """
 
 import hmac
 from typing import Annotated
 
 from fastapi import Cookie, Header, HTTPException, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from .config import get_settings
 from .deps import SessionDep
@@ -36,6 +41,28 @@ def verify_platform_key(x_api_key: str | None) -> bool:
     return hmac.compare_digest(x_api_key, get_settings().api_key)
 
 
+async def _authorized_principal(session: AsyncSession, token: str) -> Principal | None:
+    """The principal ``token`` authenticates, if every check still holds.
+
+    Shared by ``require_principal_session`` and ``require_api_key``'s
+    principal-bound sessions, so a principal-bound cookie closes the same way
+    everywhere: disabling the principal, suspending its tenant, or changing
+    the configured issuer takes effect immediately on every route it reaches,
+    not only ``/console/principal``.
+    """
+    from .crud import console as crud_console
+
+    principal = await crud_console.live_principal_session(session, token)
+    settings = get_settings()
+    if (
+        principal is None
+        or not settings.oidc_enabled
+        or principal.idp_issuer != settings.oidc_issuer
+    ):
+        return None
+    return principal
+
+
 async def require_api_key(
     request: Request,
     x_api_key: Annotated[str | None, Header()] = None,
@@ -55,6 +82,12 @@ async def require_api_key(
 
     async with request.app.state.sessionmaker() as session:
         row = await crud_console.live_console_session(session, token)
+        if row is not None and row.principal_id is not None:
+            # A principal-bound session is only as live as its principal: the
+            # bare session row doesn't know the principal was disabled, its
+            # tenant suspended, or the issuer changed out from under it.
+            if await _authorized_principal(session, token) is None:
+                row = None
     if row is not None:
         return
     raise HTTPException(
@@ -143,15 +176,8 @@ async def require_principal_session(
     Every refusal is the same 401, so the response does not tell a caller
     whether the cookie was unknown, expired, or valid for someone disabled.
     """
-    from .crud import console as crud_console
-
-    principal = await crud_console.live_principal_session(session, console_session or "")
-    settings = get_settings()
-    if (
-        principal is None
-        or not settings.oidc_enabled
-        or principal.idp_issuer != settings.oidc_issuer
-    ):
+    principal = await _authorized_principal(session, console_session or "")
+    if principal is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="missing, invalid, or expired principal session",
