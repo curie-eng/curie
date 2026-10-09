@@ -1216,13 +1216,16 @@ def _requests(number: int) -> list[dict[str, Any]]:
     )
 
 
-def _relabelled_after_publication(client: Any, github: GitHubAPI, number: int) -> dict[str, Any]:
+def _relabelled_after_publication(
+    client: Any, github: GitHubAPI, number: int, *, published: bool = True
+) -> dict[str, Any]:
     """#4158: request 1 published a PR and was cancelled; request 2 is running."""
 
     _label(client, github, number)
     first = _request(number)
     _start_running(first["id"])
-    _attach_publication(first["work_item_id"], status="succeeded", pr=number)
+    if published:
+        _attach_publication(first["work_item_id"], status="succeeded", pr=number)
     github.labels = []
     removed = _post(client, "issues", _issue_event("unlabeled", number, label={"name": LABEL}))
     assert removed.json()["status"] == "factory_cancellation_requested"
@@ -2132,7 +2135,6 @@ def test_a_review_revision_with_no_changes_completes_in_its_thread(
         "merged",
         "closed",
         "first_request",
-        "relabelled",
         "missing_pr_url",
         "empty_pr_url",
         "mismatched_pr",
@@ -2154,9 +2156,7 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
     else:
         number, pr, first = _published_issue(client, github, sink)
         objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88122"
-        if case == "relabelled":
-            objective = f"https://github.com/{REPO}/issues/{number}"
-        elif case == "mismatched_pr":
+        if case == "mismatched_pr":
             objective = _revision_objective(pr + 1, "discussion_r88122")
         request_id = _insert_revision(first["work_item_id"], number, objective)
     _start_running(request_id)
@@ -2212,6 +2212,154 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
     assert f"Cause: {cause}" in body
     assert "curie-factory:needs-human" in sink.issue_labels[number]
     assert "curie-factory:pr-open" not in sink.issue_labels[number]
+
+
+@pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
+def test_a_relabel_with_no_changes_on_an_adopted_pull_request_completes(
+    admitted: Any, cause: str
+) -> None:
+    """#4345 AC1: a relabel continuing an adopted PR completes like a mention."""
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number = 9411
+    second = _relabelled_after_publication(client, github, number)
+    sink.requests.clear()
+    sink.ci_observations.clear()
+    detail = "No changes needed: the open pull request already does what the issue asks."
+
+    finished = _finish_unpublished(client, second["id"], cause=cause, detail=detail)
+
+    assert finished.status_code == 200, finished.text
+    terminal = {row["id"]: row for row in _requests(number)}[second["id"]]
+    assert (terminal["status"], terminal["terminal_cause"]) == ("completed", "completed")
+    notices = _notices(second["id"])
+    assert len(notices) == 1
+    assert notices[0]["terminal_cause"] == "completed"
+    _reconcile()
+    path = f"/repos/{REPO}/issues/{number}/comments"
+    body = _assert_one_final_comment(
+        [comment["body"] for comment in sink.lists[path]], second["id"]
+    )
+    assert "Status: SUCCEEDED" in body
+    assert (
+        "No changes needed: the open pull request already covers this request: "
+        f"https://github.com/{REPO}/pull/{number}"
+    ) in body
+    assert "Could not complete:" not in body
+    assert "NEEDS HUMAN" not in body
+    assert "curie-factory:pr-open" in sink.issue_labels[number]
+    assert "curie-factory:needs-human" not in sink.issue_labels[number]
+    assert sink.ci_observations == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "merged",
+        "closed",
+        "missing_pr_url",
+        "could_not_complete",
+        "no_lineage",
+        "earlier_publication_failed",
+    ],
+)
+def test_a_relabel_outside_an_adopted_pull_request_still_fails(admitted: Any, case: str) -> None:
+    """#4345 AC2: a relabel is a follow-up only on an open PR an earlier request published."""
+
+    client, github, sink = admitted
+    sink.by_path = True
+    number = 9412
+    second = _relabelled_after_publication(client, github, number, published=case != "no_lineage")
+    first_id = _requests(number)[0]["id"]
+    sink.requests.clear()
+    cause = "no_pull_request"
+    detail = "No changes needed: the request is already covered."
+    if case == "could_not_complete":
+        detail = "Could not complete: the requested change needs a design decision."
+    statement = {
+        "merged": (
+            "UPDATE curie.thread_publication_lineages SET status = 'merged' WHERE id = "
+            "(SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)"
+        ),
+        "closed": (
+            "UPDATE curie.thread_publication_lineages SET status = 'closed' WHERE id = "
+            "(SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)"
+        ),
+        "missing_pr_url": (
+            "UPDATE curie.thread_publication_lineages SET pr_number = NULL, pr_url = NULL "
+            "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :id)"
+        ),
+        "earlier_publication_failed": (
+            "UPDATE curie.publications SET status = 'failed' WHERE execution_request_id = :id"
+        ),
+    }.get(case)
+
+    if statement is not None:
+        target = first_id if case == "earlier_publication_failed" else second["work_item_id"]
+
+        async def change() -> None:
+            engine = create_async_engine(get_settings().database_url)
+            try:
+                async with engine.begin() as conn:
+                    changed = await conn.execute(text(statement), {"id": target})
+                    assert changed.rowcount == 1
+            finally:
+                await engine.dispose()
+
+        asyncio.run(change())
+
+    finished = _finish_unpublished(client, second["id"], cause=cause, detail=detail)
+
+    assert finished.status_code == 200, finished.text
+    terminal = {row["id"]: row for row in _requests(number)}[second["id"]]
+    assert (terminal["status"], terminal["terminal_cause"]) == ("failed", cause)
+    notices = _notices(second["id"])
+    assert len(notices) == 1
+    assert notices[0]["terminal_cause"] == cause
+    _reconcile()
+    path = f"/repos/{REPO}/issues/{number}/comments"
+    body = _assert_one_final_comment(
+        [comment["body"] for comment in sink.lists[path]], second["id"]
+    )
+    assert "Status: NEEDS HUMAN" in body
+    assert "curie-factory:needs-human" in sink.issue_labels[number]
+
+
+def test_a_relabel_revision_on_an_adopted_pull_request_settles_through_the_ci_gate(
+    admitted: Any,
+) -> None:
+    """#4345 AC4: a relabel that publishes a revision still waits on the CI gate."""
+
+    import curie_api.workitems as workitems
+
+    client, github, sink = admitted
+    number = 9413
+    second = _relabelled_after_publication(client, github, number)
+    _attach_revision_publication(second["work_item_id"], second["id"], status="succeeded")
+    publication_id = _rows(
+        "SELECT id FROM curie.publications WHERE execution_request_id = :id",
+        {"id": second["id"]},
+    )[0]["id"]
+
+    async def claim() -> Any:
+        engine = create_async_engine(get_settings().database_url)
+        maker = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with maker() as session:
+                settled = await workitems.claim_publication_settlement(session, exclude=frozenset())
+                await session.rollback()
+                return settled
+        finally:
+            await engine.dispose()
+
+    settled = asyncio.run(claim())
+
+    assert settled is not None
+    assert settled.request_id == second["id"]
+    assert settled.cause == "completed"
+    assert settled.publication_id == publication_id
+    assert {row["id"]: row for row in _requests(number)}[second["id"]]["status"] == "running"
 
 
 @pytest.mark.parametrize("cause", ["no_pull_request", "early_stop"])
