@@ -33,6 +33,7 @@
         { "field": "systemPrompt", "why": "no approvals-verb output surfaces the agent's system prompt." },
         { "field": "starterPrompts", "why": "no approvals-verb output surfaces starter prompts." },
         { "field": "secrets", "why": "declared secret NAMES are surfaced by other verbs (skill up --secret), not skill approvals." },
+        { "field": "optionalSecrets", "why": "optional secret names have no approval inspection surface." },
         { "field": "triggers", "why": "no approvals-verb output surfaces the manifest's trigger declarations." },
         { "field": "toolPolicy", "why": "the vanilla MCP tool-policy declaration is a runtime-enforcement contract with no runtime enforcing it yet and no output surface on skill approvals; when a verb surfaces it, this omission becomes a carried field." }
       ]

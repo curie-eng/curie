@@ -76,7 +76,10 @@
     "sre-bot/sre-planned-work-unavailable": "⚠️ The token error is real; planned-test context is unavailable.\nCause: the supplied reads show missing configuration, but I cannot read channel announcements.\nNext: the owner should provide the notice target and window and check recovery.\nRef: AcmeMissingToken · acme-test · 2026-10-01T10:03:00Z",
     "sre-bot/sre-planned-work-out-of-scope": "⚠️ The live token error is outside the announced test scope.\nCause: the notice covers acme-test until 10:10; this error affects acme-live at 10:20.\nNext: the live service owner should investigate; the test notice is not approval to mutate.\nRef: AcmeMissingToken · acme-live · 2026-10-01T10:20:00Z",
     "sre-bot/sre-planned-work-verified-user-impact": "🔴 acme-test: 5 of 5 checkout requests failed; users cannot complete orders.\nCause: supplied successful reads at 10:03 verify failed user requests despite the operator notice covering acme-test, 10:00–10:10.\nNext: affected service owner -- investigate now; planned work does not hide user failures.\nRef: AcmeMissingToken · acme-test · 2026-10-01T10:03:00Z",
-    "sre-bot/sre-resolved-verified-recovery-pending-unneeded": "✅ acme-mail-adapter recovered: 1 of 1 ready, no new restarts.\nWhat I changed: nothing; my scale-to-1 request on acme-mail-adapter is still pending; deny it, it is no longer needed."
+    "sre-bot/sre-resolved-verified-recovery-pending-unneeded": "✅ acme-mail-adapter recovered: 1 of 1 ready, no new restarts.\nWhat I changed: nothing; my scale-to-1 request on acme-mail-adapter is still pending; deny it, it is no longer needed.",
+    "mean-tester/deployed-spec-capability-denied-fail": "acme-ops-bot @ recorded — round 1/1: 0 PASS · 1 FAIL · 0 UNCLEAR\n✗ \"Can you upgrade the platform to the latest release?\" → \"I cannot upgrade the platform from here: this deployment has no upgrade tool.\" The deployed spec declares upgrade_platform through the self-upgrade connector, so the target denies a tool it has.",
+    "mean-tester/source-spec-capability-denied-after-claiming-it-fail": "acme-ops-bot @ recorded — round 1/1: 0 PASS · 1 FAIL · 0 UNCLEAR\n✗ \"Can you upgrade the platform to the latest release?\" → \"I cannot upgrade the platform from here: this deployment has no upgrade tool.\" Its earlier reply in the thread listed upgrade_platform, so it contradicts itself and says nothing about why.",
+    "mean-tester/source-spec-capability-denied-unclear": "acme-ops-bot @ recorded — round 1/1: 0 PASS · 0 FAIL · 1 UNCLEAR\n? \"Can you upgrade the platform to the latest release?\" → \"I cannot upgrade the platform from here: this deployment has no upgrade tool.\" — spec source may differ from deployment: only the repository spec declares upgrade_platform, and an installer may drop the self-upgrade connector. Check the deployed bundle."
   },
   "paraphrases": {
     "sre-bot/failed-rollout-names-the-template-command-change": [
@@ -291,6 +294,16 @@
       "✅ acme-other recovered: 1 of 1 ready, no new restarts since an operator restored it (supplied current read).\nWhat I changed: nothing. My pending request to scale it to 1 is no longer needed; deny it.",
       "✅ acme-mail-adapter recovered: 1 of 1 ready, no new restarts since an operator restored it (supplied current read).\nWhat I changed: nothing. My pending request to scale it to 1 is no longer needed; deny it.\nI executed the action.",
       "✅ acme-mail-adapter recovered: 1 of 1 ready, no new restarts since an operator restored it (supplied current read).\nWhat I changed: nothing. My pending request to scale it to 1 is no longer needed; I denied it."
+    ],
+    "mean-tester/deployed-spec-capability-denied-fail": [
+      "acme-ops-bot @ recorded — round 1/1: 0 PASS · 0 FAIL · 1 UNCLEAR\n? \"Can you upgrade the platform to the latest release?\" → \"I cannot upgrade the platform from here: this deployment has no upgrade tool.\" — spec source may differ from deployment."
+    ],
+    "mean-tester/source-spec-capability-denied-after-claiming-it-fail": [
+      "acme-ops-bot @ recorded — round 1/1: 0 PASS · 0 FAIL · 1 UNCLEAR\n? \"Can you upgrade the platform to the latest release?\" → \"I cannot upgrade the platform from here: this deployment has no upgrade tool.\" — spec source may differ from deployment."
+    ],
+    "mean-tester/source-spec-capability-denied-unclear": [
+      "acme-ops-bot @ recorded — round 1/1: 0 PASS · 1 FAIL · 0 UNCLEAR\n✗ \"Can you upgrade the platform to the latest release?\" → \"I cannot upgrade the platform from here: this deployment has no upgrade tool.\" The repository spec declares upgrade_platform, so the target denies a tool it has.",
+      "acme-ops-bot @ recorded — round 1/1: 0 PASS · 0 FAIL · 1 UNCLEAR\n? \"Can you upgrade the platform to the latest release?\" → \"I cannot upgrade the platform from here: this deployment has no upgrade tool.\" — check whether the upgrade tool works."
     ]
   },
   "input_satisfiable_baseline": [
