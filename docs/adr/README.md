@@ -223,4 +223,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0208 | [A factory PR opened after its request was cancelled is adopted by the next run](0208-a-factory-pr-opened-after-its-request-was-cancelled-is-adopted-by-the-next-run.md) | Accepted |
 | 0209 | [Pause authority after a drain is a lease held by a live upgrade step](0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md) | Accepted |
 | 0212 | [A work item owner rides through a store outage and stops its turn when it cannot](0212-a-work-item-owner-rides-through-a-store-outage-and-stops-its-turn-when-it-cannot.md) | Draft |
+| 0213 | [A factory PR that conflicts after its base moves is rebased once and verified again](0213-a-factory-pr-that-conflicts-after-its-base-moves-is-rebased-once-and-verified-again.md) | Draft |
 <!-- END GENERATED: adr-index -->
