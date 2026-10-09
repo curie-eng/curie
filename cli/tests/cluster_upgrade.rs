@@ -28,6 +28,7 @@ fn opts(to: &str) -> UpgradeOpts {
         chart: UpgradeChart::AvailableLocal("charts/curie".into()),
         yes: true,
         forward_only: false,
+        allow_stock_layer_clear: false,
         take_over: None,
     }
 }
@@ -682,9 +683,9 @@ async fn dry_run_shows_rebinds_and_stock_clears_apart() {
             ],
             kept: Vec::new(),
         });
-    let out = run_lifecycle(dry_opts("0.12.3"), &mut host)
-        .await
-        .expect("dry-run plan");
+    let mut opts = dry_opts("0.12.3");
+    opts.allow_stock_layer_clear = true;
+    let out = run_lifecycle(opts, &mut host).await.expect("dry-run plan");
     let ClusterUpgradeOutput::DryRun(plan) = &out else {
         panic!("dry-run must not mutate: {out:?}");
     };

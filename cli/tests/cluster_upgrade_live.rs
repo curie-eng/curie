@@ -4476,45 +4476,55 @@ fn dry_run_lists_rebound_and_cleared_layers_and_mutates_nothing() {
     );
 }
 
-/// #4321 AC4: with no layer published for `--to` the stock binding is cleared
-/// like an owner-built one, but its notice gives the reason and the stock
-/// remedy. The upgrade still commits.
+/// #4344 AC1, AC2: Validate refuses before release, values, record or claim
+/// mutation. Upgrade ownership is acquired and released as for every refusal.
+fn assert_stock_layer_refusal_writes_only_ownership(fixture: &Fixture) {
+    assert!(fixture.helm_upgrades().is_empty(), "{:?}", fixture.argv());
+    let mutations = mutating_calls(fixture);
+    assert_eq!(mutations.len(), 2, "{mutations:?}");
+    assert!(
+        argv_starts(&mutations[0], &["kubectl", "create"]),
+        "{mutations:?}"
+    );
+    assert!(is_checkpoint_patch(&mutations[1]), "{mutations:?}");
+    let created = fixture.created();
+    assert_eq!(created.len(), 1, "{created:?}");
+    assert!(created[0].pointer("/data/record").is_none(), "{created:?}");
+    let patches = fixture.patches();
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert!(is_release_patch(&patches[0]), "{patches:?}");
+    assert!(!patches.iter().any(is_record_patch), "{patches:?}");
+    assert_ownership_released(fixture);
+    assert!(
+        !fixture.argv().iter().any(|call| {
+            call.iter().any(|arg| arg == "delete") && call.iter().any(|arg| arg == "sandboxclaim")
+        }),
+        "no claims may be retired before Validate: {:?}",
+        fixture.argv()
+    );
+    assert!(
+        !fixture.issued(&["kubectl", "get", "deploy", "rel-worker"]),
+        "Validate refusal precedes DrainPreflight: {:?}",
+        fixture.argv()
+    );
+}
+
+/// #4344 AC1: a missing stock layer refuses even when --yes approved the plan.
 #[test]
-fn unpublished_stock_layer_is_cleared_with_the_stock_remedy() {
+fn unpublished_stock_layer_refuses_at_validate_before_mutation() {
     let registry = stock_registry(false);
     let fixture = stock_fixture();
     let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
-    assert!(output.status.success(), "{}", visible(&output));
-    let body = json(&output);
-    assert_eq!(body["status"], "succeeded", "{body}");
-    assert_eq!(body["canary"]["passed"], true, "{body}");
-    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
-    let applied = values_doc(&fixture.values(1));
+    assert!(!output.status.success(), "{}", visible(&output));
+    let text = visible(&output);
     assert!(
-        applied
-            .pointer("/agentSandbox/runnerImages/dark-factory")
-            .is_none(),
-        "{applied}"
+        text.contains("stock runner layer cannot be rebound for 0.9.0: dark-factory"),
+        "{text}"
     );
-    assert_retired_after_apply(&fixture, &["acme-bot", "dark-factory"]);
-    let stock = plan_line(&body, "stock runner layers:");
-    assert!(stock.contains("dark-factory"), "{stock}");
-    assert!(stock.contains("not published"), "{stock}");
-    assert!(
-        stock.contains(&format!(
-            "curie cluster factory --namespace ns --release rel --runner-image \
-             dark-factory={STOCK_REPOSITORY}@sha256:<digest>"
-        )),
-        "{stock}"
-    );
-    assert!(
-        stock.contains("curie example dark-factory render"),
-        "{stock}"
-    );
-    assert!(!stock.contains("curie build --plugin-dir"), "{stock}");
-    assert!(!stock.contains("acme-bot"), "{stock}");
-    let owner = plan_line(&body, "runner layers:");
-    assert!(!owner.contains("dark-factory"), "{owner}");
+    assert!(text.contains("is not published"), "{text}");
+    assert!(text.contains("--allow-stock-layer-clear"), "{text}");
+    assert!(!text.contains("acme-bot ("), "{text}");
+    assert_stock_layer_refusal_writes_only_ownership(&fixture);
     assert!(
         registry
             .recorded()
@@ -4524,35 +4534,103 @@ fn unpublished_stock_layer_is_cleared_with_the_stock_remedy() {
     );
 }
 
-/// #4321 AC4 liveness: a registry that refuses connections clears the stock
-/// binding with the reason and the upgrade still commits, well inside the
-/// resolver's 30 s client timeout.
+/// #4344 AC2: a connection refusal returns with remediation inside 30 seconds.
 #[test]
-fn unreachable_registry_clears_the_stock_layer_and_still_upgrades() {
+fn unreachable_registry_refuses_the_stock_layer_before_mutation() {
     let fixture = stock_fixture();
     let started = Instant::now();
     let output = run_stock(&fixture, "healthy", "http://127.0.0.1:1", &[]);
     let elapsed = started.elapsed();
-    assert!(output.status.success(), "{}", visible(&output));
-    let body = json(&output);
-    assert_eq!(body["status"], "succeeded", "{body}");
-    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
-    let applied = values_doc(&fixture.values(1));
+    assert!(!output.status.success(), "{}", visible(&output));
+    let text = visible(&output);
     assert!(
-        applied
-            .pointer("/agentSandbox/runnerImages/dark-factory")
-            .is_none(),
-        "{applied}"
+        text.contains("stock runner layer cannot be rebound for 0.9.0: dark-factory"),
+        "{text}"
     );
-    let stock = plan_line(&body, "stock runner layers:");
-    assert!(stock.contains("dark-factory"), "{stock}");
-    assert!(stock.contains("registry"), "{stock}");
-    assert!(!stock.contains("curie build --plugin-dir"), "{stock}");
-    assert_retired_after_apply(&fixture, &["dark-factory"]);
+    assert!(text.contains("restore read access to ghcr.io"), "{text}");
+    assert_stock_layer_refusal_writes_only_ownership(&fixture);
     assert!(
         elapsed < Duration::from_secs(30),
         "a refused registry must not wait out the client timeout: {elapsed:?}"
     );
+}
+
+/// #4344 AC3: the refusing dry-run reports its plan and acquires no ownership.
+#[test]
+fn dry_run_shows_the_stock_layer_refusal() {
+    let registry = stock_registry(false);
+    let fixture = stock_fixture();
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &["--dry-run"]);
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    let refusal = plan_line(
+        &body,
+        "refusal at validate: stock runner layer cannot be rebound for",
+    );
+    assert!(refusal.contains("dark-factory"), "{refusal}");
+    assert!(refusal.contains("is not published"), "{refusal}");
+    assert!(refusal.contains("--allow-stock-layer-clear"), "{refusal}");
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert!(fixture.created().is_empty(), "{:?}", fixture.created());
+    assert!(fixture.patches().is_empty(), "{:?}", fixture.patches());
+    assert!(
+        !fixture
+            .argv()
+            .iter()
+            .any(|call| call.iter().any(|arg| arg == "sandboxclaim")),
+        "{:?}",
+        fixture.argv()
+    );
+}
+
+/// #4344 AC4: explicit consent retains the old clearing behavior for both
+/// unpublished layers and an unreachable registry, including the canary.
+#[test]
+fn allow_stock_layer_clear_clears_the_unbindable_stock_layer() {
+    let registry = stock_registry(false);
+    for (endpoint, reason) in [
+        (registry.base_url.as_str(), "not published"),
+        ("http://127.0.0.1:1", "registry"),
+    ] {
+        let fixture = stock_fixture();
+        let output = run_stock(
+            &fixture,
+            "healthy",
+            endpoint,
+            &["--allow-stock-layer-clear"],
+        );
+        assert!(output.status.success(), "{}", visible(&output));
+        let body = json(&output);
+        assert_eq!(body["status"], "succeeded", "{body}");
+        assert_eq!(body["canary"]["passed"], true, "{body}");
+        assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+        let applied = values_doc(&fixture.values(1));
+        assert!(
+            applied
+                .pointer("/agentSandbox/runnerImages/dark-factory")
+                .is_none(),
+            "{applied}"
+        );
+        assert_retired_after_apply(&fixture, &["acme-bot", "dark-factory"]);
+        let stock = plan_line(&body, "stock runner layers:");
+        assert!(stock.contains("dark-factory"), "{stock}");
+        assert!(stock.contains(reason), "{stock}");
+        assert!(
+            stock.contains(&format!(
+                "curie cluster factory --namespace ns --release rel --runner-image \
+                 dark-factory={STOCK_REPOSITORY}@sha256:<digest>"
+            )),
+            "{stock}"
+        );
+        assert!(
+            stock.contains("curie example dark-factory render"),
+            "{stock}"
+        );
+        assert!(!stock.contains("curie build --plugin-dir"), "{stock}");
+        assert!(!stock.contains("acme-bot"), "{stock}");
+        let owner = plan_line(&body, "runner layers:");
+        assert!(!owner.contains("dark-factory"), "{owner}");
+    }
 }
 
 /// #4321 AC6: Helm accepts the rebind, but the rendered per-agent template

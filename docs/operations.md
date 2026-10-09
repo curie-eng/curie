@@ -472,6 +472,7 @@ and runs every target check before mutation.
 | `--yes` | Skip the confirmation prompt. |
 | `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download. A plan that ends in a validate refusal exits nonzero, like the real run. The printed `helm upgrade` line is the command Apply runs, including `--install` and `-f <retained-values>` when it passes them. |
 | `--forward-only` | Apply pending contract or irreversible schema migrations. Without this flag, Validate refuses those migrations before mutation so a patch rollback window stays intact. |
+| `--allow-stock-layer-clear` | Proceed when a stock dark factory runner layer cannot be rebound for `--to`: clear its binding so the agent runs the platform runner without its layer until it is rebound. Refused by default. |
 
 One resumable lifecycle: inspect and plan, validate configuration and
 schema compatibility and refuse on an ambiguous migration conflict, drain
@@ -1192,8 +1193,10 @@ to the project's published dark factory layer
 (`ghcr.io/curie-eng/curie-dark-factory-runner@...`) is instead rebound to the
 layer published for the target version when that layer's base is the target
 runner. The plan lists it separately, and its sandboxes are retired the same
-way. When it cannot be rebound (no published layer, another base, or an
-unreachable registry) it is cleared, and the notice names `curie cluster factory
+way. When it cannot be rebound (no published layer, another base, an
+unreachable registry, or an unknown target runner), the upgrade refuses at
+Validate with the reason and remediation. It is cleared only with
+`--allow-stock-layer-clear`; then the notice names `curie cluster factory
 --runner-image <agent>=<repository>@sha256:<digest>`, or `curie example
 dark-factory render` then `curie cluster deploy`, instead of `curie build`. The
 canary then reads every layered agent's SandboxTemplate and fails the upgrade
@@ -1202,7 +1205,8 @@ resolve runner digests by reading the registry directly, so the operator host
 needs no docker. A registry that refuses anonymous reads falls back to `docker
 buildx imagetools` and its registry login when docker is on PATH. When no digest
 can be resolved, `curie cluster deploy` refuses and `curie cluster upgrade`
-clears every layer; setting the chart value `agentSandbox.runner.digest` pins
+refuses for stock layers unless `--allow-stock-layer-clear` is set, while
+owner-built layers are cleared; setting the chart value `agentSandbox.runner.digest` pins
 the runner so no lookup is needed.
 
 For a run that can last three hours, set an illustrative $100 USD cap after
