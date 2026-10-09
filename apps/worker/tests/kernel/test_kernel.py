@@ -2762,6 +2762,20 @@ def test_finish_race_falls_back_to_a_fresh_turn(make_harness) -> None:
             id="empty-alone-is-retryable-runner-error",
         ),
         pytest.param(
+            [
+                ErrorEvent(
+                    message="model error: server_error: API Error: Connection refused "
+                    "(ECONNREFUSED)",
+                    classification="model-unreachable",
+                )
+            ],
+            [Final(text="recovered", status=DONE)],
+            "recovered",
+            # #4333: a model endpoint that could not be reached before any
+            # side effect is a transport failure a later attempt can pass.
+            id="model-unreachable-retries",
+        ),
+        pytest.param(
             # Mid-run drop: a delta streams, then the stream ends with no final.
             [TextDelta(text="partial")],
             [TextDelta(text="full"), Final(text="full done", status=DONE)],
@@ -3119,6 +3133,69 @@ def test_side_effect_failure_escalates_without_retry(make_harness) -> None:
 
             assert h.runner.opened == ["do it"]  # exactly one attempt, no retry
             assert h.sink.last_text is not None and "human" in h.sink.last_text.lower()
+            assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_server_error_model_unreachable_split_server_error_not_retried(make_harness) -> None:
+    """#4333: only model-unreachable joined the retryable set, not server-error."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    ErrorEvent(
+                        message="model error: server_error: API Error: 500 Internal server error",
+                        classification="server-error",
+                    ),
+                    Final(text="failed", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            await h.kernel.process_event(qevent("go", event_id="evt-server-error-4333"))
+
+            assert h.runner.opened == ["go"]  # exactly one attempt, no retry
+            reply = h.sink.last_text
+            assert reply is not None
+            assert "(server-error) after 1 attempt(s)" in reply
+            assert "recovered" not in reply
+
+    asyncio.run(go())
+
+
+def test_model_unreachable_after_side_effect_escalates_without_retry(make_harness) -> None:
+    """ADR 0013: a retryable model-unreachable must not retry after a side effect."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    SideEffectFlag(tool="deploy"),
+                    ErrorEvent(
+                        message="model error: server_error: API Error: Connection refused "
+                        "(ECONNREFUSED)",
+                        classification="model-unreachable",
+                    ),
+                    Final(text="failed", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            ev = qevent("do it", event_id="evt-unreachable-side-effect")
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == ["do it"]  # exactly one attempt, no retry
+            reply = h.sink.last_text
+            assert reply is not None
+            assert reply.startswith("curie-turn-failure: model-unreachable\n")
+            assert (
+                "The run hit an error (model-unreachable) after starting an action; "
+                "not retrying automatically."
+            ) in reply
+            assert "ECONNREFUSED" in reply
+            assert "human" in reply.lower()
+            assert "recovered" not in reply
             assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
 

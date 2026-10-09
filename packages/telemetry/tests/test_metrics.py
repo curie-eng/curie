@@ -204,7 +204,12 @@ def test_schedule_fire_counter_has_closed_run_outcome_and_trigger_domains() -> N
     domains = definition["attributes"]
     assert domains["service.name"] == ["curie-worker"]
     assert set(domains["outcome"]) == {
-        "ran", "deferred", "skipped", "blocked", "reclaimed", "failed"
+        "ran",
+        "deferred",
+        "skipped",
+        "blocked",
+        "reclaimed",
+        "failed",
     }
     assert set(domains["trigger"]) == {"cron", "bind", "webhook", "test"}
     assert set(domains) == {"service.name", "outcome", "trigger"}
@@ -343,9 +348,10 @@ def test_retry_metrics_separate_bounded_retry_causes(
             "workspace-error",
             "sandbox-terminated",
             "sandbox-capacity",
+            "model-unreachable",
         ],
     }
-    assert queue["cardinality_bound"] == 14
+    assert queue["cardinality_bound"] == 16
     record_metric(
         "curie.queue.retry",
         attributes={
@@ -841,8 +847,7 @@ def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
     )
     assert provider.force_flush(timeout_millis=5000)
     labels = {
-        dict(point)["agent"]
-        for point in _exported_series(reader)["curie.agent.turn.completed"]
+        dict(point)["agent"] for point in _exported_series(reader)["curie.agent.turn.completed"]
     }
     assert "acme-0" in labels
     assert "acme-31" in labels

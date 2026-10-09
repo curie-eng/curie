@@ -250,7 +250,7 @@ Rules (detailed-architecture 2b), each with an integration test that provokes it
   a non-idempotent action. For noncron turns, flag-clean failures retry by
   classification:
   `rate-limit`, `runner-error`, `runner-timeout`, `sandbox-capacity`,
-  `sandbox-terminated` and `workspace-error` are transient (bounded exponential
+  `sandbox-terminated`, `workspace-error` and `model-unreachable` are transient (bounded exponential
   backoff);
   `budget-exceeded` and everything else escalate.
   `runner-timeout` is the runner's streaming budget expiring mid-turn (#2011),
