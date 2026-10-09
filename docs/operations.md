@@ -1184,9 +1184,11 @@ cannot be determined, it names every agent in `agentSandbox.runnerImages` before
 upgrading, in the plan and `--dry-run` output too, and clears those entries in
 the same `helm upgrade` by deleting the keys from the retained values document.
 It does not pass a null override. A null map entry is not a deletion, and the
-chart refuses it as a digest before Helm creates a revision. After that upgrade it deletes those agents'
-SandboxClaims, as `curie cluster deploy` does, so a live thread's next turn
-starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
+chart refuses it as a digest before Helm creates a revision. After that upgrade it retires those agents'
+SandboxClaims whose runner is not the planned layer, or cannot be resolved, and
+keeps sandboxes already on the target layer. If a claim, pod or template read
+fails, it falls back to retiring all of the agent's claims. A retired thread's
+next turn starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
 layer until their owners rebuild with `curie build` and redeploy. An agent bound
 to the project's published dark factory layer
 (`ghcr.io/curie-eng/curie-dark-factory-runner@...`) is instead rebound to the

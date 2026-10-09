@@ -43,7 +43,6 @@ WORKDIR=""
 CANDIDATE=""
 OWNED_KIND=0
 OWNED_HELM=0
-PUBLISHED_BIN=""
 ASSET_DIR=""
 STARTED_AT=""
 CHART_0100=""
@@ -59,6 +58,9 @@ APPLY_KILL_PID=""
 APPLY_KILL_PIDS=()
 APPLY_KILL_HELM_SEEN=0
 ROLLBACK_SERVING_HELM_PID=""
+RETIRE_RUNNER_ORIGINAL_ID=""
+RETIRE_RUNNER_DERIVED_TAG=""
+RETIRE_LAYER_TAG=""
 
 CHART_088_SHA="88664c2f991bed7a3e4bc0513ae73bfcbac08077d99a69e7087138aa6f8f3af2"
 CLI_088_SHA="dc0e1ab1b928522f1ca1c03e05d823e08218800c2d2a33d0d88af623972f6685"
@@ -90,6 +92,7 @@ SCENARIOS_ALL=(
     previous-serves
     apply-kill-takeover
     rollback-to-serving
+    runner-layer-retire
 )
 
 MATRIX_PHASES=(plan validate drain_preflight checkpoint migrate apply converge canary commit)
@@ -120,6 +123,7 @@ s09 setup n-to-n1 guarded-rollback
 s11 nosetup rollback-published-089
 s13 setup converge-negative
 s14 setup previous-serves
+s15 setup runner-layer-retire
 s16 setup apply-kill-takeover
 s17 setup rollback-to-serving"
 SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
@@ -133,7 +137,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving|runner-layer-retire] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -306,7 +310,8 @@ run_self_test() {
         log "self-test: soak release helper is wrong"
         failed=1
     fi
-    if valid_scenario "all" && valid_scenario "fresh-n" && valid_scenario "fail-every-phase" && ! valid_scenario "not-a-scenario"; then
+    if valid_scenario "all" && valid_scenario "fresh-n" && valid_scenario "fail-every-phase" \
+        && valid_scenario "runner-layer-retire" && ! valid_scenario "not-a-scenario"; then
         log "unknown scenario refused"
     else
         log "self-test: scenario helper is wrong"
@@ -370,6 +375,8 @@ run_self_test() {
         log "self-test: mutator must be cluster upgrade"
         failed=1
     fi
+    # Match the source's variable names without expanding them in this shell.
+    # shellcheck disable=SC2016
     if awk '/^restore_n\(\)/,/^}/' "$script_path" | grep -q '"$status" == "in_progress" && "$target" == "0.10.0"'; then
         log "restore_n resumes leftover in_progress 0.10.0"
     else
@@ -535,13 +542,21 @@ run_self_test() {
         log "self-test: shard coverage failed for the active manifest"
         failed=1
     fi
+    if [[ "$(shard_manifest lookup "$SHARDS_CANONICAL" s15)" == $'setup\nrunner-layer-retire' ]] \
+        && [[ "$(scenario_fn runner-layer-retire)" == run_runner_layer_retire ]]; then
+        log "runner-layer-retire runs in setup shard s15"
+    else
+        log "self-test: runner-layer-retire must run in setup shard s15"
+        failed=1
+    fi
     local mutated label
-    for label in "dropped scenario" "duplicated scenario" "dropped phase" "duplicated phase"; do
+    for label in "dropped scenario" "duplicated scenario" "dropped phase" "duplicated phase" "dropped runner-layer-retire"; do
         case "$label" in
             "dropped scenario") mutated="${SHARDS_CANONICAL/ migration-crash/}" ;;
             "duplicated scenario") mutated="${SHARDS_CANONICAL/s11 nosetup rollback-published-089/s11 nosetup rollback-published-089 fresh-n}" ;;
             "dropped phase") mutated="${SHARDS_CANONICAL/interrupt-resume:checkpoint+migrate/interrupt-resume:checkpoint}" ;;
             "duplicated phase") mutated="${SHARDS_CANONICAL/fail-every-phase:converge/fail-every-phase:converge+plan}" ;;
+            "dropped runner-layer-retire") mutated="${SHARDS_CANONICAL/s15 setup runner-layer-retire/}" ;;
         esac
         if [[ "$mutated" == "$SHARDS_CANONICAL" ]]; then
             log "self-test: $label negative control did not mutate the manifest"
@@ -553,6 +568,103 @@ run_self_test() {
             log "shard coverage refused a $label"
         fi
     done
+    local claim_probe
+    claim_probe="$(mktemp -d)"
+    python3 - "$claim_probe" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+claim = {"metadata": {"name": "acme-target", "uid": "acme-claim-uid",
+                      "labels": {"curietech.ai/agent": "acme-bot"}},
+         "status": {"sandbox": {"name": "acme-sandbox"},
+                    "conditions": [{"type": "Ready", "status": "True"}]}}
+pod = {"metadata": {"name": "acme-sandbox", "labels": {"app.kubernetes.io/component": "runner-sandbox"}},
+       "spec": {"containers": [{"name": "runner", "image": "acme-runner@sha256:target"}]},
+       "status": {"conditions": [{"type": "Ready", "status": "True"}]}}
+for name, document in (("claim", claim), ("pod", pod)):
+    (root / f"{name}.json").write_text(json.dumps(document))
+for name, value in (("managed", "curie-worker"), ("deleting", "2026-01-01T00:00:00Z")):
+    changed = json.loads(json.dumps(claim))
+    if name == "managed":
+        changed["metadata"]["labels"]["curietech.ai/managed-by"] = value
+    else:
+        changed["metadata"]["deletionTimestamp"] = value
+    (root / f"{name}.json").write_text(json.dumps(changed))
+(root / "pod-labels.json").write_text(json.dumps(pod["metadata"]["labels"]))
+(root / "pod-labels-empty.json").write_text("")
+labelled = dict(pod["metadata"]["labels"], **{"curietech.ai/agent": "acme-bot"})
+(root / "pod-labels-agent.json").write_text(json.dumps(labelled))
+pod["status"]["conditions"][0]["status"] = "False"
+(root / "unready.json").write_text(json.dumps(pod))
+unready_claim = json.loads(json.dumps(claim))
+unready_claim["status"]["conditions"] = [{"type": "Ready", "status": "False",
+                                          "reason": "DependenciesNotReady"}]
+(root / "unready-claim.json").write_text(json.dumps(unready_claim))
+unready_claim["metadata"]["labels"]["curietech.ai/managed-by"] = "curie-worker"
+(root / "unready-managed.json").write_text(json.dumps(unready_claim))
+PY
+    if runner_layer_pod_lacks_agent_label "$claim_probe/pod-labels.json" \
+        && runner_layer_pod_lacks_agent_label "$claim_probe/pod-labels-empty.json"; then
+        log "runner-layer-retire accepts a target Pod with no agent label"
+    else
+        log "self-test: runner-layer-retire rejected a target Pod with no agent label"
+        failed=1
+    fi
+    if runner_layer_pod_lacks_agent_label "$claim_probe/pod-labels-agent.json" >/dev/null 2>&1; then
+        log "self-test: runner-layer-retire accepted the agent-labelled target Pod control"
+        failed=1
+    else
+        log "runner-layer-retire refused the agent-labelled target Pod control"
+    fi
+    if [[ "$(runner_layer_claim_observation "$claim_probe/claim.json" "$claim_probe/pod.json" \
+        acme-bot acme-runner@sha256:target acme-claim-uid ready)" == acme-claim-uid ]]; then
+        log "runner-layer-retire accepts an unchanged Ready target claim"
+    else
+        log "self-test: runner-layer-retire rejected its Ready target claim"
+        failed=1
+    fi
+    local control claim_file pod_file expected_image expected_uid
+    for control in managed deleting unready old-image replaced-uid; do
+        claim_file="$claim_probe/claim.json"
+        pod_file="$claim_probe/pod.json"
+        expected_image="acme-runner@sha256:target"
+        expected_uid="acme-claim-uid"
+        case "$control" in
+            managed|deleting) claim_file="$claim_probe/$control.json" ;;
+            unready) pod_file="$claim_probe/unready.json" ;;
+            old-image) expected_image="acme-runner@sha256:old" ;;
+            replaced-uid) expected_uid="acme-replacement-uid" ;;
+        esac
+        if runner_layer_claim_observation "$claim_file" "$pod_file" acme-bot \
+            "$expected_image" "$expected_uid" ready >/dev/null 2>&1; then
+            log "self-test: runner-layer-retire accepted the $control control"
+            failed=1
+        else
+            log "runner-layer-retire refused the $control control"
+        fi
+    done
+    if [[ "$(runner_layer_claim_observation "$claim_probe/unready-claim.json" "$claim_probe/unready.json" \
+        acme-bot acme-runner@sha256:target "" bound)" == acme-claim-uid ]]; then
+        log "runner-layer-retire accepts a bound but unready old claim on the layer image"
+    else
+        log "self-test: runner-layer-retire rejected a bound but unready old claim"
+        failed=1
+    fi
+    for control in managed old-image; do
+        claim_file="$claim_probe/unready-claim.json"
+        expected_image="acme-runner@sha256:target"
+        case "$control" in
+            managed) claim_file="$claim_probe/unready-managed.json" ;;
+            old-image) expected_image="acme-runner@sha256:old" ;;
+        esac
+        if runner_layer_claim_observation "$claim_file" "$claim_probe/unready.json" acme-bot \
+            "$expected_image" "" bound >/dev/null 2>&1; then
+            log "self-test: runner-layer-retire bound observation accepted the $control control"
+            failed=1
+        else
+            log "runner-layer-retire bound observation refused the $control control"
+        fi
+    done
+    rm -rf "$claim_probe"
     local saved_evidence="$EVIDENCE_DIR" saved_summary="${GITHUB_STEP_SUMMARY-}" timing_dir
     timing_dir="$(mktemp -d)"
     EVIDENCE_DIR="$timing_dir"
@@ -1107,7 +1219,8 @@ run_scenario_timed() {
 }
 
 cleanup() {
-    local status=$?
+    local status=$? restore_failed=0
+    restore_retire_runner_tags || restore_failed=1
     if [[ -n "$APPLY_KILL_PID" ]]; then
         sigkill_tree "$APPLY_KILL_PID"
         wait "$APPLY_KILL_PID" 2>/dev/null || true
@@ -1124,6 +1237,7 @@ cleanup() {
     fi
     if (( KEEP )); then
         log "keeping owned resources (kind=$KIND_CLUSTER ns=$NAMESPACE release=$RELEASE)"
+        (( restore_failed == 0 )) || exit 1
         return 0
     fi
     if (( OWNED_HELM )); then
@@ -1141,6 +1255,10 @@ cleanup() {
     fi
     if (( status != 0 )); then
         log "cleanup finished after failure (exit $status)"
+    fi
+    if (( restore_failed )); then
+        log "runner-layer-retire could not restore its host image tags"
+        exit 1
     fi
 }
 
@@ -1165,7 +1283,6 @@ fetch_published() {
     download_pin "$REL_088/curie-0.8.8.tgz" "$ASSET_DIR/curie-0.8.8.tgz" "$CHART_088_SHA"
     download_pin "$REL_088/curie-x86_64-unknown-linux-gnu" "$ASSET_DIR/curie-0.8.8" "$CLI_088_SHA"
     chmod +x "$ASSET_DIR/curie-0.8.8"
-    PUBLISHED_BIN="$ASSET_DIR/curie-0.8.8"
     download_pin "$REL_089/curie-0.8.9.tgz" "$ASSET_DIR/curie-0.8.9.tgz" "$CHART_089_SHA"
     download_pin "$REL_089/curie-x86_64-unknown-linux-gnu" "$ASSET_DIR/curie-0.8.9" "$CLI_089_SHA"
     chmod +x "$ASSET_DIR/curie-0.8.9"
@@ -2569,6 +2686,291 @@ if int(json.load(sys.stdin).get("status", {}).get("readyReplicas", 0)) < 1:
     log "rollback-to-serving restored revision $serving at $V over pending revision $pending; API is Ready and healthy"
 }
 
+# These observations come from the real claim and its bound Pod. A replacement
+# claim, a deleting claim, or a Pod on another image cannot pass the proof.
+# The Pod's labels are not checked: a platform-template Pod carries no agent
+# label, and the claim is matched to its Pod by status.sandbox.name only.
+# The last argument is "ready" (claim and Pod must be Ready) or "bound" (the
+# claim binds a live Pod on the image; readiness is not required).
+runner_layer_claim_observation() {
+    python3 - "$@" <<'PY'
+import json, sys
+claim_file, pod_file, agent, image, expected_uid, mode = sys.argv[1:]
+if mode not in ("ready", "bound"):
+    raise SystemExit(f"unknown observation mode {mode!r}")
+claim = json.load(open(claim_file))
+pod = json.load(open(pod_file))
+def require(condition, message):
+    if not condition:
+        raise SystemExit(message)
+def ready(document):
+    return any(row.get("type") == "Ready" and row.get("status") == "True"
+               for row in document.get("status", {}).get("conditions", []))
+metadata = claim["metadata"]
+uid = metadata.get("uid")
+require(bool(uid) and (not expected_uid or uid == expected_uid), "claim UID changed or is absent")
+require(not metadata.get("deletionTimestamp"), "claim is being deleted")
+require(metadata.get("labels", {}).get("curietech.ai/agent") == agent, "claim agent label differs")
+require("curietech.ai/managed-by" not in metadata.get("labels", {}), "claim is visible to the orphan reaper")
+require(claim.get("status", {}).get("sandbox", {}).get("name") == pod["metadata"]["name"],
+        "claim does not bind the observed Pod")
+require(not pod["metadata"].get("deletionTimestamp"), "Pod is being deleted")
+runners = [container for container in pod.get("spec", {}).get("containers", [])
+           if container.get("name") == "runner"]
+require(len(runners) == 1 and runners[0].get("image") == image, "bound runner image differs")
+if mode == "ready":
+    require(ready(claim) and ready(pod), "claim or bound Pod is not Ready")
+print(uid)
+PY
+}
+
+assert_runner_layer_claim() {
+    local claim="$1" agent="$2" image="$3" expected_uid="${4:-}" pod
+    kubectl_ns wait --for=condition=Ready "sandboxclaim/$claim" --timeout=180s >&2 || return $?
+    kubectl_ns get sandboxclaim "$claim" -o json >"$WORKDIR/retire-claim.json" || return $?
+    pod="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("status", {}).get("sandbox", {}).get("name", ""))' \
+        "$WORKDIR/retire-claim.json")" || return $?
+    [[ -n "$pod" ]] || die "runner-layer-retire claim $claim has no bound sandbox"
+    kubectl_ns wait --for=condition=Ready "pod/$pod" --timeout=180s >&2 || return $?
+    kubectl_ns get pod "$pod" -o json >"$WORKDIR/retire-pod.json" || return $?
+    runner_layer_claim_observation "$WORKDIR/retire-claim.json" "$WORKDIR/retire-pod.json" \
+        "$agent" "$image" "$expected_uid" ready
+}
+
+# The old claim sits on the chart's per-agent pool, whose template has no
+# per-claim plugin bundle, so its runner cannot become Ready. The scenario only
+# needs it bound to a live Pod on the layer image so the upgrade must delete it.
+assert_runner_layer_bound_claim() {
+    local claim="$1" agent="$2" image="$3" pod="" deadline
+    deadline=$((SECONDS + 180))
+    while :; do
+        pod="$(kubectl_ns get sandboxclaim "$claim" -o jsonpath='{.status.sandbox.name}' 2>/dev/null || true)"
+        [[ -z "$pod" ]] && (( SECONDS < deadline )) || break
+        sleep 2
+    done
+    [[ -n "$pod" ]] || die "runner-layer-retire claim $claim bound no sandbox within 180s"
+    deadline=$((SECONDS + 180))
+    until kubectl_ns get pod "$pod" -o json >"$WORKDIR/retire-pod.json" 2>/dev/null; do
+        (( SECONDS < deadline )) || die "runner-layer-retire claim $claim Pod $pod did not appear within 180s"
+        sleep 2
+    done
+    kubectl_ns get sandboxclaim "$claim" -o json >"$WORKDIR/retire-claim.json" || return $?
+    runner_layer_claim_observation "$WORKDIR/retire-claim.json" "$WORKDIR/retire-pod.json" \
+        "$agent" "$image" "" bound
+}
+
+# Fails unless the Pod labels file (kubectl jsonpath '{.metadata.labels}'
+# output, possibly empty) lacks curietech.ai/agent, as a platform-template
+# Pod does (#4332).
+runner_layer_pod_lacks_agent_label() {
+    python3 - "$1" <<'PY'
+import json, sys
+text = open(sys.argv[1]).read().strip()
+labels = json.loads(text) if text else {}
+if "curietech.ai/agent" in labels:
+    raise SystemExit("target Pod carries a curietech.ai/agent label")
+PY
+}
+
+kind_runner_digest() {
+    local reference="$1" node digest
+    node="$(kind_node)"
+    [[ -n "$node" ]] || die "runner-layer-retire has no kind node"
+    digest="$(docker exec "$node" ctr -n k8s.io images list \
+        | awk -v ref="$reference" '$1 == ref {print $3}')"
+    if [[ "$digest" != sha256:* ]] || ! is_sha256 "${digest#sha256:}"; then
+        die "kind has no manifest digest for runner $reference"
+    fi
+    printf '%s' "$digest"
+}
+
+restore_retire_runner_tags() {
+    if [[ -n "$RETIRE_RUNNER_ORIGINAL_ID" ]]; then
+        docker tag "$RETIRE_RUNNER_ORIGINAL_ID" "$(image_for curie-runner 0.10.1)" || return $?
+        docker tag "$RETIRE_RUNNER_ORIGINAL_ID" curie-runner:0.10.1 || return $?
+        RETIRE_RUNNER_ORIGINAL_ID=""
+    fi
+    if [[ -n "$RETIRE_RUNNER_DERIVED_TAG" ]]; then
+        docker image rm "$RETIRE_RUNNER_DERIVED_TAG" >/dev/null || return $?
+        RETIRE_RUNNER_DERIVED_TAG=""
+    fi
+    if [[ -n "$RETIRE_LAYER_TAG" ]]; then
+        docker image rm "$RETIRE_LAYER_TAG" >/dev/null || return $?
+        RETIRE_LAYER_TAG=""
+    fi
+}
+
+run_runner_layer_retire() {
+    restore_n
+    local agent=acme-retire old_claim=acme-retire-old target_claim=acme-retire-target
+    local current_runner target_runner current_id target_id target_digest layer_tag layer_digest layer_image
+    local node target_image target_pod target_uid target_uid_after old_uid old_remaining status=0 saved_chart="$CHART_0101"
+    current_runner="$(image_for curie-runner 0.10.0)"
+    target_runner="$(image_for curie-runner 0.10.1)"
+    current_id="$(docker image inspect "$current_runner" --format '{{.Id}}')"
+    target_id="$(docker image inspect "$target_runner" --format '{{.Id}}')"
+    if [[ "$current_id" == "$target_id" ]]; then
+        # The candidate's two version tags normally alias one image. A LABEL
+        # changes its digest without changing any runner behavior.
+        RETIRE_RUNNER_ORIGINAL_ID="$target_id"
+        RETIRE_RUNNER_DERIVED_TAG="${target_runner%:*}:matrix-${KIND_CLUSTER}-retire"
+        printf 'FROM %s\nLABEL curietech.ai/matrix="runner-layer-retire"\n' "$current_runner" \
+            | docker build --pull=false -t "$RETIRE_RUNNER_DERIVED_TAG" - >&2
+        docker tag "$RETIRE_RUNNER_DERIVED_TAG" "$target_runner"
+        docker tag "$target_runner" curie-runner:0.10.1
+    fi
+    EXCLUSIVE_KIND_TAG=""
+    kind load docker-image "$target_runner" --name "$KIND_CLUSTER" >&2
+    target_digest="$(kind_runner_digest "$target_runner")"
+    [[ "$target_digest" != "$(kind_runner_digest "$current_runner")" ]] \
+        || die "runner-layer-retire needs distinct 0.10.0 and 0.10.1 runner digests"
+    node="$(kind_node)"
+    # The layer is owner-built by repository identity, retagged from this
+    # candidate, and addressable by the digest the chart requires for a bind.
+    # It is the 0.10.0 runner image, so the upgrade's exclusive_kind_tag 0.10.1
+    # may crictl rmi it from the node. Nothing may schedule on the layer after
+    # the upgrade starts; only the pre-upgrade old claim uses it.
+    layer_tag="ghcr.io/acme-corp/acme-runner:matrix-${KIND_CLUSTER}"
+    docker tag "$current_runner" "$layer_tag"
+    RETIRE_LAYER_TAG="$layer_tag"
+    kind load docker-image "$layer_tag" --name "$KIND_CLUSTER" >&2
+    layer_digest="$(kind_runner_digest "$layer_tag")"
+    layer_image="${layer_tag%:*}@${layer_digest}"
+    docker exec "$node" ctr -n k8s.io images tag --force "$layer_tag" "$layer_image" >/dev/null
+    docker exec "$node" ctr -n k8s.io images tag --force "$target_runner" \
+        "${target_runner%:*}@${target_digest}" >/dev/null
+    local chart_dir="$WORKDIR/runner-layer-retire/chart"
+    mkdir -p "$chart_dir" "$WORKDIR/runner-layer-retire/packaged"
+    tar -xzf "$CHART_0101" -C "$chart_dir"
+    # Planning pins tagged refs through the registry, not the node's local
+    # tags. Pin only this private packaged chart so the planner observes the
+    # kind-loaded target digest even when the published version tags alias.
+    python3 - "$chart_dir/curie/values.yaml" "$target_digest" <<'PY'
+import json, pathlib, sys
+path, digest = pathlib.Path(sys.argv[1]), sys.argv[2]
+lines = path.read_text().splitlines(keepends=True)
+in_sandbox = in_runner = False
+changed = 0
+for index, line in enumerate(lines):
+    if line.strip() and not line.startswith((" ", "#")):
+        in_sandbox = line.startswith("agentSandbox:")
+        in_runner = False
+    if in_sandbox and line.startswith("  ") and not line.startswith("   ") and not line.lstrip().startswith("#"):
+        in_runner = line.startswith("  runner:")
+    if in_sandbox and in_runner and line.startswith("    digest:"):
+        lines[index] = "    digest: " + json.dumps(digest) + "\n"
+        changed += 1
+if changed != 1:
+    raise SystemExit("private target chart must contain exactly one runner digest field")
+path.write_text("".join(lines))
+PY
+    helm package "$chart_dir/curie" -d "$WORKDIR/runner-layer-retire/packaged" >/dev/null
+    CHART_0101="$WORKDIR/runner-layer-retire/packaged/curie-0.10.1.tgz"
+    helm_ns upgrade "$RELEASE" "$CHART_0100" --reset-then-reuse-values \
+        --set-string "agentSandbox.runnerImages.${agent}=${layer_image}" --wait --timeout 15m >&2
+    wait_rollout >&2
+    helm_ns get values "$RELEASE" -o json >"$WORKDIR/retire-target-values.json"
+    python3 - "$WORKDIR/retire-target-values.json" "$agent" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+values = json.loads(path.read_text())
+sandbox = values.get("agentSandbox", {})
+if "digest" in sandbox.get("runner", {}):
+    raise SystemExit("retirement setup must not retain a platform runner digest override")
+sandbox.get("runnerImages", {}).pop(sys.argv[2], None)
+path.write_text(json.dumps(values))
+PY
+    helm_ns template "$RELEASE" "$CHART_0101" -f "$WORKDIR/retire-target-values.json" \
+        --show-only templates/agent-sandbox.yaml >"$WORKDIR/retire-target-render.yaml"
+    python3 - "$WORKDIR/retire-target-render.yaml" "$(fullname)-runner" <<'PY' \
+        | kubectl_ns create --dry-run=client -f - -o json >"$WORKDIR/retire-platform-template.json"
+import pathlib, re, sys
+documents = re.split(r"(?m)^---\s*$", pathlib.Path(sys.argv[1]).read_text())
+templates = [document for document in documents
+             if re.search(r"(?m)^kind: SandboxTemplate$", document)
+             and re.search(r"(?m)^  name: " + re.escape(sys.argv[2]) + r"$", document)]
+if len(templates) != 1:
+    raise SystemExit("target chart must render exactly one platform SandboxTemplate")
+print(templates[0])
+PY
+    target_image="$(python3 -c 'import json,sys; print(next(c["image"] for c in json.load(open(sys.argv[1]))["spec"]["podTemplate"]["spec"]["containers"] if c["name"] == "runner"))' \
+        "$WORKDIR/retire-platform-template.json")"
+    [[ "$target_image" == "${target_runner%:*}@${target_digest}" ]] \
+        || die "target chart does not render the kind-loaded runner digest"
+    docker run --rm --entrypoint test "$target_runner" \
+        -f /app/packages/plugin-format/tests/fixtures/valid_bundle/.claude-plugin/plugin.json \
+        || die "runner-layer-retire target runner $target_runner lacks the fixture plugin bundle at /app/packages/plugin-format/tests/fixtures/valid_bundle"
+    python3 - "$WORKDIR/retire-platform-template.json" "$agent" "$old_claim" "$target_claim" \
+        "$(fullname)-agent-${agent}-runner-pool" >"$WORKDIR/retire-resources.json" <<'PY'
+import json, sys
+template_file, agent, old_claim, target_claim, old_pool = sys.argv[1:]
+template = json.load(open(template_file))
+api = template["apiVersion"]
+template["metadata"] = {"name": "acme-retire-admin-template"}
+# The worker injects a real plugin bundle per claim and the template's
+# CURIE_PLUGIN_DIR is a placeholder. This admin claim gets no bundle, so point
+# the runner at the fixture bundle the runner image ships; its Pod then boots
+# Ready on the unchanged target image.
+runners = [container for container in template["spec"]["podTemplate"]["spec"]["containers"]
+           if container.get("name") == "runner"]
+if len(runners) != 1:
+    raise SystemExit("admin template must have exactly one runner container")
+plugin_env = [row for row in runners[0].get("env", []) if row.get("name") == "CURIE_PLUGIN_DIR"]
+if len(plugin_env) != 1:
+    raise SystemExit("admin template runner has no CURIE_PLUGIN_DIR env entry")
+plugin_env[0].pop("valueFrom", None)
+plugin_env[0]["value"] = "/app/packages/plugin-format/tests/fixtures/valid_bundle"
+# No curietech.ai/agent label on the pod template: a platform-template Pod
+# carries none, so retirement must match this claim's Pod by name alone.
+template["spec"]["podTemplate"]["metadata"] = {}
+pool = {"apiVersion": api, "kind": "SandboxWarmPool",
+        "metadata": {"name": "acme-retire-admin-pool"},
+        "spec": {"replicas": 0, "updateStrategy": {"type": "OnReplenish"},
+                 "sandboxTemplateRef": {"name": template["metadata"]["name"]}}}
+def claim(name, warm_pool):
+    # No managed-by label: neither real claim may be deleted by the worker's
+    # orphan reaper before the retirement operation being tested.
+    return {"apiVersion": api, "kind": "SandboxClaim",
+            "metadata": {"name": name, "labels": {"curietech.ai/agent": agent}},
+            "spec": {"warmPoolRef": {"name": warm_pool}}}
+print(json.dumps({"apiVersion": "v1", "kind": "List", "items": [
+    template, pool, claim(old_claim, old_pool), claim(target_claim, pool["metadata"]["name"])]}))
+PY
+    kubectl_ns create -f "$WORKDIR/retire-resources.json" >&2
+    old_uid="$(assert_runner_layer_bound_claim "$old_claim" "$agent" "$layer_image")"
+    target_uid="$(assert_runner_layer_claim "$target_claim" "$agent" "$target_image")"
+    target_pod="$(kubectl_ns get sandboxclaim "$target_claim" \
+        -o jsonpath='{.status.sandbox.name}')"
+    [[ -n "$target_pod" ]] || die "runner-layer-retire target claim has no bound sandbox"
+    kubectl_ns get pod "$target_pod" -o jsonpath='{.metadata.labels}' \
+        >"$EVIDENCE_DIR/runner-layer-retire-target-pod-labels.json"
+    runner_layer_pod_lacks_agent_label "$EVIDENCE_DIR/runner-layer-retire-target-pod-labels.json" \
+        || die "runner-layer-retire target Pod $target_pod carries a curietech.ai/agent label"
+    log "runner-layer-retire has the old claim bound on the layer image, a Ready target claim with the same agent label, and a target Pod with no agent label"
+    cluster_upgrade "0.10.1" "$CHART_0101" || status=$?
+    record_upgrade_json runner-layer-retire
+    [[ "$status" -eq 0 ]] || die "runner-layer-retire cluster upgrade exited $status"
+    assert_upgrade_status succeeded
+    [[ "$(helm_version)" == 0.10.1 ]] || die "runner-layer-retire did not reach 0.10.1"
+    helm_ns get values "$RELEASE" -o json | python3 -c '
+import json, sys
+images = json.load(sys.stdin).get("agentSandbox", {}).get("runnerImages", {})
+if sys.argv[1] in (images or {}):
+    raise SystemExit("upgrade did not clear the owner-built layer")
+' "$agent"
+    old_remaining="$(kubectl_ns get sandboxclaim "$old_claim" --ignore-not-found -o name)"
+    [[ -z "$old_remaining" ]] \
+        || die "runner-layer-retire left the old-layer claim in place"
+    target_uid_after="$(assert_runner_layer_claim "$target_claim" "$agent" "$target_image" "$target_uid")"
+    [[ "$target_uid_after" == "$target_uid" ]] \
+        || die "runner-layer-retire did not preserve the target-layer claim"
+    python3 -c 'import json,sys; print(json.dumps({"old_claim_uid":sys.argv[1], "old_claim_deleted":True, "target_claim_uid":sys.argv[2], "target_claim_uid_unchanged":True, "target_pod_ready":True, "target_image":sys.argv[3]}))' \
+        "$old_uid" "$target_uid" "$target_image" >"$EVIDENCE_DIR/runner-layer-retire-claims.json"
+    CHART_0101="$saved_chart"
+    restore_retire_runner_tags
+    log "runner-layer-retire deleted the old claim and preserved the target claim UID and Ready Pod"
+}
+
 write_evidence() {
     local elapsed=$((SECONDS - STARTED_AT)) shard_json scenarios_json
     shard_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1] or None))' "$SHARD")"
@@ -2626,6 +3028,7 @@ scenario_fn() {
         previous-serves) echo run_previous_serves ;;
         apply-kill-takeover) echo run_apply_kill_takeover ;;
         rollback-to-serving) echo run_rollback_to_serving ;;
+        runner-layer-retire) echo run_runner_layer_retire ;;
         *) die "no runner for scenario '$1'" ;;
     esac
 }
