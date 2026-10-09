@@ -35,6 +35,7 @@ const ACTION_ANNOTATION: &str = "curietech.ai/upgrade-action";
 const CREATE_WINNER: &str = "00000000-0000-4000-8000-000000000701";
 const PATCH_WINNER: &str = "00000000-0000-4000-8000-000000000702";
 const RELEASE_WINNER: &str = "00000000-0000-4000-8000-000000000703";
+const STALE_HOLDER: &str = "stale-holder";
 
 /// The exact resource selector `convergence::workloads_command` issues. The
 /// recording `kubectl` serves ONLY this string, so a narrower `deploy,sts,ds`
@@ -441,7 +442,7 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
         }
         for patch in self.patches() {
             for operation in patch.as_array().into_iter().flatten() {
-                if operation["op"] != "add" {
+                if operation["op"] != "add" && operation["op"] != "replace" {
                     continue;
                 }
                 if operation["path"] == "/metadata/annotations" {
@@ -474,7 +475,7 @@ exec "$UPGRADE_DRIVER_ROOT/recorder/helm" "$@"
         }
         for patch in self.patches() {
             for operation in patch.as_array().into_iter().flatten() {
-                if operation["op"] != "add" {
+                if operation["op"] != "add" && operation["op"] != "replace" {
                     continue;
                 }
                 if operation["path"] == "/metadata/annotations" {
@@ -1204,7 +1205,6 @@ fn installed_chart_version_comes_from_helm_metadata() {
         fixture.argv(),
         visible(&output)
     );
-    let expected = ["helm", "get", "metadata", "rel", "-n", "ns", "-o", "json"];
     let reads: Vec<_> = fixture
         .argv()
         .into_iter()
@@ -1212,10 +1212,30 @@ fn installed_chart_version_comes_from_helm_metadata() {
         .collect();
     assert!(!reads.is_empty(), "chart metadata was never read");
     assert!(
-        reads
+        reads.iter().all(|call| {
+            call.iter()
+                .map(String::as_str)
+                .take(6)
+                .eq(["helm", "get", "metadata", "rel", "-n", "ns"])
+                && call
+                    .windows(2)
+                    .any(|pair| pair == ["--revision", "1"] || pair == ["--revision", "2"])
+                && call.windows(2).any(|pair| pair == ["-o", "json"])
+        }),
+        "chart version reads must select the serving Helm revision: {reads:?}"
+    );
+    let history: Vec<_> = fixture
+        .argv()
+        .into_iter()
+        .filter(|call| argv_starts(call, &["helm", "history"]))
+        .collect();
+    assert!(!history.is_empty(), "serving history was never read");
+    assert!(
+        history.iter().all(|call| call
             .iter()
-            .all(|call| { call.iter().map(String::as_str).collect::<Vec<_>>() == expected }),
-        "chart version reads must use the real Helm metadata command: {reads:?}"
+            .map(String::as_str)
+            .eq(["helm", "history", "rel", "-n", "ns", "-o", "json", "--max", "256",])),
+        "history must use the complete release history command: {history:?}"
     );
     let result = json(&output);
     assert_eq!(result["from_version"], "0.8.6", "{result}");
@@ -1299,7 +1319,8 @@ fn ownership_create_precedes_every_upgrade_snapshot_and_has_server_state() {
     let first_snapshot = argv
         .iter()
         .position(|call| {
-            argv_starts(call, &["helm", "get", "metadata"])
+            argv_starts(call, &["helm", "history"])
+                || argv_starts(call, &["helm", "get", "metadata"])
                 || argv_starts(call, &["helm", "get", "values"])
                 || argv_starts(call, &["helm", "show", "chart"])
                 || argv_starts(call, &["helm", "template"])
@@ -1500,6 +1521,10 @@ fn existing_holder_refusal_names_holder_and_action_without_helm_writes() {
         message.contains("wait") || message.contains("stopped"),
         "refusal must give a safe next action: {message}"
     );
+    assert!(
+        message.contains(&format!("--take-over {holder}")),
+        "refusal must name the explicit recovery flag: {message}"
+    );
     assert!(fixture.patches().is_empty(), "the loser must write nothing");
     assert!(
         fixture.created().is_empty(),
@@ -1509,6 +1534,655 @@ fn existing_holder_refusal_names_holder_and_action_without_helm_writes() {
         fixture.helm_upgrades().is_empty(),
         "the loser must not reach Helm mutation"
     );
+}
+
+fn stale_holder_fixture(record: Option<&Value>) -> Fixture {
+    Fixture::new(None).config_map(&checkpoint_config_map(
+        "41",
+        Some(serde_json::json!({
+            (HOLDER_ANNOTATION): STALE_HOLDER,
+            (ACTION_ANNOTATION): "upgrade to 0.9.0 from stopped CLI",
+            "acme.example/retained": "keep",
+        })),
+        record,
+    ))
+}
+
+fn assert_ownership_released(fixture: &Fixture) {
+    let state = fixture.config_map_state();
+    let annotations = &state["metadata"]["annotations"];
+    assert!(annotations.get(HOLDER_ANNOTATION).is_none(), "{state}");
+    assert!(annotations.get(ACTION_ANNOTATION).is_none(), "{state}");
+}
+
+/// #4334: Helm history and metadata shapes follow Helm's formatters, and
+/// rollback creates a fresh release revision using the selected old chart:
+/// https://github.com/helm/helm/blob/v3.20.0/cmd/helm/history.go
+/// https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_metadata.go
+/// https://github.com/helm/helm/blob/v3.20.0/pkg/action/rollback.go
+/// The driver enforces JSON Patch tests as Kubernetes does, rather than
+/// returning success merely because the CLI requested a takeover:
+/// https://kubernetes.io/docs/reference/using-api/api-concepts/#resource-versions
+#[test]
+fn upgrade_take_over_recovers_a_killed_holder_and_pending_revision() {
+    let durable = checkpoint_through(
+        &[
+            "plan",
+            "validate",
+            "drain_preflight",
+            "checkpoint",
+            "migrate",
+        ],
+        true,
+    );
+    let fixture = stale_holder_fixture(Some(&durable));
+    let output = fixture.run_with(
+        "pending-revision",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        fixture.argv()
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["from_version"], "0.8.6", "{body}");
+    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+    assert_eq!(
+        body["resumed"], true,
+        "the durable record must resume: {body}"
+    );
+
+    let patches = fixture.patches();
+    let takeover = &patches[0];
+    let operations = takeover.as_array().expect("takeover JSON Patch");
+    assert_eq!(
+        operations[0],
+        serde_json::json!({
+            "op": "test", "path": "/metadata/resourceVersion", "value": "41",
+        })
+    );
+    assert_eq!(
+        operations[1],
+        serde_json::json!({
+            "op": "test", "path": "/metadata/annotations/curietech.ai~1upgrade-holder",
+            "value": STALE_HOLDER,
+        })
+    );
+    assert!(patch_has(
+        takeover,
+        "replace",
+        "/metadata/annotations/curietech.ai~1upgrade-holder"
+    ));
+    assert!(
+        !is_record_patch(takeover),
+        "takeover must preserve the durable record: {takeover}"
+    );
+    let holder = fixture.acquired_holder();
+    assert_ne!(holder, STALE_HOLDER);
+    assert_eq!(fixture.acquired_action(), "upgrade to 0.9.0");
+    assert!(
+        fixture.created().is_empty(),
+        "takeover must preserve the ConfigMap"
+    );
+
+    let argv = fixture.argv();
+    let jobs = argv
+        .iter()
+        .position(|call| argv_starts(call, &["kubectl", "get", "jobs"]))
+        .expect("release hook Job read");
+    assert!(
+        argv[jobs].iter().map(String::as_str).eq([
+            "kubectl",
+            "get",
+            "jobs",
+            "-n",
+            "ns",
+            "-l",
+            "app.kubernetes.io/instance=rel,app.kubernetes.io/managed-by=Helm",
+            "-o",
+            "json",
+        ]),
+        "takeover must use the release hook selector: {:?}",
+        argv[jobs]
+    );
+    let acquire = argv
+        .iter()
+        .position(|call| is_checkpoint_patch(call))
+        .unwrap();
+    let rollback = argv
+        .iter()
+        .position(|call| argv_starts(call, &["helm", "rollback"]))
+        .expect("pending orphan recovery");
+    let apply = argv
+        .iter()
+        .position(|call| argv_starts(call, &["helm", "upgrade"]))
+        .expect("resumed Helm apply");
+    assert!(
+        jobs < acquire && acquire < rollback && rollback < apply,
+        "{argv:?}"
+    );
+    assert!(
+        argv[rollback].iter().map(String::as_str).eq([
+            "helm",
+            "rollback",
+            "rel",
+            "4",
+            "-n",
+            "ns",
+            "--wait",
+            "--timeout",
+            "15m",
+        ]),
+        "recovery must wait for the serving revision: {:?}",
+        argv[rollback]
+    );
+    assert_eq!(
+        argv.iter()
+            .filter(|call| argv_starts(call, &["helm", "rollback"]))
+            .count(),
+        1
+    );
+    assert_eq!(fixture.helm_upgrades().len(), 1);
+    assert!(
+        argv.iter()
+            .enumerate()
+            .filter(|(_, call)| {
+                argv_starts(call, &["helm", "get", "values"])
+                    || argv_starts(call, &["helm", "show", "chart"])
+                    || argv_starts(call, &["helm", "template"])
+                    || is_alembic_current(call)
+            })
+            .all(|(position, _)| rollback < position),
+        "rollback must precede upgrade snapshots: {argv:?}"
+    );
+    for (index, patch) in patches.iter().enumerate().skip(1) {
+        let expected = (41 + index).to_string();
+        assert!(
+            patch.as_array().unwrap().iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/resourceVersion"
+                    && operation["value"] == expected
+            }),
+            "record and release must adopt each server resourceVersion: {patch}"
+        );
+        assert!(
+            patch.as_array().unwrap().iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/annotations/curietech.ai~1upgrade-holder"
+                    && operation["value"] == holder
+            }),
+            "every later write must retain the new holder: {patch}"
+        );
+    }
+    assert_ownership_released(&fixture);
+    assert_eq!(
+        fixture.config_map_state()["metadata"]["annotations"]["acme.example/retained"],
+        "keep"
+    );
+}
+
+#[test]
+fn take_over_a_stopped_holder_with_no_pending_revision_resumes_and_releases_ownership() {
+    let durable = checkpoint_through(
+        &[
+            "plan",
+            "validate",
+            "drain_preflight",
+            "checkpoint",
+            "migrate",
+        ],
+        true,
+    );
+    let fixture = stale_holder_fixture(Some(&durable));
+    let output = fixture.run_with(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        fixture.argv()
+    );
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["resumed"], true, "{body}");
+    assert_eq!(body["from_version"], "0.8.6", "{body}");
+    assert_eq!(body["known_good_version"], "0.9.0", "{body}");
+    assert_eq!(fixture.helm_upgrades().len(), 1, "resume must reach Apply");
+    assert!(
+        !fixture.issued(&["helm", "rollback"]),
+        "a deployed newest revision needs no rollback"
+    );
+    assert!(
+        fixture.created().is_empty(),
+        "the durable ConfigMap must survive takeover"
+    );
+
+    let holder = fixture.acquired_holder();
+    assert_ne!(holder, STALE_HOLDER);
+    let patches = fixture.patches();
+    let takeovers: Vec<_> = patches
+        .iter()
+        .filter(|patch| {
+            patch_has(
+                patch,
+                "replace",
+                "/metadata/annotations/curietech.ai~1upgrade-holder",
+            )
+        })
+        .collect();
+    assert_eq!(
+        takeovers.len(),
+        1,
+        "ownership must transfer once: {patches:?}"
+    );
+    assert_eq!(
+        takeovers[0],
+        &serde_json::json!([
+            {"op": "test", "path": "/metadata/resourceVersion", "value": "41"},
+            {"op": "test", "path": "/metadata/annotations/curietech.ai~1upgrade-holder", "value": STALE_HOLDER},
+            {"op": "replace", "path": "/metadata/annotations/curietech.ai~1upgrade-holder", "value": holder},
+            {"op": "add", "path": "/metadata/annotations/curietech.ai~1upgrade-action", "value": "upgrade to 0.9.0"},
+        ]),
+        "takeover must preserve the last durable record"
+    );
+    assert_eq!(patches.first(), Some(takeovers[0]));
+    assert!(
+        patches.iter().skip(1).any(is_record_patch),
+        "resumed lifecycle must store progress"
+    );
+    assert!(is_release_patch(patches.last().expect("ownership release")));
+    for (index, patch) in patches.iter().enumerate().skip(1) {
+        let expected = (41 + index).to_string();
+        assert!(
+            patch.as_array().unwrap().iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/resourceVersion"
+                    && operation["value"] == expected
+            }),
+            "later writes must chain the server resourceVersion: {patch}"
+        );
+        assert!(
+            patch.as_array().unwrap().iter().any(|operation| {
+                operation["op"] == "test"
+                    && operation["path"] == "/metadata/annotations/curietech.ai~1upgrade-holder"
+                    && operation["value"] == holder
+            }),
+            "later writes must use the new holder: {patch}"
+        );
+    }
+    assert_ownership_released(&fixture);
+    assert_eq!(
+        fixture.config_map_state()["metadata"]["annotations"]["acme.example/retained"],
+        "keep"
+    );
+}
+
+#[test]
+fn dry_run_take_over_a_stopped_holder_with_no_pending_revision_plans_no_rollback() {
+    let durable = checkpoint_through(&["plan", "validate"], false);
+    let fixture = stale_holder_fixture(Some(&durable));
+    let before = fixture.config_map_state();
+    let output = fixture.run_with(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["--dry-run", "--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        fixture.argv()
+    );
+    let body = json(&output);
+    let plan = body["plan"].as_array().expect("dry takeover plan");
+    assert!(
+        plan.iter()
+            .any(|line| line == "take over upgrade ownership from stale-holder"),
+        "{body}"
+    );
+    assert!(
+        plan.iter().any(|line| line == "phase plan: 0.8.6 -> 0.9.0"),
+        "{body}"
+    );
+    assert!(
+        plan.iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.starts_with("helm upgrade ")),
+        "{body}"
+    );
+    assert!(
+        !plan
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|line| line.contains("helm rollback")),
+        "{body}"
+    );
+    assert!(fixture.issued(&["helm", "history"]));
+    assert!(fixture.issued(&["kubectl", "get", "jobs"]));
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert_eq!(fixture.config_map_state(), before);
+}
+
+#[test]
+fn take_over_wrong_holder_refuses_without_a_patch() {
+    for dry in [false, true] {
+        let fixture = stale_holder_fixture(None);
+        let before = fixture.config_map_state();
+        let flags: &[&str] = if dry {
+            &["--take-over", "wrong-holder", "--dry-run"]
+        } else {
+            &["--take-over", "wrong-holder"]
+        };
+        let output = fixture.run_with("pending-revision", "0.9.0", "charts/curie", flags);
+        let message = visible(&output);
+        assert!(!output.status.success(), "{message}");
+        assert!(
+            message.contains(STALE_HOLDER),
+            "observed holder missing: {message}"
+        );
+        assert!(
+            message.contains("upgrade to 0.9.0 from stopped CLI"),
+            "observed action missing: {message}"
+        );
+        assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+        assert_eq!(fixture.config_map_state(), before);
+    }
+}
+
+/// Hook annotation and active pods are external Kubernetes/Helm fields:
+/// https://helm.sh/docs/topics/charts_hooks/
+/// https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/job-v1/#JobStatus
+#[test]
+fn take_over_running_hook_refuses_before_patching() {
+    for dry in [false, true] {
+        let fixture = stale_holder_fixture(None);
+        let flags: &[&str] = if dry {
+            &["--take-over", STALE_HOLDER, "--dry-run"]
+        } else {
+            &["--take-over", STALE_HOLDER]
+        };
+        let output = fixture.run_with("take-over-running-hook", "0.9.0", "charts/curie", flags);
+        let message = visible(&output);
+        assert!(!output.status.success(), "{message}");
+        assert!(
+            message.contains("rel-upgrade-drain"),
+            "running hook name missing: {message}"
+        );
+        assert!(fixture.issued(&["kubectl", "get", "jobs"]));
+        assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+        assert_eq!(
+            fixture.config_map_state()["metadata"]["annotations"][HOLDER_ANNOTATION],
+            STALE_HOLDER
+        );
+    }
+}
+
+#[test]
+fn take_over_ignores_an_active_job_without_a_hook_annotation() {
+    let fixture = stale_holder_fixture(None);
+    let output = fixture.run_with(
+        "take-over-active-plain-job",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        fixture.argv()
+    );
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn take_over_without_a_holder_refuses_without_creating_or_patching() {
+    for existing in [false, true] {
+        for dry in [false, true] {
+            let fixture = Fixture::new(None);
+            if existing {
+                fixture.seed_checkpoint(&checkpoint_through(&["plan"], false));
+            }
+            let flags: &[&str] = if dry {
+                &["--take-over", STALE_HOLDER, "--dry-run"]
+            } else {
+                &["--take-over", STALE_HOLDER]
+            };
+            let output = fixture.run_with("healthy", "0.9.0", "charts/curie", flags);
+            let message = visible(&output);
+            assert!(!output.status.success(), "{message}");
+            assert!(message.contains("nothing to take over"), "{message}");
+            assert!(
+                message.contains("without"),
+                "refusal must say to omit the flag: {message}"
+            );
+            assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+        }
+    }
+}
+
+#[test]
+fn take_over_unreadable_hook_jobs_refuses_without_a_patch() {
+    for scenario in [
+        "take-over-jobs-failed",
+        "take-over-jobs-malformed",
+        "take-over-jobs-not-list",
+    ] {
+        for dry in [false, true] {
+            let fixture = stale_holder_fixture(None);
+            let flags: &[&str] = if dry {
+                &["--take-over", STALE_HOLDER, "--dry-run"]
+            } else {
+                &["--take-over", STALE_HOLDER]
+            };
+            let output = fixture.run_with(scenario, "0.9.0", "charts/curie", flags);
+            let message = visible(&output);
+            assert!(!output.status.success(), "{scenario}: {message}");
+            assert!(
+                message.to_lowercase().contains("job"),
+                "Job list refusal missing: {message}"
+            );
+            assert!(fixture.issued(&["kubectl", "get", "jobs"]));
+            assert!(
+                mutating_calls(&fixture).is_empty(),
+                "{scenario}: {:?}",
+                fixture.argv()
+            );
+            assert_eq!(
+                fixture.config_map_state()["metadata"]["annotations"][HOLDER_ANNOTATION],
+                STALE_HOLDER
+            );
+        }
+    }
+}
+
+#[test]
+fn take_over_cas_race_preserves_the_winner_and_never_rolls_back() {
+    let fixture = stale_holder_fixture(None);
+    let output = fixture.run_with(
+        "take-over-cas-conflict",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(
+        message.contains(PATCH_WINNER),
+        "observed holder missing: {message}"
+    );
+    assert!(
+        message.contains("upgrade to 0.9.0"),
+        "observed action missing: {message}"
+    );
+    assert_eq!(fixture.patches().len(), 1, "takeover must not retry");
+    assert!(fixture.created().is_empty());
+    assert!(!fixture.issued(&["helm", "rollback"]));
+    assert!(fixture.helm_upgrades().is_empty());
+    assert_eq!(
+        fixture
+            .argv()
+            .iter()
+            .filter(|call| is_checkpoint_get(call))
+            .count(),
+        2,
+        "one read and one conflict diagnostic: {:?}",
+        fixture.argv()
+    );
+    let state = fixture.config_map_state();
+    assert_eq!(state["metadata"]["resourceVersion"], "42");
+    assert_eq!(
+        state["metadata"]["annotations"][HOLDER_ANNOTATION],
+        PATCH_WINNER
+    );
+    let record: Value = serde_json::from_str(state["data"]["record"].as_str().unwrap()).unwrap();
+    assert_eq!(record["status"], "external_sentinel", "{record}");
+}
+
+#[test]
+fn take_over_rollback_error_releases_ownership_and_preserves_the_record() {
+    let durable = checkpoint_through(&["plan", "validate"], false);
+    let fixture = stale_holder_fixture(Some(&durable));
+    let output = fixture.run_with(
+        "take-over-rollback-failed",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(message.contains("rollback failed"), "{message}");
+    assert!(
+        !message.contains("acme-rollback-token"),
+        "rollback stderr must be redacted: {message}"
+    );
+    assert!(fixture.issued(&["helm", "rollback", "rel", "4"]));
+    assert!(fixture.helm_upgrades().is_empty());
+    assert_ownership_released(&fixture);
+    let state = fixture.config_map_state();
+    let record: Value = serde_json::from_str(state["data"]["record"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        record, durable,
+        "failed recovery must preserve the last durable phase"
+    );
+    assert_eq!(
+        fixture.patches().len(),
+        2,
+        "takeover then release, with no record patch"
+    );
+    assert!(is_release_patch(&fixture.patches()[1]));
+}
+
+#[test]
+fn pending_revision_without_take_over_refuses_and_releases_ownership() {
+    let fixture = Fixture::new(None);
+    let output = fixture.local("pending-revision");
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(
+        message.contains("revision 5") && message.contains("pending-upgrade"),
+        "{message}"
+    );
+    assert!(
+        message.contains("revision 4") && message.contains("0.8.6"),
+        "{message}"
+    );
+    assert!(
+        message.contains("helm rollback rel 4 -n ns --wait --timeout 15m"),
+        "{message}"
+    );
+    assert!(!fixture.issued(&["helm", "rollback"]));
+    assert!(fixture.helm_upgrades().is_empty());
+    assert!(
+        fixture.records().is_empty(),
+        "pending refusal precedes durable lifecycle writes"
+    );
+    assert_ownership_released(&fixture);
+}
+
+#[test]
+fn pending_revision_with_no_serving_revision_refuses_with_or_without_take_over() {
+    for takeover in [false, true] {
+        let fixture = if takeover {
+            stale_holder_fixture(None)
+        } else {
+            Fixture::new(None)
+        };
+        let flags: &[&str] = if takeover {
+            &["--take-over", STALE_HOLDER]
+        } else {
+            &[]
+        };
+        let output = fixture.run_with("pending-no-serving", "0.9.0", "charts/curie", flags);
+        let message = visible(&output);
+        assert!(!output.status.success(), "{message}");
+        assert!(
+            message.contains("no deployed revision") && message.contains("revision 5"),
+            "{message}"
+        );
+        assert!(!fixture.issued(&["helm", "rollback"]));
+        assert!(fixture.helm_upgrades().is_empty());
+        assert_ownership_released(&fixture);
+    }
+}
+
+#[test]
+fn retained_values_refuse_a_nonpending_release_with_no_deployed_revision() {
+    for dry in [false, true] {
+        let fixture = Fixture::new(None);
+        let flags: &[&str] = if dry { &["--dry-run"] } else { &[] };
+        let output = fixture.run_with("failed-no-serving", "0.9.0", "charts/curie", flags);
+        let message = visible(&output);
+        assert!(!output.status.success(), "{message}");
+        assert!(message.contains("no deployed revision"), "{message}");
+        assert!(
+            message.contains("revision 5") && message.contains("failed"),
+            "{message}"
+        );
+        assert!(
+            !fixture.issued(&["helm", "get", "values"]),
+            "retained values must not be attributed to a nonexistent serving revision"
+        );
+        assert!(!fixture.issued(&["helm", "rollback"]));
+        assert!(fixture.helm_upgrades().is_empty());
+        if dry {
+            assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+        } else {
+            assert_ownership_released(&fixture);
+        }
+    }
+}
+
+#[test]
+fn take_over_pending_install_and_rollback_refuse_without_recovery() {
+    for scenario in ["pending-install", "pending-rollback"] {
+        let fixture = stale_holder_fixture(None);
+        let output = fixture.run_with(
+            scenario,
+            "0.9.0",
+            "charts/curie",
+            &["--take-over", STALE_HOLDER],
+        );
+        let message = visible(&output);
+        assert!(!output.status.success(), "{scenario}: {message}");
+        assert!(
+            message.contains(scenario),
+            "pending status missing: {message}"
+        );
+        assert!(!fixture.issued(&["helm", "rollback"]));
+        assert!(fixture.helm_upgrades().is_empty());
+        assert_ownership_released(&fixture);
+    }
 }
 
 #[test]
@@ -1916,8 +2590,8 @@ fn dry_run_does_not_acquire_or_mutate_cluster_ownership() {
     assert!(output.status.success(), "{}", visible(&output));
     let argv = fixture.argv();
     assert!(
-        !argv.iter().any(|call| is_checkpoint_get(call)),
-        "dry run must not enter the ownership protocol: {argv:?}"
+        argv.iter().any(|call| is_checkpoint_get(call)),
+        "dry run must read ownership before reporting a plan: {argv:?}"
     );
     assert!(
         fixture.created().is_empty(),
@@ -1937,6 +2611,200 @@ fn dry_run_does_not_acquire_or_mutate_cluster_ownership() {
             .any(|call| argv_starts(call, &["kubectl", "apply"])),
         "dry run must issue no legacy checkpoint apply: {argv:?}"
     );
+}
+
+#[test]
+fn dry_run_refuses_a_held_checkpoint() {
+    let fixture = stale_holder_fixture(None);
+    let before = fixture.config_map_state();
+    let output = fixture.run_with("pending-revision", "0.9.0", "charts/curie", &["--dry-run"]);
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(
+        message.contains(STALE_HOLDER),
+        "dry run must name the holder: {message}"
+    );
+    assert!(
+        message.contains("upgrade to 0.9.0 from stopped CLI"),
+        "{message}"
+    );
+    assert!(message.contains("--take-over stale-holder"), "{message}");
+    assert!(fixture.argv().iter().any(|call| is_checkpoint_get(call)));
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert_eq!(fixture.config_map_state(), before);
+}
+
+#[test]
+fn dry_run_reads_the_serving_revision_not_the_pending_one() {
+    let fixture = stale_holder_fixture(None);
+    let before = fixture.config_map_state();
+    let output = fixture.run_with(
+        "pending-revision",
+        "0.9.0",
+        "charts/curie",
+        &["--dry-run", "--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        fixture.argv()
+    );
+    let body = json(&output);
+    let plan: Vec<_> = body["plan"]
+        .as_array()
+        .expect("dry run plan")
+        .iter()
+        .map(|line| line.as_str().expect("plan line"))
+        .collect();
+    assert!(plan.contains(&"phase plan: 0.8.6 -> 0.9.0"), "{body}");
+    assert!(
+        !plan
+            .iter()
+            .any(|line| line.contains("already installed and known-good")),
+        "a pending target must not become known good: {body}"
+    );
+    let takeover = plan
+        .iter()
+        .position(|line| line.contains("take over upgrade ownership from stale-holder"))
+        .expect("takeover must be planned");
+    let rollback = plan
+        .iter()
+        .position(|line| line.contains("helm rollback rel 4 -n ns --wait --timeout 15m"))
+        .expect("serving rollback must be planned");
+    let upgrade = plan
+        .iter()
+        .position(|line| line.starts_with("helm upgrade "))
+        .expect("target upgrade must still be planned");
+    assert!(takeover < rollback && rollback < upgrade, "{body}");
+    let reads: Vec<_> = fixture
+        .argv()
+        .into_iter()
+        .filter(|call| argv_starts(call, &["helm", "get", "metadata"]))
+        .collect();
+    assert!(!reads.is_empty(), "serving metadata must be read");
+    assert!(
+        reads
+            .iter()
+            .all(|call| call.windows(2).any(|pair| pair == ["--revision", "4"])),
+        "every dry-run metadata read must select serving revision 4: {reads:?}"
+    );
+    assert!(fixture.issued(&["helm", "history"]));
+    assert!(fixture.argv().iter().any(|call| is_checkpoint_get(call)));
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
+    assert_eq!(fixture.config_map_state(), before);
+}
+
+/// A revision's retained values are independent of its chart version. Helm
+/// reads the newest revision unless the caller explicitly supplies --revision:
+/// https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_values.go
+/// https://github.com/helm/helm/blob/v3.20.0/pkg/action/action.go
+#[test]
+fn dry_run_take_over_reads_the_serving_revisions_retained_values() {
+    let dry = stale_holder_fixture(None);
+    let output = dry.run_with(
+        "pending-divergent-values",
+        "0.9.0",
+        "charts/curie",
+        &["--dry-run", "--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        dry.argv()
+    );
+    let body = json(&output);
+    let schema = plan_line(&body, "config schema:");
+    assert_eq!(
+        schema, "config schema: 0.8.6 -> 0.9.0",
+        "dry takeover must migrate the serving values, not the pending target's values: {body}"
+    );
+    let upgrade = plan_line(&body, "helm upgrade ");
+    assert!(
+        upgrade.contains("-f <retained-values>"),
+        "the serving overlay must be in the plan: {upgrade}"
+    );
+    let reads: Vec<_> = dry
+        .argv()
+        .into_iter()
+        .filter(|call| argv_starts(call, &["helm", "get", "values"]))
+        .collect();
+    assert_eq!(
+        reads.len(),
+        1,
+        "retained values must be read once: {reads:?}"
+    );
+    assert!(
+        reads[0].windows(2).any(|pair| pair == ["--revision", "4"]),
+        "dry takeover must select the serving values revision: {reads:?}"
+    );
+
+    let rendered = dry.captured_paths("render-values");
+    assert!(
+        !rendered.is_empty(),
+        "target rendering must receive the migrated overlay"
+    );
+    let dry_overlay = values_doc(&fs::read_to_string(&rendered[0]).unwrap());
+    assert_eq!(
+        dry_overlay.pointer("/config/migratedFrom"),
+        Some(&serde_json::json!("0.8.6"))
+    );
+    assert_eq!(
+        dry_overlay.pointer("/worker/runnerTotalTimeoutSeconds"),
+        Some(&serde_json::json!(120))
+    );
+    assert!(
+        extra_env_names(&dry_overlay).contains(&"SERVING_REVISION_ONLY".to_string()),
+        "{dry_overlay}"
+    );
+    assert!(
+        !extra_env_names(&dry_overlay).contains(&"PENDING_REVISION_ONLY".to_string()),
+        "{dry_overlay}"
+    );
+    assert!(mutating_calls(&dry).is_empty(), "{:?}", dry.argv());
+
+    let real = stale_holder_fixture(None);
+    let output = real.run_with(
+        "pending-divergent-values",
+        "0.9.0",
+        "charts/curie",
+        &["--take-over", STALE_HOLDER],
+    );
+    assert!(
+        output.status.success(),
+        "{} / {:?}",
+        visible(&output),
+        real.argv()
+    );
+    assert_eq!(real.helm_upgrades().len(), 1);
+    assert_eq!(
+        values_doc(&real.values(1)),
+        dry_overlay,
+        "the dry plan's rendered overlay must match the real takeover Apply input"
+    );
+    assert_ownership_released(&real);
+}
+
+#[test]
+fn dry_run_pending_revision_without_take_over_refuses_without_mutation() {
+    let fixture = Fixture::new(None);
+    let output = fixture.run_with("pending-revision", "0.9.0", "charts/curie", &["--dry-run"]);
+    let message = visible(&output);
+    assert!(!output.status.success(), "{message}");
+    assert!(
+        message.contains("revision 5") && message.contains("pending-upgrade"),
+        "{message}"
+    );
+    assert!(
+        message.contains("revision 4") && message.contains("0.8.6"),
+        "{message}"
+    );
+    assert!(
+        message.contains("helm rollback rel 4 -n ns --wait --timeout 15m"),
+        "{message}"
+    );
+    assert!(mutating_calls(&fixture).is_empty(), "{:?}", fixture.argv());
 }
 
 // T1(a) -- Ruling 2: the local chart's own metadata is the pin. A chart whose
@@ -2071,10 +2939,7 @@ fn metadata_version_drives_startup_apply_canary_and_commit() {
         .iter()
         .enumerate()
         .filter_map(|(index, call)| {
-            call.iter()
-                .map(String::as_str)
-                .eq(["helm", "get", "metadata", "rel", "-n", "ns", "-o", "json"])
-                .then_some(index)
+            argv_starts(call, &["helm", "get", "metadata"]).then_some(index)
         })
         .collect();
     assert_eq!(metadata_reads.len(), 4, "source, Apply, Canary, Commit");
@@ -2085,6 +2950,21 @@ fn metadata_version_drives_startup_apply_canary_and_commit() {
     );
     assert!(workloads < metadata_reads[2], "Canary observation");
     assert!(metadata_reads[2] < metadata_reads[3], "Commit observation");
+    for (position, expected_revision) in metadata_reads.iter().zip(["1", "2", "2", "2"]) {
+        assert!(
+            calls[*position]
+                .windows(2)
+                .any(|pair| pair == ["--revision", expected_revision]),
+            "every lifecycle observation must select its deployed revision: {:?}",
+            calls[*position]
+        );
+        assert!(
+            calls[..*position]
+                .iter()
+                .any(|call| argv_starts(call, &["helm", "history"])),
+            "each metadata observation needs serving history: {calls:?}"
+        );
+    }
 
     assert_unusable_metadata_after_apply("stale-version", "still reports 0.8.6");
     for scenario in [
@@ -4357,13 +5237,15 @@ fn valid_dry_run_succeeds_without_mutating() {
 }
 
 /// #2863: the apply line a dry run prints is the argv the real run executes,
-/// with only the retained values tempfile path replaced by a placeholder. The
-/// overlay's contents never reach the plan.
+/// with only an existing release's retained values tempfile path replaced by
+/// a placeholder. An absent release has no retained overlay to pass with -f.
+/// The overlay's contents never reach the plan.
 #[test]
 fn printed_apply_line_matches_executed_helm_argv() {
     let overlay = r#"{"worker":{"replicas":2},"marker":"overlay-value-must-not-print"}"#;
     for (scenario, install) in [("schema-compatible", false), ("fresh-install", true)] {
-        let dry = Fixture::new(Some(overlay));
+        let retained = (!install).then_some(overlay);
+        let dry = Fixture::new(retained);
         let output = dry.run_with(scenario, "0.9.0", "charts/curie", &["--dry-run"]);
         assert!(output.status.success(), "{scenario}: {}", visible(&output));
         assert!(
@@ -4382,16 +5264,26 @@ fn printed_apply_line_matches_executed_helm_argv() {
             .map(str::to_owned)
             .collect();
 
-        let real = Fixture::new(Some(overlay));
+        let real = Fixture::new(retained);
         let real_output = real.run(scenario, "0.9.0", "charts/curie");
         let upgrades = real.helm_upgrades();
         assert_eq!(upgrades.len(), 1, "{scenario}: {}", visible(&real_output));
         let mut executed = upgrades[0].clone();
-        let values_at = executed
-            .iter()
-            .position(|arg| arg == "-f")
-            .unwrap_or_else(|| panic!("{scenario}: apply passed no values: {executed:?}"));
-        executed[values_at + 1] = "<retained-values>".into();
+        let values_at = executed.iter().position(|arg| arg == "-f");
+        if install {
+            assert!(
+                values_at.is_none(),
+                "an absent release has no retained values: {executed:?}"
+            );
+            assert!(
+                real.captured_paths("values").is_empty(),
+                "first install must not invent a retained overlay"
+            );
+        } else {
+            let values_at = values_at
+                .unwrap_or_else(|| panic!("{scenario}: apply passed no values: {executed:?}"));
+            executed[values_at + 1] = "<retained-values>".into();
+        }
 
         assert_eq!(
             printed, executed,

@@ -3010,6 +3010,11 @@ enum ClusterAction {
         /// rollback window stays intact (#2300).
         #[arg(long = "forward-only")]
         forward_only: bool,
+        /// Take over this exact holder after verifying its CLI and Helm action
+        /// have stopped. Refuses while a release hook Job is running; recovers
+        /// an orphaned pending upgrade by rolling back to the serving revision.
+        #[arg(long, value_name = "HOLDER")]
+        take_over: Option<String>,
     },
     /// Carry bundle objects across a chart upgrade that renames the object
     /// store (issue #1324).
@@ -6054,6 +6059,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
                 forward_only,
+                take_over,
             } => {
                 let resolved = artifacts::resolve_chart(
                     chart.as_deref(),
@@ -6074,6 +6080,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         chart,
                         yes,
                         forward_only,
+                        take_over,
                     })
                     .await?,
                 )

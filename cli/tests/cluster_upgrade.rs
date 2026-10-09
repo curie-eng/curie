@@ -28,6 +28,7 @@ fn opts(to: &str) -> UpgradeOpts {
         chart: UpgradeChart::AvailableLocal("charts/curie".into()),
         yes: true,
         forward_only: false,
+        take_over: None,
     }
 }
 

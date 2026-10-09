@@ -3902,6 +3902,14 @@ export const commandManifest = {
                 "false"
               ],
               "required": false
+            },
+            {
+              "global": false,
+              "help": "Take over this exact holder after verifying its CLI and Helm action have stopped. Refuses while a release hook Job is running; recovers an orphaned pending upgrade by rolling back to the serving revision",
+              "id": "take_over",
+              "long": "take-over",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
