@@ -53,6 +53,11 @@ REV_089=""
 SENTINEL_ID="acme-2590"
 FAIL_AT_HOOK=""
 INTERRUPT_AFTER_HOOK=""
+KUBECTL_CONTEXT_ARGS=()
+HELM_CONTEXT_ARGS=()
+APPLY_KILL_PID=""
+APPLY_KILL_PIDS=()
+APPLY_KILL_HELM_SEEN=0
 ROLLBACK_SERVING_HELM_PID=""
 
 CHART_088_SHA="88664c2f991bed7a3e4bc0513ae73bfcbac08077d99a69e7087138aa6f8f3af2"
@@ -83,6 +88,7 @@ SCENARIOS_ALL=(
     migration-crash
     converge-negative
     previous-serves
+    apply-kill-takeover
     rollback-to-serving
 )
 
@@ -114,6 +120,7 @@ s09 setup n-to-n1 guarded-rollback
 s11 nosetup rollback-published-089
 s13 setup converge-negative
 s14 setup previous-serves
+s16 setup apply-kill-takeover
 s17 setup rollback-to-serving"
 SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
 
@@ -126,7 +133,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|rollback-to-serving] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -474,6 +481,54 @@ run_self_test() {
         log "self-test: migration-crash must wait at most 120s for the interrupted upgrade, then terminate it and recover ownership and the helm lock before retrying"
         failed=1
     fi
+    if awk '/^run_apply_kill_takeover\(\)/,/^}/' "$script_path" | awk '
+        /cluster_upgrade|exclusive_kind_tag|settle_helm_operation|recover_killed_upgrade_ownership|recover_helm_lock|terminate_tree/ { forbidden=1 }
+        /"\$BIN" --json cluster upgrade/ { direct++ }
+        END { exit (!forbidden && direct >= 5) ? 0 : 1 }
+    '; then
+        log "apply-kill-takeover uses the binary without harness recovery"
+    else
+        log "self-test: apply-kill-takeover must call the binary directly for every upgrade and use no harness recovery helper"
+        failed=1
+    fi
+    if awk '/^run_apply_kill_takeover\(\)/,/^}/' "$script_path" | awk '
+        /SECONDS \+ 600/ { bound=NR }
+        /running_hooks="\$\(running_release_hook_jobs\)"/ { poll=NR }
+        /release hook Jobs still running after 600s/ { refusal=NR }
+        /"\$BIN" --json cluster upgrade.*--dry-run --take-over/ { dry=NR }
+        END { exit (bound && poll > bound && refusal > poll && dry > refusal) ? 0 : 1 }
+    '; then
+        log "apply-kill-takeover waits at most 600s for hooks before matching dry takeover"
+    else
+        log "self-test: apply-kill-takeover must wait at most 600s for no running hook Jobs before matching dry takeover"
+        failed=1
+    fi
+    if awk '/^sigkill_tree\(\)/,/^}/' "$script_path" | awk '
+        /pgrep -P/ { walks=1 }
+        /sigkill_tree "\$child"/ { descendants=1 }
+        /kill -KILL "\$pid"/ { killed=1 }
+        END { exit (walks && descendants && killed) ? 0 : 1 }
+    ' && awk '/^run_apply_kill_takeover\(\)/,/^}/' "$script_path" | awk '
+        /sigkill_tree "\$pid"/ { found=1 }
+        END { exit found ? 0 : 1 }
+    '; then
+        log "apply-kill-takeover sends SIGKILL to every descendant"
+    else
+        log "self-test: apply-kill-takeover must send SIGKILL to the binary and every descendant"
+        failed=1
+    fi
+    if awk '/^prepare_takeover_context\(\)/,/^}/' "$script_path" | awk '
+        /kubeconfig_is_named_kind/ { verifies=1 }
+        /--kubeconfig "\$KUBECONFIG_FILE" config rename-context "kind-\$KIND_CLUSTER" k8/ { private=1 }
+        /KUBECTL_CONTEXT_ARGS=\(--context k8\)/ { kubectl=1 }
+        /HELM_CONTEXT_ARGS=\(--kube-context k8\)/ { helm=1 }
+        END { exit (verifies && private && kubectl && helm) ? 0 : 1 }
+    '; then
+        log "apply-kill-takeover pins its private kind cluster to context k8"
+    else
+        log "self-test: apply-kill-takeover must verify its named kind cluster before selecting k8 in its private kubeconfig"
+        failed=1
+    fi
     if shard_manifest check "$SHARDS"; then
         log "shard manifest covers every scenario exactly once"
     else
@@ -543,6 +598,21 @@ raise SystemExit(0 if ok else 1)
 printf '%s\n' "$*" >>"$CURIE_SETTLE_LOG"
 if [[ "$1" == "--kubeconfig" ]]; then
     shift 2
+fi
+if [[ "$1" == "--context" ]]; then
+    shift 2
+fi
+if [[ "$1" == "config" ]]; then
+    case "$2" in
+        current-context) cat "$CURIE_SETTLE_STATE/current-context" ;;
+        view) cat "$CURIE_SETTLE_STATE/server" ;;
+        rename-context)
+            [[ "$(cat "$CURIE_SETTLE_STATE/current-context")" == "$3" ]] || exit 1
+            printf '%s' "$4" >"$CURIE_SETTLE_STATE/current-context"
+            ;;
+        *) exit 1 ;;
+    esac
+    exit 0
 fi
 if [[ "$1" == "get" && "$2" == "namespace" ]]; then
     if [[ -f "$CURIE_SETTLE_STATE/lookup_fail" ]]; then
@@ -620,7 +690,19 @@ if [[ "$cmd" == "rollback" ]]; then
 fi
 exit 0
 EOF
-        chmod +x "$bindir/kubectl" "$bindir/helm"
+        cat >"$bindir/kind" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$CURIE_SETTLE_LOG"
+if [[ "$1" == get && "$2" == clusters ]]; then
+    printf '%s\n' "$CURIE_SETTLE_KIND_CLUSTER"
+elif [[ "$1" == get && "$2" == kubeconfig && "$3" == --name && "$4" == "$CURIE_SETTLE_KIND_CLUSTER" ]]; then
+    printf 'apiVersion: v1\nkind: Config\ncurrent-context: kind-%s\nclusters:\n  - name: kind-%s\n    cluster:\n      server: %s\n' \
+        "$CURIE_SETTLE_KIND_CLUSTER" "$CURIE_SETTLE_KIND_CLUSTER" "$(cat "$CURIE_SETTLE_STATE/kind-server")"
+else
+    exit 1
+fi
+EOF
+        chmod +x "$bindir/kubectl" "$bindir/helm" "$bindir/kind"
         saved_ns="$NAMESPACE"
         saved_kube="$KUBECONFIG_FILE"
         saved_path="$PATH"
@@ -739,6 +821,65 @@ EOF
         else
             log "a settle failure still stops a caller that has errexit on"
         fi
+        export CURIE_SETTLE_KIND_CLUSTER=curie-matrix-adopted
+        printf 'kind-%s' "$CURIE_SETTLE_KIND_CLUSTER" >"$state/current-context"
+        printf 'https://127.0.0.1:6443' >"$state/server"
+        cp "$state/server" "$state/kind-server"
+        : >"$logf"
+        if (
+            KIND_CLUSTER="$CURIE_SETTLE_KIND_CLUSTER"
+            EVIDENCE_DIR="$probe/evidence"
+            FORCE=0
+            OWNED_KIND=1
+            ensure_kind
+            (( OWNED_KIND == 0 )) || die "self-test: ensure_kind did not adopt the named cluster"
+            prepare_takeover_context
+            [[ "$(cat "$state/current-context")" == k8 ]] || die "self-test: adopted kind context was not renamed"
+            [[ "${KUBECTL_CONTEXT_ARGS[*]}" == '--context k8' && "${HELM_CONTEXT_ARGS[*]}" == '--kube-context k8' ]] \
+                || die "self-test: adopted kind context was not passed to both clients"
+            (( OWNED_KIND == 0 )) || die "self-test: context preparation changed cluster cleanup ownership"
+        ); then
+            if grep -Fq -- "--kubeconfig $KUBECONFIG_FILE config rename-context kind-$CURIE_SETTLE_KIND_CLUSTER k8" "$logf"; then
+                log "adopted named kind cluster prepared private context k8"
+            else
+                log "self-test: adopted kind context preparation did not select the private kubeconfig"
+                failed=1
+            fi
+        else
+            log "self-test: a verified adopted named kind cluster could not prepare context k8"
+            failed=1
+        fi
+        printf 'other-context' >"$state/current-context"
+        : >"$logf"
+        if (
+            KIND_CLUSTER="$CURIE_SETTLE_KIND_CLUSTER"
+            OWNED_KIND=0
+            prepare_takeover_context
+        ); then
+            log "self-test: an invalid adopted kind kubeconfig was accepted"
+            failed=1
+        elif grep -Fq 'rename-context' "$logf" || [[ "$(cat "$state/current-context")" != other-context ]]; then
+            log "self-test: invalid kind kubeconfig was changed before refusal"
+            failed=1
+        else
+            log "invalid kind kubeconfig refused before selecting k8"
+        fi
+        printf 'kind-%s' "$CURIE_SETTLE_KIND_CLUSTER" >"$state/current-context"
+        printf 'https://127.0.0.1:7443' >"$state/server"
+        : >"$logf"
+        if (
+            KIND_CLUSTER="$CURIE_SETTLE_KIND_CLUSTER"
+            OWNED_KIND=0
+            prepare_takeover_context
+        ); then
+            log "self-test: a mismatched adopted kind server was accepted"
+            failed=1
+        elif grep -Fq 'rename-context' "$logf"; then
+            log "self-test: mismatched kind server was renamed before refusal"
+            failed=1
+        else
+            log "mismatched kind server refused before selecting k8"
+        fi
         NAMESPACE="$saved_ns"
         KUBECONFIG_FILE="$saved_kube"
         export PATH="$saved_path"
@@ -752,7 +893,7 @@ EOF
         else
             unset CURIE_HELM_SETTLE_POLL_SECONDS
         fi
-        unset CURIE_SETTLE_STATE CURIE_SETTLE_LOG
+        unset CURIE_SETTLE_STATE CURIE_SETTLE_LOG CURIE_SETTLE_KIND_CLUSTER
         rm -rf "$probe"
     fi
     (( failed == 0 )) || die "self-test failed"
@@ -782,11 +923,11 @@ candidate_identity() {
 }
 
 kubectl_ns() {
-    kubectl --kubeconfig "$KUBECONFIG_FILE" -n "$NAMESPACE" "$@"
+    kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" -n "$NAMESPACE" "$@"
 }
 
 helm_ns() {
-    helm --kubeconfig "$KUBECONFIG_FILE" -n "$NAMESPACE" "$@"
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" -n "$NAMESPACE" "$@"
 }
 
 # Prints the phase and returns 0 when the namespace exists, 2 when it is
@@ -796,7 +937,7 @@ helm_ns() {
 lookup_namespace() {
     local err rc out
     err="$(mktemp)"
-    out="$(kubectl --kubeconfig "$KUBECONFIG_FILE" get namespace "$NAMESPACE" \
+    out="$(kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" get namespace "$NAMESPACE" \
         -o jsonpath='{.status.phase}' 2>"$err")" && rc=0 || rc=$?
     if (( rc == 0 )); then
         printf '%s' "$out"
@@ -863,7 +1004,7 @@ ensure_namespace() {
     done
     log "creating namespace $NAMESPACE"
     err="$(mktemp)"
-    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" 2>"$err" && rc=0 || rc=$?
+    kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" create namespace "$NAMESPACE" 2>"$err" && rc=0 || rc=$?
     if (( rc != 0 )); then
         log "namespace create failed: $(tr '\n' ' ' <"$err")"
         rm -f "$err"
@@ -967,6 +1108,11 @@ run_scenario_timed() {
 
 cleanup() {
     local status=$?
+    if [[ -n "$APPLY_KILL_PID" ]]; then
+        sigkill_tree "$APPLY_KILL_PID"
+        wait "$APPLY_KILL_PID" 2>/dev/null || true
+        APPLY_KILL_PID=""
+    fi
     if [[ -n "$ROLLBACK_SERVING_HELM_PID" ]]; then
         kill -9 "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || true
         wait "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || true
@@ -984,7 +1130,7 @@ cleanup() {
         refuse_soak "$NAMESPACE" "$RELEASE"
         log "uninstalling release $RELEASE in $NAMESPACE"
         helm_ns uninstall "$RELEASE" --wait --timeout 180s >/dev/null 2>&1 || true
-        kubectl --kubeconfig "$KUBECONFIG_FILE" delete namespace "$NAMESPACE" --wait=true --timeout=180s >/dev/null 2>&1 || true
+        kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" delete namespace "$NAMESPACE" --wait=true --timeout=180s >/dev/null 2>&1 || true
     fi
     if (( OWNED_KIND )); then
         log "deleting kind cluster $KIND_CLUSTER"
@@ -1078,6 +1224,20 @@ ensure_kind() {
     kind create cluster --name "$KIND_CLUSTER" --kubeconfig "$KUBECONFIG_FILE" --wait 120s
     kubeconfig_is_named_kind || die "created kind cluster $KIND_CLUSTER but kubeconfig does not select it"
     OWNED_KIND=1
+}
+
+prepare_takeover_context() {
+    kubeconfig_is_named_kind || die "apply-kill-takeover private kubeconfig does not select the named kind cluster"
+    kubectl --kubeconfig "$KUBECONFIG_FILE" config rename-context "kind-$KIND_CLUSTER" k8 >/dev/null
+    KUBECTL_CONTEXT_ARGS=(--context k8)
+    HELM_CONTEXT_ARGS=(--kube-context k8)
+    local server expected
+    server="$(kubectl --kubeconfig "$KUBECONFIG_FILE" --context k8 config view --minify -o jsonpath='{.clusters[0].cluster.server}')"
+    expected="$(kind get kubeconfig --name "$KIND_CLUSTER" | awk '/server:/{print $2; exit}')"
+    [[ -n "$server" && "$server" == "$expected" ]] || die "private k8 context does not point to the named kind cluster"
+    [[ "$(kubectl --kubeconfig "$KUBECONFIG_FILE" config current-context)" == k8 ]] \
+        || die "private kubeconfig did not select context k8"
+    log "private context k8 selects kind cluster $KIND_CLUSTER"
 }
 
 image_for() {
@@ -1336,10 +1496,10 @@ uninstall_owned() {
     if helm_ns status "$RELEASE" >/dev/null 2>&1; then
         helm_ns uninstall "$RELEASE" --wait --timeout 180s >/dev/null 2>&1 || true
     fi
-    kubectl --kubeconfig "$KUBECONFIG_FILE" delete namespace "$NAMESPACE" --wait=true --timeout=180s >/dev/null 2>&1 || true
+    kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" delete namespace "$NAMESPACE" --wait=true --timeout=180s >/dev/null 2>&1 || true
     local deadline=$((SECONDS + 180))
     while (( SECONDS < deadline )); do
-        if ! kubectl --kubeconfig "$KUBECONFIG_FILE" get namespace "$NAMESPACE" >/dev/null 2>&1; then
+        if ! kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" get namespace "$NAMESPACE" >/dev/null 2>&1; then
             break
         fi
         sleep 2
@@ -1350,7 +1510,7 @@ uninstall_owned() {
 helm_install_088() {
     refuse_soak "$NAMESPACE" "$RELEASE"
     load_tag_images "0.8.8"
-    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
+    kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
     local sets=()
     local line
     while IFS= read -r line; do
@@ -1376,7 +1536,7 @@ helm_install_089() {
         docker pull "$ref"
     done
     load_tag_images "0.8.9"
-    kubectl --kubeconfig "$KUBECONFIG_FILE" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
+    kubectl --kubeconfig "$KUBECONFIG_FILE" "${KUBECTL_CONTEXT_ARGS[@]}" create namespace "$NAMESPACE" >/dev/null 2>&1 || true
     local sets=()
     local line
     while IFS= read -r line; do
@@ -2019,6 +2179,45 @@ terminate_tree() {
     kill "$pid" 2>/dev/null || true
 }
 
+sigkill_tree() {
+    local pid="$1" child command args children
+    [[ -n "$pid" ]] || return 0
+    command="$(ps -p "$pid" -o comm= 2>/dev/null | tr -d '[:space:]' || true)"
+    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if [[ "$command" == helm && "$args" =~ (^|[[:space:]])upgrade([[:space:]]|$) ]]; then
+        APPLY_KILL_HELM_SEEN=1
+    fi
+    children="$(pgrep -P "$pid" 2>/dev/null || true)"
+    APPLY_KILL_PIDS+=("$pid")
+    # Stop the parent before its child exits can trigger normal cleanup.
+    kill -KILL "$pid" 2>/dev/null || true
+    for child in $children; do
+        sigkill_tree "$child"
+    done
+}
+
+running_release_hook_jobs() {
+    kubectl_ns get jobs -l "app.kubernetes.io/instance=$RELEASE,app.kubernetes.io/managed-by=Helm" \
+        -o json | python3 -c '
+import json, sys
+document = json.load(sys.stdin)
+items = document["items"]
+if not isinstance(items, list):
+    raise SystemExit("release hook Job list has no items array")
+for item in items:
+    metadata = item.get("metadata") or {}
+    hook = (metadata.get("annotations") or {}).get("helm.sh/hook")
+    active = (item.get("status") or {}).get("active", 0)
+    if not isinstance(active, int) or isinstance(active, bool) or active < 0:
+        raise SystemExit("release hook Job has an invalid active count")
+    if hook and active > 0:
+        name = metadata.get("name")
+        if not isinstance(name, str) or not name:
+            raise SystemExit("running release hook Job has no name")
+        print(name)
+'
+}
+
 recover_killed_upgrade_ownership() {
     local cm="${RELEASE}-upgrade-checkpoint"
     # SIGTERM skips finish_owned_upgrade. Strip the holder after the process
@@ -2096,6 +2295,168 @@ run_previous_serves() {
     log "fail-forward retry after previous-serves kill succeeded"
 }
 
+run_apply_kill_takeover() {
+    [[ "$(helm_version)" == "0.10.0" && "$(helm_release_status)" == deployed ]] \
+        || die "apply-kill-takeover must start from the shard's deployed 0.10.0 state"
+    local img from_image to_image from_id to_id
+    EXCLUSIVE_KIND_TAG=""
+    for img in "${IMAGES[@]}"; do
+        from_image="$(image_for "$img" "0.10.0")"
+        to_image="$(image_for "$img" "0.10.1")"
+        docker build --tag "$to_image" - <<EOF
+FROM $from_image
+LABEL curie.matrix/variant=0.10.1
+EOF
+        docker tag "$to_image" "${img}:0.10.1"
+        from_id="$(docker image inspect --format '{{.Id}}' "$from_image")"
+        to_id="$(docker image inspect --format '{{.Id}}' "$to_image")"
+        [[ "$from_id" != "$to_id" ]] || die "$img 0.10.0 and 0.10.1 image digests must differ"
+        kind load docker-image "$from_image" "$to_image" --name "$KIND_CLUSTER"
+        log "$img has distinct 0.10.0 and 0.10.1 image digests on kind"
+    done
+
+    local history="$EVIDENCE_DIR/apply-kill-takeover-history.json" serving_revision
+    helm_ns history "$RELEASE" -o json --max 256 >"$history"
+    serving_revision="$(python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))
+deployed = [row for row in rows if row["status"] == "deployed"]
+row = max(deployed, key=lambda row: int(row["revision"]))
+if row.get("app_version") != "0.10.0":
+    raise SystemExit("serving revision is not 0.10.0")
+print(row["revision"])
+' "$history")"
+    local pid status=0 seen=0 killed_revision newest newest_status
+    local CURIE_UPGRADE_TEST_FAIL_AT="" CURIE_UPGRADE_TEST_INTERRUPT_AFTER=""
+    "$BIN" --json cluster upgrade --yes --to "0.10.1" \
+        --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
+        >"$EVIDENCE_DIR/apply-kill-takeover-killed.json" 2>"$EVIDENCE_DIR/apply-kill-takeover-killed.err" &
+    pid=$!
+    APPLY_KILL_PID="$pid"
+    local deadline=$((SECONDS + 300))
+    while (( SECONDS < deadline )); do
+        helm_ns history "$RELEASE" -o json --max 256 >"$history"
+        newest="$(python3 -c '
+import json, sys
+row = max(json.load(open(sys.argv[1])), key=lambda row: int(row["revision"]))
+print(row["revision"], row["status"])
+' "$history")"
+        read -r killed_revision newest_status <<<"$newest"
+        if [[ "$newest_status" == pending-upgrade ]]; then
+            seen=1
+            break
+        fi
+        kill -0 "$pid" 2>/dev/null || die "upgrade exited before a pending-upgrade revision was observed"
+        sleep 1
+    done
+    (( seen == 1 )) || die "apply-kill-takeover did not observe pending-upgrade within 300s"
+    sleep 20
+    kill -0 "$pid" 2>/dev/null || die "upgrade finished before the apply SIGKILL"
+    APPLY_KILL_PIDS=()
+    APPLY_KILL_HELM_SEEN=0
+    sigkill_tree "$pid"
+    wait "$pid" || status=$?
+    APPLY_KILL_PID=""
+    (( status == 137 )) || die "apply-kill-takeover expected the binary's SIGKILL exit 137, got $status"
+    (( APPLY_KILL_HELM_SEEN == 1 )) || die "apply SIGKILL did not include a running helm upgrade descendant"
+    local killed_pid process_state stop_deadline=$((SECONDS + 30))
+    for killed_pid in "${APPLY_KILL_PIDS[@]}"; do
+        while true; do
+            process_state="$(ps -p "$killed_pid" -o stat= 2>/dev/null | tr -d '[:space:]' || true)"
+            [[ -n "$process_state" && "$process_state" != Z* ]] || break
+            (( SECONDS < stop_deadline )) || die "SIGKILL descendant $killed_pid is still running"
+            sleep 0.2
+        done
+    done
+
+    local cm="${RELEASE}-upgrade-checkpoint" holder resource_version
+    holder="$(kubectl_ns get configmap "$cm" -o jsonpath='{.metadata.annotations.curietech\.ai/upgrade-holder}')"
+    [[ -n "$holder" ]] || die "SIGKILL did not leave the upgrade holder annotation"
+    resource_version="$(kubectl_ns get configmap "$cm" -o jsonpath='{.metadata.resourceVersion}')"
+    helm_ns history "$RELEASE" -o json --max 256 >"$history"
+    python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))
+newest = max(rows, key=lambda row: int(row["revision"]))
+assert int(newest["revision"]) == int(sys.argv[2]) and newest["status"] == "pending-upgrade", "SIGKILL did not retain the pending-upgrade revision"
+assert any(int(row["revision"]) == int(sys.argv[3]) and row["status"] == "deployed" for row in rows), "SIGKILL changed the serving revision"
+' "$history" "$killed_revision" "$serving_revision"
+    log "SIGKILL stopped the binary and helm child; revision $killed_revision is pending above serving revision $serving_revision"
+
+    status=0
+    "$BIN" --json cluster upgrade --yes --to "0.10.1" \
+        --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
+        >"$EVIDENCE_DIR/apply-kill-takeover-refused.json" 2>"$EVIDENCE_DIR/apply-kill-takeover-refused.err" || status=$?
+    (( status != 0 )) || die "plain rerun accepted the killed holder"
+    grep -Fq -- "$holder" "$EVIDENCE_DIR/apply-kill-takeover-refused.json" "$EVIDENCE_DIR/apply-kill-takeover-refused.err" \
+        || die "plain rerun refusal did not name the killed holder"
+    grep -Fq -- "--take-over $holder" "$EVIDENCE_DIR/apply-kill-takeover-refused.json" "$EVIDENCE_DIR/apply-kill-takeover-refused.err" \
+        || die "plain rerun refusal did not name the exact takeover command"
+    status=0
+    "$BIN" --json cluster upgrade --yes --to "0.10.1" --dry-run \
+        --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
+        >"$EVIDENCE_DIR/apply-kill-takeover-dry-refused.json" 2>"$EVIDENCE_DIR/apply-kill-takeover-dry-refused.err" || status=$?
+    (( status != 0 )) || die "dry run accepted the killed holder without --take-over"
+    grep -Fq -- "$holder" "$EVIDENCE_DIR/apply-kill-takeover-dry-refused.json" "$EVIDENCE_DIR/apply-kill-takeover-dry-refused.err" \
+        || die "dry-run refusal did not name the killed holder"
+    # Cluster hook Jobs can outlive the killed Helm process. Both takeover
+    # paths refuse active hooks, so wait before planning or mutating.
+    local running_hooks deadline=$((SECONDS + 600))
+    while true; do
+        running_hooks="$(running_release_hook_jobs)"
+        [[ -n "$running_hooks" ]] || break
+        (( SECONDS < deadline )) || die "release hook Jobs still running after 600s: $running_hooks"
+        sleep 1
+    done
+    "$BIN" --json cluster upgrade --yes --to "0.10.1" --dry-run --take-over "$holder" \
+        --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
+        >"$EVIDENCE_DIR/apply-kill-takeover-dry-plan.json" 2>"$EVIDENCE_DIR/apply-kill-takeover-dry-plan.err"
+    python3 -c '
+import json, shlex, sys
+document = json.load(open(sys.argv[1]))
+assert document["dry_run"] is True, "matching takeover did not emit a dry-run plan"
+plan = document["plan"]
+assert "phase plan: 0.10.0 -> 0.10.1" in plan, "dry run did not plan from serving version 0.10.0"
+assert f"take over upgrade ownership from {sys.argv[2]}" in plan, "dry run did not plan the named takeover"
+commands = [shlex.split(line) for line in plan if line.startswith("helm ")]
+rollback = next(index for index, argv in enumerate(commands) if argv[:4] == ["helm", "rollback", sys.argv[3], sys.argv[4]])
+upgrade = next(index for index, argv in enumerate(commands) if argv[:2] == ["helm", "upgrade"])
+assert rollback < upgrade, "dry run did not plan rollback before upgrade"
+assert commands[rollback][4:] == ["-n", sys.argv[5], "--wait", "--timeout", "15m"], "dry run rollback did not use the prescribed namespace, wait and timeout"
+' "$EVIDENCE_DIR/apply-kill-takeover-dry-plan.json" "$holder" "$RELEASE" "$serving_revision" "$NAMESPACE"
+    [[ "$(kubectl_ns get configmap "$cm" -o jsonpath='{.metadata.resourceVersion}')" == "$resource_version" ]] \
+        || die "refused runs or dry-run plans mutated upgrade ownership"
+    [[ "$(helm_revision)" == "$killed_revision" && "$(helm_release_status)" == pending-upgrade ]] \
+        || die "refused runs or dry-run plans mutated the pending Helm revision"
+
+    status=0
+    "$BIN" --json cluster upgrade --yes --to "0.10.1" --take-over "$holder" \
+        --namespace "$NAMESPACE" --release "$RELEASE" --chart "$CHART_0101" \
+        >"$EVIDENCE_DIR/apply-kill-takeover.json" 2>"$EVIDENCE_DIR/apply-kill-takeover.err" || status=$?
+    (( status == 0 )) || die "real takeover exited $status"
+    [[ "$(json_field "$EVIDENCE_DIR/apply-kill-takeover.json" status)" == succeeded ]] \
+        || die "real takeover did not report succeeded"
+    helm_ns history "$RELEASE" -o json --max 256 >"$history"
+    python3 -c '
+import json, sys
+rows = json.load(open(sys.argv[1]))
+newest = max(rows, key=lambda row: int(row["revision"]))
+assert newest["status"] == "deployed" and newest["app_version"] == "0.10.1", "takeover did not deploy 0.10.1"
+assert any(int(sys.argv[2]) < int(row["revision"]) < int(newest["revision"]) and row.get("description") == f"Rollback to {sys.argv[3]}" for row in rows), "takeover did not create a rollback revision between the killed and deployed revisions"
+' "$history" "$killed_revision" "$serving_revision"
+    [[ -z "$(kubectl_ns get configmap "$cm" -o jsonpath='{.metadata.annotations.curietech\.ai/upgrade-holder}')" ]] \
+        || die "successful takeover left an upgrade holder annotation"
+    [[ "$(helm_version)" == "0.10.1" ]] || die "successful takeover metadata is not 0.10.1"
+    wait_rollout
+    kubectl_ns get deploy "$(fullname)-api" -o json | python3 -c '
+import json, sys
+deployment = json.load(sys.stdin)
+assert (deployment.get("status") or {}).get("readyReplicas", 0) > 0, "API is not Ready after takeover"
+'
+    api_health >/dev/null || die "API health failed after takeover"
+    log "apply-kill-takeover deployed 0.10.1 through the CLI rollback with a Ready API and no holder"
+}
+
 run_rollback_to_serving() {
     local V CHART_V serving pending="" status=0
     V="$(awk '$1 == "version:" { print $2; exit }' "$REPO_ROOT/charts/curie/Chart.yaml")"
@@ -2122,7 +2483,7 @@ print(row["revision"])
         || die "rollback-to-serving setup did not establish a serving revision at $V"
 
     # Start Helm directly so the recorded PID is the process that holds its lock.
-    helm --kubeconfig "$KUBECONFIG_FILE" upgrade "$RELEASE" "$CHART_V" -n "$NAMESPACE" \
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" upgrade "$RELEASE" "$CHART_V" -n "$NAMESPACE" \
         --reuse-values --wait --timeout 10m \
         >"$EVIDENCE_DIR/rollback-serving-interrupted.log" 2>&1 &
     ROLLBACK_SERVING_HELM_PID=$!
@@ -2263,6 +2624,7 @@ scenario_fn() {
         migration-crash) echo run_migration_crash ;;
         converge-negative) echo run_converge_negative ;;
         previous-serves) echo run_previous_serves ;;
+        apply-kill-takeover) echo run_apply_kill_takeover ;;
         rollback-to-serving) echo run_rollback_to_serving ;;
         *) die "no runner for scenario '$1'" ;;
     esac
@@ -2315,6 +2677,10 @@ run_serial() {
     for name in "${SCENARIOS_ALL[@]}"; do
         [[ "$name" == soak-refusal ]] && continue
         scenario_wanted "$name" || continue
+        if [[ "$name" == apply-kill-takeover ]]; then
+            prepare_takeover_context
+            run_timed "setup=nonempty-n" "setup=nonempty-n" all setup_nonempty_n
+        fi
         phases="all"
         case "$name" in
             fail-every-phase) [[ -z "${CURIE_E2E_FAIL_PHASES:-}" ]] || phases="${CURIE_E2E_FAIL_PHASES// /+}" ;;
@@ -2345,6 +2711,9 @@ run_matrix() {
     fetch_published
     package_n_charts
     ensure_kind
+    if [[ "$SHARD" == s16 ]]; then
+        prepare_takeover_context
+    fi
     prepare_candidate_images
     log "prelude elapsed_seconds=$((SECONDS - prelude_started))"
     if [[ -n "$SHARD" ]]; then

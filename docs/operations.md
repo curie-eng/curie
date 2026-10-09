@@ -547,8 +547,9 @@ of the Namespace object.
 Any interruption after ownership acquisition, including Ctrl C, SIGINT, and
 SIGTERM, leaves the holder in place. A normal exit that reports an ownership
 release CAS failure can also leave the holder. Do not rerun the upgrade in
-either case until the checked recovery below is complete. There is no expiry,
-heartbeat, or automatic takeover. First read the live checkpoint:
+either case until the checked recovery below is complete.
+There is no expiry, heartbeat, or automatic takeover. First read the live
+checkpoint:
 
 ```bash
 kubectl --context <context> -n <namespace> get configmap <release>-upgrade-checkpoint -o json
@@ -561,8 +562,43 @@ its Helm action is no longer running. Clearing a live holder can let another
 upgrade overlap the original operation. Never delete the checkpoint as a
 recovery step because it also contains the resumable lifecycle record.
 
-Only after those checks, replace both values in this conditional patch with the
-exact values just observed:
+After those checks, use the exact observed holder to plan and run recovery:
+
+```bash
+curie cluster upgrade --to <version> --namespace <namespace> --release <release> \
+  --take-over <observed-holder> --dry-run
+curie cluster upgrade --to <version> --namespace <namespace> --release <release> \
+  --take-over <observed-holder> --yes
+```
+
+Both runs refuse if the holder differs, there is nothing to take over, or a
+release Helm hook Job still has active pods. An unreadable hook Job list also
+refuses. The CLI cannot verify that the local CLI or Helm process has stopped;
+that remains the operator's check. The real run tests the observed checkpoint
+resource version and named holder in one conditional patch, replaces the holder
+with its own, and preserves the durable lifecycle record for resumption. A
+failed comparison reports the currently observed holder and action.
+
+The installed and known-good versions in a dry run come from the serving
+`deployed` revision, including when a newer revision is `pending-upgrade`.
+A dry run reads ownership without creating or patching it. A held checkpoint
+requires a matching `--take-over` even for a dry run, whose plan names the
+takeover and any rollback before the upgrade command.
+
+If the newest Helm revision is pending, a plain upgrade refuses after releasing
+its claim. The message names the pending revision and status, the serving
+revision and version, and the rollback command. With `--take-over`, an orphaned
+`pending-upgrade` revision is rolled back to the serving revision using
+`helm rollback <release> <serving-revision> -n <namespace> --wait --timeout 15m`
+before the CLI reads retained snapshots or resumes the lifecycle. A failed
+rollback fails the command and releases ownership without changing the durable
+record. `pending-install`, `pending-rollback`, and a pending history with no
+deployed revision refuse without automated recovery.
+
+The conditional manual patch remains a fallback. After verifying that the
+holder and Helm action have stopped and no release hook Job is running, recover
+any orphaned pending upgrade with the rollback command above. Then replace both
+values in this patch with the exact checkpoint values just observed:
 
 ```bash
 kubectl --context <context> -n <namespace> patch configmap <release>-upgrade-checkpoint \

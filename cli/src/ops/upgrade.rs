@@ -130,6 +130,7 @@ pub struct UpgradeOpts {
     pub chart: UpgradeChart,
     pub yes: bool,
     pub forward_only: bool,
+    pub take_over: Option<String>,
 }
 
 /// The chart operand selected before the lifecycle starts, including whether
@@ -1288,6 +1289,9 @@ trait UpgradeDriver {
     fn schema_plan(&self) -> Option<String> {
         None
     }
+    fn recovery_plan(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Whether Apply hands Helm a retained values overlay via `-f` (#2863).
     fn retained_values(&self) -> bool {
         false
@@ -1396,6 +1400,9 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
             ),
         );
     }
+    // Recovery still runs when the serving version is already known good.
+    // Insert it after filtering the lifecycle's same-version skipped commands.
+    plan.splice(2..2, host.recovery_plan());
     let mut plan: Vec<String> = plan.into_iter().map(|l| host.redact(&l)).collect();
 
     if opts.common.dry_run {
@@ -1856,6 +1863,7 @@ struct LiveHost {
     checkpoint_resource_version: Option<String>,
     checkpoint_data_present: bool,
     checkpoint_record: Option<serde_json::Value>,
+    recovery_plan: Vec<String>,
 }
 
 /// Ruling 2: Helm SILENTLY IGNORES `--version` for a local directory or
@@ -2053,6 +2061,7 @@ impl LiveHost {
             checkpoint_resource_version: None,
             checkpoint_data_present: false,
             checkpoint_record: None,
+            recovery_plan: Vec::new(),
         })
     }
 
@@ -2201,7 +2210,9 @@ impl LiveHost {
         self.run(&cmd)
     }
 
-    fn acquire_ownership(&mut self) -> Result<()> {
+    /// Real and dry runs make the same ownership and takeover checks. This
+    /// read never creates or patches the checkpoint.
+    fn read_ownership(&self) -> Result<Option<CheckpointObservation>> {
         let checkpoint = checkpoint_name(&self.opts.common.release);
         let (ok, out, err) = self.run(&self.checkpoint_get_command())?;
         if !ok {
@@ -2218,10 +2229,153 @@ impl LiveHost {
                     super::verbs::failure_reason(&err)
                 );
             }
-            return self.create_ownership();
+            if self.opts.take_over.is_some() {
+                bail!("nothing to take over; run without --take-over");
+            }
+            return Ok(None);
         }
 
         let observed = parse_checkpoint_observation(&out, "upgrade ownership read")?;
+        let holder = observed
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(UPGRADE_HOLDER_ANNOTATION))
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("upgrade holder annotation is malformed")
+            })
+            .transpose()?;
+        let action = observed
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.get(UPGRADE_ACTION_ANNOTATION))
+            .map(|value| {
+                value
+                    .as_str()
+                    .context("upgrade action annotation is malformed")
+            })
+            .transpose()?
+            .unwrap_or("<unspecified>");
+        match (holder, self.opts.take_over.as_deref()) {
+            (None, Some(_)) => bail!("nothing to take over; run without --take-over"),
+            (Some(holder), Some(expected)) if holder == expected => {
+                self.refuse_running_hook_jobs()?;
+            }
+            (Some(holder), _) => bail!(
+                "upgrade ownership is held by {holder} for action {action}; wait for that upgrade to finish, or verify that holder has stopped and no hook Job is running, then rerun with --take-over {holder}"
+            ),
+            (None, None) => {}
+        }
+        Ok(Some(observed))
+    }
+
+    fn refuse_running_hook_jobs(&self) -> Result<()> {
+        let (ok, out, err) = self.run(&super::up::hook_jobs_cmd(&self.opts.common))?;
+        if !ok {
+            bail!(
+                "could not list release hook Jobs before takeover: {}",
+                crate::schema_window::redact_probe_text(super::verbs::failure_reason(&err))
+            );
+        }
+        let document: serde_json::Value =
+            serde_json::from_str(&out).context("release hook Job list is malformed")?;
+        let jobs = document
+            .get("items")
+            .and_then(serde_json::Value::as_array)
+            .context("release hook Job list has no items list")?;
+        for job in jobs {
+            let metadata = job
+                .get("metadata")
+                .and_then(serde_json::Value::as_object)
+                .context("release hook Job metadata is malformed")?;
+            let hook = match metadata.get("annotations") {
+                None => None,
+                Some(annotations) => annotations
+                    .as_object()
+                    .context("release hook Job annotations are malformed")?
+                    .get("helm.sh/hook")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .context("release hook Job annotation is malformed")
+                    })
+                    .transpose()?,
+            };
+            if hook.is_none_or(|hook| hook.is_empty()) {
+                continue;
+            }
+            let active = match job.get("status") {
+                None => 0,
+                Some(status) => status
+                    .as_object()
+                    .context("release hook Job status is malformed")?
+                    .get("active")
+                    .map(|value| {
+                        value
+                            .as_u64()
+                            .context("release hook Job active count is malformed")
+                    })
+                    .transpose()?
+                    .unwrap_or(0),
+            };
+            if active > 0 {
+                let name = metadata
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .context("running release hook Job has no name")?;
+                bail!(
+                    "cannot take over upgrade ownership while release hook Job {name} is running"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn acquire_ownership(&mut self) -> Result<()> {
+        let Some(observed) = self.read_ownership()? else {
+            return self.create_ownership();
+        };
+        if let Some(holder) = &self.opts.take_over {
+            let patch = serde_json::json!([
+                {
+                    "op": "test",
+                    "path": "/metadata/resourceVersion",
+                    "value": observed.resource_version,
+                },
+                {
+                    "op": "test",
+                    "path": UPGRADE_HOLDER_POINTER,
+                    "value": holder,
+                },
+                {
+                    "op": "replace",
+                    "path": UPGRADE_HOLDER_POINTER,
+                    "value": self.holder,
+                },
+                {
+                    "op": "add",
+                    "path": UPGRADE_ACTION_POINTER,
+                    "value": self.ownership_action(),
+                },
+            ]);
+            let (ok, out, err) = self.run_checkpoint_patch(&patch)?;
+            if !ok {
+                let diagnostic = self.checkpoint_diagnostic();
+                bail!(
+                    "could not take over upgrade ownership from {holder}: {}; {diagnostic}; inspect the current holder before retrying",
+                    super::verbs::failure_reason(&err)
+                );
+            }
+            let observation = parse_checkpoint_observation(&out, "upgrade ownership takeover")
+                .context("ownership may remain because the server response cannot be trusted")?;
+            self.validate_owned_observation(&observation, "upgrade ownership takeover", None)
+                .context("ownership may remain because the server response cannot be trusted")?;
+            self.recovery_plan
+                .push(format!("take over upgrade ownership from {holder}"));
+            self.adopt_checkpoint_observation(observation);
+            return Ok(());
+        }
         let patch = match observed.annotations.as_ref() {
             None => serde_json::json!([
                 {
@@ -2239,20 +2393,6 @@ impl LiveHost {
                 },
             ]),
             Some(annotations) => {
-                if let Some(holder) = annotations.get(UPGRADE_HOLDER_ANNOTATION) {
-                    let holder = holder
-                        .as_str()
-                        .context("upgrade holder annotation is malformed")?;
-                    let action = match annotations.get(UPGRADE_ACTION_ANNOTATION) {
-                        Some(value) => value
-                            .as_str()
-                            .context("upgrade action annotation is malformed")?,
-                        None => "<unspecified>",
-                    };
-                    bail!(
-                        "upgrade ownership is held by {holder} for action {action}; wait for that upgrade to finish, or verify that holder has stopped before manual recovery"
-                    );
-                }
                 serde_json::json!([
                     {
                         "op": "test",
@@ -2793,22 +2933,20 @@ impl LiveHost {
         }
     }
 
-    /// R7: read the retained overlay, migrate it (#2299) and keep the result.
+    /// R7: read the serving revision's retained overlay, migrate it (#2299)
+    /// and keep the result. A pending newer revision's values are not the
+    /// values the real run retains after recovery (#4334).
     /// `Ok(None)` means no values were returned; the installed version still
     /// distinguishes an empty release from a first install.
     fn retained_overlay(&self) -> Result<Option<(String, String)>> {
-        let values_cmd = OpsCommand::new(
-            "helm",
-            vec![
-                plain("get"),
-                plain("values"),
-                plain(&self.opts.common.release),
-                plain("-n"),
-                plain(&self.opts.common.namespace),
-                plain("-o"),
-                plain("yaml"),
-            ],
-        );
+        let Some(history) = self.release_history()? else {
+            return Ok(None);
+        };
+        let revision =
+            crate::cluster_secrets::serving_revision(&history, &self.opts.common.release)
+                .map_err(anyhow::Error::msg)?;
+        let values_cmd =
+            crate::cluster_secrets::helm_get_json(&self.opts.common, "values", false, revision);
         let (ok, out, err) = self.run(&values_cmd)?;
         if !ok {
             // Fail closed exactly like `cluster up` (`up.rs`
@@ -2842,62 +2980,107 @@ impl LiveHost {
     /// The chart version of the revision Helm still marks deployed.
     /// A failed upgrade often leaves the previous revision deployed (#3421).
     fn observe_deployed_version(&mut self) {
-        let history_cmd = super::verbs::helm_history_cmd(&self.opts.common);
-        let Ok((true, history_out, _)) = self.run(&history_cmd) else {
-            return;
-        };
-        let Ok(history) = serde_json::from_str::<serde_json::Value>(&history_out) else {
-            return;
-        };
-        let Ok(revision) =
-            crate::cluster_secrets::serving_revision(&history, &self.opts.common.release)
-        else {
-            return;
-        };
-        let metadata =
+        self.set_current(self.inspect_version());
+    }
+
+    fn release_history(&self) -> Result<Option<serde_json::Value>> {
+        let (ok, out, err) = self.run(&super::verbs::helm_history_cmd(&self.opts.common))?;
+        if !ok {
+            if super::verbs::failure_reason(&err) == "Error: release: not found" {
+                return Ok(None);
+            }
+            bail!(
+                "could not read release history: {}",
+                crate::schema_window::redact_probe_text(super::verbs::failure_reason(&err))
+            );
+        }
+        serde_json::from_str(&out)
+            .context("release history is malformed")
+            .map(Some)
+    }
+
+    fn version_at_revision(&self, revision: u32) -> Option<String> {
+        let cmd =
             crate::cluster_secrets::helm_get_json(&self.opts.common, "metadata", false, revision);
-        let Ok((true, metadata_out, _)) = self.run(&metadata) else {
-            return;
-        };
-        let Ok(document) = serde_json::from_str::<serde_json::Value>(&metadata_out) else {
-            return;
-        };
-        let Some(version) = document
+        let (ok, out, _) = self.run(&cmd).ok()?;
+        if !ok {
+            return None;
+        }
+        let metadata: serde_json::Value = serde_json::from_str(&out).ok()?;
+        metadata
             .get("version")
             .and_then(serde_json::Value::as_str)
             .filter(|version| !version.is_empty())
-        else {
-            return;
-        };
-        self.set_current(Some(version.to_string()));
+            .map(ToOwned::to_owned)
     }
 
-    /// The chart version the release reports. `scripts/check-version-consistency.sh`
+    /// The serving revision's chart version. `scripts/check-version-consistency.sh`
     /// is required on every PR and release and asserts Chart.yaml `version` ==
     /// `appVersion` == the CLI version, so this one field is the whole answer
     /// and no appVersion branch is needed (driver Ruling 1). Helm status exposes
     /// a numeric release revision, while Helm metadata exposes the chart version.
     fn inspect_version(&self) -> Option<String> {
-        let cmd = OpsCommand::new(
-            "helm",
-            vec![
-                plain("get"),
-                plain("metadata"),
-                plain(&self.opts.common.release),
-                plain("-n"),
-                plain(&self.opts.common.namespace),
-                plain("-o"),
-                plain("json"),
-            ],
-        );
-        let (ok, out, _) = self.run(&cmd).ok()?;
-        if !ok {
-            return None;
+        let history = self.release_history().ok()??;
+        let revision =
+            crate::cluster_secrets::serving_revision(&history, &self.opts.common.release).ok()?;
+        self.version_at_revision(revision)
+    }
+
+    /// Pending recovery runs after ownership and before retained snapshots or
+    /// lifecycle writes. Dry runs perform the same reads and refusals, then
+    /// retain the rollback command in their plan without executing it.
+    fn recover_pending_revision(&mut self) -> Result<()> {
+        let Some(history) = self.release_history()? else {
+            return Ok(());
+        };
+        let rows = history
+            .as_array()
+            .context("release history did not return a list")?;
+        let mut newest = None;
+        for row in rows {
+            let revision = row
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|revision| u32::try_from(revision).ok())
+                .filter(|revision| *revision > 0)
+                .context("release history has an invalid revision")?;
+            let status = row
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .context("release history has an invalid status")?;
+            if newest.is_none_or(|(previous, _)| revision > previous) {
+                newest = Some((revision, status));
+            }
         }
-        let v: serde_json::Value = serde_json::from_str(&out).ok()?;
-        v.pointer("/version")
-            .and_then(|x| x.as_str())
-            .map(ToOwned::to_owned)
+        let Some((revision, status)) = newest.filter(|(_, status)| status.starts_with("pending-"))
+        else {
+            return Ok(());
+        };
+        let serving = crate::cluster_secrets::serving_revision(&history, &self.opts.common.release)
+            .map_err(anyhow::Error::msg)?;
+        let version = self
+            .version_at_revision(serving)
+            .context("could not read the serving revision's version before pending recovery")?;
+        let mut rollback = super::verbs::helm_rollback_cmd(&self.opts.common, serving);
+        rollback
+            .args
+            .extend([plain("--wait"), plain("--timeout"), plain("15m")]);
+        if self.opts.take_over.is_none() || status != "pending-upgrade" {
+            bail!(
+                "release {} newest revision {revision} is {status}; serving revision {serving} is version {version}; run `{}`, then rerun cluster upgrade",
+                self.opts.common.release,
+                rollback.display()
+            );
+        }
+        self.recovery_plan.push(rollback.display());
+        if !self.opts.common.dry_run {
+            let (ok, _, err) = self.run(&rollback)?;
+            if !ok {
+                let reason = crate::schema_window::redact_probe_text(err.trim());
+                bail!("pending upgrade rollback failed: {reason}");
+            }
+        }
+        Ok(())
     }
 
     fn persist_record(&mut self, record: &UpgradeRecord) -> Result<()> {
@@ -3208,6 +3391,9 @@ impl UpgradeDriver for LiveHost {
     fn schema_plan(&self) -> Option<String> {
         self.schema_plan.clone()
     }
+    fn recovery_plan(&self) -> Vec<String> {
+        self.recovery_plan.clone()
+    }
     fn retained_values(&self) -> bool {
         self.overlay.is_some()
     }
@@ -3308,8 +3494,15 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         bail!("a pending release chart is only valid for a dry run; download the chart before starting a real upgrade");
     }
     if opts.common.dry_run {
-        require_on_path("helm").ok();
+        require_on_path("helm")?;
+        require_on_path("kubectl")?;
         let mut live = LiveHost::new(opts.clone())?;
+        live.read_ownership()?;
+        if let Some(holder) = &opts.take_over {
+            live.recovery_plan
+                .push(format!("take over upgrade ownership from {holder}"));
+        }
+        live.recover_pending_revision()?;
         live.current = live.inspect_version();
         live.known_good = live.current.clone();
         // Retained configuration is available without the target chart, so a
@@ -3335,7 +3528,9 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
 
     let mut live = LiveHost::new(opts.clone())?;
     live.acquire_ownership()?;
-    let setup = live.parse_acquired_record();
+    let setup = live
+        .recover_pending_revision()
+        .and_then(|()| live.parse_acquired_record());
     let result = match setup {
         Ok(record) => {
             live.record = record;
@@ -3476,6 +3671,7 @@ mod hook_tests {
             chart: UpgradeChart::AvailableLocal("charts/curie".into()),
             yes: true,
             forward_only: false,
+            take_over: None,
         }
     }
 

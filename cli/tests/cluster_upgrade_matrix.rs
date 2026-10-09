@@ -390,7 +390,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         ids,
         [
             "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s11", "s13", "s14",
-            "s17",
+            "s16", "s17",
         ],
         "canonical shard ids\n{manifest}"
     );
@@ -490,6 +490,12 @@ fn self_test_checks_shard_coverage_and_timing() {
         "shard coverage refused a dropped phase",
         "shard coverage refused a duplicated phase",
         "per-scenario timing recorded",
+        "apply-kill-takeover uses the binary without harness recovery",
+        "apply-kill-takeover sends SIGKILL to every descendant",
+        "apply-kill-takeover pins its private kind cluster to context k8",
+        "adopted named kind cluster prepared private context k8",
+        "invalid kind kubeconfig refused before selecting k8",
+        "mismatched kind server refused before selecting k8",
     ] {
         assert!(
             text.contains(needle),
@@ -516,6 +522,7 @@ s09 setup n-to-n1 guarded-rollback
 s11 nosetup rollback-published-089
 s13 setup converge-negative
 s14 setup previous-serves
+s16 setup apply-kill-takeover
 s17 setup rollback-to-serving";
 
 fn assert_override_refused(manifest: &str, what: &str) {
@@ -659,6 +666,98 @@ fn cluster_upgrade_matrix_every_listed_shard_id_resolves() {
             "listed shard {id} must resolve\n{text}"
         );
     }
+}
+
+#[test]
+fn apply_kill_takeover_waits_for_hook_jobs_before_matching_dry_and_real_takeover() {
+    let source = fs::read_to_string(script()).expect("read cluster upgrade matrix");
+    let body = source
+        .split_once("run_apply_kill_takeover() {")
+        .map(|(_, rest)| rest.split_once("\n}\n").map_or(rest, |(body, _)| body))
+        .expect("run_apply_kill_takeover function");
+    let wait_start = body
+        .find("local running_hooks deadline=$((SECONDS + 600))")
+        .expect("takeover must bound the hook Job wait at 600 seconds");
+    let wait_end = body[wait_start..]
+        .find("\n    done\n")
+        .map(|offset| wait_start + offset + "\n    done\n".len())
+        .expect("hook Job wait must finish before attempting takeover");
+    let hook_wait = &body[wait_start..wait_end];
+    assert!(
+        hook_wait.contains("running_hooks=\"$(running_release_hook_jobs)\"")
+            && hook_wait.contains("[[ -n \"$running_hooks\" ]] || break")
+            && hook_wait.contains("(( SECONDS < deadline )) || die"),
+        "takeover must wait for zero running hook Jobs and refuse on timeout"
+    );
+    let matching_dry = body
+        .find("\"$BIN\" --json cluster upgrade --yes --to \"0.10.1\" --dry-run --take-over \"$holder\"")
+        .expect("matching dry takeover must use the real binary");
+    let real_takeover = body
+        .find("\"$BIN\" --json cluster upgrade --yes --to \"0.10.1\" --take-over \"$holder\"")
+        .expect("real takeover must use the real binary");
+    assert!(
+        wait_end < matching_dry && matching_dry < real_takeover,
+        "the hook Job wait must finish before matching dry and real takeover; a running hook correctly refuses both"
+    );
+}
+
+#[test]
+fn apply_kill_takeover_dry_plan_accepts_prose_and_rejects_reversed_recovery_commands() {
+    let source = fs::read_to_string(script()).expect("read cluster upgrade matrix");
+    let body = source
+        .split_once("run_apply_kill_takeover() {")
+        .map(|(_, rest)| rest.split_once("\n}\n").map_or(rest, |(body, _)| body))
+        .expect("run_apply_kill_takeover function");
+    let assertion = body
+        .split_once("2>\"$EVIDENCE_DIR/apply-kill-takeover-dry-plan.err\"")
+        .and_then(|(_, rest)| rest.split_once("python3 -c '"))
+        .and_then(|(_, rest)| {
+            rest.split_once("\n' \"$EVIDENCE_DIR/apply-kill-takeover-dry-plan.json\"")
+        })
+        .map(|(python, _)| python)
+        .expect("matching dry takeover Python assertion");
+    let fixture = tempfile::tempdir().expect("dry plan fixture");
+    let plan_path = fixture.path().join("plan.json");
+    let run_assertion = |plan: &[&str]| {
+        fs::write(
+            &plan_path,
+            serde_json::to_vec(&serde_json::json!({"dry_run": true, "plan": plan}))
+                .expect("serialize dry plan"),
+        )
+        .expect("write dry plan fixture");
+        Command::new("python3")
+            .args(["-c", assertion])
+            .arg(&plan_path)
+            .args(["stale-holder", "acme-release", "2", "ns"])
+            .output()
+            .expect("run the matrix dry takeover Python assertion")
+    };
+    let mut plan = [
+        "phase plan: 0.10.0 -> 0.10.1",
+        "phase validate: inspect the serving revision's values",
+        "take over upgrade ownership from stale-holder",
+        "helm rollback acme-release 2 -n ns --wait --timeout 15m",
+        "phase drain_preflight: the worker's hook handles its own drain",
+        "helm upgrade acme-release charts/curie -n ns --wait --timeout 15m -f <retained-values>",
+    ];
+    let valid = run_assertion(&plan);
+    assert!(
+        valid.status.success(),
+        "ordinary apostrophes in plan prose must not be parsed as shell commands\n{}",
+        output_text(&valid)
+    );
+
+    plan.swap(3, 5);
+    let reversed = run_assertion(&plan);
+    assert!(
+        !reversed.status.success(),
+        "the same Python assertion must reject upgrade before rollback"
+    );
+    assert!(
+        output_text(&reversed).contains("dry run did not plan rollback before upgrade"),
+        "reversed commands must fail the recovery ordering assertion\n{}",
+        output_text(&reversed)
+    );
 }
 
 #[test]

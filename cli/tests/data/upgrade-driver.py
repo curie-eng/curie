@@ -12,10 +12,11 @@ Payload capture:
   * every ``kubectl patch --patch-file <file>`` document is copied to
     ``patch-<n>.json``
 
-``helm get values`` returns the most recently APPLIED overlay when one exists,
-falling back to ``retained.json``. A real release retains what was last handed
-to it, and that is what makes a second run a resume of the first rather than a
-replay of the same input.
+``helm get values`` selects the requested revision, defaulting to the newest.
+Scenarios can give each revision distinct values; otherwise it returns the
+most recently APPLIED overlay when one exists, falling back to ``retained.json``.
+A real release retains what was last handed to it, and that is what makes a
+second run a resume of the first rather than a replay of the same input.
 
 Behaviour is selected by ``$UPGRADE_DRIVER_SCENARIO`` from SCENARIOS below.
 Optional per-test inputs read from the root directory:
@@ -63,8 +64,8 @@ REPO = "ghcr.io/curie-eng/curie-api"
 WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 
 # One dict, not a pile of branches. Keys:
-#   before/after      chart version `helm get metadata` reports before and after
-#                     `helm upgrade`
+#   before/after      deployed chart version in history and revision-pinned
+#                     metadata before and after `helm upgrade`
 #   after_converge    chart version `helm get metadata` reports once
 #                     convergence has observed the live workloads; defaults to
 #                     `after`. Only a
@@ -123,6 +124,14 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #                     SandboxTemplate exists and renders that image whatever the
 #                     values say, the way a template a failed or partial render
 #                     left behind survives (#4321)
+#   pending_status    orphaned newest revision status above serving revision 4
+#   no_serving_revision  history contains only the pending revision
+#   hook_jobs_shape   "valid" | "failed" | "malformed" | "not-list"
+#   active_hook       a selected hook Job still has active pods
+#   active_plain_job  a selected non-hook Job has active pods
+#   takeover_conflict  a writer replaces the holder before the takeover patch
+#   rollback_fails    Helm rollback's wait fails after creating a failed revision
+#   revision_values   retained values per revision, independent of chart version
 DEFAULT_COMPAT_METADATA = {
     "schema_min": "0043",
     "schema_head": "0043",
@@ -184,12 +193,73 @@ BASE = {
     "upgrade_fails": False,
     "history_after_upgrade": None,
     "revision_versions": None,
+    "revision_values": None,
+    "pending_status": None,
+    "no_serving_revision": False,
+    "hook_jobs_shape": "valid",
+    "active_hook": False,
+    "active_plain_job": False,
+    "takeover_conflict": False,
+    "rollback_fails": False,
     "template_ignores_runner_images": False,
     "stale_agent_templates": {},
 }
 
 SCENARIOS = {
     "healthy": {},
+    "pending-revision": {"pending_status": "pending-upgrade"},
+    "pending-divergent-values": {
+        "pending_status": "pending-upgrade",
+        "revision_values": {
+            "4": {
+                "config": {"schemaVersion": "0.8.6"},
+                "worker": {
+                    "extraEnv": [
+                        {"name": "CURIE_RUNNER_TOTAL_TIMEOUT_S", "value": "120"},
+                        {"name": "SERVING_REVISION_ONLY", "value": "keep"},
+                    ],
+                },
+                "connectorCaller": {"existingSecret": "acme-caller-pair"},
+            },
+            "5": {
+                "config": {"schemaVersion": "0.9.0"},
+                "worker": {
+                    "runnerTotalTimeoutSeconds": 999,
+                    "extraEnv": [{"name": "PENDING_REVISION_ONLY", "value": "must-not-win"}],
+                },
+                "connectorCaller": {"existingSecret": "acme-caller-pair"},
+            },
+        },
+    },
+    "take-over-running-hook": {
+        "pending_status": "pending-upgrade",
+        "active_hook": True,
+    },
+    "take-over-active-plain-job": {
+        "pending_status": "pending-upgrade",
+        "active_plain_job": True,
+    },
+    "take-over-jobs-failed": {"hook_jobs_shape": "failed"},
+    "take-over-jobs-malformed": {"hook_jobs_shape": "malformed"},
+    "take-over-jobs-not-list": {"hook_jobs_shape": "not-list"},
+    "take-over-cas-conflict": {
+        "pending_status": "pending-upgrade",
+        "takeover_conflict": True,
+    },
+    "take-over-rollback-failed": {
+        "pending_status": "pending-upgrade",
+        "rollback_fails": True,
+    },
+    "pending-no-serving": {
+        "pending_status": "pending-upgrade",
+        "no_serving_revision": True,
+    },
+    "failed-no-serving": {
+        "pending_status": "failed",
+        "no_serving_revision": True,
+    },
+    "pending-install": {"pending_status": "pending-install"},
+    "pending-rollback": {"pending_status": "pending-rollback"},
     # Keep the release cache target distinct from the running CLI version so
     # the resolver test can prove that --to owns the cache key.
     "release-cache-prior": {
@@ -295,7 +365,7 @@ SCENARIOS = {
     "namespace-absent": {"namespace_absent": True},
     "namespace-disappears": {"namespace_disappears": True},
     # A local chart directory whose own metadata is not the requested --to.
-    # No release yet: `helm get metadata` fails until something is installed,
+    # No release yet: `helm history` fails until something is installed,
     # so the Drain phase is skipped for having nothing in flight.
     "fresh-install": {"metadata_missing_before": True},
     "local-chart-mismatch": {"show_chart": "0.8.7"},
@@ -354,6 +424,8 @@ with log.open("a") as handle:
     handle.write(json.dumps([program, *args]) + "\n")
 
 upgraded = any(call[:2] == ["helm", "upgrade"] for call in previous)
+rollback_attempted = any(call[:2] == ["helm", "rollback"] for call in previous)
+rolled_back = rollback_attempted and not scenario["rollback_fails"]
 converged = any(call[:1] == ["kubectl"] and WORKLOADS in call for call in previous)
 
 if upgraded and converged:
@@ -384,6 +456,64 @@ def capture(prefix, suffix, source):
 
 def flag_value(name):
     return args[args.index(name) + 1] if name in args else None
+
+
+def history_row(revision, status, version, description):
+    """Helm's history formatter exposes chart version separately from revision.
+
+    https://github.com/helm/helm/blob/v3.20.0/cmd/helm/history.go
+    Rollback creates a new revision rather than changing the old one in place:
+    https://github.com/helm/helm/blob/v3.20.0/pkg/action/rollback.go
+    """
+    return {
+        "revision": revision,
+        "updated": "2026-09-12T00:00:00Z",
+        "status": status,
+        "chart": f"curie-{version}",
+        "app_version": version,
+        "description": description,
+    }
+
+
+def release_history():
+    if upgraded and scenario["history_after_upgrade"] is not None:
+        return copy.deepcopy(scenario["history_after_upgrade"])
+    pending = scenario["pending_status"]
+    if scenario["metadata_missing_before"] and not upgraded:
+        return None
+    if pending:
+        rows = [] if scenario["no_serving_revision"] else [
+            history_row(4, "deployed", scenario["before"], "Upgrade complete")
+        ]
+        rows.append(history_row(5, pending, scenario["target"], "Preparing upgrade"))
+        if rollback_attempted:
+            # Helm leaves the old pending row unchanged. A successful
+            # rollback supersedes deployed rows; a wait failure stores the
+            # new rollback revision as failed and leaves the old deployed
+            # revision serving.
+            # https://github.com/helm/helm/blob/v3.20.0/pkg/action/rollback.go
+            if rolled_back:
+                for row in rows:
+                    if row["status"] == "deployed":
+                        row["status"] = "superseded"
+            status = "deployed" if rolled_back else "failed"
+            rows.append(history_row(6, status, scenario["before"], "Rollback to 4"))
+        if upgraded and not scenario["upgrade_fails"]:
+            for row in rows:
+                if row["status"] == "deployed":
+                    row["status"] = "superseded"
+            revision = 7 if rollback_attempted else 6
+            rows.append(history_row(revision, "deployed", chart_version, "Upgrade complete"))
+        return rows
+    # #3849: Helm can fail before it stores a revision. Keep the original
+    # deployed row in that case, including its old chart metadata.
+    if scenario["metadata_missing_before"]:
+        return [history_row(1, "deployed", chart_version, "Install complete")]
+    rows = [history_row(1, "deployed", scenario["before"], "Install complete")]
+    if upgraded and not scenario["upgrade_fails"]:
+        rows[0]["status"] = "superseded"
+        rows.append(history_row(2, "deployed", chart_version, "Upgrade complete"))
+    return rows
 
 
 CHECKPOINT = f"{RELEASE}-upgrade-checkpoint"
@@ -538,6 +668,12 @@ def patch_kind(operations):
         return "release"
     if "/data" in paths or "/data/record" in paths:
         return "record"
+    if any(
+        operation.get("op") == "replace"
+        and operation.get("path") == "/metadata/annotations/curietech.ai~1upgrade-holder"
+        for operation in operations
+    ):
+        return "takeover"
     if any(patch_adds_holder(operation) for operation in operations):
         return "acquire"
     return "unknown"
@@ -642,8 +778,24 @@ def chart_values():
     return json.loads(path.read_text()) if path.exists() else {}
 
 
-def release_values():
-    """What the release retains: the last overlay Helm applied, else retained.json."""
+def release_values(revision=None):
+    """Revision-pinned retained values, or Helm's newest revision by default.
+
+    https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_values.go
+    """
+    revision_values = scenario["revision_values"]
+    if revision_values is not None:
+        history = release_history() or []
+        row = history[-1] if revision is None and history else next(
+            (row for row in history if str(row["revision"]) == revision), None
+        )
+        if row is None:
+            raise ValueError(f"release revision {revision} not found")
+        key = str(row["revision"])
+        if key in revision_values:
+            return copy.deepcopy(revision_values[key])
+        if row["description"].startswith("Rollback to "):
+            return copy.deepcopy(revision_values[row["description"].split()[-1]])
     applied = captured("values", ".yaml")
     source = applied[-1] if applied else root / "retained.json"
     text = source.read_text() if source.exists() else "{}"
@@ -758,7 +910,18 @@ HOOK_NAMES = {
 hooks = []
 jobs = []
 for key, name in HOOK_NAMES.items():
-    manifest = {"kind": "Job", "metadata": {"name": name, "namespace": NAMESPACE}}
+    manifest = {
+        "kind": "Job",
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "labels": {
+                "app.kubernetes.io/instance": RELEASE,
+                "app.kubernetes.io/managed-by": "Helm",
+            },
+            "annotations": {"helm.sh/hook": "pre-upgrade"},
+        },
+    }
     failed = scenario["failed_hook"] == key
     hooks.append(
         {
@@ -769,6 +932,7 @@ for key, name in HOOK_NAMES.items():
             "manifest": json.dumps(manifest),
         }
     )
+
     jobs.append(
         {
             "kind": "Job",
@@ -781,16 +945,31 @@ for key, name in HOOK_NAMES.items():
         }
     )
 
+# Hook membership comes from Helm's documented annotation, and JobStatus.active
+# counts pending and running pods. A selected active Job without the annotation
+# must not block takeover.
+# https://helm.sh/docs/topics/charts_hooks/
+# https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/job-v1/#JobStatus
+ownership_jobs = copy.deepcopy(jobs)
+if scenario["active_hook"]:
+    ownership_jobs[0]["status"] = {"active": 1}
+if scenario["active_plain_job"]:
+    plain_job = copy.deepcopy(ownership_jobs[0])
+    plain_job["metadata"]["name"] = f"{RELEASE}-ordinary-job"
+    plain_job["metadata"].pop("annotations")
+    plain_job["status"] = {"active": 1}
+    ownership_jobs.append(plain_job)
+
 if program == "helm":
     # Helm v3.20 removes rel.Chart before serializing status and keeps the
     # numeric release revision at version:
     # https://github.com/helm/helm/blob/v3.20.0/cmd/helm/status.go
     if args[0] == "history":
-        if upgraded and scenario.get("history_after_upgrade"):
-            print(json.dumps(scenario["history_after_upgrade"]))
-            sys.exit(0)
-        print("Error: release: not found", file=sys.stderr)
-        sys.exit(1)
+        history = release_history()
+        if history is None:
+            print("Error: release: not found", file=sys.stderr)
+            sys.exit(1)
+        emit(history)
     if args[0] == "status":
         if "json" in args:
             emit(
@@ -809,11 +988,22 @@ if program == "helm":
     if args[:2] == ["get", "metadata"]:
         # Helm v3.20 maps this string from rel.Chart.Metadata.Version:
         # https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_metadata.go
-        if scenario["metadata_missing_before"] and not upgraded:
+        history = release_history()
+        if history is None:
             print('Error: release: not found', file=sys.stderr)
             sys.exit(1)
         shape = scenario["metadata_after_shape"] if upgraded else "valid"
         revision = flag_value("--revision")
+        # Without --revision Helm reads the newest release, even while pending.
+        # Keep that behavior so a missing pin exposes the actual bug.
+        # https://github.com/helm/helm/blob/v3.20.0/pkg/action/action.go
+        row = history[-1] if revision is None else next(
+            (row for row in history if str(row["revision"]) == revision), None
+        )
+        if row is None:
+            print(f"Error: release revision {revision} not found", file=sys.stderr)
+            sys.exit(1)
+        chart_version = row["app_version"]
         revision_versions = scenario.get("revision_versions") or {}
         if revision and revision in revision_versions:
             chart_version = revision_versions[revision]
@@ -828,8 +1018,8 @@ if program == "helm":
             "version": chart_version,
             "appVersion": chart_version,
             "namespace": NAMESPACE,
-            "revision": 2,
-            "status": "deployed",
+            "revision": row["revision"],
+            "status": row["status"],
             "deployedAt": "2026-09-12T00:00:00Z",
         }
         if shape == "missing":
@@ -837,7 +1027,25 @@ if program == "helm":
         elif shape == "numeric":
             metadata["version"] = 2
         emit(metadata)
+    if args[0] == "rollback":
+        history = release_history() or []
+        requested = args[2] if len(args) > 2 else ""
+        serving = next((row for row in history if row["status"] == "deployed"), None)
+        if serving is None or requested != str(serving["revision"]):
+            print("Error: rollback must name the serving revision", file=sys.stderr)
+            sys.exit(1)
+        if scenario["rollback_fails"]:
+            print("Error: rollback failed: password=acme-rollback-token", file=sys.stderr)
+            sys.exit(1)
+        print(f'Rollback to {requested} was a success')
+        sys.exit(0)
     if args[:2] == ["get", "values"]:
+        # An absent Helm release cannot have retained values. GetValues.Run
+        # uses the same revision lookup as GetMetadata.Run:
+        # https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_values.go
+        if scenario["metadata_missing_before"] and not upgraded:
+            print("Error: release: not found", file=sys.stderr)
+            sys.exit(1)
         if scenario["values_fail"]:
             print('Error from server (NotFound): namespaces "ns" not found', file=sys.stderr)
             sys.exit(1)
@@ -845,6 +1053,12 @@ if program == "helm":
             reads = sum(1 for call in previous if call[:3] == ["helm", "get", "values"])
             print(json.dumps(DRIFTED_VALUES if reads else FIRST_VALUES))
             sys.exit(0)
+        if scenario["revision_values"] is not None:
+            try:
+                emit(release_values(flag_value("--revision")))
+            except ValueError as error:
+                print(f"Error: {error}", file=sys.stderr)
+                sys.exit(1)
         applied_values = captured("values", ".yaml")
         if applied_values:
             # The release retains the overlay it was last handed. A second run
@@ -953,6 +1167,22 @@ if program == "helm":
         sys.exit(0)
 
 if program == "kubectl":
+    if args[:2] == ["get", "jobs"]:
+        shape = scenario["hook_jobs_shape"]
+        if shape == "failed":
+            print("Error from server (Forbidden): jobs is forbidden", file=sys.stderr)
+            sys.exit(1)
+        if shape == "malformed":
+            print("{")
+            sys.exit(0)
+        if shape == "not-list":
+            emit({"apiVersion": "v1", "kind": "List", "items": {"unexpected": "map"}})
+        selector = flag_value("-l")
+        emit({
+            "apiVersion": "v1",
+            "kind": "List",
+            "items": [item for item in ownership_jobs if matches_selector(item, selector)],
+        })
     if args[:1] == ["-n"] and "delete" in args and "sandboxclaim" in args:
         print("sandboxclaim deleted")
         sys.exit(0)
@@ -1013,6 +1243,9 @@ if program == "kubectl":
             )
             sys.exit(1)
         if kind == "acquire" and scenario["acquire_conflict"] == "patch":
+            save_checkpoint(winning_checkpoint(PATCH_WINNER, next_resource_version(current)))
+            conflict("the object has been modified")
+        if kind == "takeover" and scenario["takeover_conflict"]:
             save_checkpoint(winning_checkpoint(PATCH_WINNER, next_resource_version(current)))
             conflict("the object has been modified")
         if kind == "record" and scenario["stale_record_cas"]:
