@@ -74,3 +74,18 @@ def is_follow_up(
     )
     match = re.fullmatch(pattern, first)
     return match is not None and int(match.group(1)) <= _MAX_ID
+
+
+def is_relabel_objective(
+    objective: str | None, *, repo_full_name: str, issue_number: int, clone_base: str
+) -> bool:
+    """Whether this request came from a relabel: the bare issue URL, no fragment."""
+
+    if not isinstance(objective, str) or not objective:
+        return False
+    first = objective.split("\n", 1)[0]
+    pattern = (
+        rf"{re.escape(clone_base.rstrip('/'))}/{re.escape(repo_full_name)}"
+        rf"/issues/{issue_number}"
+    )
+    return re.fullmatch(pattern, first) is not None

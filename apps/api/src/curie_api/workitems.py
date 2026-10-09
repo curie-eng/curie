@@ -22,7 +22,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from . import transcripts
 from .config import get_settings
-from .factory_reply_target import is_follow_up, parse_reply_target
+from .factory_reply_target import is_follow_up, is_relabel_objective, parse_reply_target
 from .models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     Agent,
@@ -785,11 +785,12 @@ async def _unchanged_follow_up(
     if detail is None or not detail.strip().startswith("No changes needed:"):
         return False
     clone_base = get_settings().github_clone_base
-    if not is_follow_up(
-        request.objective,
-        repo_full_name=work_item.repo_full_name,
-        issue_number=work_item.github_issue_number,
-        clone_base=clone_base,
+    repo, issue = work_item.repo_full_name, work_item.github_issue_number
+    follow_up = is_follow_up(
+        request.objective, repo_full_name=repo, issue_number=issue, clone_base=clone_base
+    )
+    if not follow_up and not is_relabel_objective(
+        request.objective, repo_full_name=repo, issue_number=issue, clone_base=clone_base
     ):
         return False
     lineage = (
@@ -804,6 +805,22 @@ async def _unchanged_follow_up(
         or not lineage.pr_url.strip()
     ):
         return False
+    if not follow_up:
+        # A relabel continues the PR only when an earlier request of this
+        # WorkItem published on it (ADR 0208 consequence 4).
+        adopted = await session.scalar(
+            select(Publication.id)
+            .join(ExecutionRequest, ExecutionRequest.id == Publication.execution_request_id)
+            .where(
+                Publication.lineage_id == lineage.id,
+                Publication.status == "succeeded",
+                ExecutionRequest.work_item_id == work_item.id,
+                ExecutionRequest.sequence < request.sequence,
+            )
+            .limit(1)
+        )
+        if adopted is None:
+            return False
     target = parse_reply_target(
         request.objective,
         repo_full_name=work_item.repo_full_name,

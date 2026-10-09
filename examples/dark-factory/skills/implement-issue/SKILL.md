@@ -33,8 +33,10 @@ ends the run. An all-text reply such as "Now
 I'll revise the plan" stops the loop mid-phase, publishing nothing and
 stating no reason. Say what you are doing in a message that also makes the
 next tool call. Your only text-only endings are the `Could not complete:`
-stop, `No changes needed:` when a follow-up on an open pull request needs no
-change, and the publication-pending note after `publish_changes`.
+stop, `No changes needed:` when a follow-up on an open pull request (a
+mention, review feedback, or a relabelled issue whose open pull request this
+run continues) needs no change, and the publication-pending note after
+`publish_changes`.
 
 Keep every Bash command in the foreground. Do not set `run_in_background` to
 `true`; the hook refuses background Bash calls. Wait for each command to finish
@@ -66,7 +68,8 @@ ends in exactly one of three ways:
 1. **One pull request**, requested with `mcp__curie__publish_changes`, whose
    description maps every acceptance criterion to evidence; or
 2. **No changes needed** in your final reply, and no publication, when a
-   follow-up on an open pull request needs no change; or
+   follow-up on an open pull request needs no change, including a relabelled
+   issue whose open pull request this run continues; or
 3. **A stated reason** in your final reply, and no publication, when the issue
    cannot be finished correctly.
 
@@ -363,7 +366,8 @@ pending. Do not report `wait_ci`; the platform reports it (step 9). Do not call 
 from outside the sandbox.
 
 **Finish with no changes needed** only when this run is a follow-up on an
-open pull request and nothing needs to change. Your final reply begins with
+open pull request and nothing needs to change. A relabelled issue whose open
+pull request this run continues counts as a follow-up. Your final reply begins with
 `No changes needed:` and gives the reason. Do not call
 `mcp__curie__publish_changes`.
 
