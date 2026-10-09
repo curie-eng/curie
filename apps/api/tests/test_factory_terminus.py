@@ -82,6 +82,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "model_credential_rejected",
         "model_rate_limited",
         "model_error",
+        "model_unreachable",
         "budget_exceeded",
         "runner_timeout",
         "workspace_error",
@@ -109,6 +110,28 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
 def test_every_terminus_cause_has_its_own_plain_sentence(cause: str) -> None:
     assert cause_text(cause) != cause_text("not-a-cause")
     assert cause not in cause_text(cause)
+
+
+_MODEL_UNREACHABLE_SENTENCE = (
+    "the model provider could not be reached. Check the runner's network path to the "
+    "model endpoint, then retry."
+)
+
+
+def test_model_unreachable_result_section_names_the_network_path_and_its_class() -> None:
+    body = result_section(
+        "model_unreachable",
+        pr_url=None,
+        detail="model error: server_error: API Error: Connection refused (ECONNREFUSED)",
+    )
+    headline = body.splitlines()[0]
+    assert headline == f"Could not complete: {_MODEL_UNREACHABLE_SENTENCE}"
+    assert (
+        "Provider message: model error: server_error: API Error: Connection refused "
+        "(ECONNREFUSED)" in body
+    )
+    assert "Cause: model_unreachable" in body
+    assert "Failure class: model-unreachable" in body
 
 
 def test_the_result_section_carries_no_marker() -> None:
@@ -2536,3 +2559,32 @@ def test_factory_notices_usage_limited_finish_posts_the_reset_remedy_once(
     assert "add credits" not in body
     assert "Cause: model_usage_limited" in body
     assert "Failure class: model-usage-limited" in body
+
+
+def test_factory_notices_model_unreachable_finish_comments_the_network_remedy(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9215
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    finished = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/finish",
+        headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "model_unreachable",
+            "detail": "model error: server_error: API Error: Connection refused (ECONNREFUSED)",
+        },
+    )
+    assert finished.status_code == 200, finished.text
+    assert _request(number)["terminal_cause"] == "model_unreachable"
+    _reconcile()
+    assert sink.posts == 1
+    body = sink.comments[0]["body"]
+    assert _MODEL_UNREACHABLE_SENTENCE in body
+    assert "Connection refused (ECONNREFUSED)" in body
+    assert "Cause: model_unreachable" in body
+    assert "Failure class: model-unreachable" in body

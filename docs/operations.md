@@ -1268,7 +1268,7 @@ A last `Cause:` line names the platform cause code
 `no_pull_request`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
 classified run failure: `model_credit_exhausted`, `model_usage_limited`,
-`model_credential_rejected`, `model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
+`model_credential_rejected`, `model_rate_limited`, `model_error`, `model_unreachable`, `budget_exceeded`, `runner_timeout`,
 `sandbox_terminated`, `workspace_error`, or `history_capacity`). A sandbox
 termination includes the Kubernetes reason and, for an EmptyDir eviction, the
 volume limit in a `Details:` line. When the cause has a runner failure
