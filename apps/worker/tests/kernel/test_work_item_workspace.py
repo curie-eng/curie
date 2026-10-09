@@ -1453,10 +1453,10 @@ def _fail_settled_release(h: object) -> None:
     route is exactly what the #3071 turn budget fence guards.
     """
 
-    def release(_thread_key: str) -> bool:
+    def release_if_claim(_thread_key: str, _claim_name: str) -> bool:
         raise RuntimeError("control plane unavailable")
 
-    h.substrate.release = release  # type: ignore[attr-defined]
+    h.substrate.release_if_claim = release_if_claim  # type: ignore[attr-defined]
 
 
 def test_consecutive_work_items_replace_the_sandbox_even_with_the_same_budget(

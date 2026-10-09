@@ -802,6 +802,72 @@ class SandboxSubstrate:
             raise error
         return released
 
+    def release_if_claim(self, thread_key: str, claim_name: str) -> bool:
+        """Release the thread's session only while its route names ``claim_name``.
+
+        A WorkItem run releases the claim it recorded, never whatever the
+        thread holds now (#4331). When the route is absent or names another
+        claim, nothing is deleted: no Kubernetes delete, no route delete, and
+        the call returns False. When it names ``claim_name``, the claim is
+        retired and the route dropped exactly as ``release`` does, and the call
+        returns True. The caller holds the cross-worker thread lock, which a
+        successor's claim also holds, so the read and the delete cannot
+        interleave with it.
+        """
+
+        started = time.monotonic()
+        released = False
+        current_claim: str | None = None
+        error: Exception | None = None
+        with operation_span(
+            "curie.sandbox.release",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "operation": "release_if_claim"},
+        ) as span:
+            try:
+                record = self._affinity.get(thread_key)
+                current_claim = record.handle.claim_name if record is not None else None
+                if record is not None and current_claim == claim_name:
+                    self._retire_claim(
+                        claim_name,
+                        request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                        handle=record.handle,
+                    )
+                    self._affinity.delete_if_claim(thread_key, claim_name)
+                    released = True
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "sandbox.release.failed",
+                    {"outcome": "failed", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event(
+                    "sandbox.released",
+                    {"outcome": "released" if released else "fenced"},
+                )
+        if error is None and not released:
+            logger.info(
+                "sandbox release fenced: thread %s route names claim %s, run owns claim %s;"
+                " leaving the route",
+                thread_key,
+                current_claim,
+                claim_name,
+            )
+        outcome = "failed" if error is not None else ("released" if released else "fenced")
+        attributes = _sandbox_attributes("release", outcome)
+        record_metric("curie.sandbox.lifecycle", attributes=attributes)
+        record_metric(
+            "curie.sandbox.release.duration",
+            max(0.0, time.monotonic() - started),
+            attributes=attributes,
+        )
+        if error is not None:
+            raise error
+        return released
+
     def terminate_thread(
         self,
         thread_key: str,
