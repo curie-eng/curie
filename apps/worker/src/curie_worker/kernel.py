@@ -1513,6 +1513,7 @@ class _SettlingWorkItem:
     outcome: str
     cause: str
     detail: str | None
+    ci_fix_round: int | None
     task: asyncio.Task[None] | None = None
     cleaned: bool = False
 
@@ -2095,13 +2096,21 @@ class Kernel:
         return any(held.request_id == request_id for held in self._held_work_items.values())
 
     def _begin_settling(
-        self, run: WorkItemRun, *, outcome: str, cause: str, detail: str | None
+        self,
+        run: WorkItemRun,
+        *,
+        outcome: str,
+        cause: str,
+        detail: str | None,
+        ci_fix_round: int | None,
     ) -> None:
         """Hand off only the report, synchronously retaining ownership (#4174)."""
 
         if run.request_id in self._settling_work_items:
             return
-        pending = _SettlingWorkItem(run=run, outcome=outcome, cause=cause, detail=detail)
+        pending = _SettlingWorkItem(
+            run=run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
+        )
         self._settling_work_items[run.request_id] = pending
         if self._work_item_runs.get(run.request_id) is run:
             self._work_item_runs.pop(run.request_id)
@@ -2110,10 +2119,16 @@ class Kernel:
         )
 
     async def _finish_or_settle(
-        self, run: WorkItemRun, *, outcome: str, cause: str, detail: str | None
+        self,
+        run: WorkItemRun,
+        *,
+        outcome: str,
+        cause: str,
+        detail: str | None,
+        ci_fix_round: int | None,
     ) -> None:
         try:
-            await run.finish(outcome=outcome, cause=cause, detail=detail)
+            await run.finish(outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round)
         except WorkItemConflict as exc:
             if exc.code != "not_running":
                 raise
@@ -2121,7 +2136,9 @@ class Kernel:
             # lost. Nothing remains to own; do not redeliver the ended turn.
             run.finished = True
         except WorkItemTransportError:
-            self._begin_settling(run, outcome=outcome, cause=cause, detail=detail)
+            self._begin_settling(
+                run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
+            )
 
     async def _settle_work_item(self, pending: _SettlingWorkItem) -> None:
         run = pending.run
@@ -2134,7 +2151,10 @@ class Kernel:
                     return
                 try:
                     await run.finish(
-                        outcome=pending.outcome, cause=pending.cause, detail=pending.detail
+                        outcome=pending.outcome,
+                        cause=pending.cause,
+                        detail=pending.detail,
+                        ci_fix_round=pending.ci_fix_round,
                     )
                 except WorkItemConflict as exc:
                     if exc.code in {"not_running", "publication_pending"}:
@@ -3806,6 +3826,7 @@ class Kernel:
                                     outcome="failed",
                                     cause="approval_create_failed",
                                     detail=pause.failure_detail,
+                                    ci_fix_round=None,
                                 )
                             except WorkItemConflict as exc:
                                 # work_item_cancelled means what it does in
@@ -4822,12 +4843,14 @@ class Kernel:
                         run.held = True
                 elif outcome == "delivered":
                     ci_fix = parsed is not None and parsed.is_ci_fix
-                    if ci_fix:
-                        cause = (
-                            "runner_escalated"
-                            if turn is not None and turn.start_failed
-                            else "ci_fix_unpublished"
-                        )
+                    # Only an unpublished fix turn names its round (#4330).
+                    ci_fix_round: int | None = None
+                    if parsed is not None and parsed.is_ci_fix:
+                        if turn is not None and turn.start_failed:
+                            cause = "runner_escalated"
+                        else:
+                            cause = "ci_fix_unpublished"
+                            ci_fix_round = parsed.ci_fix_round
                     elif turn is None or self._is_approval_resume(qevent.event_id):
                         cause = "no_pull_request"
                     else:
@@ -4842,6 +4865,7 @@ class Kernel:
                                 if ci_fix or turn is None
                                 else _finish_detail(turn.assistant_text)
                             ),
+                            ci_fix_round=ci_fix_round,
                         )
                     except WorkItemConflict as exc:
                         if exc.code != "publication_pending":
@@ -4856,10 +4880,15 @@ class Kernel:
                         outcome="failed",
                         cause=_escalation_cause(turn),
                         detail=turn.error_message if turn is not None else None,
+                        ci_fix_round=None,
                     )
                 else:
                     await self._finish_or_settle(
-                        run, outcome="failed", cause="runner_failed", detail=None
+                        run,
+                        outcome="failed",
+                        cause="runner_failed",
+                        detail=None,
+                        ci_fix_round=None,
                     )
             except WorkItemConflict as exc:
                 logger.warning(

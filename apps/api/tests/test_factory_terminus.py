@@ -2317,6 +2317,7 @@ def test_a_no_change_follow_up_preserves_stale_version_fencing(admitted: Any, st
                     status="failed",
                     cause="no_pull_request",
                     detail="No changes needed: the request is already covered.",
+                    ci_fix_round=None,
                     extra_where=(),
                 )
                 assert isinstance(result, WorkItemConflict), result
