@@ -184,7 +184,9 @@ def test_run_settlement_retries_transports_but_not_conflicts(
 
             async def settle() -> None:
                 if operation == "finish":
-                    await run.finish(outcome="delivered", cause="completed", detail="done")
+                    await run.finish(
+                        outcome="delivered", cause="completed", detail="done", ci_fix_round=None
+                    )
                 elif operation == "hold_for_approval":
                     await run.hold_for_approval()
                 else:
@@ -246,7 +248,9 @@ def test_run_finish_clamps_retry_budget_to_execution_deadline(monkeypatch) -> No
             run.runtime_epoch = 1
             run.execution_deadline = datetime.now(UTC) + timedelta(seconds=3)
             with pytest.raises(WorkItemTransportError):
-                await run.finish(outcome="delivered", cause="completed", detail="done")
+                await run.finish(
+                    outcome="delivered", cause="completed", detail="done", ci_fix_round=None
+                )
         assert 2.9 <= sum(sleeps) <= 3
 
     asyncio.run(go())
@@ -288,6 +292,7 @@ def test_settlement_empty_transport_message_retains_the_exception_type(
                     outcome="delivered",
                     cause="completed",
                     detail="done",
+                    ci_fix_round=None,
                     budget_s=3,
                 )
 

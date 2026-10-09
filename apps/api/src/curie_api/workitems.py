@@ -1300,6 +1300,7 @@ async def _terminalize_execution(
     status: Literal["completed", "failed"],
     cause: str,
     detail: str | None,
+    ci_fix_round: int | None,
     extra_where: Sequence[ColumnElement[bool]],
 ) -> WorkItemResult:
     work_item = await _lock_work_item(session, work_item_id)
@@ -1320,6 +1321,8 @@ async def _terminalize_execution(
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     if request.status != "running" or not cause.strip():
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
+    if cause.strip() == "ci_fix_unpublished" and ci_fix_round is None:
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     now = await _database_now(session)
     # The CI gate's causes (#3097) end a request whose pull request already
     # opened, so they share the opened-PR deadline exception. Keep this literal
@@ -1338,23 +1341,14 @@ async def _terminalize_execution(
     if status == "completed" and not opened:
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     if status == "failed" and cause.strip() == "ci_fix_unpublished":
+        assert ci_fix_round is not None
         # A CI fix turn that ended without a new publication is terminal, unless
-        # its publication is still in flight, or a fix publication already
-        # succeeded and awaits the CI gate's verdict; either one settles the
-        # request. Every succeeded publication after the request's first is a fix
-        # round's. The database does not record which of them the gate already
-        # judged failing, so a later round's unpublished turn defers here and the
-        # request ends at its execution deadline instead.
-        succeeded = (
-            select(Publication.id)
-            .where(
-                Publication.execution_request_id == request.id,
-                Publication.status == "succeeded",
-            )
-            .order_by(Publication.revision_number)
-            .offset(1)
-            .limit(1)
-        )
+        # a publication of the request is still in flight, or the turn's own
+        # round already published and awaits the CI gate's verdict; either one
+        # settles the request. The gate dispatches round N when the request has
+        # N - 1 succeeded publications and admits one turn per round, so the
+        # Nth succeeded publication is round N's. Fewer than N succeeded means
+        # this round never published, and the request fails at once.
         in_flight = await session.scalar(
             select(Publication.id)
             .where(
@@ -1363,9 +1357,13 @@ async def _terminalize_execution(
             )
             .limit(1)
         )
-        if in_flight is None:
-            in_flight = await session.scalar(succeeded)
-        if in_flight is not None:
+        succeeded = await session.scalar(
+            select(func.count(Publication.id)).where(
+                Publication.execution_request_id == request.id,
+                Publication.status == "succeeded",
+            )
+        )
+        if in_flight is not None or (succeeded or 0) >= ci_fix_round:
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
@@ -1450,6 +1448,7 @@ async def complete_execution(
         status="completed",
         cause="completed",
         detail=None,
+        ci_fix_round=None,
         extra_where=(),
     )
 
@@ -1472,6 +1471,7 @@ async def fail_execution(
         status="failed",
         cause=cause,
         detail=None,
+        ci_fix_round=None,
         extra_where=(),
     )
 
@@ -1563,6 +1563,7 @@ async def settle_ci_verdict(
         status=status,
         cause=cause,
         detail=detail,
+        ci_fix_round=None,
         extra_where=(),
     )
 

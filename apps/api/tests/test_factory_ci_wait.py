@@ -356,11 +356,27 @@ def _terminal(number: int) -> tuple[str, str | None]:
     return row["status"], row["terminal_cause"]
 
 
-def _finish(client: Any, request_id: uuid.UUID, epoch: int, cause: str) -> Any:
+def _finish(
+    client: Any, request_id: uuid.UUID, epoch: int, cause: str, ci_fix_round: int | None
+) -> Any:
     return client.post(
         f"/v1/internal/work-items/requests/{request_id}/finish",
         headers=WORKER,
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": cause},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": cause,
+            "ci_fix_round": ci_fix_round,
+        },
+    )
+
+
+def _request_version(request_id: uuid.UUID) -> int:
+    return int(
+        _rows(
+            "SELECT version FROM curie.execution_requests WHERE id = :id",
+            {"id": request_id},
+        )[0]["version"]
     )
 
 
@@ -949,7 +965,7 @@ def test_an_unpublished_fix_turn_before_the_deadline_is_terminal(admitted: Any) 
     _reconcile()
     assert len(_ci_turns(published["id"])) == 1
 
-    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
 
     assert finished.status_code == 200, finished.text
     assert _terminal(number) == ("failed", "ci_fix_unpublished")
@@ -977,11 +993,110 @@ def test_an_unpublished_fix_turn_with_a_publication_in_flight_defers(
         status="pending",
     )
 
-    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
 
     assert finished.status_code == 409, finished.text
     assert "publication_pending" in finished.text
     assert _terminal(number) == ("running", None)
+
+
+def _two_publications(client: Any, github: Any, sink: _CommentServer, number: int) -> Any:
+    """Revisions 1 and 2 succeeded, the state a round 3 fix turn finishes against."""
+
+    sink.ci_scripts = {HEAD_A: [ci_failing()], HEAD_B: [ci_failing()]}
+    published = _published(client, github, sink, number)
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_B,
+        title="Fix the test",
+        paths=["src/widget.txt"],
+        status="succeeded",
+    )
+    return published
+
+
+def test_a_final_round_unpublished_fix_turn_after_an_earlier_fix_publication_is_terminal(
+    admitted: Any,
+) -> None:
+    """Round 3 has no publication of its own, so revision 2 cannot settle it (#4330)."""
+
+    client, github, sink = admitted
+    number = 9770
+    published = _two_publications(client, github, sink, number)
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 3)
+
+    assert finished.status_code == 200, finished.text
+    assert _terminal(number) == ("failed", "ci_fix_unpublished")
+    _reconcile()
+    body = _body(sink, published["id"])
+    assert body.startswith("Could not complete:")
+    assert "without pushing a fix" in body.splitlines()[0]
+
+
+def test_an_unpublished_fix_turn_defers_when_its_own_round_published(admitted: Any) -> None:
+    """Revision 2 is round 2's own publication, so the CI gate decides, not the worker."""
+
+    client, github, sink = admitted
+    number = 9771
+    published = _two_publications(client, github, sink, number)
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    assert _terminal(number) == ("running", None)
+
+
+def test_a_final_round_unpublished_fix_turn_with_a_publication_in_flight_defers(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9772
+    published = _two_publications(client, github, sink, number)
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=3,
+        head_sha=HEAD_C,
+        title="Fix the test again",
+        paths=["src/widget.txt"],
+        status="pending",
+    )
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 3)
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    assert _terminal(number) == ("running", None)
+
+
+@pytest.mark.parametrize(
+    ("cause", "ci_fix_round"),
+    [
+        ("ci_fix_unpublished", None),
+        ("ci_fix_unpublished", 1),
+        ("ci_fix_unpublished", 4),
+        ("no_pull_request", 2),
+    ],
+)
+def test_a_finish_with_an_invalid_ci_fix_round_is_rejected(
+    admitted: Any, cause: str, ci_fix_round: int | None
+) -> None:
+    client, github, sink = admitted
+    number = 9773
+    published = _two_publications(client, github, sink, number)
+    version = _request_version(published["id"])
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), cause, ci_fix_round)
+
+    assert finished.status_code == 422, finished.text
+    assert _terminal(number) == ("running", None)
+    assert _request_version(published["id"]) == version
 
 
 def test_an_unpublished_fix_turn_past_the_deadline_expires_instead(admitted: Any) -> None:
@@ -995,7 +1110,9 @@ def test_an_unpublished_fix_turn_past_the_deadline_expires_instead(admitted: Any
     past = (row["execution_deadline"] - _database_now()).total_seconds() + 1
 
     with _clock_offset(past):
-        finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+        finished = _finish(
+            client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2
+        )
         assert finished.status_code == 409, finished.text
         _reconcile()
 
@@ -1416,7 +1533,7 @@ def test_a_fix_turn_finishing_after_its_publication_succeeded_stays_running(
         status="succeeded",
     )
 
-    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
 
     assert finished.status_code == 409, finished.text
     assert _terminal(number) == ("running", None)

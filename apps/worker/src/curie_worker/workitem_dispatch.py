@@ -60,6 +60,14 @@ class WorkItemEvent:
     def is_ci_fix(self) -> bool:
         return self.kind == "ci"
 
+    @property
+    def ci_fix_round(self) -> int:
+        """The CI fix round of a ``ci`` event; any other event has none."""
+
+        if self.kind != "ci" or self.generation is None:
+            raise ValueError(f"work-item {self.kind} event carries no CI fix round")
+        return self.generation
+
 
 @dataclass(frozen=True)
 class WorkItemAcquireGrant:
@@ -354,6 +362,7 @@ class WorkItemDispatchClient:
         outcome: str,
         cause: str,
         detail: str | None,
+        ci_fix_round: int | None,
         budget_s: float = DEFAULT_BUDGET_S,
     ) -> None:
         await self._post_settlement(
@@ -363,6 +372,7 @@ class WorkItemDispatchClient:
                 "outcome": outcome,
                 "cause": cause,
                 "detail": detail,
+                "ci_fix_round": ci_fix_round,
             },
             budget_s=budget_s,
         )
@@ -669,7 +679,9 @@ class WorkItemRun:
             self.request_id, runtime_epoch=self.runtime_epoch, budget_s=self._write_budget_s()
         )
 
-    async def finish(self, *, outcome: str, cause: str, detail: str | None) -> None:
+    async def finish(
+        self, *, outcome: str, cause: str, detail: str | None, ci_fix_round: int | None
+    ) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item finish called before start")
         await self._client.finish(
@@ -678,6 +690,7 @@ class WorkItemRun:
             outcome=outcome,
             cause=cause,
             detail=detail,
+            ci_fix_round=ci_fix_round,
             budget_s=self._write_budget_s(),
         )
         self.finished = True
