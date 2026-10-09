@@ -407,8 +407,17 @@ def _content_block_to_dict(block: object) -> dict[str, Any] | None:
 
 
 def model_message_to_conversation(message: object) -> ConversationMessage | None:
-    """Project one SDK message into Curie's portable role/content shape."""
+    """Project one SDK message into Curie's portable role/content shape.
 
+    A subagent's messages (those with a parent tool call) are not portable
+    history: the parent's ``Agent`` call and its result already carry what the
+    parent saw (RUNNER-HISTORY-GROUP-4).
+    """
+
+    if isinstance(message, UserMessage | AssistantMessage) and (
+        message.parent_tool_use_id is not None
+    ):
+        return None
     if isinstance(message, UserMessage):
         if isinstance(message.content, str):
             content: str | list[dict[str, Any]] = message.content
@@ -420,15 +429,11 @@ def model_message_to_conversation(message: object) -> ConversationMessage | None
             ]
         return ConversationMessage(role="user", content=content)
     if isinstance(message, AssistantMessage):
-        nested = message.parent_tool_use_id is not None
         content = [
             projected
             for block in message.content
-            if not (nested and isinstance(block, TextBlock | ThinkingBlock))
-            and (projected := _content_block_to_dict(block)) is not None
+            if (projected := _content_block_to_dict(block)) is not None
         ]
-        if nested and not content:
-            return None
         return ConversationMessage(
             role="assistant",
             content=content,

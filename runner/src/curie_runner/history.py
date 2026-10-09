@@ -186,9 +186,10 @@ def validate_assistant_groups(messages: Sequence[ConversationMessage]) -> None:
 
     Roles or arrival order cannot establish a logical assistant identity. Tool
     pairing validates result provenance separately from group provenance.
-    ``reduce_unprovable_overlap_turns`` runs first on a boot's replay, so the
-    overlap refusal reaches a caller only for overlap it could not isolate to
-    one turn (RUNNER-HISTORY-GROUP-4).
+    ``reduce_unprovable_overlap_turns`` runs first on a boot's replay and reduces
+    overlap within a turn or across turns, so on that path the overlap refusal
+    reaches a caller only when other malformed history kept the reducer from
+    seeing it (RUNNER-HISTORY-GROUP-4).
     """
 
     _validate_group_provenance(messages)
@@ -240,12 +241,26 @@ UNREPLAYABLE_TOOL_ACTIVITY_TEXT = (
 )
 
 
+def _starts_turn(message: ConversationMessage) -> bool:
+    """A user row with no tool_result block at all.
+
+    Stricter than ``is_tool_result_message``, which validation uses as its causal
+    boundary: a row mixing text and a tool result joins the current turn without
+    creating a boundary, so it is never kept whole as a reduced turn's opener.
+    """
+
+    return message.role == "user" and (
+        not isinstance(message.content, list)
+        or all(block.get("type") != "tool_result" for block in message.content)
+    )
+
+
 def _split_turns(messages: Sequence[ConversationMessage]) -> list[list[ConversationMessage]]:
-    """Split at each genuine user message; a tool result does not start a turn."""
+    """Split at each user row with no tool result; a text-plus-result row joins the turn."""
 
     turns: list[list[ConversationMessage]] = []
     for message in messages:
-        starts = message.role == "user" and not is_tool_result_message(message)
+        starts = _starts_turn(message)
         if starts or not turns:
             turns.append([])
         turns[-1].append(message)
@@ -256,7 +271,7 @@ def _visible_text(turn: Sequence[ConversationMessage]) -> list[ConversationMessa
     """The turn's opening user message and one assistant message of its text blocks."""
 
     opening = turn[0]
-    head = [opening] if opening.role == "user" and not is_tool_result_message(opening) else []
+    head = [opening] if _starts_turn(opening) else []
     texts: list[dict[str, Any]] = []
     for message in turn:
         if message.role != "assistant":
@@ -280,23 +295,103 @@ def reduce_unprovable_overlap_turns(
     """Replay each turn with unprovable overlapping tool calls as its visible text.
 
     RUNNER-HISTORY-GROUP-4. Returns the replay and how many turns were reduced.
-    Only the overlap refusal reduces a turn; any other malformed history is left
-    for ``validate_assistant_groups`` to refuse over the whole replay.
+    A first pass reduces each turn whose own tool calls overlap. A second pass
+    walks the replay in order and catches overlap that spans turns: when a turn
+    adds a tool call while an earlier turn's call is still unanswered, that turn
+    and every earlier turn still holding an unanswered call are reduced. Reducing
+    a turn also reduces every later turn holding a result for one of its calls,
+    transitively, so the replay never keeps a result whose call was reduced away.
+    Each turn is reduced and counted at most once. Only the overlap refusal
+    reduces a turn; the walk stops at any other malformed history, so no later
+    reduction can erase it before ``validate_assistant_groups`` refuses it.
     """
 
-    replay: list[ConversationMessage] = []
-    reduced = 0
-    for turn in _split_turns(messages):
-        try:
-            validate_assistant_groups(turn)
-        except UnprovableAssistantGroupingError:
-            replay.extend(_visible_text(turn))
-            reduced += 1
+    turns = _split_turns(messages)
+    reduced_turns: set[int] = set()
+    for index in range(len(turns)):
+        if index in reduced_turns:
             continue
+        try:
+            validate_assistant_groups(turns[index])
+        except UnprovableAssistantGroupingError:
+            _reduce_turns(turns, [index], reduced_turns)
         except HistoryError:
             pass
-        replay.extend(turn)
-    return tuple(replay), reduced
+
+    replay = [message for turn in turns for message in turn]
+    try:
+        validate_assistant_groups(replay)
+    except HistoryError:
+        pass
+    else:
+        # Validation is prefix-closed, so the walk below would reduce nothing.
+        return tuple(replay), len(reduced_turns)
+
+    # Each step validates the accumulated replay again, quadratic in turns; it
+    # runs only for a history the whole-replay validation refused.
+    accepted: list[int] = []
+    for index, turn in enumerate(turns):
+        prefix = [message for earlier in accepted for message in turns[earlier]]
+        try:
+            validate_assistant_groups([*prefix, *turn])
+        except UnprovableAssistantGroupingError:
+            overlapping = [*_turns_with_unanswered_calls(accepted, turns), index]
+            _reduce_turns(turns, overlapping, reduced_turns)
+        except HistoryError:
+            # The final validation refuses this replay; reducing later turns
+            # could only hide the defect, so stop here.
+            break
+        accepted.append(index)
+    return tuple(message for turn in turns for message in turn), len(reduced_turns)
+
+
+def _reduce_turns(
+    turns: list[list[ConversationMessage]], indexes: Sequence[int], reduced: set[int]
+) -> None:
+    """Reduce the turns, then every later turn holding a result for a reduced call."""
+
+    queue = list(indexes)
+    while queue:
+        index = queue.pop()
+        if index in reduced:
+            continue
+        removed = _block_ids(turns[index], "tool_use", "id")
+        turns[index] = _visible_text(turns[index])
+        reduced.add(index)
+        queue.extend(
+            other
+            for other, turn in enumerate(turns)
+            if other > index
+            and other not in reduced
+            and removed & _block_ids(turn, "tool_result", "tool_use_id")
+        )
+
+
+def _block_ids(turn: Sequence[ConversationMessage], kind: str, key: str) -> set[str]:
+    """The ``key`` values of the turn's content blocks of type ``kind``."""
+
+    return {
+        str(block.get(key))
+        for message in turn
+        if isinstance(message.content, list)
+        for block in message.content
+        if block.get("type") == kind
+    }
+
+
+def _turns_with_unanswered_calls(
+    accepted: Sequence[int], turns: Sequence[Sequence[ConversationMessage]]
+) -> list[int]:
+    """Indexes of accepted turns holding a tool call no accepted turn answered."""
+
+    owner: dict[str, int] = {}
+    for index in accepted:
+        # An accepted turn validated with its prefix, so its results only answer
+        # calls already recorded.
+        owner.update(dict.fromkeys(_block_ids(turns[index], "tool_use", "id"), index))
+        for answered in _block_ids(turns[index], "tool_result", "tool_use_id"):
+            owner.pop(answered, None)
+    return sorted(set(owner.values()))
 
 
 @dataclass(frozen=True)

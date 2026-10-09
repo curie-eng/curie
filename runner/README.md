@@ -295,24 +295,28 @@ marker. This grouping is replay metadata, never approval or tool authority.
   inference from adjacency, result arrival, tool name, or prose may combine
   independent messages or move a dependent call before the result it consumes.
 - **RUNNER-HISTORY-GROUP-4:** Old role/content-only records remain readable.
-  Unambiguous sequential call/result history works without a native checkpoint.
-  A legacy checkpoint can supply missing group identity only when its assistant
-  and user conversation rows match the authoritative portable prefix exactly
-  and unambiguously, with valid IDs and causal boundaries. Its prompt snapshots,
+  Unambiguous sequential call/result history works without a native checkpoint. A
+  legacy checkpoint can supply missing group identity only when its assistant and
+  user conversation rows match the authoritative portable prefix exactly and
+  unambiguously, with valid IDs and causal boundaries. Its prompt snapshots,
   attachment availability, other envelope fields, and extra content are never
   imported by this recovery. If an overlapping tool-call sequence needs grouping
-  that neither portable metadata nor validated native mapping proves, never
-  submit that known corrupt replay or manufacture a result. Replay that one turn
-  as its visible text instead: the turn runs from a genuine user message to the
-  next one, and it becomes that user message followed by one assistant message
-  carrying the turn's assistant text blocks in order (or, if it had none, a text
-  saying its tool activity could not be replayed). Every other turn keeps its
-  rows unchanged, a native checkpoint is set aside, and the runner logs a WARNING
-  naming the session and the number of turns reduced, never their content.
-  Refusing the whole history instead strands the thread: the runner exits
-  before it is ready, every retry and every later message in that thread fails
-  the same way, and a thread whose key is fixed, such as an inbound hook's, can
-  never start fresh.
+  that neither portable metadata nor validated native mapping proves, never submit
+  that known corrupt replay or manufacture a result. Replay that one turn as its
+  visible text instead: the turn runs from a genuine user message (a user row
+  carrying no tool result) to the next one, and it becomes that user message
+  followed by one assistant message carrying the turn's assistant text blocks in
+  order (or, if it had none, a text saying its tool activity could not be
+  replayed). Subagent messages (those with a parent tool call) are not portable
+  history; only the parent's `Agent` call and its result are. Overlap that spans
+  turns is reduced the same way, both the turn that adds the overlapping call and
+  each earlier turn still holding an unanswered call, plus any later turn holding
+  a result for a reduced call. Every other turn keeps its rows unchanged, a native
+  checkpoint is set aside, and the runner logs a WARNING naming the session and
+  the number of turns reduced, never their content. Refusing the whole history
+  instead strands the thread: the runner exits before it is ready, every retry and
+  every later message in that thread fails the same way, and a thread whose key is
+  fixed, such as an inbound hook's, can never start fresh.
 - **RUNNER-HISTORY-GROUP-5:** Reject malformed persisted group metadata and
   inconsistent provenance, including attribution on user rows and reuse across
   genuine user or distinct assistant-group boundaries. Preserve group identity
