@@ -10,7 +10,8 @@ from the Valkey delivery lease to the SQL runtime heartbeat that
 [ADR 0162](0162-work-items-own-durable-execution-identity.md) and
 [ADR 0157](0157-factory-work-dispatches-from-sql-over-the-runs-stream.md)
 give each started factory `ExecutionRequest`, and deciding, for both
-ownership stores, how a factory run that fails closed on a store outage ends.
+ownership stores, how a factory run that fails closed on a store outage, or on
+losing its path to the API, ends.
 That second part settles ADR 0207 consequence 6. It builds on
 [ADR 0206](0206-a-factory-run-lost-with-its-worker-is-re-admitted-as-a-new-attempt.md)
 and proposes amending
@@ -98,18 +99,32 @@ through bound depends on which loop observes the deadline first. Neither
 cause is truthful: the worker did not stop responding, and the runner did not
 fail.
 
+The SQL heartbeat also fails with both stores healthy. A factory resilience
+run on a disposable install, driven the same way, refused new worker to API
+connections for 90 seconds on 2026-10-09 while Postgres and Valkey stayed
+healthy. Each heartbeat is one `_post` attempt in
+`WorkItemDispatchClient` with no retry, so the third refused connection
+stopped the heartbeat loop and abandoned the run as above. The reconciler
+then cancelled the request as `owner_lost`, and the turn's publication, which
+was already in flight, succeeded 0.57 seconds later. Nothing was unavailable
+except the path between the owner and the API, so a cause that names a store
+outage would be as false here as `owner_lost`.
+
 ADR 0207 consequence 6 left the truthful cause for a run that fails closed on
-a store outage undecided. This ADR decides it for both ownership stores.
+a store outage undecided. This ADR decides it for both ownership stores and
+for an unreachable API, with one cause that names what the owner actually
+knows: it was alive and could not confirm its ownership.
 
 ## Decision
 
 **A work item owner rides through heartbeat transport failures until a local
 deadline that is always earlier than the API's lapse. At that deadline it
 stops its turn and its sandbox instead of abandoning them, so no turn outlives
-its owner. A factory run that fails closed because an ownership store, the
-SQL work item store or Valkey, was unavailable records `store_unavailable`,
-not `owner_lost` or `runner_escalated`, and gets an ADR 0206 successor,
-whichever path observes the outage first.**
+its owner. A factory run that fails closed because its owner could not
+confirm ownership, whether the API was unreachable, the SQL work item store
+behind it was unavailable, or Valkey was unavailable, records
+`ownership_unconfirmed`, not `owner_lost` or `runner_escalated`, and gets an
+ADR 0206 successor, whichever path observes the failure first.**
 
 1. A heartbeat refusal is handled as today: `stale_owner` abandons without
    touching the route, and `cancellation_requested` stops the owned run
@@ -137,14 +152,20 @@ whichever path observes the outage first.**
    publication. This is the server side backstop for an owner that could not
    stop its turn, for example because Kubernetes was also unreachable.
 6. Truthful cause. After fencing, the owner reports the termination with cause
-   `store_unavailable` and its observation, retrying until the API answers.
+   `ownership_unconfirmed` and its observation, retrying until the API answers.
    The API accepts it under the epoch the request had when it lapsed: a
-   request still `running` goes straight to `failed/store_unavailable`, and a
-   request the reconciler already moved to `cancellation_requested` with
+   request still `running` goes straight to `failed/ownership_unconfirmed`,
+   and a request the reconciler already moved to `cancellation_requested` with
    `owner_lost`, and that no terminator has claimed, settles as
-   `failed/store_unavailable` instead. If another terminator claimed it first,
-   `owner_lost` stands. The status comment says the work item store was
-   unavailable, not that the worker stopped responding.
+   `failed/ownership_unconfirmed` instead. If another terminator claimed it
+   first, `owner_lost` stands. The report carries what the owner observed on
+   its last heartbeat failure: the API refused or timed out the connection, or
+   the API answered with a server error. The status comment says the worker
+   could not confirm its ownership because the API was unreachable, or because
+   the API could not reach the work item store, not that the worker stopped
+   responding. The cause is the same for both, because the owner cannot tell
+   from a refused connection, a timeout or a 5xx which link failed, and the
+   handling is identical.
 7. The Valkey side converges on the same stop. For a factory WorkItem
    execution, each ADR 0207 fail closed that comes from a local deadline
    passing on transport failures, and not from a refusal, runs the fence in
@@ -152,8 +173,8 @@ whichever path observes the outage first.**
    deadline (ADR 0207 point 2), the side effect marker deadline (point 4)
    and the consumer liveness deadline (point 8). Concretely:
    1. The kernel maps classification `ownership-store-unavailable` to cause
-      `store_unavailable` in `_ESCALATION_CAUSES`, and for a factory
-      execution that class ends the request `failed/store_unavailable`
+      `ownership_unconfirmed` in `_ESCALATION_CAUSES`, and for a factory
+      execution that class ends the request `failed/ownership_unconfirmed`
       instead of taking the `saw_side_effect` escalation.
    2. When the consumer cancels a factory handler on
       `ConsumerLivenessExpired` from its local deadline, the kernel runs the
@@ -171,12 +192,15 @@ whichever path observes the outage first.**
       5) and that lookup fails, halting the claim stops the turn.
    5. The report goes to the API under the request's runtime epoch, which
       ADR 0162 fences in SQL and which a Valkey outage does not block. The
-      status comment says the delivery store was unavailable.
+      cause is `ownership_unconfirmed`, as on the SQL side, and the status
+      comment says the worker could not confirm its ownership because the
+      delivery store was unavailable. If the API is unreachable too, the
+      report retries as point 6 describes.
 
    A refusal (lease held by another token or generation, liveness held by
    another generation, or the key gone after Valkey returns) is ownership
    loss, not store unavailability, and keeps today's handling and cause.
-8. A `store_unavailable` request is followed by a successor under ADR 0206,
+8. An `ownership_unconfirmed` request is followed by a successor under ADR 0206,
    with ADR 0206's refusals, and counts in the same consecutive loss streak as
    `owner_lost` (and as `sandbox_lost` if Draft ADR 0211 is accepted). The work
    did not fail on its own account, and the owner observed its sandbox gone
@@ -184,7 +208,7 @@ whichever path observes the outage first.**
 9. ADR 0013 and replay. A successor reruns the whole run, including every
    call that flagged a side effect, which ADR 0013 otherwise answers with
    escalation. This ADR amends ADR 0013 for factory WorkItem executions that
-   end `store_unavailable` only, on the same footing as ADR 0206 already
+   end `ownership_unconfirmed` only, on the same footing as ADR 0206 already
    does for `owner_lost`. It adds no replay exposure: Path B already reruns
    these calls today under `owner_lost` on the same fault, so this ADR
    removes the race, not a safeguard. It does not decide whether replay is
@@ -192,10 +216,10 @@ whichever path observes the outage first.**
    for sandbox loss, and its point 6 replay safety bound applies to every
    successor ADR 0206 admits. The boundary is:
    1. If Draft ADR 0211 is accepted, its replay safety bound gates
-      `store_unavailable` successors exactly as it gates `owner_lost` and
+      `ownership_unconfirmed` successors exactly as it gates `owner_lost` and
       `sandbox_lost` ones, and a run outside the bound ends for a person
-      with cause `store_unavailable` and the blocking tool named.
-   2. Until then, a `store_unavailable` successor carries exactly the
+      with cause `ownership_unconfirmed` and the blocking tool named.
+   2. Until then, an `ownership_unconfirmed` successor carries exactly the
       replay risk ADR 0206 carries for `owner_lost`, no more.
 
    Non factory turns (interactive, cron, eval) keep ADR 0013 unchanged: a
@@ -233,15 +257,19 @@ with or without them.
 
 ## Consequences
 
-1. With the defaults, a work item store outage that ends within about 60 to
-   75 seconds of its start, depending on when the last heartbeat landed, no
-   longer ends healthy runs.
+1. With the defaults, a work item store outage or a loss of the worker's
+   path to the API that ends within about 60 to 75 seconds of its start,
+   depending on when the last heartbeat landed, no longer ends healthy runs.
+   The 90 second partition in the evidence exceeds that bound and would end
+   `ownership_unconfirmed` with a successor, with the turn stopped before the
+   lapse so its publication could not race the reconciler.
 2. A longer outage still fails closed, and now fails closed truthfully: the
-   turn is stopped, the sandbox is gone, the cause says the store was
-   unavailable, and a successor reruns the work.
+   turn is stopped, the sandbox is gone, the cause says the owner could not
+   confirm its ownership and the status comment says why, and a successor
+   reruns the work.
 3. The 75 second hold in the evidence, plus the time Postgres took to become
    ready again, exceeds the default bound. That run would have ended
-   `store_unavailable` with a successor, not ridden through. An operator who
+   `ownership_unconfirmed` with a successor, not ridden through. An operator who
    needs a longer ride through raises `CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS`;
    both bounds scale with it, and so does the time to detect a worker that
    really died.
@@ -250,10 +278,10 @@ with or without them.
    That is the margin the two TTL lapse already pays for, as in ADR 0207.
 5. A turn that finishes during the outage cannot record its finish until the
    store returns; it waits as today, bounded by the local deadline.
-6. A `store_unavailable` cause is new on requests and status comments, and a
-   successor follows it.
+6. An `ownership_unconfirmed` cause is new on requests and status comments,
+   and a successor follows it.
 7. A Valkey outage past the ADR 0207 bound now has one outcome for a factory
-   run: `failed/store_unavailable` and a successor, the outcome Path B
+   run: `failed/ownership_unconfirmed` and a successor, the outcome Path B
    reached by luck in the v0.12.3 run above. The 80 second hold in the
    evidence would end that way on either path.
 8. Factory and non factory turns now differ on `ownership-store-unavailable`
@@ -264,7 +292,7 @@ with or without them.
    as the fence takes before the kernel lets go of it, instead of being
    dropped at once. A worker that restarts during that window leaves the run
    to the orphan sweep and point 6, as today.
-10. The replay exposure of a `store_unavailable` successor is whatever ADR
+10. The replay exposure of an `ownership_unconfirmed` successor is whatever ADR
     0206 allows for `owner_lost`. Accepting Draft ADR 0211 narrows both
     together; rejecting it leaves both where ADR 0206 put them.
 
@@ -309,3 +337,14 @@ with or without them.
 10. Order the two paths with a shared lock. Rejected: the store that would
     hold the lock is the one that is down, and point 7's rule that the
     kernel keeps holding the run until it reports does the ordering locally.
+11. Name the cause `store_unavailable`, and add a sibling such as
+    `api_unreachable` for a partition. Rejected: the worker sees the same
+    transport failure whether the API is unreachable or the API cannot reach
+    Postgres (a timeout can be either), so it would have to guess between two
+    names for one handling, and a wrong guess is the false statement this ADR
+    removes. One cause with the observation in the status comment is truthful
+    in every case.
+12. Name the cause `owner_unreachable`. Rejected: it reads as the API failing
+    to reach the worker, which is what `owner_lost` already says, and it is
+    false for a Valkey outage, where the API reaches the worker and receives
+    the report normally.
