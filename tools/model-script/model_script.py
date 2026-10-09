@@ -91,8 +91,10 @@ def message_to_sse(message: dict[str, Any]) -> bytes:
     def emit(event: str, data: dict[str, Any]) -> None:
         frames.append(f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n")
 
-    usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
-    start = {
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    start: dict[str, Any] = {
         "id": message.get("id") or "msg_scripted",
         "type": "message",
         "role": "assistant",

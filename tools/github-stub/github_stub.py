@@ -565,9 +565,10 @@ class GithubStub:
         if tail.startswith("issues/"):
             parts = tail.split("/")
             number = int(parts[1])
-            issue = self._get("issue", number)
-            if issue is None:
+            existing_issue = self._get("issue", number)
+            if existing_issue is None:
                 return 404, {"message": "Not Found"}
+            issue = existing_issue
             suffix = "/".join(parts[2:])
             if not suffix and method in {"GET", "PATCH"}:
                 if method == "PATCH":
@@ -674,9 +675,10 @@ class GithubStub:
             number = int(parts[1])
             if len(parts) == 3 and parts[2] in {"comments", "reviews"} and method == "GET":
                 return 200, []
-            pull = self._get("pull", number)
-            if pull is None:
+            existing_pull = self._get("pull", number)
+            if existing_pull is None:
                 return 404, {"message": "Not Found"}
+            pull = existing_pull
             if len(parts) == 3 and parts[2] == "files" and method == "GET":
                 fresh = self._fresh_pull(pull)
                 files = (

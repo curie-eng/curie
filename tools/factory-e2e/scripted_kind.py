@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import importlib.util
 import ipaddress
 import json
+import math
 import os
 import random
 import shutil
@@ -32,6 +34,8 @@ ISSUE = REPO_ROOT / "tools/factory-e2e/fixtures/unitconv-issue.md"
 TRANSCRIPT = REPO_ROOT / "tools/model-script/transcripts/unitconv-issue.json"
 IMAGES = ("curie-api:local", "curie-worker:local", "curie-ui:local", "curie-runner:latest")
 BOUND_SECONDS = 2400
+RECORD_BUDGET_USD = 20
+RECORD_ATTEMPTS = 3
 
 
 class ScriptedScenarioError(RuntimeError):
@@ -182,9 +186,11 @@ class ScriptedRun:
         self.env.pop("CURIE_FACTORY_RECORD_KEY", None)
         self.env["BUILDX_BUILDER"] = "default"
         self.curie = os.environ.get("CURIE_BIN", "curie")
-        self.record_start_usage: float | None = None
+        self.record_start_remaining: float | None = None
         self.record_budget_start: float | None = None
         self.record_ledger: Path | None = None
+        self.record_namespace = os.environ.get("FACTORY_RUN_ID", self.run_id)
+        self.record_error: str | None = None
 
     def check_disk(self, stage: str) -> None:
         if shutil.disk_usage("/").free < 30 * 1024**3:
@@ -221,19 +227,117 @@ class ScriptedRun:
     def kubectl(self, *argv: str, timeout: float = 300) -> str:
         return self.command("kubectl", "--context", self.context, *argv, timeout=timeout)
 
-    def provider_usage(self) -> tuple[float, float]:
+    def provider_remaining(self) -> float:
+        """Read the provider's remaining limit without retaining key material."""
+
         key = os.environ["CURIE_FACTORY_RECORD_KEY"]
         request = Request(fe.OPENROUTER_KEY_URL, headers={"Authorization": f"Bearer {key}"})
         try:
             with urlopen(request, timeout=30) as response:
                 data = json.load(response)["data"]
-            usage = float(data["usage"])
-            remaining = data.get("limit_remaining")
-            if remaining is None:
-                remaining = float(data["limit"]) - usage
-            return usage, float(remaining)
+            remaining = float(data["limit_remaining"])
+            if not math.isfinite(remaining) or remaining < 0:
+                raise ValueError("invalid remaining limit")
+            return remaining
         except Exception:
             raise fe.ConfigError("provider credit could not be verified") from None
+
+    def prepare_recording(self) -> None:
+        """Share the credit budget across worktrees and scope attempts to a run."""
+
+        remaining = self.provider_remaining()
+        self.record_start_remaining = remaining
+        self.evidence.update(
+            recording_run_id=self.record_namespace,
+            recording_start_remaining_usd=remaining,
+            recording_model_calls=0,
+        )
+        common_dir = self.command(
+            "git", "rev-parse", "--path-format=absolute", "--git-common-dir", timeout=30
+        ).strip()
+        repository = hashlib.sha256(str(Path(common_dir).resolve()).encode()).hexdigest()
+        state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+        ledger = state / "curie-factory-scripted" / repository / "recording.sqlite3"
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            baseline = float(os.environ.get("CURIE_FACTORY_RECORD_BASELINE_REMAINING", remaining))
+        except ValueError:
+            raise fe.ConfigError("recording baseline must be a USD amount") from None
+        if not math.isfinite(baseline) or baseline < RECORD_BUDGET_USD:
+            raise fe.ConfigError("provider credit requires at least 20 USD at budget start")
+        with sqlite3.connect(ledger) as database:
+            database.execute(
+                "CREATE TABLE IF NOT EXISTS budget ("
+                "id INTEGER PRIMARY KEY CHECK (id=1), start_remaining REAL NOT NULL)"
+            )
+            database.execute(
+                "CREATE TABLE IF NOT EXISTS attempts ("
+                "id TEXT PRIMARY KEY, run_id TEXT NOT NULL, start_remaining REAL NOT NULL, "
+                "end_remaining REAL, model_calls INTEGER NOT NULL DEFAULT 0)"
+            )
+            database.execute("BEGIN IMMEDIATE")
+            database.execute("INSERT OR IGNORE INTO budget VALUES (1, ?)", (baseline,))
+            self.record_budget_start = database.execute(
+                "SELECT start_remaining FROM budget WHERE id=1"
+            ).fetchone()[0]
+            self.evidence["recording_budget_start_remaining_usd"] = self.record_budget_start
+            self.assert_record_budget(remaining)
+            count = database.execute(
+                "SELECT count(*) FROM attempts WHERE run_id=? AND model_calls > 0",
+                (self.record_namespace,),
+            ).fetchone()[0]
+            if count >= RECORD_ATTEMPTS:
+                raise fe.ConfigError("recording is limited to 3 model-reaching attempts per run")
+            database.execute(
+                "INSERT INTO attempts (id, run_id, start_remaining) VALUES (?, ?, ?)",
+                (self.run_id, self.record_namespace, remaining),
+            )
+        self.record_ledger = ledger
+
+    def assert_record_budget(self, remaining: float) -> None:
+        assert self.record_budget_start is not None
+        if self.record_budget_start - remaining >= RECORD_BUDGET_USD:
+            raise fe.ConfigError("recording reached its total 20 USD provider budget")
+
+    def record_model_call(self) -> None:
+        """Charge one attempt at its first forwarded model request."""
+
+        assert self.record_ledger is not None
+        self.assert_record_budget(self.provider_remaining())
+        with sqlite3.connect(self.record_ledger) as database:
+            database.execute("BEGIN IMMEDIATE")
+            calls = database.execute(
+                "SELECT model_calls FROM attempts WHERE id=?", (self.run_id,)
+            ).fetchone()[0]
+            count = database.execute(
+                "SELECT count(*) FROM attempts WHERE run_id=? AND model_calls > 0",
+                (self.record_namespace,),
+            ).fetchone()[0]
+            if calls == 0 and count >= RECORD_ATTEMPTS:
+                raise fe.ConfigError("recording is limited to 3 model-reaching attempts per run")
+            database.execute(
+                "UPDATE attempts SET model_calls=model_calls + 1 WHERE id=?", (self.run_id,)
+            )
+        self.evidence["recording_model_calls"] = calls + 1
+        if calls == 0:
+            self.evidence["recording_attempt"] = count + 1
+
+    def count_recording_requests(self, model_module: Any) -> None:
+        """Check limits before the proxy forwards a valid Messages request."""
+
+        forward = self.model._record
+
+        def record_request(handler: Any, path: str, body: bytes) -> None:
+            if model_module.request_key(model_module._safe_json(body)) is not None:
+                try:
+                    self.record_model_call()
+                except fe.ConfigError as exc:
+                    self.record_error = str(exc)
+                    self.model._reject(handler, "POST", path, body)
+                    return
+            forward(handler, path, body)
+
+        self.model._record = record_request
 
     def prerequisites(self) -> None:
         for binary in ("docker", "kind", "helm", "kubectl", "openssl", "git", self.curie):
@@ -245,31 +349,7 @@ class ScriptedRun:
         self.command("docker", "info", timeout=30)
         self.command("helm", "version", timeout=30)
         if self.args.record:
-            self.record_start_usage, remaining = self.provider_usage()
-            if remaining < 20:
-                raise fe.ConfigError("provider credit requires at least 20 USD remaining")
-            scratch = REPO_ROOT / ".projects/factory-scripted"
-            scratch.mkdir(parents=True, exist_ok=True)
-            self.record_ledger = scratch / "recording.sqlite3"
-            with sqlite3.connect(self.record_ledger) as database:
-                database.execute(
-                    "CREATE TABLE IF NOT EXISTS attempts ("
-                    "id TEXT PRIMARY KEY, start_usage REAL, end_usage REAL)"
-                )
-                database.execute("BEGIN IMMEDIATE")
-                count, first = database.execute(
-                    "SELECT count(*), min(start_usage) FROM attempts"
-                ).fetchone()
-                self.record_budget_start = first if first is not None else self.record_start_usage
-                if count >= 3:
-                    raise fe.ConfigError("recording is limited to 3 attempts")
-                if self.record_start_usage - self.record_budget_start >= 20:
-                    raise fe.ConfigError("recording provider usage reached its 20 USD budget")
-                database.execute(
-                    "INSERT INTO attempts VALUES (?, ?, NULL)",
-                    (self.run_id, self.record_start_usage),
-                )
-            self.evidence["recording_attempt"] = count + 1
+            self.prepare_recording()
         if self.args.build_images:
             for component in ("api", "worker", "ui"):
                 self.check_disk(f"building {component}")
@@ -292,9 +372,7 @@ class ScriptedRun:
 
     def execute(self) -> None:
         self.prerequisites()
-        scratch = REPO_ROOT / ".projects/factory-scripted"
-        scratch.mkdir(parents=True, exist_ok=True)
-        self.workdir = Path(tempfile.mkdtemp(prefix=f"{self.run_id}-", dir=scratch))
+        self.workdir = Path(tempfile.mkdtemp(prefix=f"curie-factory-scripted-{self.run_id}-"))
         self.env["KUBECONFIG"] = str(self.workdir / "kubeconfig")
         self.env["CURIE_CONFIG_DIR"] = str(self.workdir / "curie-config")
         # Docker can reassign an ephemeral published port when the registry
@@ -384,6 +462,8 @@ class ScriptedRun:
         self.model = model.ModelScript(
             Path(self.args.transcript), record=self.args.record, host=gateway
         )
+        if self.args.record:
+            self.count_recording_requests(model)
         self.model.start()
         self.evidence.update(stub_port=self.stub.port, model_port=self.model.port)
         self.kubectl("apply", "-f", str(REPO_ROOT / "charts/curie/crds"))
@@ -607,9 +687,12 @@ class ScriptedRun:
 
     def wait_for_final(self) -> None:
         assert self.deadline is not None
+        assert self.install_started is not None
         advanced = False
         next_publication_probe = 0.0
         while time.monotonic() < self.deadline:
+            if self.record_error is not None:
+                raise ScriptedScenarioError(self.record_error)
             if self.model.unexpected:
                 raise ScriptedScenarioError("unexpected model request")
             if self.stub.unknown_requests:
@@ -642,10 +725,8 @@ class ScriptedRun:
                 self.evidence["final_comment"] = final[0]
                 self.evidence["final_comment_count"] = len(final)
                 return
-            if self.args.record and self.record_start_usage is not None:
-                usage, _ = self.provider_usage()
-                if self.record_budget_start is not None and usage - self.record_budget_start >= 20:
-                    raise ScriptedScenarioError("recording provider usage reached 20 USD")
+            if self.args.record and self.record_start_remaining is not None:
+                self.assert_record_budget(self.provider_remaining())
             time.sleep(2)
         raise ScriptedScenarioError("final issue comment timed out after 2400 seconds")
 
@@ -822,15 +903,17 @@ class ScriptedRun:
                 errors.append(str(exc))
         if self.record_ledger is not None:
             try:
-                usage, _ = self.provider_usage()
+                remaining_credit = self.provider_remaining()
                 with sqlite3.connect(self.record_ledger) as database:
                     database.execute(
-                        "UPDATE attempts SET end_usage=? WHERE id=?", (usage, self.run_id)
+                        "UPDATE attempts SET end_remaining=? WHERE id=?",
+                        (remaining_credit, self.run_id),
                     )
                 assert self.record_budget_start is not None
-                cost = usage - self.record_budget_start
+                cost = max(0.0, self.record_budget_start - remaining_credit)
+                self.evidence["recording_end_remaining_usd"] = remaining_credit
                 self.evidence["recording_total_usd"] = cost
-                if cost > 20:
+                if cost > RECORD_BUDGET_USD:
                     errors.append("recording exceeded its total 20 USD provider budget")
             except Exception as exc:
                 errors.append(str(exc))
@@ -869,8 +952,8 @@ def main(args: argparse.Namespace) -> int:
         detail, _ = fe.redact_agent_text(str(exc), run.secrets)
         run.evidence["error"] = detail
     finally:
-        for signum, handler in previous_handlers.items():
-            signal.signal(signum, handler)
+        for restored_signum, handler in previous_handlers.items():
+            signal.signal(restored_signum, handler)
         try:
             if run.cleanup():
                 result = fe.EXIT_FAILED

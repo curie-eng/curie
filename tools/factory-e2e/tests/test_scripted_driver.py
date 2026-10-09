@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import socket
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -20,6 +21,17 @@ import pytest
 import scripted_kind as sk
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture(autouse=True)
+def owned_scratch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    mkdtemp = sk.tempfile.mkdtemp
+    monkeypatch.setattr(
+        sk.tempfile, "mkdtemp", lambda *, prefix: mkdtemp(prefix=prefix, dir=scratch)
+    )
+    return scratch
 
 
 def _refuse_external_command(*_args: Any, **_kwargs: Any) -> Any:
@@ -110,7 +122,7 @@ def test_partial_resource_creation_failure_deletes_every_attempted_owned_resourc
     assert ("docker", "rm", "-f", evidence["registry"]) in calls
     cluster_delete = ("kind", "delete", "cluster", "--name", evidence["cluster"])
     assert (cluster_delete in calls) is (failure_stage == "cluster")
-    assert not list((tmp_path / ".projects/factory-scripted").iterdir())
+    assert not list((tmp_path / "scratch").iterdir())
 
 
 def _attempted_resources(run: sk.ScriptedRun) -> None:
@@ -379,3 +391,221 @@ def test_registry_publishes_the_explicit_port_its_mirror_names(
     assert (host, container) == ("127.0.0.1", "5000")
     assert 0 < int(port) < 32768
     assert f'registry.mirrors."localhost:{port}"' in mirrors[0]
+
+
+def _recording_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_id: str = "example-run",
+    remaining: float = 50,
+) -> sk.ScriptedRun:
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-upstream-key")
+    monkeypatch.setenv("FACTORY_RUN_ID", run_id)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.delenv("CURIE_FACTORY_RECORD_BASELINE_REMAINING", raising=False)
+    args = fe.parse_args(["scripted", "--record", "--transcript", str(tmp_path / "record.json")])
+    run = sk.ScriptedRun(args)
+    monkeypatch.setattr(run, "provider_remaining", lambda: remaining)
+    monkeypatch.setattr(run, "command", lambda *_args, **_kwargs: str(tmp_path / "repo/.git"))
+    run.prepare_recording()
+    return run
+
+
+def test_failures_before_model_calls_leave_all_three_run_attempts_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for _ in range(4):
+        run = _recording_run(tmp_path, monkeypatch)
+        assert run.cleanup() == []
+        assert "recording_attempt" not in run.evidence
+        assert run.evidence["recording_model_calls"] == 0
+    for attempt in range(1, 4):
+        run = _recording_run(tmp_path, monkeypatch)
+        run.record_model_call()
+        assert run.evidence["recording_attempt"] == attempt
+        assert run.cleanup() == []
+    with pytest.raises(fe.ConfigError, match="3 model-reaching attempts per run"):
+        _recording_run(tmp_path, monkeypatch)
+
+
+def test_attempt_limit_resets_for_a_new_run_while_provider_budget_stays_shared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for _ in range(3):
+        run = _recording_run(tmp_path, monkeypatch, remaining=50)
+        run.record_model_call()
+        assert run.cleanup() == []
+    next_run = _recording_run(tmp_path, monkeypatch, run_id="next-run", remaining=35)
+    next_run.record_model_call()
+    assert next_run.evidence["recording_attempt"] == 1
+    assert next_run.evidence["recording_budget_start_remaining_usd"] == 50
+    assert next_run.cleanup() == []
+    assert next_run.evidence["recording_total_usd"] == 15
+    with pytest.raises(fe.ConfigError, match="total 20 USD provider budget"):
+        _recording_run(tmp_path, monkeypatch, run_id="third-run", remaining=30)
+
+
+def test_in_flight_attempt_reserves_the_last_run_slot_before_forwarding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _recording_run(tmp_path, monkeypatch)
+    second = _recording_run(tmp_path, monkeypatch)
+    third = _recording_run(tmp_path, monkeypatch)
+    pending = _recording_run(tmp_path, monkeypatch)
+    for run in (first, second, third):
+        run.record_model_call()
+    with pytest.raises(fe.ConfigError, match="3 model-reaching attempts per run"):
+        pending.record_model_call()
+    first.record_model_call()
+    assert first.evidence["recording_model_calls"] == 2
+    assert first.evidence["recording_attempt"] == 1
+
+
+def test_budget_is_rechecked_before_each_model_call_and_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _recording_run(tmp_path, monkeypatch)
+    run.record_model_call()
+    monkeypatch.setattr(run, "provider_remaining", lambda: 30)
+    with pytest.raises(fe.ConfigError, match="total 20 USD provider budget"):
+        run.record_model_call()
+    assert run.evidence["recording_model_calls"] == 1
+    monkeypatch.setattr(run, "provider_remaining", lambda: 29)
+    assert run.cleanup() == ["recording exceeded its total 20 USD provider budget"]
+    assert run.evidence["recording_total_usd"] == 21
+    assert run.evidence["recording_start_remaining_usd"] == 50
+    assert run.evidence["recording_end_remaining_usd"] == 29
+
+
+@pytest.mark.parametrize("provider_status", [200, 503])
+def test_real_proxy_counts_provider_requests_including_provider_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_status: int,
+) -> None:
+    """Drive the real recording endpoint, replacing only the external provider."""
+
+    model_module = sk._module(
+        "factory_accounting_model_script", REPO_ROOT / "tools/model-script/model_script.py"
+    )
+    run = _recording_run(tmp_path, monkeypatch)
+    model = model_module.ModelScript(Path(run.args.transcript), record=True)
+    run.model = model
+    run.count_recording_requests(model_module)
+    provider_calls: list[str] = []
+    message = {"type": "message", "content": [{"type": "text", "text": "done"}]}
+
+    class ProviderResponse:
+        status = provider_status
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self) -> ProviderResponse:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(message if provider_status == 200 else {"type": "error"}).encode()
+
+    def provider(request: Request, **_kwargs: Any) -> ProviderResponse:
+        provider_calls.append(request.full_url)
+        if provider_status >= 400:
+            raise HTTPError(request.full_url, provider_status, "provider unavailable", {}, None)
+        return ProviderResponse()
+
+    monkeypatch.setattr(model_module, "urlopen", provider)
+    model.start()
+    try:
+        invalid = Request(
+            model.base_url + "/v1/messages",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+        )
+        with pytest.raises(HTTPError) as refused:
+            urlopen(invalid, timeout=5)
+        refused.value.close()
+        assert run.evidence["recording_model_calls"] == 0
+        assert provider_calls == []
+        request = Request(
+            model.base_url + "/v1/messages",
+            data=json.dumps({"messages": [{"role": "user", "content": "convert units"}]}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        if provider_status >= 400:
+            with pytest.raises(HTTPError) as unavailable:
+                urlopen(request, timeout=5)
+            assert unavailable.value.code == provider_status
+            unavailable.value.close()
+        else:
+            with urlopen(request, timeout=5) as response:
+                assert json.load(response)["type"] == "message"
+        assert len(provider_calls) == 1
+        assert run.evidence["recording_attempt"] == 1
+        assert run.evidence["recording_model_calls"] == 1
+        monkeypatch.setattr(run, "provider_remaining", lambda: 30)
+        with pytest.raises(HTTPError) as budget_refused:
+            urlopen(request, timeout=5)
+        assert budget_refused.value.code == 422
+        budget_refused.value.close()
+        assert len(provider_calls) == 1
+        assert run.record_error == "recording reached its total 20 USD provider budget"
+        assert run.record_ledger is not None
+        with sqlite3.connect(run.record_ledger) as database:
+            assert database.execute("SELECT model_calls FROM attempts").fetchone() == (1,)
+        assert b"example-upstream-key" not in run.record_ledger.read_bytes()
+    finally:
+        with pytest.raises(model_module.UnexpectedRequest):
+            model.close()
+
+
+@pytest.mark.parametrize("remaining", [None, -1, "nan", "inf"])
+def test_provider_balance_requires_an_observed_finite_remaining_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining: Any,
+) -> None:
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-upstream-key")
+
+    class BalanceResponse:
+        def __enter__(self) -> BalanceResponse:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> str:
+            # OpenRouter documents limit_remaining separately from usage:
+            # https://openrouter.ai/docs/api-reference/authentication
+            return json.dumps({"data": {"usage": 1, "limit": 50, "limit_remaining": remaining}})
+
+    monkeypatch.setattr(sk, "urlopen", lambda *_args, **_kwargs: BalanceResponse())
+    with pytest.raises(fe.ConfigError, match="provider credit could not be verified"):
+        run.provider_remaining()
+
+
+def test_provider_balance_uses_remaining_limit_instead_of_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-upstream-key")
+
+    class BalanceResponse:
+        def __enter__(self) -> BalanceResponse:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> str:
+            return json.dumps({"data": {"usage": 999, "limit_remaining": 35}})
+
+    monkeypatch.setattr(sk, "urlopen", lambda *_args, **_kwargs: BalanceResponse())
+    assert run.provider_remaining() == 35
