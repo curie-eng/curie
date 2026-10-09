@@ -110,10 +110,33 @@ was already in flight, succeeded 0.57 seconds later. Nothing was unavailable
 except the path between the owner and the API, so a cause that names a store
 outage would be as false here as `owner_lost`.
 
+The workspace object store is a third store a factory run depends on, and an
+outage there ends a run as `owner_lost` within seconds. A factory resilience
+run on a disposable install, driven the same way, made the object store
+unreachable during a live factory turn on 2026-10-09. The runner does not
+touch the object store mid turn, so the turn itself finished. The worker's
+post turn publication check then failed. `_attempt_turn` in `kernel.py` calls
+`validate_snapshot_against_base` (in
+[`apps/worker/src/curie_worker/publication_validation.py`](../../apps/worker/src/curie_worker/publication_validation.py)),
+which reads the per thread workspace ownership record through
+`WorkspaceCoordinator.current`, `_load_ownership` and the object store's
+`get_stream` in
+[`apps/worker/src/curie_worker/workspace.py`](../../apps/worker/src/curie_worker/workspace.py).
+A missing record is handled, but the client's `EndpointConnectionError` is
+not. The only handler around the check catches `WorkspacePreparationError`,
+so the botocore error escaped the turn and the `finally` unregistered the
+run. The orphan sweep then found a request carrying its own consumer name
+that the kernel no longer held. For its own name, `_orphaned` in
+`workitem_orphans.py` returns `not locally_owned` at once; the absence proof
+window applies only to peers. The sweep declared the run `owner_lost` 1.8
+seconds after the escape. The worker was alive, held the request's current
+epoch, and could have reported why it stopped.
+
 ADR 0207 consequence 6 left the truthful cause for a run that fails closed on
-a store outage undecided. This ADR decides it for both ownership stores and
-for an unreachable API, with one cause that names what the owner actually
-knows: it was alive and could not confirm its ownership.
+a store outage undecided. This ADR decides it for both ownership stores, for
+an unreachable API, and for the object store that holds the workspace
+ownership record on the post turn path, with one cause that names what the
+owner actually knows: it was alive and could not confirm its ownership.
 
 ## Decision
 
@@ -122,7 +145,8 @@ deadline that is always earlier than the API's lapse. At that deadline it
 stops its turn and its sandbox instead of abandoning them, so no turn outlives
 its owner. A factory run that fails closed because its owner could not
 confirm ownership, whether the API was unreachable, the SQL work item store
-behind it was unavailable, or Valkey was unavailable, records
+behind it was unavailable, Valkey was unavailable, or the object store holding
+its workspace ownership record was unavailable after the turn, records
 `ownership_unconfirmed`, not `owner_lost` or `runner_escalated`, and gets an
 ADR 0206 successor, whichever path observes the failure first.**
 
@@ -231,13 +255,41 @@ ADR 0206 successor, whichever path observes the failure first.**
     that window. On the Valkey side point 7 applies only to factory WorkItem
     executions, the only runs with a request to fail and a successor to
     admit. Interactive, cron and eval runs keep ADR 0207 as written.
+11. The object store on the post turn path. For a factory WorkItem
+    execution, a failure to read the per thread workspace ownership record
+    because the object store is unavailable (a connection, timeout or server
+    error from the object store client, not a missing or malformed record)
+    is the owner failing to confirm its ownership, not a crash of the turn.
+    It must not escape the turn. The publication check retries the read
+    within the snapshot budget that already bounds the publication snapshot
+    read before it. If the read still fails, the run takes the same stop as
+    point 7: the fence in point 4 (the turn is already over, so this halts
+    the claim and sandbox), the report in point 6 with cause
+    `ownership_unconfirmed`, and the kernel keeps holding the run until the
+    termination is recorded or refused, as point 7.3 requires. The status
+    comment says the worker could not confirm its ownership because the
+    workspace object store was unavailable. A missing or malformed record
+    keeps today's handling. Non factory turns are out of scope, as in point
+    10.
+12. Absence grace for self owned runs. The orphan sweep declares a run its
+    own process holds no longer only after it has observed that run not
+    held locally on consecutive sweeps spanning at least the absence proof
+    window it already applies to peers; a run seen held again clears the
+    observation. Point 7.3 and point 11 keep the kernel holding a run while
+    it stops, so the grace is the backstop for any other path that lets go
+    of a live run early, not the primary mechanism. A run that really lost
+    its process is still declared within the same window as a peer's.
 
 When this ADR is accepted, the realizing paths are expected to be
 `WorkItemRun._heartbeat_loop` and `WorkItemDispatchClient.record_termination`
 in `apps/worker/src/curie_worker/workitem_dispatch.py`; a new stop callback
 beside `_stop_owned_work_item`, `_mark_side_effect_with_retry`, the
-`saw_side_effect` branch of `_process_event`, `_ESCALATION_CAUSES` and
-`owns_work_item` in `apps/worker/src/curie_worker/kernel.py`; the handler
+`saw_side_effect` branch of `_process_event`, `_ESCALATION_CAUSES`,
+`owns_work_item` and the publication check in `_attempt_turn` in
+`apps/worker/src/curie_worker/kernel.py`; `validate_snapshot_against_base` in
+`apps/worker/src/curie_worker/publication_validation.py` and the ownership
+read in `apps/worker/src/curie_worker/workspace.py`; `_orphaned` in
+`apps/worker/src/curie_worker/workitem_orphans.py`; the handler
 cancellation in `StreamConsumer._liveness_refresh_loop` in
 `apps/worker/src/curie_worker/stream_consumer.py`; the heartbeat grant in
 `apps/api/src/curie_api/workitem_dispatch.py`;
@@ -295,6 +347,15 @@ with or without them.
 10. The replay exposure of an `ownership_unconfirmed` successor is whatever ADR
     0206 allows for `owner_lost`. Accepting Draft ADR 0211 narrows both
     together; rejecting it leaves both where ADR 0206 put them.
+11. An object store outage that outlasts the post turn retry now ends a
+    factory run `failed/ownership_unconfirmed` with a successor and a status
+    comment that names the object store, instead of `owner_lost` 1.8 seconds
+    after an escaped exception. A shorter outage rides through, and the
+    publication check passes on retry.
+12. The orphan sweep takes up to the absence proof window longer to declare
+    a self owned run whose process really let go of it. That is the delay
+    peers already get, 45 seconds with the default consumer heartbeat TTL,
+    which is inside the reconciler's 90 second lapse.
 
 ## Alternatives considered
 
