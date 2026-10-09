@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Isolated cluster-upgrade matrix for the next-train verb (#2590).
 #
-# Every mutating upgrade row is `curie cluster upgrade --yes --to ...`.
+# Upgrade rows use `curie cluster upgrade --yes --to ...`; rollback-to-serving
+# injects its interrupted history with one raw Helm upgrade.
 # Refuses the permanent soak (namespace/release `curie`, namespace `default`).
 # Never mutates soak, never prints secret values, never messages a human.
 #
@@ -57,6 +58,7 @@ HELM_CONTEXT_ARGS=()
 APPLY_KILL_PID=""
 APPLY_KILL_PIDS=()
 APPLY_KILL_HELM_SEEN=0
+ROLLBACK_SERVING_HELM_PID=""
 
 CHART_088_SHA="88664c2f991bed7a3e4bc0513ae73bfcbac08077d99a69e7087138aa6f8f3af2"
 CLI_088_SHA="dc0e1ab1b928522f1ca1c03e05d823e08218800c2d2a33d0d88af623972f6685"
@@ -87,6 +89,7 @@ SCENARIOS_ALL=(
     converge-negative
     previous-serves
     apply-kill-takeover
+    rollback-to-serving
 )
 
 MATRIX_PHASES=(plan validate drain_preflight checkpoint migrate apply converge canary commit)
@@ -117,7 +120,8 @@ s09 setup n-to-n1 guarded-rollback
 s11 nosetup rollback-published-089
 s13 setup converge-negative
 s14 setup previous-serves
-s16 setup apply-kill-takeover"
+s16 setup apply-kill-takeover
+s17 setup rollback-to-serving"
 SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
 
 log() { printf '%s\n' "$*" >&2; }
@@ -129,7 +133,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -453,6 +457,14 @@ run_self_test() {
         log "published 0.8.9 refusal keeps the guarded rollback proof in one scenario"
     else
         log "self-test: rollback-published-089 must run the guarded rollback proof"
+        failed=1
+    fi
+    if declare -F run_rollback_to_serving >/dev/null 2>&1 \
+        && ! awk '/^run_rollback_to_serving\(\)/,/^}/' "$script_path" \
+            | grep -E 'settle_helm_operation|recover_helm_lock|recover_killed_upgrade_ownership' >/dev/null; then
+        log "rollback-to-serving leaves the pending revision for the CLI"
+    else
+        log "self-test: rollback-to-serving must leave the pending revision for the CLI without recovery helpers"
         failed=1
     fi
     if awk '/^run_migration_crash\(\)/,/^}/' "$script_path" | awk '
@@ -1100,6 +1112,11 @@ cleanup() {
         sigkill_tree "$APPLY_KILL_PID"
         wait "$APPLY_KILL_PID" 2>/dev/null || true
         APPLY_KILL_PID=""
+    fi
+    if [[ -n "$ROLLBACK_SERVING_HELM_PID" ]]; then
+        kill -9 "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || true
+        wait "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || true
+        ROLLBACK_SERVING_HELM_PID=""
     fi
     if [[ -n "$CURRENT_LABEL" ]]; then
         record_timing_row "$CURRENT_LABEL" "$CURRENT_NAME" "$CURRENT_PHASES" failed $((SECONDS - CURRENT_STARTED))
@@ -2440,6 +2457,118 @@ assert (deployment.get("status") or {}).get("readyReplicas", 0) > 0, "API is not
     log "apply-kill-takeover deployed 0.10.1 through the CLI rollback with a Ready API and no holder"
 }
 
+run_rollback_to_serving() {
+    local V CHART_V serving pending="" status=0
+    V="$(awk '$1 == "version:" { print $2; exit }' "$REPO_ROOT/charts/curie/Chart.yaml")"
+    [[ -n "$V" ]] || die "rollback-to-serving could not read the checkout chart version"
+    # The checkout version admits the live tree head; 0.10.x does not.
+    retag_candidate_versions "0.10.0" "$V" required
+    helm package "$REPO_ROOT/charts/curie" --version "$V" --app-version "$V" -d "$WORKDIR/charts" >/dev/null
+    CHART_V="$WORKDIR/charts/curie-${V}.tgz"
+    [[ -f "$CHART_V" ]] || die "rollback-to-serving chart package is missing"
+    exclusive_kind_tag "$V"
+    cluster_upgrade "$V" "$CHART_V" || status=$?
+    record_upgrade_json "rollback-serving-setup"
+    (( status == 0 )) || die "rollback-to-serving setup upgrade exited $status"
+    assert_upgrade_status "succeeded"
+    wait_rollout
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-serving-before.json"
+    serving="$(python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+if row["status"] != "deployed" or row["app_version"] != sys.argv[1] or row["chart"] != "curie-" + sys.argv[1]:
+    raise SystemExit("newest revision is not deployed at the checkout version")
+print(row["revision"])
+' "$V" <"$EVIDENCE_DIR/rollback-serving-before.json")" \
+        || die "rollback-to-serving setup did not establish a serving revision at $V"
+
+    # Start Helm directly so the recorded PID is the process that holds its lock.
+    helm --kubeconfig "$KUBECONFIG_FILE" "${HELM_CONTEXT_ARGS[@]}" upgrade "$RELEASE" "$CHART_V" -n "$NAMESPACE" \
+        --reuse-values --wait --timeout 10m \
+        >"$EVIDENCE_DIR/rollback-serving-interrupted.log" 2>&1 &
+    ROLLBACK_SERVING_HELM_PID=$!
+    local deadline=$((SECONDS + 300))
+    while (( SECONDS < deadline )); do
+        helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-serving-pending.json"
+        pending="$(python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+if row["status"] == "pending-upgrade" and int(row["revision"]) > int(sys.argv[1]):
+    print(row["revision"])
+' "$serving" <"$EVIDENCE_DIR/rollback-serving-pending.json")"
+        [[ -z "$pending" ]] || break
+        kill -0 "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    [[ -n "$pending" ]] || die "rollback-to-serving did not observe pending-upgrade within 300s"
+    kill -9 "$ROLLBACK_SERVING_HELM_PID" \
+        || die "rollback-to-serving Helm exited before SIGKILL"
+    status=0
+    wait "$ROLLBACK_SERVING_HELM_PID" 2>/dev/null || status=$?
+    ROLLBACK_SERVING_HELM_PID=""
+    (( status != 0 )) || die "rollback-to-serving interrupted Helm reported success"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-serving-killed.json"
+    python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+newest = max(rows, key=lambda r: int(r["revision"]))
+serving, pending, version = sys.argv[1:]
+if int(newest["revision"]) != int(pending) or newest["status"] != "pending-upgrade":
+    raise SystemExit("killed upgrade did not leave its newest revision pending-upgrade")
+if not any(int(r["revision"]) == int(serving) and r["status"] == "deployed" and r["app_version"] == version for r in rows):
+    raise SystemExit("killed upgrade did not retain the serving revision")
+' "$serving" "$pending" "$V" <"$EVIDENCE_DIR/rollback-serving-killed.json" \
+        || die "rollback-to-serving did not preserve the required interrupted history"
+
+    status=0
+    "$BIN" --json cluster rollback --dry-run --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-serving-dry-run.json" 2>"$EVIDENCE_DIR/rollback-serving-dry-run.err" \
+        || status=$?
+    (( status == 0 )) || die "rollback-to-serving dry run exited $status"
+    python3 -c '
+import json, shlex, sys
+doc = json.load(sys.stdin)
+release, serving, pending, version = sys.argv[1:]
+plan = doc["plan"]
+summary = f"selected revision {serving} (deployed, curie-{version}) from revision {pending}; skipped none"
+commands = [shlex.split(line) for line in plan]
+if doc.get("dry_run") is not True or summary not in plan:
+    raise SystemExit("dry run does not identify the serving and pending revisions")
+if not any(args[:4] == ["helm", "rollback", release, serving] for args in commands):
+    raise SystemExit("dry run does not name the serving revision in its Helm rollback command")
+' "$RELEASE" "$serving" "$pending" "$V" <"$EVIDENCE_DIR/rollback-serving-dry-run.json" \
+        || die "rollback-to-serving dry run selected the wrong target"
+
+    status=0
+    "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
+        >"$EVIDENCE_DIR/rollback-serving.json" 2>"$EVIDENCE_DIR/rollback-serving.err" \
+        || status=$?
+    (( status == 0 )) || die "rollback-to-serving rollback exited $status"
+    [[ "$(json_field "$EVIDENCE_DIR/rollback-serving.json" "to_revision")" == "$serving" ]] \
+        || die "rollback-to-serving rollback did not target serving revision $serving"
+    [[ "$(json_field "$EVIDENCE_DIR/rollback-serving.json" "from_revision")" == "$pending" ]] \
+        || die "rollback-to-serving rollback did not start from pending revision $pending"
+    helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-serving-after.json"
+    python3 -c '
+import json, sys
+row = max(json.load(sys.stdin), key=lambda r: int(r["revision"]))
+serving, pending, version = sys.argv[1:]
+if int(row["revision"]) <= int(pending) or row["status"] != "deployed" or row["app_version"] != version or row["chart"] != "curie-" + version:
+    raise SystemExit("newest rollback revision is not deployed at the serving version")
+if row["description"] != "Rollback to " + serving:
+    raise SystemExit("newest revision does not record rollback to the serving revision")
+' "$serving" "$pending" "$V" <"$EVIDENCE_DIR/rollback-serving-after.json" \
+        || die "rollback-to-serving did not restore the serving version in Helm history"
+    wait_rollout
+    kubectl_ns get deploy "$(fullname)-api" -o json | python3 -c '
+import json, sys
+if int(json.load(sys.stdin).get("status", {}).get("readyReplicas", 0)) < 1:
+    raise SystemExit("API has no ready replicas")
+' || die "rollback-to-serving API is not Ready"
+    api_health >/dev/null || die "rollback-to-serving API health failed"
+    log "rollback-to-serving restored revision $serving at $V over pending revision $pending; API is Ready and healthy"
+}
+
 write_evidence() {
     local elapsed=$((SECONDS - STARTED_AT)) shard_json scenarios_json
     shard_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1] or None))' "$SHARD")"
@@ -2496,6 +2625,7 @@ scenario_fn() {
         converge-negative) echo run_converge_negative ;;
         previous-serves) echo run_previous_serves ;;
         apply-kill-takeover) echo run_apply_kill_takeover ;;
+        rollback-to-serving) echo run_rollback_to_serving ;;
         *) die "no runner for scenario '$1'" ;;
     esac
 }

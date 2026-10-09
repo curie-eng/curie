@@ -111,6 +111,10 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin guarded rollback reloading 0.10.0 images\n{text}"
     );
     assert!(
+        text.contains("rollback-to-serving leaves the pending revision for the CLI"),
+        "self-test must refuse recovery helpers in rollback-to-serving\n{text}"
+    );
+    assert!(
         text.contains("published 0.8.8 rollback reloads 0.8.8 images"),
         "self-test must pin rollback-088 reloading 0.8.8 images\n{text}"
     );
@@ -386,9 +390,18 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         ids,
         [
             "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s11", "s13", "s14",
-            "s16"
+            "s16", "s17",
         ],
         "canonical shard ids\n{manifest}"
+    );
+    let rollback_shard = shards
+        .iter()
+        .find(|shard| shard["id"] == "s17")
+        .expect("rollback-to-serving shard s17");
+    assert_eq!(
+        rollback_shard["scenarios"],
+        serde_json::json!([{"name": "rollback-to-serving", "phases": null}]),
+        "s17 must run rollback-to-serving"
     );
 
     let mut unsplit: Vec<String> = Vec::new();
@@ -509,7 +522,8 @@ s09 setup n-to-n1 guarded-rollback
 s11 nosetup rollback-published-089
 s13 setup converge-negative
 s14 setup previous-serves
-s16 setup apply-kill-takeover";
+s16 setup apply-kill-takeover
+s17 setup rollback-to-serving";
 
 fn assert_override_refused(manifest: &str, what: &str) {
     assert_ne!(
@@ -547,6 +561,14 @@ fn self_test_fails_when_override_drops_a_scenario() {
     assert_override_refused(
         &GOOD_SHARDS.replace(" migration-crash", ""),
         "dropped scenario",
+    );
+}
+
+#[test]
+fn self_test_fails_when_override_drops_rollback_to_serving() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("\ns17 setup rollback-to-serving", ""),
+        "dropped rollback-to-serving scenario",
     );
 }
 

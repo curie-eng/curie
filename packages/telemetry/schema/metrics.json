@@ -984,7 +984,8 @@
           "runner-timeout",
           "workspace-error",
           "sandbox-terminated",
-          "sandbox-capacity"
+          "sandbox-capacity",
+          "model-unreachable"
         ],
         "service.name": [
           "curie-worker"
@@ -994,7 +995,7 @@
           "eval"
         ]
       },
-      "cardinality_bound": 14,
+      "cardinality_bound": 16,
       "description": "Bounded queue redelivery and in-process turn retries.",
       "monotonic": true,
       "type": "counter",

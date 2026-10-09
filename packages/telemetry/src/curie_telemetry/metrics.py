@@ -164,6 +164,8 @@ _QUEUE_RETRY_ATTRIBUTES = {
     # cause; omitting it makes the retry metric reject the classification.
     # "sandbox-capacity" (#3693): an approval resume refused by the sandbox
     # ResourceQuota, retried under its own name.
+    # "model-unreachable" (#4333): a transport failure reaching the model
+    # endpoint, retried under its own name.
     "retry_class": [
         "redelivery",
         "rate-limit",
@@ -172,6 +174,7 @@ _QUEUE_RETRY_ATTRIBUTES = {
         "workspace-error",
         "sandbox-terminated",
         "sandbox-capacity",
+        "model-unreachable",
     ],
 }
 _THREAD_ATTRIBUTES = {
