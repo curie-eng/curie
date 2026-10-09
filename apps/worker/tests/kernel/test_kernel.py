@@ -51,6 +51,7 @@ from curie_worker.sandbox import (
     RouteRecord,
     SandboxHandle,
 )
+from curie_worker.sandbox.types import SandboxTermination
 from curie_worker.workspace import (
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
@@ -116,7 +117,7 @@ class _HistoryBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-    **_: object,
+        **_: object,
     ) -> dict[str, str]:
         del kind, address
         return {
@@ -420,7 +421,7 @@ class _BuiltInCodingBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-    **_: object,
+        **_: object,
     ) -> dict[str, str]:
         return {}
 
@@ -1164,7 +1165,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
 
@@ -1299,7 +1300,7 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -1962,7 +1963,7 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -2032,7 +2033,7 @@ def _workspace_binding(
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return dict(boot_env_override or {"CURIE_RUNNER_TOKEN": "workspace-test-token"})
 
@@ -2871,6 +2872,84 @@ def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> No
     asyncio.run(go())
 
 
+class _DropAfterSideEffectPersisted:
+    """A runner ``hold`` that drops the stream once the worker persisted the flag.
+
+    ``abort_after_frames`` can close the socket before the client reads the
+    buffered flag frame, and aiohttp then raises before yielding it. Raising
+    from the handler after the headers were sent aborts the chunked stream.
+    """
+
+    def __init__(self, redis: Any, key: str) -> None:
+        self._redis = redis
+        self._key = key
+
+    async def wait(self) -> None:
+        for _ in range(500):
+            if await self._redis.exists(self._key):
+                break
+            await asyncio.sleep(0.01)
+        raise ConnectionResetError("runner pod deleted")
+
+
+def test_deleted_pod_after_side_effect_escalates_as_sandbox_terminated(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SandboxTermination("Deleted")
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            h.runner.default_script = [SideEffectFlag(tool="deploy"), TextDelta(text="partial")]
+            h.runner.hold = _DropAfterSideEffectPersisted(
+                h.async_redis, h.config.side_effect_key(event.event_id)
+            )
+
+            await h.kernel.process_event(event)
+
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+
+            # ADR 0013: no automatic retry after a side effect, even though
+            # sandbox-terminated is otherwise retryable.
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            assert isinstance(finish["detail"], str)
+            assert "Kubernetes pod terminated: Deleted" in finish["detail"]
+            assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+def test_deleted_pod_without_side_effect_retries(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SandboxTermination("Deleted")
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT, ISSUE_PROMPT]
+            assert len(h.fake_k8s.termination_queries) == 2
+
+    asyncio.run(go())
+
+
 def test_first_eviction_survives_generic_failure_on_retry_in_terminal_and_factory(
     make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -3478,7 +3557,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return {
                 "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
@@ -3690,9 +3769,7 @@ def test_is_eval_thread_key_reads_the_isolate_prefix_from_the_scoped_key() -> No
     is_eval = kernel_module._is_eval_thread_key  # noqa: SLF001
 
     assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100"))
-    assert is_eval(
-        scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops")
-    )
+    assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops"))
     assert not is_eval(scoped_conversation_id("slack", "C1", "1720000000.000100"))
     assert not is_eval(scoped_conversation_id("slack", "C1", "eval-1720000000.000100"))
     assert not is_eval(scoped_conversation_id("slack", "eval:C1", "1720000000.000100"))
@@ -5309,7 +5386,7 @@ class _TokenBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-    **_: object,
+        **_: object,
     ) -> dict[str, str]:
         return {"CURIE_RUNNER_TOKEN": self._token}
 
@@ -6788,12 +6865,8 @@ def test_history_persistence_error_has_dedicated_factory_cause() -> None:
 
 
 def test_max_turns_and_unclassified_have_their_own_factory_causes() -> None:
-    max_turns = kernel_module.TurnOutcome(
-        terminal_ok=False, classification="max-turns"
-    )
-    unclassified = kernel_module.TurnOutcome(
-        terminal_ok=False, classification="unclassified"
-    )
+    max_turns = kernel_module.TurnOutcome(terminal_ok=False, classification="max-turns")
+    unclassified = kernel_module.TurnOutcome(terminal_ok=False, classification="unclassified")
 
     assert kernel_module._escalation_cause(max_turns) == "max_turns"
     assert kernel_module._escalation_cause(unclassified) == "unclassified"
