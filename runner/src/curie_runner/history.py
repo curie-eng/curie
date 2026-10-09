@@ -99,6 +99,7 @@ HISTORY_APPEND_RESERVE_BYTES = 8_192
 # Compare-and-set attempts for one capacity compaction before giving up.
 _COMPACTION_ATTEMPTS = 3
 
+
 def _json_copy(value: JsonContent) -> JsonContent:
     """Return a detached JSON-safe copy of message content."""
 
@@ -197,9 +198,13 @@ def validate_assistant_groups(messages: Sequence[ConversationMessage]) -> None:
         if not isinstance(message.content, list):
             continue
         calls = [block for block in message.content if block.get("type") == "tool_use"]
-        if calls and pending and (
-            message.assistant_group is None
-            or any(group != message.assistant_group for group in pending.values())
+        if (
+            calls
+            and pending
+            and (
+                message.assistant_group is None
+                or any(group != message.assistant_group for group in pending.values())
+            )
         ):
             raise UnprovableAssistantGroupingError(
                 "overlapping tool calls lack common proven assistant grouping; "
@@ -428,10 +433,7 @@ class TurnRecord:
                 isinstance(item, Mapping) for item in raw_messages
             ):
                 raise HistoryError("invalid structured conversation messages")
-            messages = tuple(
-                ConversationMessage.from_dict(item)
-                for item in raw_messages
-            )
+            messages = tuple(ConversationMessage.from_dict(item) for item in raw_messages)
         raw_approval = data.get("approval")
         raw_harness_replay = data.get("harness_replay")
         return cls(
@@ -462,10 +464,7 @@ def _state_value_size(record: Mapping[str, Any]) -> int:
 def _digest_marker(value: str) -> str:
     encoded = value.encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
-    return (
-        "[history payload omitted; "
-        f"sha256={digest}; original_bytes={len(encoded)}]"
-    )
+    return f"[history payload omitted; sha256={digest}; original_bytes={len(encoded)}]"
 
 
 def _add_text_payload(
@@ -498,9 +497,7 @@ def _turn_text_payloads(
     messages = record.get("messages")
     if not isinstance(messages, list):
         return candidates
-    first_user = next(
-        (i for i, message in enumerate(messages) if message["role"] == "user"), None
-    )
+    first_user = next((i for i, message in enumerate(messages) if message["role"] == "user"), None)
     final_assistant = next(
         (i for i in range(len(messages) - 1, -1, -1) if messages[i]["role"] == "assistant"),
         None,
@@ -571,9 +568,7 @@ def _turn_text_payloads(
     return candidates
 
 
-def _replace_path(
-    root: dict[str, Any], path: tuple[str | int, ...], replacement: str
-) -> None:
+def _replace_path(root: dict[str, Any], path: tuple[str | int, ...], replacement: str) -> None:
     target: Any = root
     for part in path[:-1]:
         target = target[part]
@@ -624,9 +619,7 @@ def _compact_tool_groups(raw: dict[str, Any], max_value_bytes: int) -> dict[str,
         neighbors.setdefault(call_index, set()).add(reply_index)
         neighbors.setdefault(reply_index, set()).add(call_index)
 
-    first_user = next(
-        (i for i, message in enumerate(messages) if message["role"] == "user"), None
-    )
+    first_user = next((i for i, message in enumerate(messages) if message["role"] == "user"), None)
     if first_user is not None:
         protected.add(first_user)
     final_assistant = next(
@@ -674,7 +667,10 @@ def _compact_tool_groups(raw: dict[str, Any], max_value_bytes: int) -> dict[str,
                 [{"type": "text", "text": content}] if isinstance(content, str) else content
             ):
                 if block.get("type") in (
-                    "tool_use", "tool_result", "thinking", "redacted_thinking"
+                    "tool_use",
+                    "tool_result",
+                    "thinking",
+                    "redacted_thinking",
                 ):
                     omitted_blocks.append(block)
                     call_count += block.get("type") == "tool_use"
@@ -703,9 +699,7 @@ def _compact_tool_groups(raw: dict[str, Any], max_value_bytes: int) -> dict[str,
     return candidate
 
 
-def bound_turn_record(
-    record: TurnRecord, *, max_value_bytes: int
-) -> TurnRecord:
+def bound_turn_record(record: TurnRecord, *, max_value_bytes: int) -> TurnRecord:
     """Bound one turn for a whole state value without losing message order.
 
     Native harness replay is discarded first because portable messages are the
@@ -1266,9 +1260,7 @@ def build_conversation_replay(
             latest_summary_index = index
 
     appended_turns = [
-        record
-        for record in records[latest_summary_index + 1 :]
-        if isinstance(record, TurnRecord)
+        record for record in records[latest_summary_index + 1 :] if isinstance(record, TurnRecord)
     ]
     active_turns = [
         *((latest_summary.tail) if latest_summary is not None else ()),
@@ -1281,9 +1273,7 @@ def build_conversation_replay(
         )
         source_turns = latest_summary.source_turns + len(active_turns)
     else:
-        current_messages = tuple(
-            message for turn in active_turns for message in turn.messages
-        )
+        current_messages = tuple(message for turn in active_turns for message in turn.messages)
         source_turns = len(active_turns)
 
     over_turns = max_turns is not None and len(active_turns) > max_turns
