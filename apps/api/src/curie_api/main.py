@@ -30,7 +30,7 @@ from starlette.routing import Match
 
 from curie_api.crud import agents as crud_agents
 
-from . import __version__
+from . import __version__, oidc
 from .channel_identities import start_static_slack_bootstrap
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
@@ -479,6 +479,8 @@ def create_app() -> FastAPI:
     # Which credential the platform will clone with (ADR-0092, #1262). One
     # line, no secret, and a warning when the App is set up only halfway.
     log_credential_path(get_settings())
+    # And whether an enabled OIDC login admits everyone its IdP signs in.
+    oidc.log_admission_policy(get_settings())
     app = FastAPI(title="Curie API", version="0.1.0", lifespan=lifespan)
 
     @app.get("/health", tags=["health"])

@@ -106,8 +106,8 @@ fn release_catalog_windows_match_their_revision_boundaries() {
         (
             "0.13.0",
             "0082",
-            "0099",
-            &["0082", "0091a", "0092a", "0093a", "0098", "0099"],
+            "0100",
+            &["0082", "0091a", "0092a", "0093a", "0098", "0099", "0100"],
             &["0081", "0091", "0092", "0093"],
             false,
             false,
@@ -173,8 +173,8 @@ fn stable_v0100_sorts_after_its_release_candidate_for_fail_forward() {
 /// 0071, work item base expansion 0072, polling cursor expansion 0073, hook
 /// source policy/operation expansions 0075/0076, deploy notice expansion
 /// 0082, provider-installations/channel-identities expansion 0083, channel
-/// canvas edits expansion 0084, and action executions expansion 0085, so the
-/// upgrade is forward-only.
+/// canvas edits expansion 0084, action executions expansion 0085, and OIDC
+/// login expansion 0100, so the upgrade is forward-only.
 #[test]
 fn v091_source_upgrades_through_the_packaged_chart_graph() {
     let source = window_for("0.9.1").expect("0.9.1 is catalogued");
@@ -184,7 +184,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
 
     assert_eq!(source.schema_head, "0044");
     assert_eq!(target.schema_min, "0082");
-    assert_eq!(target.schema_head, "0099");
+    assert_eq!(target.schema_head, "0100");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
@@ -201,7 +201,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
             "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0075", "0076", "0079", "0080",
             "0081", "0082", "0083", "0084", "0085", "0086", "0087", "0088", "0089", "0090",
             "0091a", "0092a", "0093a", "0094", "0095", "0096", "0097", "0098", "0091", "0092",
-            "0093", "0099"
+            "0093", "0099", "0100"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -245,7 +245,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0058");
-    assert_eq!(target.schema_head, "0099");
+    assert_eq!(target.schema_head, "0100");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.1 reaches the new head");
     assert_eq!(
@@ -259,7 +259,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066", "0067", "0068", "0069",
             "0070", "0071", "0072", "0073", "0075", "0076", "0079", "0080", "0081", "0082", "0083",
             "0084", "0085", "0086", "0087", "0088", "0089", "0090", "0091a", "0092a", "0093a",
-            "0094", "0095", "0096", "0097", "0098", "0091", "0092", "0093", "0099"
+            "0094", "0095", "0096", "0097", "0098", "0091", "0092", "0093", "0099", "0100"
         ]
     );
 
@@ -287,10 +287,10 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
 // @spec PROTECTED-HOOK-SOURCE-10
 /// Released 0.10.2 stamps 0062. Stable 0.10.3 follows with contract 0063,
 /// the feature train continues with expansions through 0069, contract
-/// 0070 establishes route identity, then expansions 0071 through 0081 add
+/// 0070 establishes route identity, then expansions 0071 through 0099 add
 /// memory writes, work item bases, polling cursors, hook source
-/// policies/operations, deploy notices, and provider installations/channel
-/// identities.
+/// policies/operations, deploy notices, provider installations/channel
+/// identities, and remediation tables, plus OIDC login expansion 0100.
 #[test]
 fn released_v0102_upgrades_through_the_feature_train_revisions() {
     // @spec DEPLOY-NOTICE-RELEASE-1.
@@ -300,7 +300,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0062");
-    assert_eq!(target.schema_head, "0099");
+    assert_eq!(target.schema_head, "0100");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.2 reaches the new head");
     assert_eq!(
@@ -314,7 +314,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             "0063", "0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071", "0072", "0073",
             "0075", "0076", "0079", "0080", "0081", "0082", "0083", "0084", "0085", "0086", "0087",
             "0088", "0089", "0090", "0091a", "0092a", "0093a", "0094", "0095", "0096", "0097",
-            "0098", "0091", "0092", "0093", "0099"
+            "0098", "0091", "0092", "0093", "0099", "0100"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -347,7 +347,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
 /// Released 0.10.3 owns revision 0063. The feature train must start after it,
 /// so an upgrade applies every unreleased expansion without mistaking the
 /// released factory queue migration for runner resources. Route identity 0070
-/// is the only contract step; expansions 0071 through 0082 follow it.
+/// is the only contract step; expansions 0071 through 0100 follow it.
 #[test]
 fn released_v0103_upgrades_through_the_renumbered_feature_train() {
     // @spec DEPLOY-NOTICE-RELEASE-1.
@@ -357,7 +357,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0063");
-    assert_eq!(target.schema_head, "0099");
+    assert_eq!(target.schema_head, "0100");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.3 reaches the new head");
     assert_eq!(
@@ -371,7 +371,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             "0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0075",
             "0076", "0079", "0080", "0081", "0082", "0083", "0084", "0085", "0086", "0087", "0088",
             "0089", "0090", "0091a", "0092a", "0093a", "0094", "0095", "0096", "0097", "0098",
-            "0091", "0092", "0093", "0099"
+            "0091", "0092", "0093", "0099", "0100"
         ]
     );
     let contracts: Vec<&str> = pending

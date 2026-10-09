@@ -104,11 +104,11 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
     assert result.rollback_compatible is True
     pending = {step.revision for step in result.pending}
     if branch_head == "0093":
-        assert {"0082", "0091a", "0092a", "0093a", "0098", "0099"} <= pending
+        assert {"0082", "0091a", "0092a", "0093a", "0098", "0099", "0100"} <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
-        assert pending == {"0091", "0092", "0093", "0099"}
-    assert current_revision() == "0099"
+        assert pending == {"0091", "0092", "0093", "0099", "0100"}
+    assert current_revision() == "0100"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]

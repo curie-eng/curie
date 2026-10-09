@@ -1785,6 +1785,111 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/console/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logout
+         * @description Revoke the session in the cookie, whichever login minted it, and clear it.
+         *
+         *     Deliberately no credential beyond the cookie itself: the cookie names the
+         *     one session this can end, and ``X-API-Key`` is not a way to name one.
+         *     Always the same 204, whether the cookie was live, unknown, already revoked
+         *     or absent, so logout is idempotent and says nothing about which it was.
+         *     SameSite=Strict keeps a cross-site page from logging someone out, but not a
+         *     same-site cross-origin form (#3000), so a present cookie's origin must also
+         *     match before the session is touched.
+         */
+        post: operations["logout_console_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/console/oidc/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Oidc Callback
+         * @description Finish an OIDC login and mint a principal console session.
+         *
+         *     The order is the security argument: bind ``state`` to this browser's
+         *     cookie, then spend the server-side attempt (single use, committed before
+         *     anything else can fail), and only then touch the IdP with the code and the
+         *     stored PKCE verifier. The ID token is validated against the attempt's
+         *     nonce, the principal is resolved and must be active in an active tenant,
+         *     and only then does a session exist. Every terminal response clears the
+         *     state cookie, and every refusal looks the same. A rate-limited 429 is not
+         *     terminal: it comes before the attempt is touched and keeps the cookie, so
+         *     the same callback can complete after ``Retry-After``.
+         *
+         *     The ``code`` and ``state`` in the query may land in access logs. That is
+         *     tolerated: the code is useless without the verifier that never left the
+         *     server, and the state is single-use and cookie-bound.
+         */
+        get: operations["oidc_callback_console_oidc_callback_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/console/oidc/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Oidc Login
+         * @description Start an OIDC login: persist an attempt and redirect to the IdP.
+         *
+         *     Discovery runs first so a misconfigured or mixed-up IdP fails here, before
+         *     an attempt row exists and before the browser is sent anywhere.
+         */
+        get: operations["oidc_login_console_oidc_login_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/console/principal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Current Principal
+         * @description Return the principal the OIDC session cookie authenticates.
+         */
+        get: operations["current_principal_console_principal_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/console/session": {
         parameters: {
             query?: never;
@@ -6346,6 +6451,35 @@ export interface components {
             namespace: string;
             /** Pod */
             pod: string;
+        };
+        /**
+         * PrincipalOut
+         * @description The principal an OIDC console session authenticates (#2908).
+         *
+         *     Identity and display attributes only. ``idp_issuer`` and the authorization
+         *     version are server bookkeeping the console has no use for, and the session
+         *     token never appears here for the same reason it is absent from
+         *     ``ConsoleSessionOut``.
+         */
+        PrincipalOut: {
+            /** Display Name */
+            display_name: string | null;
+            /** Email */
+            email: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Idp Subject */
+            idp_subject: string;
+            /** Status */
+            status: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
         };
         /**
          * ProbeCreate
@@ -12476,6 +12610,124 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ConsoleLoginCodeOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    logout_console_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    oidc_callback_console_oidc_callback_get: {
+        parameters: {
+            query?: {
+                code?: string | null;
+                state?: string | null;
+                error?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_oidc_state"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            303: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The login was refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    oidc_login_console_oidc_login_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            302: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    current_principal_console_principal_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrincipalOut"];
                 };
             };
             /** @description Validation Error */

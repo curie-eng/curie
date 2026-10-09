@@ -35,9 +35,10 @@ from sqlalchemy.exc import DBAPIError
 BELOW = "0086"
 # The single head now: the nomination revision (task 6), the ledger fields
 # revision (task 8), the read executions revision (task 7), the execution code
-# revision (task 11) and the remediation approvals revision (task 10) follow the
-# policy one.
-HEAD = "0097"
+# revision (task 11), the remediation approvals revision (task 10) and the rest
+# of the feature train follow the policy one, and the OIDC login migration
+# (#2908) follows all of it.
+HEAD = "0100"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}
 GENERATION_COLUMNS = {

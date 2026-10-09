@@ -31,11 +31,24 @@ does not become a platform key and cannot call either administrative mint.
 Readers accept only ``__Host-curie_console_session``. Sessions already minted
 under ``curie_console_session`` stop working; the session TTL is 12 hours, and
 the operator exchanges a new login code.
+
+Generic OIDC login (#2908, ADR 0155) is a second way to arrive at the same
+kind of session: ``GET /console/oidc/login`` redirects to the IdP with PKCE,
+``GET /console/oidc/callback`` exchanges the code server-side and mints a
+session bound to a principal instead of a ``subject``. No token ever reaches
+browser script -- the reason for a server-side code flow rather than an
+endpoint that accepts an ID token from the page. ``GET /console/principal`` is
+the first route guarded by ``require_principal_session``.
+
+``POST /console/logout`` ends either kind of session.
 """
 
+import hmac
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse, RedirectResponse
 
 from curie_api.crud import console as crud_console
 from curie_api.schemas.console import (
@@ -43,12 +56,18 @@ from curie_api.schemas.console import (
     ConsoleLoginCodeOut,
     ConsoleSessionExchange,
     ConsoleSessionOut,
+    PrincipalOut,
 )
 
-from ..approval_auth import set_console_session_cookie
-from ..auth import CONSOLE_SESSION_COOKIE, require_platform_key
+from .. import oidc
+from ..approval_auth import enforce_console_cookie_origin, set_console_session_cookie
+from ..auth import CONSOLE_SESSION_COOKIE, require_platform_key, require_principal_session
+from ..config import get_settings
 from ..deps import SessionDep
+from ..models import Principal
 from ..rate_limit import require_rate_limit
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/console", tags=["console"])
 
@@ -64,6 +83,18 @@ async def limit_session_exchange(request: Request) -> None:
 
 async def limit_current_session(request: Request) -> None:
     await require_rate_limit(request, route="console_session_get", limit=120, window_seconds=60)
+
+
+async def limit_logout(request: Request) -> None:
+    await require_rate_limit(request, route="console_logout", limit=30, window_seconds=60)
+
+
+async def limit_oidc(request: Request, *, route: str) -> None:
+    # Login and callback write (an attempt row; an IdP exchange and a session),
+    # so they get the write budget although both are GETs. Called after the
+    # OIDC-enabled check, not as a dependency, so a disabled install keeps its
+    # plain 404 and never reaches Valkey.
+    await require_rate_limit(request, route=route, limit=30, window_seconds=60)
 
 
 @router.post(
@@ -148,3 +179,223 @@ async def current_session(
         subject=subject,
         expires_at=expires_at,
     )
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+    dependencies=[Depends(limit_logout)],
+)
+async def logout(
+    request: Request,
+    session: SessionDep,
+    console_session: Annotated[str | None, Cookie(alias=SESSION_COOKIE)] = None,
+) -> Response:
+    """Revoke the session in the cookie, whichever login minted it, and clear it.
+
+    Deliberately no credential beyond the cookie itself: the cookie names the
+    one session this can end, and ``X-API-Key`` is not a way to name one.
+    Always the same 204, whether the cookie was live, unknown, already revoked
+    or absent, so logout is idempotent and says nothing about which it was.
+    SameSite=Strict keeps a cross-site page from logging someone out, but not a
+    same-site cross-origin form (#3000), so a present cookie's origin must also
+    match before the session is touched.
+    """
+    if console_session:
+        enforce_console_cookie_origin(request)
+        row = await crud_console.live_console_session(session, console_session)
+        if row is not None:
+            await crud_console.revoke_console_session(session, row)
+    response = Response(
+        status_code=status.HTTP_204_NO_CONTENT, headers={"Cache-Control": "no-store"}
+    )
+    # Same name, path and flags as the set, or the browser keeps its cookie.
+    response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True, samesite="strict")
+    return response
+
+
+# --- generic OIDC login (#2908) ------------------------------------------------
+
+#: Carries ``state`` from the login redirect to the callback in the same
+#: browser. The callback requires the query ``state`` to equal it, which is the
+#: login-CSRF binding: an attacker cannot make a victim's browser complete a
+#: login the attacker started, because the victim's browser never got this
+#: cookie. SameSite=Lax (not Strict) because the callback arrives as a
+#: top-level navigation FROM the IdP's site, and Strict would withhold it.
+#:
+#: The ``__Host-`` prefix makes the browser accept the cookie only when it is
+#: Secure, Path=/ and host-only (no Domain). Without it a sibling subdomain or
+#: a plaintext response could plant a state of the attacker's choosing, which
+#: turns the binding back into login CSRF. The callback reads only this name.
+#: Path=/ is also what the prefix requires, and it keeps the cookie reaching
+#: the callback when the API sits behind a path prefix such as ``/api``.
+OIDC_STATE_COOKIE = "__Host-curie_oidc_state"
+_OIDC_COOKIE_PATH = "/"
+_NO_STORE = {"Cache-Control": "no-store"}
+#: The one body every refused callback gets. Never the IdP's `error` or
+#: `error_description`: those are attacker-influenced strings, and echoing
+#: which step failed would tell a prober what to fix.
+_OIDC_REFUSED = "OIDC login failed"
+
+
+def _require_oidc_enabled() -> None:
+    # 404, not 403: with OIDC off the routes should look like they do not
+    # exist, exactly as they did before this feature.
+    if not get_settings().oidc_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, headers=_NO_STORE)
+
+
+def _clear_state_cookie(response: Response) -> None:
+    # Same name, path and flags as the set: a browser only replaces (and so
+    # only deletes) the cookie those match, and it refuses a __Host- cookie
+    # that is not Secure with Path=/.
+    response.delete_cookie(
+        OIDC_STATE_COOKIE, path=_OIDC_COOKIE_PATH, secure=True, httponly=True, samesite="lax"
+    )
+
+
+def _refuse_callback(reason: str) -> JSONResponse:
+    """The single indistinguishable callback failure; the reason goes to logs only."""
+
+    logger.warning("oidc callback refused: %s", reason)
+    response = JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"detail": _OIDC_REFUSED},
+        headers=_NO_STORE,
+    )
+    _clear_state_cookie(response)
+    return response
+
+
+@router.get("/oidc/login", status_code=status.HTTP_302_FOUND, response_class=RedirectResponse)
+async def oidc_login(request: Request, session: SessionDep) -> RedirectResponse:
+    """Start an OIDC login: persist an attempt and redirect to the IdP.
+
+    Discovery runs first so a misconfigured or mixed-up IdP fails here, before
+    an attempt row exists and before the browser is sent anywhere.
+    """
+    _require_oidc_enabled()
+    await limit_oidc(request, route="console_oidc_login")
+    try:
+        metadata = await oidc.discover()
+    except oidc.OidcError as exc:
+        logger.warning("oidc discovery failed: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="identity provider unavailable",
+            headers=_NO_STORE,
+        ) from None
+    try:
+        start = await crud_console.create_oidc_login_attempt(session)
+    except crud_console.OidcLoginAttemptsExhausted:
+        # No row, no state cookie: a refused start leaves nothing behind.
+        logger.warning("oidc login refused: live login attempt cap reached")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="too many logins in progress; try again shortly",
+            headers=_NO_STORE,
+        ) from None
+    response = RedirectResponse(
+        oidc.authorization_url(
+            metadata,
+            state=start.state,
+            nonce=start.nonce,
+            challenge=start.code_challenge,
+        ),
+        status_code=status.HTTP_302_FOUND,
+        headers=_NO_STORE,
+    )
+    response.set_cookie(
+        OIDC_STATE_COOKIE,
+        start.state,
+        max_age=int(crud_console.OIDC_LOGIN_TTL.total_seconds()),
+        path=_OIDC_COOKIE_PATH,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
+    return response
+
+
+@router.get(
+    "/oidc/callback",
+    status_code=status.HTTP_303_SEE_OTHER,
+    response_class=RedirectResponse,
+    responses={401: {"description": "The login was refused"}},
+)
+async def oidc_callback(
+    request: Request,
+    session: SessionDep,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    # title: keep the schema title the prefix-free name gave it, not the
+    # "  Host-..." pydantic derives from the __Host- alias.
+    state_cookie: Annotated[
+        str | None, Cookie(alias=OIDC_STATE_COOKIE, title="Curie Oidc State")
+    ] = None,
+) -> Response:
+    """Finish an OIDC login and mint a principal console session.
+
+    The order is the security argument: bind ``state`` to this browser's
+    cookie, then spend the server-side attempt (single use, committed before
+    anything else can fail), and only then touch the IdP with the code and the
+    stored PKCE verifier. The ID token is validated against the attempt's
+    nonce, the principal is resolved and must be active in an active tenant,
+    and only then does a session exist. Every terminal response clears the
+    state cookie, and every refusal looks the same. A rate-limited 429 is not
+    terminal: it comes before the attempt is touched and keeps the cookie, so
+    the same callback can complete after ``Retry-After``.
+
+    The ``code`` and ``state`` in the query may land in access logs. That is
+    tolerated: the code is useless without the verifier that never left the
+    server, and the state is single-use and cookie-bound.
+    """
+    _require_oidc_enabled()
+    await limit_oidc(request, route="console_oidc_callback")
+    if not state or not state_cookie or not hmac.compare_digest(
+        state.encode("utf-8"), state_cookie.encode("utf-8")
+    ):
+        return _refuse_callback("state does not match the state cookie")
+    attempt = await crud_console.consume_oidc_login_attempt(session, state)
+    if attempt is None:
+        return _refuse_callback("unknown, consumed or expired login attempt")
+    if error is not None:
+        return _refuse_callback("the IdP returned an error")
+    if not code:
+        return _refuse_callback("no authorization code")
+    try:
+        id_token = await oidc.exchange_code(code, attempt.code_verifier)
+        claims = await oidc.validate_id_token(id_token, nonce=attempt.nonce)
+    except oidc.OidcError as exc:
+        return _refuse_callback(str(exc))
+    # Before resolve_principal, so a refused person gets no principal row and
+    # an existing principal's attributes are not refreshed by a login that
+    # does not happen.
+    if not oidc.meets_required_claims(claims, get_settings().oidc_required_claims):
+        return _refuse_callback("ID token lacks a required claim")
+
+    principal = await crud_console.resolve_principal(session, claims)
+    if not await crud_console.principal_is_active(session, principal):
+        # Undo the attribute refresh: a refused login changes nothing.
+        await session.rollback()
+        return _refuse_callback("principal or tenant is not active")
+    token, _ = await crud_console.create_principal_console_session(session, principal)
+
+    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER, headers=_NO_STORE)
+    # The same cookie, with the same flags and reasons, as exchange_login_code.
+    set_console_session_cookie(response, token)
+    _clear_state_cookie(response)
+    return response
+
+
+@router.get("/principal", response_model=PrincipalOut)
+async def current_principal(
+    principal: Annotated[Principal, Depends(require_principal_session)],
+    response: Response,
+) -> PrincipalOut:
+    """Return the principal the OIDC session cookie authenticates."""
+
+    response.headers["Cache-Control"] = "no-store"
+    return PrincipalOut.model_validate(principal)

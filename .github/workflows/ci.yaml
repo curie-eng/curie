@@ -1959,6 +1959,48 @@ jobs:
           CURIE_E2E_TIERS: ${{ needs.changes.outputs.skill_local_tiers }}
         run: bash cli/scripts/e2e-ladder.sh
 
+  # OIDC console login against a real Dex IdP (#2908, #3800). Runs whenever the
+  # local tier is selected: the API, the console UI proxy and compose wiring it
+  # drives are the local tier's surfaces. Its own runner, so it runs in parallel
+  # with the ladder. `curie dev oidc-e2e` runs the same driver locally.
+  e2e-oidc:
+    name: E2E OIDC console login (real Dex)
+    runs-on: ubuntu-latest
+    needs: [rust-build, changes, ci-images]
+    if: ${{ needs.changes.outputs.local == 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Download the curie binary built by the Rust job
+        uses: actions/download-artifact@v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Make the binary executable
+        run: chmod +x cli/target/release/curie
+      - name: Load the images built by the ci-images job
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,ui}"
+      - name: Tag the candidate API and console UI for the driver
+        run: |
+          set -euo pipefail
+          docker tag curie-ci/api:candidate ghcr.io/curie-eng/curie-api:oidc-e2e
+          docker tag curie-ci/ui:candidate ghcr.io/curie-eng/curie-ui:oidc-e2e
+      - name: OIDC end to end (real Dex, isolated compose project)
+        env:
+          CURIE_BIN: cli/target/release/curie
+          CURIE_OIDC_E2E_IMAGE_TAG: oidc-e2e
+        run: bash cli/scripts/oidc-e2e.sh --evidence "$RUNNER_TEMP/oidc-e2e-evidence.json"
+      - name: Upload the OIDC evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: oidc-e2e-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/oidc-e2e-evidence.json
+          if-no-files-found: warn
+
   # LOCAL-RELEASE RUNG -- split into its own job (issue #695 follow-up) so it
   # runs in PARALLEL with the skill+local rung above instead of appended after
   # it, taking the release round trip off the ladder's critical path
@@ -4020,7 +4062,7 @@ jobs:
     permissions:
       contents: read
       actions: read
-    needs: [changes, e2e-ladder, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
+    needs: [changes, e2e-ladder, e2e-oidc, e2e-ladder-release, e2e-ladder-cluster, e2e-cluster-chart-regressions, e2e-cluster-rollout-recovery, e2e-cluster-approval-resume-restarts, e2e-released-upgrade, e2e-released-upgrade-negative, e2e-cluster-upgrade-matrix-shards, e2e-cluster-upgrade-matrix]
     # A cancelled run leaves no evidence and must rerun. In a completed run,
     # every dependency outcome reaches the strict matcher below, which rejects
     # selected results other than success.
@@ -4038,6 +4080,7 @@ jobs:
           RELEASED_UPGRADE_FULL: ${{ needs.changes.outputs.released_upgrade_full }}
           APPROVAL_RESUME_SELECTED: ${{ needs.changes.outputs.approval_resume }}
           SKILL_LOCAL_RESULT: ${{ needs.e2e-ladder.result }}
+          OIDC_RESULT: ${{ needs.e2e-oidc.result }}
           LOCAL_RELEASE_RESULT: ${{ needs.e2e-ladder-release.result }}
           CLUSTER_RESULT: ${{ needs.e2e-ladder-cluster.result }}
           CLUSTER_CHART_RESULT: ${{ needs.e2e-cluster-chart-regressions.result }}
@@ -4052,6 +4095,7 @@ jobs:
 
           validate_selected_outcomes() {
             if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
+                  "$OIDC_RESULT" != "$oidc_expected" ||
                   "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
                   "$CLUSTER_RESULT" != "$cluster_expected" ||
                   "$CLUSTER_CHART_RESULT" != "$cluster_expected" ||
@@ -4082,6 +4126,11 @@ jobs:
           skill_local_expected="skipped"
           if [[ "$SKILL_SELECTED" == "true" || "$LOCAL_SELECTED" == "true" ]]; then
             skill_local_expected="success"
+          fi
+          # Mirrors the OIDC job's if: it runs whenever the local tier does.
+          oidc_expected="skipped"
+          if [[ "$LOCAL_SELECTED" == "true" ]]; then
+            oidc_expected="success"
           fi
           local_release_expected="skipped"
           if [[ "$LOCAL_RELEASE_SELECTED" == "true" ]]; then
@@ -4120,7 +4169,7 @@ jobs:
 
           # Flip every checked result in turn. Each flipped verdict must be
           # rejected, so no dependency can drop out of the validator unnoticed.
-          for name in SKILL_LOCAL_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
+          for name in SKILL_LOCAL_RESULT OIDC_RESULT LOCAL_RELEASE_RESULT CLUSTER_RESULT \
             CLUSTER_CHART_RESULT ROLLOUT_RECOVERY_RESULT APPROVAL_RESUME_RESULT \
             RELEASED_UPGRADE_RESULT \
             RELEASED_UPGRADE_NEGATIVE_RESULT UPGRADE_MATRIX_RESULT; do

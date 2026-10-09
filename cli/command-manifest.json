@@ -10195,6 +10195,24 @@
           "name": "model-credit"
         },
         {
+          "about": "Drive generic OIDC console login end to end against a real Dex IdP (#2908, #3800, `python3 tools/oidc-e2e/oidc_e2e.py`). Boots this checkout's API and console UI as an isolated compose project beside Dex, logs in through the console's /api proxy, and asserts PKCE and cookie flags, callback binding and replay, logout's Origin check, required claims, issuer binding, the rate limit, and that the login-code console login still resolves an approval with OIDC off. Removes everything on exit and writes JSON evidence. Needs Docker; no credentials",
+          "args": [
+            {
+              "global": false,
+              "help": "Driver flags (`--build`, `--keep`, `--evidence <path>`); see `curie dev oidc-e2e -- --help`",
+              "id": "args",
+              "num_args": {
+                "max": 18446744073709551615,
+                "min": 1
+              },
+              "positional": true,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "oidc-e2e"
+        },
+        {
           "about": "Serve a TLS GitHub fixture or capture public check lifecycle recordings",
           "args": [
             {

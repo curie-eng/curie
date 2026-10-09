@@ -358,6 +358,11 @@ _HTTP_OPERATIONS = [
     "/config",
     "/connector-capabilities/probes",
     "/console/login-codes",
+    "/console/logout",
+    # Generic OIDC console login (#2908).
+    "/console/oidc/callback",
+    "/console/oidc/login",
+    "/console/principal",
     "/console/session",
     "/deploy-targets/list",
     "/deploy-targets/resolve",

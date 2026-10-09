@@ -561,7 +561,7 @@ print(json.dumps(graph))
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
         assert_eq!(candidate.schema_min, "0082");
-        assert_eq!(candidate.schema_head, "0099");
+        assert_eq!(candidate.schema_head, "0100");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
@@ -586,6 +586,7 @@ print(json.dumps(graph))
         assert!(live_in_window("0097", &current));
         assert!(live_in_window("0098", &current));
         assert!(live_in_window("0099", &current));
+        assert!(live_in_window("0100", &current));
         assert!(!live_in_window("0093", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
@@ -621,6 +622,7 @@ print(json.dumps(graph))
         assert!(live_in_window("0097", &candidate_release));
         assert!(live_in_window("0098", &candidate_release));
         assert!(live_in_window("0099", &candidate_release));
+        assert!(live_in_window("0100", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let published =
             window_for("0.12.1").expect("released source control window remains catalogued");

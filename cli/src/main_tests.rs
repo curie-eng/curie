@@ -849,6 +849,28 @@ fn dev_subcommands_parse() {
         _ => panic!("dev factory-e2e parsed as another command"),
     }
     assert!(try_parse_from(["curie", "dev", "factory-e2e"]).is_err());
+    for (argv, expected) in [
+        (vec!["curie", "dev", "oidc-e2e"], vec![]),
+        (
+            vec![
+                "curie",
+                "dev",
+                "oidc-e2e",
+                "--build",
+                "--evidence",
+                "out.json",
+            ],
+            vec!["--build", "--evidence", "out.json"],
+        ),
+    ] {
+        let cli = try_parse_from(argv).expect("dev oidc-e2e should parse with or without flags");
+        match cli.command {
+            Some(Command::Dev {
+                action: DevAction::OidcE2e { args },
+            }) => assert_eq!(args, expected),
+            _ => panic!("dev oidc-e2e parsed as another command"),
+        }
+    }
     let cli = try_parse_from(["curie", "dev", "chart-runtime-e2e"])
         .expect("dev chart-runtime-e2e should parse");
     assert!(matches!(
