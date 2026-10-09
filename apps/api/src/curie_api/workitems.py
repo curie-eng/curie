@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from curie_telemetry.redact import redact_text
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -68,6 +68,7 @@ ConflictCode = Literal[
 
 _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
 _IN_FLIGHT_PUBLICATION = ("pending", "approved", "launching", "running")
+_AWAITING_PUBLICATION = (*_IN_FLIGHT_PUBLICATION, "succeeded")
 # A failed finish that never published defers to an in-flight publication (#2577, #3128).
 _UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop"})
 # Longest provider message a factory notice keeps (#3073).
@@ -83,6 +84,27 @@ _NO_READMIT: dict[str, Any] = {
     "readmit_base_source": None,
     "readmit_base_commit": None,
 }
+
+
+def _not_awaiting_publication() -> ColumnElement[bool]:
+    # A publication in flight or succeeded hands the request's terminus to the
+    # publication loop and the CI gate, not to runtime owner loss.
+    return ~exists().where(
+        Publication.execution_request_id == ExecutionRequest.id,
+        Publication.status.in_(_AWAITING_PUBLICATION),
+    )
+
+
+async def _awaits_publication(session: AsyncSession, request_id: uuid.UUID) -> bool:
+    publication_id = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.execution_request_id == request_id,
+            Publication.status.in_(_AWAITING_PUBLICATION),
+        )
+        .limit(1)
+    )
+    return publication_id is not None
 
 
 def _base_values(base: ResolvedBase | None) -> dict[str, Any]:
@@ -2091,16 +2113,7 @@ async def request_owner_lost_cancellation(
     )
     if not heartbeat_lapsed and not owner_absent:
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
-    published = await session.scalar(
-        select(Publication.id)
-        .where(
-            Publication.execution_request_id == request.id,
-            Publication.status == "succeeded",
-        )
-        .limit(1)
-    )
-    if published is not None:
-        # A published request waits on CI; the CI gate owns its terminus.
+    if await _awaits_publication(session, request.id):
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
@@ -2109,6 +2122,7 @@ async def request_owner_lost_cancellation(
             ExecutionRequest.work_item_id == work_item_id,
             ExecutionRequest.version == expected_request_version,
             ExecutionRequest.status == "running",
+            _not_awaiting_publication(),
             (
                 (
                     ExecutionRequest.runtime_heartbeat_expires_at.is_not(None)

@@ -25,6 +25,7 @@ from .threadkeys import (
     route_thread_key_matches,
 )
 from .workitems import (
+    _AWAITING_PUBLICATION,
     ExecutionRequestSnapshot,
     WorkItemConflict,
     WorkItemOutcome,
@@ -33,6 +34,7 @@ from .workitems import (
     _lock_request,
     _lock_request_by_id,
     _lock_work_item,
+    _not_awaiting_publication,
     _outcome,
     _record_runtime_termination,
     _reload_request,
@@ -1041,15 +1043,6 @@ def _not_approval_hold() -> ColumnElement[bool]:
     )
 
 
-def _not_awaiting_publication() -> ColumnElement[bool]:
-    # A publication in flight or succeeded hands the request's terminus to the
-    # publication loop and the CI gate, not to runtime owner loss.
-    return ~exists().where(
-        Publication.execution_request_id == ExecutionRequest.id,
-        Publication.status.in_((*workitems._IN_FLIGHT_PUBLICATION, "succeeded")),
-    )
-
-
 async def list_runtime_owners(
     session: AsyncSession, *, limit: int, after: uuid.UUID | None = None
 ) -> list[RuntimeOwnerRow]:
@@ -1122,7 +1115,7 @@ async def declare_owner_lost(
         select(Publication.id)
         .where(
             Publication.execution_request_id == request.id,
-            Publication.status.in_((*workitems._IN_FLIGHT_PUBLICATION, "succeeded")),
+            Publication.status.in_(_AWAITING_PUBLICATION),
         )
         .limit(1)
     )

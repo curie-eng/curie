@@ -3161,7 +3161,29 @@ def test_an_owner_lost_request_waiting_on_its_publication_admits_no_successor(
         await _start_by_id(session, lost_id)
         await _attach_own_publication(session, item_id, lost_id, status=publication_status)
 
-        await _lose(session, lost_id)
+        # Rows cancelled before this fix can still await their own publication.
+        # Reproduce that persisted state without retaining the forbidden path.
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET status = 'cancellation_requested', "
+                "terminal_cause = 'owner_lost', cancellation_requested_at = clock_timestamp(), "
+                "runtime_owner = 'worker-a', runtime_epoch = GREATEST(runtime_epoch, 1), "
+                "runtime_heartbeat_expires_at = :expired, version = version + 1, "
+                "updated_at = clock_timestamp() WHERE id = :id"
+            ),
+            {
+                "id": lost_id,
+                "expired": await _now(session)
+                - timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+            },
+        )
+        await session.commit()
+        observed = await _observe(session, lost_id)
+        assert observed.request is not None
+        assert (observed.request.status, observed.request.terminal_cause) == (
+            "failed",
+            "owner_lost",
+        )
 
         rows = await _requests(session, item_id)
         assert [(r.id, r.status, r.terminal_cause) for r in rows] == [
