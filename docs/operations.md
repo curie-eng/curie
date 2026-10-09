@@ -631,10 +631,17 @@ curie cluster rollback
 | `--allow-failed-revision` | Permit a `--revision` that Helm never finished applying. |
 | `--live-schema-revision <rev>` | Assert the live Alembic revision instead of reading it from the API pod. The schema-window check still runs against this value. |
 | `--yes` | Skip the confirmation prompt. |
-| `--dry-run` | Print the commands that would run and exit. |
+| `--dry-run` | Read Helm history and print the selected revision and commands. The live-schema probe and rollback do not run. |
 
-`curie cluster rollback` puts the release back on the newest revision that
-Helm actually finished applying.
+`curie cluster rollback` selects the newest `deployed` revision as the serving
+revision. When the newest history row is above it and is not `deployed` or
+`superseded`, the rollback targets the serving revision. For example, deployed
+revision 4 followed by pending revision 5 rolls back to revision 4, clearing
+the unfinished upgrade while retaining known good state.
+
+Otherwise, it selects the newest `deployed` or `superseded` revision below
+the serving revision. If no revision is deployed, it selects below the highest
+revision in the history.
 
 That is not what a bare `helm rollback` does, and the difference bites on a
 cluster without gVisor. `cluster up` tries the install with the chart's
@@ -642,14 +649,21 @@ gVisor default first; if the cluster has no `runsc` RuntimeClass, that attempt
 is recorded as a **failed** Helm revision before the successful retry with
 gVisor off. Do that a few times and the release history alternates
 failed/superseded/failed/superseded. `helm rollback` with no revision targets
-the immediately preceding revision -- which, on that history, is a failed one:
+the immediately preceding revision, which, on that history, is a failed one:
 a manifest Helm never finished putting on the cluster. Rolling back to it does
 not restore a working release, it re-applies a broken one.
 
-So this verb reads the history first, skips every revision whose status is not
-`deployed` or `superseded`, and rolls back to the newest one that is. It prints
-which revisions it passed over, so you can see exactly what a bare
+This verb reads the history first and only selects a revision whose status is
+`deployed` or `superseded`. It prints which ineligible revisions it passed over,
+so you can see exactly what a bare
 `helm rollback` would have landed on instead.
+
+`--dry-run` also reads Helm history and applies the same target selection and
+status refusals. It prints the resolved revision number, status and chart,
+the revision it rolls back from, and any skipped revisions. `--json` carries
+these same lines in the plan. A failed history read or refused selection exits
+nonzero. The plan lists the live-schema probe, but neither that probe nor
+`helm rollback` runs during a dry run.
 
 Status is not the whole story. Every API pod still runs `alembic upgrade head`
 at startup, so an older image refuses a live database revision it does not
