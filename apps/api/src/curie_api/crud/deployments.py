@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.schemas.deployments import DeploymentCreate
 
-from ..models import AgentVersion, Deployment, Environment
+from ..models import Agent, AgentVersion, Deployment, Environment
 
 _WORKSPACE_UNSET = object()
 
@@ -60,6 +60,9 @@ async def create_deployment_row(
         resolved_workspace_enabled = workspace_enabled
     deployment = Deployment(
         agent_id=agent_id,
+        # The agent's tenant, read inside the INSERT so there is no
+        # read-then-write window (ADR 0166 decision 3).
+        tenant_id=select(Agent.tenant_id).where(Agent.id == agent_id).scalar_subquery(),
         version_id=version_id,
         environment=environment,
         commit_sha=commit_sha,

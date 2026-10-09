@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.schemas.channels import ChannelBindingPatch, ChannelBindingWrite
 
-from ..models import AgentChannel
+from ..models import Agent, AgentChannel
 
 
 class AmbiguousRoute(RuntimeError):
@@ -313,6 +313,9 @@ async def add_channel_binding(
 
     binding = AgentChannel(
         agent_id=agent_id,
+        # The agent's tenant, read inside the INSERT so there is no
+        # read-then-write window (ADR 0166 decision 3).
+        tenant_id=select(Agent.tenant_id).where(Agent.id == agent_id).scalar_subquery(),
         kind=channel.kind,
         address=channel.address,
         endpoint=channel.endpoint,

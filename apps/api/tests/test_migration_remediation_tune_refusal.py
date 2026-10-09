@@ -30,7 +30,8 @@ from sqlalchemy.exc import IntegrityError
 
 BELOW = "0095"
 REVISION = "0096"
-HEAD = "0100"
+# #2911's tenant scope (0101) is the single head.
+HEAD = "0101"
 TUNE_REFUSAL = "tune_execution_not_automated"
 REFUSAL_CHECK = "remediation_nominations_refusal_ck"
 

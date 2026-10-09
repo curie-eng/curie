@@ -560,34 +560,23 @@ print(json.dumps(graph))
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0082");
-        assert_eq!(candidate.schema_head, "0100");
+        assert_eq!(candidate.schema_min, "0101");
+        assert_eq!(candidate.schema_head, "0101");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
         );
         let current = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
-        assert!(live_in_window("0082", &current));
-        assert!(live_in_window("0083", &current));
-        assert!(live_in_window("0084", &current));
-        assert!(live_in_window("0085", &current));
-        assert!(live_in_window("0086", &current));
-        assert!(live_in_window("0087", &current));
-        assert!(live_in_window("0088", &current));
-        assert!(live_in_window("0089", &current));
-        assert!(live_in_window("0090", &current));
-        assert!(live_in_window("0091a", &current));
-        assert!(live_in_window("0092a", &current));
-        assert!(live_in_window("0093a", &current));
-        assert!(live_in_window("0094", &current));
-        assert!(live_in_window("0095", &current));
-        assert!(live_in_window("0096", &current));
-        assert!(live_in_window("0097", &current));
-        assert!(live_in_window("0098", &current));
-        assert!(live_in_window("0099", &current));
-        assert!(live_in_window("0100", &current));
-        assert!(!live_in_window("0093", &current));
+        // #2911: the Agent ORM and resolver read 0101's tenant-scope columns, so
+        // every revision the window admitted below it is no longer live.
+        for below in [
+            "0082", "0083", "0084", "0085", "0086", "0087", "0088", "0089", "0090", "0091a",
+            "0092a", "0093a", "0094", "0095", "0096", "0097", "0098", "0099", "0100", "0093",
+        ] {
+            assert!(!live_in_window(below, &current), "{below}");
+        }
+        assert!(live_in_window("0101", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
@@ -615,14 +604,8 @@ print(json.dumps(graph))
         let candidate_release = window_for("0.13.0").expect("feature candidate is catalogued");
         assert_eq!(candidate_release.schema_min, candidate.schema_min);
         assert_eq!(candidate_release.schema_head, candidate.schema_head);
-        assert!(live_in_window("0090", &candidate_release));
-        assert!(live_in_window("0094", &candidate_release));
-        assert!(live_in_window("0095", &candidate_release));
-        assert!(live_in_window("0096", &candidate_release));
-        assert!(live_in_window("0097", &candidate_release));
-        assert!(live_in_window("0098", &candidate_release));
-        assert!(live_in_window("0099", &candidate_release));
-        assert!(live_in_window("0100", &candidate_release));
+        assert!(live_in_window("0101", &candidate_release));
+        assert!(!live_in_window("0100", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let published =
             window_for("0.12.1").expect("released source control window remains catalogued");

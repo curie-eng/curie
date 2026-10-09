@@ -306,6 +306,10 @@ def _parse_resume_event_id(event_id: str) -> uuid.UUID | None:
         return None
 
 
+# Migration 0051's auto-provisioned tenant, the one every row belongs to until
+# a second tenant exists. A frozen copy: this package does not import the API's.
+DEFAULT_TENANT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+
 # The trailing `d.id DESC` carries no meaning of its own -- id order is not a
 # precedence rule and nothing may start reading one into it. It exists only to
 # make the order TOTAL: two active deployments in the same environment with an
@@ -343,6 +347,7 @@ JOIN {schema}.agent_channels c ON c.agent_id = a.id
 JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
 WHERE c.kind = :kind AND c.address = :address
+  AND a.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
 ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 """
 
@@ -374,7 +379,7 @@ SELECT a.id AS agent_id,
 FROM {schema}.agents a
 JOIN {schema}.deployments d ON d.agent_id = a.id AND d.status = 'active'
 JOIN {schema}.agent_versions v ON v.id = d.version_id AND v.agent_id = a.id
-WHERE a.id = :agent_id
+WHERE a.id = :agent_id AND a.tenant_id = :tenant_id
 ORDER BY (d.environment = 'prod') DESC, d.deployed_at DESC, d.id DESC
 LIMIT 1
 """
@@ -393,6 +398,7 @@ SELECT a.id AS agent_id,
 FROM {schema}.agents a
 JOIN {schema}.agent_channels c ON c.agent_id = a.id
 WHERE c.kind = :kind AND c.address = :address
+  AND a.tenant_id = :tenant_id AND c.tenant_id = :tenant_id
 """
 
 # ADR-0168 decision 6: the identity bound at an address, if any. A channel-port
@@ -403,6 +409,7 @@ _ADDRESS_IDENTITY_SQL = """
 SELECT c.adapter AS adapter
 FROM {schema}.agent_channels c
 WHERE c.kind = :kind AND lower(c.address) = lower(:address) AND c.adapter IS NOT NULL
+  AND c.tenant_id = :tenant_id
 ORDER BY c.adapter
 LIMIT 1
 """
@@ -624,11 +631,30 @@ class ChannelReadGrantAbsent(Exception):
 
 
 class BindingResolver:
-    """Resolves a channel address to its active agent deployment (read-only)."""
+    """Resolves a channel address to its active agent deployment (read-only).
 
-    def __init__(self, engine: AsyncEngine, config: WorkerConfig) -> None:
+    Scoped to one tenant (ADR 0166 decision 3). Every read matches only agents
+    whose ``tenant_id`` is the resolver's, and a route also requires the
+    binding row to carry it, so a binding out of step with its agent fails
+    closed. Another tenant's agent answers exactly as an unknown one does.
+    ``deployments`` and ``agent_versions`` are row scoped by the column only and
+    follow their agent (``v.agent_id = a.id``); predicates on them would have to
+    land in ``connector_loop._TARGETS_SQL`` too, or the two rankings diverge
+    (#3049). The tenant is the default one until the queued turn carries its
+    own (#2914); it is deliberately not an operator setting, since a mistyped
+    tenant would drop every event.
+    """
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        config: WorkerConfig,
+        *,
+        tenant_id: uuid.UUID = DEFAULT_TENANT_ID,
+    ) -> None:
         self._engine = engine
         self._config = config
+        self._tenant_id = tenant_id
         # Table identifiers are not user input; the schema comes from config.
         self._sql = text(_RESOLVE_SQL.format(schema=config.db_schema))
         self._undeployed_binding_sql = text(_UNDEPLOYED_BINDING_SQL.format(schema=config.db_schema))
@@ -660,7 +686,7 @@ class BindingResolver:
         # @spec WORKER-CANARY-2: direct resolver callers also fail closed.
         if not _valid_slack_selector(kind, adapter):
             return None
-        params = {"kind": kind, "address": address}
+        params = {"kind": kind, "address": address, "tenant_id": self._tenant_id}
         async with self._engine.connect() as conn:
             if adapter is None and kind != SLACK_KIND:
                 bound = (await conn.execute(self._undeployed_binding_sql, params)).all()
@@ -681,7 +707,9 @@ class BindingResolver:
         row's validated id. Never a fallback for a binding miss.
         """
         async with self._engine.connect() as conn:
-            result = await conn.execute(self._resolve_agent_sql, {"agent_id": agent_id})
+            result = await conn.execute(
+                self._resolve_agent_sql, {"agent_id": agent_id, "tenant_id": self._tenant_id}
+            )
             row = result.mappings().first()
         return None if row is None else _deployment_from_row(dict(row))
 
@@ -703,7 +731,8 @@ class BindingResolver:
             return None
         async with self._engine.connect() as conn:
             result = await conn.execute(
-                self._undeployed_binding_sql, {"kind": kind, "address": address}
+                self._undeployed_binding_sql,
+                {"kind": kind, "address": address, "tenant_id": self._tenant_id},
             )
             rows = result.all()
         matches = matching_routes(rows, kind, address, adapter)
@@ -719,7 +748,8 @@ class BindingResolver:
         """The identity bound at ``address`` on ``kind``, or None (ADR-0168 decision 6)."""
         async with self._engine.connect() as conn:
             result = await conn.execute(
-                self._address_identity_sql, {"kind": kind, "address": address}
+                self._address_identity_sql,
+                {"kind": kind, "address": address, "tenant_id": self._tenant_id},
             )
             value = result.scalar()
         return value if isinstance(value, str) and value else None
@@ -735,10 +765,11 @@ class BindingResolver:
 
         sql = text(
             f"SELECT kind, adapter, endpoint FROM {self._config.db_schema}.agent_channels "
-            "WHERE agent_id = :id ORDER BY kind, adapter NULLS FIRST, endpoint NULLS FIRST"
+            "WHERE agent_id = :id AND tenant_id = :tenant_id "
+            "ORDER BY kind, adapter NULLS FIRST, endpoint NULLS FIRST"
         )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             rows = result.all()
         return [
             AgentRoute(kind=str(row.kind), adapter=row.adapter, endpoint=row.endpoint)
@@ -747,9 +778,12 @@ class BindingResolver:
 
     async def repo_full_name(self, agent_id: uuid.UUID) -> str | None:
         """The agent's GitHub repo (owner/name), for the eval PR-check report."""
-        sql = text(f"SELECT repo_full_name FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT repo_full_name FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None
@@ -953,9 +987,12 @@ class BindingResolver:
         """The agent's connector secrets (#429), for lanes that boot by agent_id
         rather than by channel (the eval consumer). Decodes the JSONB the same
         way ``resolve`` does; None when the agent is unknown or has no secrets."""
-        sql = text(f"SELECT secrets FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT secrets FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None or row[0] is None:
             return None
@@ -966,9 +1003,12 @@ class BindingResolver:
 
     async def name_for(self, agent_id: uuid.UUID) -> str | None:
         """The agent's NAME for eval pool routing (#1488). None if unknown."""
-        sql = text(f"SELECT name FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT name FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None
@@ -981,9 +1021,12 @@ class BindingResolver:
         This is a separate read from deployment resolution. Resolution runs in
         migration tests against schemas that predate the column.
         """
-        sql = text(f"SELECT runner_resources FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT runner_resources FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None
@@ -1000,9 +1043,12 @@ class BindingResolver:
         schemas that predate the column (migration 0068). A missing agent row or
         a null value reads as off.
         """
-        sql = text(f"SELECT memory_writes FROM {self._config.db_schema}.agents WHERE id = :id")
+        sql = text(
+            f"SELECT memory_writes FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
+        )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         return bool(row is not None and row[0])
 
@@ -1015,11 +1061,12 @@ class BindingResolver:
         """
 
         sql = text(
-            f"SELECT execution_deadline_seconds FROM {self._config.db_schema}.agents WHERE id = :id"
+            f"SELECT execution_deadline_seconds FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
         )
         try:
             async with self._engine.connect() as conn:
-                result = await conn.execute(sql, {"id": agent_id})
+                result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
                 row = result.first()
         except Exception:  # noqa: BLE001 - a missing column still boots
             logger.warning(
@@ -1037,10 +1084,11 @@ class BindingResolver:
         """Model, reviewer model, thinking, and resources for eval boots."""
         sql = text(
             "SELECT model, reviewer_model, thinking, runner_resources "
-            f"FROM {self._config.db_schema}.agents WHERE id = :id"
+            f"FROM {self._config.db_schema}.agents "
+            "WHERE id = :id AND tenant_id = :tenant_id"
         )
         async with self._engine.connect() as conn:
-            result = await conn.execute(sql, {"id": agent_id})
+            result = await conn.execute(sql, {"id": agent_id, "tenant_id": self._tenant_id})
             row = result.first()
         if row is None:
             return None, None, None, None
