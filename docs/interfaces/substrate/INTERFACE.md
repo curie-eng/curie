@@ -19,7 +19,7 @@ order: 1
 
 ## The black line
 
-The substrate is where a conversation thread claims, dials, suspends, and reaps an isolated runner runtime. `SandboxSubstrate` composes the port; everything Kubernetes-shaped (or Docker-shaped) lives behind the `SandboxClient` `Protocol`. The kernel talks in `thread_key` and receives a `SandboxHandle` with a dial target — it never touches a cluster or a container runtime directly. The swap axis is which runtime backs a claim (k8s CRDs vs local Docker containers); the routing, affinity, and rehydrate logic above the line stay opinionated core.
+The substrate is where a conversation thread claims, dials, suspends, and reaps an isolated runner runtime. `SandboxSubstrate` composes the `SandboxClient` `Protocol` for lifecycle operations. The kernel talks in `thread_key` and receives a `SandboxHandle` with a dial target; it never touches a cluster or a container runtime directly. Concrete runtime checks remain inside the substrate, including the Kubernetes-only log-tail diagnostic described below. The swap axis is which runtime backs a claim (k8s CRDs vs local Docker containers); the routing, affinity, and rehydrate logic above the line stay opinionated core.
 
 ## Current contract
 
@@ -53,6 +53,14 @@ Two, both under `apps/worker/src/curie_worker/sandbox/`:
 - `DockerSandboxClient` (`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient`) — boots runner containers on the local Docker daemon for middle mode (a laptop, no cluster).
 
 ## Known leakage
+
+Claim-timeout diagnosis bypasses the port. `SandboxSubstrate._await_bound`
+(`apps/worker/src/curie_worker/sandbox/substrate.py::SandboxSubstrate._await_bound`)
+checks `isinstance(..., KubernetesSandboxClient)` and calls its concrete `pod_log_tail`
+(`apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.pod_log_tail`).
+It reads at most 8 KiB or 200 lines from the runner container, preferring the previous
+instance, and logs a redacted tail. `SandboxClient` declares no log-tail operation,
+and Docker or another substrate receives no equivalent timeout log diagnosis.
 
 The `SandboxView.port` field (`apps/worker/src/curie_worker/sandbox/types.py::SandboxView`) exists only because the Docker path publishes each runner on its own loopback host port, while the Kubernetes path uses one fleet-wide `runner_port`; `None` means "fall back to `SubstrateConfig.runner_port`". Credential handling also differs across the line: the k8s client strips `CURIE_CREDENTIALS` (`apps/worker/src/curie_worker/sandbox/k8s.py::CREDENTIALS_ENV`) from per-claim env so it is never persisted in plaintext on the claim (`apps/worker/src/curie_worker/sandbox/k8s.py::KubernetesSandboxClient.create_claim`), relying on the chart Secret's `secretKeyRef`; the Docker client has no Secret and forwards at most one model credential by name (`apps/worker/src/curie_worker/sandbox/docker.py::DockerSandboxClient.create_claim`), across four states: nothing at all for a fake-model run, which authenticates against nothing; an explicit non-empty CURIE_CREDENTIALS alone (never an ambient CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY that would shadow it), kept under a base-URL override only when it is *not* OAuth-shaped, since the runner routes an `sk-or-` OpenRouter key into ANTHROPIC_API_KEY behind a preset base URL but blanks a `sk-ant-oat` Claude Code token there (`runner/src/curie_runner/sdk_auth.py::OAUTH_TOKEN_PREFIX`, `runner/src/curie_runner/sdk_auth.py::_is_forwardable_provider_credential`); an OAuth-shaped explicit credential under that override, which is dropped entirely (#603, `apps/worker/src/curie_worker/sandbox/docker.py::_OAUTH_TOKEN_PREFIX`) so a real token never sits inert in a container that resolves none; otherwise the ambient SDK credentials, each only when present and only absent a base-URL override, since a local endpoint needs no real Anthropic token. That rule is frozen as data in `tests/vectors/model-credential-forwarding.json` and asserted from both the Python worker lane and the Rust CLI lane, so a change to it fails in two places.
 

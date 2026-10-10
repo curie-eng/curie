@@ -662,8 +662,9 @@ was guarded by the same platform key, a compromised sandbox could resolve its ow
 tool call under any asserted identity. ADR-0033 (#410) closed the sandbox-key gap by
 minting a scoped, agent-bound `state` token that only the state router accepts. ADR-0106
 closes the remaining caller-assertion gap: the resolve endpoint now accepts only a
-dispatcher-attested `chat` token, a live subject-bound Console session, or a signed
-subject-bound `operator` token. On the ordinary resolve path the platform key alone
+dispatcher-attested `chat` token, a live subject-bound Console session, a signed
+subject-bound `operator` token, or an authenticated `adapter` principal for a served
+binding. On the ordinary resolve path the platform key alone
 resolves nothing. Break-glass recovery is the exception: when an operator enables
 `approval_recovery_enabled`, the platform key plus any operator principal for attribution
 can reject any pending approval installation-wide, bypassing the authorizer. That blast
@@ -671,7 +672,12 @@ radius is accepted rather than fenced, so the setting stays off by default and e
 lands in the audit trail in the same transaction as its effect. Recovery cannot approve,
 and the sandbox's scoped token cannot reach it. A
 notification transport credential likewise confers no resolution capability: the
-notification contains no interaction, and this contract exposes no second-channel resolver.
+notification contains no interaction. Email cards have a separate adapter-principal
+resolution path, checked against the served binding, its allowed callers, and the route's
+email approvers. The shipped AgentMail adapter currently refuses all inbound mail before
+approval handling because it cannot verify positive sender authentication
+(`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.handle_inbound`),
+so that API path does not prove working approval replies through AgentMail.
 The runtime `PreToolUse` hook (`build_approval_hook`, #1852) is the first interceptor
 of a gated tool call, with the SDK `canUseTool` callback (`build_can_use_tool`, #245)
 as backstop, but
@@ -687,10 +693,11 @@ and verdict. For an `adapter` principal, `principal_subject` names the adapter i
 the sender it vouches for: the sender is carried as `actor` from the
 `X-Curie-Approval-Actor` header, and no Slack approver set admits an adapter, not even an
 explicit user list ([ADR-0177](../../adr/0177-an-approval-is-answered-where-it-was-asked-including-by-email.md)'s separate finding). An adapter is served, and so may list
-and resolve, an approval whose card went to one of its own bindings on the same agent:
+an approval whose card went to one of its own bindings on the same agent:
 the conversation that asked (routeless or `requesting_surface`), matched on the record's
-`(reply_kind, reply_channel)` pair, or a fixed route target the recorded `card_channel`
-names. Where the card went is read from the record, not the current route: re-pointing a
+`(reply_kind, reply_channel, reply_adapter)` route, or a fixed route target the recorded
+`card_channel` names. A fixed Slack target grants adapter listing only: no Slack
+approver set admits an adapter to answer. Where the card went is read from the record, not the current route: re-pointing a
 route after the ask neither moves the card nor hands the approval to the new target's
 adapter, and approvers added meanwhile make a non-Slack card admit nobody. The record
 keeps the card's address but not its kind, so a non-Slack asking address shaped like a

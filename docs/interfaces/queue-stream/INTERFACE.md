@@ -30,8 +30,10 @@ The routing, consumer-group concurrency, dedupe, and reclaim rules stay opiniona
 **core**. `redis.Redis` / `redis.asyncio.Redis` structurally satisfy the ports, so
 redis-py is the one backing today with no adapter; a redis-compatible backend (Valkey,
 Redis, a managed equivalent) is still a URL change, and a non-redis broker (Kafka, SQS)
-is now a drop-in implementation of the two Protocols rather than a grep-and-replace of
-every call site. The **second broker itself is not built** — no second-broker demand
+can implement the dispatcher publication and shared consumer transport ports. Those
+two Protocols do not cover every producer or adjacent Redis operation: a complete swap
+also migrates direct cron and API appends, retention, delivery leases, liveness, and
+thread-reset state described below. The **second broker itself is not built**; no second-broker demand
 exists (ADR-0007); only the port is extracted.
 
 ## Current contract

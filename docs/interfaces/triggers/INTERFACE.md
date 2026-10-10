@@ -104,7 +104,7 @@ another handler that mints a `QueuedTurn` with the right `source`. The eight tha
   `api.commitPollIntervalSeconds` is set. It exists because the webhook above is
   an INBOUND request, and a self-hosted cluster behind a firewall cannot receive
   one at all -- outbound always works (#1239).
-- **Generic HMAC hook** — `apps/api/src/curie_api/routers/hooks.py::ingest_hook`:
+8. **Generic HMAC hook**: `apps/api/src/curie_api/routers/hooks.py::ingest_hook`:
   `@router.post("/{agent_id}/{hook}")` verifies a Curie HMAC over
   `X-Curie-Timestamp`, `X-Curie-Delivery-Id`, the decoded hook name, the parsed
   requested `tool_access` policy and the raw body. The context is compact ASCII
@@ -116,8 +116,17 @@ another handler that mints a `QueuedTurn` with the right `source`. The eight tha
   not contain `.`, which would make the earlier boundary ambiguous. A captured
   signature cannot change the hook's receipt namespace or add or remove a
   policy restriction. A timestamp more than 5 minutes from the server clock is
-  refused with the same 401 as a bad signature. The route claims the delivery
-  id and enqueues a `QueuedTurn` with `source=WEBHOOK`. The
+  refused with the same 401 as a bad signature. Source authentication also reads the
+  current key, then verifies it again while holding the agent's source gate
+  (`apps/api/src/curie_api/hook_source_auth.py::authenticated_source`). Protected policy
+  selects its hook-specific generation key; ordinary or absent policy selects the agent's
+  legacy generation key. A valid signature is not admission: this route accepts only a
+  never-configured source, with neither a policy nor durable attempt history. Configured
+  sources are refused, and history without a policy is refused as `pending_history`.
+  Missing, unreadable, or invalid authority fails closed with 503. Gate liveness is
+  rechecked before receipt, retry, and enqueue effects through
+  `apps/api/src/curie_api/hook_source_auth.py::AuthenticatedHookSource.ensure_live`.
+  An admitted route claims the delivery id and enqueues a `QueuedTurn` with `source=WEBHOOK`. The
   turn replies through one of the agent's bindings: its only one, or the route
   the `kind`, `address` and optional `adapter` query parameters name (the
   identity for Slack, the adapter slug for any other kind; ADR-0168 decision 3).
@@ -188,7 +197,9 @@ per-agent cron scheduler (`apps/worker/src/curie_worker/cron_loop.py::CronSchedu
 [Cron triggers](../../guides/cron-triggers.md) for the operator guide. A generic HMAC hook ingress
 is shipped (`ingest_hook` above). Mapping a declared `webhook` path onto that handler at deploy is
 not built (#3666), so a declared webhook validates its shape but does not yet wire a live wake-up;
-`ingest_hook` serves any valid hook name whether or not the bundle declared it.
+`ingest_hook` may admit a valid hook name whether or not the bundle declared it, but
+only while its source has never been configured; the source-authentication fence above
+still applies.
 
 ## Implementations today
 
