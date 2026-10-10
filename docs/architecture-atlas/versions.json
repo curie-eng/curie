@@ -1,6 +1,6 @@
 {
   "schemaVersion": "1.0",
-  "defaultVersion": "v0.12.3",
+  "defaultVersion": "audit-2026-10-10-f66c4aa5",
   "versions": [
     {
       "id": "v0.7.1",
@@ -257,6 +257,14 @@
       "date": "2026-10-08",
       "branch": "main",
       "commit": "b5162bb4367fdf0d370c500cb3b4a268acd67a94"
+    },
+    {
+      "id": "audit-2026-10-10-f66c4aa5",
+      "label": "Seam audit 2026-10-10 (f66c4aa5)",
+      "file": "snapshots/audit-2026-10-10-f66c4aa5.json",
+      "date": "2026-10-10",
+      "branch": "main",
+      "commit": "f66c4aa55523f474da50dc7261a3b9373ede988a"
     }
   ]
 }
