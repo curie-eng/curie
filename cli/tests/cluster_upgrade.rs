@@ -522,6 +522,38 @@ async fn dry_run_apply_line_carries_install_and_retained_values_only_when_passed
     );
 }
 
+/// #4332: a same-version known-good rerun skips Apply, so its dry-run plan
+/// must not promise to retire any agent's SandboxClaims.
+#[tokio::test]
+async fn same_version_dry_run_drops_runner_layer_retire_lines() {
+    let mut host = FakeUpgradeHost::installed("0.11.0")
+        .with_known_good("0.11.0")
+        .with_retained_values()
+        .with_runner_layer_clears(&["factory", "sre-bot"]);
+    let out = run_lifecycle(dry_opts("0.11.0"), &mut host)
+        .await
+        .expect("dry-run plan");
+    let ClusterUpgradeOutput::DryRun(plan) = &out else {
+        panic!("dry-run must not mutate: {out:?}");
+    };
+    assert!(
+        plan.lines.iter().any(
+            |l| l.contains("0.11.0 is already installed") && l.contains("no helm upgrade runs")
+        ),
+        "{:?}",
+        plan.lines
+    );
+    assert!(
+        plan.lines
+            .iter()
+            .all(|l| !l.starts_with("retire SandboxClaims ") && !l.starts_with("helm upgrade ")),
+        "a skipped Apply retires nothing: {:?}",
+        plan.lines
+    );
+    assert_eq!(host.mutate_calls, 0);
+    assert!(host.retired_claims.is_empty());
+}
+
 /// #3218: an upgrade that changes the platform runner names every layered
 /// agent before it upgrades and clears each one's runner image in the same
 /// `helm upgrade`, after the retained values so the clear wins.
@@ -557,17 +589,17 @@ async fn dry_run_names_stale_runner_layers_and_clears_them_in_the_apply() {
     assert!(notice.contains("factory, sre-bot"), "{notice}");
     assert!(notice.contains("WITHOUT their layer"), "{notice}");
     assert!(notice.contains("curie build --plugin-dir"), "{notice}");
-    // #3422: the plan retires each cleared agent's claims right after Apply.
+    // Claim names are observed after Apply, so the plan describes selection.
     let apply_at = plan.lines.iter().position(|l| l == apply).unwrap();
     assert_eq!(
         &plan.lines[apply_at + 1..apply_at + 3],
         &[
-            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=factory --wait=true --ignore-not-found=true",
-            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=sre-bot --wait=true --ignore-not-found=true",
+            "retire SandboxClaims of agent factory whose runner is not the planned layer",
+            "retire SandboxClaims of agent sre-bot whose runner is not the planned layer",
         ]
     );
     assert!(
-        notice.contains("Their live sandboxes are retired"),
+        notice.contains("it retires their SandboxClaims whose runner is not the planned layer"),
         "{notice}"
     );
     let json = output_json(&out).to_string();
@@ -587,7 +619,7 @@ async fn dry_run_names_stale_runner_layers_and_clears_them_in_the_apply() {
     };
     assert!(plan.lines.iter().all(|l| !l.contains("runnerImages")
         && !l.starts_with("runner layers:")
-        && !l.contains("sandboxclaim")));
+        && !l.contains("SandboxClaims")));
 }
 
 /// #3849: a Helm apply error is a terminal failed checkpoint at apply.
@@ -724,9 +756,9 @@ async fn dry_run_shows_rebinds_and_stock_clears_apart() {
     assert_eq!(
         &plan.lines[apply_at + 1..apply_at + 4],
         &[
-            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=acme-bot --wait=true --ignore-not-found=true",
-            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=dark-factory --wait=true --ignore-not-found=true",
-            "kubectl -n curie delete sandboxclaim -l curietech.ai/agent=night-factory --wait=true --ignore-not-found=true",
+            "retire SandboxClaims of agent acme-bot whose runner is not the planned layer",
+            "retire SandboxClaims of agent dark-factory whose runner is not the planned layer",
+            "retire SandboxClaims of agent night-factory whose runner is not the planned layer",
         ]
     );
     assert_eq!(host.mutate_calls, 0);

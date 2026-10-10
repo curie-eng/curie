@@ -97,6 +97,14 @@ impl Fixture {
         .unwrap();
     }
 
+    fn set_retirement_inputs(&self, inputs: &Value) {
+        fs::write(
+            self.0.path().join("retirement.json"),
+            serde_json::to_string(inputs).unwrap(),
+        )
+        .unwrap();
+    }
+
     /// Seed the complete upgrade checkpoint ConfigMap `kubectl get` returns.
     fn seed_checkpoint(&self, record: &Value) {
         self.seed_config_map(&checkpoint_config_map("41", None, Some(record)));
@@ -4189,23 +4197,7 @@ fn upgrade_omits_stale_runner_layers_and_keeps_credentials() {
         "helm argv must not set a null digest: {:?}",
         upgrades[0]
     );
-    let deletes: Vec<Vec<String>> = fixture
-        .argv()
-        .into_iter()
-        .filter(|call| call.iter().any(|arg| arg == "sandboxclaim"))
-        .collect();
-    assert!(
-        deletes
-            .iter()
-            .any(|call| call.iter().any(|arg| arg.contains("acme-bot"))),
-        "cleared claims are retired: {deletes:?}"
-    );
-    assert!(
-        deletes
-            .iter()
-            .any(|call| call.iter().any(|arg| arg.contains("acme-other"))),
-        "cleared claims are retired: {deletes:?}"
-    );
+    assert_retired_after_apply(&fixture, &["acme-bot", "acme-other"]);
 }
 
 /// The CRD `live_canary` reads the rendered runner images from (#4321).
@@ -4334,9 +4326,15 @@ fn plan_line(body: &Value, prefix: &str) -> String {
 }
 
 fn retirement(agent: &str) -> String {
-    format!(
-        "kubectl -n ns delete sandboxclaim -l curietech.ai/agent={agent} --wait=true --ignore-not-found=true"
-    )
+    format!("retire SandboxClaims of agent {agent} whose runner is not the planned layer")
+}
+
+fn claim_deletes(fixture: &Fixture) -> Vec<Vec<String>> {
+    fixture
+        .argv()
+        .into_iter()
+        .filter(|call| argv_starts(call, &["kubectl", "-n", "ns", "delete", "sandboxclaim"]))
+        .collect()
 }
 
 /// Each named agent's claims are retired by a `kubectl delete sandboxclaim`
@@ -4348,22 +4346,21 @@ fn assert_retired_after_apply(fixture: &Fixture, agents: &[&str]) {
         .position(|call| argv_starts(call, &["helm", "upgrade"]))
         .unwrap_or_else(|| panic!("no helm upgrade: {argv:?}"));
     for agent in agents {
-        let label = format!("curietech.ai/agent={agent}");
+        let claim = format!("{agent}-old-claim");
         let at = argv
             .iter()
             .position(|call| {
-                argv_starts(
-                    call,
-                    &[
+                call.iter().map(String::as_str).collect::<Vec<_>>()
+                    == [
                         "kubectl",
                         "-n",
                         "ns",
                         "delete",
                         "sandboxclaim",
-                        "-l",
-                        label.as_str(),
-                    ],
-                )
+                        claim.as_str(),
+                        "--wait=true",
+                        "--ignore-not-found=true",
+                    ]
             })
             .unwrap_or_else(|| panic!("{agent}'s claims are not retired: {argv:?}"));
         assert!(
@@ -4371,6 +4368,280 @@ fn assert_retired_after_apply(fixture: &Fixture, agents: &[&str]) {
             "{agent} retired before the helm upgrade: {argv:?}"
         );
     }
+}
+
+/// After the `helm upgrade`, retirement reads the agent's claims by label and
+/// the namespace's pods with no selector at all, since platform-pool pods
+/// carry no agent label. No pods read anywhere carries `-l`.
+fn assert_retirement_reads_after_apply(fixture: &Fixture, agent: &str) {
+    let argv = fixture.argv();
+    let apply_at = argv
+        .iter()
+        .position(|call| argv_starts(call, &["helm", "upgrade"]))
+        .unwrap_or_else(|| panic!("no helm upgrade: {argv:?}"));
+    let selector = format!("curietech.ai/agent={agent}");
+    let claims_read = [
+        "kubectl",
+        "-n",
+        "ns",
+        "get",
+        "sandboxclaim",
+        "-l",
+        selector.as_str(),
+        "-o",
+        "json",
+    ];
+    let pods_read = ["kubectl", "-n", "ns", "get", "pods", "-o", "json"];
+    for expected in [&claims_read[..], &pods_read[..]] {
+        let read_at = argv
+            .iter()
+            .position(|call| call.iter().map(String::as_str).eq(expected.iter().copied()))
+            .unwrap_or_else(|| panic!("missing read {expected:?}: {argv:?}"));
+        assert!(
+            read_at > apply_at,
+            "retirement observes post-Apply state: {argv:?}"
+        );
+    }
+    assert!(
+        argv.iter()
+            .filter(|call| argv_starts(call, &["kubectl", "-n", "ns", "get", "pods"]))
+            .all(|call| !call.iter().any(|arg| arg == "-l" || arg.starts_with("-l="))),
+        "pods must be read without a label selector: {argv:?}"
+    );
+}
+
+/// #4332: the agent's two claims resolve to different runner images. The
+/// target claim represents work admitted after the post-upgrade drain hook.
+#[test]
+fn runner_layer_retire_keeps_claims_already_on_the_target_layer() {
+    let registry = stock_registry(true);
+    let fixture = stock_retirement_fixture();
+    fixture.set_retirement_inputs(&serde_json::json!({
+        "agents": {"dark-factory": {
+            "claims": retirement_claims(&[
+                ("dark-factory-old-claim", "old-sandbox"),
+                ("dark-factory-target-claim", "target-sandbox"),
+            ]),
+        }},
+        // Namespace-wide, unlabelled. `unrelated-sandbox` runs the old layer
+        // but no claim names it, so it must not cause a delete.
+        "pods": retirement_pods(&[
+            ("old-sandbox", STOCK_OLD),
+            ("target-sandbox", stock_new().as_str()),
+            ("unrelated-sandbox", STOCK_OLD),
+        ]),
+    }));
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "succeeded", "{body}");
+    assert_eq!(body["canary"]["passed"], true, "{body}");
+    assert_retired_after_apply(&fixture, &["dark-factory"]);
+    let deletes = claim_deletes(&fixture);
+    assert_eq!(deletes.len(), 1, "one named delete per agent: {deletes:?}");
+    assert!(
+        deletes.iter().all(|call| !call
+            .iter()
+            .any(|arg| arg == "dark-factory-target-claim" || arg == "-l")),
+        "target-layer claims must survive every delete: {deletes:?}"
+    );
+    assert_retirement_reads_after_apply(&fixture, "dark-factory");
+}
+
+#[test]
+fn runner_layer_retire_runs_no_delete_when_every_claim_is_on_the_target_layer() {
+    let registry = stock_registry(true);
+    let fixture = stock_retirement_fixture();
+    fixture.set_retirement_inputs(&serde_json::json!({
+        "agents": {"dark-factory": {
+            "claims": retirement_claims(&[("dark-factory-target-claim", "target-sandbox")]),
+        }},
+        "pods": retirement_pods(&[("target-sandbox", stock_new().as_str())]),
+    }));
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(json(&output)["status"], "succeeded");
+    assert!(claim_deletes(&fixture).is_empty(), "{:?}", fixture.argv());
+}
+
+#[test]
+fn runner_layer_retire_clear_preserves_claims_on_the_platform_template_image() {
+    let registry = stock_registry(true);
+    let fixture = stock_fixture();
+    fixture.set_retained(&serde_json::json!({
+        "agentSandbox": {"runnerImages": {"acme-bot": LAYER_BOT}},
+        "connectorCaller": {"existingSecret": "acme-caller-pair"},
+    }));
+    fixture.set_retirement_inputs(&serde_json::json!({
+        "agents": {"acme-bot": {
+            "claims": retirement_claims(&[
+                ("acme-bot-old-claim", "old-sandbox"),
+                ("acme-bot-target-claim", "target-sandbox"),
+            ]),
+        }},
+        // The target pod comes from the platform template, which renders no
+        // agent label; only a by-name match finds it. `unrelated-sandbox`
+        // still runs the owner layer but belongs to no claim.
+        "pods": retirement_pods(&[
+            ("old-sandbox", LAYER_BOT),
+            ("target-sandbox", platform_runner().as_str()),
+            ("unrelated-sandbox", LAYER_BOT),
+        ]),
+    }));
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(output.status.success(), "{}", visible(&output));
+    assert_eq!(json(&output)["status"], "succeeded");
+    assert_retired_after_apply(&fixture, &["acme-bot"]);
+    assert_retirement_reads_after_apply(&fixture, "acme-bot");
+    let deletes = claim_deletes(&fixture);
+    assert_eq!(deletes.len(), 1, "{:?}", fixture.argv());
+    assert!(
+        deletes[0].iter().any(|arg| arg == "acme-bot-old-claim"),
+        "{deletes:?}"
+    );
+    assert!(
+        deletes.iter().all(|call| !call
+            .iter()
+            .any(|arg| arg == "acme-bot-target-claim" || arg == "-l")),
+        "the platform-image claim must survive the clear: {deletes:?}"
+    );
+}
+
+/// A read or parse failure after Apply preserves the existing best-effort
+/// retirement behavior, while the later canary reads healthy templates.
+#[test]
+fn runner_layer_retire_falls_back_to_agent_wide_delete_when_a_read_fails() {
+    let registry = stock_registry(true);
+    for (case, inputs) in [
+        ("claims read", serde_json::json!({"fail_read": "claims"})),
+        ("pods read", serde_json::json!({"fail_read": "pods"})),
+        (
+            "templates read",
+            serde_json::json!({"fail_read": "templates"}),
+        ),
+        (
+            "claims parse",
+            serde_json::json!({"agents": {"dark-factory": {"claims": "not JSON"}}}),
+        ),
+        ("pods parse", serde_json::json!({"pods": "not JSON"})),
+        (
+            "templates parse",
+            serde_json::json!({"templates": "not JSON"}),
+        ),
+    ] {
+        let fixture = stock_retirement_fixture();
+        fixture.set_retirement_inputs(&inputs);
+        let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+        assert!(output.status.success(), "{case}: {}", visible(&output));
+        let body = json(&output);
+        assert_eq!(body["status"], "succeeded", "{case}: {body}");
+        assert_eq!(body["canary"]["passed"], true, "{case}: {body}");
+        let expected: Vec<String> = [
+            "kubectl",
+            "-n",
+            "ns",
+            "delete",
+            "sandboxclaim",
+            "-l",
+            "curietech.ai/agent=dark-factory",
+            "--wait=true",
+            "--ignore-not-found=true",
+        ]
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+        assert_eq!(
+            claim_deletes(&fixture),
+            vec![expected.clone()],
+            "{case}: {:?}",
+            fixture.argv()
+        );
+        let argv = fixture.argv();
+        let apply_at = argv
+            .iter()
+            .position(|call| argv_starts(call, &["helm", "upgrade"]))
+            .unwrap();
+        let delete_at = argv.iter().position(|call| call == &expected).unwrap();
+        assert!(
+            delete_at > apply_at,
+            "{case}: fallback must follow Apply: {argv:?}"
+        );
+    }
+}
+
+/// #4332: a failing by-name delete names the command to rerun.
+#[test]
+fn runner_layer_retire_reports_a_failed_by_name_delete_with_the_command_to_rerun() {
+    let registry = stock_registry(true);
+    let fixture = stock_retirement_fixture();
+    fixture.set_retirement_inputs(&serde_json::json!({"fail_delete": true}));
+    let output = run_stock(&fixture, "healthy", &registry.base_url, &[]);
+    assert!(!output.status.success(), "{}", visible(&output));
+    let body = json(&output);
+    assert_eq!(body["status"], "failed", "{body}");
+    assert_eq!(body["phase"], "apply", "{body}");
+    let rerun = "kubectl -n ns delete sandboxclaim dark-factory-old-claim \
+                 --wait=true --ignore-not-found=true";
+    let reason = body["fail_forward"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("retiring its sandboxes failed")
+            && reason.contains("sandboxclaims is forbidden")
+            && reason.contains(&format!("run `{rerun}`")),
+        "{body}"
+    );
+    let expected: Vec<String> = rerun.split(' ').map(str::to_string).collect();
+    assert_eq!(
+        claim_deletes(&fixture),
+        vec![expected],
+        "one by-name delete, no label-wide retry: {:?}",
+        fixture.argv()
+    );
+}
+
+fn stock_retirement_fixture() -> Fixture {
+    let fixture = stock_fixture();
+    fixture.set_retained(&serde_json::json!({
+        "agentSandbox": {"runnerImages": {"dark-factory": STOCK_OLD}},
+        "connectorCaller": {"existingSecret": "acme-caller-pair"},
+    }));
+    fixture
+}
+
+fn retirement_claims(items: &[(&str, &str)]) -> Value {
+    // The vendored CRD prints .status.sandbox.name as the claim's sandbox
+    // (charts/curie/crds/crd-sandboxclaims.yaml), and the worker reads it as
+    // the bound pod's name (apps/worker/src/curie_worker/sandbox/k8s.py).
+    let items: Vec<Value> = items
+        .iter()
+        .map(|(name, sandbox)| {
+            serde_json::json!({
+                "metadata": {"name": name},
+                "status": {"sandbox": {"name": sandbox}},
+            })
+        })
+        .collect();
+    serde_json::json!({"apiVersion": "v1", "kind": "List", "items": items})
+}
+
+fn retirement_pods(items: &[(&str, &str)]) -> Value {
+    // Deliberately no `curietech.ai/agent` label: platform-template pods do
+    // not render one (charts/curie/templates/agent-sandbox.yaml) and claim
+    // labels never reach pods, so retirement must match pods by name only.
+    // Kubernetes PodSpec exposes spec.containers[*].name and image:
+    // https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodSpec
+    let items: Vec<Value> = items
+        .iter()
+        .map(|(name, image)| {
+            serde_json::json!({
+                "metadata": {"name": name},
+                "spec": {"containers": [
+                    {"name": "sidecar", "image": "ghcr.io/acme/acme-helper:0.9.0"},
+                    {"name": "runner", "image": image},
+                ]},
+            })
+        })
+        .collect();
+    serde_json::json!({"apiVersion": "v1", "kind": "List", "items": items})
 }
 
 /// #4321 AC1, AC2: a stock binding is rebound in the `-f` document Helm gets
@@ -5394,10 +5665,7 @@ fn same_version_rerun_keeps_bindings_when_the_runner_cannot_be_resolved() {
     assert_eq!(body["known_good_version"], "0.9.0", "{body}");
     assert!(fixture.helm_upgrades().is_empty(), "{:?}", fixture.argv());
     assert!(
-        !fixture
-            .argv()
-            .iter()
-            .any(|call| call.iter().any(|arg| arg == "sandboxclaim")),
+        claim_deletes(&fixture).is_empty(),
         "nothing is retired: {:?}",
         fixture.argv()
     );

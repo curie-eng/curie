@@ -1453,6 +1453,7 @@ def test_upgrade_matrix_lists_every_shard_on_full_runs_and_one_on_prs(
         "s11",
         "s13",
         "s14",
+        "s15",
         "s16",
         "s17",
     ]

@@ -25,6 +25,10 @@ Optional per-test inputs read from the root directory:
   * ``chart-values.json`` -- the target chart's own values, which
     ``helm show values`` prints. Absent, that read exits 64 as it always has,
     so no existing test starts resolving a runner tag over the network.
+  * ``retirement.json`` -- per-agent claim lists under ``agents``, one
+    namespace-wide ``pods`` list (platform-pool pods carry no agent label, so
+    the CLI must read pods unlabelled and match them by name), plus a
+    selected retirement read failure, malformed response, or ``fail_delete``.
 
 ``kubectl get sandboxtemplates...`` renders the SandboxTemplates the chart
 would produce from the values Helm was last handed (the most recent
@@ -901,6 +905,66 @@ def matches_selector(item, selector):
     return True
 
 
+def retirement_inputs():
+    path = root / "retirement.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def retirement_failure(resource):
+    if retirement_inputs().get("fail_read") == resource:
+        print(f"Error from server (Forbidden): {resource} is forbidden", file=sys.stderr)
+        sys.exit(1)
+
+
+def emit_retirement_payload(payload):
+    if isinstance(payload, str):
+        print(payload)
+        sys.exit(0)
+    emit(payload)
+
+
+def retirement_claims(agent):
+    retirement_failure("claims")
+    payload = retirement_inputs().get("agents", {}).get(agent, {}).get("claims")
+    if payload is None:
+        # The vendored CRD prints .status.sandbox.name as the claim's sandbox
+        # (charts/curie/crds/crd-sandboxclaims.yaml), the bound pod's name.
+        item = {
+            "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+            "kind": "SandboxClaim",
+            "metadata": {
+                "name": f"{agent}-old-claim",
+                "labels": {"curietech.ai/agent": agent},
+            },
+            "status": {"sandbox": {"name": f"{agent}-old-sandbox"}},
+        }
+        payload = {"apiVersion": "v1", "kind": "List", "items": [item]}
+    emit_retirement_payload(payload)
+
+
+def retirement_pods():
+    retirement_failure("pods")
+    inputs = retirement_inputs()
+    payload = inputs.get("pods")
+    if payload is None:
+        # One old-layer pod per bound agent. Like a platform-pool pod, it
+        # carries no curietech.ai/agent label: claim labels never reach pods.
+        retained = json.loads((root / "retained.json").read_text())
+        layers = (retained.get("agentSandbox") or {}).get("runnerImages") or {}
+        items = [
+            {
+                "apiVersion": "v1",
+                "kind": "Pod",
+                "metadata": {"name": f"{agent}-old-sandbox"},
+                "spec": {"containers": [{"name": "runner", "image": image}]},
+            }
+            for agent, image in sorted(layers.items())
+            if isinstance(image, str)
+        ]
+        payload = {"apiVersion": "v1", "kind": "List", "items": items}
+    emit_retirement_payload(payload)
+
+
 HOOK_NAMES = {
     "upgrade-drain": f"{RELEASE}-upgrade-drain",
     "upgrade-drain-attest": f"{RELEASE}-upgrade-drain-attest",
@@ -1184,9 +1248,29 @@ if program == "kubectl":
             "items": [item for item in ownership_jobs if matches_selector(item, selector)],
         })
     if args[:1] == ["-n"] and "delete" in args and "sandboxclaim" in args:
+        if retirement_inputs().get("fail_delete"):
+            print("Error from server (Forbidden): sandboxclaims is forbidden", file=sys.stderr)
+            sys.exit(1)
         print("sandboxclaim deleted")
         sys.exit(0)
     if args[:2] == ["-n", NAMESPACE] and args[2:4] == ["get", SANDBOX_TEMPLATES]:
+        inputs = retirement_inputs()
+        prior_reads = sum(
+            call[:5] == ["kubectl", "-n", NAMESPACE, "get", SANDBOX_TEMPLATES]
+            for call in previous
+        )
+        # Only retirement's first read fails; the later canary still sees
+        # the healthy rendered templates and can complete the upgrade.
+        if upgraded and prior_reads == 0:
+            if inputs.get("fail_read") == "templates":
+                print("Error from server (Forbidden): templates is forbidden", file=sys.stderr)
+                sys.exit(1)
+            if "templates" in inputs:
+                payload = inputs["templates"]
+                if isinstance(payload, str):
+                    print(payload)
+                    sys.exit(0)
+                emit(payload)
         selector = flag_value("-l")
         emit(
             {
@@ -1195,6 +1279,23 @@ if program == "kubectl":
                 "items": [item for item in sandbox_templates() if matches_selector(item, selector)],
             }
         )
+    if args[:2] == ["-n", NAMESPACE] and args[2:4] == ["get", "pods"]:
+        # Pods are read namespace-wide and matched to claims by name only. A
+        # selector would miss platform-pool pods, which carry no agent label.
+        if args != ["-n", NAMESPACE, "get", "pods", "-o", "json"]:
+            print(
+                "agent retirement requires an unlabelled namespace-wide JSON pod read",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        retirement_pods()
+    if args[:2] == ["-n", NAMESPACE] and args[2:4] == ["get", "sandboxclaim"]:
+        selector = flag_value("-l") or ""
+        prefix = "curietech.ai/agent="
+        if not selector.startswith(prefix) or args[-2:] != ["-o", "json"]:
+            print("agent retirement requires a labelled JSON claim read", file=sys.stderr)
+            sys.exit(1)
+        retirement_claims(selector[len(prefix):])
     if scenario["workloads_fail"] and args[:3] == ["get", WORKLOADS, "-n"]:
         print("Error from server (Forbidden): workloads is forbidden", file=sys.stderr)
         sys.exit(1)

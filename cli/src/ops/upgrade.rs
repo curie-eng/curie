@@ -730,11 +730,9 @@ fn plan_lines(
             .into(),
         apply.join(" "),
     ];
-    lines.extend(
-        runner_layer_retirements(&opts.common.namespace, &runner_layers.retired_agents())
-            .iter()
-            .map(OpsCommand::display),
-    );
+    lines.extend(runner_layers.retired_agents().iter().map(|agent| {
+        format!("retire SandboxClaims of agent {agent} whose runner is not the planned layer")
+    }));
     lines.extend([
         "phase converge: exact images, generations, replicas, unavailable=0, hooks, queues, manifest"
             .into(),
@@ -791,14 +789,62 @@ pub(crate) fn target_runner_ref(
     crate::cluster_secrets::effective_runner_ref(&values, Some(to))
 }
 
-/// One `kubectl delete sandboxclaim` per agent whose runner layer the upgrade
-/// clears or rebinds (#3422, #4321), the same retirement `cluster deploy` runs
-/// (#3300).
-fn runner_layer_retirements(namespace: &str, agents: &[String]) -> Vec<OpsCommand> {
-    agents
+/// Select claims still on an old or unresolved runner after Apply (#4332).
+/// The claim's `status.sandbox.name` identifies its pod, whose named `runner`
+/// container carries the rendered image. Compare that string exactly as the
+/// controller receives it, without resolving tags or digests.
+pub(crate) fn runner_layer_retire_claim_names(
+    claims: &str,
+    pods: &str,
+    target_image: &str,
+) -> Result<Vec<String>> {
+    let claims: serde_json::Value =
+        serde_json::from_str(claims).context("SandboxClaim list is not JSON")?;
+    let claims = claims
+        .get("items")
+        .and_then(|items| items.as_array())
+        .context("SandboxClaim list has no items")?;
+    let pods: serde_json::Value = serde_json::from_str(pods).context("Pod list is not JSON")?;
+    let pods = pods
+        .get("items")
+        .and_then(|items| items.as_array())
+        .context("Pod list has no items")?;
+    let images: BTreeMap<&str, Option<&str>> = pods
         .iter()
-        .map(|agent| crate::cluster_secrets::retire_claims_command(namespace, agent))
-        .collect()
+        .filter_map(|pod| {
+            let name = pod.pointer("/metadata/name")?.as_str()?;
+            let image = pod
+                .pointer("/spec/containers")
+                .and_then(|containers| containers.as_array())
+                .and_then(|containers| {
+                    containers.iter().find(|container| {
+                        container.get("name").and_then(|name| name.as_str()) == Some("runner")
+                    })
+                })
+                .and_then(|container| container.get("image"))
+                .and_then(|image| image.as_str());
+            Some((name, image))
+        })
+        .collect();
+    let mut names = Vec::new();
+    for claim in claims {
+        let name = claim
+            .pointer("/metadata/name")
+            .and_then(|name| name.as_str())
+            .filter(|name| !name.is_empty())
+            .context("SandboxClaim has no name")?;
+        let image = claim
+            .pointer("/status/sandbox/name")
+            .and_then(|name| name.as_str())
+            .filter(|name| !name.is_empty())
+            .and_then(|name| images.get(name))
+            .copied()
+            .flatten();
+        if image != Some(target_image) {
+            names.push(name.to_string());
+        }
+    }
+    Ok(names)
 }
 
 /// What an upgrade does to each `agentSandbox.runnerImages` binding (#3218,
@@ -815,8 +861,8 @@ pub struct RunnerLayerPlan {
 }
 
 impl RunnerLayerPlan {
-    /// Every agent whose binding changes, so whose live sandboxes are retired
-    /// after Apply, in name order.
+    /// Every agent whose binding changes, so whose old-layer or unresolved
+    /// claims are retired after Apply, in name order.
     pub fn retired_agents(&self) -> Vec<String> {
         let mut agents: Vec<String> = self
             .rebinds
@@ -1002,8 +1048,10 @@ pub(crate) fn runner_layer_rebind_line(plan: &RunnerLayerPlan, to: &str) -> Opti
         .collect();
     Some(format!(
         "runner layers rebound: the platform runner changes, so this upgrade binds {} to the \
-         dark factory runner layer published for {to}, built on the target runner. Their live \
-         sandboxes are retired after the helm upgrade",
+         dark factory runner layer published for {to}, built on the target runner. After the \
+         helm upgrade it retires their SandboxClaims whose runner is not the planned layer, or \
+         cannot be resolved, and keeps sandboxes already on the target layer. If a claim, pod \
+         or template read fails, it retires all of their claims",
         pairs.join(", ")
     ))
 }
@@ -1061,7 +1109,10 @@ pub(crate) fn stock_runner_layer_notice(
         "stock runner layers: the platform runner changes and the dark factory runner layer of \
          these agent(s) cannot be rebound for {to}, so this upgrade clears \
          agentSandbox.runnerImages for them and they run the platform runner WITHOUT their \
-         layer until rebound: {}. Their live sandboxes are retired after the helm upgrade",
+         layer until rebound: {}. After the helm \
+         upgrade it retires their SandboxClaims whose runner is not the planned layer, or \
+         cannot be resolved, and keeps sandboxes already on the target layer. If a claim, pod \
+         or template read fails, it retires all of their claims",
         stock.join("; ")
     ))
 }
@@ -1200,8 +1251,10 @@ pub(crate) fn runner_layer_notice(agents: &[String]) -> Option<String> {
          will stop matching. This upgrade clears agentSandbox.runnerImages for them: they run \
          the platform runner WITHOUT their layer until their owners rebuild with `curie build \
          --plugin-dir <dir> --registry <ref>` against the upgraded CLI and redeploy with \
-         `curie cluster deploy`. Their live sandboxes are retired after the helm upgrade, so \
-         existing threads start fresh on the platform runner at their next turn",
+         `curie cluster deploy`. After the helm upgrade it retires their SandboxClaims whose \
+         runner is not the planned layer, or cannot be resolved, and keeps sandboxes already on \
+         the target layer. If a claim, pod or template read fails, it retires all of their \
+         claims. Retired threads start fresh on the platform runner at their next turn",
         agents.join(", ")
     ))
 }
@@ -1388,6 +1441,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         plan.retain(|line| {
             !line.starts_with("helm upgrade ")
                 && !line.starts_with("kubectl ")
+                && !line.starts_with("retire SandboxClaims ")
                 && !line.starts_with("phase drain_preflight:")
                 && !line.starts_with("phase checkpoint:")
                 && !line.starts_with("phase migrate:")
@@ -3278,7 +3332,7 @@ impl LiveHost {
         release_fullname_from_values(&self.opts.common.release, &values)
     }
 
-    /// The release's SandboxTemplates, read once for the canary (#4321).
+    /// The release's SandboxTemplates for retirement and the canary (#4321, #4332).
     fn read_sandbox_templates(&self) -> Result<ObservedTemplates> {
         let cmd = OpsCommand::new(
             "kubectl",
@@ -3301,6 +3355,47 @@ impl LiveHost {
             bail!("`{}` failed: {}", cmd.display(), err.trim());
         }
         parse_sandbox_templates(&out)
+    }
+
+    /// Read this agent's claims and the namespace's pods after Apply, so
+    /// claims already admitted on the target runner survive retirement
+    /// (#4332). Claims are selected by the agent label. Pods are read with no
+    /// selector and matched to claims by name only, because pods rendered
+    /// from the platform template carry no `curietech.ai/agent` label.
+    fn read_runner_layer_retire_claim_names(
+        &self,
+        agent: &str,
+        target_image: &str,
+    ) -> Result<Vec<String>> {
+        let read = |kind: &str, selector: Option<String>| -> Result<String> {
+            let mut args = vec![
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("get"),
+                plain(kind),
+            ];
+            if let Some(selector) = selector {
+                args.push(plain("-l"));
+                args.push(plain(selector));
+            }
+            args.push(plain("-o"));
+            args.push(plain("json"));
+            let cmd = OpsCommand::new("kubectl", args);
+            let (ok, out, err) = self.run(&cmd)?;
+            if !ok {
+                bail!("`{}` failed: {}", cmd.display(), err.trim());
+            }
+            Ok(out)
+        };
+        let claims = read(
+            "sandboxclaim",
+            Some(format!(
+                "{}={agent}",
+                crate::docker::CONNECTOR_AGENT_LABEL_KEY
+            )),
+        )?;
+        let pods = read("pods", None)?;
+        runner_layer_retire_claim_names(&claims, &pods, target_image)
     }
 
     /// The DrainPreflight worker-reachability check. The real #2010 drain
@@ -3450,10 +3545,53 @@ impl UpgradeDriver for LiveHost {
         }
     }
     fn retire_runner_layer_claims(&mut self) -> Result<()> {
-        for cmd in runner_layer_retirements(
-            &self.opts.common.namespace,
-            &self.runner_layers.retired_agents(),
-        ) {
+        let agents = self.runner_layers.retired_agents();
+        if agents.is_empty() {
+            return Ok(());
+        }
+        let templates = self.read_sandbox_templates().ok();
+        let fullname = self.release_fullname();
+        let platform_name = format!("{fullname}-runner");
+        for agent in agents {
+            let agent_name = format!("{fullname}-agent-{agent}-runner");
+            let target_image = templates.as_ref().and_then(|templates| {
+                templates
+                    .items
+                    .iter()
+                    .find(|(name, _)| *name == agent_name)
+                    .or_else(|| {
+                        templates
+                            .items
+                            .iter()
+                            .find(|(name, _)| *name == platform_name)
+                    })
+                    .and_then(|(_, image)| image.as_deref())
+                    .filter(|image| !image.is_empty())
+            });
+            let names = target_image.and_then(|image| {
+                self.read_runner_layer_retire_claim_names(&agent, image)
+                    .ok()
+            });
+            let cmd = match names {
+                Some(names) if names.is_empty() => continue,
+                Some(names) => {
+                    let mut args = vec![
+                        plain("-n"),
+                        plain(&self.opts.common.namespace),
+                        plain("delete"),
+                        plain("sandboxclaim"),
+                    ];
+                    args.extend(names.iter().map(plain));
+                    args.extend([plain("--wait=true"), plain("--ignore-not-found=true")]);
+                    OpsCommand::new("kubectl", args)
+                }
+                // Apply already changed the release. An unreadable template,
+                // claim or pod list must retain today's retirement guarantee.
+                None => crate::cluster_secrets::retire_claims_command(
+                    &self.opts.common.namespace,
+                    &agent,
+                ),
+            };
             let (ok, _, err) = self.run(&cmd)?;
             if !ok {
                 bail!(
@@ -3896,6 +4034,186 @@ mod runner_layer_guard_tests {
     const RUNNER_OTHER: &str = "ghcr.io/curie-eng/curie-runner@sha256:3333333333333333333333333333333333333333333333333333333333333333";
     const OWNER_LAYER: &str = "ghcr.io/acme/acme-bot-runner@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 
+    fn retirement_claim(name: &str, sandbox: Option<&str>) -> serde_json::Value {
+        // The vendored CRD prints .status.sandbox.name as the claim's sandbox
+        // (charts/curie/crds/crd-sandboxclaims.yaml); the worker reads it as
+        // the bound pod's name (apps/worker/src/curie_worker/sandbox/k8s.py).
+        let mut claim = serde_json::json!({"metadata": {"name": name}});
+        if let Some(sandbox) = sandbox {
+            claim["status"] = serde_json::json!({"sandbox": {"name": sandbox}});
+        }
+        claim
+    }
+
+    /// A pod with no `curietech.ai/agent` label, as every platform-template
+    /// pod is (charts/curie/templates/agent-sandbox.yaml renders that label
+    /// only for per-agent templates), so selection must match by name.
+    fn retirement_pod(name: &str, containers: &[(&str, &str)]) -> serde_json::Value {
+        // Kubernetes PodSpec exposes spec.containers[*].name and image:
+        // https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#PodSpec
+        let containers: Vec<serde_json::Value> = containers
+            .iter()
+            .map(|(name, image)| serde_json::json!({"name": name, "image": image}))
+            .collect();
+        serde_json::json!({"metadata": {"name": name}, "spec": {"containers": containers}})
+    }
+
+    fn retirement_names(
+        claims: Vec<serde_json::Value>,
+        pods: Vec<serde_json::Value>,
+        target: &str,
+    ) -> Vec<String> {
+        let claims = serde_json::json!({"apiVersion": "v1", "kind": "List", "items": claims});
+        let pods = serde_json::json!({"apiVersion": "v1", "kind": "List", "items": pods});
+        runner_layer_retire_claim_names(&claims.to_string(), &pods.to_string(), target)
+            .expect("claim and pod lists parse")
+    }
+
+    /// A namespace-wide pod list: the claims' pods plus unrelated pods on the
+    /// old image. One unrelated pod carries the agent label and another shares
+    /// the target claim's own name; neither is any claim's sandbox.
+    fn namespace_pods(
+        old: &str,
+        old_image: &str,
+        target: &str,
+        target_image: &str,
+    ) -> Vec<serde_json::Value> {
+        let mut labelled = retirement_pod("unrelated-labelled-sandbox", &[("runner", old_image)]);
+        labelled["metadata"]["labels"] = serde_json::json!({"curietech.ai/agent": "acme"});
+        vec![
+            retirement_pod(old, &[("runner", old_image)]),
+            retirement_pod(target, &[("sidecar", old_image), ("runner", target_image)]),
+            retirement_pod("unrelated-sandbox", &[("runner", old_image)]),
+            retirement_pod("acme-target-claim", &[("runner", old_image)]),
+            labelled,
+        ]
+    }
+
+    #[test]
+    fn runner_layer_retire_selects_only_claims_on_the_old_layer() {
+        let pods = namespace_pods("old-sandbox", STOCK_OLD, "target-sandbox", STOCK_NEW);
+        assert!(
+            pods[1]["metadata"].get("labels").is_none(),
+            "the target-layer pod carries no agent label"
+        );
+        let names = retirement_names(
+            vec![
+                retirement_claim("acme-old-claim", Some("old-sandbox")),
+                retirement_claim("acme-target-claim", Some("target-sandbox")),
+                retirement_claim("acme-unbound-claim", None),
+                retirement_claim("acme-missing-pod-claim", Some("missing-sandbox")),
+            ],
+            pods,
+            STOCK_NEW,
+        );
+        assert_eq!(
+            names,
+            vec![
+                "acme-old-claim",
+                "acme-unbound-claim",
+                "acme-missing-pod-claim"
+            ]
+        );
+    }
+
+    #[test]
+    fn runner_layer_retire_selects_claims_whose_runner_cannot_be_resolved() {
+        let names = retirement_names(
+            vec![
+                retirement_claim("acme-unbound-claim", None),
+                serde_json::json!({"metadata": {"name": "acme-no-name-claim"},
+                    "status": {"sandbox": {}}}),
+                retirement_claim("acme-empty-name-claim", Some("")),
+                retirement_claim("acme-missing-pod-claim", Some("missing-sandbox")),
+                retirement_claim("acme-no-runner-claim", Some("sidecar-sandbox")),
+                retirement_claim("acme-no-image-claim", Some("no-image-sandbox")),
+                retirement_claim("acme-target-claim", Some("target-sandbox")),
+            ],
+            vec![
+                retirement_pod("sidecar-sandbox", &[("sidecar", STOCK_NEW)]),
+                serde_json::json!({"metadata": {"name": "no-image-sandbox"},
+                    "spec": {"containers": [{"name": "runner"}]}}),
+                retirement_pod("target-sandbox", &[("runner", STOCK_NEW)]),
+            ],
+            STOCK_NEW,
+        );
+        assert_eq!(
+            names,
+            vec![
+                "acme-unbound-claim",
+                "acme-no-name-claim",
+                "acme-empty-name-claim",
+                "acme-missing-pod-claim",
+                "acme-no-runner-claim",
+                "acme-no-image-claim",
+            ]
+        );
+    }
+
+    #[test]
+    fn runner_layer_retire_clear_selects_only_claims_off_the_platform_runner() {
+        // The target is the platform runner, whose template renders no agent
+        // label, so the surviving pod is found only by name.
+        let names = retirement_names(
+            vec![
+                retirement_claim("acme-owner-layer-claim", Some("old-sandbox")),
+                retirement_claim("acme-target-claim", Some("target-sandbox")),
+                retirement_claim("acme-unbound-claim", None),
+                retirement_claim("acme-missing-pod-claim", Some("missing-sandbox")),
+            ],
+            namespace_pods("old-sandbox", OWNER_LAYER, "target-sandbox", RUNNER_NEW),
+            RUNNER_NEW,
+        );
+        assert_eq!(
+            names,
+            vec![
+                "acme-owner-layer-claim",
+                "acme-unbound-claim",
+                "acme-missing-pod-claim"
+            ]
+        );
+    }
+
+    #[test]
+    fn runner_layer_retire_compares_the_rendered_image_string_without_resolving_tags() {
+        let target = "ghcr.io/acme/acme-runner:0.9.0";
+        let names = retirement_names(
+            vec![
+                retirement_claim("acme-digest-claim", Some("digest-sandbox")),
+                retirement_claim("acme-tag-claim", Some("tag-sandbox")),
+            ],
+            vec![
+                retirement_pod(
+                    "digest-sandbox",
+                    &[("runner", "ghcr.io/acme/acme-runner@sha256:aaaa")],
+                ),
+                retirement_pod("tag-sandbox", &[("runner", target)]),
+            ],
+            target,
+        );
+        assert_eq!(names, vec!["acme-digest-claim"]);
+    }
+
+    #[test]
+    fn runner_layer_retire_empty_claim_list_selects_nothing() {
+        assert!(retirement_names(Vec::new(), Vec::new(), STOCK_NEW).is_empty());
+    }
+
+    #[test]
+    fn runner_layer_retire_rejects_unreadable_lists_for_label_wide_fallback() {
+        let empty = r#"{"items":[]}"#;
+        for invalid in ["not JSON", "{}", r#"{"items":null}"#, r#"{"items":{}}"#] {
+            assert!(
+                runner_layer_retire_claim_names(invalid, empty, STOCK_NEW).is_err(),
+                "invalid claim list must trigger fallback: {invalid}"
+            );
+            assert!(
+                runner_layer_retire_claim_names(empty, invalid, STOCK_NEW).is_err(),
+                "invalid pod list must trigger fallback: {invalid}"
+            );
+        }
+    }
+
     fn bindings(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
             .iter()
@@ -4276,9 +4594,11 @@ mod runner_layer_guard_tests {
                  will stop matching. This upgrade clears agentSandbox.runnerImages for them: they \
                  run the platform runner WITHOUT their layer until their owners rebuild with \
                  `curie build --plugin-dir <dir> --registry <ref>` against the upgraded CLI and \
-                 redeploy with `curie cluster deploy`. Their live sandboxes are retired after the \
-                 helm upgrade, so existing threads start fresh on the platform runner at their \
-                 next turn"
+                 redeploy with `curie cluster deploy`. After the helm upgrade it \
+                 retires their SandboxClaims whose runner is not the planned layer, or cannot be \
+                 resolved, and keeps sandboxes already on the target layer. If a claim, pod or \
+                 template read fails, it retires all of their claims. Retired threads start fresh \
+                 on the platform runner at their next turn"
             )
         );
         assert_eq!(runner_layer_notice(&[]), None);
