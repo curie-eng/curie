@@ -34,6 +34,9 @@ is documentation of where the code already draws the line, not a new abstraction
 | Connector host (bundle-declared MCP servers) | CLEAN | 1 (Kubernetes) + in-memory fake | not separately graded | #1063, #1184 | [Connector host (bundle-declared MCP servers)](interfaces/connector-host/INTERFACE.md) |
 | Sealed credential (cluster-sealed connector secrets) | SOFT | 2 halves (Rust sealer, Python opener) over one frozen wire | not separately graded | #1240 | [Sealed credential (cluster-sealed connector secrets)](interfaces/sealed-credential/INTERFACE.md) |
 | Third-party port adapter (deployed service) | NONE | lifecycle unbuilt; generic HTTP edge shipped | not separately graded | #19, #158 | [Third-party port adapter (deployed service)](interfaces/port-adapter-service/INTERFACE.md) |
+| MCP service-key authentication | SOFT | 1 deployment-owned service identity mode | not separately graded | #3273, #3308 | [MCP service-key authentication](interfaces/mcp-service-auth/INTERFACE.md) |
+| Cluster lifecycle admission | SOFT | 1 Helm and kubectl lifecycle coordinated by the Rust CLI with a worker pre-upgrade hook | not separately graded | #2301, #2010 | [Cluster lifecycle admission](interfaces/cluster-lifecycle/INTERFACE.md) |
+| Protected hook source authority | CLEAN | 0 production resolvers (tests inject the only implementation) | not separately graded | #3603 | [Protected hook source authority](interfaces/protected-hook-source-authority/INTERFACE.md) |
 <!-- END GENERATED: seam-table -->
 
 ## Kind legend
