@@ -50,6 +50,7 @@ from curie_worker.workitem_dispatch import (
     WorkItemStartGrant,
     WorkItemStartRefused,
 )
+from curie_worker.workspace import WorkspacePreparationError
 from redis.exceptions import ResponseError
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
@@ -849,6 +850,66 @@ def test_model_unreachable_on_every_attempt_finishes_with_its_cause_and_message(
             assert finish["cause"] == "model_unreachable"
             assert isinstance(finish["detail"], str)
             assert "API Error: Connection refused (ECONNREFUSED)" in finish["detail"]
+
+    asyncio.run(exercise())
+
+
+def test_workspace_retry_fault_finishes_with_redacted_bounded_stage_and_reason(
+    make_harness,
+) -> None:
+    """#4367: work-item finish consumes safe detail before reply formatting."""
+
+    reason = (
+        "API returned HTTP 500: -----BEGIN PRIVATE KEY-----\n"
+        f"{'SYNTHETIC-PRIVATE-MATERIAL' * 30}\n-----END PRIVATE KEY----- "
+        f"remaining diagnosis {'x' * 1000}"
+    )
+
+    class WorkspaceFaultOnRetry(_Workspace):
+        def select_repository(self, **kwargs: object) -> object:
+            selected = super().select_repository(**kwargs)
+            if len(self.selections) > 1:
+                raise WorkspacePreparationError("repository-selection", reason)
+            return selected
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=WorkspaceFaultOnRetry,
+            publication_creator=_NoExistingPublication(),
+            max_attempts=3,
+        ) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            # Start the real execution before the workspace retry fails. A
+            # fault before start defers the request and has no finish reader.
+            h.runner.default_script = [
+                ErrorEvent(message="retry this clean attempt", classification="runner-error"),
+                Final(text="", status=SessionStatus.CLASSIFIED_FAILURE),
+            ]
+            request_id = uuid.uuid4()
+            prompt = f"Resolve {ISSUE_URL}"
+
+            await h.kernel.process_event(_turn(f"work-item-{request_id}-execute-1", prompt))
+
+            assert h.runner.opened == [prompt]
+            assert h.kernel._workspace.selections == [WORK_ITEM_REPO] * 3
+            assert work_items.calls.count("start") == 1
+            assert work_items.calls.count("finish") == 1
+            finish = work_items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "workspace_error"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert detail.startswith(
+                "workspace repository-selection failed: API returned HTTP 500: "
+                "[REDACTED:pem_private_key]"
+            )
+            assert len(detail) <= 300
+            assert "remaining diagnosis" in detail
+            assert "SYNTHETIC-PRIVATE-MATERIAL" not in detail
+            assert "-----BEGIN PRIVATE KEY-----" not in detail
+            assert "-----END PRIVATE KEY-----" not in detail
 
     asyncio.run(exercise())
 

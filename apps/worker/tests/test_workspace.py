@@ -870,12 +870,44 @@ def test_internal_workspace_selection_sends_author_thread_and_optional_repo(
     )
 
     assert selected == "acme-corp/acme-bot"
+    assert len(calls) == 1
     assert calls[0]["url"].endswith(f"/{DEPLOYMENT_ID}/selection")
     assert json.loads(calls[0]["body"]) == {
         "conversation_id": "1700000000.000100",
         "author": "U0REQUEST1",
         "repo_full_name": "acme-corp/acme-bot",
     }
+
+
+def test_internal_workspace_selection_http_500_preserves_stage_and_status(
+    workspace: Any,
+) -> None:
+    """A server fault carries the status, never the API's arbitrary response body."""
+
+    calls: list[dict[str, Any]] = []
+
+    def transport(**request: Any) -> Any:
+        calls.append(request)
+        return SimpleNamespace(
+            status=500,
+            headers={},
+            body=b'{"detail":"opaque API response must stay private"}',
+        )
+
+    client = workspace.WorkspaceCredentialClient(
+        api_url="https://api.example.com",
+        github_api_url="https://api.github.com",
+        worker_token=WORKER_AUTH,
+        transport=transport,
+    )
+
+    with pytest.raises(workspace.WorkspacePreparationError) as excinfo:
+        client.select(DEPLOYMENT_ID, "1700000000.000100", "U0REQUEST1", "acme-corp/acme-bot")
+
+    assert len(calls) == 1
+    assert excinfo.value.stage == "repository-selection"
+    assert str(excinfo.value) == "workspace repository-selection failed: API returned HTTP 500"
+    assert not isinstance(excinfo.value, workspace.WorkspaceSelectionRefused)
 
 
 def test_unallowlisted_selection_names_the_chart_allowlist(

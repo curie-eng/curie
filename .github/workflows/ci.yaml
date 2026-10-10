@@ -2437,15 +2437,16 @@ jobs:
           path: ${{ runner.temp }}/runtime-assertion-receipts
           if-no-files-found: ignore
 
-  # CHART RUNTIME REGRESSIONS, in parallel with the cluster rung. Single
+  # CHART RUNTIME REGRESSIONS, in parallel with the cluster rung. Most
   # regression proofs that need an enforcing Calico cluster but neither the
-  # curie binary nor the product images, so this job does not wait on the Rust
-  # build and finishes inside the rung. It is selected by the same cluster tier
+  # curie binary nor the product images use this job's cluster. The workspace
+  # regression builds its own CLI and product images from source and owns a
+  # separate disposable kind cluster. This job does not wait on the Rust build
+  # and is selected by the same cluster tier
   # (every charts/ change), and `E2E required` needs it: the Langfuse readiness
   # assertion and the connector readiness probe are registered runtime
   # assertions (#3391), and a failure here reddens the required verdict exactly
-  # as the rung does. Each proof uses its own namespace, so they share the
-  # cluster.
+  # as the rung does. Proofs using this job's cluster each own their namespace.
   e2e-cluster-chart-regressions:
     name: E2E chart runtime regressions (kind, Calico)
     runs-on: ubuntu-latest
@@ -2640,6 +2641,12 @@ jobs:
         run: |
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
+      - name: Workspace dependency failure reaches the terminal diagnostic
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |

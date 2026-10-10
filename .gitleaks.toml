@@ -18,6 +18,22 @@
 useDefault = true
 
 [[rules]]
+id = "private-key"
+# Inherit the default detector. These redaction fixtures use source expressions
+# that produce deliberately invalid synthetic PEM material at runtime.
+  [[rules.allowlists]]
+  description = "Synthetic PEM interpolation in both workspace diagnostic regressions"
+  condition = "AND"
+  regexTarget = "match"
+  paths = [
+    '''^apps/worker/tests/kernel/test_kernel\.py$''',
+    '''^apps/worker/tests/kernel/test_work_item_workspace\.py$''',
+  ]
+  regexes = [
+    '''^-----BEGIN PRIVATE KEY-----\\n"\n[ \t]+f"\{'SYNTHETIC-PRIVATE-MATERIAL' \* 30\}\\n-----END PRIVATE KEY-----$''',
+  ]
+
+[[rules]]
 id = "slack-conversation-id"
 description = "Slack conversation id (channel/group/DM) -- use an EXAMPLE id in docs and tests"
 # Slack ids are C/G/D, then a digit, then 7-9 more uppercase alphanumerics

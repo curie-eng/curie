@@ -53,6 +53,8 @@ from curie_worker.sandbox import (
 )
 from curie_worker.sandbox.types import SandboxTermination
 from curie_worker.workspace import (
+    WorkspaceClaimCoordinator,
+    WorkspaceCredentialClient,
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
 )
@@ -1998,8 +2000,8 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
 # The refusal half of this ticket is already covered above, by the INFO line the
 # refusal branch emits. These pin the other half: clone and upload failures used
 # to be swallowed by the broad start-failure clause, which names an event id and
-# an anonymous repr. They assert the log line, not the reply; the reply was never
-# the missing half.
+# an anonymous repr. The original #2004 tests pin those log lines. The #4367
+# tests below also pin the stage and reason carried into the terminal reply.
 
 
 def _workspace_binding(
@@ -2116,6 +2118,184 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
             assert "acme-corp/acme-bot" in message, message
             assert "stage=clone" in message, message
             assert "repository not found" in message, message
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_detail", "expected_attempts"),
+    [
+        pytest.param(
+            500,
+            "workspace repository-selection failed: API returned HTTP 500",
+            3,
+            id="fault-exhausts-retry-budget",
+        ),
+        pytest.param(
+            403,
+            "That repository is not in api.githubRepoAllowlist for this installation; "
+            "allow `owner/repo` or `owner/*` in the chart values.",
+            1,
+            id="allowlist-refusal-is-terminal",
+        ),
+        pytest.param(
+            409,
+            "This thread is already bound to a different repository.",
+            1,
+            id="selection-conflict-is-terminal",
+        ),
+    ],
+)
+def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
+    make_harness, status: int, expected_detail: str, expected_attempts: int
+) -> None:
+    """#4367: selection faults retain the reason while policy refusals stay terminal."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        requests: list[dict[str, object]] = []
+
+        async def select(request: web.Request) -> web.Response:
+            requests.append(await request.json())
+            return web.json_response(
+                {
+                    "detail": {
+                        "code": "workspace.selection_conflict",
+                        "message": "opaque API response must not become the public reason",
+                    }
+                },
+                status=status,
+            )
+
+        app = web.Application()
+        app.router.add_post(f"/v1/internal/workspaces/{deployment_id}/selection", select)
+        async with TestServer(app) as server:
+            credentials = WorkspaceCredentialClient(
+                api_url=str(server.make_url("")),
+                github_api_url="https://api.github.com",
+                worker_token="workspace-test-token",
+            )
+            async with make_harness(
+                binding=_workspace_binding(deployment_id), max_attempts=3
+            ) as h:
+                h.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=h.substrate,
+                )
+                event = qevent(
+                    "Fix https://github.com/acme-corp/acme-bot",
+                    thread=f"tWorkspaceSelection{status}",
+                )
+                await h.kernel.process_event(event)
+
+                assert len(requests) == expected_attempts
+                assert all(
+                    body["repo_full_name"] == "acme-corp/acme-bot" for body in requests
+                )
+                assert h.fake_k8s.claim_envs == []
+                assert h.runner.opened == []
+                assert h.runner.steers == []
+                assert len(h.sink.completions) == 1
+                assert h.sink.completions[0].event_id == event.event_id
+                reply = h.sink.last_text
+                assert reply is not None
+                if status == 500:
+                    assert kernel_module.failure_class_from_reply(reply) == "workspace-error"
+                    assert expected_detail in reply
+                    assert "after 3 attempt(s)" in reply
+                    assert h.sink.completions[0].outcome == "escalated"
+                else:
+                    assert reply == expected_detail
+                    assert kernel_module.failure_class_from_reply(reply) is None
+                    assert h.sink.completions[0].outcome == "delivered"
+                assert "opaque API response" not in reply
+                assert await h.kernel._markers.is_terminal(event.event_id)
+
+    asyncio.run(go())
+
+
+def test_workspace_failure_reason_is_redacted_before_clipping(make_harness) -> None:
+    """A credential spanning the bound must be consumed before a prefix is kept."""
+
+    deployment_id = uuid.uuid4()
+    reason = (
+        "git clone exited 128: -----BEGIN PRIVATE KEY-----\n"
+        f"{'SYNTHETIC-PRIVATE-MATERIAL' * 30}\n-----END PRIVATE KEY----- "
+        f"remaining diagnosis {'x' * 1000}"
+    )
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=1) as h:
+
+            class WorkspaceProbe:
+                def select_repository(self, **_kwargs: object) -> str:
+                    return "acme-corp/acme-bot"
+
+                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                    raise WorkspacePreparationError("clone", reason)
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+            event = qevent(
+                "Fix https://github.com/acme-corp/acme-bot", thread="tWorkspaceSecret"
+            )
+            await h.kernel.process_event(event)
+
+            reply = h.sink.last_text
+            assert reply is not None
+            assert kernel_module.failure_class_from_reply(reply) == "workspace-error"
+            detail = reply.split("after 1 attempt(s). ", 1)[1].split(" event_id=", 1)[0]
+            assert detail.startswith(
+                "workspace clone failed: git clone exited 128: [REDACTED:pem_private_key]"
+            )
+            assert len(detail) <= 300
+            assert "remaining diagnosis" in detail
+            assert "SYNTHETIC-PRIVATE-MATERIAL" not in reply
+            assert "-----BEGIN PRIVATE KEY-----" not in reply
+            assert "-----END PRIVATE KEY-----" not in reply
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+            assert len(h.sink.completions) == 1
+            assert h.sink.completions[0].outcome == "escalated"
+
+    asyncio.run(go())
+
+
+def test_prior_side_effect_does_not_retry_a_workspace_selection_failure(make_harness) -> None:
+    """The durable no-retry marker wins before another workspace request is sent."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=3) as h:
+
+            class WorkspaceProbe:
+                selection_calls = 0
+
+                def select_repository(self, **_kwargs: object) -> str:
+                    self.selection_calls += 1
+                    raise WorkspacePreparationError(
+                        "repository-selection", "API returned HTTP 500"
+                    )
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            event = qevent(
+                "Fix https://github.com/acme-corp/acme-bot", thread="tWorkspacePriorAction"
+            )
+            await h.kernel._markers.mark_side_effect(event.event_id)
+            await h.kernel.process_event(event)
+
+            assert probe.selection_calls == 0
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+            reply = h.sink.last_text
+            assert reply is not None
+            assert kernel_module.failure_class_from_reply(reply) == "prior-side-effect"
+            assert "not retrying automatically" in reply
+            assert len(h.sink.completions) == 1
+            assert h.sink.completions[0].outcome == "escalated"
+            assert await h.kernel._markers.is_terminal(event.event_id)
 
     asyncio.run(go())
 
