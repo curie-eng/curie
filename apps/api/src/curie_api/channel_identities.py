@@ -45,11 +45,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .config import Settings
+from .identity.slack import AUTH_TEST_KEY
 from .models import (
     PROVIDER_REFERENCE_DENY_PATTERN,
     PROVIDER_REFERENCE_MAX_LENGTH,
     PROVIDER_REFERENCE_PATTERN,
     ChannelIdentity,
+    ProviderInstallation,
 )
 from .schemas.channel_identities import ChannelIdentityCreate, ChannelIdentityUpdate
 
@@ -137,6 +139,11 @@ def _check_attributes_deny(value: Any) -> None:
             _check_attributes_deny(item)
 
 
+def check_attributes(attributes: dict[str, Any]) -> None:
+    """The deny check for a whole ``attributes`` bag, for writers outside this module."""
+    _check_attributes_deny(attributes)
+
+
 # Only named constraints are translated; anything else is a bug and re-raises.
 _CONSTRAINT_ERRORS: dict[str, tuple[type[Exception], str]] = {
     "channel_identities_tenant_provider_name_key": (
@@ -220,23 +227,79 @@ async def update_identity(
     identity: ChannelIdentity,
     data: ChannelIdentityUpdate,
 ) -> ChannelIdentity:
+    """Apply a partial update under the lock order every writer shares.
+
+    The target installation (when the body names one) FOR SHARE, then the
+    identity FOR UPDATE, re-read, so a concurrent Slack identity report
+    (:mod:`.identity.attach`) and this update serialize rather than one
+    overwriting the other's attributes. The reserved ``slack_auth_test``
+    evidence is the report's alone: replacing ``attributes`` keeps it, a new
+    ``credential_ref`` or ``name`` drops it (the token it described is gone
+    until the dispatcher restarts and reports again), and a reattach recomputes
+    ``installation_mismatch`` against it.
+    """
+
     fields = data.model_fields_set
     for field in _REFERENCE_FIELDS:
         if field in fields:
             check_reference(field, getattr(data, field))
     if "attributes" in fields:
         _check_attributes_deny(data.attributes)
-    for field in (
-        "name",
-        "credential_ref",
-        "scopes",
-        "webhook_verification_ref",
-        "attributes",
-        "status",
-        "provider_installation_id",
-    ):
+
+    target: ProviderInstallation | None = None
+    if "provider_installation_id" in fields and data.provider_installation_id is not None:
+        target = await session.scalar(
+            select(ProviderInstallation)
+            .where(ProviderInstallation.id == data.provider_installation_id)
+            .with_for_update(read=True)
+        )
+    locked = await session.scalar(
+        select(ChannelIdentity)
+        .where(ChannelIdentity.id == identity.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked is None:
+        await session.rollback()
+        raise IdentityInvalid("the channel identity no longer exists")
+    identity = locked
+
+    attributes = dict(identity.attributes or {})
+    evidence = attributes.get(AUTH_TEST_KEY)
+    if "attributes" in fields:
+        attributes = dict(data.attributes or {})
+        if evidence is not None:
+            attributes[AUTH_TEST_KEY] = evidence
+    credential_changed = (
+        "credential_ref" in fields and data.credential_ref != identity.credential_ref
+    )
+    # The evidence was reported under the old name, by the token it held.
+    renamed = "name" in fields and data.name != identity.name
+    if credential_changed or renamed:
+        attributes.pop(AUTH_TEST_KEY, None)
+        evidence = None
+    for field in ("name", "credential_ref", "scopes", "webhook_verification_ref", "status"):
         if field in fields:
             setattr(identity, field, getattr(data, field))
+    identity.attributes = attributes
+
+    if "provider_installation_id" in fields:
+        identity.provider_installation_id = data.provider_installation_id
+        if data.provider_installation_id is None:
+            # Detached: there is nothing left to mismatch.
+            identity.installation_mismatch = False
+        elif target is not None and isinstance(evidence, dict):
+            # The evidence names ('', team_id); without evidence the flag stays.
+            identity.installation_mismatch = (target.authority, target.external_account_id) != (
+                "",
+                evidence.get("team_id"),
+            )
+    if renamed and identity.provider_installation_id is not None:
+        # The row may now stand for another token, so its attachment is
+        # unproven until a report under the new name matches it. Interactions
+        # need no stored evidence and would otherwise still pass the
+        # installation check against the old attachment.
+        identity.installation_mismatch = True
     await _commit(session)
     await session.refresh(identity)
     return identity

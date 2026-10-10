@@ -77,7 +77,7 @@ def test_one_hand_written_revision_on_the_assumed_parent() -> None:
 
     revision, down = _revision()
     assert (revision, down) == (HEAD, BELOW)
-    assert ScriptDirectory.from_config(alembic_config()).get_heads() == ["0101"]
+    assert ScriptDirectory.from_config(alembic_config()).get_heads() == ["0102"]
 
 
 def test_the_record_is_keyed_by_what_it_qualifies(

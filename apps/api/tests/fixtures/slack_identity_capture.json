@@ -1,0 +1,5 @@
+[
+  {"delivery":"app_mention","envelope":{"team_id":"THOME0001","is_ext_shared_channel":false,"authorizations":[{"team_id":"THOME0001","enterprise_id":null,"is_enterprise_install":false,"is_bot":true}]},"event":{"type":"app_mention","user":"UALICE001","team":"THOME0001"}},
+  {"delivery":"block_actions","payload":{"type":"block_actions","user":{"id":"UALICE001","team_id":"THOME0001"},"team":{"id":"THOME0001"},"enterprise":null,"is_enterprise_install":false}},
+  {"delivery":"view_submission","payload":{"type":"view_submission","user":{"id":"UALICE001","team_id":"THOME0001"},"team":{"id":"THOME0001"},"enterprise":null,"is_enterprise_install":false}}
+]

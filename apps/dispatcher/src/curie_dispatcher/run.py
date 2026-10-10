@@ -30,6 +30,8 @@ from .identities import (
     default_identity_credentials,
     resolve_identity_credentials,
 )
+from .identity import shutdown_identity_lookups
+from .installation_report import InstallationReportClient, start_installation_reports
 from .preflight import (
     ApiUnreachableError,
     PreflightedIdentity,
@@ -190,11 +192,24 @@ def build_supervisor(
         logger=logger,
         declared_count=declared_count if declared_count is not None else len(admitted),
     )
-    return SupervisorGroup(
+    group = SupervisorGroup(
         {c.name: c.supervisor for c in connections},
         logger=logger,
         restart_backoff=backoff,
     )
+    # Kept on the group so ``main`` can start each identity's installation
+    # report (#3039) with that identity's own Web client.
+    group.identity_connections = connections  # type: ignore[attr-defined]
+    return group
+
+
+def _reporting_identities(group: object) -> list[tuple[str, WebClient]]:
+    """Each identity's name and its own Web client, from what the group exposes.
+
+    A group that carries no connections (a stand-in) reports nothing.
+    """
+    connections = getattr(group, "identity_connections", None) or ()
+    return [(c.name, c.web_client) for c in connections]
 
 
 def main() -> None:
@@ -233,11 +248,19 @@ def main() -> None:
         supervisor = build_supervisor(
             config, logger=logger, identities=admitted, declared_count=len(identities)
         )
+        # Looked up as a module global so tests can keep the reports offline.
+        reports_stop = threading.Event()
+        start_installation_reports(
+            _reporting_identities(supervisor),
+            InstallationReportClient(config.api_base_url, config.api_key),
+            stop_event=reports_stop,
+        )
         hb_stop = start_heartbeat(config.heartbeat_file, config.heartbeat_interval_s)
 
         def _shut_down(signum: int) -> None:
             logger.info("received signal %s, shutting down", signum)
             hb_stop.set()
+            reports_stop.set()
             supervisor.request_stop()
 
         def _handle_signal(signum: int, _frame: object) -> None:
@@ -259,6 +282,8 @@ def main() -> None:
             supervisor.run()
         finally:
             hb_stop.set()
+            reports_stop.set()
+            shutdown_identity_lookups()
         logger.info("dispatcher stopped")
     finally:
         telemetry.shutdown()

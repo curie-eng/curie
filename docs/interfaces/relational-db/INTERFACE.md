@@ -231,6 +231,11 @@ per (nomination, stage) the worker receipt loop has claimed: its lease, attempt
 count and `posted_at`. The row holds no message text, argument or reason and
 cascades with its nomination. The downgrade drops both.
 
+Migration `0102_identity_links.py` (identity namespaces and links, #2910,
+ADR-0198 decision 5) is additive: two new tables, whose active-link uniqueness
+is a partial unique index (`identity_links_active_native_key`,
+`WHERE revoked_at IS NULL`).
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.
@@ -318,7 +323,9 @@ is a judgement call, not something derivable from the tree.
    the list of provider scopes granted to one channel identity (#2909); `attributes` is
    the same class's `attributes`, provider-specific identity details that don't fit a
    fixed column, such as a Slack identity's extra token reference (ADR-0168 decision 1,
-   as scoped by ADR-0193 decision 4).
+   as scoped by ADR-0198 decision 4). Its reserved `slack_auth_test` key holds what a
+   Slack identity's own `auth.test` reported (#3039), written only by
+   `apps/api/src/curie_api/identity/attach.py::report_slack_identity`.
 4. **Raw dialect-specific SQL outside the ORM** — `DISTINCT ON`, which is Postgres-only,
    is written by hand in `apps/api/src/curie_api/commitpoller.py::_DEPLOYED_SQL` (executed
    through `text(...)` in `apps/api/src/curie_api/commitpoller.py::CommitPoller.poll_once`)
