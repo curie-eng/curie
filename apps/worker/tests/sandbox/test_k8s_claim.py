@@ -24,6 +24,9 @@ from curie_worker.sandbox.k8s import (
     KubernetesSandboxClient,
     _claim_view,
 )
+from curie_worker.sandbox.types import KubeTransientError
+from kubernetes.client import ApiException
+from urllib3.exceptions import MaxRetryError, ReadTimeoutError
 
 # Captured live with `kubectl get sandboxclaims` in JSON form. The controller's
 # direct Pod admission failure emitted no Warning quota Event, so this Ready
@@ -160,6 +163,151 @@ def _client(api: _FakeApi) -> KubernetesSandboxClient:
     client._core_api = api  # type: ignore[attr-defined]
     client._namespace = "test-ns"  # type: ignore[attr-defined]
     return client
+
+
+class _LogApi(_FakeApi):
+    """The CoreV1Api boundary, with one response per attempted log read."""
+
+    def __init__(self, responses: list[object], *, elapsed: list[float] | None = None) -> None:
+        super().__init__()
+        self.responses = responses
+        self.elapsed = elapsed or [0.0] * len(responses)
+        self.now = 100.0
+        self.log_reads: list[dict[str, object]] = []
+
+    def read_namespaced_pod_log(
+        self,
+        name: str,
+        namespace: str,
+        *,
+        container: str,
+        previous: bool,
+        tail_lines: int,
+        limit_bytes: int,
+        _preload_content: bool,
+        _request_timeout: float,
+    ) -> object:
+        # Kubernetes documents previous as the previous terminated container's
+        # log and bounds by both lines and bytes. The generated Python API
+        # exposes the urllib3 response when _preload_content is false:
+        # https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/#read-log
+        # https://github.com/kubernetes-client/python/blob/master/kubernetes/docs/CoreV1Api.md#read_namespaced_pod_log
+        self.log_reads.append(
+            {
+                "name": name,
+                "namespace": namespace,
+                "container": container,
+                "previous": previous,
+                "tail_lines": tail_lines,
+                "limit_bytes": limit_bytes,
+                "preload_content": _preload_content,
+                "request_timeout": _request_timeout,
+            }
+        )
+        self.now += self.elapsed.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            SimpleNamespace(data=b"runner boot\ntraceback: \xff\n"),
+            "runner boot\ntraceback: \ufffd\n",
+        ),
+        (b"plain bytes\n", "plain bytes\n"),
+        ("plain text\n", "plain text\n"),
+    ],
+    ids=["http-response-invalid-utf8", "raw-bytes", "text"],
+)
+def test_pod_log_tail_reads_previous_runner_output_with_bounds(
+    response: object, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    api = _LogApi([response])
+    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: api.now)
+
+    assert _client(api).pod_log_tail("runner-pod", request_timeout_seconds=5.0) == expected
+    assert api.log_reads == [
+        {
+            "name": "runner-pod",
+            "namespace": "test-ns",
+            "container": "runner",
+            "previous": True,
+            "tail_lines": 200,
+            "limit_bytes": 8192,
+            "preload_content": False,
+            "request_timeout": 5.0,
+        }
+    ]
+
+
+def test_pod_log_tail_falls_back_to_current_only_when_previous_returns_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _LogApi(
+        [k8s_module.k8s_client.ApiException(status=400), SimpleNamespace(data=b"current\n")],
+        elapsed=[2.0, 0.0],
+    )
+    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: api.now)
+
+    assert _client(api).pod_log_tail("runner-pod", request_timeout_seconds=5.0) == "current\n"
+    assert [read["previous"] for read in api.log_reads] == [True, False]
+    assert [read["request_timeout"] for read in api.log_reads] == [5.0, 3.0]
+    assert all(
+        read["name"] == "runner-pod"
+        and read["namespace"] == "test-ns"
+        and read["container"] == "runner"
+        and read["tail_lines"] == 200
+        and read["limit_bytes"] == 8192
+        and read["preload_content"] is False
+        for read in api.log_reads
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        k8s_module.k8s_client.ApiException(status=403),
+        k8s_module.k8s_client.ApiException(status=404),
+        k8s_module.k8s_client.ApiException(status=500),
+        TimeoutError("log read timed out"),
+        OSError("log transport failed"),
+    ],
+    ids=["forbidden", "missing", "server-error", "timeout", "transport"],
+)
+def test_pod_log_tail_errors_return_none_without_retry(error: BaseException) -> None:
+    api = _LogApi([error])
+
+    assert _client(api).pod_log_tail("runner-pod", request_timeout_seconds=5.0) is None
+    assert len(api.log_reads) == 1
+    assert api.log_reads[0]["previous"] is True
+
+
+@pytest.mark.parametrize(
+    "error",
+    [k8s_module.k8s_client.ApiException(status=400), TimeoutError("current log timed out")],
+    ids=["current-400", "current-timeout"],
+)
+def test_pod_log_tail_current_failure_returns_none_and_never_retries_again(
+    error: BaseException,
+) -> None:
+    api = _LogApi([k8s_module.k8s_client.ApiException(status=400), error])
+
+    assert _client(api).pod_log_tail("runner-pod", request_timeout_seconds=5.0) is None
+    assert [read["previous"] for read in api.log_reads] == [True, False]
+
+
+def test_pod_log_tail_exhausted_previous_read_does_not_start_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api = _LogApi([k8s_module.k8s_client.ApiException(status=400)], elapsed=[5.1])
+    monkeypatch.setattr(k8s_module.time, "monotonic", lambda: api.now)
+
+    assert _client(api).pod_log_tail("runner-pod", request_timeout_seconds=5.0) is None
+    assert len(api.log_reads) == 1
 
 
 def _resource_quota(
@@ -1071,9 +1219,7 @@ def test_pod_event_fallback_uses_only_the_current_pod_uid() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(
         metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
-        status=SimpleNamespace(
-            phase="Failed", reason=None, message=None, container_statuses=[]
-        ),
+        status=SimpleNamespace(phase="Failed", reason=None, message=None, container_statuses=[]),
     )
     api.events = [
         SimpleNamespace(
@@ -1110,9 +1256,7 @@ def test_stale_pod_event_cannot_supply_a_failed_pods_cause() -> None:
     api = _FakeApi()
     api.pod = SimpleNamespace(
         metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
-        status=SimpleNamespace(
-            phase="Failed", reason=None, message=None, container_statuses=[]
-        ),
+        status=SimpleNamespace(phase="Failed", reason=None, message=None, container_statuses=[]),
     )
     api.events = [
         SimpleNamespace(
@@ -1136,9 +1280,7 @@ def test_running_pod_without_termination_or_matching_event_has_no_cause() -> Non
     since = datetime.now(UTC) - timedelta(seconds=5)
     api.pod = SimpleNamespace(
         metadata=SimpleNamespace(name="sbx-1", uid="pod-current"),
-        status=SimpleNamespace(
-            phase="Running", reason=None, message=None, container_statuses=[]
-        ),
+        status=SimpleNamespace(phase="Running", reason=None, message=None, container_statuses=[]),
     )
     api.events = [
         SimpleNamespace(
@@ -1150,12 +1292,7 @@ def test_running_pod_without_termination_or_matching_event_has_no_cause() -> Non
         )
     ]
 
-    assert (
-        _client(api).pod_termination(
-            "sbx-1", request_timeout_seconds=0.5, since=since
-        )
-        is None
-    )
+    assert _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since) is None
 
 
 def test_recent_eviction_event_explains_a_still_running_pod() -> None:
@@ -1193,9 +1330,12 @@ def test_oom_event_alone_does_not_identify_runner_in_running_pod() -> None:
         )
     ]
 
-    assert _client(api).pod_termination(
-        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
-    ) is None
+    assert (
+        _client(api).pod_termination(
+            "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+        )
+        is None
+    )
 
 
 def test_terminated_sidecar_does_not_hide_runner_state() -> None:
@@ -1254,9 +1394,7 @@ def test_only_recent_oom_last_state_explains_a_running_pod(recent: bool) -> None
         ),
     )
 
-    termination = _client(api).pod_termination(
-        "sbx-1", request_timeout_seconds=0.5, since=since
-    )
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
 
     if recent:
         assert termination is not None
@@ -1264,3 +1402,349 @@ def test_only_recent_oom_last_state_explains_a_running_pod(recent: bool) -> None
         assert termination.detail == "exit code 137"
     else:
         assert termination is None
+
+
+def _runner_status(terminated: SimpleNamespace | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        name="runner", state=SimpleNamespace(terminated=terminated), last_state=None
+    )
+
+
+def _readable_pod(
+    *,
+    phase: str = "Running",
+    deletion_timestamp: datetime | None = None,
+    creation_timestamp: datetime | None = None,
+    container_statuses: list[SimpleNamespace] | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        metadata=SimpleNamespace(
+            name="sbx-1",
+            uid="pod-current",
+            deletion_timestamp=deletion_timestamp,
+            creation_timestamp=creation_timestamp,
+        ),
+        status=SimpleNamespace(
+            phase=phase,
+            reason=None,
+            message=None,
+            container_statuses=container_statuses or [],
+        ),
+    )
+
+
+def test_deleted_pod_404_without_event_reports_deleted() -> None:
+    api = _FakeApi()
+    api.pod_error = ApiException(status=404)
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Deleted"
+    assert termination.detail is None
+    assert len(api.event_reads) == 1
+
+
+def test_deleted_pod_404_with_recent_evicted_event_reports_evicted() -> None:
+    api = _FakeApi()
+    api.pod_error = ApiException(status=404)
+    api.events = [
+        SimpleNamespace(
+            reason="Evicted",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-previous"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination(
+        "sbx-1", request_timeout_seconds=0.5, since=datetime.now(UTC) - timedelta(seconds=5)
+    )
+
+    assert termination is not None
+    assert termination.reason == "Evicted"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ApiException(status=403),
+        ApiException(status=500),
+        TimeoutError("pod read timed out"),
+    ],
+    ids=["forbidden", "server-error", "timeout"],
+)
+def test_unreadable_pod_without_event_has_no_cause(error: BaseException) -> None:
+    """Only a 404 proves deletion; any other read failure keeps no cause."""
+
+    api = _FakeApi()
+    api.pod_error = error
+
+    assert (
+        _client(api).pod_termination(
+            "sbx-1",
+            request_timeout_seconds=0.5,
+            since=datetime.now(UTC) - timedelta(seconds=5),
+        )
+        is None
+    )
+    assert len(api.event_reads) == 1
+
+
+def test_deleting_pod_with_generic_runner_exit_reports_deleted_with_exit_code() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(
+        phase="Failed",
+        deletion_timestamp=datetime.now(UTC),
+        creation_timestamp=since - timedelta(minutes=5),
+        container_statuses=[
+            _runner_status(SimpleNamespace(reason="Error", exit_code=143)),
+        ],
+    )
+
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
+
+    assert termination is not None
+    assert termination.reason == "Deleted"
+    assert termination.detail == "exit code 143"
+
+
+def test_deleting_pod_with_oom_runner_reports_oom_killed() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(
+        deletion_timestamp=datetime.now(UTC),
+        creation_timestamp=since - timedelta(minutes=5),
+        container_statuses=[
+            _runner_status(SimpleNamespace(reason="OOMKilled", exit_code=137)),
+        ],
+    )
+
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
+
+    assert termination is not None
+    assert termination.reason == "OOMKilled"
+    assert termination.detail == "exit code 137"
+
+
+def test_deleting_pod_keeps_deleted_despite_recent_current_uid_oom_event() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(
+        deletion_timestamp=datetime.now(UTC),
+        creation_timestamp=since - timedelta(minutes=5),
+        container_statuses=[_runner_status(SimpleNamespace(reason="Error", exit_code=143))],
+    )
+    api.events = [
+        SimpleNamespace(
+            reason="OOMKilling",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
+
+    assert termination is not None
+    assert termination.reason == "Deleted"
+    assert termination.detail == "exit code 143"
+
+
+def test_deleting_running_pod_without_terminated_runner_reports_deleted() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(
+        deletion_timestamp=datetime.now(UTC),
+        creation_timestamp=since - timedelta(minutes=5),
+        container_statuses=[_runner_status(None)],
+    )
+
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
+
+    assert termination is not None
+    assert termination.reason == "Deleted"
+    assert termination.detail is None
+
+
+def _runner_with_last_oom(finished_at: datetime) -> SimpleNamespace:
+    return SimpleNamespace(
+        name="runner",
+        state=SimpleNamespace(terminated=None),
+        last_state=SimpleNamespace(
+            terminated=SimpleNamespace(reason="OOMKilled", exit_code=137, finished_at=finished_at)
+        ),
+    )
+
+
+def test_deleting_pod_with_recent_last_state_oom_reports_oom_killed() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(
+        deletion_timestamp=datetime.now(UTC),
+        creation_timestamp=since - timedelta(minutes=5),
+        container_statuses=[_runner_with_last_oom(since + timedelta(seconds=1))],
+    )
+
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
+
+    assert termination is not None
+    assert termination.reason == "OOMKilled"
+    assert termination.detail == "exit code 137"
+
+
+def test_deleting_pod_with_stale_last_state_oom_reports_deleted() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(
+        deletion_timestamp=datetime.now(UTC),
+        creation_timestamp=since - timedelta(minutes=5),
+        container_statuses=[_runner_with_last_oom(since - timedelta(seconds=1))],
+    )
+
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
+
+    assert termination is not None
+    assert termination.reason == "Deleted"
+    assert termination.detail is None
+
+
+def test_replaced_pod_created_exactly_at_since_reports_deleted() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(creation_timestamp=since)
+
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
+
+    assert termination is not None
+    assert termination.reason == "Deleted"
+    assert termination.detail == "replaced by a new pod with the same name"
+
+
+def test_replaced_failed_pod_ignores_its_own_status_and_current_uid_event() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(
+        phase="Failed",
+        creation_timestamp=since + timedelta(seconds=1),
+        container_statuses=[_runner_status(SimpleNamespace(reason="OOMKilled", exit_code=137))],
+    )
+    api.events = [
+        SimpleNamespace(
+            reason="Evicted",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-current"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
+
+    assert termination is not None
+    assert termination.reason == "Deleted"
+    assert termination.detail == "replaced by a new pod with the same name"
+
+
+def test_replaced_pod_reports_deleted_and_ignores_older_uid_eviction() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(creation_timestamp=since + timedelta(seconds=1))
+    api.events = [
+        SimpleNamespace(
+            reason="Evicted",
+            involved_object=SimpleNamespace(kind="Pod", name="sbx-1", uid="pod-previous"),
+            last_timestamp=datetime.now(UTC),
+        )
+    ]
+
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
+
+    assert termination is not None
+    assert termination.reason == "Deleted"
+    assert termination.detail == "replaced by a new pod with the same name"
+
+
+def test_running_pod_created_before_since_without_event_has_no_cause() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(creation_timestamp=since - timedelta(minutes=5))
+
+    assert _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since) is None
+
+
+def test_succeeded_pod_without_deletion_is_completed_not_deleted() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    api.pod = _readable_pod(phase="Succeeded", creation_timestamp=since - timedelta(minutes=5))
+
+    termination = _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since)
+
+    assert termination is not None
+    assert termination.reason == "Completed"
+
+
+def test_naive_creation_timestamp_is_not_replaced() -> None:
+    api = _FakeApi()
+    since = datetime.now(UTC) - timedelta(seconds=5)
+    naive_after_since = (since + timedelta(seconds=1)).replace(tzinfo=None)
+    api.pod = _readable_pod(creation_timestamp=naive_after_since)
+
+    assert _client(api).pod_termination("sbx-1", request_timeout_seconds=0.5, since=since) is None
+
+
+class _RaisingCustomObjectsApi:
+    """The CustomObjectsApi boundary, failing every read with one exception."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def get_namespaced_custom_object(self, *args: object, **kwargs: object) -> dict[str, Any]:
+        del args, kwargs
+        raise self.error
+
+
+def _raising_client(error: Exception) -> KubernetesSandboxClient:
+    client = KubernetesSandboxClient.__new__(KubernetesSandboxClient)
+    client._api = _RaisingCustomObjectsApi(error)
+    client._namespace = "test-ns"
+    return client
+
+
+_READ_TIMEOUT = ReadTimeoutError(
+    None,  # type: ignore[arg-type]
+    "/apis/extensions.agents.x-k8s.io/v1beta1/namespaces/test-ns/sandboxclaims/c",
+    "Read timed out. (read timeout=0.07)",
+)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _READ_TIMEOUT,
+        MaxRetryError(None, "/apis/sandboxclaims/c", _READ_TIMEOUT),  # type: ignore[arg-type]
+        ApiException(status=503),
+    ],
+    ids=["read-timeout", "max-retry", "503"],
+)
+def test_transient_kube_read_failures_raise_kube_transient_error(error: Exception) -> None:
+    # #4181: a urllib3 transport error escaped _get as a non-SandboxError and
+    # left the claim's stream entry pending.
+    with pytest.raises(KubeTransientError, match="sandboxclaims/c") as excinfo:
+        _raising_client(error).get_claim("c", request_timeout_seconds=1.0)
+
+    assert excinfo.value.__cause__ is error
+
+
+def test_kube_read_404_is_absence() -> None:
+    client = _raising_client(ApiException(status=404))
+
+    assert client.get_claim("c", request_timeout_seconds=1.0) is None
+
+
+def test_kube_read_403_is_reraised_unchanged() -> None:
+    error = ApiException(status=403)
+
+    with pytest.raises(ApiException) as excinfo:
+        _raising_client(error).get_claim("c", request_timeout_seconds=1.0)
+
+    assert excinfo.value is error

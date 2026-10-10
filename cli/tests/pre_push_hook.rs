@@ -126,12 +126,34 @@ impl Fixture {
             self.root.join("tools/preflight/preflight.py"),
         )
         .unwrap();
+        fs::write(
+            self.root.join("pyproject.toml"),
+            "[tool.uv.workspace]\nmembers = []\n",
+        )
+        .unwrap();
+        fs::write(self.root.join("tools/preflight/always.txt"), "").unwrap();
+        for relative in [
+            "tools/e2e-ci-selection/select_tiers.py",
+            ".github/e2e-selection.yaml",
+            "release/atlas.py",
+            "cli/Cargo.toml",
+        ] {
+            let destination = self.root.join(relative);
+            fs::create_dir_all(destination.parent().unwrap()).unwrap();
+            fs::copy(source.join(relative), destination).unwrap();
+        }
         git(&self.root, &["add", "."]);
         git(&self.root, &["commit", "-qm", "Add real preflight inputs"]);
+        let remote = self.temp.path().join("origin.git");
         git(
             &self.root,
-            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+            &["init", "--bare", "-q", remote.to_str().unwrap()],
         );
+        git(
+            &self.root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&self.root, &["push", "-q", "origin", "main"]);
         fs::create_dir(self.root.join("docs")).unwrap();
         fs::write(self.root.join("docs/example.md"), "Example notes\n").unwrap();
         git(&self.root, &["add", "docs/example.md"]);
@@ -144,6 +166,68 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_curie"))
             .args(args)
             .current_dir(&self.root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+    }
+
+    fn recorded_gh(&self, fail_api: bool) -> PathBuf {
+        let bin = self.temp.path().join("recorded-gh");
+        fs::create_dir(&bin).unwrap();
+        // Sanitized fields from GitHub's documented provider responses. Only
+        // the external GitHub boundary is replayed; Git, uv and every fast
+        // gate execute their real commands.
+        // https://docs.github.com/en/rest/repos/rules#get-rules-for-a-branch
+        // https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference
+        // https://docs.github.com/en/rest/branches/branch-protection#get-status-checks-protection
+        let script = r#"#!/usr/bin/env python3
+import json
+import sys
+
+args = sys.argv[1:]
+if args[:2] == ["repo", "view"]:
+    print("acme-corp/acme-bot")
+    raise SystemExit(0)
+if not args or args[0] != "api":
+    raise SystemExit("unexpected recorded gh invocation")
+if FAIL_API:
+    raise SystemExit("recorded GitHub API unavailable")
+endpoint = args[1].lstrip("/")
+if "/protection/required_status_checks" in endpoint:
+    print(json.dumps({"message": "Branch not protected", "status": "404"}))
+    print("gh: Branch not protected (HTTP 404)", file=sys.stderr)
+    raise SystemExit(1)
+if "/rules/branches/" in endpoint:
+    response = [{"type": "required_status_checks", "parameters": {
+        "required_status_checks": [{"context": "Python (ruff + mypy + pytest)"}]
+    }}]
+elif "/check-runs" in endpoint:
+    response = {"total_count": 1, "check_runs": [{
+        "name": "Python (ruff + mypy + pytest)",
+        "status": "completed", "conclusion": "success"
+    }]}
+else:
+    raise SystemExit("unexpected recorded gh endpoint: " + endpoint)
+print(json.dumps(response))
+"#;
+        executable(
+            &bin.join("gh"),
+            &script.replace("FAIL_API", if fail_api { "True" } else { "False" }),
+        );
+        bin
+    }
+
+    fn real_cli_with_gh(&self, args: &[&str], gh_bin: &Path) -> Output {
+        let path = env::join_paths(
+            std::iter::once(gh_bin.to_path_buf())
+                .chain(env::split_paths(&env::var_os("PATH").unwrap())),
+        )
+        .unwrap();
+        Command::new(env!("CARGO_BIN_EXE_curie"))
+            .args(args)
+            .current_dir(&self.root)
+            .env("PATH", path)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
@@ -312,18 +396,64 @@ fn cli_preflight_json_dry_run_matches_the_real_python_tool() {
 }
 
 #[test]
-fn cli_preflight_missing_fast_is_usage_error_with_actionable_json() {
+fn cli_preflight_defaults_to_full_and_executes_docs_only_without_services() {
     let fixture = Fixture::new();
     fixture.prepare_preflight();
-    let output = fixture.real_cli(&["dev", "preflight", "--json"]);
-    assert_eq!(output.status.code(), Some(2), "{}", visible(&output));
+    let gh_bin = fixture.recorded_gh(false);
+    let worktrees = git(&fixture.root, &["worktree", "list", "--porcelain"]);
+    let output = fixture.real_cli_with_gh(&["dev", "preflight", "--json"], &gh_bin);
+    assert!(output.status.success(), "{}", visible(&output));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_preflight_schema(&report);
+    assert_eq!(report["passed"], true);
+    assert_eq!(report["tier"], "full");
+    assert_eq!(report["dry_run"], false);
+    assert_eq!(report["base"]["contains_tip"], true);
+    assert_eq!(
+        report["base"]["failing_required_checks"],
+        serde_json::json!([])
+    );
+    assert_eq!(report["failures"], serde_json::json!([]));
+    assert_eq!(report["ci_only"], serde_json::json!([]));
+    let checks = report["checks"].as_array().unwrap();
+    for job in ["action-pins", "commit-messages", "gitleaks"] {
+        let check = checks
+            .iter()
+            .find(|check| check["job"] == job)
+            .unwrap_or_else(|| panic!("full default must execute {job}: {report}"));
+        assert_eq!(check["status"], "passed", "{report}");
+    }
+    for name in ["PR body", "Fix pin", "Affected Python tests"] {
+        let check = checks
+            .iter()
+            .find(|check| check["name"] == name)
+            .unwrap_or_else(|| panic!("full default must report {name}: {report}"));
+        assert_eq!(check["status"], "skipped", "{report}");
+    }
+    assert_eq!(
+        git(&fixture.root, &["worktree", "list", "--porcelain"]),
+        worktrees,
+        "full execution must remove its detached verification checkout"
+    );
+}
+
+#[test]
+fn cli_preflight_unavailable_github_preserves_transient_exit_and_actionable_json() {
+    let fixture = Fixture::new();
+    fixture.prepare_preflight();
+    let gh_bin = fixture.recorded_gh(true);
+    let output = fixture.real_cli_with_gh(&["dev", "preflight", "--dry-run", "--json"], &gh_bin);
+    assert_eq!(output.status.code(), Some(3), "{}", visible(&output));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_preflight_schema(&report);
+    assert_eq!(report["passed"], false);
+    assert_eq!(report["tier"], "full");
     assert!(report["error"]
         .as_str()
-        .is_some_and(|value| !value.is_empty()));
+        .is_some_and(|value| value.contains("recorded GitHub API unavailable")));
     assert!(report["fix"]
         .as_str()
-        .is_some_and(|value| value.contains("--fast")));
+        .is_some_and(|value| !value.is_empty()));
 }
 
 #[test]

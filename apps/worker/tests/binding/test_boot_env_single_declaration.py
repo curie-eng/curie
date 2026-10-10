@@ -209,6 +209,7 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_PUBLICATION_IMAGE_PULL_SECRETS",
         "CURIE_PUBLICATION_PRIORITY_CLASS_NAME",
         "CURIE_PUBLICATION_PROTECTED_PATHS",
+        "CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS",
         "CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME",
         "CURIE_PUBLICATION_OWNER_NAME",
         "CURIE_PUBLICATION_GIT_USER_NAME",
@@ -336,6 +337,9 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         # The Claude SDK consumes this background model setting for session
         # titles. The runner passes it to the SDK, outside the BootEnv contract.
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        # SDK-owned runtime target for model: opus; BootEnv carries only the
+        # per-agent CURIE_REVIEWER_MODEL override (#4120).
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
         # PR #663 operator-tunable Docker runner hardening knobs; the docker
         # substrate reads these from its OWN env, never injected into the runner
         # boot contract.
@@ -572,9 +576,9 @@ def test_boot_env_keys_are_declared_once_in_aci_protocol() -> None:
     # one of them "unclassified" instead of naming it the drift it is.
     boot_keys = set(BootEnv.env_keys())
     assert boot_keys, "BootEnv declares no keys; the scan would be vacuous"
-    assert not boot_keys - {
-        k for k in boot_keys if k.startswith(_PREFIXES)
-    }, "a declared boot key sits outside the scanned prefixes; widen _PREFIXES"
+    assert not boot_keys - {k for k in boot_keys if k.startswith(_PREFIXES)}, (
+        "a declared boot key sits outside the scanned prefixes; widen _PREFIXES"
+    )
 
     redeclared: list[str] = []
     unclassified: list[str] = []
@@ -594,8 +598,7 @@ def test_boot_env_keys_are_declared_once_in_aci_protocol() -> None:
             "side and the sandbox still boots, still runs, and silently drops the\n"
             "feature. Read the key from the BootEnv declaration (render it via\n"
             "BootEnv.render_worker on the worker side, parse it via BootEnv.from_env\n"
-            "on the runner side) instead of retyping the literal:\n"
-            + "\n".join(sorted(redeclared))
+            "on the runner side) instead of retyping the literal:\n" + "\n".join(sorted(redeclared))
         )
     if unclassified:
         problems.append(
@@ -604,8 +607,7 @@ def test_boot_env_keys_are_declared_once_in_aci_protocol() -> None:
             "one of them is one or the other: if the sandbox reads it, declare it on\n"
             "BootEnv; if some other process reads it, add it to _NON_BOOT_ALLOWLIST\n"
             "in this file with the consumer named. An unclassified one is how the\n"
-            "next straggler is born:\n"
-            + "\n".join(sorted(unclassified))
+            "next straggler is born:\n" + "\n".join(sorted(unclassified))
         )
 
     assert not problems, "\n\n".join(problems)
@@ -641,6 +643,5 @@ def test_agent_id_is_not_declared_anywhere_in_the_lanes() -> None:
     hits = [f"{rel}:{lineno}" for rel, lineno, name in _scan() if name == "CURIE_AGENT_ID"]
     assert not hits, (
         "CURIE_AGENT_ID is injected into every sandbox boot env and no consumer "
-        "ever reads it. Delete the write site rather than declaring it:\n  "
-        + "\n  ".join(hits)
+        "ever reads it. Delete the write site rather than declaring it:\n  " + "\n  ".join(hits)
     )

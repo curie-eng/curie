@@ -24,6 +24,7 @@ from aci_protocol import (
     derive_dead_letter_stream_name,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_upgrade_pause import authoritative_key
 from plugin_format.connector_render import ConnectorProxy
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -463,8 +464,8 @@ class Settings(BaseSettings):
         ),
     )
     work_item_acquire_lease_seconds: int = Field(
-        default=300,
-        gt=0,
+        default=60,
+        ge=40,
         validation_alias=AliasChoices(
             "CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS",
             "WORK_ITEM_ACQUIRE_LEASE_SECONDS",
@@ -500,6 +501,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices(
             "CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS",
             "WORK_ITEM_BACKOFF_MAX_SECONDS",
+        ),
+    )
+    work_item_start_deferral_limit: int = Field(
+        default=5,
+        gt=0,
+        validation_alias=AliasChoices(
+            "CURIE_WORK_ITEM_START_DEFERRAL_LIMIT",
+            "WORK_ITEM_START_DEFERRAL_LIMIT",
         ),
     )
     work_item_terminate_retry_seconds: int = Field(
@@ -797,15 +806,7 @@ class Settings(BaseSettings):
         return f"{scheme}://:{self.valkey_password}@{self.valkey_host}:{self.valkey_port}/0"
 
     def upgrade_quiesce_key(self) -> str:
-        # Mirrors WorkerConfig.upgrade_quiesce_key (#2374, #3127): one
-        # authoritative "stop taking new work" marker per Helm installation,
-        # written by the worker with the same key_prefix and installation_id.
-        # A blank installation_id (standalone or Compose) keeps the legacy
-        # release-wide key.
-        legacy_key = f"{self.worker_key_prefix}:upgrade:quiesce"
-        if not self.installation_id:
-            return legacy_key
-        return f"{legacy_key}:{self.installation_id}"
+        return authoritative_key(self.worker_key_prefix, self.installation_id)
 
     @field_validator("github_factory_python_ci", mode="before")
     @classmethod

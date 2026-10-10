@@ -141,6 +141,24 @@ fn version_key(version: &str) -> Option<VersionKey> {
     Some((major, minor, patch, stable, rc))
 }
 
+/// Catalog head of the first catalogued version released after `app_version`.
+/// A build carrying `app_version` was cut before that release, so it cannot
+/// declare a later schema head. `None` when no later version is catalogued;
+/// callers pass a catalogued version, so an unparseable one never reaches the
+/// open bound. Version order stands in for release order on one schema chain:
+/// a patch cut after a later line was catalogued is refused, which fails
+/// closed with a fail forward hint.
+pub fn next_release_head(app_version: &str) -> Option<String> {
+    let key = version_key(app_version)?;
+    catalog()
+        .windows
+        .iter()
+        .filter_map(|(version, window)| Some((version_key(version)?, window)))
+        .filter(|(candidate, _)| *candidate > key)
+        .min_by_key(|(candidate, _)| *candidate)
+        .map(|(_, window)| window.schema_head.clone())
+}
+
 /// Newest catalogued application version in `candidates` whose window contains
 /// `live`. That is the fail-forward target a refused rollback must name.
 pub fn newest_fail_forward<'a>(
@@ -268,6 +286,29 @@ pub fn redact_probe_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_release_head_is_the_head_of_the_next_catalogued_version() {
+        assert_eq!(next_release_head("0.10.0").as_deref(), Some("0058"));
+        assert_eq!(next_release_head("v0.10.0-rc.1").as_deref(), Some("0057"));
+        assert_eq!(next_release_head("0.10.3").as_deref(), Some("0070"));
+        assert_eq!(next_release_head("0.12.1").as_deref(), Some("0081"));
+        assert_eq!(next_release_head("not-a-version"), None);
+    }
+
+    #[test]
+    fn newest_catalogued_version_has_no_next_release_head() {
+        let newest = catalog()
+            .windows
+            .keys()
+            .max_by_key(|version| version_key(version))
+            .expect("the catalog has released windows");
+        assert_eq!(
+            next_release_head(newest),
+            None,
+            "a main build carrying the newest release must keep an open upper bound"
+        );
+    }
 
     #[test]
     fn v084_cannot_start_against_0039() {
@@ -436,19 +477,19 @@ mod tests {
     // @spec PROTECTED-HOOK-SOURCE-2: require the ledger without rewriting prior windows.
     #[test]
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
+        // The candidate moves with every migration between releases, so it is
+        // pinned only to the catalog: its head is the last catalogued revision
+        // and its minimum is not after its head.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0076");
-        assert_eq!(candidate.schema_head, "0080");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
         );
-
         let current = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
-        assert!(live_in_window("0076", &current));
-        assert!(live_in_window("0080", &current));
-        assert!(!live_in_window("0075", &current));
+        assert!(live_in_window(&candidate.schema_min, &current));
+        assert!(live_in_window(&candidate.schema_head, &current));
+
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
         assert_eq!(retained.schema_min, "0070");
         assert_eq!(retained.schema_head, "0073");
@@ -464,11 +505,12 @@ mod tests {
         assert_eq!(released_patch.schema_head, "0076");
         assert!(live_in_window("0076", &released_patch));
         assert!(!live_in_window("0079", &released_patch));
-        let candidate_release = window_for("0.12.2").expect("promoted candidate is catalogued");
-        assert_eq!(candidate_release.schema_min, candidate.schema_min);
-        assert_eq!(candidate_release.schema_head, candidate.schema_head);
-        assert!(live_in_window("0080", &candidate_release));
-        assert!(!live_in_window("0075", &candidate_release));
+        let released_ledger = window_for("0.12.2").expect("released 0.12.2 remains catalogued");
+        assert_eq!(released_ledger.schema_min, "0076");
+        assert_eq!(released_ledger.schema_head, "0081");
+        assert!(live_in_window("0080", &released_ledger));
+        assert!(live_in_window("0081", &released_ledger));
+        assert!(!live_in_window("0075", &released_ledger));
         let stable = window_for("0.12.0").expect("released window remains catalogued");
         assert_eq!(stable.schema_min, "0070");
         assert_eq!(stable.schema_head, "0073");
@@ -492,9 +534,10 @@ mod tests {
     fn source_control_candidate_0122_requires_ledger_schema() {
         let window = window_for("0.12.2").expect("source control candidate is catalogued");
         assert_eq!(window.schema_min, "0076");
-        assert_eq!(window.schema_head, "0080");
+        assert_eq!(window.schema_head, "0081");
         assert!(live_in_window("0076", &window));
         assert!(live_in_window("0080", &window));
+        assert!(live_in_window("0081", &window));
         assert!(!live_in_window("0075", &window));
     }
 
@@ -528,16 +571,33 @@ mod tests {
             !chart_window.artifact_identity_ambiguous,
             "Chart.yaml appVersion {app_version} must have one unambiguous artifact identity"
         );
-        assert_eq!(
-            chart_window.schema_min,
-            catalog().candidate.schema_min,
-            "Chart.yaml appVersion {app_version} minimum must match the candidate"
-        );
-        assert_eq!(
-            chart_window.schema_head,
-            catalog().candidate.schema_head,
-            "Chart.yaml appVersion {app_version} head must match the candidate"
-        );
+        // A registered (released) appVersion keeps its released window while the
+        // candidate moves ahead; scripts/check-schema-window.py owns comparing
+        // that window to the release tag. Only an unregistered appVersion must
+        // still equal the candidate.
+        let atlas: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("docs/architecture-atlas/versions.json"))
+                .expect("architecture atlas versions.json"),
+        )
+        .expect("versions.json is valid JSON");
+        let release_id = format!("v{app_version}");
+        let registered = atlas["versions"]
+            .as_array()
+            .expect("versions.json versions array")
+            .iter()
+            .any(|entry| entry["id"].as_str() == Some(release_id.as_str()));
+        if !registered {
+            assert_eq!(
+                chart_window.schema_min,
+                catalog().candidate.schema_min,
+                "unregistered Chart.yaml appVersion {app_version} minimum must match the candidate"
+            );
+            assert_eq!(
+                chart_window.schema_head,
+                catalog().candidate.schema_head,
+                "unregistered Chart.yaml appVersion {app_version} head must match the candidate"
+            );
+        }
 
         let mut found = Vec::new();
         let mut down_of = Vec::new();

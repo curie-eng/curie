@@ -217,9 +217,11 @@ substitute test runner or shim. If the repository's checks cannot be installed
 from files already in the checkout, say that verification inside the sandbox is
 unavailable. For a factory Python change, publication is allowed only when the
 changed path selects the required Python CI job. The pull request must say
-"In-sandbox verification was unavailable." and that the required CI check had
-not reported when this pull request was opened; the issue status comment
-reports its result. The factory
+"In-sandbox verification was unavailable for: <check id> (delegated to <CI job>)."
+and that the required CI check had not reported when this pull request was
+opened; the issue status comment reports its result. The sentence names every
+unavailable check, comma separated in recorded order, and the parenthetical
+appears only when the check declares `delegated_to`. The factory
 does not report success until that job runs and passes. Other changes still
 need a runnable check before publication.
 
@@ -311,7 +313,7 @@ released. A `not_declared` record takes no route and still starts the model.
 
 For a factory Python change, any failed check refuses publication. A delegated
 check that could not run stamps the pull request with "In-sandbox verification
-was unavailable." and says that "<check> had not reported when this pull request
+was unavailable for: <check> (delegated to <delegated_to>)." and says that "<check> had not reported when this pull request
 was opened; the issue status comment reports its result." With no configured
 check, that sentence names Repository CI instead of the check. With no check
 named `python`, the stamp says "The repository declares no in-sandbox
@@ -421,6 +423,20 @@ It pushes the branch to the base repository, so a `push` or `pull_request`
 workflow there runs the changed files with the repository's Actions secrets
 before a person reviews the pull request. Keep those secrets in GitHub
 environments that require reviewers. Human approval is the default.
+
+The worker also refuses new third-party dependency names by default, including
+new transitive lockfile entries. It checks `pyproject.toml`, `uv.lock`,
+`Cargo.toml`, `Cargo.lock`, `package.json`, `pnpm-lock.yaml` and
+`package-lock.json` by basename at any repository depth, comparing the base tree
+with the tree after applying the patch. Version changes to existing names are
+allowed. Path, workspace, editable, virtual and directory sources are ignored;
+Git sources count as third-party. A new file has an empty dependency set before
+the patch, and an in-scope file that cannot be parsed is refused. The install-wide
+setting `worker.publication.allowDependencyAdditions` defaults to `false` and is
+rendered as `CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS` on the worker. Set it
+to `true` to allow additions for every publication, including factory work and
+human-approved requests. The `.github/` and protected-path refusals still apply.
+
 An operator can opt one agent into automatic publication with
 `curie local publication-policy` or `curie cluster publication-policy` and
 `--policy auto`. That still records an approval, names the platform policy as

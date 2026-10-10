@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
+from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .. import workitem_dispatch
 from ..auth import require_internal_worker_token
 from ..config import get_settings
-from ..deps import SessionDep
+from ..deps import LivenessSessionDep, SessionDep
 from ..workitem_dispatch import DispatchConflict
 from ..workitems import WorkItemConflict, WorkItemOutcome
 
@@ -75,6 +76,18 @@ class FinishBody(BaseModel):
     cause: str = Field(min_length=1)
     # The provider's own failure message (#3073). The API redacts and clips it.
     detail: str | None = Field(default=None, max_length=4000)
+    # The CI fix round whose turn ended unpublished (#4330). Required for
+    # ``ci_fix_unpublished`` and refused for every other cause.
+    ci_fix_round: int | None = Field(default=None, ge=CI_FIRST_FIX_ROUND, le=CI_MAX_ROUNDS)
+
+    @model_validator(mode="after")
+    def _round_matches_cause(self) -> Self:
+        unpublished = self.cause.strip() == "ci_fix_unpublished"
+        if unpublished and self.ci_fix_round is None:
+            raise ValueError("ci_fix_unpublished requires ci_fix_round")
+        if not unpublished and self.ci_fix_round is not None:
+            raise ValueError("ci_fix_round is only valid with cause ci_fix_unpublished")
+        return self
 
 
 class TerminationClaimBody(BaseModel):
@@ -230,6 +243,7 @@ async def defer_work_item_request(
     return {
         "dispatch_generation": result.dispatch_generation,
         "not_before": result.not_before,
+        "terminal_cause": result.terminal_cause,
     }
 
 
@@ -258,7 +272,7 @@ async def start_work_item_request(
 
 @router.post("/requests/{request_id}/heartbeat")
 async def heartbeat_work_item_request(
-    request_id: uuid.UUID, body: HeartbeatBody, session: SessionDep
+    request_id: uuid.UUID, body: HeartbeatBody, session: LivenessSessionDep
 ) -> dict[str, Any]:
     result = await workitem_dispatch.heartbeat(
         session, request_id, runtime_epoch=body.runtime_epoch
@@ -314,6 +328,7 @@ async def finish_work_item_request(
         outcome=body.outcome,
         cause=body.cause,
         detail=body.detail,
+        ci_fix_round=body.ci_fix_round,
     )
     if isinstance(result, DispatchConflict):
         _raise_conflict(result)

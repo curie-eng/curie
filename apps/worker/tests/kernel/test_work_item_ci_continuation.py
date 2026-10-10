@@ -12,9 +12,13 @@ execution already ended. A fix turn that ends without publishing finishes as
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 import uuid
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from aci_protocol import (
@@ -28,11 +32,15 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol import work_item_events
+from curie_dispatcher.queue import to_stream_fields
 from curie_worker import kernel as kernel_module
 from curie_worker.behaviorpacks import BehaviorPacks
+from curie_worker.delivery_lease import DeliveryLease, DeliveryLeaseStore
+from curie_worker.sandbox import MissingAgentPoolError, QuotaRejection
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
+    WorkItemEvent,
     WorkItemRunning,
     WorkItemStartGrant,
     parse_work_item_event_id,
@@ -253,6 +261,20 @@ def test_ci_id_with_a_malformed_uuid_does_not_parse() -> None:
     assert parse_work_item_event_id("work-item-not-a-uuid-ci-2") is None
 
 
+def test_ci_fix_round_is_the_parsed_round_and_refuses_other_events() -> None:
+    request_id = uuid.uuid4()
+    parsed = parse_work_item_event_id(f"work-item-{request_id}-ci-3")
+    assert parsed is not None
+    assert parsed.ci_fix_round == 3
+
+    execute = parse_work_item_event_id(work_item_events.execute_event_id(request_id, 1))
+    assert execute is not None
+    with pytest.raises(ValueError):
+        _ = execute.ci_fix_round
+    with pytest.raises(ValueError):
+        _ = WorkItemEvent(request_id=request_id, kind="ci", generation=None).ci_fix_round
+
+
 def test_execute_and_terminate_ids_still_parse() -> None:
     request_id = uuid.uuid4()
     execute = parse_work_item_event_id(f"work-item-{request_id}-execute-1")
@@ -294,8 +316,9 @@ def test_a_ci_turn_is_a_factory_work_item_turn(make_harness) -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("round_", [2, 3])
 def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished(
-    make_harness,
+    make_harness, round_: int
 ) -> None:
     async def exercise() -> None:
         async with make_harness(
@@ -314,7 +337,7 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
                 ),
             ]
 
-            await h.kernel.process_event(_ci_turn(request_id))
+            await h.kernel.process_event(_ci_turn(request_id, round_))
 
             assert "running_for_conversation" in work_items.calls
             assert "acquire" not in work_items.calls
@@ -327,8 +350,247 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "ci_fix_unpublished"
             assert finish["detail"] is None
+            assert finish["ci_fix_round"] == round_
             # A CI fix turn has its own bounded loop: no #3128 continuation.
             assert len(h.runner.opened) == 1
+
+    asyncio.run(exercise())
+
+
+async def _continuation_lease(h: Any, turn: QueuedTurn) -> DeliveryLease:
+    """Give the turn real delivery authority on its pending Valkey entry."""
+    await h.async_redis.xgroup_create(
+        h.config.stream, h.config.consumer_group, id="0", mkstream=True
+    )
+    entry_id = await h.async_redis.xadd(h.config.stream, to_stream_fields(turn))
+    await h.async_redis.xreadgroup(
+        h.config.consumer_group, h.config.consumer_name, {h.config.stream: ">"}, count=1
+    )
+    return await DeliveryLeaseStore(h.async_redis, h.config).acquire(
+        h.config.stream,
+        h.config.consumer_group,
+        entry_id,
+        consumer=h.config.consumer_name,
+    )
+
+
+def _refuse_claims(
+    h: Any,
+    work_items: _WorkItems,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    refusals: int | None,
+) -> list[str]:
+    """Refuse at the fake Kubernetes seam, keeping the real substrate intact."""
+    create_claim = h.fake_k8s.create_claim
+    claims: list[str] = []
+
+    def claim(name: str, **kwargs: Any) -> None:
+        assert work_items.finishes == [], "capacity must not settle the execution"
+        assert h.runner.opened == [], "no runner turn starts while claims are refused"
+        claims.append(name)
+        h.fake_k8s.quota_rejection = (
+            QuotaRejection(
+                quota_name="curie-sandbox-quota",
+                requested={"limits.cpu": "1"},
+                used={"limits.cpu": "2"},
+                hard={"limits.cpu": "2"},
+            )
+            if refusals is None or len(claims) <= refusals
+            else None
+        )
+        create_claim(name, **kwargs)
+
+    monkeypatch.setattr(h.fake_k8s, "create_claim", claim)
+    return claims
+
+
+@pytest.mark.parametrize("continuation", ["ci", "approval"])
+def test_factory_continuation_waits_past_max_attempts_then_runs(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    continuation: str,
+) -> None:
+    """#4275: four quota refusals must not consume the three runner attempts."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=3,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            request_id = uuid.uuid4()
+            work_items = _WorkItems(running=request_id)
+            h.kernel._work_items = work_items
+            turn = _ci_turn(request_id)
+            if continuation == "approval":
+                turn = turn.model_copy(
+                    update={
+                        "event_id": f"approval-{uuid.uuid4()}-resolved",
+                        "text": "[approval resolved] approved",
+                    }
+                )
+            claims = _refuse_claims(h, work_items, monkeypatch, refusals=4)
+            backoff_counts: list[int] = []
+
+            def no_backoff(count: int) -> float:
+                backoff_counts.append(count)
+                assert work_items.finishes == []
+                assert h.sink.updates == [] and h.sink.text_posts == []
+                assert h.kernel._order_locks == {}, "capacity waiting releases order"
+                return 0.0
+
+            monkeypatch.setattr(h.kernel, "_backoff", no_backoff)
+            h.runner.default_script = [Final(text="No fix published.", status=SessionStatus.DONE)]
+            with caplog.at_level(logging.INFO, logger="curie_worker.kernel"):
+                await h.kernel.process_event(turn)
+
+            assert len(claims) == 5
+            assert len(h.runner.opened) == 1
+            assert backoff_counts == [1, 2, 3, 4]
+            assert h.sink.updates == [] and h.sink.text_posts == []
+            assert len(work_items.finishes) == 1
+            assert work_items.finishes[0][1]["cause"] == (
+                "ci_fix_unpublished" if continuation == "ci" else "no_pull_request"
+            )
+            assert work_items.finishes[0][1]["ci_fix_round"] == (
+                2 if continuation == "ci" else None
+            )
+            retries = [record for record in caplog.records if "capacity retry" in record.message]
+            assert len(retries) == 4
+            for count, record in enumerate(retries, start=1):
+                assert record.levelno == logging.INFO
+                assert turn.event_id in record.message
+                assert f"refusal={count}" in record.message
+                assert "backoff=" in record.message
+            assert await h.kernel._markers.is_terminal(turn.event_id)
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("remaining_s", [5.0, 4.0])
+def test_ci_capacity_wait_stops_at_delivery_budget(
+    make_harness,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    remaining_s: float,
+) -> None:
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=3,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            request_id = uuid.uuid4()
+            work_items = _WorkItems(running=request_id)
+            h.kernel._work_items = work_items
+            turn = _ci_turn(request_id)
+            lease = await _continuation_lease(h, turn)
+            claims = _refuse_claims(h, work_items, monkeypatch, refusals=None)
+            backoff_counts: list[int] = []
+
+            def advance_delivery(count: int) -> float:
+                backoff_counts.append(count)
+                if count == 4:
+                    lease.budget = replace(
+                        lease.budget,
+                        deadline_ms=lease.budget.anchor_server_ms + int(remaining_s * 1000),
+                        anchor_monotonic=time.monotonic(),
+                    )
+                return 0.0
+
+            monkeypatch.setattr(h.kernel, "_backoff", advance_delivery)
+            await h.kernel.process_event(turn, lease=lease)
+
+            assert backoff_counts == [1, 2, 3, 4]
+            assert len(claims) == 4
+            assert h.runner.opened == []
+            assert len(work_items.finishes) == 1
+            assert work_items.finishes[0][1]["cause"] == "runner_escalated"
+            assert h.sink.updates == [] and h.sink.text_posts == []
+            assert await h.kernel._markers.is_terminal(turn.event_id)
+            assert "exceeded its delivery deadline" in caplog.text
+
+    asyncio.run(exercise())
+
+
+def test_ci_capacity_wait_stops_at_execution_deadline(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=3,
+            claim_timeout_seconds=0.05,
+        ) as h:
+            request_id = uuid.uuid4()
+            work_items = _WorkItems(running=request_id)
+            h.kernel._work_items = work_items
+            turn = _ci_turn(request_id)
+            lease = await _continuation_lease(h, turn)
+            claims = _refuse_claims(h, work_items, monkeypatch, refusals=None)
+            backoff_counts: list[int] = []
+
+            def advance_execution(count: int) -> float:
+                backoff_counts.append(count)
+                if count == 4:
+                    run = h.kernel._run_for_event(turn.event_id)
+                    assert run is not None
+                    run.execution_deadline = datetime.now(UTC) + timedelta(seconds=5)
+                return 0.0
+
+            monkeypatch.setattr(h.kernel, "_backoff", advance_execution)
+            await h.kernel.process_event(turn, lease=lease)
+
+            assert lease.remaining_s() > 5
+            assert backoff_counts == [1, 2, 3, 4]
+            assert len(claims) == 4
+            assert h.runner.opened == []
+            assert len(work_items.finishes) == 1
+            assert work_items.finishes[0][1]["cause"] == "runner_escalated"
+            assert h.sink.updates == [] and h.sink.text_posts == []
+            assert await h.kernel._markers.is_terminal(turn.event_id)
+            assert "exceeded its delivery deadline" in caplog.text
+
+    asyncio.run(exercise())
+
+
+def test_ci_fix_that_cannot_start_settles_runner_escalated(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+        ) as h:
+            request_id = uuid.uuid4()
+            work_items = _WorkItems(running=request_id)
+            h.kernel._work_items = work_items
+            attempts: list[str] = []
+
+            def missing_pool(name: str, **_kwargs: object) -> None:
+                attempts.append(name)
+                raise MissingAgentPoolError("acme-bot", "curie-agent-acme-bot-runner-pool")
+
+            monkeypatch.setattr(h.fake_k8s, "create_claim", missing_pool)
+            turn = _ci_turn(request_id)
+            await h.kernel.process_event(turn)
+
+            assert len(attempts) == 1
+            assert h.runner.opened == []
+            assert len(work_items.finishes) == 1
+            assert work_items.finishes[0][1]["cause"] == "runner_escalated"
+            assert work_items.finishes[0][1]["detail"] is None
+            assert work_items.finishes[0][1]["ci_fix_round"] is None
+            assert await h.kernel._markers.is_terminal(turn.event_id)
 
     asyncio.run(exercise())
 
@@ -345,9 +607,7 @@ def test_a_fix_publication_carries_the_adopted_request_and_epoch(
             self.creates: list[object] = []
             self.contexts: list[PublicationContext] = []
 
-        async def get_publication_precheck_context(
-            self, **kwargs: object
-        ) -> PublicationContext:
+        async def get_publication_precheck_context(self, **kwargs: object) -> PublicationContext:
             context = await super().get_publication_precheck_context(**kwargs)
             self.contexts.append(context)
             return context
@@ -355,7 +615,9 @@ def test_a_fix_publication_carries_the_adopted_request_and_epoch(
         async def get_publication_lineage(self, *_args: object) -> None:
             return None
 
-        async def create_publication(self, request: object) -> CreatedPublication:
+        async def create_publication(
+            self, request: object, *, budget_s: float = 120
+        ) -> CreatedPublication:
             self.creates.append(request)
             return CreatedPublication(
                 id="publication-ci-fix", approval_id="approval-ci-fix", status="pending"

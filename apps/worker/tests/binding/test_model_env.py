@@ -28,6 +28,7 @@ from curie_worker.sandbox_token import verify
 
 def _resolved(
     model: str | None = None,
+    reviewer_model: str | None = None,
     thinking: str | None = None,
     deployment_environment: str | None = None,
 ) -> ResolvedDeployment:
@@ -40,6 +41,7 @@ def _resolved(
         max_usd_per_day=None,
         max_output_tokens_per_run=None,
         model=model,
+        reviewer_model=reviewer_model,
         thinking=thinking,
         deployment_environment=deployment_environment,
     )
@@ -155,7 +157,7 @@ def test_eval_boot_env_carries_fake_and_credentials() -> None:
         bundle_ref="bundles/x.zip",
         requested_at="2026-07-05T00:00:00+00:00",
     )
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env[FAKE_MODEL_ENV] == "1"
     assert env[CREDENTIALS_ENV] == "cred-eval"
 
@@ -316,7 +318,7 @@ def test_eval_boot_env_carries_api_backend_and_env_key() -> None:
         requested_at="2026-07-05T00:00:00+00:00",
     )
 
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env[API_BACKEND_ENV] == "messages"
     assert env[MODEL_ENV_KEY_ENV] == "MY_PROVIDER_KEY"
 
@@ -333,9 +335,10 @@ def test_eval_boot_env_carries_api_backend_and_env_key() -> None:
 
 
 def test_apply_model_env_has_no_per_agent_override_params() -> None:
-    # Signature pin, still exact. Exactly TWO per-agent parameters are allowed
+    # Signature pin, still exact. Exactly THREE per-agent parameters are allowed
     # here, each authorized by name: model_override (#254, the per-agent model)
-    # and thinking_override (#1182, ADR-0098, the per-agent thinking depth).
+    # thinking_override (#1182, ADR-0098, the per-agent thinking depth), and
+    # reviewer_model_override (#4120, an inert reviewer model id).
     #
     # The regression this guards has not changed shape: a NEW *_override
     # parameter would mean an agent row can aim the credential read or redeclare
@@ -350,7 +353,9 @@ def test_apply_model_env_has_no_per_agent_override_params() -> None:
     import inspect
 
     params = set(inspect.signature(apply_model_env).parameters)
-    assert params == {"env", "config", "model_override", "thinking_override"}
+    assert params == {
+        "env", "config", "model_override", "reviewer_model_override", "thinking_override"
+    }
 
 
 def test_resolved_deployment_carries_no_api_backend_or_env_key_field() -> None:
@@ -565,7 +570,7 @@ def test_eval_boot_env_carries_false_completion_check() -> None:
         requested_at="2026-07-05T00:00:00+00:00",
     )
 
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env[FALSE_COMPLETION_CHECK_ENV] == "1"
 
 
@@ -646,3 +651,24 @@ def test_boot_env_omits_an_unknown_deployment_environment() -> None:
     resolver = BindingResolver.__new__(BindingResolver)
     resolver._config = WorkerConfig()  # type: ignore[attr-defined]
     assert "CURIE_DEPLOYMENT_ENVIRONMENT" not in resolver.boot_env(_resolved(), "thread-1")
+
+
+@pytest.mark.parametrize("credential", ["sk-ant-api03-PLACEHOLDER", "sk-or-PLACEHOLDER"])
+def test_binding_boot_env_reviewer_model_set_and_clear_preserve_the_implementer(
+    credential: str,
+) -> None:
+    from aci_protocol import BootEnv
+
+    resolver = BindingResolver.__new__(BindingResolver)
+    resolver._config = WorkerConfig(credentials=credential, model="platform-implementer")
+    env = resolver.boot_env(_resolved(reviewer_model="acme-reviewer-model"), "thread-1")
+    assert env["CURIE_REVIEWER_MODEL"] == "acme-reviewer-model"
+    assert env[MODEL_ENV] == "platform-implementer"
+    assert env[CREDENTIALS_ENV] == credential
+    assert BootEnv.from_env(env | {"CURIE_SANDBOX_ID": "acme-sandbox"}).reviewer_model == (
+        "acme-reviewer-model"
+    )
+    cleared = resolver.boot_env(_resolved(reviewer_model=None), "thread-1")
+    assert "CURIE_REVIEWER_MODEL" not in cleared
+    assert cleared[MODEL_ENV] == "platform-implementer"
+    assert cleared[CREDENTIALS_ENV] == credential

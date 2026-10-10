@@ -2,6 +2,8 @@
 # Issue #4005: execute the actual controller-ready Helm hook in an owned kind
 # cluster. Keep the rendered SandboxWarmPool at zero replicas: its successful
 # reconciliation establishes the durable metric without starting runner pods.
+# Issue #4197: an upgrade that does not restart a controller which restarted
+# once long before must pass on the stable serving leader and stay deployed.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,6 +16,7 @@ RELEASE=curie-controller-preflight
 CONTROLLER_NS=agent-sandbox-system
 DEPLOY=agent-sandbox-controller
 READ_ROLE=agent-sandbox-controller-networkpolicies-read
+LEASE=a3317529.agent-sandbox.x-k8s.io
 HOOK="$RELEASE-preflight-controller"
 
 fail() {
@@ -67,7 +70,7 @@ cleanup() {
   fi
   rm -rf "$TMP"
   if [[ "$rc" -eq 0 && "$scenario_passed" -eq 1 ]]; then
-    echo "PASS: fresh install passes, a rotated-log upgrade passes from successful reconcile metrics without replacing or restarting the controller, and an RBAC crash-loop fails the actual upgrade hook."
+    echo "PASS: fresh install passes, a rotated-log upgrade passes from successful reconcile metrics without replacing or restarting the controller, an upgrade over a long-serving leader with an old restart passes and stays deployed, and an RBAC crash-loop fails the actual upgrade hook."
   fi
   exit "$rc"
 }
@@ -186,14 +189,73 @@ if ! helm upgrade "$RELEASE" "$CANDIDATE_CHART" --kube-context "$CONTEXT" \
   fail "healthy rotated-log controller upgrade failed the actual controller-ready hook"
 fi
 upgrade_logs="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" logs "job/$HOOK")"
-grep -qi 'RESULT: PASS.*reconcile' <<< "$upgrade_logs" \
-  || fail "rotated-log upgrade did not report a metrics-based RESULT: PASS"
+# The leader may already have served past stableLeaderSeconds on a slow
+# runner, in which case the Lease signal (checked first) passes instead.
+grep -Eqi 'RESULT: PASS.*(reconcile|rollout complete and serving)' <<< "$upgrade_logs" \
+  || fail "rotated-log upgrade did not report a metrics- or leader-based RESULT: PASS"
 printf '%s\n' "$upgrade_logs"
 after_uid="$(kubectl --context "$CONTEXT" -n "$CONTROLLER_NS" get pod "$pod" -o jsonpath='{.metadata.uid}')"
 after_restarts="$(kubectl --context "$CONTEXT" -n "$CONTROLLER_NS" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
 [[ "$after_uid" == "$uid" && "$after_restarts" == "$restarts" ]] \
   || fail "rotated-log upgrade changed controller identity or restart count"
 echo "Controller after upgrade: uid=$after_uid restartCount=$after_restarts"
+
+# Issue #4197: restart the controller container once (same pod, so the
+# upgrade below does not replace it), let the new process lead past
+# stableLeaderSeconds, then upgrade. Before the fix the restart alone failed
+# the hook on every later upgrade that did not restart the controller.
+stable_leader_seconds=180
+container_id="$(kubectl --context "$CONTEXT" -n "$CONTROLLER_NS" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].containerID}')"
+docker exec "$node" crictl stop "${container_id#containerd://}" >/dev/null
+restarted=0
+for ((attempt=0; attempt<60; attempt++)); do
+  restarts="$(kubectl --context "$CONTEXT" -n "$CONTROLLER_NS" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+  ready="$(kubectl --context "$CONTEXT" -n "$CONTROLLER_NS" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].ready}')"
+  if [[ "$restarts" =~ ^[0-9]+$ && "$restarts" -gt "$after_restarts" && "$ready" == true ]]; then
+    restarted=1
+    break
+  fi
+  sleep 2
+done
+[[ "$restarted" -eq 1 ]] || fail "controller container did not restart in place"
+leader_held=0
+for ((attempt=0; attempt<150; attempt++)); do
+  read -r holder acquired renewed < <(kubectl --context "$CONTEXT" -n "$CONTROLLER_NS" get lease "$LEASE" \
+    -o jsonpath='{.spec.holderIdentity} {.spec.acquireTime} {.spec.renewTime}{"\n"}')
+  held="$(python3 - "$acquired" "$renewed" <<'PY'
+import sys
+from datetime import datetime
+
+a, b = (datetime.fromisoformat(t) for t in sys.argv[1:3])
+print(int((b - a).total_seconds()))
+PY
+)"
+  if [[ "${holder%%_*}" == "$pod" && "$held" -ge $((stable_leader_seconds + 10)) ]]; then
+    leader_held=1
+    break
+  fi
+  sleep 2
+done
+[[ "$leader_held" -eq 1 ]] || fail "restarted controller did not lead past ${stable_leader_seconds}s"
+echo "Controller before leader upgrade: restartCount=$restarts holder=$holder held=${held}s"
+
+if ! helm upgrade "$RELEASE" "$CANDIDATE_CHART" --kube-context "$CONTEXT" \
+    --namespace "$NAMESPACE" "${values[@]}" --timeout 300s; then
+  kubectl --context "$CONTEXT" -n "$NAMESPACE" logs "job/$HOOK" || true
+  fail "upgrade over a long-serving controller with an old restart failed the controller-ready hook"
+fi
+leader_logs="$(kubectl --context "$CONTEXT" -n "$NAMESPACE" logs "job/$HOOK")"
+grep -q 'RESULT: PASS.*rollout complete and serving' <<< "$leader_logs" \
+  || fail "upgrade over a long-serving controller did not pass on the stable-leader signal"
+printf '%s\n' "$leader_logs"
+release_status="$(helm status "$RELEASE" --kube-context "$CONTEXT" --namespace "$NAMESPACE" -o json \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["info"]["status"])')"
+[[ "$release_status" == deployed ]] || fail "release is $release_status after a healthy no-restart upgrade"
+leader_uid="$(kubectl --context "$CONTEXT" -n "$CONTROLLER_NS" get pod "$pod" -o jsonpath='{.metadata.uid}')"
+leader_restarts="$(kubectl --context "$CONTEXT" -n "$CONTROLLER_NS" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].restartCount}')"
+[[ "$leader_uid" == "$uid" && "$leader_restarts" == "$restarts" ]] \
+  || fail "leader upgrade changed controller identity or restart count"
+echo "Controller after leader upgrade: uid=$leader_uid restartCount=$leader_restarts release=$release_status"
 
 # Remove only the NetworkPolicy read grant and restart its controller. The
 # negative upgrade's post-renderer removes that same one ClusterRole so Helm

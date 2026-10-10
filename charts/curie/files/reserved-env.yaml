@@ -25,6 +25,7 @@ worker:
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_NAMESPACE: the release namespace (Helm --namespace)
+  CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS: worker.publication.allowDependencyAdditions
   CURIE_PUBLICATION_CPU_LIMIT: worker.publication.resources.limits.cpu
   CURIE_PUBLICATION_CPU_REQUEST: worker.publication.resources.requests.cpu
   CURIE_PUBLICATION_ENABLED: worker.publication.enabled
@@ -139,6 +140,7 @@ api:
   GITHUB_FACTORY_CI_WAIT_S: api.githubFactoryCiWaitSeconds
   GITHUB_FACTORY_PYTHON_CI: api.githubFactoryPythonCi
   GITHUB_FACTORY_BASES: api.githubFactoryBases
+  GITHUB_FACTORY_METADATA_CI: api.githubFactoryMetadataCi
   GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
   GITHUB_FACTORY_INTAKE: api.githubFactoryIntake
   GITHUB_FACTORY_LABEL: api.githubFactoryLabel

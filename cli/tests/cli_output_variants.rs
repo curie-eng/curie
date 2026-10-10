@@ -323,6 +323,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
             "Done" => OverridesOutput::Done {
                 agent: "a".to_string(),
                 model: Some("kimi-k2".to_string()),
+                reviewer_model: Some("claude-opus-5-5".to_string()),
                 thinking: Some("adaptive".to_string()),
                 execution_deadline_seconds: Some(90),
                 runner_resources: None,

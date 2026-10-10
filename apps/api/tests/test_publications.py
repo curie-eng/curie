@@ -2024,9 +2024,7 @@ def test_publication_resolved_before_card_registration_settles_the_card_once(
     events, remaining, waited = asyncio.run(exercise())
     assert waited == [False, True, False]
     settled = [
-        event
-        for event in events
-        if isinstance(event, ReplyUpdate) and event.settled is not None
+        event for event in events if isinstance(event, ReplyUpdate) and event.settled is not None
     ]
     assert len(settled) == 1
     assert settled[0].target.reply_ref == card_ts
@@ -2086,12 +2084,16 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
         def __init__(self, engine: Any) -> None:
             self.engine = engine
 
-        async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+        async def create_publication(
+            self, request: PublicationCreateRequest, *, budget_s: float = 120
+        ) -> CreatedPublication:
             sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 data = PublicationCreate.model_validate(request.to_json())
+
                 async def metadata_check() -> None:
                     return
+
                 publication, _ = await crud.create_publication(
                     session, data, patch=data.decoded_patch(), metadata_check=metadata_check
                 )
@@ -2122,7 +2124,7 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return {"CURIE_SESSION_ID": f"session-{thread}"}
 
@@ -2834,7 +2836,7 @@ def test_kernel_publications_isolate_same_timestamp_across_slack_channels(
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             env = self._resolver.boot_env(
                 resolved,
@@ -4225,6 +4227,133 @@ def test_lineage_advance_success_clears_an_earlier_attempt_error(
     ) == [{"status": "succeeded", "error": None}]
 
 
+def _late_publication_link_case(
+    client: TestClient, auth_headers: dict[str, str], *, refusal: str | None = None
+) -> tuple[dict[str, Any], uuid.UUID, uuid.UUID]:
+    deployment = _create_deployment(client, auth_headers)
+    _, publication = _create_publication(client, _publication_payload(deployment["id"]))
+    approved = _resolve(client, auth_headers, publication["approval_id"])
+    assert approved.status_code == 200, approved.text
+    lineage_id = uuid.UUID(publication["lineage_id"])
+    lineage = _rows(
+        "SELECT agent_id, conversation_id FROM curie.thread_publication_lineages WHERE id = :id",
+        {"id": lineage_id},
+    )[0]
+    item_id, request_id = uuid.uuid4(), uuid.uuid4()
+    _execute(
+        "INSERT INTO curie.work_items (id, github_repository_id, github_issue_number, "
+        "github_installation_id, agent_id, repo_full_name, conversation_id, version) "
+        "VALUES (:id, :repository, 4298, :installation, :agent, :repo, :conversation, 7)",
+        {
+            "id": item_id,
+            "agent": lineage["agent_id"],
+            "repository": 9002 if refusal == "repository_id" else 9001,
+            "installation": 42 if refusal == "installation_id" else 41,
+            "repo": "acme-corp/other" if refusal == "repository" else REPO,
+            "conversation": lineage["conversation_id"],
+        },
+    )
+    _execute(
+        "INSERT INTO curie.execution_requests (id, work_item_id, sequence, status, "
+        "wait_deadline, started_at, execution_deadline, terminal_cause, execution_attempts) "
+        "VALUES (:id, :item, 1, 'cancellation_requested', "
+        "clock_timestamp() - interval '2 minutes', clock_timestamp() - interval '1 minute', "
+        "clock_timestamp() + interval '1 hour', 'issue_cancelled', 1)",
+        {"id": request_id, "item": item_id},
+    )
+    _execute(
+        "UPDATE curie.publications SET execution_request_id = :request WHERE id = :id",
+        {"id": uuid.UUID(publication["id"]), "request": request_id},
+    )
+    return publication, item_id, request_id
+
+
+def test_lineage_advance_links_a_readmitted_work_item_after_its_request_left_running(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+) -> None:
+    client, truth, _ = review_lineage_app
+    publication, item_id, request_id = _late_publication_link_case(client, auth_headers)
+    truth["branch"] = publication["branch"]
+    before = _rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id})[0]
+    old_request = _rows("SELECT * FROM curie.execution_requests WHERE id = :id", {"id": request_id})
+
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+
+    assert advanced.status_code == 200, advanced.text
+    after = _rows("SELECT * FROM curie.work_items WHERE id = :id", {"id": item_id})[0]
+    assert after["publication_lineage_id"] == uuid.UUID(publication["lineage_id"])
+    assert after["version"] == before["version"] + 1
+    unchanged = set(before) - {"publication_lineage_id", "version", "updated_at"}
+    assert {key: after[key] for key in unchanged} == {key: before[key] for key in unchanged}
+    assert (
+        _rows("SELECT * FROM curie.execution_requests WHERE id = :id", {"id": request_id})
+        == old_request
+    )
+    assert _rows(
+        "SELECT execution_request_id FROM curie.publications WHERE id = :id",
+        {"id": uuid.UUID(publication["id"])},
+    ) == [{"execution_request_id": request_id}]
+
+
+@pytest.mark.parametrize(
+    "refusal", ["cancelled", "another_owner", "repository_id", "installation_id", "repository"]
+)
+def test_late_lineage_advance_preserves_ineligible_work_item_rows(
+    review_lineage_app: tuple[TestClient, dict[str, Any], str],
+    auth_headers: dict[str, str],
+    clean_db: None,
+    refusal: str,
+) -> None:
+    client, truth, _ = review_lineage_app
+    publication, item_id, request_id = _late_publication_link_case(
+        client, auth_headers, refusal=refusal
+    )
+    truth["branch"] = publication["branch"]
+    if refusal == "another_owner":
+        _execute(
+            "INSERT INTO curie.work_items (id, github_repository_id, github_issue_number, "
+            "github_installation_id, agent_id, repo_full_name, conversation_id, "
+            "publication_lineage_id) SELECT :other, github_repository_id, 4299, "
+            "github_installation_id, agent_id, repo_full_name, 'other-conversation', :lineage "
+            "FROM curie.work_items WHERE id = :id",
+            {
+                "id": item_id,
+                "other": uuid.uuid4(),
+                "lineage": uuid.UUID(publication["lineage_id"]),
+            },
+        )
+    elif refusal == "cancelled":
+        _execute(
+            "UPDATE curie.work_items SET cancelled_at = clock_timestamp() WHERE id = :id",
+            {"id": item_id},
+        )
+    before = _rows("SELECT * FROM curie.work_items ORDER BY id")
+    old_request = _rows("SELECT * FROM curie.execution_requests WHERE id = :id", {"id": request_id})
+
+    advanced = _advance_lineage(
+        client,
+        publication["id"],
+        expected_version=1,
+        expected_head_sha=None,
+        head_sha=FIRST_REVISION_SHA,
+    )
+
+    assert advanced.status_code == 200, advanced.text
+    assert _rows("SELECT * FROM curie.work_items ORDER BY id") == before
+    assert (
+        _rows("SELECT * FROM curie.execution_requests WHERE id = :id", {"id": request_id})
+        == old_request
+    )
+
+
 def test_lineage_advance_refuses_a_worker_whose_publication_lease_was_reclaimed(
     publication_stack: tuple[TestClient, str],
     auth_headers: dict[str, str],
@@ -5611,20 +5740,17 @@ def test_enterprise_publication_advances_and_refreshes_the_same_lineage(
         "base_ref": "main",
     }
 
-    truth["authorization"] = "Basic " + base64.b64encode(
-        b"x-access-token:fixture-publication-app-token"
-    ).decode()
-
-    refreshed = _get_lineage(
-        client, deployment_id=deployment["id"], conversation_id=conversation
+    truth["authorization"] = (
+        "Basic " + base64.b64encode(b"x-access-token:fixture-publication-app-token").decode()
     )
+
+    refreshed = _get_lineage(client, deployment_id=deployment["id"], conversation_id=conversation)
     assert refreshed.status_code == 200, refreshed.text
     assert refreshed.json()["pr_url"] == ENTERPRISE_PR_URL
     assert refreshed.json()["version"] == 2
     assert truth["requests"]
     assert all(
-        request.url.host == "github.example.com"
-        and request.url.path.startswith("/forge/api/v3/")
+        request.url.host == "github.example.com" and request.url.path.startswith("/forge/api/v3/")
         for request in truth["requests"]
     )
     assert any(
@@ -5639,7 +5765,9 @@ def test_enterprise_publication_advances_and_refreshes_the_same_lineage(
     [{"api_url": ENTERPRISE_API_URL, "html_base": ENTERPRISE_HTML_BASE}],
     indirect=True,
 )
-@pytest.mark.parametrize("wrong_url", [PR_URL, f"https://other.example.com/{REPO}/pull/{PR_NUMBER}"])
+@pytest.mark.parametrize(
+    "wrong_url", [PR_URL, f"https://other.example.com/{REPO}/pull/{PR_NUMBER}"]
+)
 def test_enterprise_publication_refuses_wrong_host_outcomes_before_provider_access(
     review_lineage_app: tuple[TestClient, dict[str, Any], str],
     auth_headers: dict[str, str],
@@ -5689,9 +5817,9 @@ def test_enterprise_publication_refuses_public_github_provider_truth(
             client, truth, auth_headers, conversation="enterprise-refused-refresh"
         )
         truth["pr_url"] = PR_URL
-        truth["authorization"] = "Basic " + base64.b64encode(
-            b"x-access-token:fixture-publication-app-token"
-        ).decode()
+        truth["authorization"] = (
+            "Basic " + base64.b64encode(b"x-access-token:fixture-publication-app-token").decode()
+        )
         before = _lineage_identity(publication["lineage_id"])
         refused = _get_lineage(
             client,
@@ -6545,9 +6673,7 @@ def test_stale_worker_lease_refuses_before_terminal_provider_and_leaves_rows_unc
 
     async def claim() -> Any:
         engine = create_async_engine(get_settings().database_url)
-        store = PostgresPublicationStore(
-            engine, schema="curie", lease_owner="stale-lineage-worker"
-        )
+        store = PostgresPublicationStore(engine, schema="curie", lease_owner="stale-lineage-worker")
         try:
             work = await store.claim_next()
             assert work is not None
@@ -6704,7 +6830,8 @@ def test_a_replay_matches_a_row_an_older_writer_stored_as_null(
 
 @pytest.fixture
 def _factory_publication_case(
-    clean_db: None, admitted: Any  # noqa: F811
+    clean_db: None,
+    admitted: Any,  # noqa: F811
 ) -> Iterator[tuple[TestClient, uuid.UUID, dict[str, Any]]]:
     """Build a live factory request and its deployment for publication API tests."""
 
@@ -6715,8 +6842,7 @@ def _factory_publication_case(
     request_id = request["id"]
     runtime_epoch = _start_factory_request(request_id)
     work_item = _factory_rows(
-        "SELECT w.agent_id, w.conversation_id FROM curie.work_items w "
-        "WHERE w.id = :id",
+        "SELECT w.agent_id, w.conversation_id FROM curie.work_items w WHERE w.id = :id",
         {"id": request["work_item_id"]},
     )[0]
 
@@ -6773,9 +6899,7 @@ CONVERSION_PYTHON_CI_POLICY = {
 }
 
 
-def _configure_python_ci(
-    monkeypatch: pytest.MonkeyPatch, policies: Mapping[str, Any]
-) -> None:
+def _configure_python_ci(monkeypatch: pytest.MonkeyPatch, policies: Mapping[str, Any]) -> None:
     """Set GITHUB_FACTORY_PYTHON_CI as an operator would (#3617)."""
 
     monkeypatch.setenv("GITHUB_FACTORY_PYTHON_CI", json.dumps(dict(policies)))
@@ -6798,6 +6922,9 @@ def _record_factory_verification(
     outcome: str = "unavailable",
     check: str = "python",
     command: str = "uv run pytest unitconv/tests -q",
+    delegated_to: str | None = None,
+    blocked_services: list[str] | None = None,
+    missing_binaries: list[str] | None = None,
 ) -> Any:
     observation: dict[str, Any]
     if outcome == "not_declared":
@@ -6815,9 +6942,15 @@ def _record_factory_verification(
             "command": command,
             "outcome": outcome,
             "exit_status": {"unavailable": None, "passed": 0}.get(outcome, 1),
-            "missing_binaries": ["uv"] if outcome == "unavailable" else [],
-            "blocked_services": [],
+            "missing_binaries": (
+                missing_binaries
+                if missing_binaries is not None
+                else (["uv"] if outcome == "unavailable" else [])
+            ),
+            "blocked_services": blocked_services or [],
         }
+        if delegated_to is not None:
+            observation["delegated_to"] = delegated_to
     token = sandbox_token.mint(
         get_settings().api_key,
         agent=str(request_id),
@@ -6831,9 +6964,7 @@ def _record_factory_verification(
     )
 
 
-def _post_factory_publication(
-    client: TestClient, payload: dict[str, Any]
-) -> Any:
+def _post_factory_publication(client: TestClient, payload: dict[str, Any]) -> Any:
     selected = client.post(
         f"/v1/internal/workspaces/{payload['deployment_id']}/selection",
         json={
@@ -6868,7 +6999,7 @@ def test_factory_publication_adds_unavailable_and_pending_proof_to_python_pr_bod
         {"id": publication_id},
     )[0]["body"]
     assert payload["body"] in body
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: python." in body
     assert (
         "Unit conversion suite had not reported when this pull request was opened; "
         "the issue status comment reports its result."
@@ -6909,7 +7040,7 @@ def test_factory_python_publication_with_no_declared_check_states_it_was_not_dec
     assert payload["body"] in body
     assert _NOT_DECLARED_STAMP in body
     assert _PENDING_PROOF_STAMP in body
-    assert "In-sandbox verification was unavailable." not in body
+    assert "In-sandbox verification was unavailable" not in body
     assert "pending proof" not in body
     assert "No in-sandbox Python verification check was declared." not in body
     assert "verification passed" not in body.casefold()
@@ -6935,7 +7066,7 @@ def test_factory_python_publication_with_only_a_rust_check_is_not_declared_for_p
     body = _factory_publication_body(created.json()["id"])
     assert _NOT_DECLARED_STAMP in body
     assert _PENDING_PROOF_STAMP in body
-    assert "In-sandbox verification was unavailable." not in body
+    assert "In-sandbox verification was unavailable" not in body
 
 
 def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
@@ -6971,7 +7102,7 @@ def test_factory_python_publication_uses_the_python_check_among_several(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: python." in body
     assert _PENDING_PROOF_STAMP in body
     assert _NOT_DECLARED_STAMP not in body
 
@@ -6995,10 +7126,13 @@ def test_factory_python_publication_refuses_a_failed_python_check_beside_a_passe
 
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
-    assert _factory_rows(
-        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
-        {"id": request_id},
-    )[0]["n"] == 0
+    assert (
+        _factory_rows(
+            "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+            {"id": request_id},
+        )[0]["n"]
+        == 0
+    )
 
 
 def test_factory_python_publication_refuses_any_failed_declared_check(
@@ -7038,11 +7172,81 @@ def test_factory_python_publication_stamps_an_unavailable_check_under_any_id(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: api." in body
     assert _PENDING_PROOF_STAMP in body
     assert _NOT_DECLARED_STAMP not in body
     assert "pending proof" not in body
     assert "No in-sandbox Python verification check was declared." not in body
+
+
+def test_factory_python_publication_names_only_the_unavailable_check_with_its_delegate(
+    _conversion_python_ci: None,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    passed = _record_factory_verification(client, request_id, outcome="passed")
+    assert passed.status_code == 201, passed.text
+    unavailable = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="pgstore",
+        command="uv run pytest pgstore/tests -q",
+        blocked_services=["postgres"],
+        missing_binaries=[],
+        delegated_to="pgstore (postgres)",
+    )
+    assert unavailable.status_code == 201, unavailable.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert (
+        "In-sandbox verification was unavailable for: pgstore (delegated to pgstore (postgres))."
+    ) in body
+    assert "In-sandbox verification was unavailable." not in body
+    assert "unavailable for: python" not in body
+    assert _PENDING_PROOF_STAMP in body
+    assert _NOT_DECLARED_STAMP not in body
+
+
+def test_factory_python_publication_names_every_unavailable_check_in_recorded_order(
+    _conversion_python_ci: None,
+    _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
+) -> None:
+    client, request_id, payload = _factory_publication_case
+    passed = _record_factory_verification(client, request_id, outcome="passed")
+    assert passed.status_code == 201, passed.text
+    first = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="pgstore",
+        command="uv run pytest pgstore/tests -q",
+        blocked_services=["postgres"],
+        missing_binaries=[],
+        delegated_to="pgstore (postgres)",
+    )
+    assert first.status_code == 201, first.text
+    second = _record_factory_verification(
+        client,
+        request_id,
+        outcome="unavailable",
+        check="api",
+        command="uv run pytest tests -q",
+    )
+    assert second.status_code == 201, second.text
+
+    created = _post_factory_publication(client, payload)
+
+    assert created.status_code == 201, created.text
+    body = _factory_publication_body(created.json()["id"])
+    assert (
+        "In-sandbox verification was unavailable for: "
+        "pgstore (delegated to pgstore (postgres)), api."
+    ) in body
+    assert _PENDING_PROOF_STAMP in body
 
 
 def test_factory_python_publication_refuses_a_missing_preflight_observation(
@@ -7055,10 +7259,13 @@ def test_factory_python_publication_refuses_a_missing_preflight_observation(
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.verification_preflight_missing"
     assert "preflight" in refused.json()["detail"]["message"].casefold()
-    assert _factory_rows(
-        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
-        {"id": request_id},
-    )[0]["n"] == 0
+    assert (
+        _factory_rows(
+            "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+            {"id": request_id},
+        )[0]["n"]
+        == 0
+    )
 
 
 def test_factory_python_publication_refuses_a_failed_preflight_observation(
@@ -7073,10 +7280,13 @@ def test_factory_python_publication_refuses_a_failed_preflight_observation(
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "publication.verification_preflight_failed"
     assert "rerun" in refused.json()["detail"]["message"].casefold()
-    assert _factory_rows(
-        "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
-        {"id": request_id},
-    )[0]["n"] == 0
+    assert (
+        _factory_rows(
+            "SELECT count(*) AS n FROM curie.publications WHERE execution_request_id = :id",
+            {"id": request_id},
+        )[0]["n"]
+        == 0
+    )
 
 
 def test_factory_python_publication_refuses_when_ci_does_not_select_the_path(
@@ -7132,7 +7342,7 @@ def test_later_non_python_publication_keeps_prior_python_proof_pending(
     created = _post_factory_publication(client, later)
 
     assert created.status_code == 201, created.text
-    assert "In-sandbox verification was unavailable." in created.json()["body"]
+    assert "In-sandbox verification was unavailable for: python." in created.json()["body"]
     assert _PENDING_PROOF_STAMP in created.json()["body"]
 
 
@@ -7177,7 +7387,7 @@ def test_outside_python_layout_without_a_policy_accepts_any_python_path(
 
     assert created.status_code == 201, created.text
     body = _factory_publication_body(created.json()["id"])
-    assert "In-sandbox verification was unavailable." in body
+    assert "In-sandbox verification was unavailable for: python." in body
     assert _REPOSITORY_PENDING_PROOF in body
 
 
@@ -7228,9 +7438,7 @@ def test_custom_policy_refuses_a_path_outside_its_selection(
     monkeypatch: pytest.MonkeyPatch,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
-    _configure_python_ci(
-        monkeypatch, {FACTORY_REPO: {"check": "Unit tests", "paths": ["src"]}}
-    )
+    _configure_python_ci(monkeypatch, {FACTORY_REPO: {"check": "Unit tests", "paths": ["src"]}})
     client, request_id, payload = _factory_publication_case
     # Selected by the conversion policy, outside this custom policy's layout.
     payload["changed_paths"] = ["unitconv/convert.py"]

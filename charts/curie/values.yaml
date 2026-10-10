@@ -1021,6 +1021,12 @@ otelCollector:
   # Network exporters must opt into bounded retry and a persistent file_storage
   # sending queue. The chart rejects an exporter that omits either protection.
   extraExporters: {}
+  # @spec charts/curie/README.md: Optional trace processors.
+  # Additional Collector processor definitions. Select IDs for traces below;
+  # selected processors run after memory_limiter and before batch. Built-in
+  # names are reserved and both keys default to no change in any pipeline.
+  extraProcessors: {}
+  extraTracePipelineProcessors: []
   # Only awsemf exporters may bypass exporterhelper validation on contrib
   # 0.119.0. Map each configured awsemf name to a nonblank reason naming the
   # exporter and checked Collector version. Other network exporters retain
@@ -1293,6 +1299,10 @@ api:
   # an entry may only use its default branch. Rendered as JSON into
   # GITHUB_FACTORY_BASES.
   githubFactoryBases: {}
+  # Checks and commit statuses that rerun after a pull request metadata edit,
+  # keyed by owner/name: {checks: [name, ...], statuses: [name, ...]}.
+  # Rendered as JSON into GITHUB_FACTORY_METADATA_CI.
+  githubFactoryMetadataCi: {}
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
@@ -2004,6 +2014,9 @@ worker:
     # Each entry matches that exact path and anything under it. The worker
     # receives the list as a JSON array, so a path may contain a comma.
     protectedPaths: []
+    # Opt in to new third-party dependency names in manifests and lockfiles.
+    # Applies to every publication in this install, including factory work.
+    allowDependencyAdditions: false
     # GitHub publishes these address sets from https://api.github.com/meta.
     # Override for GitHub Enterprise or refresh when GitHub changes the set.
     githubHttpsCidrs:
@@ -2453,11 +2466,19 @@ preflights:
   controllerReady:
     enabled: true
     image: alpine/k8s:1.31.2
-    # Max seconds to wait for "Starting workers" or positive successful-reconcile
-    # metrics after checking for controller failures. Sized for a fresh install;
-    # an upgrade over a crash-looping controller may need a manual pod delete
-    # + `helm test`.
+    # Max seconds to wait for a stable serving leader, "Starting workers" or
+    # positive successful-reconcile metrics after checking for controller
+    # failures. Sized for a fresh install; an upgrade over a crash-looping
+    # controller may need a manual pod delete + `helm test`.
     timeoutSeconds: 180
+    # How long the current controller pod must have held its leader-election
+    # Lease, while still renewing it, for the gate to accept it as serving
+    # without a fresh startup log (issue #4197). This is what lets an upgrade
+    # that does not restart the controller pass. It must exceed the
+    # controller's 120s cache-sync timeout, after which a manager whose
+    # informers cannot sync exits and loses the lease; the chart refuses
+    # values below 150.
+    stableLeaderSeconds: 180
     resources:
       requests: { cpu: 50m, memory: 64Mi }
       limits: { cpu: 250m, memory: 128Mi }
@@ -2870,6 +2891,10 @@ security:
   # single-tenant single-node dev cluster; matters for the shared/production path.
   dataTierNetworkPolicy:
     enabled: true
+    # @spec docs/superpowers/specs/2026-10-08-mcp-connector-valkey-ingress-optout.md
+    # Keep the existing MCP connector peer by default. Set false only when
+    # connector proxies do not need to reach this release's in-chart Valkey.
+    allowMcpConnectorValkeyIngress: true
   # Default-on ingress isolation for Collector self-metrics. OTLP receivers
   # remain open to platform workloads and external senders on 4317/4318, and
   # the kubelet health probe remains admitted on 13133. The Prometheus endpoint

@@ -33,6 +33,7 @@
         { "field": "systemPrompt", "why": "no approvals-verb output surfaces the agent's system prompt." },
         { "field": "starterPrompts", "why": "no approvals-verb output surfaces starter prompts." },
         { "field": "secrets", "why": "declared secret NAMES are surfaced by other verbs (skill up --secret), not skill approvals." },
+        { "field": "optionalSecrets", "why": "optional secret names have no approval inspection surface." },
         { "field": "triggers", "why": "no approvals-verb output surfaces the manifest's trigger declarations." },
         { "field": "toolPolicy", "why": "the vanilla MCP tool-policy declaration is a runtime-enforcement contract with no runtime enforcing it yet and no output surface on skill approvals; when a verb surfaces it, this omission becomes a carried field." }
       ]
@@ -96,22 +97,27 @@
     {
       "struct": "PreflightCheck",
       "file": "cli/src/commands.rs",
-      "reason": "A selected CI command from the source-owned fast preflight planner, unrelated to plugin_format."
+      "reason": "A selected CI command from the source-owned preflight planner, unrelated to plugin_format."
     },
     {
       "struct": "PreflightFailure",
       "file": "cli/src/commands.rs",
-      "reason": "A failed gate result from the source-owned fast preflight planner, unrelated to plugin_format."
+      "reason": "A failed gate result from the source-owned preflight planner, unrelated to plugin_format."
+    },
+    {
+      "struct": "PreflightBase",
+      "file": "cli/src/commands.rs",
+      "reason": "The preflight base freshness and required check health report, unrelated to plugin_format."
     },
     {
       "struct": "PreflightOutput",
       "file": "cli/src/commands.rs",
-      "reason": "The source-owned fast preflight report contract, unrelated to plugin_format."
+      "reason": "The source-owned preflight report contract, unrelated to plugin_format."
     },
     {
       "struct": "PreflightSetupError",
       "file": "cli/src/commands.rs",
-      "reason": "A fast preflight setup error with recovery instructions, unrelated to plugin_format."
+      "reason": "A preflight setup error with recovery instructions, unrelated to plugin_format."
     },
     {
       "struct": "CheckReport",

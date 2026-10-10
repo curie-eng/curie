@@ -1093,9 +1093,10 @@ enum FactoryAction {
         /// Kind cluster name used only when no kube context is targeted.
         #[arg(long, default_value = curie::factory_quickstart::DEFAULT_KIND_NAME)]
         kind_name: String,
-        /// Model id installed by cluster up.
-        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_MODEL)]
-        model: String,
+        /// Model id installed by cluster up. Defaults to Claude Sonnet for
+        /// Anthropic credentials, or GLM Flash for OpenRouter credentials.
+        #[arg(long)]
+        model: Option<String>,
         /// Per run execution deadline in seconds for the deployed agent.
         #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_DEADLINE_SECONDS)]
         execution_deadline: u32,
@@ -1241,17 +1242,23 @@ enum SreBotAction {
 
 #[derive(Subcommand)]
 enum DevAction {
-    /// Run the cheap pull request gates selected for the committed change.
+    /// Check the committed change before opening or updating a pull request.
     Preflight {
-        /// Run the fast tier. Required; no full tier is provided.
+        /// Run only the fast tier; the full tier is the default.
         #[arg(long)]
         fast: bool,
         /// Origin branch to compare against (for example, main or next).
         #[arg(long, default_value = "main")]
         base: String,
-        /// Print the selected CI commands without running them.
+        /// Print the selected checks without running them.
         #[arg(long)]
         dry_run: bool,
+        /// File containing the proposed pull request body.
+        #[arg(long, conflicts_with = "fast")]
+        pr_body: Option<PathBuf>,
+        /// Proposed pull request title used by the body guard.
+        #[arg(long, requires = "pr_body")]
+        title: Option<String>,
     },
     /// Manage hooks for this source checkout.
     Hooks {
@@ -2467,6 +2474,12 @@ enum LocalAction {
         /// Clear the model override back to the platform default.
         #[arg(long)]
         clear_model: bool,
+        /// Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot).
+        #[arg(long)]
+        reviewer_model: Option<String>,
+        /// Clear the reviewer model override back to the credential default.
+        #[arg(long)]
+        clear_reviewer_model: bool,
         /// Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`).
         #[arg(long)]
         thinking: Option<String>,
@@ -2925,11 +2938,15 @@ enum ClusterAction {
     /// cluster with no `runsc` RuntimeClass that is the wrong one: `cluster up`
     /// records a FAILED revision before its successful gVisor-off retry, so the
     /// history alternates failed/superseded and the preceding revision is a
-    /// failed one -- a manifest helm never finished applying.
+    /// failed one, a manifest Helm never finished applying.
     ///
-    /// This verb skips every revision whose status is not `deployed` or
-    /// `superseded` and rolls back to the newest one below the current revision
-    /// that is, printing which revisions it passed over. See issue #1899.
+    /// When the newest revision is above the newest `deployed` serving revision
+    /// with a status other than `deployed` or `superseded`, this verb rolls back
+    /// to that serving revision. Otherwise it selects the newest prior `deployed`
+    /// or `superseded` revision, printing which ineligible revisions it passed
+    /// over. See issues #1899 and #4335.
+    /// A dry run reads Helm history and prints the resolved target without
+    /// probing the live schema or running the rollback.
     Rollback {
         /// Roll back to this exact revision instead of the newest safe one. A
         /// revision that is not `deployed` or `superseded` is refused unless
@@ -2957,7 +2974,8 @@ enum ClusterAction {
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
-        /// Print the commands that would run and exit without executing.
+        /// Read Helm history and print the selected revision and commands without
+        /// probing the live schema or running the rollback.
         #[arg(long)]
         dry_run: bool,
     },
@@ -2997,6 +3015,11 @@ enum ClusterAction {
         /// rollback window stays intact (#2300).
         #[arg(long = "forward-only")]
         forward_only: bool,
+        /// Take over this exact holder after verifying its CLI and Helm action
+        /// have stopped. Refuses while a release hook Job is running; recovers
+        /// an orphaned pending upgrade by rolling back to the serving revision.
+        #[arg(long, value_name = "HOLDER")]
+        take_over: Option<String>,
     },
     /// Carry bundle objects across a chart upgrade that renames the object
     /// store (issue #1324).
@@ -3545,6 +3568,12 @@ enum ClusterAction {
         /// Clear the model override back to the platform default.
         #[arg(long)]
         clear_model: bool,
+        /// Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot).
+        #[arg(long)]
+        reviewer_model: Option<String>,
+        /// Clear the reviewer model override back to the credential default.
+        #[arg(long)]
+        clear_reviewer_model: bool,
         /// Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`).
         #[arg(long)]
         thinking: Option<String>,
@@ -4834,7 +4863,12 @@ async fn run(command: Option<Command>) -> Result<()> {
                 fast,
                 base,
                 dry_run,
-            } => emit(commands::dev_preflight(fast, &base, dry_run).await?),
+                pr_body,
+                title,
+            } => emit(
+                commands::dev_preflight(fast, &base, dry_run, pr_body.as_deref(), title.as_deref())
+                    .await?,
+            ),
             DevAction::Hooks { action } => match action {
                 HooksAction::Install => commands::dev_hooks_install(),
             },
@@ -5634,6 +5668,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 agent,
                 model,
                 clear_model,
+                reviewer_model,
+                clear_reviewer_model,
                 thinking,
                 clear_thinking,
                 execution_deadline,
@@ -5653,6 +5689,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                         dry_run,
                     },
                     commands::OverrideChange::resolve("model", model, clear_model)?,
+                    commands::OverrideChange::resolve(
+                        "reviewer-model",
+                        reviewer_model,
+                        clear_reviewer_model,
+                    )?,
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?,
                     commands::OverrideChange::resolve_execution_deadline(
                         execution_deadline,
@@ -6023,6 +6064,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
                 forward_only,
+                take_over,
             } => {
                 let resolved = artifacts::resolve_chart(
                     chart.as_deref(),
@@ -6043,6 +6085,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         chart,
                         yes,
                         forward_only,
+                        take_over,
                     })
                     .await?,
                 )
@@ -6950,6 +6993,8 @@ async fn run(command: Option<Command>) -> Result<()> {
                 agent,
                 model,
                 clear_model,
+                reviewer_model,
+                clear_reviewer_model,
                 thinking,
                 clear_thinking,
                 execution_deadline,
@@ -6965,6 +7010,11 @@ async fn run(command: Option<Command>) -> Result<()> {
                 // operator wait on a cluster lookup to be told so is worse than
                 // telling them immediately.
                 let model = commands::OverrideChange::resolve("model", model, clear_model)?;
+                let reviewer_model = commands::OverrideChange::resolve(
+                    "reviewer-model",
+                    reviewer_model,
+                    clear_reviewer_model,
+                )?;
                 let thinking =
                     commands::OverrideChange::resolve("thinking", thinking, clear_thinking)?;
                 let execution_deadline = commands::OverrideChange::resolve_execution_deadline(
@@ -6986,6 +7036,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             dry_run,
                         },
                         model,
+                        reviewer_model,
                         thinking,
                         execution_deadline,
                         runner_resources,

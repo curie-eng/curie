@@ -237,5 +237,7 @@ def test_source_policy_additive_upgrade_preserves_existing_agent(
     before = sql_dicts("SELECT * FROM curie.agents WHERE id = :id", {"id": agent_id})
     command.upgrade(alembic_config(), "head")
     _columns()
-    assert sql_dicts("SELECT * FROM curie.agents WHERE id = :id", {"id": agent_id}) == before
+    assert sql_dicts("SELECT * FROM curie.agents WHERE id = :id", {"id": agent_id}) == [
+        {**row, "reviewer_model": None} for row in before
+    ]
     assert sql_dicts("SELECT * FROM curie.hook_source_policies") == []

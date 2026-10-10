@@ -27,7 +27,7 @@ from .. import sandbox_token
 from ..config import get_settings
 from ..deps import SessionDep
 from ..factory_card import CardInput, render_card
-from ..factory_notices import cause_text, needs_human
+from ..factory_notices import cause_text
 from ..factory_progress import (
     PROGRESS_SCOPE,
     ProgressReport,
@@ -45,6 +45,7 @@ from ..models import (
     ThreadPublicationLineage,
     WorkItem,
 )
+from ..workitems import OWNER_LOST_RETRY_LIMIT, owner_lost_streak, owner_lost_successor_admitted
 
 router = APIRouter(tags=["factory-status"])
 
@@ -131,11 +132,14 @@ async def report_work_item_verification(
     request_id: uuid.UUID, body: VerificationObservation, session: SessionDep
 ) -> Any:
     result = await record_verification(session, token_request_id=request_id, body=body)
-    if result.outcome != "recorded":
+    if result.outcome not in ("recorded", "replayed"):
         return JSONResponse(
             status_code=_STATUS_CODES[result.outcome], content={"code": result.outcome}
         )
-    return {"recorded": True, "request_id": str(result.request_id)}
+    response = {"recorded": True, "request_id": str(result.request_id)}
+    if result.outcome == "replayed":
+        response["replayed"] = True
+    return response
 
 
 @router.get(
@@ -180,6 +184,14 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             )
         )
     terminal = request.terminal_cause if request.terminal_at is not None else None
+    retrying = (
+        request.status == "failed"
+        and terminal == "owner_lost"
+        and 1
+        <= await owner_lost_streak(session, work_item.id, through_sequence=request.sequence)
+        < OWNER_LOST_RETRY_LIMIT
+        and await owner_lost_successor_admitted(session, request)
+    )
     body = render_card(
         CardInput(
             repo=work_item.repo_full_name,
@@ -188,6 +200,7 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             revision_pr=revision_pr,
             status=request.status,
             publishing=publishing,
+            retrying=retrying,
             started_at=request.started_at,
             terminal_at=request.terminal_at,
             now=datetime.now(UTC),
@@ -202,7 +215,6 @@ async def factory_status_card(token: str, session: SessionDep) -> Response:
             cause_text=(
                 cause_text(terminal) if terminal and terminal != "completed" else None
             ),
-            needs_human=needs_human(request.status, terminal),
         )
     )
     return Response(

@@ -13,6 +13,7 @@ provisioned-runner end-to-end (no ``target_url``) that tears the sandbox down.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -62,6 +63,7 @@ from curie_worker.consumer_liveness import (
     consumer_heartbeat_capable_key,
     consumer_heartbeat_key,
 )
+from curie_worker.delivery_lease import DeliveryLeaseStore
 from curie_worker.eval import (
     EvalCase,
     EvalJob,
@@ -78,6 +80,7 @@ from curie_worker.eval import stream as eval_stream_module
 from curie_worker.eval.models import EvalCaseResult, EvalOutcome, EvalRunResult
 from curie_worker.sandbox import AffinityStore, SandboxSubstrate, SubstrateConfig
 from curie_worker.sandbox.types import ClaimView, QuotaRejection, SandboxError, SandboxView
+from curie_worker.stream_consumer import ConsumerLivenessExpired
 from opentelemetry import trace
 from redis.asyncio import Redis as AsyncRedis
 from redis.asyncio.retry import Retry as AsyncRetry
@@ -98,13 +101,224 @@ _DB_URL = os.environ.get(
 _DB_SCHEMA = os.environ.get("TEST_DB_SCHEMA", "curie")
 
 
+@pytest.mark.parametrize(
+    ("lane", "outage_s"),
+    [
+        pytest.param("delivery", 2.9, id="delivery-29s-survives"),
+        pytest.param("liveness", 2.9, id="liveness-29s-survives"),
+        pytest.param("delivery", 5.0, id="delivery-50s-expires"),
+        pytest.param("liveness", 5.0, id="liveness-50s-expires"),
+        pytest.param("delivery-key-gone", 0.0, id="delivery-key-gone-refused"),
+        pytest.param("delivery-wrong-token", 0.0, id="delivery-wrong-token-refused"),
+    ],
+)
+def test_eval_real_suite_shares_ownership_outage_recovery_and_expiry(
+    make_eval_harness,
+    bundles,
+    monkeypatch: pytest.MonkeyPatch,
+    lane: str,
+    outage_s: float,
+) -> None:
+    """Both shared leases fence a real eval suite, with production clocks at 0.1.
+
+    RustFS supplies the bundle and Langfuse records the score. Only model
+    responses and the platform's report HTTP are faked. The ownership adapters
+    delegate every successful operation to real Valkey.
+    """
+    bundles_store, upload = bundles
+
+    async def go() -> None:
+        async with make_eval_harness() as (base_url, fake, _runner):
+            token = uuid.uuid4().hex
+            cfg = _lease_cfg(
+                token,
+                delivery_lease_ttl_s=4.5,
+                delivery_lease_heartbeat_s=1.0,
+                consumer_heartbeat_ttl_ms=4500,
+                consumer_capability_ttl_ms=9000,
+                reclaim_min_idle_ms=6000,
+                read_block_ms=10,
+            )
+            client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
+            release = asyncio.Event()
+            fake.hold_inputs["ownership-outage"] = release
+            fake.responses["ownership-outage"] = "completed"
+            bundle_ref = upload(
+                EvalSuite(
+                    name="ownership-outage",
+                    cases=[
+                        EvalCase(
+                            id="held",
+                            input="ownership-outage",
+                            grader=Grader(kind=CONTAINS, expected="completed"),
+                        )
+                    ],
+                )
+            )
+            reports: list[dict[str, Any]] = []
+            async with httpx.AsyncClient(timeout=30.0) as lf_client:
+                consumer = _build_consumer(
+                    redis_client=client,
+                    cfg=cfg,
+                    bundle_store=bundles_store,
+                    substrate=_UnusedSubstrate(),
+                    reports=reports,
+                    lf_client=lf_client,
+                )
+                leases = DeliveryLeaseStore(client, cfg)
+                # Same real store that production injects at construction.
+                consumer._leases = leases
+                liveness = consumer._liveness_store
+                assert liveness is not None
+                real_heartbeat = leases.heartbeat
+                real_renew = liveness.renew
+                outage_until: float | None = None
+                failures = 0
+                heartbeat_calls = 0
+                recovered = asyncio.Event()
+                loss_calls = 0
+                real_finish_loss = consumer._finish_lease_loss
+
+                def unavailable() -> None:
+                    nonlocal failures
+                    if outage_until is not None and time.monotonic() < outage_until:
+                        failures += 1
+                        raise redis.exceptions.ConnectionError("injected eval ownership outage")
+
+                async def heartbeat(*args: Any, **kwargs: Any) -> Any:
+                    nonlocal heartbeat_calls
+                    heartbeat_calls += 1
+                    unavailable()
+                    result = await real_heartbeat(*args, **kwargs)
+                    if outage_until is not None:
+                        recovered.set()
+                    return result
+
+                async def renew(**kwargs: Any) -> bool:
+                    unavailable()
+                    result = await real_renew(**kwargs)
+                    if outage_until is not None:
+                        recovered.set()
+                    return result
+
+                async def finish_loss(*args: Any, **kwargs: Any) -> None:
+                    nonlocal loss_calls
+                    loss_calls += 1
+                    await real_finish_loss(*args, **kwargs)
+
+                if lane.startswith("delivery"):
+                    monkeypatch.setattr(leases, "heartbeat", heartbeat)
+                    monkeypatch.setattr(consumer, "_finish_lease_loss", finish_loss)
+                else:
+                    monkeypatch.setattr(liveness, "renew", renew)
+                await consumer.ensure_group()
+                entry_id = await client.xadd(
+                    cfg.eval_stream,
+                    {
+                        STREAM_PAYLOAD_FIELD: _item(
+                            suite="ownership-outage",
+                            sha=f"sha-{token}",
+                            bundle_ref=bundle_ref,
+                            target_url=base_url,
+                        ).model_dump_json()
+                    },
+                )
+                task = asyncio.create_task(consumer.run())
+                try:
+                    await _wait_until(lambda: bool(fake.seen))
+                    lease = consumer._held_leases[entry_id]
+                    started = (
+                        lease.local_deadline_monotonic - 3.5
+                        if lane == "delivery"
+                        else consumer._last_liveness_renewal
+                    )
+                    assert started is not None
+                    if outage_s > 0:
+                        outage_until = time.monotonic() + outage_s
+                    if outage_s == 0:
+                        refused_at = time.monotonic()
+                        lease_key = cfg.delivery_lease_key(
+                            cfg.eval_stream, cfg.eval_consumer_group, entry_id
+                        )
+                        if lane == "delivery-key-gone":
+                            await client.delete(lease_key)
+                        else:
+                            await client.set(lease_key, "another-owner", px=4500)
+                        await asyncio.wait_for(lease.lost.wait(), timeout=1.25)
+                        assert time.monotonic() - refused_at < 1.2
+                        await asyncio.gather(*list(consumer._lease_loss_tasks))
+                        assert loss_calls == 1
+                        await asyncio.sleep(0.05)
+                        assert heartbeat_calls == 1
+                        consumer.request_stop()
+                        release.set()
+                        await asyncio.wait_for(task, timeout=5.0)
+                        assert not reports, "a refused eval owner published a report"
+                        assert entry_id in await _eval_pending(client, cfg)
+                    elif outage_s == 2.9:
+                        await asyncio.wait_for(recovered.wait(), timeout=3.3)
+                        assert failures == 2
+                        assert not lease.lost.is_set()
+                        assert not task.done()
+                        release.set()
+                        await _wait_until(lambda: bool(reports))
+                        await _wait_until(lambda: entry_id not in consumer._inflight_ids)
+                        assert reports[0]["passed_count"] == reports[0]["total"] == 1
+                        assert entry_id not in await _eval_pending(client, cfg)
+                        assert loss_calls == 0
+                    elif lane == "delivery":
+                        await asyncio.sleep(max(0, started + 3.43 - time.monotonic()))
+                        assert not lease.lost.is_set()
+                        await asyncio.wait_for(lease.lost.wait(), timeout=0.2)
+                        assert time.monotonic() - started == pytest.approx(3.5, abs=0.07)
+                        await asyncio.gather(*list(consumer._lease_loss_tasks))
+                        assert loss_calls == 1
+                        consumer.request_stop()
+                        release.set()
+                        await asyncio.wait_for(task, timeout=5.0)
+                        assert not reports, "a fenced eval owner published a report"
+                        assert entry_id in await _eval_pending(client, cfg)
+                        assert failures == 3
+                    else:
+                        await asyncio.sleep(max(0, started + 3.43 - time.monotonic()))
+                        assert not task.done()
+                        with pytest.raises(ConsumerLivenessExpired):
+                            await asyncio.wait_for(task, timeout=0.2)
+                        assert time.monotonic() - started == pytest.approx(3.5, abs=0.07)
+                        assert not reports
+                        assert entry_id in await _eval_pending(client, cfg)
+                        assert not consumer._inflight_ids
+                        assert failures == 3
+                finally:
+                    release.set()
+                    consumer.request_stop()
+                    with contextlib.suppress(ConsumerLivenessExpired):
+                        await asyncio.wait_for(task, timeout=5.0)
+                    await client.delete(
+                        consumer_heartbeat_key(
+                            cfg.eval_stream, cfg.eval_consumer_group, cfg.eval_consumer_name
+                        ),
+                        consumer_heartbeat_capable_key(
+                            cfg.eval_stream, cfg.eval_consumer_group, cfg.eval_consumer_name
+                        ),
+                    )
+                    await _eval_cleanup(client, cfg)
+
+    asyncio.run(go())
+
+
 class _StubRepo:
     """The B1 repo lookup, stubbed: a channel/agent resolves to a GitHub repo."""
 
     def __init__(
-        self, *, model: str | None = None, thinking: str | None = None
+        self,
+        *,
+        model: str | None = None,
+        reviewer_model: str | None = None,
+        thinking: str | None = None,
     ) -> None:
         self._model = model
+        self._reviewer_model = reviewer_model
         self._thinking = thinking
         self.model_settings_agent_ids: list[uuid.UUID] = []
 
@@ -121,9 +335,9 @@ class _StubRepo:
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+    ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
-        return self._model, self._thinking, None
+        return self._model, self._reviewer_model, self._thinking, None
 
 
 class _ObservedBindingResolver(BindingResolver):
@@ -135,7 +349,7 @@ class _ObservedBindingResolver(BindingResolver):
 
     async def model_settings_for(
         self, agent_id: uuid.UUID
-    ) -> tuple[str | None, str | None, dict[str, object] | None]:
+    ) -> tuple[str | None, str | None, str | None, dict[str, object] | None]:
         self.model_settings_agent_ids.append(agent_id)
         return await super().model_settings_for(agent_id)
 
@@ -940,7 +1154,7 @@ def test_entry_is_acked_after_report_even_when_report_fails(make_eval_harness, b
         ),
     ],
 )
-def test_provisioned_runner_end_to_end(
+def test_provisioned_runner_reviewer_model_end_to_end(
     make_eval_harness,
     bundles,
     platform_model: str | None,
@@ -971,13 +1185,14 @@ def test_provisioned_runner_end_to_end(
                 await conn.execute(
                     text(
                         f"INSERT INTO {_DB_SCHEMA}.agents "
-                        "(id, name, model, thinking, repo_full_name) "
-                        "VALUES (:id, :name, :model, :thinking, :repo)"
+                        "(id, name, model, reviewer_model, thinking, repo_full_name) "
+                        "VALUES (:id, :name, :model, :reviewer_model, :thinking, :repo)"
                     ),
                     {
                         "id": agent_id,
                         "name": f"eval_agent_{token}",
                         "model": stored_model,
+                        "reviewer_model": "acme-reviewer-model" if stored_model else None,
                         "thinking": agent_thinking,
                         "repo": "acme-corp/acme-bot",
                     },
@@ -1096,6 +1311,9 @@ def test_provisioned_runner_end_to_end(
                         assert THINKING_ENV not in claim_env
                     else:
                         assert claim_env[THINKING_ENV] == expected_thinking
+                    assert claim_env.get("CURIE_REVIEWER_MODEL") == (
+                        "acme-reviewer-model" if stored_model else None
+                    )
                     assert repo_lookup.model_settings_agent_ids == [agent_id]
                     assert fake_k8s.deleted, "provisioned sandbox was never released"
                     assert not fake_k8s.claims
@@ -1441,7 +1659,7 @@ def test_eval_boot_env_mints_runner_token() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env.get(RUNNER_TOKEN_ENV), "_boot_env must mint a non-empty runner token"
 
 
@@ -1462,7 +1680,7 @@ def test_eval_lane_boot_env_omits_memory_ref() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert "CURIE_MEMORY_REF" not in env
     assert "CURIE_MEMORY_TOKEN" not in env
     assert "CURIE_HISTORY_REF" not in env
@@ -1486,7 +1704,7 @@ def test_eval_boot_env_forwards_sha_as_bundle_version() -> None:
         repo_lookup=None,
     )
     item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    env = consumer._boot_env(item, None, None, model=None)
+    env = consumer._boot_env(item, None, None, model=None, reviewer_model=None)
     assert env["CURIE_BUNDLE_VERSION"] == "deadbeef"
     assert env[BUNDLE_REF_ENV] == "bundles/x.zip"
 
@@ -1508,14 +1726,16 @@ def test_eval_requested_model_boots_and_tags_that_model() -> None:
     item = _item(
         suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None, model="claude-x"
     )
-    env = consumer._boot_env(item, None, None, model="claude-x")
+    env = consumer._boot_env(item, None, None, model="claude-x", reviewer_model=None)
     assert env[MODEL_ENV] == "claude-x"  # requested model wins over worker default
     assert consumer._eval_model(item, "claude-x") == "claude-x"
 
     # No requested model: the worker default is booted and tagged, as before.
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
     assert (
-        consumer._boot_env(default_item, None, None, model="worker-default")[MODEL_ENV]
+        consumer._boot_env(
+            default_item, None, None, model="worker-default", reviewer_model=None
+        )[MODEL_ENV]
         == "worker-default"
     )
     assert consumer._eval_model(default_item, "worker-default") == "worker-default"
@@ -1576,7 +1796,9 @@ def test_eval_fake_model_install_refuses_to_label_a_model_never_called(
     # A fake run with no requested model is unlabelled too (not the worker default,
     # which the fake session never calls either).
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
-    default_env = consumer._boot_env(default_item, None, None, model="stored_model")
+    default_env = consumer._boot_env(
+        default_item, None, None, model="stored_model", reviewer_model=None
+    )
     assert default_env[MODEL_ENV] == "stored_model"
     assert consumer._eval_model(default_item, "stored_model") is None
 
@@ -1637,7 +1859,10 @@ def test_eval_claim_creation_is_bounded_to_one_by_default() -> None:
 
     async def go() -> None:
         await asyncio.gather(
-            *(consumer._acquire_target(item, model=None, thinking=None) for item in items)
+            *(
+                consumer._acquire_target(item, model=None, reviewer_model=None, thinking=None)
+                for item in items
+            )
         )
 
     asyncio.run(go())
@@ -1666,7 +1891,10 @@ def test_eval_claim_creation_bound_admits_configured_parallelism() -> None:
 
     async def go() -> None:
         await asyncio.gather(
-            *(consumer._acquire_target(item, model=None, thinking=None) for item in items)
+            *(
+                consumer._acquire_target(item, model=None, reviewer_model=None, thinking=None)
+                for item in items
+            )
         )
 
     asyncio.run(go())
@@ -1933,6 +2161,7 @@ def test_eval_boot_env_drops_reserved_connector_secret() -> None:
         },
         None,
         model=None,
+        reviewer_model=None,
     )
     # The reserved model-credential key never carries the injected value.
     assert env.get("ANTHROPIC_BASE_URL") != "http://evil"

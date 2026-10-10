@@ -37,7 +37,7 @@ pub const PERMISSIONS: [(&str, &str); 7] = [
     ("pull_requests", "write"),
     ("checks", "read"),
     ("statuses", "write"),
-    ("actions", "read"),
+    ("actions", "write"),
 ];
 
 /// `curie-factory-<8 lowercase hex>`: unique enough that the GitHub-wide App
@@ -153,22 +153,24 @@ impl GithubApi {
     }
 
     /// One call; returns the status and the parsed body (Null when not JSON).
-    /// `auth` is a bearer credential and is never echoed.
+    /// `auth`, when required by the endpoint, is never echoed.
     async fn call(
         &self,
         method: reqwest::Method,
         url: reqwest::Url,
-        auth: &str,
+        auth: Option<&str>,
         body: Option<&serde_json::Value>,
     ) -> Result<(u16, serde_json::Value)> {
         let shown = format!("{method} {}", url.path());
         let mut request = self
             .client
             .request(method, url)
-            .header("Authorization", format!("Bearer {auth}"))
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("User-Agent", format!("curie/{}", env!("CARGO_PKG_VERSION")));
+        if let Some(auth) = auth {
+            request = request.bearer_auth(auth);
+        }
         if let Some(body) = body {
             request = request.json(body);
         }
@@ -188,8 +190,43 @@ impl GithubApi {
     }
 
     async fn get_app(&self, jwt: &str) -> Result<(u16, serde_json::Value)> {
-        self.call(reqwest::Method::GET, self.url(&["app"]), jwt, None)
+        self.call(reqwest::Method::GET, self.url(&["app"]), Some(jwt), None)
             .await
+    }
+
+    /// The numeric user id comes from GitHub's documented user response,
+    /// not the App id. Public user data requires no authentication:
+    /// https://docs.github.com/en/rest/users/users#get-a-user.
+    pub async fn bot_publication_identity(&self, slug: &str) -> Result<PublicationIdentity> {
+        let name = format!("{slug}[bot]");
+        let failure = |detail: String| {
+            let remedy = "check the App bot account and retry; to override commit identity separately, use curie cluster upgrade --set worker.publication.gitUserEmail=<email> and --set worker.publication.gitUserName=<name>";
+            CliError::transient(format!(
+                "GitHub bot lookup GET /users/{name} failed: {detail}; nothing was applied; {remedy}"
+            ))
+            .with_fix(remedy)
+        };
+        let (status, body) = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["users", &name]),
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| failure(error.to_string()))?;
+        if status != 200 {
+            return Err(failure(format!("GitHub returned HTTP {status}")).into());
+        }
+        let id = body
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or_else(|| failure("GitHub returned no positive numeric user id".into()))?;
+        Ok(PublicationIdentity {
+            email: format!("{id}+{name}@users.noreply.github.com"),
+            name,
+        })
     }
 
     /// Resolve once, then keep every Contents API read on the same commit.
@@ -207,7 +244,7 @@ impl GithubApi {
             .call(
                 reqwest::Method::GET,
                 self.url(&["repos", owner, name]),
-                token,
+                Some(token),
                 None,
             )
             .await?;
@@ -225,7 +262,7 @@ impl GithubApi {
             .call(
                 reqwest::Method::GET,
                 self.url(&["repos", owner, name, "commits", branch]),
-                token,
+                Some(token),
                 None,
             )
             .await?;
@@ -260,7 +297,9 @@ impl GithubApi {
         segments.extend(path.split('/').filter(|part| !part.is_empty()));
         let mut url = self.url(&segments);
         url.query_pairs_mut().append_pair("ref", commit);
-        let (status, body) = self.call(reqwest::Method::GET, url, token, None).await?;
+        let (status, body) = self
+            .call(reqwest::Method::GET, url, Some(token), None)
+            .await?;
         if status == 404 {
             return Ok(RepositoryContent::Missing);
         }
@@ -347,6 +386,12 @@ pub struct InstalledApp {
     tokens: BTreeMap<String, String>,
 }
 
+/// The GitHub App bot's author identity for factory publication.
+pub struct PublicationIdentity {
+    pub name: String,
+    pub email: String,
+}
+
 impl InstalledApp {
     pub fn token_for(&self, repo: &str) -> Option<&str> {
         self.tokens
@@ -410,7 +455,9 @@ pub async fn inspect_app(api: &GithubApi, app_id: &str, pem: &str) -> Result<Ins
         url.query_pairs_mut()
             .append_pair("per_page", "100")
             .append_pair("page", &page.to_string());
-        let (status, installations) = api.call(reqwest::Method::GET, url, &jwt, None).await?;
+        let (status, installations) = api
+            .call(reqwest::Method::GET, url, Some(&jwt), None)
+            .await?;
         if !(200..300).contains(&status) {
             return Err(unexpected(status, "GET /app/installations"));
         }
@@ -440,7 +487,7 @@ pub async fn inspect_app(api: &GithubApi, app_id: &str, pem: &str) -> Result<Ins
             .call(
                 reqwest::Method::POST,
                 api.url(&["app", "installations", &id, "access_tokens"]),
-                &jwt,
+                Some(&jwt),
                 None,
             )
             .await?;
@@ -465,7 +512,9 @@ pub async fn inspect_app(api: &GithubApi, app_id: &str, pem: &str) -> Result<Ins
             url.query_pairs_mut()
                 .append_pair("per_page", "100")
                 .append_pair("page", &page.to_string());
-            let (status, body) = api.call(reqwest::Method::GET, url, &token, None).await?;
+            let (status, body) = api
+                .call(reqwest::Method::GET, url, Some(&token), None)
+                .await?;
             if !(200..300).contains(&status) {
                 return Err(unexpected(status, "GET /installation/repositories"));
             }
@@ -765,7 +814,7 @@ pub async fn label_exists(
         .call(
             reqwest::Method::GET,
             api.url(&["repos", owner, name, "labels", label]),
-            token,
+            Some(token),
             None,
         )
         .await?;
@@ -810,7 +859,7 @@ pub async fn create_label(
         .call(
             reqwest::Method::POST,
             api.url(&["repos", owner, name, "labels"]),
-            token,
+            Some(token),
             Some(&body),
         )
         .await?;

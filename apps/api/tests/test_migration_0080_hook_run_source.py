@@ -84,12 +84,15 @@ def _column() -> list[dict[str, Any]]:
     )
 
 
-def test_0080_is_the_single_expand_head_after_0079() -> None:
+def test_0080_is_expand_after_0079_and_precedes_the_single_candidate_head() -> None:
     script = ScriptDirectory.from_config(_config())
     revision = script.get_revision(REVISION)
     assert revision is not None
     assert revision.down_revision == BELOW
-    assert script.get_heads() == [REVISION]
+    assert script.get_heads() == ["0093"]
+    candidate = script.get_revision("0081")
+    assert candidate is not None
+    assert candidate.down_revision == REVISION
     kinds = json.loads((API_DIR / "src/curie_api/revision_kinds.json").read_text())
     assert kinds[REVISION] == "expand"
 

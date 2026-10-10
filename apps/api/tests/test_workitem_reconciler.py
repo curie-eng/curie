@@ -6,7 +6,7 @@ import asyncio
 import json
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from types import SimpleNamespace
 from typing import Any
@@ -22,8 +22,10 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
+from curie_api import workitems
 from curie_api.config import get_settings
-from curie_api.workitem_dispatch import admit, fence_published
+from curie_api.main import create_app
+from curie_api.workitem_dispatch import acquire, admit, defer, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
@@ -43,6 +45,16 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from test_factory_terminus import (  # noqa: F401 (fixtures)
+    HEAD_A,
+    _attach_publication,
+    _label,
+    _request,
+    _start_running,
+    admitted,
+    ci_pending,
+    comments,
+)
 
 REPO = "acme-corp/acme-bot"
 ADDRESS = "C0EXAMPLE1"
@@ -58,7 +70,6 @@ RECONCILER_STEPS = (
     "_settle_overdue_cancellations",
     "_readmit_pending",
     "_reconcile_missed_labels",
-    "_sync_status_comments",
     "_redispatch_lapsed_acquisitions",
     "_publish_execute_wakes",
 )
@@ -121,7 +132,8 @@ def test_work_item_enqueue_carrier_names_the_recorded_producer_span(
     spans = exporter.get_finished_spans()
     ingress = next(span for span in spans if span.name == "test.ingress")
     enqueue = next(
-        span for span in spans
+        span
+        for span in spans
         if span.name == "curie.queue.enqueue" and span.context.span_id == int(carrier[2], 16)
     )
     assert enqueue.kind is SpanKind.PRODUCER
@@ -138,9 +150,7 @@ def test_work_item_enqueue_without_a_tracer_preserves_the_payload_only(
     monkeypatch: pytest.MonkeyPatch,
     marked: bool,
 ) -> None:
-    monkeypatch.setattr(
-        telemetry_tracing, "_tracer", trace.NoOpTracerProvider().get_tracer("test")
-    )
+    monkeypatch.setattr(telemetry_tracing, "_tracer", trace.NoOpTracerProvider().get_tracer("test"))
     turn = QueuedTurn(
         event_id=f"work-item-{uuid.uuid4()}-terminate-1",
         conversation_id=WIRE_CONVERSATION,
@@ -231,6 +241,19 @@ def allowlisted(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 
 @pytest.fixture
+def owner_lost_factory(
+    admitted: Any,  # noqa: F811
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Any:
+    # Both imported factory fixtures and runs_stream choose a private stream.
+    # Use the stream whose Valkey fixture registers teardown for these tests.
+    monkeypatch.setenv("RUNS_STREAM", runs_stream)
+    get_settings.cache_clear()
+    return admitted
+
+
+@pytest.fixture
 def reconciler_metrics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[InMemoryMetricReader]:
@@ -282,9 +305,7 @@ class _SessionTracker:
 
 
 class _TrackingSessionmaker:
-    def __init__(
-        self, inner: async_sessionmaker[AsyncSession], tracker: _SessionTracker
-    ) -> None:
+    def __init__(self, inner: async_sessionmaker[AsyncSession], tracker: _SessionTracker) -> None:
         self.inner = inner
         self.tracker = tracker
 
@@ -318,9 +339,7 @@ class _XaddSpy:
 
     async def xadd(self, *args: Any, **kwargs: Any) -> Any:
         current = self.tracker.current
-        self.in_transaction.append(
-            False if current is None else bool(current.in_transaction())
-        )
+        self.in_transaction.append(False if current is None else bool(current.in_transaction()))
         return await self.inner.xadd(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
@@ -349,10 +368,7 @@ async def _now(session: AsyncSession) -> datetime:
 async def _agent_with_channel(session: AsyncSession) -> uuid.UUID:
     agent_id = uuid.uuid4()
     await session.execute(
-        text(
-            "INSERT INTO curie.agents (id, name, repo_full_name) "
-            "VALUES (:id, :name, :repo)"
-        ),
+        text("INSERT INTO curie.agents (id, name, repo_full_name) VALUES (:id, :name, :repo)"),
         {
             "id": agent_id,
             "name": f"acme-bot-{agent_id.hex[:8]}",
@@ -390,18 +406,38 @@ def _facts(agent_id: uuid.UUID, **overrides: Any) -> SimpleNamespace:
 
 async def _request_row(session: AsyncSession, request_id: uuid.UUID) -> Any:
     return (
-        await session.execute(
-            text(
-                "SELECT r.status, r.terminal_cause, r.execution_attempts, "
-                "r.capacity_deferrals, r.dispatch_generation, "
-                "r.published_generation, r.wait_deadline, r.started_at, "
-                "r.terminate_published_at, r.objective, r.reply_kind, "
-                "r.reply_address, r.reply_conversation_id "
-                "FROM curie.execution_requests r WHERE r.id = :id"
-            ),
-            {"id": request_id},
+        (
+            await session.execute(
+                text(
+                    "SELECT r.status, r.terminal_cause, r.execution_attempts, "
+                    "r.capacity_deferrals, r.dispatch_generation, "
+                    "r.published_generation, r.wait_deadline, r.started_at, "
+                    "r.terminate_published_at, r.cancellation_requested_at, "
+                    "r.objective, r.reply_kind, "
+                    "r.reply_address, r.reply_conversation_id "
+                    "FROM curie.execution_requests r WHERE r.id = :id"
+                ),
+                {"id": request_id},
+            )
         )
-    ).mappings().one()
+        .mappings()
+        .one()
+    )
+
+
+async def _lapse_runtime_heartbeat(session: AsyncSession, request_id: uuid.UUID) -> None:
+    await session.execute(
+        text(
+            "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = :expiry "
+            "WHERE id = :id"
+        ),
+        {
+            "id": request_id,
+            "expiry": await _now(session)
+            - timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+        },
+    )
+    await session.commit()
 
 
 def _run(
@@ -418,9 +454,7 @@ def _run(
         maker = async_sessionmaker(engine, expire_on_commit=False)
         tracker = _SessionTracker()
         tracked = _TrackingSessionmaker(maker, tracker)
-        client = aioredis.Redis(
-            host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None
-        )
+        client = aioredis.Redis(host=VALKEY_HOST, port=VALKEY_PORT, password=VALKEY_PW or None)
         valkey: aioredis.Redis = _XaddSpy(client, tracker) if spy_xadd else client
         settings = get_settings()
         assert settings.runs_stream == stream
@@ -477,7 +511,7 @@ def test_run_once_creates_the_group_then_publishes_a_readable_execute_wake(
     assert payload["author"] == REQUESTER
 
 
-def test_status_comment_failure_still_publishes_a_readable_execute_wake(
+def test_run_once_never_calls_status_comments_and_publishes_a_readable_execute_wake(
     clean_db: None,
     allowlisted: None,
     valkey: redis.Redis,
@@ -485,7 +519,11 @@ def test_status_comment_failure_still_publishes_a_readable_execute_wake(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    attempted = False
+
     async def fail_status_comments(*_args: Any, **_kwargs: Any) -> None:
+        nonlocal attempted
+        attempted = True
         raise RuntimeError("injected status comment failure")
 
     monkeypatch.setattr(
@@ -521,12 +559,126 @@ def test_status_comment_failure_still_publishes_a_readable_execute_wake(
     assert payload["conversation_id"] == WIRE_CONVERSATION
     assert payload["text"] == OBJECTIVE
     assert payload["author"] == REQUESTER
-    assert any(
-        "sync_status_comments" in record.getMessage()
-        and record.exc_info is not None
-        and str(record.exc_info[1]) == "injected status comment failure"
+    assert not attempted
+    assert not any("sync_status_comments" in record.getMessage() for record in caplog.records)
+
+
+def test_status_comment_loop_recovers_after_failure_and_cancels_cleanly(
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    attempts = 0
+
+    async def steps(
+        _maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> None:
+        recovered = asyncio.Event()
+        original = reconciler._sync_status_comments
+
+        async def fail_once() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("injected status comment loop failure")
+            await original()
+            recovered.set()
+
+        monkeypatch.setattr(reconciler, "_sync_status_comments", fail_once)
+        loop = asyncio.create_task(reconciler.run_status_comments_forever())
+        try:
+            await asyncio.wait_for(recovered.wait(), 5)
+            assert attempts >= 2
+            assert not loop.done()
+        finally:
+            loop.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(loop, 2)
+
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_INTERVAL_SECONDS", "1")
+    get_settings.cache_clear()
+    try:
+        _run(steps, runs_stream)
+    finally:
+        get_settings.cache_clear()
+    failures = [
+        record
         for record in caplog.records
-    )
+        if record.exc_info is not None
+        and str(record.exc_info[1]) == "injected status comment loop failure"
+    ]
+    assert len(failures) == 1
+
+
+def test_lifespan_runs_status_sync_on_a_separate_task_and_cancels_both_loops(
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+) -> None:
+    client, github, sink = admitted
+    number = 9958
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "true")
+    monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_INTERVAL_SECONDS", "1")
+    get_settings.cache_clear()
+    app = create_app()
+
+    async def go() -> None:
+        entered, released = asyncio.Event(), asyncio.Event()
+        sink.get_barrier = (
+            f"/repos/{REPO}/issues/{number}",
+            asyncio.get_running_loop(),
+            entered,
+            released,
+        )
+        try:
+            async with app.router.lifespan_context(app):
+                await asyncio.wait_for(entered.wait(), 5)
+                dispatch = app.state.work_item_reconciler_task
+                status = app.state.work_item_status_comments_task
+                assert dispatch is not None and status is not None
+                assert dispatch is not status
+                assert not dispatch.done() and not status.done()
+
+                # The background dispatch loop may be the pass that publishes.
+                async def published_generation() -> Any:
+                    while True:
+                        async with app.state.sessionmaker() as session:
+                            published = await session.scalar(
+                                text(
+                                    "SELECT published_generation "
+                                    "FROM curie.execution_requests WHERE id = :id"
+                                ),
+                                {"id": request_id},
+                            )
+                        if published == 1:
+                            return published
+                        await asyncio.sleep(0.05)
+
+                # One shared 2 s deadline: dispatch must publish within 2 s
+                # while its sibling status sync is still awaiting GitHub.
+                async with asyncio.timeout(2):
+                    # The real dispatch pass must finish while its sibling awaits GitHub.
+                    await app.state.work_item_reconciler.run_once()
+                    published = await published_generation()
+                assert published == 1
+                assert not status.done()
+            assert dispatch.cancelled()
+            assert status.cancelled()
+            assert app.state.engine.pool.checkedout() == 0
+            assert app.state.liveness_engine.pool.checkedout() == 0
+        finally:
+            released.set()
+            sink.get_barrier = None
+
+    try:
+        client.portal.call(go)
+    finally:
+        get_settings.cache_clear()
 
 
 @pytest.mark.parametrize("failed_step", RECONCILER_STEPS)
@@ -678,12 +830,8 @@ def test_crash_between_xadd_and_fence_republishes_the_same_event_id(
             raise RuntimeError("injected fence failure")
         return await fence_published(*args, **kwargs)
 
-    monkeypatch.setattr(
-        "curie_api.workitem_dispatch.fence_published", fail_once
-    )
-    monkeypatch.setattr(
-        "curie_api.workitem_reconciler.fence_published", fail_once
-    )
+    monkeypatch.setattr("curie_api.workitem_dispatch.fence_published", fail_once)
+    monkeypatch.setattr("curie_api.workitem_reconciler.fence_published", fail_once)
 
     async def steps(
         maker: async_sessionmaker[AsyncSession],
@@ -753,9 +901,7 @@ def test_lost_xadd_leaves_the_row_due_for_the_next_pass(
 
     request_id = _run(steps, runs_stream)
     payloads = _payloads(valkey, runs_stream)
-    assert [payload["event_id"] for payload in payloads] == [
-        f"work-item-{request_id}-execute-1"
-    ]
+    assert [payload["event_id"] for payload in payloads] == [f"work-item-{request_id}-execute-1"]
 
 
 def test_expire_waiting_records_capacity_wait_expired(
@@ -836,12 +982,16 @@ def test_deadline_and_owner_lost_cancellation_are_requested(
                     "execution_attempts = 1, "
                     "runtime_owner = 'worker-a', "
                     "runtime_epoch = 1, "
-                    "runtime_heartbeat_expires_at = s.ts + interval '59 seconds', "
+                    "runtime_heartbeat_expires_at = :expired, "
                     "version = version + 1 "
                     "FROM (SELECT clock_timestamp() - interval '60 seconds' AS ts) s "
                     "WHERE e.id = :id"
                 ),
-                {"id": owner_facts.request_id},
+                {
+                    "id": owner_facts.request_id,
+                    "expired": await _now(session)
+                    - timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+                },
             )
             await session.commit()
             deadline_id = deadline_facts.request_id
@@ -860,6 +1010,358 @@ def test_deadline_and_owner_lost_cancellation_are_requested(
             ) == ("cancellation_requested", "owner_lost")
 
     _run(steps, runs_stream)
+
+
+@pytest.mark.parametrize("runtime_ttl_seconds", [15, 45])
+def test_owner_lost_waits_one_runtime_ttl_after_heartbeat_expiry(
+    clean_db: None,
+    allowlisted: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_ttl_seconds: int,
+) -> None:
+    monkeypatch.setenv("CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS", str(runtime_ttl_seconds))
+    get_settings.cache_clear()
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        async with maker() as session:
+            agent_id = await _agent_with_channel(session)
+            grace = _facts(agent_id)
+            lost = _facts(agent_id, github_issue_number=2574)
+            absent = _facts(agent_id, github_issue_number=2575)
+            now = await _now(session)
+            ttl = get_settings().work_item_runtime_ttl_seconds
+            assert ttl == runtime_ttl_seconds
+            for facts, owner, expiry in (
+                (grace, "worker-a", now - timedelta(seconds=5)),
+                (lost, "worker-a", now - timedelta(seconds=ttl + 5)),
+                (absent, None, now + timedelta(seconds=ttl)),
+            ):
+                await admit(session, facts)
+                started_at = now - timedelta(seconds=ttl + 10)
+                await session.execute(
+                    text(
+                        "UPDATE curie.execution_requests SET status = 'running', "
+                        "started_at = :started, execution_deadline = :deadline, "
+                        "execution_attempts = 1, runtime_owner = :owner, "
+                        "runtime_epoch = 1, runtime_heartbeat_expires_at = :expiry, "
+                        "version = version + 1 WHERE id = :id"
+                    ),
+                    {
+                        "id": facts.request_id,
+                        "started": started_at,
+                        "deadline": started_at + timedelta(seconds=1800),
+                        "owner": owner,
+                        "expiry": expiry,
+                    },
+                )
+            await session.commit()
+        await reconciler.run_once()
+        async with maker() as session:
+            grace_row = await _request_row(session, grace.request_id)
+            assert (grace_row.status, grace_row.terminal_cause) == ("running", None)
+            assert grace_row.terminate_published_at is None
+            for request_id in (lost.request_id, absent.request_id):
+                row = await _request_row(session, request_id)
+                assert (row.status, row.terminal_cause) == (
+                    "cancellation_requested",
+                    "owner_lost",
+                )
+                assert row.terminate_published_at is not None
+        return lost.request_id, absent.request_id
+
+    lost_id, absent_id = _run(steps, runs_stream)
+    assert {payload["event_id"] for payload in _payloads(valkey, runs_stream)} == {
+        f"work-item-{lost_id}-terminate",
+        f"work-item-{absent_id}-terminate",
+    }
+
+
+@pytest.mark.parametrize(
+    "publication_status", ["pending", "approved", "launching", "running", "succeeded"]
+)
+def test_owner_lost_skips_a_request_whose_publication_owns_its_terminus(
+    owner_lost_factory: Any,
+    valkey: redis.Redis,
+    runs_stream: str,
+    publication_status: str,
+) -> None:
+    client, github, sink = owner_lost_factory
+    sink.ci_script = [ci_pending()]
+    protected_number, neighbour_number = 9959, 9960
+    for number in (protected_number, neighbour_number):
+        _label(client, github, number)
+        _start_running(_request(number)["id"])
+    protected, neighbour = _request(protected_number), _request(neighbour_number)
+    _attach_publication(
+        protected["work_item_id"],
+        status=publication_status,
+        pr=77 if publication_status == "succeeded" else None,
+    )
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> None:
+        async with maker() as session:
+            for request in (protected, neighbour):
+                await _lapse_runtime_heartbeat(session, request["id"])
+        await reconciler.run_once()
+        async with maker() as session:
+            kept = await _request_row(session, protected["id"])
+            assert (kept.status, kept.terminal_cause) == ("running", None)
+            assert kept.cancellation_requested_at is None
+            assert kept.terminate_published_at is None
+            lost = await _request_row(session, neighbour["id"])
+            assert (lost.status, lost.terminal_cause) == (
+                "cancellation_requested",
+                "owner_lost",
+            )
+            assert lost.cancellation_requested_at is not None
+            assert lost.terminate_published_at is not None
+
+    _run(steps, runs_stream)
+    assert [payload["event_id"] for payload in _payloads(valkey, runs_stream)] == [
+        f"work-item-{neighbour['id']}-terminate"
+    ]
+
+
+@pytest.mark.parametrize(
+    "publication_status", ["pending", "approved", "launching", "running", "succeeded"]
+)
+def test_owner_lost_direct_cancellation_refuses_a_publication_owned_terminus(
+    owner_lost_factory: Any,
+    runs_stream: str,
+    publication_status: str,
+) -> None:
+    client, github, _sink = owner_lost_factory
+    number = 9961
+    _label(client, github, number)
+    request = _request(number)
+    _start_running(request["id"])
+    _attach_publication(
+        request["work_item_id"],
+        status=publication_status,
+        pr=77 if publication_status == "succeeded" else None,
+    )
+    request = _request(number)
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        _reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> None:
+        async with maker() as session:
+            await _lapse_runtime_heartbeat(session, request["id"])
+            result = await workitems.request_owner_lost_cancellation(
+                session,
+                work_item_id=request["work_item_id"],
+                request_id=request["id"],
+                expected_work_item_version=request["work_version"],
+                expected_request_version=request["version"],
+            )
+            assert isinstance(result, workitems.WorkItemConflict), result
+            assert result.code == "illegal_transition"
+            kept = await _request_row(session, request["id"])
+            assert (kept.status, kept.terminal_cause) == ("running", None)
+            assert kept.cancellation_requested_at is None
+
+    _run(steps, runs_stream)
+
+
+def test_owner_lost_guarded_update_refuses_a_publication_owned_terminus(
+    owner_lost_factory: Any,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, github, _sink = owner_lost_factory
+    number = 9962
+    _label(client, github, number)
+    request = _request(number)
+    _start_running(request["id"])
+    _attach_publication(request["work_item_id"], status="approved", pr=None)
+    request = _request(number)
+
+    async def not_awaiting(_session: AsyncSession, _request_id: uuid.UUID) -> bool:
+        return False
+
+    # Permit installing the new Python guard before the source change, so the
+    # regression fails on the UPDATE outcome rather than a missing attribute.
+    monkeypatch.setattr(workitems, "_awaits_publication", not_awaiting, raising=False)
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        _reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> None:
+        async with maker() as session:
+            await _lapse_runtime_heartbeat(session, request["id"])
+            result = await workitems.request_owner_lost_cancellation(
+                session,
+                work_item_id=request["work_item_id"],
+                request_id=request["id"],
+                expected_work_item_version=request["work_version"],
+                expected_request_version=request["version"],
+            )
+            assert isinstance(result, workitems.WorkItemConflict), result
+            assert result.code == "stale_version"
+            kept = await _request_row(session, request["id"])
+            assert (kept.status, kept.terminal_cause) == ("running", None)
+            assert kept.cancellation_requested_at is None
+
+    _run(steps, runs_stream)
+
+
+@pytest.mark.parametrize("publication_status", ["failed", "denied", "expired"])
+def test_owner_lost_direct_cancellation_allows_a_terminal_publication(
+    owner_lost_factory: Any,
+    runs_stream: str,
+    publication_status: str,
+) -> None:
+    client, github, _sink = owner_lost_factory
+    number = 9963
+    _label(client, github, number)
+    request = _request(number)
+    _start_running(request["id"])
+    _attach_publication(request["work_item_id"], status=publication_status, pr=None)
+    request = _request(number)
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        _reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> None:
+        async with maker() as session:
+            await _lapse_runtime_heartbeat(session, request["id"])
+            result = await workitems.request_owner_lost_cancellation(
+                session,
+                work_item_id=request["work_item_id"],
+                request_id=request["id"],
+                expected_work_item_version=request["work_version"],
+                expected_request_version=request["version"],
+            )
+            assert isinstance(result, workitems.WorkItemOutcome), result
+            assert result.request is not None
+            assert (result.request.status, result.request.terminal_cause) == (
+                "cancellation_requested",
+                "owner_lost",
+            )
+            lost = await _request_row(session, request["id"])
+            assert (lost.status, lost.terminal_cause) == (
+                "cancellation_requested",
+                "owner_lost",
+            )
+            assert lost.cancellation_requested_at is not None
+
+    _run(steps, runs_stream)
+
+
+@pytest.mark.parametrize(
+    ("publication_status", "cause"),
+    [
+        ("failed", "publication_failed"),
+        ("denied", "publication_denied"),
+        ("expired", "publication_expired"),
+    ],
+)
+def test_owner_lost_skips_then_settles_a_terminal_publication(
+    owner_lost_factory: Any,
+    valkey: redis.Redis,
+    runs_stream: str,
+    publication_status: str,
+    cause: str,
+) -> None:
+    client, github, _sink = owner_lost_factory
+    number = 9964
+    _label(client, github, number)
+    request = _request(number)
+    _start_running(request["id"])
+    _attach_publication(request["work_item_id"], status="approved", pr=None)
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> None:
+        async with maker() as session:
+            await _lapse_runtime_heartbeat(session, request["id"])
+        await reconciler.run_once()
+        async with maker() as session:
+            kept = await _request_row(session, request["id"])
+            assert (kept.status, kept.terminal_cause) == ("running", None)
+            assert kept.cancellation_requested_at is None
+            assert kept.terminate_published_at is None
+            await session.execute(
+                text(
+                    "UPDATE curie.publications SET status = :status, "
+                    "terminal_at = clock_timestamp() WHERE execution_request_id = :id"
+                ),
+                {"id": request["id"], "status": publication_status},
+            )
+            await session.commit()
+        await reconciler.run_once()
+        async with maker() as session:
+            settled = await _request_row(session, request["id"])
+            assert (settled.status, settled.terminal_cause) == ("failed", cause)
+            assert settled.cancellation_requested_at is None
+            assert settled.terminate_published_at is None
+
+    _run(steps, runs_stream)
+    assert _payloads(valkey, runs_stream) == []
+
+
+@pytest.mark.parametrize("publication_status", ["launching", "running"])
+def test_owner_lost_skips_then_completes_a_publication_through_the_ci_gate(
+    owner_lost_factory: Any,
+    valkey: redis.Redis,
+    runs_stream: str,
+    publication_status: str,
+) -> None:
+    client, github, sink = owner_lost_factory
+    number = 9965
+    _label(client, github, number)
+    request = _request(number)
+    _start_running(request["id"])
+    _attach_publication(request["work_item_id"], status=publication_status, pr=77)
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> None:
+        async with maker() as session:
+            await _lapse_runtime_heartbeat(session, request["id"])
+        await reconciler.run_once()
+        async with maker() as session:
+            kept = await _request_row(session, request["id"])
+            assert (kept.status, kept.terminal_cause) == ("running", None)
+            assert kept.cancellation_requested_at is None
+            assert kept.terminate_published_at is None
+            assert sink.ci_observations == []
+            await session.execute(
+                text(
+                    "UPDATE curie.publications SET status = 'succeeded', "
+                    "terminal_at = clock_timestamp() WHERE execution_request_id = :id"
+                ),
+                {"id": request["id"]},
+            )
+            await session.commit()
+        await reconciler.run_once()
+        async with maker() as session:
+            settled = await _request_row(session, request["id"])
+            assert (settled.status, settled.terminal_cause) == ("completed", "completed")
+            assert settled.cancellation_requested_at is None
+            assert settled.terminate_published_at is None
+
+    _run(steps, runs_stream)
+    assert sink.ci_observations == [HEAD_A]
+    assert _payloads(valkey, runs_stream) == []
 
 
 def test_terminate_wake_uses_the_sql_snapshot_without_an_agent_channel(
@@ -928,6 +1430,86 @@ def test_terminate_wake_uses_the_sql_snapshot_without_an_agent_channel(
     assert handle.get("placeholder") is None
     assert handle.get("endpoint") is None
     assert handle.get("adapter") is None
+
+
+def test_start_failed_request_gets_no_execute_wake_while_a_waiting_sibling_does(
+    clean_db: None,
+    allowlisted: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#4170: the fifth start deferral fails the request, so it is never re-woken."""
+
+    monkeypatch.setenv("CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS", "1")
+    monkeypatch.setenv("CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS", "1")
+    get_settings.cache_clear()
+
+    async def acquire_and_defer(
+        session: AsyncSession, request_id: uuid.UUID, *, reason: str, capacity: bool
+    ) -> None:
+        generation = await session.scalar(
+            text("SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id"),
+            {"id": request_id},
+        )
+        granted = await acquire(session, request_id, owner="worker-a", generation=generation)
+        assert getattr(granted, "code", None) is None, granted
+        deferred = await defer(
+            session,
+            request_id,
+            owner="worker-a",
+            generation=generation,
+            reason=reason,
+            capacity=capacity,
+        )
+        assert getattr(deferred, "code", None) is None, deferred
+
+    async def steps(
+        maker: async_sessionmaker[AsyncSession],
+        reconciler: WorkItemReconciler,
+        _client: aioredis.Redis,
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        async with maker() as session:
+            agent_id = await _agent_with_channel(session)
+            doomed = _facts(agent_id)
+            sibling = _facts(agent_id, github_issue_number=2574)
+            await admit(session, doomed)
+            await admit(session, sibling)
+            for _ in range(5):
+                await acquire_and_defer(
+                    session,
+                    doomed.request_id,
+                    reason="not_started:classified_failure",
+                    capacity=False,
+                )
+            await acquire_and_defer(session, sibling.request_id, reason="capacity", capacity=True)
+            row = await _request_row(session, doomed.request_id)
+            assert (row.status, row.terminal_cause) == ("failed", "start_failed")
+            due = await session.scalar(
+                text(
+                    "SELECT max(dispatch_not_before) FROM curie.execution_requests "
+                    "WHERE id IN (:doomed, :sibling)"
+                ),
+                {"doomed": doomed.request_id, "sibling": sibling.request_id},
+            )
+            assert due is not None
+            while await _now(session) < due:
+                await asyncio.sleep(0.05)
+            await session.commit()
+        await reconciler.run_once()
+        async with maker() as session:
+            row = await _request_row(session, doomed.request_id)
+            assert (row.status, row.terminal_cause) == ("failed", "start_failed")
+            assert row.published_generation is None
+            sibling_row = await _request_row(session, sibling.request_id)
+            assert sibling_row.status == "waiting"
+            assert sibling_row.published_generation == sibling_row.dispatch_generation == 2
+        return doomed.request_id, sibling.request_id
+
+    doomed_id, sibling_id = _run(steps, runs_stream)
+    event_ids = [payload["event_id"] for payload in _payloads(valkey, runs_stream)]
+    assert not [e for e in event_ids if e.startswith(f"work-item-{doomed_id}-execute")]
+    assert event_ids == [f"work-item-{sibling_id}-execute-2"]
 
 
 def test_suite_create_app_does_not_start_the_work_item_reconciler(client: Any) -> None:

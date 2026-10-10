@@ -11,6 +11,7 @@
 //! https://docs.github.com/en/rest/issues/labels
 //! https://docs.github.com/en/rest/repos/contents#get-repository-content
 //! https://docs.github.com/en/rest/commits/commits#get-a-commit
+//! https://docs.github.com/en/rest/users/users#get-a-user
 //!
 //! No live GitHub and no cluster. PEMs are generated at runtime with openssl
 //! so this file never carries key material.
@@ -179,6 +180,7 @@ struct Fixture {
     github: MockServer,
     secret_json: String,
     values: String,
+    api_prefix: &'static str,
 }
 
 fn path_only(req: &Request) -> &str {
@@ -202,6 +204,16 @@ impl Fixture {
     }
 
     fn with_toolchain(config: GithubConfig, toolchain: ToolchainFixture) -> Self {
+        Self::with_bot_lookup(config, toolchain, 200, r#"{"id":123}"#, "")
+    }
+
+    fn with_bot_lookup(
+        config: GithubConfig,
+        toolchain: ToolchainFixture,
+        bot_status: u16,
+        bot_body: &'static str,
+        api_prefix: &'static str,
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let shim_dir = dir.path().join("bin");
         std::fs::create_dir(&shim_dir).expect("create shim dir");
@@ -229,7 +241,24 @@ impl Fixture {
         let log = dir.path().join("invocations.log");
         let github = serve(move |req: &Request| {
             let auth = req.header("authorization").unwrap_or("").to_string();
-            let path = path_only(req);
+            let path = path_only(req).strip_prefix(api_prefix).unwrap_or("");
+            if path.starts_with("/users/") {
+                writeln!(
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log)
+                        .unwrap(),
+                    "github {}",
+                    req.path
+                )
+                .unwrap();
+                // GitHub's public user endpoint does not require auth:
+                // https://docs.github.com/en/rest/users/users#get-a-user
+                assert!(req.header("authorization").is_none());
+                assert_eq!(path, format!("/users/{SLUG}[bot]"));
+                return Response::json(bot_status, bot_body);
+            }
             if path.starts_with("/repos/acme/")
                 && (path.contains("/contents") || path.contains("/commits/"))
             {
@@ -330,11 +359,27 @@ impl Fixture {
             github,
             secret_json: String::new(),
             values: r#"{"api":{"environment":"dev"}}"#.to_string(),
+            api_prefix,
         }
     }
 
     fn installed() -> Self {
         Self::new(GithubConfig { installed: true })
+    }
+
+    fn record_existing_app(&mut self) {
+        self.values = serde_json::json!({
+            "api": {
+                "environment":"dev",
+                "githubAppId":APP_ID,
+                "githubAppExistingSecret":"curie-github-app",
+                "githubFactoryIntake":"poll",
+                "githubFactoryMention":SLUG,
+                "githubFactoryLabel":"curie-factory",
+                "githubRepoAllowlist":["acme/bot"],
+            }
+        })
+        .to_string();
     }
 
     fn path(&self, name: &str) -> String {
@@ -378,7 +423,10 @@ impl Fixture {
             .env("HOME", self.dir.path().join("home"))
             .env("KUBECONFIG", self.dir.path().join("kubeconfig"))
             .env_remove("CURIE_GITHUB_WEBHOOK_SECRET")
-            .env("CURIE_GITHUB_API_URL", &self.github.base_url)
+            .env(
+                "CURIE_GITHUB_API_URL",
+                format!("{}{}", self.github.base_url, self.api_prefix),
+            )
             .env("FAKE_VALUES", &self.values)
             .env("FAKE_SECRET_JSON", &self.secret_json)
             .env("SHIM_LOG", self.log_path())
@@ -448,10 +496,16 @@ fn assert_registration_params(url: &str) {
         "pull_requests=write",
         "checks=read",
         "statuses=write",
-        "actions=read",
+        // Failed-job reruns require Actions write permission:
+        // https://docs.github.com/en/rest/actions/workflow-runs#re-run-failed-jobs-from-a-workflow-run
+        "actions=write",
     ] {
         assert!(has(kv), "registration URL lacks {kv}: {url}");
     }
+    assert!(
+        !has("actions=read"),
+        "registration URL must not request Actions read-only access: {url}"
+    );
     assert!(
         !pairs.iter().any(|p| p.starts_with("events")),
         "registration URL must subscribe to no events: {url}"
@@ -480,6 +534,234 @@ fn strs(v: &[String]) -> Vec<&str> {
 }
 
 #[test]
+fn factory_app_bot_identity_is_resolved_before_helm_and_applied() {
+    for prefix in ["", "/api/v3"] {
+        let fx = Fixture::with_bot_lookup(
+            GithubConfig { installed: true },
+            ToolchainFixture::None,
+            200,
+            r#"{"id":123}"#,
+            prefix,
+        );
+        let output = fx.run(&strs(&happy_argv(&fx)));
+        assert!(output.status.success(), "{}", combined(&output));
+        let values: serde_json::Value = serde_json::from_str(&fx.values_file()).unwrap();
+        assert_eq!(
+            values.pointer("/worker/publication/gitUserName"),
+            Some(&serde_json::json!(format!("{SLUG}[bot]")))
+        );
+        assert_eq!(
+            values.pointer("/worker/publication/gitUserEmail"),
+            Some(&serde_json::json!(format!(
+                "123+{SLUG}[bot]@users.noreply.github.com"
+            )))
+        );
+        let log = fx.log();
+        assert!(
+            log.find("/users/").expect("bot lookup") < log.find("helm ").expect("helm call"),
+            "bot lookup must precede Helm: {log}"
+        );
+    }
+}
+
+#[test]
+fn factory_app_keeps_each_recorded_operator_publication_identity() {
+    for publication in [
+        serde_json::json!({"gitUserName":"Operator"}),
+        serde_json::json!({"gitUserEmail":"operator@example.com"}),
+        serde_json::json!({"gitUserName":"Operator","gitUserEmail":"operator@example.com"}),
+    ] {
+        let mut fx = Fixture::installed();
+        fx.values = serde_json::json!({
+            "api":{"environment":"dev"},
+            "worker":{"publication":publication},
+        })
+        .to_string();
+        let output = fx.run(&strs(&happy_argv(&fx)));
+        assert!(output.status.success(), "{}", combined(&output));
+        let values: serde_json::Value = serde_json::from_str(&fx.values_file()).unwrap();
+        assert!(
+            values.pointer("/worker/publication").is_none(),
+            "reuse-values must keep operator identity without either inferred field: {values}"
+        );
+    }
+}
+
+#[test]
+fn factory_app_keeps_numeric_and_empty_operator_publication_values() {
+    for publication in [
+        serde_json::json!({"gitUserName":123}),
+        serde_json::json!({"gitUserName":""}),
+        serde_json::json!({"gitUserEmail":""}),
+    ] {
+        let mut fx = Fixture::installed();
+        fx.values = serde_json::json!({
+            "api":{"environment":"dev"},
+            "worker":{"publication":publication},
+        })
+        .to_string();
+        let output = fx.run(&strs(&happy_argv(&fx)));
+        assert!(output.status.success(), "{}", combined(&output));
+        let values: serde_json::Value = serde_json::from_str(&fx.values_file()).unwrap();
+        assert!(
+            values.pointer("/worker/publication").is_none(),
+            "reuse-values must preserve every explicit operator value: {values}"
+        );
+    }
+}
+
+#[test]
+fn factory_app_bot_lookup_failure_exits_three_before_any_helm_call() {
+    for (status, body) in [
+        // An invalid HTTP status line exercises the transport error path.
+        (0, "{}"),
+        (404, r#"{"message":"Not Found"}"#),
+        (503, r#"{"message":"Unavailable"}"#),
+        (200, "not JSON"),
+        (200, r#"{"login":"acme[bot]"}"#),
+        (200, r#"{"id":"123"}"#),
+        (200, r#"{"id":-1}"#),
+    ] {
+        let fx = Fixture::with_bot_lookup(
+            GithubConfig { installed: true },
+            ToolchainFixture::None,
+            status,
+            body,
+            "",
+        );
+        let output = fx.run(&strs(&happy_argv(&fx)));
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(3), "{text}");
+        assert!(text.contains(&format!("/users/{SLUG}[bot]")), "{text}");
+        assert!(
+            text.contains("--set worker.publication.gitUserEmail="),
+            "{text}"
+        );
+        assert!(
+            !fx.log().lines().any(|line| line.starts_with("helm ")),
+            "{}",
+            fx.log()
+        );
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn factory_existing_app_mention_resolves_public_bot_identity_before_helm() {
+    let mut fx = Fixture::installed();
+    fx.record_existing_app();
+    let output = fx.run(&[
+        "cluster",
+        "factory",
+        "--mention",
+        SLUG,
+        "--intake",
+        "poll",
+        "--chart",
+        "charts/curie",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    let values: serde_json::Value = serde_json::from_str(&fx.values_file()).unwrap();
+    assert_eq!(
+        values.pointer("/worker/publication/gitUserName"),
+        Some(&serde_json::json!(format!("{SLUG}[bot]")))
+    );
+    assert_eq!(
+        values.pointer("/worker/publication/gitUserEmail"),
+        Some(&serde_json::json!(format!(
+            "123+{SLUG}[bot]@users.noreply.github.com"
+        )))
+    );
+    let log = fx.log();
+    assert!(
+        log.find("/users/").expect("bot lookup") < log.find("helm ").expect("helm call"),
+        "bot lookup must precede Helm: {log}"
+    );
+    let requests = fx.github.recorded();
+    assert_eq!(requests.len(), 1, "only the public user lookup is needed");
+    assert_eq!(requests[0].path, format!("/users/{SLUG}[bot]"));
+    assert!(requests[0].header("authorization").is_none());
+}
+
+#[test]
+fn factory_existing_app_mention_bot_lookup_failure_never_calls_helm() {
+    for (status, body) in [
+        (404, r#"{"message":"Not Found"}"#),
+        (503, r#"{"message":"Unavailable"}"#),
+        (200, r#"{"id":"123"}"#),
+    ] {
+        let mut fx = Fixture::with_bot_lookup(
+            GithubConfig { installed: true },
+            ToolchainFixture::None,
+            status,
+            body,
+            "",
+        );
+        fx.record_existing_app();
+        let output = fx.run(&[
+            "cluster",
+            "factory",
+            "--mention",
+            SLUG,
+            "--intake",
+            "poll",
+            "--chart",
+            "charts/curie",
+        ]);
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(3), "{text}");
+        assert!(text.contains(&format!("/users/{SLUG}[bot]")), "{text}");
+        assert!(
+            text.contains("--set worker.publication.gitUserEmail="),
+            "{text}"
+        );
+        assert!(
+            !fx.log().lines().any(|line| line.starts_with("helm ")),
+            "{}",
+            fx.log()
+        );
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn factory_existing_app_mention_keeps_recorded_operator_identity() {
+    for publication in [
+        serde_json::json!({"gitUserName":"Operator"}),
+        serde_json::json!({"gitUserEmail":"operator@example.com"}),
+        serde_json::json!({"gitUserName":123}),
+        serde_json::json!({"gitUserEmail":""}),
+    ] {
+        let mut fx = Fixture::installed();
+        fx.record_existing_app();
+        let mut recorded: serde_json::Value = serde_json::from_str(&fx.values).unwrap();
+        recorded["worker"] = serde_json::json!({"publication":publication});
+        fx.values = recorded.to_string();
+        let output = fx.run(&[
+            "cluster",
+            "factory",
+            "--mention",
+            SLUG,
+            "--intake",
+            "poll",
+            "--chart",
+            "charts/curie",
+        ]);
+        assert!(output.status.success(), "{}", combined(&output));
+        let values: serde_json::Value = serde_json::from_str(&fx.values_file()).unwrap();
+        assert!(
+            values.pointer("/worker/publication").is_none(),
+            "explicit operator identity must remain unchanged: {values}"
+        );
+        let log = fx.log();
+        assert!(
+            log.find("/users/").expect("bot lookup") < log.find("helm ").expect("helm call"),
+            "bot lookup must precede Helm even for overrides: {log}"
+        );
+    }
+}
+
+#[test]
 fn without_an_app_the_registration_link_is_printed_and_nothing_applied() {
     let fx = Fixture::installed();
     let output = fx.run(&["cluster", "factory", "--chart", "charts/curie"]);
@@ -487,6 +769,18 @@ fn without_an_app_the_registration_link_is_printed_and_nothing_applied() {
     assert_eq!(output.status.code(), Some(0), "output: {text}");
     let url = find_url(&text, "https://github.com/settings/apps/new");
     assert_registration_params(&url);
+    let actions: Vec<&str> = url
+        .split_once('?')
+        .map(|(_, query)| query)
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| pair.starts_with("actions="))
+        .collect();
+    assert_eq!(
+        actions,
+        ["actions=write"],
+        "registration URL must request Actions write exactly once: {url}"
+    );
     let lower = text.to_lowercase();
     for step in ["1.", "2.", "3.", "4."] {
         assert!(text.contains(step), "four numbered steps expected: {text}");

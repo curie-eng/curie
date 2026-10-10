@@ -18,7 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
-from .. import crud, factory_ci, factory_progress
+from .. import crud, factory_ci, factory_progress, workitems
 from ..auth import (
     require_api_key,
     require_internal_worker_token,
@@ -43,6 +43,7 @@ from ..publication_truth import (
     PRECHECK_TIMEOUT_SECONDS,
     PublicationPrecheckRefused,
     PublicationPrecheckUnavailable,
+    PublicationPullRequestNotAdopted,
     read_publication_authority,
     read_publication_metadata,
 )
@@ -99,6 +100,13 @@ async def mint_publication_context(
     settings = get_settings()
     try:
         async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):
+            await workitems.adopt_orphan_publication_lineage(
+                session,
+                deployment_id=data.deployment_id,
+                work_item_id=data.work_item_id,
+                execution_request_id=data.execution_request_id,
+                runtime_epoch=data.runtime_epoch,
+            )
             authority = await read_publication_authority(
                 session,
                 github_html_base=settings.github_html_base,
@@ -128,6 +136,12 @@ async def mint_publication_context(
                 raise PublicationPrecheckUnavailable
             if current != authority or int(current.execution_deadline.timestamp()) <= time.time():
                 raise PublicationPrecheckRefused
+    except PublicationPullRequestNotAdopted:
+        raise precheck_error(
+            409,
+            "pull_request_not_adopted",
+            "an earlier pull request on this issue could not be continued",
+        ) from None
     except PublicationPrecheckRefused:
         raise precheck_error(
             409, "invalid_context", "publication execution authority is no longer current"
@@ -398,9 +412,7 @@ async def create_publication(
                 )
             )
         ).all()
-        changed_paths = [
-            path for paths in prior_paths for path in paths
-        ] + data.changed_paths
+        changed_paths = [path for paths in prior_paths for path in paths] + data.changed_paths
         python_ci = factory_ci.python_ci_policy(settings, data.repo_full_name)
         unselected = factory_ci._unselected_python_path(changed_paths, python_ci)
         if unselected is not None:
@@ -434,8 +446,9 @@ async def create_publication(
                 )
             # A Python check can be declared under any id, so every stored check
             # counts: any failure refuses a Python change and any unavailable check
-            # stamps the unavailable disclosure. Only when nothing was unavailable
-            # does a missing ``python`` check stamp the not-declared pair.
+            # stamps the unavailable disclosure, which names each unavailable check
+            # in recorded order. Only when nothing was unavailable does a missing
+            # ``python`` check stamp the not-declared pair.
             if factory_progress.failed_verification(observations) is not None:
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
@@ -454,9 +467,18 @@ async def create_publication(
                 )
             )
             statements: tuple[str, ...] = ()
-            if any(observation.outcome == "unavailable" for observation in observations):
+            unavailable = [
+                observation for observation in observations if observation.outcome == "unavailable"
+            ]
+            if unavailable:
+                named = ", ".join(
+                    f"{observation.check} (delegated to {observation.delegated_to})"
+                    if observation.delegated_to
+                    else f"{observation.check}"
+                    for observation in unavailable
+                )
                 statements = (
-                    "In-sandbox verification was unavailable.",
+                    f"In-sandbox verification was unavailable for: {named}.",
                     pending_proof,
                 )
             elif factory_progress.python_verification(observations) is None:
@@ -685,9 +707,7 @@ async def advance_publication_lineage(
     return await _publication_lineage_out(session, lineage)
 
 
-async def _replay_held_review_feedback(
-    request: Request, lineage: ThreadPublicationLineage
-) -> None:
+async def _replay_held_review_feedback(request: Request, lineage: ThreadPublicationLineage) -> None:
     """Admit review feedback held while this lineage awaited identity (#2962).
 
     Best effort: the reconciler retries every pass, so a failure here only

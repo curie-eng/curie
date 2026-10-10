@@ -14,6 +14,7 @@ trap 'rm -rf "$WORK"' EXIT
 python3 - "$CHART" "$WORK" <<'PY'
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -117,7 +118,7 @@ def identity_env_names(output):
     return names
 
 
-def same_objects(label, left, right, ignore=()):
+def same_objects(label, left, right, ignore=(), *, is_upgrade):
     """Every deterministic object equal, and the random ones equal by key set."""
     a, b = documents(left), documents(right)
     assert a.keys() == b.keys(), f"{label}: object sets differ: {sorted(set(a) ^ set(b))}"
@@ -129,6 +130,32 @@ def same_objects(label, left, right, ignore=()):
                 f"{label}: {key} carries a different set of keys"
             )
             continue
+        if key == ("Job", "acme-curie-schema-migrate"):
+            # Offline upgrade renders mint one memoized identity per render.
+            # Validate its actual Secret binding, then normalize only this
+            # literal value; every other byte of the Job remains comparable.
+            for docs, job in ((a, a[key]), (b, b[key])):
+                containers = job["spec"]["template"]["spec"]["containers"]
+                migrate = [item for item in containers if item.get("name") == "schema-migrate"]
+                assert len(migrate) == 1, f"{label}: schema-migrate container is missing or ambiguous"
+                identities = named(migrate[0].get("env", []), "CURIE_INSTALLATION_ID")
+                if not is_upgrade:
+                    assert not identities, f"{label}: install migrate must omit pause installation identity"
+                    continue
+                assert len(identities) == 1, f"{label}: migrate installation identity is duplicated"
+                identity = identities[0]
+                assert set(identity) == {"name", "value"}, (
+                    f"{label}: migrate installation identity must be one literal value"
+                )
+                value = identity["value"]
+                assert isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9]{32}", value), (
+                    f"{label}: offline installation identity must be 32 alphanumeric characters"
+                )
+                secret = docs[("Secret", SECRET)]
+                assert value == (secret.get("stringData") or {}).get("installationId"), (
+                    f"{label}: migrate identity differs from its own managed Secret installationId"
+                )
+                identity["value"] = "validated-render-installation-id"
         assert a[key] == b[key], f"{label}: {key} differs from the reference render"
 
 
@@ -230,12 +257,12 @@ assert identity_env_names(byo) == []
 # --- S4: an empty or null list is the stock shape, fresh and on upgrade -----
 for label, identities in (("S4 empty", []), ("S4 null", None)):
     _, output = render({"dispatcher": {"slack": {**PLAIN["dispatcher"]["slack"], "identities": identities}}})
-    same_objects(label, plain, output)
+    same_objects(label, plain, output, is_upgrade=False)
 _, plain_upgrade = render(PLAIN, "--is-upgrade")
 _, empty_upgrade = render(
     {"dispatcher": {"slack": {**PLAIN["dispatcher"]["slack"], "identities": []}}}, "--is-upgrade"
 )
-same_objects("S4 upgrade", plain_upgrade, empty_upgrade)
+same_objects("S4 upgrade", plain_upgrade, empty_upgrade, is_upgrade=True)
 
 # --- T1: the block plus two listed identities -------------------------------
 _, block_only = render(slack(**BLOCK_REFS))
@@ -286,6 +313,7 @@ same_objects(
     "T1 everything else",
     block_only,
     two,
+    is_upgrade=False,
     ignore={("Deployment", "acme-curie-dispatcher"), ("Deployment", "acme-curie-worker"),
             ("Deployment", "acme-curie-api")},
 )

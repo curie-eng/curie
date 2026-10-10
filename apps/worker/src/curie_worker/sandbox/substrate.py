@@ -33,6 +33,7 @@ from typing import Any
 
 from aci_protocol import BootEnv
 from curie_telemetry import operation_span, record_metric
+from curie_telemetry.redact import redact_text
 from opentelemetry.trace import SpanKind, StatusCode
 
 from ..binding import (
@@ -46,6 +47,7 @@ from ..binding import (
 from ..workitem_dispatch import TerminationObservation
 from .affinity import AffinityStore
 from .docker import DockerSandboxClient
+from .k8s import KubernetesSandboxClient
 from .types import (
     AGENT_LABEL,
     MANAGED_BY_LABEL,
@@ -54,6 +56,7 @@ from .types import (
     TURN_PROGRESS_ELIGIBILITY_ENV,
     CapacityExhaustedError,
     ClaimTimeoutError,
+    KubeTransientError,
     NoRouteError,
     PressureScanResult,
     QuotaRejection,
@@ -112,6 +115,12 @@ logger = logging.getLogger(__name__)
 # drops the stale route and rebinds. Slow turn, not corruption.
 REAP_GRACE_MARGIN_SECONDS = 30.0
 _CONTROL_REQUEST_TIMEOUT_S = 5.0
+# After its first poll, a wait loop sends no further poll with less than this
+# left before its deadline: a sub-second request timeout cannot get an answer
+# from a loaded apiserver and only produces a misleading kube API error in place
+# of the real timeout (#4181). The first poll is exempt, so a claim budget an
+# operator configured below this floor still gets one look at the claim.
+_MIN_POLL_BUDGET_S = 0.5
 _GONE_READ_TIMEOUT_S = 1.0
 _POD_TERMINATION_TIMEOUT_S = 2.0
 
@@ -174,11 +183,23 @@ class SandboxSubstrate:
         self._affinity = affinity
         self._config = config
         self._boot_credential_revoker: Callable[[str, str], bool] | None = None
+        self._boot_credential_minter: Callable[[Mapping[str, str]], dict[str, str]] | None = None
 
     def set_boot_credential_revoker(self, revoker: Callable[[str, str], bool]) -> None:
         """Report a released boot credential. The kernel wires the API call."""
 
         self._boot_credential_revoker = revoker
+
+    def set_boot_credential_minter(
+        self, minter: Callable[[Mapping[str, str]], dict[str, str]]
+    ) -> None:
+        """Give each new claim its own boot credential. The kernel wires the signer.
+
+        A retry claims again from the env whose credential the failed claim
+        already released, and the API refuses a released credential.
+        """
+
+        self._boot_credential_minter = minter
 
     def _remember_claim_credential(self, claim_name: str, env: Mapping[str, str] | None) -> None:
         token = None
@@ -781,6 +802,72 @@ class SandboxSubstrate:
             raise error
         return released
 
+    def release_if_claim(self, thread_key: str, claim_name: str) -> bool:
+        """Release the thread's session only while its route names ``claim_name``.
+
+        A WorkItem run releases the claim it recorded, never whatever the
+        thread holds now (#4331). When the route is absent or names another
+        claim, nothing is deleted: no Kubernetes delete, no route delete, and
+        the call returns False. When it names ``claim_name``, the claim is
+        retired and the route dropped exactly as ``release`` does, and the call
+        returns True. The caller holds the cross-worker thread lock, which a
+        successor's claim also holds, so the read and the delete cannot
+        interleave with it.
+        """
+
+        started = time.monotonic()
+        released = False
+        current_claim: str | None = None
+        error: Exception | None = None
+        with operation_span(
+            "curie.sandbox.release",
+            kind=SpanKind.INTERNAL,
+            attributes={"service.name": "curie-worker", "operation": "release_if_claim"},
+        ) as span:
+            try:
+                record = self._affinity.get(thread_key)
+                current_claim = record.handle.claim_name if record is not None else None
+                if record is not None and current_claim == claim_name:
+                    self._retire_claim(
+                        claim_name,
+                        request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
+                        handle=record.handle,
+                    )
+                    self._affinity.delete_if_claim(thread_key, claim_name)
+                    released = True
+            except Exception as exc:
+                error = exc
+                if hasattr(span, "set_status"):
+                    span.set_status(StatusCode.ERROR)
+                span.add_event(
+                    "sandbox.release.failed",
+                    {"outcome": "failed", "error.class": type(exc).__name__},
+                )
+            else:
+                span.add_event(
+                    "sandbox.released",
+                    {"outcome": "released" if released else "fenced"},
+                )
+        if error is None and not released:
+            logger.info(
+                "sandbox release fenced: thread %s route names claim %s, run owns claim %s;"
+                " leaving the route",
+                thread_key,
+                current_claim,
+                claim_name,
+            )
+        outcome = "failed" if error is not None else ("released" if released else "fenced")
+        attributes = _sandbox_attributes("release", outcome)
+        record_metric("curie.sandbox.lifecycle", attributes=attributes)
+        record_metric(
+            "curie.sandbox.release.duration",
+            max(0.0, time.monotonic() - started),
+            attributes=attributes,
+        )
+        if error is not None:
+            raise error
+        return released
+
     def terminate_thread(
         self,
         thread_key: str,
@@ -1280,6 +1367,8 @@ class SandboxSubstrate:
                 derived = self._existing_agent_pool(config.warm_pool, agent_name)
                 if derived is not None:
                     pool = derived
+        if env is not None and self._boot_credential_minter is not None:
+            env = self._boot_credential_minter(env)
         self._remember_claim_credential(name, env)
         self._k8s.create_claim(
             name,
@@ -1387,16 +1476,27 @@ class SandboxSubstrate:
         last_ready_condition: tuple[str | None, str | None] | None = None
         consecutive_quota = 0
         last_unschedulable: str | None = None
+        last_pod_name = claim_name
         sleeps = _poll_sleeps(self._config)
-        while time.monotonic() < deadline:
-            claim = self._k8s.get_claim(
-                claim_name,
-                request_timeout_seconds=min(
-                    _CONTROL_REQUEST_TIMEOUT_S,
-                    max(0.001, deadline - time.monotonic()),
-                ),
-            )
+        polled = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (polled and remaining < _MIN_POLL_BUDGET_S):
+                break
+            polled = True
+            try:
+                claim = self._k8s.get_claim(
+                    claim_name,
+                    request_timeout_seconds=min(_CONTROL_REQUEST_TIMEOUT_S, remaining),
+                )
+            except KubeTransientError as exc:
+                # No observation this poll: the debounce and the last Ready
+                # condition stay as the last real read left them, so the final
+                # timeout still reports what the claim was actually waiting on.
+                logger.info("transient read of claim %s: %s", claim_name, exc)
+                claim = None
             if claim is not None:
+                last_pod_name = claim.sandbox_name or claim_name
                 last_quota_rejection = claim.quota_rejection
                 if claim.quota_rejection is not None:
                     consecutive_quota += 1
@@ -1439,6 +1539,15 @@ class SandboxSubstrate:
                 f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s; "
                 f"its pod is Unschedulable: {last_unschedulable}"
             )
+        if isinstance(self._k8s, KubernetesSandboxClient):
+            tail = self._k8s.pod_log_tail(last_pod_name, request_timeout_seconds=5.0)
+            if tail:
+                logger.warning(
+                    "runner log tail for claim %s pod %s:\n%s",
+                    claim_name,
+                    last_pod_name,
+                    redact_text(tail),
+                )
         raise ClaimTimeoutError(
             f"claim {claim_name} not bound within {self._config.claim_timeout_seconds}s; "
             f"{condition_detail}."
@@ -1446,14 +1555,20 @@ class SandboxSubstrate:
 
     def _await_service_fqdn(self, sandbox_name: str, deadline: float) -> SandboxView:
         sleeps = _poll_sleeps(self._config)
-        while time.monotonic() < deadline:
-            sandbox = self._k8s.get_sandbox(
-                sandbox_name,
-                request_timeout_seconds=min(
-                    _CONTROL_REQUEST_TIMEOUT_S,
-                    max(0.001, deadline - time.monotonic()),
-                ),
-            )
+        polled = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or (polled and remaining < _MIN_POLL_BUDGET_S):
+                break
+            polled = True
+            try:
+                sandbox = self._k8s.get_sandbox(
+                    sandbox_name,
+                    request_timeout_seconds=min(_CONTROL_REQUEST_TIMEOUT_S, remaining),
+                )
+            except KubeTransientError as exc:
+                logger.info("transient read of sandbox %s: %s", sandbox_name, exc)
+                sandbox = None
             if sandbox is not None and sandbox.service_fqdn:
                 return sandbox
             time.sleep(max(0.0, min(next(sleeps), deadline - time.monotonic())))

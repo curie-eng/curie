@@ -307,13 +307,13 @@
       "result": "OverridesOutput",
       "kind": "CliOutput",
       "schema": "overrides.schema.json",
-      "version": "2.0"
+      "version": "3.0"
     },
     {
       "result": "PreflightOutput",
       "kind": "CliOutput",
       "schema": "preflight.schema.json",
-      "version": "1.0"
+      "version": "2.0"
     },
     {
       "result": "PublicationPolicyOutput",

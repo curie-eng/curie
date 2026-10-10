@@ -40,9 +40,7 @@ async def test_recording_a_call_sends_its_arguments_and_a_dedupe_key() -> None:
     client, seen = _client(lambda _r: httpx.Response(201, json={"id": "a1", "status": "pending"}))
 
     async with client:
-        recorded = await ActionClient(
-            api_base_url="http://api", api_key="k", client=client
-        ).record(
+        recorded = await ActionClient(api_base_url="http://api", api_key="k", client=client).record(
             SideEffectFlag(
                 tool="scale_deployment",
                 call_id="toolu_01",
@@ -70,9 +68,7 @@ async def test_a_redelivered_record_is_not_an_error() -> None:
     client, _ = _client(lambda _r: httpx.Response(200, json={"id": "a1", "status": "pending"}))
 
     async with client:
-        recorded = await ActionClient(
-            api_base_url="http://api", api_key="k", client=client
-        ).record(
+        recorded = await ActionClient(api_base_url="http://api", api_key="k", client=client).record(
             SideEffectFlag(tool="t", call_id="c", arguments={}),
             event_id="e",
             conversation_id="C1",
@@ -171,9 +167,7 @@ async def test_a_redacted_snapshot_never_produces_an_undoable_action() -> None:
     async with client:
         await ActionClient(api_base_url="http://api", api_key="k", client=client).complete(
             "a1",
-            SideEffectFlag(
-                tool="set_env", call_id="c", failed=False, result=result, redacted=True
-            ),
+            SideEffectFlag(tool="set_env", call_id="c", failed=False, result=result, redacted=True),
         )
 
     body = seen[0]["body"]
@@ -202,4 +196,127 @@ async def test_a_refused_write_is_raised_not_swallowed() -> None:
                 event_id="e",
                 conversation_id="C1",
                 agent_id=None,
+                budget_s=0,
             )
+
+
+@pytest.fixture
+def retry_clock(monkeypatch):
+    from curie_worker import api_retry
+
+    class Clock:
+        now = 0.0
+        sleeps: list[float]
+
+        def __init__(self) -> None:
+            self.sleeps = []
+
+        def __call__(self) -> float:
+            return self.now
+
+        async def sleep(self, delay: float) -> None:
+            self.sleeps.append(delay)
+            self.now += delay
+
+    clock = Clock()
+    monkeypatch.setattr(api_retry, "_clock", clock)
+    monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
+    return clock
+
+
+# The replay contract is defined by routers/actions.py::create_action and complete_action.
+@pytest.mark.parametrize("operation", ["record", "complete"])
+async def test_ledger_transient_writes_replay_the_same_payload(operation, retry_clock) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if len(seen) == 1:
+            error = httpx.ConnectError if operation == "record" else httpx.ReadTimeout
+            raise error("API restarting", request=request)
+        if len(seen) == 2:
+            return httpx.Response(503)
+        return httpx.Response(
+            201 if operation == "record" else 200, json={"id": "a1", "status": "succeeded"}
+        )
+
+    client, seen = _client(handler)
+    async with client:
+        actions = ActionClient(api_base_url="http://api", api_key="k", client=client)
+        frame = SideEffectFlag(tool="deploy", call_id="call-1", arguments={"replicas": 2})
+        if operation == "record":
+            result = await actions.record(
+                frame, event_id="event-1", conversation_id="thread", agent_id=None
+            )
+            assert result.id == "a1"
+        else:
+            await actions.complete("a1", frame)
+    assert len(seen) == 3
+    assert all(request["body"] == seen[0]["body"] for request in seen)
+    if operation == "record":
+        assert [request["body"]["dedupe_key"] for request in seen] == ["event-1:call-1"] * 3
+    assert retry_clock.sleeps == [0.5, 1.0]
+
+
+@pytest.mark.parametrize("status", [400, 404, 409, 422])
+@pytest.mark.parametrize("operation", ["record", "complete"])
+async def test_ledger_refusals_are_never_retried(status, operation, retry_clock) -> None:
+    client, seen = _client(lambda _request: httpx.Response(status))
+    async with client:
+        actions = ActionClient(api_base_url="http://api", api_key="k", client=client)
+        frame = SideEffectFlag(tool="deploy", call_id="call-1")
+        with pytest.raises(ActionBackendError):
+            if operation == "record":
+                await actions.record(
+                    frame, event_id="event", conversation_id="thread", agent_id=None
+                )
+            else:
+                await actions.complete("a1", frame)
+    assert len(seen) == 1
+    assert retry_clock.sleeps == []
+
+
+async def test_ledger_transport_failure_exhausts_only_the_requested_window(retry_clock) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("API still absent", request=request)
+
+    client, seen = _client(handler)
+    async with client:
+        with pytest.raises(ActionBackendError):
+            await ActionClient(api_base_url="http://api", api_key="k", client=client).record(
+                SideEffectFlag(tool="deploy", call_id="call-1"),
+                event_id="event",
+                conversation_id="thread",
+                agent_id=None,
+                budget_s=3,
+            )
+    assert retry_clock.sleeps == [0.5, 1.0, 1.5]
+    assert sum(retry_clock.sleeps) == 3
+    assert retry_clock.now == 3
+    assert len(seen) == 4
+
+
+@pytest.mark.parametrize("operation", ["record", "complete"])
+async def test_ledger_empty_timeout_message_retains_the_exception_type(
+    operation, retry_clock
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("", request=request)
+
+    client, seen = _client(handler)
+    async with client:
+        actions = ActionClient(api_base_url="http://api", api_key="k", client=client)
+        frame = SideEffectFlag(tool="deploy", call_id="call-1")
+        with pytest.raises(ActionBackendError, match="ReadTimeout") as caught:
+            if operation == "record":
+                await actions.record(
+                    frame,
+                    event_id="event",
+                    conversation_id="thread",
+                    agent_id=None,
+                    budget_s=3,
+                )
+            else:
+                await actions.complete("a1", frame, budget_s=3)
+
+    assert isinstance(caught.value.__cause__, httpx.ReadTimeout)
+    assert str(caught.value.__cause__) == ""
+    assert retry_clock.sleeps == [0.5, 1.0, 1.5]
+    assert len(seen) == 4

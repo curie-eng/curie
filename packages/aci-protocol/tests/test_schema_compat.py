@@ -67,7 +67,7 @@ def test_reply_placeholders_are_required_nullable_strings() -> None:
 
 def test_publication_context_is_an_optional_event_field_with_required_contents() -> None:
     schema = build_schema()
-    assert schema["protocolVersion"] == "0.5.14"
+    assert schema["protocolVersion"] == "0.5.19"
 
     definitions = schema["$defs"]
     event = definitions["Event"]

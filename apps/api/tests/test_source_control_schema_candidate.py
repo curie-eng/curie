@@ -32,26 +32,27 @@ def test_candidate_requires_exact_ledger_schema(resource: str) -> None:
         if resource == "api"
         else catalog()["candidate"]
     )
-    assert window == {"schema_min": "0076", "schema_head": "0080"}
+    assert window == {"schema_min": "0076", "schema_head": "0093"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
-def test_new_candidate_release_fields_are_0122(field: str) -> None:
+def test_new_candidate_release_fields_are_0123(field: str) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     if field == "cargo":
         value = tomllib.loads((ROOT / "cli/Cargo.toml").read_text())["package"]["version"]
     else:
         chart = yaml.safe_load((ROOT / "charts/curie/Chart.yaml").read_text())
         value = chart["version" if field == "chart" else "appVersion"]
-    assert value == "0.12.2"
+    assert value == "0.12.3"
 
 
 def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     data = catalog()
     assert data["windows"].get("0.12.1") == {"schema_min": "0076", "schema_head": "0076"}
-    assert data["windows"].get("0.12.2") == {"schema_min": "0076", "schema_head": "0080"}
-    assert data["revisions"][-3:] == ["0076", "0079", "0080"]
+    assert data["windows"].get("0.12.2") == {"schema_min": "0076", "schema_head": "0081"}
+    assert data["windows"].get("0.12.3") == {"schema_min": "0076", "schema_head": "0093"}
+    assert data["revisions"][-5:] == ["0080", "0081", "0091", "0092", "0093"]
     assert (
         json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())["0076"]
         == "expand"
@@ -61,14 +62,14 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
 def test_every_prior_registered_window_is_exactly_preserved() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2."""
     # Published historical windows through 0.12.0 are pinned from spec-only2c638e50a.
-    # The unpublished 0.12.1 window is promoted to the current candidate for release.
+    # Subsequent release windows are explicit additions; historical windows stay fixed.
     expected = json.loads(
         (Path(__file__).parent / "fixtures/source_schema_prior_windows.json").read_text()
     )
     actual = catalog()["windows"]
     assert {name: actual[name] for name in expected} == expected
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
-    assert set(actual) - set(expected) <= {"0.12.1", "0.12.2"}
+    assert set(actual) - set(expected) <= {"0.12.1", "0.12.2", "0.12.3"}
 
 
 def test_0075_startup_refuses_without_migrating_then_0076_starts(

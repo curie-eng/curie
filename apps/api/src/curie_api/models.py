@@ -139,6 +139,9 @@ class Agent(Base):
     # the platform/worker default model applies. The value is passed straight
     # through to the runner, which resolves it against its configured provider.
     model: Mapped[str | None] = mapped_column(default=None)
+    # Per-agent reviewer model (#4120). NULL lets the runner choose the
+    # credential's default; a value becomes the SDK's Opus alias target.
+    reviewer_model: Mapped[str | None] = mapped_column(default=None)
     # Per-agent thinking depth (#1182, ADR-0098). Forwarded as CURIE_THINKING at
     # sandbox boot; NULL means the worker's CURIE_THINKING default applies, and
     # unset at both layers means the runner sends no thinking configuration and
@@ -778,7 +781,10 @@ class ExecutionRequest(Base):
             name="execution_requests_deadline_ck",
         ),
         CheckConstraint(
-            "((status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
+            "((status = 'failed' AND started_at IS NULL "
+            "AND execution_deadline IS NULL AND terminal_at IS NOT NULL "
+            "AND terminal_cause = 'start_failed' AND termination_observation IS NULL) "
+            "OR (status = 'queued' AND wait_deadline IS NULL AND started_at IS NULL "
             "AND execution_deadline IS NULL AND terminal_at IS NULL "
             "AND terminal_cause IS NULL AND termination_observation IS NULL) "
             "OR (status = 'waiting' AND wait_deadline IS NOT NULL AND started_at IS NULL "
@@ -840,6 +846,10 @@ class ExecutionRequest(Base):
         CheckConstraint(
             "capacity_deferrals >= 0",
             name="execution_requests_capacity_deferrals_ck",
+        ),
+        CheckConstraint(
+            "start_deferrals >= 0",
+            name="execution_requests_start_deferrals_ck",
         ),
         CheckConstraint(
             "dispatch_epoch >= 0",
@@ -943,6 +953,7 @@ class ExecutionRequest(Base):
         DateTime(timezone=True), default=None
     )
     capacity_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
+    start_deferrals: Mapped[int] = mapped_column(default=0, server_default="0")
     last_deferral_reason: Mapped[str | None] = mapped_column(Text, default=None)
     execution_attempts: Mapped[int] = mapped_column(default=0, server_default="0")
     runtime_owner: Mapped[str | None] = mapped_column(Text, default=None)
@@ -971,6 +982,8 @@ class ExecutionRequest(Base):
     reply_kind: Mapped[str | None] = mapped_column(Text, default=None)
     reply_address: Mapped[str | None] = mapped_column(Text, default=None)
     reply_conversation_id: Mapped[str | None] = mapped_column(Text, default=None)
+    # Admitted because its predecessor ended failed/owner_lost (ADR 0206).
+    owner_lost_retry: Mapped[bool] = mapped_column(default=False, server_default="false")
 
     work_item: Mapped[WorkItem] = relationship(back_populates="execution_requests")
 
@@ -1073,6 +1086,12 @@ class FactoryStatusComment(Base):
     detail: Mapped[str | None] = mapped_column(Text, default=None)
     attempts: Mapped[int] = mapped_column(default=0, server_default="0")
     scan_page: Mapped[int] = mapped_column(default=1, server_default="1")
+    sync_owner: Mapped[str | None] = mapped_column(Text, default=None)
+    sync_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+    # Set when the comment is invalidated while a sync holds the lease.
+    sync_invalidated: Mapped[bool] = mapped_column(default=False, server_default="false")
     posted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
     )

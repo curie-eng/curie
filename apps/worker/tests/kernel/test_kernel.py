@@ -7,6 +7,7 @@ scriptable in-process fake runner; only Slack and the model are faked.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import sys
 import threading
@@ -50,6 +51,7 @@ from curie_worker.sandbox import (
     RouteRecord,
     SandboxHandle,
 )
+from curie_worker.sandbox.types import SandboxTermination
 from curie_worker.workspace import (
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
@@ -115,7 +117,7 @@ class _HistoryBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-    **_: object,
+        **_: object,
     ) -> dict[str, str]:
         del kind, address
         return {
@@ -175,6 +177,11 @@ class _PressureAttachmentLane:
 
     def discard_prepared(self, **_kwargs: object) -> None:
         self.discard_calls += 1
+
+    def carry(self, thread_key: str, *, agent_id: str | None = None) -> dict[str, str]:
+        """No retained set: a text-only turn carries nothing (#4079)."""
+
+        return {}
 
 
 def _capture_pressure_outcomes(monkeypatch: pytest.MonkeyPatch) -> list[str]:
@@ -414,7 +421,7 @@ class _BuiltInCodingBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-    **_: object,
+        **_: object,
     ) -> dict[str, str]:
         return {}
 
@@ -1158,7 +1165,7 @@ def test_conflicting_runtime_repo_is_terminal_before_claim_or_model(
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return {"CURIE_RUNNER_TOKEN": "workspace-test-token"}
 
@@ -1293,7 +1300,7 @@ def test_workspace_capability_without_selection_keeps_fresh_thread_generic(
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -1458,6 +1465,9 @@ def test_late_workspace_selection_replaces_generic_sandbox_and_stays_sticky(
         (False, False, "idle-awaiting-input", True),
         (False, True, "awaiting-approval", True),
         (False, True, "idle-awaiting-input", False),
+        (True, True, "classified-failure", True),
+        (False, False, "classified-failure", True),
+        (False, True, "classified-failure", False),
     ],
 )
 def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe(
@@ -1513,6 +1523,8 @@ def test_late_workspace_selection_defers_without_steering_until_boundary_is_safe
     [
         pytest.param(SessionStatus.DONE, id="done"),
         pytest.param(SessionStatus.IDLE_AWAITING_INPUT, id="idle-awaiting-input"),
+        # #4188: a failed turn is never recorded, so durable replay is whole.
+        pytest.param(SessionStatus.CLASSIFIED_FAILURE, id="classified-failure"),
     ],
 )
 def test_workspace_handoff_boundary_accepts_completed_durable_status(
@@ -1951,7 +1963,7 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return {}
 
@@ -2021,7 +2033,7 @@ def _workspace_binding(
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return dict(boot_env_override or {"CURIE_RUNNER_TOKEN": "workspace-test-token"})
 
@@ -2600,6 +2612,9 @@ def test_active_file_turn_with_a_real_delivery_lease_settles_once(
                 self.resolve_calls += 1
                 raise AssertionError("an active file turn downloaded its attachment")
 
+            def carry(self, thread_key: str, *, agent_id: str | None = None) -> dict[str, str]:
+                return {}
+
         async with make_harness() as h:
             lane = AttachmentLane()
             h.kernel._attachments = lane  # type: ignore[attr-defined]
@@ -2747,6 +2762,20 @@ def test_finish_race_falls_back_to_a_fresh_turn(make_harness) -> None:
             id="empty-alone-is-retryable-runner-error",
         ),
         pytest.param(
+            [
+                ErrorEvent(
+                    message="model error: server_error: API Error: Connection refused "
+                    "(ECONNREFUSED)",
+                    classification="model-unreachable",
+                )
+            ],
+            [Final(text="recovered", status=DONE)],
+            "recovered",
+            # #4333: a model endpoint that could not be reached before any
+            # side effect is a transport failure a later attempt can pass.
+            id="model-unreachable-retries",
+        ),
+        pytest.param(
             # Mid-run drop: a delta streams, then the stream ends with no final.
             [TextDelta(text="partial")],
             [TextDelta(text="full"), Final(text="full done", status=DONE)],
@@ -2853,6 +2882,84 @@ def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> No
             assert "The node was low on memory." in finish["detail"]
             assert "Kubernetes pod terminated" in finish["detail"]
             assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+class _DropAfterSideEffectPersisted:
+    """A runner ``hold`` that drops the stream once the worker persisted the flag.
+
+    ``abort_after_frames`` can close the socket before the client reads the
+    buffered flag frame, and aiohttp then raises before yielding it. Raising
+    from the handler after the headers were sent aborts the chunked stream.
+    """
+
+    def __init__(self, redis: Any, key: str) -> None:
+        self._redis = redis
+        self._key = key
+
+    async def wait(self) -> None:
+        for _ in range(500):
+            if await self._redis.exists(self._key):
+                break
+            await asyncio.sleep(0.01)
+        raise ConnectionResetError("runner pod deleted")
+
+
+def test_deleted_pod_after_side_effect_escalates_as_sandbox_terminated(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SandboxTermination("Deleted")
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            h.runner.default_script = [SideEffectFlag(tool="deploy"), TextDelta(text="partial")]
+            h.runner.hold = _DropAfterSideEffectPersisted(
+                h.async_redis, h.config.side_effect_key(event.event_id)
+            )
+
+            await h.kernel.process_event(event)
+
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+
+            # ADR 0013: no automatic retry after a side effect, even though
+            # sandbox-terminated is otherwise retryable.
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            assert isinstance(finish["detail"], str)
+            assert "Kubernetes pod terminated: Deleted" in finish["detail"]
+            assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+def test_deleted_pod_without_side_effect_retries(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SandboxTermination("Deleted")
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT, ISSUE_PROMPT]
+            assert len(h.fake_k8s.termination_queries) == 2
 
     asyncio.run(go())
 
@@ -3026,6 +3133,69 @@ def test_side_effect_failure_escalates_without_retry(make_harness) -> None:
 
             assert h.runner.opened == ["do it"]  # exactly one attempt, no retry
             assert h.sink.last_text is not None and "human" in h.sink.last_text.lower()
+            assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_server_error_model_unreachable_split_server_error_not_retried(make_harness) -> None:
+    """#4333: only model-unreachable joined the retryable set, not server-error."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    ErrorEvent(
+                        message="model error: server_error: API Error: 500 Internal server error",
+                        classification="server-error",
+                    ),
+                    Final(text="failed", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            await h.kernel.process_event(qevent("go", event_id="evt-server-error-4333"))
+
+            assert h.runner.opened == ["go"]  # exactly one attempt, no retry
+            reply = h.sink.last_text
+            assert reply is not None
+            assert "(server-error) after 1 attempt(s)" in reply
+            assert "recovered" not in reply
+
+    asyncio.run(go())
+
+
+def test_model_unreachable_after_side_effect_escalates_without_retry(make_harness) -> None:
+    """ADR 0013: a retryable model-unreachable must not retry after a side effect."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    SideEffectFlag(tool="deploy"),
+                    ErrorEvent(
+                        message="model error: server_error: API Error: Connection refused "
+                        "(ECONNREFUSED)",
+                        classification="model-unreachable",
+                    ),
+                    Final(text="failed", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            ev = qevent("do it", event_id="evt-unreachable-side-effect")
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == ["do it"]  # exactly one attempt, no retry
+            reply = h.sink.last_text
+            assert reply is not None
+            assert reply.startswith("curie-turn-failure: model-unreachable\n")
+            assert (
+                "The run hit an error (model-unreachable) after starting an action; "
+                "not retrying automatically."
+            ) in reply
+            assert "ECONNREFUSED" in reply
+            assert "human" in reply.lower()
+            assert "recovered" not in reply
             assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
 
@@ -3464,7 +3634,7 @@ def test_quota_capacity_reclaims_oldest_idle_route_and_preserves_history(
             *,
             kind: str | None = None,
             address: str | None = None,
-        **_: object,
+            **_: object,
         ) -> dict[str, str]:
             return {
                 "CURIE_HISTORY_REF": f"https://api.example.com/state/transcript/{thread_key}",
@@ -3676,9 +3846,7 @@ def test_is_eval_thread_key_reads_the_isolate_prefix_from_the_scoped_key() -> No
     is_eval = kernel_module._is_eval_thread_key  # noqa: SLF001
 
     assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100"))
-    assert is_eval(
-        scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops")
-    )
+    assert is_eval(scoped_conversation_id("slack", "C1", "eval:1720000000.000100", identity="ops"))
     assert not is_eval(scoped_conversation_id("slack", "C1", "1720000000.000100"))
     assert not is_eval(scoped_conversation_id("slack", "C1", "eval-1720000000.000100"))
     assert not is_eval(scoped_conversation_id("slack", "eval:C1", "1720000000.000100"))
@@ -5295,7 +5463,7 @@ class _TokenBinding:
         *,
         kind: str | None = None,
         address: str | None = None,
-    **_: object,
+        **_: object,
     ) -> dict[str, str]:
         return {"CURIE_RUNNER_TOKEN": self._token}
 
@@ -5971,6 +6139,259 @@ _PRESSURE_LEASE_KNOBS: dict[str, object] = {
 }
 
 
+class _MarkerRetryClock:
+    """Inject arithmetic and sleeps locally; keep actual Valkey writes real."""
+
+    def __init__(self) -> None:
+        self.now = time.monotonic()
+        self.owner_task = asyncio.current_task()
+        self.delays: list[float] = []
+        self.after_sleep: Callable[[], None] | None = None
+
+    def monotonic(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:
+        if asyncio.current_task() is not self.owner_task:
+            await asyncio.sleep(delay)
+            return
+        self.delays.append(delay)
+        self.now += delay
+        if self.after_sleep is not None:
+            self.after_sleep()
+        # Yield real time so a separately scheduled liveness renewal can reach
+        # Valkey, without changing shared time or asyncio module functions.
+        await asyncio.sleep(0.01)
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            kernel_module, "time", SimpleNamespace(**{**vars(time), "monotonic": self.monotonic})
+        )
+        monkeypatch.setattr(
+            kernel_module, "asyncio", SimpleNamespace(**{**vars(asyncio), "sleep": self.sleep})
+        )
+
+
+async def _marker_retry_lease(h: Any, event_id: str) -> Any:
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    await h.async_redis.xgroup_create(
+        h.config.stream, h.config.consumer_group, id="0", mkstream=True
+    )
+    return await _leased_entry(
+        h, DeliveryLeaseStore(h.async_redis, h.config), event_id=event_id, generation=1
+    )
+
+
+def test_side_effect_marker_retries_exact_backoff_and_holds_action_until_durable(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            event = qevent("marker retry", event_id=uuid.uuid4().hex)
+            lease = await _marker_retry_lease(h, event.event_id)
+            clock = _MarkerRetryClock()
+            lease.local_deadline_monotonic = clock.now + 35.0
+            clock.install(monkeypatch)
+            real_marker = h.kernel._markers.mark_side_effect
+            real_action = h.kernel._record_action
+            writes = 0
+            actions = 0
+
+            async def failed_writes(event_id: str) -> None:
+                nonlocal writes
+                writes += 1
+                assert actions == 0, "the side-effect frame was applied before its marker"
+                if writes <= 5:
+                    raise redis.exceptions.ConnectionError("injected marker transport error")
+                await real_marker(event_id)
+
+            async def observed_action(*args: Any, **kwargs: Any) -> None:
+                nonlocal actions
+                assert await h.kernel._markers.saw_side_effect(event.event_id)
+                actions += 1
+                await real_action(*args, **kwargs)
+
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", failed_writes)
+            monkeypatch.setattr(h.kernel, "_record_action", observed_action)
+            token = kernel_module._DELIVERY_LEASE.set(lease)
+            try:
+                acc = kernel_module._StreamAccumulator()
+                await h.kernel._apply_frame(
+                    SideEffectFlag(tool="deploy", call_id="marker-retry"),
+                    acc,
+                    SimpleNamespace(),
+                    event,
+                )
+            finally:
+                kernel_module._DELIVERY_LEASE.reset(token)
+            assert clock.delays == [0.5, 1.0, 2.0, 4.0, 5.0]
+            assert writes == 6 and actions == 1
+            assert acc.saw_side_effect and acc.classification is None
+            assert not lease.lost.is_set()
+
+    asyncio.run(go())
+
+
+def test_marker_deadline_returns_ownership_store_unavailable_while_liveness_is_healthy(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real runner turn reaches the existing consume timeout outcome path."""
+
+    from curie_worker.consumer import Consumer
+    from curie_worker.delivery_lease import DeliveryLeaseStore
+
+    async def go() -> None:
+        async with make_harness(consumer_heartbeat_ttl_ms=150) as h:
+            event = qevent("marker deadline", event_id=uuid.uuid4().hex)
+            lease = await _marker_retry_lease(h, event.event_id)
+            consumer = Consumer(
+                redis=h.async_redis,
+                kernel=h.kernel,
+                config=h.config,
+                leases=DeliveryLeaseStore(h.async_redis, h.config),
+            )
+            await consumer._publish_liveness()
+            initial_liveness = consumer._last_liveness_renewal
+            liveness = asyncio.create_task(consumer._liveness_refresh_loop())
+            h.runner.default_script = [
+                SideEffectFlag(tool="deploy", call_id="held-marker"),
+                Final(text="must not apply", status=DONE),
+            ]
+            clock = _MarkerRetryClock()
+            started = clock.now
+            lease.local_deadline_monotonic = started + 35.0
+            clock.install(monkeypatch)
+            attempts: list[float] = []
+            actions: list[Any] = []
+
+            async def unavailable(_event_id: str) -> None:
+                attempts.append(clock.now - started)
+                raise redis.exceptions.ConnectionError("injected marker store outage")
+
+            async def forbidden_action(*args: Any, **_kwargs: Any) -> None:
+                actions.append(args)
+                raise AssertionError("an unmarked side-effect frame reached the action ledger")
+
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", unavailable)
+            monkeypatch.setattr(h.kernel, "_record_action", forbidden_action)
+            token = kernel_module._DELIVERY_LEASE.set(lease)
+            try:
+                outcome = await h.kernel._attempt(
+                    event,
+                    TargetRoute(),
+                    lambda: None,
+                    pressure_retried=False,
+                    workspace_inference=kernel_module._WorkspaceInferenceCarry(),
+                )
+                assert outcome.terminal_ok is False
+                assert outcome.classification == "ownership-store-unavailable"
+                assert outcome.saw_side_effect
+                assert "must not apply" not in outcome.text
+                assert kernel_module._display_error_classification(outcome.classification) == (
+                    "ownership-store-unavailable"
+                )
+                assert clock.delays == [0.5, 1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0, 5.0, 2.5]
+                assert attempts == [0.0, 0.5, 1.5, 3.5, 7.5, 12.5, 17.5, 22.5, 27.5, 32.5]
+                assert clock.now - started == 35.0
+                assert not actions
+                assert not await h.kernel._markers.saw_side_effect(event.event_id)
+                assert not liveness.done(), "marker exhaustion terminated healthy liveness"
+                assert consumer._last_liveness_renewal > initial_liveness
+                assert await consumer._liveness_store.is_alive(
+                    stream=h.config.stream,
+                    group=h.config.consumer_group,
+                    consumer=h.config.consumer_name,
+                )
+                assert not lease.lost.is_set()
+            finally:
+                kernel_module._DELIVERY_LEASE.reset(token)
+                liveness.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await liveness
+                await consumer._cleanup_alive()
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize("loss_point", ["retry", "confirmed-write"])
+def test_side_effect_marker_cannot_apply_a_frame_after_authority_is_lost(
+    make_harness, monkeypatch: pytest.MonkeyPatch, loss_point: str
+) -> None:
+    from curie_worker.delivery_lease import LeaseLostError
+
+    async def go() -> None:
+        async with make_harness() as h:
+            event = qevent("lost marker", event_id=uuid.uuid4().hex)
+            lease = await _marker_retry_lease(h, event.event_id)
+            clock = _MarkerRetryClock()
+            lease.local_deadline_monotonic = clock.now + 35.0
+            clock.install(monkeypatch)
+            real_marker = h.kernel._markers.mark_side_effect
+            attempts = 0
+            actions: list[Any] = []
+
+            async def lose_during_write(event_id: str) -> None:
+                nonlocal attempts
+                attempts += 1
+                if loss_point == "retry":
+                    raise redis.exceptions.ConnectionError("injected marker outage before refusal")
+                await real_marker(event_id)
+                lease.lost.set()
+
+            async def forbidden_action(*args: Any, **_kwargs: Any) -> None:
+                actions.append(args)
+
+            if loss_point == "retry":
+                clock.after_sleep = lease.lost.set
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", lose_during_write)
+            monkeypatch.setattr(h.kernel, "_record_action", forbidden_action)
+            token = kernel_module._DELIVERY_LEASE.set(lease)
+            try:
+                with pytest.raises(LeaseLostError):
+                    await h.kernel._apply_frame(
+                        SideEffectFlag(tool="deploy"),
+                        kernel_module._StreamAccumulator(),
+                        SimpleNamespace(),
+                        event,
+                    )
+            finally:
+                kernel_module._DELIVERY_LEASE.reset(token)
+            assert attempts == 1, "a lost owner attempted another marker write"
+            assert not actions
+            assert await h.kernel._markers.saw_side_effect(event.event_id) is (
+                loss_point == "confirmed-write"
+            )
+            assert clock.delays == ([0.5] if loss_point == "retry" else [])
+
+    asyncio.run(go())
+
+
+def test_unfenced_side_effect_marker_failure_propagates_without_retry(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def go() -> None:
+        async with make_harness() as h:
+            attempts = 0
+
+            async def unavailable(_event_id: str) -> None:
+                nonlocal attempts
+                attempts += 1
+                raise redis.exceptions.ConnectionError("injected unfenced marker outage")
+
+            monkeypatch.setattr(h.kernel._markers, "mark_side_effect", unavailable)
+            with pytest.raises(redis.exceptions.ConnectionError):
+                await h.kernel._apply_frame(
+                    SideEffectFlag(tool="deploy"),
+                    kernel_module._StreamAccumulator(),
+                    SimpleNamespace(),
+                    qevent("unfenced marker"),
+                )
+            assert attempts == 1
+
+    asyncio.run(go())
+
+
 async def _leased_entry(h: Any, store: Any, *, event_id: str, generation: int) -> Any:
     """A lease on a real PEL row, advanced to ``generation`` by re-acquisition.
 
@@ -6521,12 +6942,8 @@ def test_history_persistence_error_has_dedicated_factory_cause() -> None:
 
 
 def test_max_turns_and_unclassified_have_their_own_factory_causes() -> None:
-    max_turns = kernel_module.TurnOutcome(
-        terminal_ok=False, classification="max-turns"
-    )
-    unclassified = kernel_module.TurnOutcome(
-        terminal_ok=False, classification="unclassified"
-    )
+    max_turns = kernel_module.TurnOutcome(terminal_ok=False, classification="max-turns")
+    unclassified = kernel_module.TurnOutcome(terminal_ok=False, classification="unclassified")
 
     assert kernel_module._escalation_cause(max_turns) == "max_turns"
     assert kernel_module._escalation_cause(unclassified) == "unclassified"

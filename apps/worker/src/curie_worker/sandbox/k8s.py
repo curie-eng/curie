@@ -19,6 +19,7 @@ from typing import Any
 from aci_protocol import BootEnv
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
+from urllib3.exceptions import HTTPError as Urllib3HTTPError
 
 from ..attachments import ATTACHMENTS_REF_ENV
 from ..workspace import WORKSPACE_REF_ENV, WORKSPACE_SHA256_ENV
@@ -28,6 +29,7 @@ from .types import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
     ClaimView,
+    KubeTransientError,
     OperatingMode,
     QuotaRejection,
     SandboxTermination,
@@ -39,6 +41,9 @@ CORE_GROUP = "agents.x-k8s.io"
 CORE_VERSION = "v1beta1"
 EXT_GROUP = "extensions.agents.x-k8s.io"
 EXT_VERSION = "v1beta1"
+
+# Apiserver statuses a read may recover from on the next poll.
+_TRANSIENT_STATUSES = frozenset({500, 502, 503, 504})
 
 # Per-claim env with no containerName reaches only the FIRST main container (the
 # agent-sandbox Overrides policy). The bundle ref must additionally reach the
@@ -258,6 +263,10 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
     if phase == "Failed" and reason == "Evicted":
         return SandboxTermination("Evicted", _safe_pod_message(getattr(status, "message", None)))
 
+    # A graceful delete surfaces as a generic Error or Completed runner exit.
+    # On a deleting pod only OOMKilled outranks the deletion itself.
+    deleting = getattr(getattr(pod, "metadata", None), "deletion_timestamp", None) is not None
+    deleted_detail: str | None = None
     for container in getattr(status, "container_statuses", None) or []:
         if getattr(container, "name", None) != "runner":
             continue
@@ -266,6 +275,9 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
             continue
         exit_code = getattr(terminated, "exit_code", None)
         detail = f"exit code {exit_code}" if isinstance(exit_code, int) else None
+        if deleting and getattr(terminated, "reason", None) != "OOMKilled":
+            deleted_detail = detail
+            break
         return SandboxTermination(
             _safe_termination_reason(getattr(terminated, "reason", None)), detail
         )
@@ -284,6 +296,8 @@ def _pod_termination(pod: Any, *, since: datetime) -> SandboxTermination | None:
             detail = f"exit code {exit_code}" if isinstance(exit_code, int) else None
             return SandboxTermination("OOMKilled", detail)
 
+    if deleting:
+        return SandboxTermination("Deleted", deleted_detail)
     if phase in {"Failed", "Succeeded"}:
         return SandboxTermination(
             _safe_termination_reason(
@@ -516,9 +530,7 @@ class KubernetesSandboxClient:
             EXT_GROUP, EXT_VERSION, self._namespace, "sandboxclaims", body
         )
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         obj = self._get(
             EXT_GROUP,
             EXT_VERSION,
@@ -576,9 +588,7 @@ class KubernetesSandboxClient:
             raise
         return True
 
-    def get_sandbox(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> SandboxView | None:
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
         obj = self._get(
             CORE_GROUP,
             CORE_VERSION,
@@ -620,9 +630,7 @@ class KubernetesSandboxClient:
             status_used=getattr(status, "used", None),
         )
 
-    def pod_unschedulable(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> str | None:
+    def pod_unschedulable(self, name: str, *, request_timeout_seconds: float) -> str | None:
         try:
             pod = self._core_api.read_namespaced_pod(
                 name,
@@ -642,6 +650,46 @@ class KubernetesSandboxClient:
                 return message if isinstance(message, str) and message else "Unschedulable"
         return None
 
+    def pod_log_tail(self, name: str, *, request_timeout_seconds: float) -> str | None:
+        """Read the runner's last 8 KB, preferring its terminated instance."""
+
+        deadline = time.monotonic() + request_timeout_seconds
+        for previous in (True, False):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            response: Any = None
+            try:
+                response = self._core_api.read_namespaced_pod_log(
+                    name,
+                    self._namespace,
+                    container="runner",
+                    previous=previous,
+                    tail_lines=200,
+                    limit_bytes=8192,
+                    _preload_content=False,
+                    _request_timeout=remaining,
+                )
+                data = getattr(response, "data", response)
+                if isinstance(data, bytes):
+                    return data.decode("utf-8", errors="replace")
+                return str(data)
+            except k8s_client.ApiException as exc:
+                if previous and exc.status == 400:
+                    continue
+                return None
+            except Exception:  # noqa: BLE001 - diagnosis is best effort
+                return None
+            finally:
+                for method_name in ("close", "release_conn"):
+                    try:
+                        method = getattr(response, method_name, None)
+                        if callable(method):
+                            method()
+                    except Exception:  # noqa: BLE001 - response cleanup is best effort
+                        pass
+        return None
+
     def pod_termination(
         self, name: str, *, since: datetime, request_timeout_seconds: float
     ) -> SandboxTermination | None:
@@ -649,14 +697,26 @@ class KubernetesSandboxClient:
 
         deadline = time.monotonic() + request_timeout_seconds
         pod: Any = None
+        # A 404 is positive evidence the pod was deleted: the stream was
+        # established against it. A 403 or a timeout proves nothing.
+        pod_missing = False
         try:
             pod = self._core_api.read_namespaced_pod(
                 name,
                 self._namespace,
                 _request_timeout=max(0.001, deadline - time.monotonic()),
             )
+        except k8s_client.ApiException as exc:
+            pod_missing = exc.status == 404
         except Exception:  # noqa: BLE001 - diagnosis is best effort
             pass
+        # since is taken after the original pod was serving, and creation
+        # timestamps truncate to the second, so a pod created at or after it is
+        # a controller replacement. Its status and events describe another pod.
+        if pod is not None and _recent(
+            getattr(getattr(pod, "metadata", None), "creation_timestamp", None), since=since
+        ):
+            return SandboxTermination("Deleted", "replaced by a new pod with the same name")
         status_termination = _pod_termination(pod, since=since) if pod is not None else None
         pod_uid = getattr(getattr(pod, "metadata", None), "uid", None)
         event_termination: SandboxTermination | None = None
@@ -680,11 +740,11 @@ class KubernetesSandboxClient:
         }:
             return status_termination
         if event_termination is not None and (
-            event_termination.reason == "Evicted"
-            or pod is None
-            or status_termination is not None
+            event_termination.reason == "Evicted" or pod is None or status_termination is not None
         ):
             return event_termination
+        if pod_missing:
+            return SandboxTermination("Deleted")
         return status_termination
 
     def set_sandbox_mode(self, name: str, mode: OperatingMode) -> None:
@@ -720,5 +780,13 @@ class KubernetesSandboxClient:
         except k8s_client.ApiException as exc:
             if exc.status == 404:
                 return None
+            if exc.status in _TRANSIENT_STATUSES:
+                raise KubeTransientError(f"kube API {exc.status} reading {plural}/{name}") from exc
             raise
+        except Urllib3HTTPError as exc:
+            # With retries=0 a read timeout or dropped connection surfaces as a
+            # raw urllib3 error; typed here so it is a SandboxError (#4181).
+            raise KubeTransientError(
+                f"kube API transport error reading {plural}/{name}: {type(exc).__name__}"
+            ) from exc
         return dict(obj)

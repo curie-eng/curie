@@ -956,6 +956,10 @@ def test_unreachable_postgres_is_named_as_a_blocked_service(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     # #3873: an undelegated blocked service stops the run before the model.
+    # The runner collects held secrets from the actual process environment.
+    # Isolate this synthetic probe from a local stack password equal to the
+    # service name; the collision/redaction path is checked separately below.
+    monkeypatch.setenv("CURIE_LOCAL_POSTGRES_PASSWORD", "example-db-password")
     marker = tmp_path / "uv-arguments"
     bindir = _uv_on_path(
         tmp_path, marker, exit_status=1, error="connection refused at postgres:5432"
@@ -970,6 +974,31 @@ def test_unreachable_postgres_is_named_as_a_blocked_service(
     )
     assert _names(final.text, "python")
     assert _names(final.text, "postgres")
+    assert "connection refused" not in final.text
+    assert ":5432" not in final.text
+
+
+def test_blocked_postgres_classification_survives_service_name_secret_redaction(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    # A credential can equal a service label. Keep the structured preflight
+    # classification while refusing to disclose that value in assistant text.
+    monkeypatch.setenv("CURIE_LOCAL_POSTGRES_PASSWORD", "postgres")
+    marker = tmp_path / "uv-arguments"
+    bindir = _uv_on_path(
+        tmp_path, marker, exit_status=1, error="connection refused at postgres:5432"
+    )
+
+    booted, final = _blocked_first_turn(
+        tmp_path, monkeypatch, path=str(bindir), probe_marker=marker, model=_MODEL
+    )
+
+    assert booted.received[0][0] == _record(
+        outcome="unavailable", exit_status=None, blocked=["postgres"]
+    )
+    assert _names(final.text, "python")
+    assert "postgres" not in final.text
+    assert "[REDACTED:held_secret]" in final.text
     assert "connection refused" not in final.text
     assert ":5432" not in final.text
 

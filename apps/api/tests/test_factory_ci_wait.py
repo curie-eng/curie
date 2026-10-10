@@ -63,6 +63,7 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _reconcile_later,
     _request,
     _rows,
+    _set_base_ref,
     _start_running,
     admitted,
     check_run,
@@ -355,11 +356,27 @@ def _terminal(number: int) -> tuple[str, str | None]:
     return row["status"], row["terminal_cause"]
 
 
-def _finish(client: Any, request_id: uuid.UUID, epoch: int, cause: str) -> Any:
+def _finish(
+    client: Any, request_id: uuid.UUID, epoch: int, cause: str, ci_fix_round: int | None
+) -> Any:
     return client.post(
         f"/v1/internal/work-items/requests/{request_id}/finish",
         headers=WORKER,
-        json={"runtime_epoch": epoch, "outcome": "failed", "cause": cause},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": cause,
+            "ci_fix_round": ci_fix_round,
+        },
+    )
+
+
+def _request_version(request_id: uuid.UUID) -> int:
+    return int(
+        _rows(
+            "SELECT version FROM curie.execution_requests WHERE id = :id",
+            {"id": request_id},
+        )[0]["version"]
     )
 
 
@@ -457,6 +474,92 @@ def test_no_checks_within_the_grace_period_completes_with_a_note(admitted: Any) 
     assert body.startswith(f"Completed: {published['pr_url']}")
     assert "Note:" in body
     assert _ci_turns(published["id"]) == []
+
+
+def test_a_dirty_pull_without_checks_fails_promptly_without_a_ci_fix(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9761
+    sink.ci_script = [ci_empty()]
+    sink.pull_script = [{"mergeable": False, "mergeable_state": "dirty", "merged": False}]
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert _ci_turns(published["id"]) == []
+    _assert_no_final_result(sink)
+
+    _reconcile_later(130)
+
+    assert _terminal(number) == ("failed", "merge_conflict")
+    body = _body(sink, published["id"])
+    assert body.startswith("Could not complete: the pull request has merge conflicts")
+    assert "Reason: merge_conflict" in body
+    assert published["pr_url"] in body
+    assert "Details:" in body
+    assert "Provider message:" not in body
+    assert "Cause: merge_conflict" in body
+    assert _ci_turns(published["id"]) == []
+    assert sink.reruns == []
+
+
+def test_null_pull_mergeability_waits_for_the_third_clean_observation(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9762
+    sink.ci_script = [ci_empty()]
+    sink.pull_script = [
+        {"mergeable": None, "mergeable_state": "unknown", "merged": False},
+        {"mergeable": None, "mergeable_state": "unknown", "merged": False},
+        {"mergeable": True, "mergeable_state": "clean", "merged": False},
+    ]
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    assert sink.pull_observations == [published["pr"]]
+
+    _reconcile_later(130)
+
+    assert _terminal(number) == ("running", None)
+    assert sink.pull_observations == [published["pr"]] * 2
+    _assert_no_final_result(sink)
+    assert _ci_turns(published["id"]) == []
+
+    _reconcile_later(150)
+
+    assert _terminal(number) == ("completed", "completed")
+    assert sink.pull_observations == [published["pr"]] * 3
+    body = _body(sink, published["id"])
+    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert "Note: No CI checks appeared within 120 s." in body
+    assert _ci_turns(published["id"]) == []
+
+
+def test_persistently_null_pull_mergeability_ends_unverified_at_the_deadline(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9763
+    sink.ci_script = [ci_empty()]
+    sink.pull_script = [{"mergeable": None, "mergeable_state": "unknown", "merged": False}]
+    published = _published(client, github, sink, number)
+
+    _reconcile()
+
+    assert _terminal(number) == ("running", None)
+    _assert_no_final_result(sink)
+
+    _reconcile_later(1210)
+
+    assert _terminal(number) == ("failed", "ci_unverified")
+    body = _body(sink, published["id"])
+    assert "Reason: mergeability_unknown" in body
+    assert published["pr_url"] in body
+    assert "CI could not be verified" in body
+    assert "could not be read" not in body
+    assert _ci_turns(published["id"]) == []
+    assert sink.reruns == []
 
 
 # --- AC2: the fix loop, capped at 3 rounds ---------------------------------------
@@ -862,7 +965,7 @@ def test_an_unpublished_fix_turn_before_the_deadline_is_terminal(admitted: Any) 
     _reconcile()
     assert len(_ci_turns(published["id"])) == 1
 
-    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
 
     assert finished.status_code == 200, finished.text
     assert _terminal(number) == ("failed", "ci_fix_unpublished")
@@ -890,11 +993,110 @@ def test_an_unpublished_fix_turn_with_a_publication_in_flight_defers(
         status="pending",
     )
 
-    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
 
     assert finished.status_code == 409, finished.text
     assert "publication_pending" in finished.text
     assert _terminal(number) == ("running", None)
+
+
+def _two_publications(client: Any, github: Any, sink: _CommentServer, number: int) -> Any:
+    """Revisions 1 and 2 succeeded, the state a round 3 fix turn finishes against."""
+
+    sink.ci_scripts = {HEAD_A: [ci_failing()], HEAD_B: [ci_failing()]}
+    published = _published(client, github, sink, number)
+    _reconcile()
+    assert len(_ci_turns(published["id"])) == 1
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=2,
+        head_sha=HEAD_B,
+        title="Fix the test",
+        paths=["src/widget.txt"],
+        status="succeeded",
+    )
+    return published
+
+
+def test_a_final_round_unpublished_fix_turn_after_an_earlier_fix_publication_is_terminal(
+    admitted: Any,
+) -> None:
+    """Round 3 has no publication of its own, so revision 2 cannot settle it (#4330)."""
+
+    client, github, sink = admitted
+    number = 9770
+    published = _two_publications(client, github, sink, number)
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 3)
+
+    assert finished.status_code == 200, finished.text
+    assert _terminal(number) == ("failed", "ci_fix_unpublished")
+    _reconcile()
+    body = _body(sink, published["id"])
+    assert body.startswith("Could not complete:")
+    assert "without pushing a fix" in body.splitlines()[0]
+
+
+def test_an_unpublished_fix_turn_defers_when_its_own_round_published(admitted: Any) -> None:
+    """Revision 2 is round 2's own publication, so the CI gate decides, not the worker."""
+
+    client, github, sink = admitted
+    number = 9771
+    published = _two_publications(client, github, sink, number)
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    assert _terminal(number) == ("running", None)
+
+
+def test_a_final_round_unpublished_fix_turn_with_a_publication_in_flight_defers(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9772
+    published = _two_publications(client, github, sink, number)
+    _attach_fix(
+        published["work_item_id"],
+        published["id"],
+        revision=3,
+        head_sha=HEAD_C,
+        title="Fix the test again",
+        paths=["src/widget.txt"],
+        status="pending",
+    )
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 3)
+
+    assert finished.status_code == 409, finished.text
+    assert "publication_pending" in finished.text
+    assert _terminal(number) == ("running", None)
+
+
+@pytest.mark.parametrize(
+    ("cause", "ci_fix_round"),
+    [
+        ("ci_fix_unpublished", None),
+        ("ci_fix_unpublished", 1),
+        ("ci_fix_unpublished", 4),
+        ("no_pull_request", 2),
+    ],
+)
+def test_a_finish_with_an_invalid_ci_fix_round_is_rejected(
+    admitted: Any, cause: str, ci_fix_round: int | None
+) -> None:
+    client, github, sink = admitted
+    number = 9773
+    published = _two_publications(client, github, sink, number)
+    version = _request_version(published["id"])
+
+    finished = _finish(client, published["id"], _epoch(published["id"]), cause, ci_fix_round)
+
+    assert finished.status_code == 422, finished.text
+    assert _terminal(number) == ("running", None)
+    assert _request_version(published["id"]) == version
 
 
 def test_an_unpublished_fix_turn_past_the_deadline_expires_instead(admitted: Any) -> None:
@@ -908,7 +1110,9 @@ def test_an_unpublished_fix_turn_past_the_deadline_expires_instead(admitted: Any
     past = (row["execution_deadline"] - _database_now()).total_seconds() + 1
 
     with _clock_offset(past):
-        finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+        finished = _finish(
+            client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2
+        )
         assert finished.status_code == 409, finished.text
         _reconcile()
 
@@ -938,6 +1142,7 @@ def _racing_pass(count: int) -> None:
         reconcilers = [WorkItemReconciler(maker, c, get_settings()) for c in clients]
         try:
             await asyncio.gather(*(r.run_once() for r in reconcilers))
+            await asyncio.gather(*(r._sync_status_comments() for r in reconcilers))
         finally:
             for c in clients:
                 await c.aclose()
@@ -1208,7 +1413,7 @@ def test_unreadable_ci_ends_unverified_at_once(admitted: Any, entry: Any, reason
     assert _terminal(number) == ("failed", "ci_unverified")
     body = _body(sink, published["id"])
     assert body.startswith("Could not complete:")
-    assert "unverified" in body
+    assert "CI could not be verified" in body
     assert f"Reason: {reason}" in body
     assert "BODYTEXT" not in body
     assert "Completed:" not in body
@@ -1273,8 +1478,11 @@ def test_a_lapsed_heartbeat_does_not_lose_a_request_waiting_on_ci(admitted: Any)
     published = _published(client, github, sink, number)
     _execute(
         "UPDATE curie.execution_requests SET runtime_heartbeat_expires_at = "
-        "clock_timestamp() - interval '1 second' WHERE id = :id",
-        {"id": published["id"]},
+        "clock_timestamp() - CAST(:elapsed AS interval) WHERE id = :id",
+        {
+            "id": published["id"],
+            "elapsed": timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+        },
     )
 
     _reconcile()
@@ -1325,7 +1533,7 @@ def test_a_fix_turn_finishing_after_its_publication_succeeded_stays_running(
         status="succeeded",
     )
 
-    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished")
+    finished = _finish(client, published["id"], _epoch(published["id"]), "ci_fix_unpublished", 2)
 
     assert finished.status_code == 409, finished.text
     assert _terminal(number) == ("running", None)
@@ -1344,6 +1552,7 @@ def _passes_on_one_reconciler(count: int) -> None:
         try:
             for _ in range(count):
                 await reconciler.run_once()
+                await reconciler._sync_status_comments()
         finally:
             await valkey.aclose()
             await engine.dispose()
@@ -2322,3 +2531,62 @@ def test_managed_workspace_clones_the_tls_github_origin_through_real_api_and_sto
     finally:
         preparer.delete(prepared)
         assert list(workspace_objects.list_keys("")) == []
+
+
+# --- #4105: failures already failing on the base branch ---------------------------
+
+BASE_HEAD = "d4" * 20
+
+
+def _audit_failing() -> Any:
+    return ci_entry(
+        check_run("pip-audit", conclusion="failure", summary="multidict advisory"),
+        check_run("lint"),
+    )
+
+
+def test_an_unreadable_base_keeps_todays_fix_round(admitted: Any) -> None:
+    """AC4: a 502 on the base head's check runs counts every failure as caused."""
+
+    client, github, sink = admitted
+    number = 9760
+    sink.ci_scripts = {HEAD_A: [_audit_failing()], BASE_HEAD: [ci_entry(check_status=502)]}
+    sink.branches = {"main": BASE_HEAD}
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+    request_id = published["id"]
+
+    _reconcile()
+
+    # The base head was actually asked for, and its unreadable answer changed nothing.
+    assert ("GET", f"/repos/{REPO}/branches/main", None) in sink.requests
+    assert sink.ci_observations == [HEAD_A, BASE_HEAD]
+    assert _terminal(number) == ("running", None)
+    assert _terminal_notices(request_id) == []
+    _assert_no_final_result(sink)
+    turns = _ci_turns(request_id)
+    assert [t["event_id"] for t in turns] == [f"work-item-{request_id}-ci-2"]
+    assert turns[0]["text"].split("\n")[1] == (
+        f"Curie wait_ci round 2 of 3: the checks on {published['pr_url']} failed at {HEAD_A}."
+    )
+    assert "pip-audit" in turns[0]["text"]
+
+
+def test_a_failure_also_failing_on_the_base_completes_the_request(admitted: Any) -> None:
+    client, github, sink = admitted
+    number = 9761
+    sink.ci_scripts = {
+        HEAD_A: [_audit_failing()],
+        BASE_HEAD: [ci_entry(check_run("pip-audit", conclusion="failure"), check_run("lint"))],
+    }
+    sink.branches = {"main": BASE_HEAD}
+    published = _published(client, github, sink, number)
+    _set_base_ref(published["work_item_id"], "main")
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+    assert _ci_turns(published["id"]) == []
+    body = _body(sink, published["id"])
+    assert body.startswith(f"Completed: {published['pr_url']}")
+    assert "Note: Also failing on the base branch, not caused by this change: pip-audit" in body

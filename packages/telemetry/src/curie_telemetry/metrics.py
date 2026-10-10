@@ -34,6 +34,9 @@ _TURN_OUTCOMES: Final = [
     # and leaves the stream entry pending.
     "deadline_halted",
     "capacity_wait_expired",
+    # "stale_owner" (#4331): an abandoned WorkItem run whose turn reached an
+    # approval gate drops the delivery; the API termination owns its outcome.
+    "stale_owner",
 ]
 
 
@@ -161,6 +164,8 @@ _QUEUE_RETRY_ATTRIBUTES = {
     # cause; omitting it makes the retry metric reject the classification.
     # "sandbox-capacity" (#3693): an approval resume refused by the sandbox
     # ResourceQuota, retried under its own name.
+    # "model-unreachable" (#4333): a transport failure reaching the model
+    # endpoint, retried under its own name.
     "retry_class": [
         "redelivery",
         "rate-limit",
@@ -169,6 +174,7 @@ _QUEUE_RETRY_ATTRIBUTES = {
         "workspace-error",
         "sandbox-terminated",
         "sandbox-capacity",
+        "model-unreachable",
     ],
 }
 _THREAD_ATTRIBUTES = {
@@ -197,6 +203,8 @@ _SANDBOX_ATTRIBUTES = {
         "failed",
         "orphan-cleaned",
         "observed",
+        # A WorkItem release whose thread route names another claim (#4331).
+        "fenced",
         "terminated",
         "expiry-unsupported",
         "race-lost",
@@ -330,7 +338,6 @@ _HTTP_OPERATIONS = [
     "/health",
     "/ready",
     "/hooks/{agent_id}/{hook}",
-    "/hooks/{agent_id}/{hook}/support",
     "/langfuse/traces",
     "/langfuse/traces/{trace_id}",
     "/langfuse/traces/{trace_id}/eval-case",

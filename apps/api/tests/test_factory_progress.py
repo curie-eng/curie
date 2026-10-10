@@ -12,6 +12,7 @@ test_factory_terminus.py. Machine fixtures drive the events.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 import time
@@ -727,8 +728,9 @@ def test_malformed_verification_is_rejected_without_persisting_evidence(
     assert _reports(request_id) == []
 
 
-def test_duplicate_verification_does_not_replace_the_first_observation(
+def test_changed_verification_replay_keeps_the_first_observation_and_logs_both_outcomes(
     admitted: Any,  # noqa: F811
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     client, github, _sink = admitted
     number = 9715
@@ -752,10 +754,16 @@ def test_duplicate_verification_does_not_replace_the_first_observation(
     }
 
     first = verification(client, request_id, first_observation)
-    duplicate = verification(client, request_id, second_observation)
+    with caplog.at_level(logging.INFO, logger="curie_api.factory_progress"):
+        replay = verification(client, request_id, second_observation)
 
     assert first.status_code == 201, first.text
-    assert duplicate.status_code == 409, duplicate.text
+    assert replay.status_code == 201, replay.text
+    assert replay.json() == {
+        "recorded": True,
+        "request_id": str(request_id),
+        "replayed": True,
+    }
     assert _reports(request_id) == [
         {
             "phase": "verification_preflight",
@@ -763,6 +771,13 @@ def test_duplicate_verification_does_not_replace_the_first_observation(
             "loop_round": None,
         }
     ]
+    (record,) = [record for record in caplog.records if record.name == "curie_api.factory_progress"]
+    assert record.levelno == logging.INFO
+    message = record.getMessage()
+    assert str(request_id) in message
+    assert "check=python" in message
+    assert "stored_outcome=unavailable" in message
+    assert "replayed_outcome=passed" in message
 
 
 def _declared(check: str, command: str) -> dict[str, Any]:
@@ -778,6 +793,178 @@ def _declared(check: str, command: str) -> dict[str, Any]:
 
 def _note(observation: dict[str, Any]) -> str:
     return json.dumps(observation, sort_keys=True, separators=(",", ":"))
+
+
+@pytest.mark.parametrize(
+    "observation",
+    [_declared("python", PYTHON_COMMAND), NOT_DECLARED],
+    ids=["declared-check", "not-declared"],
+)
+def test_identical_verification_replay_returns_success_and_stores_one_observation(
+    admitted: Any,  # noqa: F811
+    observation: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, github, _sink = admitted
+    number = 9741
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+
+    first = verification(client, request_id, observation)
+    with caplog.at_level(logging.INFO, logger="curie_api.factory_progress"):
+        replay = verification(client, request_id, observation)
+
+    assert first.status_code == 201, first.text
+    assert first.json() == {"recorded": True, "request_id": str(request_id)}
+    assert replay.status_code == 201, replay.text
+    assert replay.json() == {
+        "recorded": True,
+        "request_id": str(request_id),
+        "replayed": True,
+    }
+    assert _reports(request_id) == [
+        {"phase": "verification_preflight", "note": _note(observation), "loop_round": None}
+    ]
+    assert not [record for record in caplog.records if record.name == "curie_api.factory_progress"]
+
+
+@pytest.mark.parametrize(
+    ("first_observation", "changes"),
+    [
+        (
+            {**_declared("python", PYTHON_COMMAND), "outcome": "failed", "exit_status": 1},
+            {"exit_status": 2},
+        ),
+        (
+            {
+                **_declared("python", PYTHON_COMMAND),
+                "outcome": "unavailable",
+                "exit_status": None,
+                "missing_binaries": ["uv"],
+            },
+            {"missing_binaries": ["git"]},
+        ),
+        (
+            {
+                **_declared("python", PYTHON_COMMAND),
+                "outcome": "unavailable",
+                "exit_status": None,
+                "missing_binaries": ["uv"],
+            },
+            {"blocked_services": ["postgres"]},
+        ),
+        (
+            {
+                **_declared("python", PYTHON_COMMAND),
+                "outcome": "unavailable",
+                "exit_status": None,
+                "missing_binaries": ["uv"],
+            },
+            {"delegated_to": "python-ci"},
+        ),
+    ],
+    ids=["exit-status", "missing-binary", "blocked-service", "delegated-to"],
+)
+def test_verification_replay_preserves_first_result_fields_and_logs_at_info(
+    admitted: Any,  # noqa: F811
+    first_observation: dict[str, Any],
+    changes: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, github, _sink = admitted
+    number = 9742
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    assert verification(client, request_id, first_observation).status_code == 201
+
+    with caplog.at_level(logging.INFO, logger="curie_api.factory_progress"):
+        replay = verification(client, request_id, {**first_observation, **changes})
+
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["recorded"] is True
+    assert replay.json()["replayed"] is True
+    assert _reports(request_id) == [
+        {
+            "phase": "verification_preflight",
+            "note": _note(first_observation),
+            "loop_round": None,
+        }
+    ]
+    (record,) = [record for record in caplog.records if record.name == "curie_api.factory_progress"]
+    assert record.levelno == logging.INFO
+    message = record.getMessage()
+    assert str(request_id) in message
+    assert "check=python" in message
+    assert f"stored_outcome={first_observation['outcome']}" in message
+    assert f"replayed_outcome={first_observation['outcome']}" in message
+
+
+def test_all_four_checks_can_replay_at_the_limit_but_a_fifth_check_conflicts(
+    admitted: Any,  # noqa: F811
+) -> None:
+    client, github, _sink = admitted
+    number = 9743
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    checks = [
+        _declared("python", PYTHON_COMMAND),
+        _declared("rust", "cargo test --locked"),
+        _declared("ui", "pnpm test"),
+        _declared("helm", "helm lint charts/curie"),
+    ]
+    for observation in checks:
+        response = verification(client, request_id, observation)
+        assert response.status_code == 201, response.text
+    for observation in checks:
+        replay = verification(client, request_id, observation)
+        assert replay.status_code == 201, replay.text
+        assert replay.json()["recorded"] is True
+        assert replay.json()["replayed"] is True
+
+    fifth = verification(client, request_id, _declared("docs", "bash scripts/check-docs.sh"))
+
+    assert fifth.status_code == 409, fifth.text
+    assert fifth.json()["code"] == "verification_exists"
+    assert _reports(request_id) == [
+        {"phase": "verification_preflight", "note": _note(observation), "loop_round": None}
+        for observation in checks
+    ]
+
+
+@pytest.mark.parametrize(
+    "notes",
+    [
+        ["unreadable"],
+        [json.dumps(_declared("python", PYTHON_COMMAND))],
+        [_note(_declared("python", PYTHON_COMMAND))] * 2,
+        [_note(NOT_DECLARED), _note(_declared("python", PYTHON_COMMAND))],
+        [_note(_declared(f"check_{index}", "make check")) for index in range(5)],
+    ],
+    ids=["malformed", "noncanonical", "duplicate-check", "mixed-not-declared", "over-limit"],
+)
+def test_unreadable_stored_verification_is_never_acknowledged_as_a_replay(
+    admitted: Any,  # noqa: F811
+    notes: list[str],
+) -> None:
+    from test_factory_status_comment import _execute
+
+    client, github, _sink = admitted
+    number = 9744
+    _label(client, github, number)
+    request_id = _request(number)["id"]
+    for note in notes:
+        _execute(
+            "INSERT INTO curie.execution_request_phase_reports "
+            "(execution_request_id, phase, note) VALUES (:id, 'verification_preflight', :note)",
+            {"id": request_id, "note": note},
+        )
+    stored = _reports(request_id)
+
+    response = verification(client, request_id, _declared("python", PYTHON_COMMAND))
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "verification_exists"
+    assert _reports(request_id) == stored
 
 
 def test_python_check_id_is_the_api_python_gate_key() -> None:
@@ -816,16 +1003,14 @@ def test_two_declared_checks_are_recorded_on_one_request(
         ),
         (_declared("python", PYTHON_COMMAND), NOT_DECLARED),
         (NOT_DECLARED, _declared("python", PYTHON_COMMAND)),
-        (NOT_DECLARED, NOT_DECLARED),
     ],
     ids=[
-        "duplicate-check-id",
+        "changed-command",
         "not-declared-after-a-check",
         "check-after-not-declared",
-        "second-not-declared",
     ],
 )
-def test_conflicting_second_verification_is_rejected_like_a_duplicate(
+def test_conflicting_second_verification_is_rejected_without_changing_the_first(
     admitted: Any,  # noqa: F811
     first_observation: dict[str, Any],
     second_observation: dict[str, Any],
@@ -1534,8 +1719,8 @@ PILLS = {
     "running": ("RUNNING", "#2f81f7", True),
     "cancellation_requested": ("STOPPING", "#bc4c00", True),
     "completed": ("SUCCEEDED", "#1a7f37", False),
-    "failed": ("FAILED", "#cf222e", False),
-    "expired": ("EXPIRED", "#953800", False),
+    "failed": ("NEEDS HUMAN", "#bf8700", False),
+    "expired": ("NEEDS HUMAN", "#bf8700", False),
     "cancelled": ("CANCELLED", "#6e7781", False),
 }
 
@@ -1548,6 +1733,11 @@ def test_every_constraint_status_has_its_pill(status: str) -> None:
 
 def test_a_running_request_that_is_publishing_shows_publishing() -> None:
     assert pill_for("running", True) == ("PUBLISHING", "#8250df", True)
+
+
+def test_a_retrying_failed_request_has_a_blue_non_live_pill() -> None:
+    assert pill_for("failed", False, retrying=True) == ("RETRYING", "#2f81f7", False)
+    assert pill_for("failed", False) == ("NEEDS HUMAN", "#bf8700", False)
 
 
 def test_an_unknown_status_shows_its_raw_value_in_grey() -> None:

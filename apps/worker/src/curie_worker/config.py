@@ -38,6 +38,7 @@ from aci_protocol.service_config import (
     warn_if_deprecated_api_url_env,
 )
 from aci_protocol.slack_identities import SLACK_IDENTITIES_ENV, SlackIdentities
+from curie_upgrade_pause import authoritative_key, legacy_key
 from pydantic import AliasChoices, BeforeValidator, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic_settings.sources import (
@@ -839,12 +840,12 @@ class WorkerConfig(BaseSettings):
     # ``read_block_ms`` to avoid probing peers during ordinary read blocking.
     dead_consumer_idle_ms: int = Field(default=15000, ge=0)
     # Independent stream-consumer liveness. A capable worker publishes the
-    # short alive lease before it reads and refreshes it throughout graceful
+    # 45-second alive lease before it reads and refreshes it throughout graceful
     # in-flight drain. A replacement requires two absent observations separated
     # by a full heartbeat TTL before prompt claim, so neither consumer idle nor
     # one transient Redis read can manufacture process death.
     consumer_heartbeat_ttl_ms: int = Field(
-        default=15000,
+        default=45000,
         gt=0,
         validation_alias="CURIE_CONSUMER_HEARTBEAT_TTL_MS",
     )
@@ -1155,6 +1156,10 @@ class WorkerConfig(BaseSettings):
     publication_protected_paths: PublicationProtectedPaths = Field(
         default=(),
         validation_alias="CURIE_PUBLICATION_PROTECTED_PATHS",
+    )
+    publication_allow_dependency_additions: bool = Field(
+        default=False,
+        validation_alias="CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS",
     )
 
     @field_validator("publication_protected_paths")
@@ -1473,14 +1478,7 @@ class WorkerConfig(BaseSettings):
         return f"{self.key_prefix}:progress:inbox:pending"
 
     def upgrade_quiesce_key(self) -> str:
-        # One authoritative "stop taking new work" marker per Helm installation
-        # (#2374), shared by every replica in that installation. Standalone and
-        # Compose deliberately have a blank installation ID and retain the
-        # legacy release-wide key. Every marker is written with a finite TTL.
-        legacy_key = self.upgrade_legacy_quiesce_key()
-        if not self.installation_id:
-            return legacy_key
-        return f"{legacy_key}:{self.installation_id}"
+        return authoritative_key(self.key_prefix, self.installation_id)
 
     def upgrade_drain_success_key(self) -> str:
         """The record that this revision's drain finished cleanly (#3360).
@@ -1498,7 +1496,7 @@ class WorkerConfig(BaseSettings):
     def upgrade_legacy_quiesce_key(self) -> str:
         """The pre-#2374 global key used only by standalone or the bridge."""
 
-        return f"{self.key_prefix}:upgrade:quiesce"
+        return legacy_key(self.key_prefix)
 
     def lock_key(self, thread_key: str) -> str:
         return f"{self.key_prefix}:lock:{thread_key}"

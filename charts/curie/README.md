@@ -351,6 +351,41 @@ are operator-configured collector exporters; installing Grafana, Loki, Tempo,
 Prometheus, or another retained backend is deliberately separate from this
 chart's OTLP write path.
 
+### Optional trace processors
+
+`otelCollector.extraProcessors` defines additional Collector processors by
+component ID. `otelCollector.extraTracePipelineProcessors` selects their IDs in
+execution order for the traces pipeline. Selected processors run after
+`memory_limiter` and before `batch`; with both values empty, the rendered
+Collector configuration and all three pipelines retain their existing defaults.
+An upgrade using `--reuse-values` from a release whose values predate these
+keys also treats the omitted keys as empty. An explicitly supplied non-map
+`extraProcessors` or non-list `extraTracePipelineProcessors` is rejected.
+For example, an operator can suppress routine spans before batching and export
+while retaining user, state, and action spans:
+
+```yaml
+otelCollector:
+  extraProcessors:
+    filter/routine_spans:
+      error_mode: ignore
+      traces:
+        span:
+          - 'IsMatch(name, "^(health|background)")'
+  extraTracePipelineProcessors: [filter/routine_spans]
+```
+
+The chart refuses an extra processor that replaces a built-in processor, a
+malformed component ID or non-map configuration, an undefined pipeline
+reference, a duplicate selected ID, or a selected built-in ID. The selection
+affects traces only; logs and metrics keep their existing processor order.
+The operator owns the filter expression and must validate it against the
+pinned Collector image and representative spans before applying it. On
+Collector contrib 0.119.0, `otelcol-contrib validate --config=...` accepted
+the example filter; an OTLP/HTTP input with `health.check`,
+`background.poll`, `user.message`, `state.update`, and `action.execute`
+produced exactly the final three spans at a detailed debug exporter.
+
 The SRE bot Prometheus overlay includes alerts for dead lettered messages,
 slow sandbox claims, refused capacity reclamation, and transcript persistence
 failures. It counts a counter's first observed sample so failures are visible
@@ -1083,23 +1118,38 @@ true`, gated also on `agentSandbox.controller.deploy` (also default true).
    crash-loops and no SandboxClaim ever binds. The Deployment has no
    readiness probe, so `rollout status` can pass while the manager still
    blocks on cache sync.
-2. Each poll checks current logs, pod restarts, and previous logs when available
-   before accepting a success signal. A forbidden-NetworkPolicy log, lost
-   leader-election lease, or pod restart fails the gate with its existing
-   cause-specific diagnostic.
-3. The Job passes when it observes "Starting workers" or a positive sum of
+2. Each poll first fails on a forbidden-NetworkPolicy line in the current
+   controller log.
+3. It then passes on a stable serving leader (issue #4197): the controller
+   Deployment has finished rolling out its current generation, the
+   leader-election Lease names a current Running, Ready, non-terminating
+   controller pod, the same holder has led for at least
+   `preflights.controllerReady.stableLeaderSeconds` (default 180, minimum 150),
+   and it renews the Lease while the hook watches. A manager whose informer
+   caches cannot sync exits after the 120s controller-runtime cache-sync
+   timeout and loses the lease, so a longer continuous term proves sync. This
+   is what lets an upgrade that does not restart the controller pass, even
+   when its startup log has rotated away, its metrics port is unreachable
+   from the control plane, or it restarted long before the upgrade. Both lease
+   timestamps come from the controller, so the hook node's clock does not
+   matter.
+4. Otherwise it checks pod restarts and previous logs. A lost leader-election
+   lease or a pod restart fails the gate with its existing cause-specific
+   diagnostic. A controller this upgrade restarted holds a fresh lease, so it
+   is judged here.
+5. The Job then passes when it observes "Starting workers" or a positive sum of
    `controller_runtime_reconcile_total` samples with `result="success"` from
    the current Running controller pod. It reads metrics on port 8080 through
    the Kubernetes pod proxy. Successful reconciles require synced informer
    caches, and their counter persists when the startup log rotates away.
    Failed metrics requests and zero successful reconciles keep polling within
    `preflights.controllerReady.timeoutSeconds` (default 180).
-4. An upgrade over a crash-looping controller may need a manual pod delete
+6. An upgrade over a crash-looping controller may need a manual pod delete
    plus `helm test`, because the hook waits for a healthy controller that
    never arrives.
-5. Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
+7. Skipped when `agentSandbox.controller.deploy: false` (BYO controller) or
    `preflights.controllerReady.enabled: false`.
-6. Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
+8. Read the verdict: `kubectl logs -n <ns> job/<release>-preflight-controller`.
 
 ## Single-node footprint (measured on a disposable single-node k3s cluster, 4 GB / 4 core)
 
@@ -1289,6 +1339,17 @@ and exfiltrate. BYO stores (`<store>.deploy: false`) are external and get no
 policy. Claim 5 of the security probe verifies it empirically (an app-labeled pod
 reaches each store while a non-app-labeled pod is blocked), which also catches a
 non-enforcing CNI.
+
+The Valkey allow-ingress policy also admits MCP connector pods so connector
+proxies can spend one-shot grants. Set
+`security.dataTierNetworkPolicy.allowMcpConnectorValkeyIngress: false` when
+those proxies do not need this release's in-chart Valkey. The default is
+`true`, preserving the current policy for fresh installs and older release
+values reused during upgrade. This removes only the MCP connector peer and its
+Valkey port rule; the release app peer, Valkey default-deny policy, and all
+other NetworkPolicies remain. The value must be a boolean. It does not replace
+caller-proxy preflight or the chart's NetworkPolicy verification. See
+[issue #4318](https://github.com/curie-eng/curie/issues/4318).
 
 **gVisor needs runsc on the node**, and `security.gvisor.mode` is a tri-state
 (default `auto`):
@@ -1744,6 +1805,20 @@ not a fork, so a `push` or `pull_request` workflow in that repository runs
 the changed files with the repository's Actions secrets before a person
 reviews the pull request. Keep those secrets in GitHub environments that
 require reviewers.
+
+The worker also refuses new third-party dependency names by default, including
+new transitive lockfile entries. It compares `pyproject.toml`, `uv.lock`,
+`Cargo.toml`, `Cargo.lock`, `package.json`, `pnpm-lock.yaml` and
+`package-lock.json` by basename at any repository depth after applying the patch
+to the base tree. Version changes to existing names are allowed. Path, workspace,
+editable, virtual and directory sources are ignored; Git sources count as
+third-party. A new file has an empty dependency set before the patch, and an
+in-scope file that cannot be parsed is refused. Set
+`worker.publication.allowDependencyAdditions: true` to allow additions across
+every publication in the install, including factory work and human-approved
+requests. The default is `false`, rendered as
+`CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS` on the worker. This opt-in keeps
+the `.github/` and `worker.publication.protectedPaths` refusals.
 
 One allowed root `https://github.com/owner/repository` URL in the initial
 message establishes the thread's selection and causes the worker to acquire its

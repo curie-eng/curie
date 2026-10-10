@@ -768,6 +768,22 @@
           ],
           "title": "Progress Url"
         },
+        "reviewer_model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "env": "CURIE_REVIEWER_MODEL",
+          "producer": [
+            "worker"
+          ],
+          "title": "Reviewer Model"
+        },
         "runner_token": {
           "anyOf": [
             {
@@ -1896,6 +1912,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.14",
-  "title": "ACI Protocol v0.5.14"
+  "protocolVersion": "0.5.19",
+  "title": "ACI Protocol v0.5.19"
 }

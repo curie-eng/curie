@@ -195,11 +195,25 @@ def _reduced_turn(user_text, assistant_texts):
 # The shape of a durable hook thread written before group capture: a sequential
 # turn, a turn whose second batch ran two calls at once, then a later turn.
 def _legacy_thread():
-    earlier = (_text("user", "acme first alert"), _call(1, None), _result(1),
-               _text("assistant", "acme first answer"))
-    ambiguous = (_text("user", "acme second alert"), _thinking(), _call(2, None), _result(2),
-                 _thinking(), _call(3, None), _call(4, None), _result(3), _result(4),
-                 _text("assistant", "acme second "), _text("assistant", "answer"))
+    earlier = (
+        _text("user", "acme first alert"),
+        _call(1, None),
+        _result(1),
+        _text("assistant", "acme first answer"),
+    )
+    ambiguous = (
+        _text("user", "acme second alert"),
+        _thinking(),
+        _call(2, None),
+        _result(2),
+        _thinking(),
+        _call(3, None),
+        _call(4, None),
+        _result(3),
+        _result(4),
+        _text("assistant", "acme second "),
+        _text("assistant", "answer"),
+    )
     later = (_text("user", "acme third alert"), _text("assistant", "acme third answer"))
     return earlier, ambiguous, later
 
@@ -874,3 +888,734 @@ def test_incomplete_current_prompt_native_cache_rebuilds_complete_portable_prefi
     assert [(m["role"], m["content"]) for m in conversation] == [
         (m.role, m.content) for m in messages
     ]
+
+
+# Issue #4336: a subagent's messages carry parent_tool_use_id. They are not the
+# parent conversation; only the parent's Agent call and its result are.
+THIRD = hashlib.sha256(b"msg_acme_third").hexdigest()
+FOURTH = hashlib.sha256(b"msg_acme_fourth").hexdigest()
+_NATIVE_IDS = {
+    GROUP: "msg_acme_example",
+    OTHER: "msg_acme_dependent",
+    THIRD: "msg_acme_third",
+    FOURTH: "msg_acme_fourth",
+}
+AGENT_ID = "call-acme-agent"
+AGENT_INPUT = {
+    "description": "acme survey",
+    "prompt": "acme nested prompt",
+    "subagent_type": "acme-explorer",
+}
+AGENT_RESULT = "acme subagent summary"
+
+
+def _agent_call_row(group=GROUP):
+    raw = {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": AGENT_ID, "name": "Agent", "input": AGENT_INPUT}],
+    }
+    if group is not None:
+        raw["assistant_group"] = group
+    return ConversationMessage.from_dict(raw)
+
+
+def _agent_result_row():
+    return ConversationMessage(
+        role="user",
+        content=[{"type": "tool_result", "tool_use_id": AGENT_ID, "content": AGENT_RESULT}],
+    )
+
+
+def _grouped(message, group):
+    raw = message.to_dict()
+    raw["assistant_group"] = group
+    return ConversationMessage.from_dict(raw)
+
+
+def _sdk_agent_call():
+    from claude_agent_sdk import AssistantMessage, ToolUseBlock
+
+    return AssistantMessage(
+        content=[ToolUseBlock(id=AGENT_ID, name="Agent", input=AGENT_INPUT)], model="acme-model"
+    )
+
+
+def _sdk_agent_result():
+    from claude_agent_sdk import ToolResultBlock, UserMessage
+
+    return UserMessage(content=[ToolResultBlock(tool_use_id=AGENT_ID, content=AGENT_RESULT)])
+
+
+def _sdk_subagent_messages():
+    """The subagent's prompt, its parallel Read and Glob, and their results."""
+
+    from claude_agent_sdk import (
+        AssistantMessage,
+        TextBlock,
+        ThinkingBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+
+    return [
+        UserMessage(content="acme nested prompt", parent_tool_use_id=AGENT_ID),
+        AssistantMessage(
+            content=[
+                ThinkingBlock(thinking="acme nested thought", signature="acme-nested-sig"),
+                ToolUseBlock(id="call-acme-read", name="Read", input={"file_path": "/tmp/acme"}),
+                ToolUseBlock(id="call-acme-glob", name="Glob", input={"pattern": "acme/*"}),
+            ],
+            model="acme-model",
+            parent_tool_use_id=AGENT_ID,
+        ),
+        UserMessage(
+            content=[ToolResultBlock(tool_use_id="call-acme-read", content="acme read result")],
+            parent_tool_use_id=AGENT_ID,
+        ),
+        UserMessage(
+            content=[ToolResultBlock(tool_use_id="call-acme-glob", content="acme glob result")],
+            parent_tool_use_id=AGENT_ID,
+        ),
+        AssistantMessage(
+            content=[TextBlock(text="acme nested answer")],
+            model="acme-model",
+            parent_tool_use_id=AGENT_ID,
+        ),
+    ]
+
+
+def _native_checkpoint(messages, system_prompt):
+    """An exact native correspondence the resume would otherwise prefer."""
+
+    entries = []
+    for index, message in enumerate(messages):
+        payload = message.to_dict()
+        payload.pop("assistant_group", None)
+        if message.assistant_group is not None:
+            payload["id"] = _NATIVE_IDS[message.assistant_group]
+        entries.append({"type": message.role, "uuid": f"acme-native-{index}", "message": payload})
+    entries.append(
+        {
+            "type": "attachment",
+            "attachment": {"type": "prompt_snapshot", "systemPrompt": [system_prompt]},
+        }
+    )
+    return HarnessReplayState(harness="claude", kind="checkpoint", entries=tuple(entries))
+
+
+def _warnings(caplog):
+    return [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_subagent_messages_are_not_portable_history():
+    from claude_agent_sdk import AssistantMessage, TextBlock, ThinkingBlock
+    from curie_runner.adapter import model_message_to_conversation
+
+    nested = [
+        *_sdk_subagent_messages(),
+        AssistantMessage(
+            content=[ThinkingBlock(thinking="acme nested only", signature="acme-sig")],
+            model="acme-model",
+            parent_tool_use_id=AGENT_ID,
+        ),
+        AssistantMessage(
+            content=[TextBlock(text="acme nested text only")],
+            model="acme-model",
+            parent_tool_use_id=AGENT_ID,
+        ),
+    ]
+    # The string prompt, the tool_use, both tool_results and text-only rows.
+    assert [model_message_to_conversation(message) for message in nested] == [None] * len(nested)
+    assert model_message_to_conversation(_sdk_agent_call()) == _agent_call_row(None)
+    assert model_message_to_conversation(_sdk_agent_result()) == _agent_result_row()
+
+
+def test_session_capture_keeps_only_the_parent_agent_call_and_result(monkeypatch):
+    from aci_protocol import Event
+    from claude_agent_sdk import AssistantMessage, TextBlock
+    from curie_runner import RunTracer, SideEffectClassifier, adapter
+    from curie_runner.adapter import ClaudeAgentSession, build_options
+    from curie_runner.history import _split_turns, is_tool_result_message
+    from curie_runner.session import SessionRunner
+
+    client = _ResponseClient(
+        [
+            [
+                _stream_start("msg_acme_example"),
+                _sdk_agent_call(),
+                *_sdk_subagent_messages(),
+                _sdk_agent_result(),
+                _stream_start("msg_acme_dependent"),
+                AssistantMessage(content=[TextBlock(text="acme final answer")], model="acme-model"),
+            ]
+        ]
+    )
+    monkeypatch.setattr(adapter, "ClaudeSDKClient", lambda _options: client)
+
+    class Store:
+        def __init__(self):
+            self.records = []
+
+        async def load(self):
+            return list(self.records)
+
+        async def append(self, record):
+            self.records.append(record)
+            return True
+
+    store = Store()
+    options = build_options(
+        plugins=[], model=None, system_prompt=None, resume=None, max_turns=2, max_budget_usd=1
+    )
+    runner = SessionRunner(
+        max_usd_per_day=None,
+        held_secrets=frozenset(),
+        session_factory=lambda: ClaudeAgentSession(options),
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="acme-subagent-capture",
+        history_store=store,
+    )
+
+    async def run():
+        await runner.start()
+        try:
+            _lines = [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text="acme request", user="U0EXAMPLE1", ts="1")
+                )
+            ]
+        finally:
+            await runner.close()
+
+    anyio.run(run)
+    (record,) = store.records
+    assert record.messages == (
+        ConversationMessage(role="user", content="acme request"),
+        _agent_call_row(GROUP),
+        _agent_result_row(),
+        _grouped(_text("assistant", "acme final answer"), OTHER),
+    )
+    assert [m for m in record.messages if m.role == "user" and not is_tool_result_message(m)] == [
+        ConversationMessage(role="user", content="acme request")
+    ]
+    assert len(_split_turns(record.messages)) == 1
+
+
+def test_overlap_across_turns_reduces_the_affected_turns_and_boots(tmp_path, caplog):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    prompt = "current acme prompt"
+    clean_first = (_text("user", "acme zero request"), _text("assistant", "acme zero answer"))
+    unanswered = (
+        _text("user", "acme first request"),
+        _grouped(_text("assistant", "acme looking"), GROUP),
+        _call(1, GROUP),
+    )
+    other_group = (
+        _text("user", "acme second request"),
+        _call(2, OTHER),
+        _result(2),
+        _text("assistant", "acme second answer"),
+    )
+    clean_last = (
+        _text("user", "acme third request"),
+        _call(3, THIRD),
+        _result(3),
+        _text("assistant", "acme third answer"),
+    )
+
+    # Control: the same checkpoint construction is preferred when nothing reduces.
+    clean = (*clean_first, *clean_last)
+    control = _entries(
+        clean, tmp_path, harness_replay=_native_checkpoint(clean, prompt), system_prompt=prompt
+    )
+    assert any(e["type"] == "attachment" for e in control)
+
+    messages = (*clean_first, *unanswered, *other_group, *clean_last)
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        entries = _entries(
+            messages,
+            tmp_path,
+            harness_replay=_native_checkpoint(messages, prompt),
+            system_prompt=prompt,
+        )
+    assert _rows(entries) == [
+        *[(m.role, m.content) for m in clean_first],
+        *_reduced_turn("acme first request", ["acme looking"]),
+        *_reduced_turn("acme second request", ["acme second answer"]),
+        *[(m.role, m.content) for m in clean_last],
+    ]
+    assert _tool_ids(entries) == {"call-acme-3"}
+    # The checkpoint describes rows this replay no longer carries.
+    assert all(e["type"] != "attachment" for e in entries)
+    assert [e["parentUuid"] for e in entries[1:]] == [e["uuid"] for e in entries[:-1]]
+    (warning,) = _warnings(caplog)
+    assert "session=acme-thread" in warning.getMessage()
+    assert "turns_reduced=2" in warning.getMessage()
+    assert "acme first" not in warning.getMessage()
+
+
+def _project_turn(sdk_messages, groups):
+    """Project SDK messages as SessionRunner records them, one group per assistant row."""
+
+    from curie_runner.adapter import model_message_to_conversation
+
+    groups = iter(groups)
+    rows = []
+    for message in sdk_messages:
+        projected = model_message_to_conversation(message)
+        if projected is None:
+            continue
+        if projected.role == "assistant":
+            projected = _grouped(projected, next(groups))
+        rows.append(projected)
+    return rows
+
+
+def test_subagent_turn_transcript_boots_structured_resume(tmp_path, caplog):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    from claude_agent_sdk import AssistantMessage, TextBlock, UserMessage
+
+    first = _project_turn(
+        [
+            UserMessage(content="acme first request"),
+            _sdk_agent_call(),
+            *_sdk_subagent_messages(),
+            _sdk_agent_result(),
+            AssistantMessage(content=[TextBlock(text="acme first answer")], model="acme-model"),
+        ],
+        # Only the top-level assistant rows consume a group once nested rows drop.
+        [GROUP, OTHER, THIRD, THIRD],
+    )
+    second = _project_turn(
+        [
+            UserMessage(content="acme second request"),
+            _assistant(9),
+            _sdk_result(9),
+            AssistantMessage(content=[TextBlock(text="acme second answer")], model="acme-model"),
+        ],
+        [FOURTH, None],
+    )
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        entries = _entries((*first, *second), tmp_path)
+    assert _rows(entries) == [
+        ("user", "acme first request"),
+        ("assistant", _agent_call_row().content),
+        ("user", _agent_result_row().content),
+        ("assistant", [{"type": "text", "text": "acme first answer"}]),
+        ("user", "acme second request"),
+        ("assistant", _call(9).content),
+        ("user", _sdk_result_row(9)),
+        ("assistant", [{"type": "text", "text": "acme second answer"}]),
+    ]
+    assert _tool_ids(entries) == {AGENT_ID, "call-acme-9"}
+    assert _warnings(caplog) == []
+
+
+def _sdk_result_row(number):
+    return [
+        {
+            "type": "tool_result",
+            "tool_use_id": f"call-acme-{number}",
+            "content": "acme exact result",
+            "is_error": False,
+        }
+    ]
+
+
+# The shape #4336 found stored: before the projection dropped subagent rows,
+# the nested prompt split the parent turn and nothing marks it as nested.
+def _stored_subagent_thread():
+    top = (_text("user", "acme top request"), _agent_call_row(GROUP))
+    nested = (
+        _text("user", "acme nested prompt"),
+        ConversationMessage.from_dict(
+            {
+                "role": "assistant",
+                "assistant_group": OTHER,
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call-acme-read",
+                        "name": "Read",
+                        "input": {"file_path": "/tmp/acme"},
+                    }
+                ],
+            }
+        ),
+        ConversationMessage.from_dict(
+            {
+                "role": "assistant",
+                "assistant_group": OTHER,
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "call-acme-glob",
+                        "name": "Glob",
+                        "input": {"pattern": "acme/*"},
+                    }
+                ],
+            }
+        ),
+        ConversationMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-acme-read",
+                    "content": "acme read result",
+                }
+            ],
+        ),
+        ConversationMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-acme-glob",
+                    "content": "acme glob result",
+                }
+            ],
+        ),
+        _agent_result_row(),
+        _grouped(_text("assistant", "acme top answer"), THIRD),
+    )
+    later = (
+        _text("user", "acme later request"),
+        _call(5, FOURTH),
+        _result(5),
+        _text("assistant", "acme later answer"),
+    )
+    return top, nested, later
+
+
+def test_stored_subagent_transcript_boots_with_reduced_replay(tmp_path, caplog):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    from curie_runner.history import UNREPLAYABLE_TOOL_ACTIVITY_TEXT
+
+    top, nested, later = _stored_subagent_thread()
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        entries = _entries((*top, *nested, *later), tmp_path)
+    assert _rows(entries) == [
+        *_reduced_turn("acme top request", [UNREPLAYABLE_TOOL_ACTIVITY_TEXT]),
+        *_reduced_turn("acme nested prompt", ["acme top answer"]),
+        *[(m.role, m.content) for m in later],
+    ]
+    assert _tool_ids(entries) == {"call-acme-5"}
+    assert [e["parentUuid"] for e in entries[1:]] == [e["uuid"] for e in entries[:-1]]
+    (warning,) = _warnings(caplog)
+    assert "session=acme-thread" in warning.getMessage()
+    assert "turns_reduced=2" in warning.getMessage()
+    assert "acme nested" not in warning.getMessage()
+
+
+def _parallel_agent_call_row(identifier):
+    return ConversationMessage.from_dict(
+        {
+            "role": "assistant",
+            "assistant_group": GROUP,
+            "content": [
+                {"type": "tool_use", "id": identifier, "name": "Agent", "input": AGENT_INPUT}
+            ],
+        }
+    )
+
+
+def _tool_result_row(identifier, text):
+    return ConversationMessage(
+        role="user",
+        content=[{"type": "tool_result", "tool_use_id": identifier, "content": text}],
+    )
+
+
+def _stored_parallel_agents_thread():
+    """Two parallel Agent calls stored in the old shape, then a clean later turn."""
+
+    from curie_runner.history import UNREPLAYABLE_TOOL_ACTIVITY_TEXT
+
+    nested_call = _call(7, OTHER)
+    second_nested_call = _call(8, THIRD)
+    later = (
+        _text("user", "acme later request"),
+        _call(5, FOURTH),
+        _result(5),
+        _text("assistant", "acme later answer"),
+    )
+    messages = (
+        _text("user", "acme top request"),
+        _parallel_agent_call_row("call-acme-agent-a"),
+        _parallel_agent_call_row("call-acme-agent-b"),
+        _text("user", "acme nested prompt a"),
+        nested_call,
+        _result(7),
+        _text("user", "acme nested prompt b"),
+        second_nested_call,
+        _result(8),
+        _tool_result_row("call-acme-agent-a", "acme summary a"),
+        _tool_result_row("call-acme-agent-b", "acme summary b"),
+        _text("assistant", "acme top answer"),
+        *later,
+    )
+    # The nested call overlaps both pending Agent calls, so the turn opening
+    # them and the first nested turn reduce; the second nested turn holds the
+    # results for those calls, so it reduces too. The later turn keeps its rows.
+    expected = [
+        *_reduced_turn("acme top request", [UNREPLAYABLE_TOOL_ACTIVITY_TEXT]),
+        *_reduced_turn("acme nested prompt a", [UNREPLAYABLE_TOOL_ACTIVITY_TEXT]),
+        *_reduced_turn("acme nested prompt b", ["acme top answer"]),
+        *[(m.role, m.content) for m in later],
+    ]
+    return messages, expected, {"call-acme-5"}
+
+
+def _answered_in_next_turn_thread():
+    """A turn answers one of two parallel calls; a later turn opens another group."""
+
+    from curie_runner.history import UNREPLAYABLE_TOOL_ACTIVITY_TEXT
+
+    messages = (
+        _text("user", "acme first request"),
+        _call(1, GROUP),
+        _call(2, GROUP),
+        _text("user", "acme second request"),
+        _result(1),
+        _text("assistant", "acme second answer"),
+        _text("user", "acme third request"),
+        _call(3, OTHER),
+        _result(3),
+        _text("assistant", "acme third answer"),
+    )
+    # Call 3 overlaps pending call 2, so the third turn and the first turn
+    # reduce; the second turn holds the result for call 1, so it reduces too.
+    expected = [
+        *_reduced_turn("acme first request", [UNREPLAYABLE_TOOL_ACTIVITY_TEXT]),
+        *_reduced_turn("acme second request", ["acme second answer"]),
+        *_reduced_turn("acme third request", ["acme third answer"]),
+    ]
+    return messages, expected, set()
+
+
+@pytest.mark.parametrize(
+    "thread",
+    [_stored_parallel_agents_thread, _answered_in_next_turn_thread],
+    ids=["parallel_agents", "answered_in_next_turn"],
+)
+def test_cross_turn_reduction_reduces_the_turn_holding_an_orphaned_result(tmp_path, caplog, thread):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    messages, expected, kept_tool_ids = thread()
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        entries = _entries(messages, tmp_path)
+    assert _rows(entries) == expected
+    assert _tool_ids(entries) == kept_tool_ids
+    assert [e["parentUuid"] for e in entries[1:]] == [e["uuid"] for e in entries[:-1]]
+    (warning,) = _warnings(caplog)
+    assert "turns_reduced=3" in warning.getMessage()
+
+
+def test_cross_turn_reduction_keeps_earlier_malformed_history_refused(tmp_path):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    from curie_runner.history import UnprovableAssistantGroupingError
+
+    messages = (
+        _text("user", "acme first request"),
+        _call(1, GROUP),
+        # A genuine user message is a causal boundary; reusing GROUP after it
+        # is malformed provenance that no reduction may launder away.
+        _text("user", "acme second request"),
+        _grouped(_text("assistant", "acme second answer"), GROUP),
+        _text("user", "acme third request"),
+        _call(2, OTHER),
+    )
+    with pytest.raises(HistoryError, match="reused after a causal boundary") as refused:
+        _entries(messages, tmp_path)
+    assert not isinstance(refused.value, UnprovableAssistantGroupingError)
+
+
+def test_unanswered_call_followed_by_text_only_turn_is_not_reduced(tmp_path, caplog):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    messages = (
+        _text("user", "acme first request"),
+        _grouped(_text("assistant", "acme looking"), GROUP),
+        _call(1, GROUP),
+        _text("user", "acme second request"),
+        _text("assistant", "acme second answer"),
+    )
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        entries = _entries(messages, tmp_path)
+    assert _rows(entries) == [(m.role, m.content) for m in messages]
+    assert _warnings(caplog) == []
+
+
+def test_later_turn_answering_an_earlier_call_is_not_reduced(tmp_path, caplog):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    messages = (
+        _text("user", "acme first request"),
+        _call(1, GROUP),
+        _text("user", "acme second request"),
+        _result(1),
+        _text("assistant", "acme second answer"),
+    )
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        entries = _entries(messages, tmp_path)
+    assert _rows(entries) == [(m.role, m.content) for m in messages]
+    assert _tool_ids(entries) == {"call-acme-1"}
+    assert _warnings(caplog) == []
+
+
+def test_cross_turn_reduction_is_idempotent():
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    from curie_runner.history import reduce_unprovable_overlap_turns
+
+    top, nested, later = _stored_subagent_thread()
+    reduced, count = reduce_unprovable_overlap_turns((*top, *nested, *later))
+    assert count == 2
+    again, recount = reduce_unprovable_overlap_turns(reduced)
+    assert again == reduced
+    assert recount == 0
+
+
+def _mixed_text_and_result_row(text, number):
+    return ConversationMessage(
+        role="user",
+        content=[
+            {"type": "text", "text": text},
+            {
+                "type": "tool_result",
+                "tool_use_id": f"call-acme-{number}",
+                "content": "acme result",
+                "is_error": False,
+            },
+        ],
+    )
+
+
+def test_result_before_its_call_stays_refused_when_the_call_turn_is_reduced(tmp_path):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    from curie_runner.history import UnprovableAssistantGroupingError
+
+    messages = (
+        _text("user", "acme first request"),
+        # A result for a call nothing earlier made is malformed history.
+        _result(1),
+        _text("assistant", "acme first answer"),
+        _text("user", "acme second request"),
+        # Calls 1 and 2 overlap in different groups, so this turn reduces;
+        # the earlier result must not be reduced away with it.
+        _call(1, GROUP),
+        _call(2, OTHER),
+    )
+    with pytest.raises(HistoryError, match="unmatched") as refused:
+        _entries(messages, tmp_path)
+    assert not isinstance(refused.value, UnprovableAssistantGroupingError)
+
+
+def test_mixed_text_and_result_row_does_not_keep_an_orphaned_result(tmp_path, caplog):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    later = (
+        _text("user", "acme third request"),
+        _call(4, THIRD),
+        _result(4),
+        _text("assistant", "acme third answer"),
+    )
+    messages = (
+        _text("user", "acme first request"),
+        _call(1, GROUP),
+        _call(2, GROUP),
+        # A row carrying a tool result is not a turn boundary even with text,
+        # so it and call 3 join the first turn, which then overlaps.
+        _mixed_text_and_result_row("acme second request", 1),
+        _call(3, OTHER),
+        _result(3),
+        _text("assistant", "acme second answer"),
+        *later,
+    )
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        entries = _entries(messages, tmp_path)
+    assert _rows(entries) == [
+        *_reduced_turn("acme first request", ["acme second answer"]),
+        *[(m.role, m.content) for m in later],
+    ]
+    assert _tool_ids(entries) == {"call-acme-4"}
+    assert [e["parentUuid"] for e in entries[1:]] == [e["uuid"] for e in entries[:-1]]
+    (warning,) = _warnings(caplog)
+    assert "turns_reduced=1" in warning.getMessage()
+
+
+def test_orphan_closure_follows_a_multi_hop_chain(tmp_path, caplog):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    from curie_runner.history import UNREPLAYABLE_TOOL_ACTIVITY_TEXT
+
+    clean = (
+        _text("user", "acme fifth request"),
+        _call(5, FOURTH),
+        _result(5),
+        _text("assistant", "acme fifth answer"),
+    )
+    messages = (
+        _text("user", "acme first request"),
+        _call(1, GROUP),
+        _call(2, GROUP),
+        # Call 3 overlaps the pending calls 1 and 2, so this turn and the
+        # first reduce across turns.
+        _text("user", "acme second request"),
+        _call(3, OTHER),
+        # Holds the result for reduced call 3, so it reduces, removing call 4.
+        _text("user", "acme third request"),
+        _result(3),
+        _call(4, THIRD),
+        _text("assistant", "acme third answer"),
+        # Holds the result for call 4, reduced only by the second hop.
+        _text("user", "acme fourth request"),
+        _result(4),
+        _text("assistant", "acme fourth answer"),
+        *clean,
+    )
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        entries = _entries(messages, tmp_path)
+    assert _rows(entries) == [
+        *_reduced_turn("acme first request", [UNREPLAYABLE_TOOL_ACTIVITY_TEXT]),
+        *_reduced_turn("acme second request", [UNREPLAYABLE_TOOL_ACTIVITY_TEXT]),
+        *_reduced_turn("acme third request", ["acme third answer"]),
+        *_reduced_turn("acme fourth request", ["acme fourth answer"]),
+        *[(m.role, m.content) for m in clean],
+    ]
+    assert _tool_ids(entries) == {"call-acme-5"}
+    assert [e["parentUuid"] for e in entries[1:]] == [e["uuid"] for e in entries[:-1]]
+    (warning,) = _warnings(caplog)
+    assert "turns_reduced=4" in warning.getMessage()
+
+
+def test_per_turn_reduction_reduces_the_later_turn_holding_its_result(tmp_path, caplog):
+    """@spec RUNNER-HISTORY-GROUP-4"""
+    from curie_runner.history import UNREPLAYABLE_TOOL_ACTIVITY_TEXT
+
+    clean = (
+        _text("user", "acme third request"),
+        _call(3, THIRD),
+        _result(3),
+        _text("assistant", "acme third answer"),
+    )
+    messages = (
+        _text("user", "acme first request"),
+        # Calls 1 and 2 overlap in different groups within one turn.
+        _call(1, GROUP),
+        _call(2, OTHER),
+        _text("user", "acme second request"),
+        _result(1),
+        _text("assistant", "acme second answer"),
+        *clean,
+    )
+    with caplog.at_level(logging.WARNING, logger="curie_runner.adapter"):
+        entries = _entries(messages, tmp_path)
+    assert _rows(entries) == [
+        *_reduced_turn("acme first request", [UNREPLAYABLE_TOOL_ACTIVITY_TEXT]),
+        *_reduced_turn("acme second request", ["acme second answer"]),
+        *[(m.role, m.content) for m in clean],
+    ]
+    assert _tool_ids(entries) == {"call-acme-3"}
+    assert [e["parentUuid"] for e in entries[1:]] == [e["uuid"] for e in entries[:-1]]
+    (warning,) = _warnings(caplog)
+    assert "turns_reduced=2" in warning.getMessage()

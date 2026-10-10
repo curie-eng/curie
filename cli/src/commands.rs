@@ -919,15 +919,24 @@ fn configure_source_hooks(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// One cheap workflow step selected by the preflight planner.
+/// One selected preflight gate, including its mirrored CI command when present.
 #[derive(Deserialize, Serialize)]
 pub struct PreflightCheck {
-    pub workflow: String,
-    pub job: String,
-    pub step: String,
-    pub command: String,
-    pub cwd: String,
-    pub group: String,
+    pub name: String,
+    pub status: String,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -937,14 +946,24 @@ pub struct PreflightFailure {
     pub exit_code: i32,
 }
 
-/// The planner's report is shared by dry runs and executed fast checks.
+#[derive(Deserialize, Serialize)]
+pub struct PreflightBase {
+    #[serde(rename = "ref")]
+    pub reference: String,
+    pub contains_tip: bool,
+    pub failing_required_checks: Vec<String>,
+}
+
+/// The source-owned report is shared by both tiers and their dry runs.
 #[derive(Deserialize, Serialize)]
 pub struct PreflightOutput {
     pub checks: Vec<PreflightCheck>,
     pub failures: Vec<PreflightFailure>,
     pub passed: bool,
     pub dry_run: bool,
-    pub base: String,
+    pub tier: String,
+    pub base: PreflightBase,
+    pub ci_only: Vec<String>,
     pub head: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -966,50 +985,53 @@ impl crate::ui::CliOutput for PreflightOutput {
     fn render(&self, ui: &crate::ui::Ui) {
         for check in &self.checks {
             ui.payload_plain(&format!(
-                "{} / {} / {} ({}): {}",
-                check.workflow, check.job, check.step, check.cwd, check.command
+                "{}: {}\n{}",
+                check.name, check.status, check.detail
             ));
         }
-        for failure in &self.failures {
-            ui.payload_plain(&format!(
-                "{} failed (exit {}):\n{}",
-                failure.check, failure.exit_code, failure.output_tail
-            ));
+        for entry in &self.ci_only {
+            ui.payload_plain(&format!("{entry}: runs in CI only"));
         }
         if self.dry_run {
             ui.note(&format!(
-                "Fast preflight plan: {} checks.",
+                "{} preflight plan: {} checks.",
+                self.tier,
                 self.checks.len()
             ));
         } else if self.passed {
             ui.success(&format!(
-                "Fast preflight passed: {} checks.",
+                "{} preflight passed: {} checks.",
+                self.tier,
                 self.checks.len()
             ));
         }
     }
 }
 
-/// Run the source-owned fast planner and preserve its single structured result.
-pub async fn dev_preflight(fast: bool, base: &str, dry_run: bool) -> Result<PreflightOutput> {
-    if !fast {
-        return Err(
-            crate::exit::CliError::usage("The preflight command requires --fast.")
-                .with_fix("Run `curie dev preflight --fast`.")
-                .into(),
-        );
-    }
+/// Run the source-owned planner and preserve its single structured result.
+pub async fn dev_preflight(
+    fast: bool,
+    base: &str,
+    dry_run: bool,
+    pr_body: Option<&Path>,
+    title: Option<&str>,
+) -> Result<PreflightOutput> {
     let root = find_repo_root().ok_or_else(|| {
-        crate::exit::CliError::usage("Fast preflight requires a Curie source checkout.")
-            .with_fix("Run `curie dev preflight --fast` from a Curie source checkout.")
+        crate::exit::CliError::usage("Preflight requires a Curie source checkout.")
+            .with_fix("Run `curie dev preflight` from a Curie source checkout.")
     })?;
     if !root.join("tools/preflight/preflight.py").is_file() {
         return Err(crate::exit::CliError::usage(
-            "The source checkout has no fast preflight tool.",
+            "The source checkout has no preflight tool.",
         )
         .with_fix("Update this Curie source checkout to a revision containing the preflight tool.")
         .into());
     }
+    // Resolve the caller's file before changing the subprocess working directory.
+    let body_file = pr_body
+        .map(|path| std::env::current_dir().map(|cwd| cwd.join(path)))
+        .transpose()
+        .context("Could not resolve the proposed pull request body file")?;
     let mut command = tokio::process::Command::new("uv");
     command
         .args([
@@ -1019,31 +1041,39 @@ pub async fn dev_preflight(fast: bool, base: &str, dry_run: bool) -> Result<Pref
             "pyyaml==6.0.3",
             "python3",
             "tools/preflight/preflight.py",
-            "--fast",
             "--base",
             base,
             "--json",
         ])
         .current_dir(&root)
         .stderr(std::process::Stdio::inherit());
+    if fast {
+        command.arg("--fast");
+    }
     if dry_run {
         command.arg("--dry-run");
     }
+    if let Some(path) = body_file {
+        command.arg("--pr-body").arg(path);
+    }
+    if let Some(title) = title {
+        command.arg("--title").arg(title);
+    }
     let output = command.output().await.map_err(|error| {
-        crate::exit::CliError::usage(format!("Could not run the fast preflight tool: {error}"))
+        crate::exit::CliError::transient(format!("Could not run the preflight tool: {error}"))
             .with_fix("Install uv, then run `curie install` from this source checkout and retry.")
     })?;
     let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("The fast preflight tool did not return one JSON object")?;
+        .context("The preflight tool did not return one JSON object")?;
     if output.status.code() == Some(2) {
         let error: PreflightSetupError = serde_json::from_value(payload)
-            .context("The fast preflight tool returned an invalid setup error")?;
+            .context("The preflight tool returned an invalid setup error")?;
         return Err(crate::exit::CliError::usage(error.error)
             .with_fix(error.fix)
             .into());
     }
-    let report: PreflightOutput = serde_json::from_value(payload)
-        .context("The fast preflight tool returned an invalid report")?;
+    let report: PreflightOutput =
+        serde_json::from_value(payload).context("The preflight tool returned an invalid report")?;
     if !output.status.success() {
         let message = report
             .error
@@ -1053,7 +1083,12 @@ pub async fn dev_preflight(fast: bool, base: &str, dry_run: bool) -> Result<Pref
             .fix
             .as_deref()
             .context("The failed preflight report omitted its fix")?;
-        let error = crate::exit::CliError::failure(message).with_fix(fix);
+        let error = if output.status.code() == Some(3) {
+            crate::exit::CliError::transient(message)
+        } else {
+            crate::exit::CliError::failure(message)
+        }
+        .with_fix(fix);
         return Err(crate::ui::ui().failed_report(&report, error.into()));
     }
     Ok(report)
@@ -10103,7 +10138,7 @@ pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let mut record = client.fire_hook(&opts.agent, &opts.name).await?;
     let deadline = Instant::now() + Duration::from_secs(opts.wait_secs);
-    while record.outcome.is_none() {
+    while matches!(record.outcome.as_deref(), None | Some("deferred")) {
         if Instant::now() >= deadline {
             return Err(crate::exit::transient(format!(
                 "hook {} did not settle within {}s; inspect with `curie {} hook record {} {} {}`",
@@ -10114,6 +10149,20 @@ pub async fn hook_fire(opts: HookFireOpts) -> Result<HookFireOutput> {
         record = client
             .get_hook_run(&opts.agent, &opts.name, &record.id)
             .await?;
+    }
+    if record.outcome.as_deref() != Some("ran") {
+        let mut message = format!(
+            "hook {} ran and recorded {}",
+            record.name,
+            record.outcome.as_deref().unwrap_or("-")
+        );
+        if let Some(reason) = record.reason.as_deref().filter(|reason| !reason.is_empty()) {
+            message.push_str(&format!(": {reason}"));
+        }
+        let output = HookFireOutput::Record(Box::new(record));
+        return Err(
+            crate::ui::ui().failed_report(&output, crate::exit::CliError::failure(message).into())
+        );
     }
     Ok(HookFireOutput::Record(Box::new(record)))
 }
@@ -13827,12 +13876,14 @@ impl OverrideChange {
 ///
 /// Args:
 ///   model: the intent for the model override.
+///   reviewer_model: the intent for the reviewer model override.
 ///   thinking: the intent for the thinking override.
 ///
 /// Returns:
-///   The body to PATCH, or `None` when both intents are `Unchanged`.
+///   The body to PATCH, or `None` when every intent is `Unchanged`.
 pub fn overrides_patch_body(
     model: &OverrideChange,
+    reviewer_model: &OverrideChange,
     thinking: &OverrideChange,
     execution_deadline: &OverrideChange,
     runner_resources: &OverrideChange,
@@ -13840,6 +13891,9 @@ pub fn overrides_patch_body(
     let mut body = serde_json::Map::new();
     if let Some(v) = model.patch_value() {
         body.insert("model".to_string(), v);
+    }
+    if let Some(v) = reviewer_model.patch_value() {
+        body.insert("reviewer_model".to_string(), v);
     }
     if let Some(v) = thinking.patch_value() {
         body.insert("thinking".to_string(), v);
@@ -13871,6 +13925,7 @@ pub fn overrides_patch_body(
 /// Args:
 ///   agent: the agent's name.
 ///   model: the stored model override, `None` when the platform default applies.
+///   reviewer_model: the stored reviewer override, `None` when the credential default applies.
 ///   thinking: the stored thinking override, same convention.
 ///   execution_deadline_seconds: the stored deadline override, same convention.
 ///   runner_resources: the stored runner resources override, same convention.
@@ -13879,9 +13934,11 @@ pub fn overrides_patch_body(
 ///
 /// Returns:
 ///   The summary line, with no trailing newline.
+#[allow(clippy::too_many_arguments)] // Mirrors every stored override and the inspect/write result.
 pub fn overrides_summary(
     agent: &str,
     model: &Option<String>,
+    reviewer_model: &Option<String>,
     thinking: &Option<String>,
     execution_deadline_seconds: &Option<u32>,
     runner_resources: &Option<serde_json::Value>,
@@ -13889,6 +13946,7 @@ pub fn overrides_summary(
     changed: bool,
 ) -> String {
     let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "platform default".to_string());
+    let reviewer = reviewer_model.as_deref().unwrap_or("credential default");
     let deadline = execution_deadline_seconds
         .map(|s| format!("{s} s"))
         .unwrap_or_else(|| "platform default".to_string());
@@ -13901,18 +13959,18 @@ pub fn overrides_summary(
     let verb = if changed { " now" } else { "" };
     let writes = if memory_writes { "on" } else { "off" };
     format!(
-        "overrides for {agent}{verb}: model {}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}",
+        "overrides for {agent}{verb}: model {}, reviewer model {reviewer}, thinking {}, execution deadline {deadline}, runner resources {resources}, memory writes {writes}",
         show(model),
         show(thinking)
     )
 }
 
-/// Output of `<tier> overrides <agent>`: the dry-run plan, or the agent's two
+/// Output of `<tier> overrides <agent>`: the dry-run plan, or the agent's
 /// nullable overrides as the API stored them. Owns its data so it outlives the
 /// `ApiClient`.
 ///
-/// `model`/`thinking` are `None` when no override is pinned, which is the same
-/// fact the API returns as JSON null: the platform default applies. `changed`
+/// Nullable overrides are `None` when unpinned, matching the API's JSON null.
+/// The reviewer uses its credential default; other overrides use platform defaults. `changed`
 /// distinguishes an inspect from a write, so an agent consumer can tell "this
 /// is what it is" from "this is what it now is" without diffing.
 /// `memory_writes` is the agent's NOT NULL memory-tools switch (#1461), so it
@@ -13923,6 +13981,7 @@ pub enum OverridesOutput {
     Done {
         agent: String,
         model: Option<String>,
+        reviewer_model: Option<String>,
         thinking: Option<String>,
         execution_deadline_seconds: Option<u32>,
         runner_resources: Option<serde_json::Value>,
@@ -13938,6 +13997,7 @@ impl crate::ui::CliOutput for OverridesOutput {
             OverridesOutput::Done {
                 agent,
                 model,
+                reviewer_model,
                 thinking,
                 execution_deadline_seconds,
                 runner_resources,
@@ -13946,6 +14006,7 @@ impl crate::ui::CliOutput for OverridesOutput {
             } => serde_json::json!({
                 "agent": agent,
                 "model": model,
+                "reviewer_model": reviewer_model,
                 "thinking": thinking,
                 "execution_deadline_seconds": execution_deadline_seconds,
                 "runner_resources": runner_resources,
@@ -13961,6 +14022,7 @@ impl crate::ui::CliOutput for OverridesOutput {
             OverridesOutput::Done {
                 agent,
                 model,
+                reviewer_model,
                 thinking,
                 execution_deadline_seconds,
                 runner_resources,
@@ -13970,6 +14032,7 @@ impl crate::ui::CliOutput for OverridesOutput {
                 ui.payload(&overrides_summary(
                     agent,
                     model,
+                    reviewer_model,
                     thinking,
                     execution_deadline_seconds,
                     runner_resources,
@@ -13981,7 +14044,7 @@ impl crate::ui::CliOutput for OverridesOutput {
     }
 }
 
-/// `curie <tier> overrides <agent> [--model V|--clear-model] [--thinking V|--clear-thinking]`.
+/// `curie <tier> overrides <agent>` sets or clears model, reviewer and thinking overrides.
 ///
 /// With no change flags this INSPECTS: one `GET`-resolved agent, no write. With
 /// any change flag it PATCHes only the fields named, then reports the row as the
@@ -13998,6 +14061,7 @@ impl crate::ui::CliOutput for OverridesOutput {
 /// Args:
 ///   opts: api url/key, the agent name or id, and the dry-run flag.
 ///   model: the intent for the model override.
+///   reviewer_model: the intent for the reviewer model override.
 ///   thinking: the intent for the thinking override.
 ///
 /// Returns:
@@ -14005,6 +14069,7 @@ impl crate::ui::CliOutput for OverridesOutput {
 pub async fn overrides(
     opts: AgentActionOpts,
     model: OverrideChange,
+    reviewer_model: OverrideChange,
     thinking: OverrideChange,
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
@@ -14012,6 +14077,7 @@ pub async fn overrides(
     overrides_with_memory_writes(
         opts,
         model,
+        reviewer_model,
         thinking,
         execution_deadline,
         runner_resources,
@@ -14036,6 +14102,7 @@ pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
 /// Args:
 ///   opts: api url/key, the agent name or id, and the dry-run flag.
 ///   model: the intent for the model override.
+///   reviewer_model: the intent for the reviewer model override.
 ///   thinking: the intent for the thinking override.
 ///   execution_deadline: the intent for the execution deadline.
 ///   runner_resources: the intent for the runner resources override.
@@ -14046,13 +14113,20 @@ pub fn memory_writes_flag(value: Option<&str>) -> Option<bool> {
 pub async fn overrides_with_memory_writes(
     opts: AgentActionOpts,
     model: OverrideChange,
+    reviewer_model: OverrideChange,
     thinking: OverrideChange,
     execution_deadline: OverrideChange,
     runner_resources: OverrideChange,
     memory_writes: Option<bool>,
 ) -> Result<OverridesOutput> {
     let ui = crate::ui::ui();
-    let mut body = overrides_patch_body(&model, &thinking, &execution_deadline, &runner_resources);
+    let mut body = overrides_patch_body(
+        &model,
+        &reviewer_model,
+        &thinking,
+        &execution_deadline,
+        &runner_resources,
+    );
     if let Some(on) = memory_writes {
         let map = body.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
         if let Some(obj) = map.as_object_mut() {
@@ -14077,11 +14151,12 @@ pub async fn overrides_with_memory_writes(
     let client = ApiClient::new(&opts.api_url, &opts.api_key)?;
     let agent = client.find_agent(&opts.agent).await?;
     let Some(body) = body else {
-        // Inspect: find_agent already carries both fields, so there is nothing
+        // Inspect: find_agent already carries every override, so there is nothing
         // further to fetch and nothing to write.
         return Ok(OverridesOutput::Done {
             agent: agent.name,
             model: agent.model,
+            reviewer_model: agent.reviewer_model,
             thinking: agent.thinking,
             execution_deadline_seconds: agent.execution_deadline_seconds,
             runner_resources: agent.runner_resources,
@@ -14104,6 +14179,7 @@ pub async fn overrides_with_memory_writes(
     Ok(OverridesOutput::Done {
         agent: saved.name,
         model: saved.model,
+        reviewer_model: saved.reviewer_model,
         thinking: saved.thinking,
         execution_deadline_seconds: saved.execution_deadline_seconds,
         runner_resources: saved.runner_resources,
@@ -14310,6 +14386,7 @@ mod overrides_tests {
     fn an_unchanged_field_is_absent_and_a_cleared_field_is_present_and_null() {
         let body = overrides_patch_body(
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
             &OverrideChange::Clear,
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
@@ -14330,6 +14407,7 @@ mod overrides_tests {
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
         )
         .is_none());
     }
@@ -14338,6 +14416,7 @@ mod overrides_tests {
     fn a_set_field_carries_its_value() {
         let body = overrides_patch_body(
             &OverrideChange::Set("kimi-k2".into()),
+            &OverrideChange::Unchanged,
             &OverrideChange::Set("adaptive".into()),
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
@@ -14383,12 +14462,13 @@ mod overrides_tests {
             &None,
             &None,
             &None,
+            &None,
             false,
             false,
         );
         assert_eq!(
             line,
-            "overrides for a: model kimi-k2, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off"
+            "overrides for a: model kimi-k2, reviewer model credential default, thinking platform default, execution deadline platform default, runner resources platform default, memory writes off"
         );
         assert!(!line.contains("  "), "no double space anywhere: {line}");
     }
@@ -14399,13 +14479,14 @@ mod overrides_tests {
             super::overrides_summary(
                 "a",
                 &None,
+                &None,
                 &Some("adaptive".into()),
                 &Some(90),
                 &None,
                 true,
                 true
             ),
-            "overrides for a now: model platform default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on"
+            "overrides for a now: model platform default, reviewer model credential default, thinking adaptive, execution deadline 90 s, runner resources platform default, memory writes on"
         );
     }
 
@@ -14431,6 +14512,7 @@ mod overrides_tests {
     fn the_dry_run_body_carries_the_trimmed_value() {
         let body = overrides_patch_body(
             &OverrideChange::resolve("model", Some(" kimi-k2 ".into()), false).unwrap(),
+            &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
@@ -14467,6 +14549,7 @@ mod overrides_tests {
         let body = overrides_patch_body(
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
             &OverrideChange::resolve_execution_deadline(Some("120".into()), false).unwrap(),
             &OverrideChange::Unchanged,
         )
@@ -14481,6 +14564,7 @@ mod overrides_tests {
         let body = overrides_patch_body(
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,
+            &OverrideChange::Unchanged,
             &OverrideChange::Clear,
             &OverrideChange::Unchanged,
         )
@@ -14492,6 +14576,7 @@ mod overrides_tests {
     fn an_unchanged_execution_deadline_is_absent_when_model_and_thinking_are_set() {
         let body = overrides_patch_body(
             &OverrideChange::Set("kimi-k2".into()),
+            &OverrideChange::Unchanged,
             &OverrideChange::Set("adaptive".into()),
             &OverrideChange::Unchanged,
             &OverrideChange::Unchanged,

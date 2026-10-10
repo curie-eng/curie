@@ -67,7 +67,7 @@ def test_event_repr_hides_memory_token() -> None:
 def test_schema_lists_memory_token_as_optional_nullable_string() -> None:
     # @spec MEMORY-TOKEN-1: a new optional field is a patch under 0.x.
     schema = build_schema()
-    assert schema["protocolVersion"] == "0.5.14"
+    assert schema["protocolVersion"] == "0.5.19"
 
     event = schema["$defs"]["Event"]
     assert "memory_token" not in event.get("required", [])

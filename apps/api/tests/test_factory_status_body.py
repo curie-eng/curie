@@ -19,8 +19,8 @@ from curie_api.factory_notices import (
     upsert_issue_notice,
 )
 from curie_api.factory_progress import PhaseSlot, PhaseView, StageSlot
-from curie_api.factory_reply_target import ReplyTarget
-from curie_api.models import FactoryStatusComment, WorkItem
+from curie_api.factory_reply_target import ReplyTarget, is_relabel_objective
+from curie_api.models import FactoryStatusComment
 
 REQUEST = uuid.UUID("00000000-0000-0000-0000-000000003125")
 CARD = "https://curie.example.com/v1/factory/cards/abc.svg"
@@ -375,7 +375,7 @@ def test_every_factory_comment_creation_redacts_at_the_http_boundary(target_kind
         async with httpx.AsyncClient(transport=httpx.MockTransport(github)) as client:
             outcome = await _deliver(
                 _GitHub(client, "https://api.github.com", "/repos/acme-corp/acme-bot", {}),
-                WorkItem(github_issue_number=3936),
+                3936,
                 FactoryStatusComment(execution_request_id=REQUEST, scan_page=1),
                 target,
                 f"{_PROVIDER_DETAIL}\n{_PR_URL}\n{marker_for(REQUEST)}\n",
@@ -454,3 +454,44 @@ def test_marked_notice_create_update_and_unchanged_use_the_redacted_body(existin
         _assert_redacted(writes[0][1])
 
     asyncio.run(exercise())
+
+
+_RELABEL_BASE = "https://github.com"
+_RELABEL_URL = "https://github.com/acme-corp/acme-bot/issues/7"
+
+
+@pytest.mark.parametrize("clone_base", [_RELABEL_BASE, f"{_RELABEL_BASE}/"])
+@pytest.mark.parametrize(
+    "objective", [_RELABEL_URL, f"{_RELABEL_URL}\n\nRelabelled by a maintainer."]
+)
+def test_a_relabel_objective_is_the_bare_issue_url(objective: str, clone_base: str) -> None:
+    """#4345 AC6: the first line is exactly the issue URL under the clone base."""
+
+    assert is_relabel_objective(
+        objective, repo_full_name="acme-corp/acme-bot", issue_number=7, clone_base=clone_base
+    )
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        f"{_RELABEL_URL}#issuecomment-1",
+        "https://github.com/acme-corp/acme-bot/pull/7",
+        "https://github.com/acme-corp/acme-bot/issues/8",
+        "https://github.com/acme-corp/other-bot/issues/7",
+        f"{_RELABEL_URL}/x",
+        f"{_RELABEL_URL}/",
+        f"{_RELABEL_URL}0",
+        f"Relabelled.\n{_RELABEL_URL}",
+        None,
+        "",
+    ],
+)
+def test_anything_but_the_bare_issue_url_is_not_a_relabel_objective(
+    objective: str | None,
+) -> None:
+    """#4345 AC6: fragments, PR URLs, other issues or repos, and trailing paths refuse."""
+
+    assert not is_relabel_objective(
+        objective, repo_full_name="acme-corp/acme-bot", issue_number=7, clone_base=_RELABEL_BASE
+    )

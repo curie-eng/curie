@@ -28,7 +28,7 @@ token. The platform reads the issue for the sandbox.
 | [`kubectl`](https://kubernetes.io/docs/tasks/tools/) | Kubernetes operations, required for every context |
 | [`helm`](https://helm.sh/docs/intro/install/) | Curie installation, required for every context |
 | `curie` v0.12.1 or later | install it with the command below |
-| An [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | the factory model, `z-ai/glm-5.3-flash` by default, and the reviewers, which run `anthropic/claude-opus-5.5`. Plan on about 5 USD of available OpenRouter credit per run; actual spend varies. The command asks once, or reads `CURIE_CREDENTIALS`. |
+| An [Anthropic](https://console.anthropic.com/) API key (`sk-ant-`) or an [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | Anthropic defaults to `claude-sonnet-5-5` for implementation and `claude-opus-5-5` for review. OpenRouter defaults to `z-ai/glm-5.3-flash` for implementation and `openai/gpt-6.1-sol` for review. Plan on about 5 USD of available OpenRouter credit per run; actual spend varies. The command asks once, or reads `CURIE_CREDENTIALS`. |
 | A GitHub account | your own GitHub App and the trial repository |
 
 The command checks all required tools on `PATH` before running any command or
@@ -151,7 +151,7 @@ What it does:
    context never prompts.
 2. It installs Curie with `cluster up`. On the kind path it sets
    `security.gvisor.mode=off` before the first install. It asks for the
-   OpenRouter key once when `CURIE_CREDENTIALS` is unset and the release is
+   Anthropic or OpenRouter API key once when `CURIE_CREDENTIALS` is unset and the release is
    not already on a real model.
 3. It prints a prefilled GitHub App registration link and stops. Nothing about
    the App is applied yet.
@@ -218,17 +218,67 @@ The cluster factory command performs the same check for its allowlisted reposito
 Without `--app-id`, it prints `toolchain inference skipped: no --app-id`.
 Dry-run describes the inference without reading GitHub.
 
-Before deploying, the second run reads the key's remaining credit from
+Factory commits are authored by the GitHub App's bot identity. Before any Helm
+call, App setup resolves `<slug>[bot]` through GitHub's user API and configures
+`worker.publication.gitUserName=<slug>[bot]` and
+`worker.publication.gitUserEmail=<id>+<slug>[bot]@users.noreply.github.com`.
+The numeric id is the bot user's id, not the App ID. Both quickstart's second
+pass and `curie cluster factory` use this identity when neither author field
+has a recorded operator value. If either field is already set, both fields
+stay unchanged.
+
+For an App already connected to the release, pass its bare slug with
+`curie cluster factory --mention <slug>` to apply the same bot author identity.
+This public user lookup needs neither a new private key nor an installation
+token. Reconfiguring intake without App credentials or `--mention` keeps the
+release's existing author configuration.
+
+To choose another author identity, set it on the release before rerunning App
+setup:
+
+```bash
+curie cluster upgrade --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
+  --set worker.publication.gitUserName='Example Operator' \
+  --set worker.publication.gitUserEmail=operator@example.com
+```
+
+The bot lookup still runs before Helm reads, including when the release has an
+operator override. If GitHub cannot return a numeric bot user id, setup exits
+3 without calling Helm and prints an author override hint. Restore access to
+the bot user lookup before retrying setup.
+
+An explicit `--model <id>` selects the implementer model instead of the
+credential's default, even when it matches the OpenRouter default. Both
+reviewers use the `opus` alias; the runner resolves it to the credential's
+default reviewer model. To pin another reviewer model for this agent, use the same context,
+namespace and release as the quickstart:
+
+```bash
+curie cluster overrides dark-factory --context "$CURIE_CONTEXT" \
+  --namespace "$CURIE_NAMESPACE" --release "$CURIE_RELEASE" \
+  --reviewer-model <provider-model-id>
+```
+
+Use `--clear-reviewer-model` in place of `--reviewer-model <provider-model-id>`
+to restore the credential's default. `curie local overrides` accepts the same
+reviewer flags for a local installation.
+
+For OpenRouter credentials, before deploying, the second run reads the key's remaining credit from
 OpenRouter (the smaller of the key's limit and the account balance). It warns
 when that is below the recommended 5 USD of available credit for one run. When it cannot read
 the credit, for example because the key only lives in the cluster, it prints
 `OpenRouter credit not checked` and continues. The check never stops the
 command. The ready output names the reviewer model and the per-run credit. A run
 that runs out of credit ends with the out-of-credits cause on the issue.
+With an Anthropic API key, quickstart skips this OpenRouter credit request.
+If the provider reaches a usage limit, the run ends with cause
+`model_usage_limited`. Wait for the limit to reset, then re-add the factory
+label to try again. Credit exhaustion continues to use the add-credit remedy.
 
 The recommended 5 USD of available provider credit is a planning allowance,
 not a guaranteed minimum charge per run. Actual spend depends on the task,
-including the Opus reviewers. Separately, quickstart configures the agent's
+including the reviewers. Separately, quickstart configures the agent's
 budget to 5 USD per day; several inexpensive runs can fit within that daily
 budget. Having provider credit does not raise the configured daily budget.
 

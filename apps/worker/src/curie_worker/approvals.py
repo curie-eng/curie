@@ -30,6 +30,7 @@ from channel_protocol import MessageField, OutboundMessage
 from curie_dispatcher.approval_actions import parse_decision_time
 from curie_telemetry import inject_trace_context
 
+from .api_retry import DEFAULT_BUDGET_S, post_with_retry
 from .workspace import WorkspaceSelectionRefused
 
 # Re-exported so this module stays the kernel-facing seam for the approval
@@ -84,6 +85,7 @@ def _publication_refusal(response: httpx.Response) -> str | None:
         return detail
     return None
 
+
 def _rejected_reraise_refusal(response: httpx.Response) -> str | None:
     """The thread message of an API re-raise refusal (#2885), or None.
 
@@ -118,6 +120,7 @@ __all__ = [
     "PublicationCreateRequest",
     "PublicationCreator",
     "PublicationLineage",
+    "PullRequestNotAdopted",
     "ReviewAuthorityUnavailable",
     "VerifiedReviewFeedback",
 ]
@@ -253,6 +256,10 @@ class ApprovalBackendError(Exception):
         self.refusal = refusal
 
 
+class PullRequestNotAdopted(Exception):
+    """An existing conversation PR cannot be continued; retrying cannot fix it."""
+
+
 def _coded_refusal(response: httpx.Response) -> str | None:
     """``"<code>: <message>"`` from an API ``{"detail": {code, message}}`` body."""
 
@@ -366,7 +373,9 @@ def decided_at(message: OutboundMessage) -> datetime | None:
 class ApprovalCreator(Protocol):
     """The kernel-facing seam; tests supply a recording fake."""
 
-    async def create(self, request: ApprovalRequest) -> CreatedApproval: ...
+    async def create(
+        self, request: ApprovalRequest, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> CreatedApproval: ...
 
 
 @dataclass(frozen=True)
@@ -385,7 +394,9 @@ class VerifiedReviewFeedback:
 class PublicationCreator(Protocol):
     """Atomic trusted write seam used only for exact publish provenance."""
 
-    async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication: ...
+    async def create_publication(
+        self, request: PublicationCreateRequest, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> CreatedPublication: ...
 
     async def get_publication_lineage(
         self,
@@ -456,13 +467,9 @@ class ApprovalClient:
         """Ask the trusted API to match this complete turn to fresh authority."""
 
         refusal = (
-            "GitHub feedback could not be verified for this conversation; "
-            "no model turn started."
+            "GitHub feedback could not be verified for this conversation; no model turn started."
         )
-        if (
-            not self._worker_headers
-            or _REVIEW_EVENT_ID_RE.fullmatch(turn.event_id) is None
-        ):
+        if not self._worker_headers or _REVIEW_EVENT_ID_RE.fullmatch(turn.event_id) is None:
             raise WorkspaceSelectionRefused(refusal)
         headers = {**self._worker_headers, "Content-Type": "application/json"}
         inject_trace_context(headers)
@@ -482,9 +489,7 @@ class ApprovalClient:
                 "GitHub feedback verification transport unavailable"
             ) from None
         if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
-            raise ApprovalBackendError(
-                "GitHub feedback verification temporarily unavailable"
-            )
+            raise ApprovalBackendError("GitHub feedback verification temporarily unavailable")
         if response.status_code != 200:
             # Never reflect an API/provider body into the conversation. A 409 is
             # a definitive authority refusal; rollout/auth/availability statuses
@@ -518,9 +523,7 @@ class ApprovalClient:
                 origin_key=origin_key,
                 lineage_version=lineage_version,
                 reservation_id=(
-                    uuid.UUID(str(reservation_value))
-                    if reservation_value is not None
-                    else None
+                    uuid.UUID(str(reservation_value)) if reservation_value is not None else None
                 ),
             )
         except (KeyError, TypeError, ValueError):
@@ -562,42 +565,39 @@ class ApprovalClient:
                 timeout=_REVIEW_RESERVE_HTTP_TIMEOUT_S,
             )
         except httpx.HTTPError:
-            raise ApprovalBackendError(
-                "GitHub review reservation transport unavailable"
-            ) from None
+            raise ApprovalBackendError("GitHub review reservation transport unavailable") from None
         if response.status_code in {401, 403, 404, 429} or response.status_code >= 500:
-            raise ApprovalBackendError(
-                "GitHub review reservation temporarily unavailable"
-            )
+            raise ApprovalBackendError("GitHub review reservation temporarily unavailable")
         if response.status_code != 200:
-            raise WorkspaceSelectionRefused(
-                "GitHub feedback revision is no longer executable."
-            )
+            raise WorkspaceSelectionRefused("GitHub feedback revision is no longer executable.")
         try:
             body = response.json()
             if body["origin_key"] != turn.event_id:
                 raise ValueError("wrong review origin")
             reservation_id = uuid.UUID(str(body["reservation_id"]))
-            if (
-                verified.reservation_id is not None
-                and reservation_id != verified.reservation_id
-            ):
+            if verified.reservation_id is not None and reservation_id != verified.reservation_id:
                 raise ValueError("wrong review reservation")
             return reservation_id
         except (KeyError, TypeError, ValueError):
             raise WorkspaceSelectionRefused(refusal) from None
 
-    async def create(self, request: ApprovalRequest) -> CreatedApproval:
+    async def create(
+        self, request: ApprovalRequest, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> CreatedApproval:
         headers = {**self._headers, "Content-Type": "application/json"}
         inject_trace_context(headers)
         try:
-            response = await self._client.post(
+            response = await post_with_retry(
+                self._client,
                 self._url,
                 content=request.model_dump_json(),
                 headers=headers,
+                budget_s=budget_s,
             )
         except httpx.HTTPError as exc:
-            raise ApprovalBackendError(f"approval create failed: {exc}") from exc
+            raise ApprovalBackendError(
+                f"approval create failed: {type(exc).__name__}: {exc}"
+            ) from exc
         refusal = _rejected_reraise_refusal(response)
         if refusal is not None:
             raise ApprovalRefused(refusal)
@@ -651,12 +651,18 @@ class ApprovalClient:
             logger.warning("approval read returned an unusable body for %s: %s", approval_id, exc)
             return None
 
-    async def create_publication(self, request: PublicationCreateRequest) -> CreatedPublication:
+    async def create_publication(
+        self, request: PublicationCreateRequest, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> CreatedPublication:
         """Atomically persist the approval and its private patch.
 
         The ordinary platform API key is intentionally not accepted on this
         route.  If the dedicated worker credential is absent, fail before any
         request so a local/non-cluster install cannot create a stranded card.
+
+        The route is replay safe on ``dedupe_key`` (an exact replay answers
+        200), so transient transport faults and 5xx are retried within
+        ``budget_s``. A 4xx is never retried.
         """
 
         if not self._worker_headers:
@@ -666,10 +672,12 @@ class ApprovalClient:
         headers = {**self._worker_headers, "Content-Type": "application/json"}
         inject_trace_context(headers)
         try:
-            response = await self._client.post(
+            response = await post_with_retry(
+                self._client,
                 self._publication_url,
                 json=request.to_json(),
                 headers=headers,
+                budget_s=budget_s,
             )
         except httpx.HTTPError as exc:
             raise ApprovalBackendError(f"publication create failed: {exc}") from exc
@@ -726,12 +734,19 @@ class ApprovalClient:
             # Only the authenticated API can establish first publication
             # absence. Auth, provider and authority errors are never absence.
             return None
+        if response.status_code == 409:
+            try:
+                detail = response.json()["detail"]
+            except (KeyError, TypeError, ValueError):
+                detail = None
+            if isinstance(detail, dict) and detail.get("code") == "pull_request_not_adopted":
+                raise PullRequestNotAdopted(
+                    "an earlier pull request on this issue could not be continued"
+                )
         if response.status_code != 200:
             raise ApprovalBackendError("publication context unavailable")
         try:
-            context = PublicationContext.model_validate(
-                response.json(), context=READER_CONTEXT
-            )
+            context = PublicationContext.model_validate(response.json(), context=READER_CONTEXT)
         except (TypeError, ValueError):
             # Validation errors can contain the capability. Do not propagate
             # their body or chain into the worker's ordinary error logging.

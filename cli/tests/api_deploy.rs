@@ -1912,6 +1912,99 @@ async fn redeploy_without_connector_secrets_clears_the_agent_record() {
     );
 }
 
+// @spec #4129 optional-secret contract: declaration alone must never synthesize a binding.
+#[tokio::test]
+async fn optional_secrets_are_absent_from_local_and_cluster_deploy_records() {
+    for tier in [commands::DeployTier::Local, commands::DeployTier::Cluster] {
+        let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+            ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+            ("GET", p) if p.starts_with("/deployments?") => Response::json(200, "[]"),
+            (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        scaffold(dir.path(), AGENT_NAME).unwrap();
+        let manifest_path = dir.path().join(".claude-plugin/plugin.json");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["optionalSecrets"] = serde_json::json!(["OPTIONAL_TOKEN"]);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let mut opts = identity_deploy_opts(&server, dir.path(), None, None, None);
+        opts.tier = tier;
+        opts.env = Some(commands::DeployEnv::Dev);
+        // The production prepare path executes the gate and writes the record;
+        // it stops before cluster deployment, so this is API wiring proof.
+        commands::prepare_deploy(opts).await.unwrap();
+        let patches = patch_bodies(&server);
+        assert_eq!(patches.len(), 1, "{tier:?}: {patches:?}");
+        assert!(
+            empty_secret_declaration(&patches[0]),
+            "{tier:?}: {patches:?}"
+        );
+
+        manifest["secrets"] = serde_json::json!(["REQUIRED_TOKEN"]);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let before = server.recorded().len();
+        let mut opts = identity_deploy_opts(&server, dir.path(), None, None, None);
+        opts.tier = tier;
+        opts.env = Some(commands::DeployEnv::Dev);
+        let err = commands::prepare_deploy(opts)
+            .await
+            .err()
+            .expect("required refusal");
+        assert_eq!(curie::exit::classify(&err).0.code(), 2);
+        let message = format!("{err:#}");
+        assert!(message.contains(
+            "declares connector secret(s) that were not bound on deploy: REQUIRED_TOKEN"
+        ));
+        assert!(!message.contains("OPTIONAL_TOKEN"));
+        assert_eq!(server.recorded().len(), before, "refuse before networking");
+    }
+}
+
+// @spec #4129 optional-secret contract: an explicit optional binding follows normal local delivery.
+#[cfg(unix)]
+#[tokio::test]
+async fn local_cli_delivers_only_explicitly_bound_optional_secrets() {
+    let server = serve(|req| match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/agents") => existing_agents(&agent_json(AGENT_ID, AGENT_NAME, BOUND, None)),
+        ("PATCH", p) if *p == format!("/agents/{AGENT_ID}") => patched_agent(BOUND, None),
+        (m, p) => deploy_tail(m, p).unwrap_or_else(|| panic!("unexpected request: {m} {p}")),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    scaffold(dir.path(), AGENT_NAME).unwrap();
+    let manifest_path = dir.path().join(".claude-plugin/plugin.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["optionalSecrets"] = serde_json::json!(["OPTIONAL_TOKEN", "UNBOUND_TOKEN"]);
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_curie"));
+    command
+        .args(["local", "deploy", "--plugin-dir"])
+        .arg(dir.path())
+        .args(["--api-url", &server.base_url, "--secret", "OPTIONAL_TOKEN"])
+        .env("CURIE_CONFIG_DIR", config.path())
+        .env("OPTIONAL_TOKEN", "example-bound-value")
+        .env("UNBOUND_TOKEN", "example-ambient-value");
+    let output = tokio::task::spawn_blocking(move || command.output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let patches = patch_bodies(&server);
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert_eq!(
+        patches[0]["secrets"],
+        serde_json::json!({"OPTIONAL_TOKEN": "example-bound-value"})
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("example-bound-value"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("example-bound-value"));
+}
+
 /// A nonempty declaration replaces the stored map, and a second agent's row
 /// is not part of this deploy.
 #[tokio::test]

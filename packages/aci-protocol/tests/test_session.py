@@ -169,6 +169,7 @@ def _full_boot_env() -> BootEnv:
         bundle_version="abc123def456",
         runner_token="rt-full-token",
         model="claude-opus-4-6",
+        reviewer_model="claude-opus-5-5",
         fake_model=True,
         history_ref=_HISTORY_REF,
         channel_memory_ref=_CHANNEL_MEMORY_REF,
@@ -492,6 +493,7 @@ def test_render_worker_omits_unset_optionals_rather_than_emitting_empty_strings(
         "CURIE_BUNDLE_VERSION",
         "CURIE_RUNNER_TOKEN",
         "CURIE_MODEL",
+        "CURIE_REVIEWER_MODEL",
         "CURIE_FAKE_MODEL",
         "CURIE_HISTORY_TOKEN",
         "CURIE_MEMORY_TOKEN",
@@ -553,6 +555,7 @@ def test_render_worker_emits_exactly_the_worker_owned_key_subset() -> None:
         credentials_ref="k8s://secret/demo",
         api_backend="messages",
         thinking="disabled",
+        reviewer_model="claude-opus-5-5",
         deployment_environment="prod",
         model_env_key="MY_PROVIDER_KEY",
         state_url="http://api:8000/agents/agent-abc/state",
@@ -827,6 +830,7 @@ def test_env_keys_declares_the_whole_flattened_boot_surface() -> None:
         "CURIE_BUNDLE_VERSION",
         "CURIE_RUNNER_TOKEN",
         "CURIE_MODEL",
+        "CURIE_REVIEWER_MODEL",
         "CURIE_FAKE_MODEL",
         "CURIE_HISTORY_REF",
         "CURIE_CHANNEL_MEMORY_REF",
@@ -1218,3 +1222,14 @@ def test_from_env_reads_channel_bound_with_the_fake_model_truthy_set(raw: str) -
 
 def test_channel_bound_is_not_a_session_config_field() -> None:
     assert "channel_bound" not in SessionConfig.model_fields
+
+
+@pytest.mark.parametrize("reviewer_model", [None, "claude-opus-5-5", "acme-reviewer-model"])
+def test_reviewer_model_is_a_declared_optional_worker_boot_key(
+    reviewer_model: str | None,
+) -> None:
+    env = _worker_env(reviewer_model=reviewer_model)
+    assert BootEnv.env_key("reviewer_model") == "CURIE_REVIEWER_MODEL"
+    assert "CURIE_REVIEWER_MODEL" in BootEnv.env_keys(producer="worker")
+    assert ("CURIE_REVIEWER_MODEL" in env) is (reviewer_model is not None)
+    assert BootEnv.from_env(env | _SUBSTRATE_ENV).reviewer_model == reviewer_model

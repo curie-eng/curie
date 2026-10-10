@@ -164,7 +164,7 @@ fn the_run_credit_is_five_usd() {
 }
 
 #[test]
-fn the_quickstart_reviewer_model_matches_the_factory_bundle() {
+fn the_quickstart_reviewer_model_is_display_only_and_agents_use_the_opus_alias() {
     let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/dark-factory");
     let phases: Value = serde_json::from_str(
         &std::fs::read_to_string(bundle.join("progress/phases.json")).unwrap(),
@@ -183,7 +183,7 @@ fn the_quickstart_reviewer_model_matches_the_factory_bundle() {
             .find_map(|line| line.strip_prefix("model:"))
             .unwrap_or_else(|| panic!("{agent} names no model"))
             .trim();
-        assert_eq!(model, REVIEWER_MODEL, "{agent}");
+        assert_eq!(model, "opus", "{agent}");
     }
 }
 

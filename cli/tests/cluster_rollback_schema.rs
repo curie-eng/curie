@@ -157,7 +157,7 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
 
     assert_eq!(source.schema_head, "0044");
     assert_eq!(target.schema_min, "0076");
-    assert_eq!(target.schema_head, "0080");
+    assert_eq!(target.schema_head, "0093");
 
     let pending =
         pending_revisions(Some("0044"), &target).expect("0044 reaches the packaged chart head");
@@ -171,7 +171,8 @@ fn v091_source_upgrades_through_the_packaged_chart_graph() {
         [
             "0045", "0046", "0047", "0048", "0049", "0050", "0051", "0052", "0053", "0054", "0055",
             "0056", "0057", "0058", "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066",
-            "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0075", "0076", "0079", "0080"
+            "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0075", "0076", "0079", "0080",
+            "0081", "0091", "0092", "0093"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -214,7 +215,7 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0058");
-    assert_eq!(target.schema_head, "0080");
+    assert_eq!(target.schema_head, "0093");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.1 reaches the new head");
     assert_eq!(
@@ -226,7 +227,8 @@ fn released_v0101_upgrades_through_the_new_feature_train_revision() {
         revisions,
         [
             "0059", "0060", "0061", "0062", "0063", "0064", "0065", "0066", "0067", "0068", "0069",
-            "0070", "0071", "0072", "0073", "0075", "0076", "0079", "0080"
+            "0070", "0071", "0072", "0073", "0075", "0076", "0079", "0080", "0081", "0091", "0092",
+            "0093"
         ]
     );
 
@@ -260,7 +262,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0062");
-    assert_eq!(target.schema_head, "0080");
+    assert_eq!(target.schema_head, "0093");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.2 reaches the new head");
     assert_eq!(
@@ -272,7 +274,7 @@ fn released_v0102_upgrades_through_the_feature_train_revisions() {
         revisions,
         [
             "0063", "0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071", "0072", "0073",
-            "0075", "0076", "0079", "0080"
+            "0075", "0076", "0079", "0080", "0081", "0091", "0092", "0093"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -310,7 +312,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
             .expect("packaged chart schema compatibility metadata parses");
 
     assert_eq!(source.schema_head, "0063");
-    assert_eq!(target.schema_head, "0080");
+    assert_eq!(target.schema_head, "0093");
     let pending = pending_revisions(Some(&source.schema_head), &target)
         .expect("released 0.10.3 reaches the new head");
     assert_eq!(
@@ -322,7 +324,7 @@ fn released_v0103_upgrades_through_the_renumbered_feature_train() {
         revisions,
         [
             "0064", "0065", "0066", "0067", "0068", "0069", "0070", "0071", "0072", "0073", "0075",
-            "0076", "0079", "0080"
+            "0076", "0079", "0080", "0081", "0091", "0092", "0093"
         ]
     );
     let contracts: Vec<&str> = pending
@@ -636,7 +638,10 @@ async fn v085_revision_0039_to_v084_is_refused_before_helm_mutates() {
     }
 
     // Negative control: an ambiguous target still performs no retained
-    // manifest read when the whole schema gate is disabled.
+    // manifest read when the whole schema gate is disabled. The refused run
+    // above may read the manifest after its catalog refusal (#4230), so the
+    // log starts empty here.
+    fs::write(&rollback_log, "").expect("reset helm log");
     fs::write(&history_json, two_revision_history("0.8.9", "0.9.0"))
         .expect("write ambiguous history");
     let mut opts = rollback_opts();
@@ -911,5 +916,201 @@ fn json_refusal_is_nonzero_actionable_and_redacted() {
     assert!(
         !helm_log.contains("rollback-ran") && !helm_log.contains("rollback prod-release"),
         "json refusal must not invoke helm rollback: {helm_log}"
+    );
+}
+
+/// Unlabeled retained manifest: no schema-compat ConfigMap is declared.
+const UNLABELED_MANIFEST: &str = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: byo-config\n  labels:\n    app.kubernetes.io/component: api\ndata:\n  note: no schema metadata\n";
+
+/// A refused rollback whose target's catalog window is not ambiguous must
+/// return the plain catalog refusal: the original message, the fail forward
+/// fix with no retained-manifest guidance, and no mutation.
+fn assert_original_catalog_refusal(
+    fixture: &RollbackFixture,
+    output: &Output,
+    target: &str,
+    live: &str,
+    catalog_head: &str,
+    expected_fix: &str,
+) {
+    assert!(
+        !output.status.success(),
+        "rollback to {target} with live {live} must be refused: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let payload = json_payload(output);
+    let error = payload["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains(&format!(
+            "refusing rollback to application {target}: live database revision {live} is outside its declared schema range (head {catalog_head})"
+        )),
+        "refusal must be the original catalog message: {payload}"
+    );
+    let fix = payload["fix"].as_str().unwrap_or_default();
+    assert_eq!(
+        fix, expected_fix,
+        "refusal fix must be the plain catalog fail forward fix: {payload}"
+    );
+    fixture.assert_no_mutation();
+}
+
+/// #4230 AC7(a): a main-built 0.12.1 revision whose own schema-compat metadata
+/// declares 0076..0081 can start against live 0081, so rollback proceeds even
+/// though the released 0.12.1 catalog window ends at 0076.
+#[test]
+fn main_built_v0121_ahead_of_its_release_rolls_back_by_declared_window() {
+    let history = two_revision_history("0.12.1", "0.12.2");
+    let manifest = compatibility_manifest("prod-release-schema-compat", "0.12.1", "0076", "0081");
+    let fixture = RollbackFixture::new(&history, "0081", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert!(
+        output.status.success(),
+        "declared 0076..0081 window admits live 0081: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(json_payload(&output)["rolled_back"], true);
+    let log = fixture.helm_log();
+    assert!(
+        log.lines()
+            .any(|line| line == "get manifest prod-release -n agent-ns --revision 1"),
+        "the refused catalog window must trigger a retained manifest read: {log}"
+    );
+    assert!(
+        log.lines()
+            .any(|line| line == "rollback prod-release 1 -n agent-ns"),
+        "the admitted target must be rolled back: {log}"
+    );
+}
+
+/// #4230 AC7(b): without a labeled schema-compat ConfigMap the release build
+/// is judged by its catalog window and refused.
+#[test]
+fn v0121_without_labeled_metadata_keeps_the_catalog_refusal() {
+    let history = two_revision_history("0.12.1", "0.12.2");
+    let fixture = RollbackFixture::new(&history, "0081", Ok(UNLABELED_MANIFEST));
+    let output = fixture.run(&[]);
+    assert_original_catalog_refusal(
+        &fixture,
+        &output,
+        "0.12.1",
+        "0081",
+        "0076",
+        "fail forward to application 0.12.2, which can start against revision 0081",
+    );
+}
+
+/// #4230 AC7(c): the published v0.10.2 chart declares head 0061, earlier than
+/// its catalog head 0062, so the declared window never replaces the catalog
+/// window and the original refusal stands.
+#[test]
+fn published_v0102_declared_head_earlier_than_catalog_keeps_the_catalog_refusal() {
+    let history = two_revision_history("0.10.2", "0.10.3");
+    let manifest = compatibility_manifest("prod-release-schema-compat", "0.10.2", "0060", "0061");
+    let fixture = RollbackFixture::new(&history, "0063", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert_original_catalog_refusal(
+        &fixture,
+        &output,
+        "0.10.2",
+        "0063",
+        "0062",
+        "fail forward to application 0.10.3, which can start against revision 0063",
+    );
+}
+
+/// #4230 AC7(d): a failed retained manifest read returns the original catalog
+/// refusal, not a manifest read error.
+#[test]
+fn v0121_manifest_read_failure_keeps_the_catalog_refusal() {
+    let history = two_revision_history("0.12.1", "0.12.2");
+    let fixture = RollbackFixture::new(&history, "0081", Err("boom"));
+    let output = fixture.run(&[]);
+    assert_original_catalog_refusal(
+        &fixture,
+        &output,
+        "0.12.1",
+        "0081",
+        "0076",
+        "fail forward to application 0.12.2, which can start against revision 0081",
+    );
+    let payload = json_payload(&output);
+    assert!(
+        !payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("boom"),
+        "the manifest read error must not replace the catalog refusal: {payload}"
+    );
+}
+
+/// #4230 Decision 12: a later declared head that still excludes the live
+/// revision returns the original catalog refusal.
+#[test]
+fn v0121_declared_window_that_still_excludes_live_keeps_the_catalog_refusal() {
+    let history = two_revision_history("0.12.1", "0.12.2");
+    let manifest = compatibility_manifest("prod-release-schema-compat", "0.12.1", "0076", "0080");
+    let fixture = RollbackFixture::new(&history, "0081", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert_original_catalog_refusal(
+        &fixture,
+        &output,
+        "0.12.1",
+        "0081",
+        "0076",
+        "fail forward to application 0.12.2, which can start against revision 0081",
+    );
+}
+
+/// A chart packaged from this tree under the released 0.10.0 version declares
+/// the candidate head, which no build cut before 0.10.1 could carry. The
+/// declared window is past the next release's head, so the catalog refusal
+/// stands. This is the shape the cluster upgrade matrix's guarded rollback
+/// drives on kind.
+#[test]
+fn chart_packaged_from_a_newer_tree_under_v0100_keeps_the_catalog_refusal() {
+    let history = two_revision_history("0.10.0", "0.10.1");
+    let manifest = compatibility_manifest("prod-release-schema-compat", "0.10.0", "0076", "0081");
+    let fixture = RollbackFixture::new(&history, "0081", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert_original_catalog_refusal(
+        &fixture,
+        &output,
+        "0.10.0",
+        "0081",
+        "0058",
+        "no catalogued application version in this release history can start against revision 0081; stay on the current revision",
+    );
+    let log = fixture.helm_log();
+    assert!(
+        log.lines()
+            .any(|line| line == "get manifest prod-release -n agent-ns --revision 1"),
+        "the refusal must come from the declared window bound, not a skipped manifest read: {log}"
+    );
+}
+
+/// A build cut between 0.10.1 and 0.10.2 declares a head up to 0.10.2's
+/// catalog head 0062, so an older release line is admitted the same way as
+/// the newest one.
+#[test]
+fn main_built_v0101_before_the_next_release_rolls_back_by_declared_window() {
+    let history = two_revision_history("0.10.1", "0.10.2");
+    let manifest = compatibility_manifest("prod-release-schema-compat", "0.10.1", "0045", "0060");
+    let fixture = RollbackFixture::new(&history, "0060", Ok(&manifest));
+    let output = fixture.run(&[]);
+    assert!(
+        output.status.success(),
+        "declared 0045..0060 window admits live 0060: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fixture
+            .helm_log()
+            .lines()
+            .any(|line| line == "rollback prod-release 1 -n agent-ns"),
+        "the admitted target must be rolled back: {}",
+        fixture.helm_log()
     );
 }

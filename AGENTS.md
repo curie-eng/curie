@@ -293,15 +293,26 @@ or older worktree does not automatically acquire newer instructions; read this
 section from the updated base when resuming. Do not edit a live claimed Bonus
 Drain task or launch a second copy to apply the guidance.
 
-### Fast push checks
+### Preflight checks
 
-After committing and before pushing, run `curie dev preflight --fast` from the
-source checkout. It selects the cheap PR gates for the committed change and
-runs their CI commands. The default base is `main`; use `--base <branch>`
-to compare against another fetched `origin/<branch>`. Use `--dry-run` to inspect
-the selected commands and `--json` for one structured report. A failing gate
-includes its output tail. This fast tier does not replace any required
-verification below.
+There is no required pre-PR preflight. Do not run the full tier (`curie dev
+preflight` without `--fast`) while implementing a change or before opening or
+updating a pull request. It starts a private Compose project with the full
+Langfuse, ClickHouse, and OTel stack and runs the changed Python suites, and
+several agent runs doing that at once overload the shared host. CI runs those
+suites and the PR body and Fix pin guards on every pull request; require
+current-head PR checks to pass instead. Run the full tier only when a person
+asks for it explicitly.
+
+The fast tier starts no services. The tracked pre-push hook runs it on every
+push, so do not run it separately. It selects the cheap PR gates for the
+committed change and runs their CI commands. To run it by hand, use
+`curie dev preflight --fast` from the source checkout. The default base is
+`main`; use `--base <branch>` to compare against another fetched
+`origin/<branch>`. Use `--dry-run` to inspect the selected commands and
+`--json` for one structured report. A failing gate includes its output tail
+and is a failure to fix before pushing. This fast tier does not replace any
+required verification below.
 
 `curie install`, `curie update`, and `curie dev hooks install` configure the
 shared relative `core.hooksPath=.githooks`. Each linked worktree runs its own

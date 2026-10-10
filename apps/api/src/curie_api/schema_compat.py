@@ -14,19 +14,26 @@ import json
 import logging
 import os
 import sys
+import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+import asyncpg  # type: ignore[import-untyped]
 from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from curie_protected_hooks.schema_serving import AppWindow, SchemaServingUnavailable, load_window
 from curie_protected_hooks.schema_serving import assert_servable as shared_assert_servable
 from curie_protected_hooks.schema_serving import can_serve as shared_can_serve
+from curie_upgrade_pause import PAUSE_LEASE_S, marker_keys, renew_pause
+from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -41,6 +48,22 @@ KIND_IRREVERSIBLE = "irreversible"
 _VALID_KINDS = {KIND_EXPAND, KIND_CONTRACT, KIND_IRREVERSIBLE}
 
 _KINDS_RESOURCE = "revision_kinds.json"
+
+POSTGRES_ATTEMPTS = 60
+POSTGRES_RETRY_S = 2
+POSTGRES_CONNECT_TIMEOUT_S = 2
+PAUSE_RENEW_INTERVAL_S = 100
+_PAUSE_ENV = (
+    "VALKEY_HOST",
+    "VALKEY_PORT",
+    "VALKEY_PASSWORD",
+    "VALKEY_TLS",
+    "CURIE_INSTALLATION_ID",
+    "CURIE_UPGRADE_REVISION",
+    "CURIE_UPGRADE_LEGACY_QUIESCE",
+    "KEY_PREFIX",
+)
+
 
 def _default_alembic() -> Path:
     """Prefer the image copy, then the source tree next to this package."""
@@ -283,6 +306,7 @@ def _pending_from_script(
 def apply_upgrade(
     *,
     forward_only: bool,
+    before_apply: Callable[[], None],
     alembic_config: Config | None = None,
     window: AppWindow | None = None,
     kinds: dict[str, str] | None = None,
@@ -307,9 +331,249 @@ def apply_upgrade(
     if decision.action == "noop":
         decision.outcome = "already_at_head"
         return decision
+    before_apply()
     command.upgrade(cfg, target.schema_head)
     decision.outcome = "applied"
     return decision
+
+
+async def wait_for_postgres() -> int:
+    """The migrate Job's bounded, redacted readiness probe."""
+    database_url = get_settings().database_url.replace(
+        "postgresql+asyncpg://", "postgresql://", 1
+    )
+    parsed = urlparse(database_url)
+    query: list[tuple[str, str]] = []
+    ssl: str | None = None
+    for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+        if key == "ssl":
+            ssl = value
+        else:
+            query.append((key, value))
+    database_url = urlunparse(parsed._replace(query=urlencode(query)))
+    connect_kwargs: dict[str, Any] = {"timeout": POSTGRES_CONNECT_TIMEOUT_S}
+    if ssl is not None:
+        connect_kwargs["ssl"] = ssl
+    probe_error_class = ""
+    for attempt in range(1, POSTGRES_ATTEMPTS + 1):
+        try:
+            connection = await asyncpg.connect(database_url, **connect_kwargs)
+            await connection.close()
+            return 0
+        except Exception as error:
+            probe_error_class = type(error).__name__
+        if attempt == 1:
+            print(
+                "Waiting for Postgres readiness; "
+                f"probe error class: {probe_error_class}",
+                flush=True,
+            )
+        elif attempt % 10 == 0 and attempt < POSTGRES_ATTEMPTS:
+            print(
+                f"Still waiting for Postgres readiness after {attempt} "
+                f"of {POSTGRES_ATTEMPTS} attempts; "
+                f"probe error class: {probe_error_class}",
+                flush=True,
+            )
+        if attempt < POSTGRES_ATTEMPTS:
+            await asyncio.sleep(POSTGRES_RETRY_S)
+    print(
+        f"Postgres unavailable after {POSTGRES_ATTEMPTS} readiness attempts; "
+        f"final probe error class: {probe_error_class}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return 1
+
+
+class _PauseLost(RuntimeError):
+    """The migration guard refused locally expired or revoked authority."""
+
+
+class _PauseAuthority:
+    """Share the apply-start fence between the event loop and Alembic thread."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._confirmed = False
+        self._lost = False
+        self._deadline = time.monotonic() + PAUSE_LEASE_S - PAUSE_RENEW_INTERVAL_S
+        self._reason = "expired"
+
+    def _valid_locked(self) -> bool:
+        if not self._lost and time.monotonic() >= self._deadline:
+            self._lost = True
+            self._reason = "expired"
+        return self._confirmed and not self._lost
+
+    def confirm(self) -> bool:
+        with self._lock:
+            # Even the first confirmation must arrive before its wait ceiling.
+            # Lost authority is permanent, including a late successful renewal.
+            self._valid_locked()
+            if self._lost:
+                return False
+            self._confirmed = True
+            self._deadline = time.monotonic() + PAUSE_LEASE_S - PAUSE_RENEW_INTERVAL_S
+            return True
+
+    def lose(self, reason: str) -> None:
+        with self._lock:
+            if not self._lost:
+                self._lost = True
+                self._reason = reason
+
+    def remaining(self) -> float:
+        with self._lock:
+            return self._deadline - time.monotonic()
+
+    def valid(self) -> bool:
+        with self._lock:
+            return self._valid_locked()
+
+    def before_apply(self) -> None:
+        with self._lock:
+            if not self._valid_locked():
+                raise _PauseLost()
+            # Passing this guard is the start linearization point before Alembic.
+            # No lock or event-loop callback is held during the synchronous apply.
+
+    def report_loss(self) -> None:
+        with self._lock:
+            reason = self._reason
+        print(f"Upgrade pause authority lost: {reason}", file=sys.stderr, flush=True)
+
+
+async def _renew_upgrade_pause(
+    redis: Redis,
+    keys: tuple[str, ...],
+    revision: int,
+    authority: _PauseAuthority,
+    confirmed: asyncio.Event,
+    lost: asyncio.Event,
+) -> None:
+    while not lost.is_set():
+        retry_delay: float = PAUSE_RENEW_INTERVAL_S
+        try:
+            result = await renew_pause(redis, keys, revision, int(PAUSE_LEASE_S * 1000))
+        except Exception:
+            # Retry inside the confirmation window, rather than at its deadline.
+            # The transport does not perform hidden retries of its own.
+            retry_delay = PAUSE_RENEW_INTERVAL_S / 5
+            print("Upgrade pause renewal unavailable", file=sys.stderr, flush=True)
+        else:
+            print(f"Upgrade pause renewal revision={revision} result={result}", flush=True)
+            if result != "renewed":
+                authority.lose(result)
+                lost.set()
+                return
+            if not authority.confirm():
+                lost.set()
+                return
+            confirmed.set()
+        await asyncio.sleep(retry_delay)
+
+
+async def _watch_pause_deadline(authority: _PauseAuthority, lost: asyncio.Event) -> None:
+    # A stuck Redis operation must never suspend the local authority clock.
+    while not lost.is_set():
+        remaining = authority.remaining()
+        if remaining <= 0:
+            authority.lose("expired")
+            lost.set()
+            return
+        try:
+            await asyncio.wait_for(lost.wait(), timeout=remaining)
+        except TimeoutError:
+            continue
+
+
+def _report_upgrade(decision: CompatDecision) -> int:
+    print(json.dumps(render_decision(decision), sort_keys=True))
+    return 2 if decision.action == "refuse" else 0
+
+
+async def upgrade_with_pause(*, forward_only: bool) -> int:
+    """Own readiness, renewal and guarded migration for the whole Job lifetime."""
+    if not all(name in os.environ for name in _PAUSE_ENV):
+        if await wait_for_postgres():
+            return 1
+        decision = await asyncio.to_thread(
+            apply_upgrade, forward_only=forward_only, before_apply=lambda: None
+        )
+        return _report_upgrade(decision)
+
+    try:
+        revision = int(os.environ["CURIE_UPGRADE_REVISION"])
+        if revision < 0:
+            raise ValueError("negative revision")
+        settings = get_settings()
+        keys = marker_keys(
+            settings.worker_key_prefix,
+            settings.installation_id,
+            os.environ["CURIE_UPGRADE_LEGACY_QUIESCE"].lower() in {"1", "true", "yes"},
+        )
+        redis = Redis.from_url(
+            settings.valkey_dsn(),
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            retry=Retry(NoBackoff(), 0),
+        )
+    except Exception:
+        print("Upgrade pause configuration invalid", file=sys.stderr, flush=True)
+        return 1
+
+    authority = _PauseAuthority()
+    confirmed = asyncio.Event()
+    lost = asyncio.Event()
+    tasks: list[asyncio.Task[Any]] = [
+        asyncio.create_task(
+            _renew_upgrade_pause(redis, keys, revision, authority, confirmed, lost)
+        ),
+        asyncio.create_task(_watch_pause_deadline(authority, lost)),
+    ]
+    confirmation = asyncio.create_task(confirmed.wait())
+    loss = asyncio.create_task(lost.wait())
+    tasks.extend((confirmation, loss))
+    try:
+        await asyncio.wait((confirmation, loss), return_when=asyncio.FIRST_COMPLETED)
+        if not authority.valid():
+            authority.report_loss()
+            return 1
+        readiness = asyncio.create_task(wait_for_postgres())
+        tasks.append(readiness)
+        await asyncio.wait((readiness, loss), return_when=asyncio.FIRST_COMPLETED)
+        if not authority.valid():
+            authority.report_loss()
+            return 1
+        if readiness.result():
+            return 1
+        # Awaiting the thread keeps renewal and the independent clock scheduling.
+        # On loss, join the thread. Its guard prevents an unstarted apply, and
+        # a started migration is allowed to finish rather than being cancelled.
+        try:
+            decision = await asyncio.to_thread(
+                apply_upgrade,
+                forward_only=forward_only,
+                before_apply=authority.before_apply,
+            )
+        except _PauseLost:
+            authority.report_loss()
+            return 1
+        if not authority.valid():
+            print(json.dumps(render_decision(decision), sort_keys=True))
+            authority.report_loss()
+            return 1
+        return _report_upgrade(decision)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            async with asyncio.timeout(2):
+                await redis.aclose()
+        except Exception:
+            print("Upgrade pause cleanup unavailable", file=sys.stderr, flush=True)
 
 
 async def _dispose_startup_engine(engine: AsyncEngine) -> None:
@@ -412,11 +676,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(render_decision(decision), sort_keys=True))
         return 0 if decision.action != "refuse" else 2
-    decision = apply_upgrade(forward_only=forward_only)
-    print(json.dumps(render_decision(decision), sort_keys=True))
-    if decision.action == "refuse":
-        return 2
-    return 0
+    return asyncio.run(upgrade_with_pause(forward_only=forward_only))
 
 
 if __name__ == "__main__":

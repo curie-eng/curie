@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from aci_protocol import (
     ErrorEvent,
@@ -25,17 +26,27 @@ from aci_protocol import (
     ReplyHandle,
     SessionStatus,
     TextDelta,
+    ToolNote,
     TurnSource,
 )
 from channel_protocol.reply import ReplyAck, ReplyEvent
-from curie_worker.approvals import ApprovalRequest, CreatedApproval, PublicationLineage
+from curie_worker.approvals import (
+    ApprovalBackendError,
+    ApprovalClient,
+    ApprovalRequest,
+    CreatedApproval,
+    PublicationCreateRequest,
+    PublicationLineage,
+)
 from curie_worker.behaviorpacks import BehaviorPacks
 from curie_worker.config import WorkerConfig
 from curie_worker.kernel import ThreadBusyError
 from curie_worker.reply_sink import ReplySink, TargetRoute, build_reply_sink
+from curie_worker.runner_client import RunnerWorkspaceSnapshot
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
+    WorkItemRequestView,
     WorkItemStartGrant,
     WorkItemStartRefused,
 )
@@ -146,6 +157,15 @@ class _WorkItems:
         if self.after_finish is not None:
             await self.after_finish()
 
+    async def get_request(self, _request_id: uuid.UUID) -> WorkItemRequestView:
+        self.calls.append("get_request")
+        return WorkItemRequestView(
+            status="running",
+            runtime_epoch=1,
+            runtime_claim_name=None,
+            runtime_sandbox_name=None,
+        )
+
     def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
         async def record(*_args: object, **_kwargs: object) -> None:
             self.calls.append(name)
@@ -154,7 +174,7 @@ class _WorkItems:
 
 
 class _Approvals:
-    async def create(self, _request: ApprovalRequest) -> CreatedApproval:
+    async def create(self, _request: ApprovalRequest, *, budget_s: float = 120) -> CreatedApproval:
         return CreatedApproval(id="appr-1", status="pending")
 
 
@@ -164,6 +184,99 @@ class _NoExistingPublication:
 
     async def get_publication_precheck_context(self, **_kwargs: object) -> None:
         return None
+
+
+class _HttpPrecheckApi(_NoExistingPublication):
+    """Serve the API refusal shape from #4299 to the real worker client."""
+
+    def __init__(self, responses: list[tuple[int, dict[str, object] | None]]) -> None:
+        self.mints: list[httpx.Request] = []
+
+        def answer(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1/internal/publications/precheck/context"
+            assert request.headers["X-Curie-Worker-Token"] == "example-worker-token"
+            self.mints.append(request)
+            status, body = responses[min(len(self.mints) - 1, len(responses) - 1)]
+            return httpx.Response(status, json=body) if body is not None else httpx.Response(status)
+
+        self.http = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+        self.client = ApprovalClient(
+            api_base_url="http://api.example.test",
+            api_key="",
+            client=self.http,
+            read_timeout_s=5.0,
+            worker_token="example-worker-token",
+        )
+
+    async def get_publication_precheck_context(self, **kwargs: object) -> PublicationContext | None:
+        return await self.client.get_publication_precheck_context(**kwargs)  # type: ignore[arg-type]
+
+    async def aclose(self) -> None:
+        await self.http.aclose()
+
+
+_PR_NOT_ADOPTED_RESPONSE: tuple[int, dict[str, object]] = (
+    409,
+    {
+        "detail": {
+            "code": "pull_request_not_adopted",
+            "message": "an earlier pull request could not be continued",
+        }
+    },
+)
+
+
+def test_real_precheck_client_raises_the_dedicated_existing_pr_refusal() -> None:
+    from curie_worker.approvals import PullRequestNotAdopted
+
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([_PR_NOT_ADOPTED_RESPONSE])
+        try:
+            with pytest.raises(PullRequestNotAdopted) as caught:
+                await publications.get_publication_precheck_context(
+                    deployment_id=DEPLOYMENT_ID,
+                    work_item_id=uuid.uuid4(),
+                    execution_request_id=uuid.uuid4(),
+                    runtime_epoch=1,
+                    queued_event_id="work-item-context-example",
+                )
+            assert type(caught.value) is PullRequestNotAdopted
+            assert len(publications.mints) == 1
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (409, {"detail": {"code": "invalid_context"}}),
+        (503, {"detail": {"code": "precheck_unavailable"}}),
+        (503, {"detail": {"code": "pull_request_not_adopted"}}),
+        (409, {"detail": "pull_request_not_adopted"}),
+    ],
+)
+def test_real_precheck_client_keeps_other_refusals_as_backend_errors(
+    status: int, body: dict[str, object]
+) -> None:
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([(status, body)])
+        try:
+            with pytest.raises(ApprovalBackendError) as caught:
+                await publications.get_publication_precheck_context(
+                    deployment_id=DEPLOYMENT_ID,
+                    work_item_id=uuid.uuid4(),
+                    execution_request_id=uuid.uuid4(),
+                    runtime_epoch=1,
+                    queued_event_id="work-item-context-example",
+                )
+            assert type(caught.value) is ApprovalBackendError
+            assert len(publications.mints) == 1
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
 
 
 class _RecordingSink:
@@ -272,9 +385,7 @@ def test_factory_turn_receives_only_authoritative_publication_context(
             def __init__(self) -> None:
                 self.mint_calls: list[dict[str, object]] = []
 
-            async def get_publication_lineage(
-                self, *_args: object
-            ) -> PublicationLineage | None:
+            async def get_publication_lineage(self, *_args: object) -> PublicationLineage | None:
                 if mint_mode == "absent":
                     return None
                 return PublicationLineage(
@@ -349,6 +460,162 @@ def test_factory_turn_receives_only_authoritative_publication_context(
     asyncio.run(exercise())
 
 
+def test_existing_pr_refusal_finishes_execute_once_without_starting_the_runner(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([_PR_NOT_ADOPTED_RESPONSE])
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=publications,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+                event = _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+
+                await h.kernel.process_event(event)
+
+                assert len(publications.mints) == 1
+                assert h.runner.opened == []
+                assert items.calls.count("start") == 1
+                assert items.calls.count("finish") == 1
+                assert items.finishes[0]["outcome"] == "failed"
+                assert items.finishes[0]["cause"] == "pull_request_not_adopted"
+                assert await h.kernel._markers.is_terminal(event.event_id)
+                assert all("runner_escalated" not in text for text in _escalations(caplog))
+                assert any("pull-request-not-adopted" in text for text in _escalations(caplog))
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("status", "code"), [(409, "invalid_context"), (503, "precheck_unavailable")]
+)
+def test_other_precheck_backend_errors_exhaust_the_existing_execute_retry_budget(
+    make_harness, status: int, code: str
+) -> None:
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([(status, {"detail": {"code": code}})])
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=publications,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+
+                await h.kernel.process_event(
+                    _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+
+                assert len(publications.mints) == h.config.max_attempts
+                assert h.runner.opened == []
+                assert items.calls.count("finish") == 1
+                assert items.finishes[0]["outcome"] == "failed"
+                assert items.finishes[0]["cause"] == "runner_escalated"
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_a_transient_generic_precheck_refusal_still_allows_a_factory_turn(
+    make_harness,
+) -> None:
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi(
+            [(409, {"detail": {"code": "invalid_context"}}), (204, None)]
+        )
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                approvals=_Approvals(),
+                publication_creator=publications,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+                h.runner.default_script = [
+                    Final(
+                        text="Requesting approval.",
+                        status=SessionStatus.AWAITING_APPROVAL,
+                        approval_summary="Run the requested command",
+                        approval_gate_kind="permission",
+                        approval_granted_tool="Bash",
+                    )
+                ]
+
+                await h.kernel.process_event(
+                    _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+
+                assert len(publications.mints) == 2
+                assert len(h.runner.opened) == 1
+                assert items.finishes == []
+                assert items.calls.count("hold_for_approval") == 1
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_existing_pr_refusal_finishes_approval_resume_without_a_new_runner_turn(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([(204, None), _PR_NOT_ADOPTED_RESPONSE])
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                approvals=_Approvals(),
+                publication_creator=publications,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+                h.runner.default_script = [
+                    Final(
+                        text="Requesting approval.",
+                        status=SessionStatus.AWAITING_APPROVAL,
+                        approval_summary="Run the requested command",
+                        approval_gate_kind="permission",
+                        approval_granted_tool="Bash",
+                    )
+                ]
+                await h.kernel.process_event(
+                    _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+                assert len(publications.mints) == 1
+                assert len(h.runner.opened) == 1
+                assert items.finishes == []
+                before = len(publications.mints)
+                resumed = _turn(
+                    f"approval-{uuid.uuid4()}-resolved",
+                    "[approval resolved] approved",
+                    placeholder="approval-placeholder",
+                )
+
+                await h.kernel.process_event(resumed)
+
+                assert len(publications.mints) - before == 1
+                assert len(h.runner.opened) == 1
+                assert items.calls.count("finish") == 1
+                assert items.finishes[0]["outcome"] == "failed"
+                assert items.finishes[0]["cause"] == "pull_request_not_adopted"
+                assert await h.kernel._markers.is_terminal(resumed.event_id)
+                assert all("runner_escalated" not in text for text in _escalations(caplog))
+                assert any("pull-request-not-adopted" in text for text in _escalations(caplog))
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
 @pytest.mark.parametrize("completion_write_fails", [False, True])
 def test_work_item_approval_resume_emits_no_requesting_turn_reply(
     make_harness, completion_write_fails: bool
@@ -358,8 +625,8 @@ def test_work_item_approval_resume_emits_no_requesting_turn_reply(
             binding=_Binding(),
             workspace_factory=_Workspace,
             approvals=_Approvals(),
-
-        publication_creator=_NoExistingPublication(),) as h:
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             work_items = _WorkItems()
             h.kernel._work_items = work_items
             request_id = uuid.uuid4()
@@ -416,8 +683,8 @@ def test_github_work_item_reaches_the_model_without_chat_replies(make_harness) -
                 binding=_Binding(),
                 workspace_factory=_Workspace,
                 sink=sink,
-
-            publication_creator=_NoExistingPublication(),) as h:
+                publication_creator=_NoExistingPublication(),
+            ) as h:
                 work_items = _WorkItems()
                 h.kernel._work_items = work_items
                 h.runner.default_script = [
@@ -546,6 +813,42 @@ def test_credit_exhausted_escalation_finishes_with_its_cause_and_message(
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "model_credit_exhausted"
             assert finish["detail"] == message
+
+    asyncio.run(exercise())
+
+
+def test_model_unreachable_on_every_attempt_finishes_with_its_cause_and_message(
+    make_harness,
+) -> None:
+    """#4333: an outage longer than the retries names the cause, not ``unclassified``."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+            max_attempts=3,
+        ) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            message = "model error: server_error: API Error: Connection refused (ECONNREFUSED)"
+            h.runner.default_script = [
+                ErrorEvent(message=message, classification="model-unreachable"),
+                Final(text="", status=SessionStatus.CLASSIFIED_FAILURE),
+            ]
+            request_id = uuid.uuid4()
+            prompt = f"Resolve {ISSUE_URL}"
+
+            await h.kernel.process_event(_turn(f"work-item-{request_id}-execute-1", prompt))
+
+            # Retryable with no side effect: every attempt is spent first.
+            assert h.runner.opened == [prompt, prompt, prompt]
+            assert work_items.calls.count("finish") == 1
+            finish = work_items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "model_unreachable"
+            assert isinstance(finish["detail"], str)
+            assert "API Error: Connection refused (ECONNREFUSED)" in finish["detail"]
 
     asyncio.run(exercise())
 
@@ -703,13 +1006,228 @@ def test_finish_refused_as_cancelled_releases_the_sandbox_claim(make_harness) ->
     asyncio.run(exercise())
 
 
+# --- #4191: a publication refused because the run was cancelled settles ---------
+
+PUBLISH_TOOL = "mcp__curie__publish_changes"
+_CANCELLED_PUBLICATION_BODY = {
+    "detail": {
+        "code": "publication.work_item_cancelled",
+        "message": "the work item request was cancelled",
+    }
+}
+# A FastAPI request-validation 422: the detail is a list, not a coded dict.
+_UNPROCESSABLE_PUBLICATION_BODY = {
+    "detail": [{"loc": ["body", "base_sha"], "msg": "field required", "type": "missing"}]
+}
+
+
+class _HttpPublicationApi(_NoExistingPublication):
+    """Publication creator whose create goes through the real ``ApprovalClient``.
+
+    The API answer is served by an ``httpx.MockTransport``, so the
+    ``ApprovalBackendError`` and its ``refusal`` are built by
+    ``ApprovalClient.create_publication`` in curie_worker/approvals.py exactly as
+    a live 409 or 422 builds them.
+    """
+
+    def __init__(self, status: int, body: dict[str, object]) -> None:
+        self.creates = 0
+        self._http = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _req: httpx.Response(status, json=body))
+        )
+        self._client = ApprovalClient(
+            api_base_url="http://api.example.test",
+            api_key="",
+            client=self._http,
+            read_timeout_s=5.0,
+            worker_token="example-worker-token",
+        )
+
+    async def create_publication(
+        self, request: PublicationCreateRequest, *, budget_s: float = 120
+    ) -> object:
+        self.creates += 1
+        return await self._client.create_publication(request, budget_s=budget_s)
+
+    async def aclose(self) -> None:
+        await self._http.aclose()
+
+
+class _CodedFinishRefusal(_WorkItems):
+    """``finish`` is refused with ``code``; the claims live at that moment are kept."""
+
+    def __init__(self, code: str, fake_k8s: object) -> None:
+        super().__init__()
+        self.code = code
+        self.fake_k8s = fake_k8s
+        self.claims_at_finish: list[str] = []
+
+    async def finish(self, _request_id: uuid.UUID, **kwargs: object) -> None:
+        self.calls.append("finish")
+        self.finishes.append(kwargs)
+        self.claims_at_finish = list(self.fake_k8s.claims)  # type: ignore[attr-defined]
+        raise WorkItemConflict(self.code)
+
+
+def _patch_publication_snapshot(h: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def snapshot(*_args: object, **_kwargs: object) -> RunnerWorkspaceSnapshot:
+        return RunnerWorkspaceSnapshot(
+            repo_full_name=WORK_ITEM_REPO,
+            base_sha="a1" * 20,
+            patch=b"diff --git a/src/widget.py b/src/widget.py\n",
+            changed_paths=("src/widget.py",),
+            contains_workflow_files=False,
+            publication_title="Fix the widget parser",
+            publication_body="Fixes the parser.",
+        )
+
+    monkeypatch.setattr(h.kernel._runner, "snapshot", snapshot)  # type: ignore[attr-defined]
+    monkeypatch.setattr(
+        "curie_worker.kernel.validate_snapshot_against_base",
+        lambda *_args, **_kwargs: None,
+    )
+
+
+_PUBLISH_TURN = [
+    ToolNote(text=f"running tool {PUBLISH_TOOL}", tool=PUBLISH_TOOL),
+    Final(
+        text="Ready to publish",
+        status=SessionStatus.AWAITING_APPROVAL,
+        approval_summary="Publish the change",
+        approval_gate_kind="permission",
+        approval_granted_tool=PUBLISH_TOOL,
+    ),
+]
+
+
+def _escalations(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "escalating event" in r.getMessage()]
+
+
+def test_publication_refused_as_cancelled_settles_and_releases_the_claim(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#4191 AC1: the API refuses the publication 409 work_item_cancelled and then
+    refuses the approval_create_failed finish the same way. The delivery settles
+    on this pass, releases the run's claim, and flags nobody."""
+
+    caplog.set_level("INFO", logger="curie_worker.kernel")
+
+    async def exercise() -> None:
+        publications = _HttpPublicationApi(409, _CANCELLED_PUBLICATION_BODY)
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=publications,
+            ) as h:
+                work_items = _CodedFinishRefusal("work_item_cancelled", h.fake_k8s)
+                h.kernel._work_items = work_items
+                _patch_publication_snapshot(h, monkeypatch)
+                h.runner.turn_scripts = [list(_PUBLISH_TURN)]
+                h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
+                request_id = uuid.uuid4()
+
+                await h.kernel.process_event(
+                    _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+
+                assert publications.creates == 1
+                assert work_items.calls.count("finish") == 1
+                assert work_items.finishes[0]["cause"] == "approval_create_failed"
+                assert len(work_items.claims_at_finish) == 1
+                assert work_items.claims_at_finish[0] in h.fake_k8s.deleted_claims
+                assert h.fake_k8s.claims == {}
+                assert _escalations(caplog) == []
+                assert any(
+                    "approval create refused for cancelled work item" in r.getMessage()
+                    for r in caplog.records
+                )
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_publication_refused_as_cancelled_still_raises_on_a_stale_owner_finish(
+    make_harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#4191 AC2: only work_item_cancelled and publication_pending settle the
+    approval_create_failed finish; any other refusal still leaves the entry."""
+
+    async def exercise() -> None:
+        publications = _HttpPublicationApi(409, _CANCELLED_PUBLICATION_BODY)
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=publications,
+            ) as h:
+                work_items = _CodedFinishRefusal("stale_owner", h.fake_k8s)
+                h.kernel._work_items = work_items
+                _patch_publication_snapshot(h, monkeypatch)
+                h.runner.turn_scripts = [list(_PUBLISH_TURN)]
+                h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
+
+                with pytest.raises(WorkItemConflict) as raised:
+                    await h.kernel.process_event(
+                        _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                    )
+
+                assert raised.value.code == "stale_owner"
+                assert work_items.calls.count("finish") == 1
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_publication_unprocessable_still_escalates_approval_create_failed(
+    make_harness, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#4191 AC2: a 422 publication create is a real failure, still flagged."""
+
+    caplog.set_level("INFO", logger="curie_worker.kernel")
+
+    async def exercise() -> None:
+        publications = _HttpPublicationApi(422, _UNPROCESSABLE_PUBLICATION_BODY)
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=publications,
+            ) as h:
+                work_items = _WorkItems()
+                h.kernel._work_items = work_items
+                _patch_publication_snapshot(h, monkeypatch)
+                h.runner.turn_scripts = [list(_PUBLISH_TURN)]
+                h.runner.default_script = [Final(text="must not run", status=SessionStatus.DONE)]
+
+                await h.kernel.process_event(
+                    _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+
+                assert publications.creates == 1
+                assert [f["cause"] for f in work_items.finishes] == ["approval_create_failed"]
+                escalations = _escalations(caplog)
+                assert escalations, "a 422 publication create must still be flagged"
+                assert any("approval-create-failed" in text for text in escalations)
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_approval_hold_keeps_its_sandbox_claim(make_harness) -> None:
     """Awaiting approval is not a terminus: the resume turn still needs the route."""
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [
                 Final(
@@ -738,8 +1256,11 @@ def test_cancelled_work_item_deletes_its_suspended_sandbox_claim(make_harness, p
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             work_items = _WorkItems()
             h.kernel._work_items = work_items
             h.runner.default_script = [
@@ -788,8 +1309,11 @@ def test_work_item_boot_env_carries_the_configured_turn_budget(make_harness) -> 
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             request_id = uuid.uuid4()
@@ -811,8 +1335,11 @@ def test_ordinary_chat_boot_env_carries_no_turn_budget(make_harness) -> None:
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.runner.default_script = [Final(text="Noted.", status=SessionStatus.DONE)]
 
             await h.kernel.process_event(
@@ -843,8 +1370,11 @@ def test_work_item_max_turns_escalation_names_the_work_item_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = _max_turns_script()
             request_id = uuid.uuid4()
@@ -871,8 +1401,11 @@ def test_chat_max_turns_escalation_names_the_runner_budget(make_harness) -> None
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.runner.default_script = _max_turns_script()
 
             await h.kernel.process_event(
@@ -897,8 +1430,11 @@ def test_work_item_replaces_a_chat_sandbox_booted_without_its_turn_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
 
@@ -923,8 +1459,11 @@ def test_chat_replaces_a_work_item_sandbox_booted_with_the_factory_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
 
@@ -950,10 +1489,10 @@ def _fail_settled_release(h: object) -> None:
     route is exactly what the #3071 turn budget fence guards.
     """
 
-    def release(_thread_key: str) -> bool:
+    def release_if_claim(_thread_key: str, _claim_name: str) -> bool:
         raise RuntimeError("control plane unavailable")
 
-    h.substrate.release = release  # type: ignore[attr-defined]
+    h.substrate.release_if_claim = release_if_claim  # type: ignore[attr-defined]
 
 
 def test_consecutive_work_items_replace_the_sandbox_even_with_the_same_budget(
@@ -965,8 +1504,11 @@ def test_consecutive_work_items_replace_the_sandbox_even_with_the_same_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             _fail_settled_release(h)
@@ -995,8 +1537,11 @@ def test_chat_steers_a_live_work_item_turn_instead_of_replacing_it(make_harness)
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             _fail_settled_release(h)
@@ -1023,8 +1568,11 @@ def test_chat_never_opens_a_turn_on_a_runner_with_the_factory_budget(
 
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, work_item_max_turns=5
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            work_item_max_turns=5,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             h.kernel._work_items = _WorkItems()
             h.runner.default_script = [Final(text="Done.", status=SessionStatus.DONE)]
             _fail_settled_release(h)
@@ -1127,8 +1675,11 @@ def test_terminate_wake_for_an_orphan_tears_down_its_stored_claim(make_harness) 
 def test_owns_work_item_tracks_live_and_held_runs(make_harness) -> None:
     async def exercise() -> None:
         async with make_harness(
-            binding=_Binding(), workspace_factory=_Workspace, approvals=_Approvals()
-        , publication_creator=_NoExistingPublication()) as h:
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            approvals=_Approvals(),
+            publication_creator=_NoExistingPublication(),
+        ) as h:
             work_items = _WorkItems()
             h.kernel._work_items = work_items
             running = uuid.uuid4()
@@ -1371,5 +1922,34 @@ def test_a_runner_whose_caller_token_still_fits_is_adopted(
             await h.kernel.process_event(_turn(f"slack-{uuid.uuid4()}", "and again"))
 
             assert len(h.fake_k8s.claim_envs) == 1
+
+    asyncio.run(exercise())
+
+
+def test_usage_limited_factory_run_finishes_with_its_cause_without_retry(
+    make_harness,
+) -> None:
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+        ) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            message = "You've hit your session limit · resets 3pm (UTC)"
+            h.runner.default_script = [
+                ErrorEvent(message=message, classification="model-usage-limited"),
+                Final(text="", status=SessionStatus.CLASSIFIED_FAILURE),
+            ]
+            request_id = uuid.uuid4()
+            await h.kernel.process_event(
+                _turn(f"work-item-{request_id}-execute-1", f"Resolve {ISSUE_URL}")
+            )
+            assert len(h.runner.opened) == 1, "a subscription reset window must not be retried"
+            assert work_items.calls.count("finish") == 1
+            assert work_items.finishes[0]["outcome"] == "failed"
+            assert work_items.finishes[0]["cause"] == "model_usage_limited"
+            assert work_items.finishes[0]["detail"] == message
 
     asyncio.run(exercise())

@@ -21,7 +21,8 @@
           "idle",
           "interrupted",
           "deadline_halted",
-          "capacity_wait_expired"
+          "capacity_wait_expired",
+          "stale_owner"
         ],
         "service.name": [
           "curie-worker"
@@ -30,7 +31,7 @@
           "worker"
         ]
       },
-      "cardinality_bound": 306,
+      "cardinality_bound": 340,
       "description": "Terminal turns for one agent. Each process admits at most 32 distinct slugs; further slugs, non-slugs, and the reserved names other and unbound share other. A turn with no resolved agent is unbound. The cap is per process, so a fleet query can still fold a slug into other on one worker.",
       "monotonic": true,
       "type": "counter",
@@ -350,7 +351,6 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
-          "/hooks/{agent_id}/{hook}/support",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -425,7 +425,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 952,
+      "cardinality_bound": 944,
       "description": "Active HTTP server requests.",
       "monotonic": false,
       "type": "up_down_counter",
@@ -496,7 +496,6 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
-          "/hooks/{agent_id}/{hook}/support",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -578,7 +577,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4760,
+      "cardinality_bound": 4720,
       "description": "HTTP server requests.",
       "monotonic": true,
       "type": "counter",
@@ -649,7 +648,6 @@
           "/health",
           "/ready",
           "/hooks/{agent_id}/{hook}",
-          "/hooks/{agent_id}/{hook}/support",
           "/langfuse/traces",
           "/langfuse/traces/{trace_id}",
           "/langfuse/traces/{trace_id}/eval-case",
@@ -731,7 +729,7 @@
           "OTHER"
         ]
       },
-      "cardinality_bound": 4760,
+      "cardinality_bound": 4720,
       "description": "HTTP server request duration.",
       "monotonic": false,
       "type": "histogram",
@@ -986,7 +984,8 @@
           "runner-timeout",
           "workspace-error",
           "sandbox-terminated",
-          "sandbox-capacity"
+          "sandbox-capacity",
+          "model-unreachable"
         ],
         "service.name": [
           "curie-worker"
@@ -996,7 +995,7 @@
           "eval"
         ]
       },
-      "cardinality_bound": 14,
+      "cardinality_bound": 16,
       "description": "Bounded queue redelivery and in-process turn retries.",
       "monotonic": true,
       "type": "counter",
@@ -1263,6 +1262,7 @@
           "failed",
           "orphan-cleaned",
           "observed",
+          "fenced",
           "terminated",
           "expiry-unsupported",
           "race-lost",
@@ -1279,7 +1279,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 152,
+      "cardinality_bound": 160,
       "description": "Sandbox claim duration.",
       "monotonic": false,
       "type": "histogram",
@@ -1306,6 +1306,7 @@
           "failed",
           "orphan-cleaned",
           "observed",
+          "fenced",
           "terminated",
           "expiry-unsupported",
           "race-lost",
@@ -1322,7 +1323,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 152,
+      "cardinality_bound": 160,
       "description": "Failed and orphan sandbox cleanup.",
       "monotonic": true,
       "type": "counter",
@@ -1349,6 +1350,7 @@
           "failed",
           "orphan-cleaned",
           "observed",
+          "fenced",
           "terminated",
           "expiry-unsupported",
           "race-lost",
@@ -1365,7 +1367,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 152,
+      "cardinality_bound": 160,
       "description": "Sandbox lifecycle outcomes.",
       "monotonic": true,
       "type": "counter",
@@ -1392,6 +1394,7 @@
           "failed",
           "orphan-cleaned",
           "observed",
+          "fenced",
           "terminated",
           "expiry-unsupported",
           "race-lost",
@@ -1408,7 +1411,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 152,
+      "cardinality_bound": 160,
       "description": "Sandbox release duration.",
       "monotonic": false,
       "type": "histogram",
@@ -1435,6 +1438,7 @@
           "failed",
           "orphan-cleaned",
           "observed",
+          "fenced",
           "terminated",
           "expiry-unsupported",
           "race-lost",
@@ -1451,7 +1455,7 @@
           "curie-worker"
         ]
       },
-      "cardinality_bound": 152,
+      "cardinality_bound": 160,
       "description": "Sandbox resume duration.",
       "monotonic": false,
       "type": "histogram",
@@ -1690,7 +1694,8 @@
           "idle",
           "interrupted",
           "deadline_halted",
-          "capacity_wait_expired"
+          "capacity_wait_expired",
+          "stale_owner"
         ],
         "service.name": [
           "curie-api",
@@ -1707,7 +1712,7 @@
           "eval"
         ]
       },
-      "cardinality_bound": 216,
+      "cardinality_bound": 240,
       "description": "Turns reaching a terminal result.",
       "monotonic": true,
       "type": "counter",
@@ -1724,7 +1729,8 @@
           "idle",
           "interrupted",
           "deadline_halted",
-          "capacity_wait_expired"
+          "capacity_wait_expired",
+          "stale_owner"
         ],
         "service.name": [
           "curie-api",
@@ -1741,7 +1747,7 @@
           "eval"
         ]
       },
-      "cardinality_bound": 216,
+      "cardinality_bound": 240,
       "description": "End to end turn duration.",
       "monotonic": false,
       "type": "histogram",

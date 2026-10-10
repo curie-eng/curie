@@ -75,6 +75,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
+  # A claim that never became Ready logs the runner's last 8 KB before cleanup.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list"]
@@ -276,6 +280,8 @@ spec:
               value: {{ .Values.worker.publication.patchMaxBytes | quote }}
             - name: CURIE_PUBLICATION_PROTECTED_PATHS
               value: {{ .Values.worker.publication.protectedPaths | default list | toJson | quote }}
+            - name: CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS
+              value: {{ .Values.worker.publication.allowDependencyAdditions | default false | quote }}
             - name: CURIE_PUBLICATION_RESULT_MAX_ATTEMPTS
               value: {{ .Values.worker.publication.resultMaxAttempts | quote }}
             - name: CURIE_PUBLICATION_RECONCILE_MAX_ATTEMPTS

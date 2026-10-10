@@ -2470,6 +2470,26 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot)",
+              "id": "reviewer_model",
+              "long": "reviewer-model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the reviewer model override back to the credential default",
+              "id": "clear_reviewer_model",
+              "long": "clear-reviewer-model",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Pin this thinking depth (e.g. `disabled`, `adaptive`, `enabled:2000`)",
               "id": "thinking",
               "long": "thinking",
@@ -3790,7 +3810,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Print the commands that would run and exit without executing",
+              "help": "Read Helm history and print the selected revision and commands without probing the live schema or running the rollback",
               "id": "dry_run",
               "long": "dry-run",
               "positional": false,
@@ -3802,7 +3822,7 @@ export const commandManifest = {
             }
           ],
           "hidden": false,
-          "long_about": "Roll the release back to the newest revision that is actually known good.\n\nA bare `helm rollback` targets the immediately preceding revision. On a cluster with no `runsc` RuntimeClass that is the wrong one: `cluster up` records a FAILED revision before its successful gVisor-off retry, so the history alternates failed/superseded and the preceding revision is a failed one -- a manifest helm never finished applying.\n\nThis verb skips every revision whose status is not `deployed` or `superseded` and rolls back to the newest one below the current revision that is, printing which revisions it passed over. See issue #1899.",
+          "long_about": "Roll the release back to the newest revision that is actually known good.\n\nA bare `helm rollback` targets the immediately preceding revision. On a cluster with no `runsc` RuntimeClass that is the wrong one: `cluster up` records a FAILED revision before its successful gVisor-off retry, so the history alternates failed/superseded and the preceding revision is a failed one, a manifest Helm never finished applying.\n\nWhen the newest revision is above the newest `deployed` serving revision with a status other than `deployed` or `superseded`, this verb rolls back to that serving revision. Otherwise it selects the newest prior `deployed` or `superseded` revision, printing which ineligible revisions it passed over. See issues #1899 and #4335. A dry run reads Helm history and prints the resolved target without probing the live schema or running the rollback.",
           "name": "rollback"
         },
         {
@@ -3881,6 +3901,14 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Take over this exact holder after verifying its CLI and Helm action have stopped. Refuses while a release hook Job is running; recovers an orphaned pending upgrade by rolling back to the serving revision",
+              "id": "take_over",
+              "long": "take-over",
+              "positional": false,
               "required": false
             }
           ],
@@ -5355,6 +5383,26 @@ export const commandManifest = {
               "help": "Clear the model override back to the platform default",
               "id": "clear_model",
               "long": "clear-model",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Pin the reviewer model (forwarded as CURIE_REVIEWER_MODEL at boot)",
+              "id": "reviewer_model",
+              "long": "reviewer-model",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Clear the reviewer model override back to the credential default",
+              "id": "clear_reviewer_model",
+              "long": "clear-reviewer-model",
               "positional": false,
               "possible_values": [
                 "true",
@@ -7164,11 +7212,8 @@ export const commandManifest = {
               "required": false
             },
             {
-              "default_values": [
-                "z-ai/glm-5.3-flash"
-              ],
               "global": false,
-              "help": "Model id installed by cluster up",
+              "help": "Model id installed by cluster up. Defaults to Claude Sonnet for Anthropic credentials, or GLM Flash for OpenRouter credentials",
               "id": "model",
               "long": "model",
               "positional": false,
@@ -7807,11 +7852,11 @@ export const commandManifest = {
       "name": "dev",
       "subcommands": [
         {
-          "about": "Run the cheap pull request gates selected for the committed change",
+          "about": "Check the committed change before opening or updating a pull request",
           "args": [
             {
               "global": false,
-              "help": "Run the fast tier. Required; no full tier is provided",
+              "help": "Run only the fast tier; the full tier is the default",
               "id": "fast",
               "long": "fast",
               "positional": false,
@@ -7834,7 +7879,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Print the selected CI commands without running them",
+              "help": "Print the selected checks without running them",
               "id": "dry_run",
               "long": "dry-run",
               "positional": false,
@@ -7842,6 +7887,22 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File containing the proposed pull request body",
+              "id": "pr_body",
+              "long": "pr-body",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Proposed pull request title used by the body guard",
+              "id": "title",
+              "long": "title",
+              "positional": false,
               "required": false
             }
           ],

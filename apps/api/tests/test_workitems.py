@@ -87,9 +87,7 @@ async def _request(
         work_item_id=item.id,
         request_id=request_id or uuid.uuid4(),
         wait_deadline=(
-            deadline
-            if deadline is not None
-            else await _now(session) + timedelta(hours=1)
+            deadline if deadline is not None else await _now(session) + timedelta(hours=1)
         ),
         expected_work_item_version=item.version,
     )
@@ -208,9 +206,7 @@ async def _grant_opened_pull_request(
         github_installation_id=item.github_installation_id,
     )
     deployment_id = await session.scalar(
-        text(
-            "SELECT deployment_id FROM curie.thread_publication_lineages WHERE id = :id"
-        ),
+        text("SELECT deployment_id FROM curie.thread_publication_lineages WHERE id = :id"),
         {"id": lineage_id},
     )
     approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
@@ -347,9 +343,7 @@ def test_work_item_identity_replay_and_conflicting_provenance(clean_db: None) ->
         }
         for variant in variants:
             conflict = _conflict(
-                await workitems.create_or_get_work_item(
-                    session, **(base | variant)
-                ),
+                await workitems.create_or_get_work_item(session, **(base | variant)),
                 "identity_mismatch",
             )
             assert conflict.work_item_id == created.work_item.id
@@ -401,20 +395,21 @@ def test_concurrent_duplicate_work_item_intake_returns_one_replay(clean_db: None
 
     results = asyncio.run(race())
     assert all(isinstance(result, workitems.WorkItemOutcome) for result in results)
-    outcomes = [
-        result for result in results if isinstance(result, workitems.WorkItemOutcome)
-    ]
+    outcomes = [result for result in results if isinstance(result, workitems.WorkItemOutcome)]
     assert sorted(outcome.replayed for outcome in outcomes) == [False, True]
     assert len({outcome.work_item.id for outcome in outcomes}) == 1
     assert all(outcome.work_item.version == 1 for outcome in outcomes)
 
     async def verify(session: AsyncSession) -> None:
-        assert await session.scalar(
-            text(
-                "SELECT count(*) FROM curie.work_items "
-                "WHERE github_repository_id = 101 AND github_issue_number = 2573"
+        assert (
+            await session.scalar(
+                text(
+                    "SELECT count(*) FROM curie.work_items "
+                    "WHERE github_repository_id = 101 AND github_issue_number = 2573"
+                )
             )
-        ) == 1
+            == 1
+        )
 
     with_session(verify)
 
@@ -485,17 +480,21 @@ def test_request_replay_fences_and_sequential_lifecycle(clean_db: None) -> None:
         )
         assert (late_start.work_item_version, late_start.request_version) == (2, 1)
         unchanged_waiting = (
-            await session.execute(
-                text(
-                    "SELECT w.version AS work_version, r.status, "
-                    "r.version AS request_version, r.wait_deadline, r.started_at, "
-                    "r.execution_deadline FROM curie.work_items w "
-                    "JOIN curie.execution_requests r ON r.work_item_id = w.id "
-                    "WHERE w.id = :id AND r.id = :request_id"
-                ),
-                {"id": item.id, "request_id": request.id},
+            (
+                await session.execute(
+                    text(
+                        "SELECT w.version AS work_version, r.status, "
+                        "r.version AS request_version, r.wait_deadline, r.started_at, "
+                        "r.execution_deadline FROM curie.work_items w "
+                        "JOIN curie.execution_requests r ON r.work_item_id = w.id "
+                        "WHERE w.id = :id AND r.id = :request_id"
+                    ),
+                    {"id": item.id, "request_id": request.id},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         assert (
             unchanged_waiting.work_version,
             unchanged_waiting.status,
@@ -632,21 +631,28 @@ def test_concurrent_request_id_reuse_across_work_items_is_an_identity_conflict(
 
     async def verify(session: AsyncSession) -> None:
         rows = (
-            await session.execute(
-                text(
-                    "SELECT id, version, next_sequence FROM curie.work_items "
-                    "WHERE id IN (:first, :second)"
-                ),
-                {"first": first.id, "second": second.id},
+            (
+                await session.execute(
+                    text(
+                        "SELECT id, version, next_sequence FROM curie.work_items "
+                        "WHERE id IN (:first, :second)"
+                    ),
+                    {"first": first.id, "second": second.id},
+                )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
         state = {row.id: (row.version, row.next_sequence) for row in rows}
         assert state[winners[0].work_item.id] == (2, 2)
         assert state[losers[0].work_item_id] == (1, 1)
-        assert await session.scalar(
-            text("SELECT count(*) FROM curie.execution_requests WHERE id = :id"),
-            {"id": request_id},
-        ) == 1
+        assert (
+            await session.scalar(
+                text("SELECT count(*) FROM curie.execution_requests WHERE id = :id"),
+                {"id": request_id},
+            )
+            == 1
+        )
 
     with_session(verify)
 
@@ -691,17 +697,21 @@ def test_start_terminal_transitions_and_deadlines_are_fenced(clean_db: None) -> 
             2,
         )
         unchanged_running = (
-            await session.execute(
-                text(
-                    "SELECT w.version AS work_version, r.status, "
-                    "r.version AS request_version, r.started_at, "
-                    "r.execution_deadline, r.terminal_at, r.terminal_cause "
-                    "FROM curie.work_items w JOIN curie.execution_requests r "
-                    "ON r.work_item_id = w.id WHERE w.id = :id AND r.id = :request_id"
-                ),
-                {"id": item.id, "request_id": request.id},
+            (
+                await session.execute(
+                    text(
+                        "SELECT w.version AS work_version, r.status, "
+                        "r.version AS request_version, r.started_at, "
+                        "r.execution_deadline, r.terminal_at, r.terminal_cause "
+                        "FROM curie.work_items w JOIN curie.execution_requests r "
+                        "ON r.work_item_id = w.id WHERE w.id = :id AND r.id = :request_id"
+                    ),
+                    {"id": item.id, "request_id": request.id},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         assert (
             unchanged_running.work_version,
             unchanged_running.status,
@@ -804,9 +814,7 @@ def test_start_terminal_transitions_and_deadlines_are_fenced(clean_db: None) -> 
 
 
 @pytest.mark.parametrize("mismatch", ["agent", "conversation", "repository"])
-def test_publication_linkage_validates_lineage_identity(
-    clean_db: None, mismatch: str
-) -> None:
+def test_publication_linkage_validates_lineage_identity(clean_db: None, mismatch: str) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent(session)
         running = await _start(
@@ -817,9 +825,7 @@ def test_publication_linkage_validates_lineage_identity(
             session,
             await _agent(session, "other-agent") if mismatch == "agent" else agent_id,
             conversation=(
-                "slack:C0EXAMPLE1:1700000000.000200"
-                if mismatch == "conversation"
-                else CONVERSATION
+                "slack:C0EXAMPLE1:1700000000.000200" if mismatch == "conversation" else CONVERSATION
             ),
             repo="acme-corp/another-bot" if mismatch == "repository" else REPO,
         )
@@ -906,9 +912,7 @@ def test_publication_linkage_refreshes_cached_verified_github_identity(
         assert running.request is not None
         lineage_id = await _lineage(session, agent_id)
         cached = await session.scalar(
-            select(ThreadPublicationLineage).where(
-                ThreadPublicationLineage.id == lineage_id
-            )
+            select(ThreadPublicationLineage).where(ThreadPublicationLineage.id == lineage_id)
         )
         assert cached is not None
         assert (cached.github_repository_id, cached.github_installation_id) == (
@@ -958,10 +962,13 @@ def test_publication_linkage_refreshes_cached_verified_github_identity(
             "lineage_mismatch",
         )
         assert (conflict.work_item_version, conflict.request_version) == (2, 2)
-        assert await session.scalar(
-            text("SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"),
-            {"id": running.work_item.id},
-        ) is None
+        assert (
+            await session.scalar(
+                text("SELECT publication_lineage_id FROM curie.work_items WHERE id = :id"),
+                {"id": running.work_item.id},
+            )
+            is None
+        )
 
     with_session(body)
 
@@ -987,9 +994,7 @@ def test_publication_link_is_unique_idempotent_and_restricts_deletion(
             )
         ).one()
         assert tuple(historical_identity) == ("merged", None, None)
-        waiting = await _request(
-            session, (await _item(session, agent_id)).work_item
-        )
+        waiting = await _request(session, (await _item(session, agent_id)).work_item)
         assert waiting.request is not None
         _conflict(
             await workitems.link_publication_lineage(
@@ -1070,10 +1075,239 @@ def test_publication_link_is_unique_idempotent_and_restricts_deletion(
             )
             await session.commit()
         await session.rollback()
-        assert await session.scalar(
-            text("SELECT count(*) FROM curie.thread_publication_lineages WHERE id = :id"),
-            {"id": lineage_id},
-        ) == 1
+        assert (
+            await session.scalar(
+                text("SELECT count(*) FROM curie.thread_publication_lineages WHERE id = :id"),
+                {"id": lineage_id},
+            )
+            == 1
+        )
+
+    with_session(body)
+
+
+async def _nonrunning_publication_link_case(
+    session: AsyncSession, *, status: str = "cancellation_requested"
+) -> tuple[workitems.WorkItemOutcome, uuid.UUID]:
+    running = await _request(session, (await _item(session, await _agent(session))).work_item)
+    assert running.request is not None
+    await _attach_own_publication(
+        session, running.work_item.id, running.request.id, status="succeeded"
+    )
+    lineage_id = await session.scalar(
+        text("SELECT lineage_id FROM curie.publications WHERE execution_request_id = :id"),
+        {"id": running.request.id},
+    )
+    assert isinstance(lineage_id, uuid.UUID)
+    await session.execute(
+        text(
+            "UPDATE curie.thread_publication_lineages SET github_repository_id = 101, "
+            "github_installation_id = 202, github_pr_node_id = 'PR_example_4298', "
+            "base_ref = 'main' WHERE id = :id"
+        ),
+        {"id": lineage_id},
+    )
+    await session.execute(
+        text(
+            "UPDATE curie.execution_requests SET status = :status, terminal_cause = :cause, "
+            "execution_attempts = 1, "
+            "started_at = clock_timestamp() - interval '2 hours', "
+            "execution_deadline = clock_timestamp() - interval '1 hour', "
+            "terminal_at = CASE WHEN :terminal THEN clock_timestamp() ELSE NULL END, "
+            "termination_observation = CASE WHEN :terminal THEN :observation ELSE NULL END "
+            "WHERE id = :id"
+        ),
+        {
+            "id": running.request.id,
+            "status": status,
+            "terminal": status != "cancellation_requested",
+            "cause": "owner_lost" if status == "failed" else "issue_cancelled",
+            "observation": FIXTURE_TERMINATION,
+        },
+    )
+    await session.commit()
+    return running, lineage_id
+
+
+@pytest.mark.parametrize("status", ["cancellation_requested", "cancelled", "failed"])
+def test_nonrunning_publisher_can_link_its_existing_pr_after_its_deadline(
+    clean_db: None, status: str
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        running, lineage_id = await _nonrunning_publication_link_case(session, status=status)
+        assert running.request is not None
+        before_request = (
+            (
+                await session.execute(
+                    text("SELECT * FROM curie.execution_requests WHERE id = :id"),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        before_publication = (
+            (
+                await session.execute(
+                    text("SELECT * FROM curie.publications WHERE execution_request_id = :id"),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+        linked = await workitems.link_publication_lineage(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=running.request.id,
+            publication_lineage_id=lineage_id,
+            expected_work_item_version=running.work_item.version,
+            expected_request_version=running.request.version,
+        )
+
+        assert isinstance(linked, workitems.WorkItemOutcome), linked
+        assert linked.work_item.publication_lineage_id == lineage_id
+        assert linked.work_item.version == running.work_item.version + 1
+        assert linked.request is not None
+        assert (linked.request.status, linked.request.version) == (status, running.request.version)
+        assert dict(
+            (
+                await session.execute(
+                    text("SELECT * FROM curie.execution_requests WHERE id = :id"),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        ) == dict(before_request)
+        assert dict(
+            (
+                await session.execute(
+                    text("SELECT * FROM curie.publications WHERE execution_request_id = :id"),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        ) == dict(before_publication)
+        replay = await workitems.link_publication_lineage(
+            session,
+            work_item_id=linked.work_item.id,
+            request_id=linked.request.id,
+            publication_lineage_id=lineage_id,
+            expected_work_item_version=linked.work_item.version,
+            expected_request_version=linked.request.version,
+        )
+        assert isinstance(replay, workitems.WorkItemOutcome), replay
+        assert replay.replayed is True
+        assert replay.work_item.version == linked.work_item.version
+
+    with_session(body)
+
+
+@pytest.mark.parametrize(
+    ("refusal", "code"),
+    [
+        ("cancelled_item", "work_item_cancelled"),
+        ("stale_item", "stale_version"),
+        ("stale_request", "stale_version"),
+        ("no_own_publication", "publication_ineligible"),
+        ("closed", "publication_ineligible"),
+        ("merged", "publication_ineligible"),
+        ("no_pr", "publication_ineligible"),
+        ("another_owner", "lineage_already_owned"),
+        ("repository_id", "lineage_mismatch"),
+        ("installation_id", "lineage_mismatch"),
+    ],
+)
+def test_nonrunning_publication_link_preserves_cancellation_ownership_and_version_guards(
+    clean_db: None, refusal: str, code: workitems.ConflictCode
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        running, lineage_id = await _nonrunning_publication_link_case(session)
+        assert running.request is not None
+        expected_item_version = running.work_item.version
+        expected_request_version = running.request.version
+        if refusal == "cancelled_item":
+            await session.execute(
+                text("UPDATE curie.work_items SET cancelled_at = clock_timestamp() WHERE id = :id"),
+                {"id": running.work_item.id},
+            )
+        elif refusal == "stale_item":
+            expected_item_version -= 1
+        elif refusal == "stale_request":
+            expected_request_version -= 1
+        elif refusal == "no_own_publication":
+            await session.execute(
+                text(
+                    "UPDATE curie.publications SET execution_request_id = NULL "
+                    "WHERE lineage_id = :id"
+                ),
+                {"id": lineage_id},
+            )
+        elif refusal == "another_owner":
+            other = await _item(
+                session, running.work_item.agent_id, issue=2574, conversation="other-conversation"
+            )
+            await session.execute(
+                text(
+                    "UPDATE curie.work_items SET publication_lineage_id = :lineage WHERE id = :id"
+                ),
+                {"id": other.work_item.id, "lineage": lineage_id},
+            )
+        else:
+            changes = {
+                "closed": "status = 'closed'",
+                "merged": "status = 'merged'",
+                "no_pr": (
+                    "pr_number = NULL, pr_url = NULL, head_sha = NULL, "
+                    "github_repository_id = NULL, github_installation_id = NULL, "
+                    "github_pr_node_id = NULL, base_ref = NULL"
+                ),
+                "repository_id": "github_repository_id = 999",
+                "installation_id": "github_installation_id = 999",
+            }
+            await session.execute(
+                text(
+                    f"UPDATE curie.thread_publication_lineages SET {changes[refusal]} "
+                    "WHERE id = :id"
+                ),
+                {"id": lineage_id},
+            )
+        await session.commit()
+        before = {
+            table: [
+                dict(row)
+                for row in (
+                    await session.execute(text(f"SELECT * FROM curie.{table} ORDER BY id"))
+                ).mappings()
+            ]
+            for table in ("work_items", "execution_requests", "publications")
+        }
+
+        _conflict(
+            await workitems.link_publication_lineage(
+                session,
+                work_item_id=running.work_item.id,
+                request_id=running.request.id,
+                publication_lineage_id=lineage_id,
+                expected_work_item_version=expected_item_version,
+                expected_request_version=expected_request_version,
+            ),
+            code,
+        )
+
+        after = {
+            table: [
+                dict(row)
+                for row in (
+                    await session.execute(text(f"SELECT * FROM curie.{table} ORDER BY id"))
+                ).mappings()
+            ]
+            for table in before
+        }
+        assert after == before
 
     with_session(body)
 
@@ -1112,9 +1346,7 @@ def test_cancellation_seals_idle_waiting_terminal_and_running_work(
             "work_item_cancelled",
         )
 
-        waiting = await _request(
-            session, (await _item(session, agent_id, issue=2574)).work_item
-        )
+        waiting = await _request(session, (await _item(session, agent_id, issue=2574)).work_item)
         stopped = await workitems.request_cancellation(
             session, work_item_id=waiting.work_item.id, expected_work_item_version=2
         )
@@ -1471,10 +1703,7 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
                 assert isinstance(holder_pid, int)
                 assert isinstance(service_pid, int)
                 await holder.execute(
-                    text(
-                        "LOCK TABLE curie.thread_publication_lineages "
-                        "IN ACCESS EXCLUSIVE MODE"
-                    )
+                    text("LOCK TABLE curie.thread_publication_lineages IN ACCESS EXCLUSIVE MODE")
                 )
 
                 service_task = asyncio.create_task(
@@ -1501,19 +1730,23 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
                             # already volatile.
                             await observer.execute(text("SELECT pg_stat_clear_snapshot()"))
                             row = (
-                                await observer.execute(
-                                    text(
-                                        "SELECT a.wait_event_type, a.query, "
-                                        "EXISTS (SELECT 1 FROM pg_locks l "
-                                        "WHERE l.pid = a.pid AND NOT l.granted) "
-                                        "AS waiting_lock, CAST(:holder AS integer) = "
-                                        "ANY(pg_blocking_pids(a.pid)) "
-                                        "AS blocked_by_holder FROM pg_stat_activity a "
-                                        "WHERE a.pid = :service"
-                                    ),
-                                    {"holder": holder_pid, "service": service_pid},
+                                (
+                                    await observer.execute(
+                                        text(
+                                            "SELECT a.wait_event_type, a.query, "
+                                            "EXISTS (SELECT 1 FROM pg_locks l "
+                                            "WHERE l.pid = a.pid AND NOT l.granted) "
+                                            "AS waiting_lock, CAST(:holder AS integer) = "
+                                            "ANY(pg_blocking_pids(a.pid)) "
+                                            "AS blocked_by_holder FROM pg_stat_activity a "
+                                            "WHERE a.pid = :service"
+                                        ),
+                                        {"holder": holder_pid, "service": service_pid},
+                                    )
                                 )
-                            ).mappings().one_or_none()
+                                .mappings()
+                                .one_or_none()
+                            )
                             if row is not None and (
                                 row.wait_event_type == "Lock"
                                 and row.waiting_lock
@@ -1549,18 +1782,22 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
                     )
 
                     persisted = (
-                        await observer.execute(
-                            text(
-                                "SELECT w.publication_lineage_id, "
-                                "w.version AS work_version, r.status, "
-                                "r.version AS request_version, r.started_at, "
-                                "r.execution_deadline FROM curie.work_items w "
-                                "JOIN curie.execution_requests r "
-                                "ON r.work_item_id = w.id WHERE w.id = :id"
-                            ),
-                            {"id": item_id},
+                        (
+                            await observer.execute(
+                                text(
+                                    "SELECT w.publication_lineage_id, "
+                                    "w.version AS work_version, r.status, "
+                                    "r.version AS request_version, r.started_at, "
+                                    "r.execution_deadline FROM curie.work_items w "
+                                    "JOIN curie.execution_requests r "
+                                    "ON r.work_item_id = w.id WHERE w.id = :id"
+                                ),
+                                {"id": item_id},
+                            )
                         )
-                    ).mappings().one()
+                        .mappings()
+                        .one()
+                    )
                     assert persisted.publication_lineage_id is None
                     assert (
                         persisted.work_version,
@@ -1596,9 +1833,7 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
 
 def test_start_and_cancellation_race_has_only_serial_outcomes(clean_db: None) -> None:
     async def setup(session: AsyncSession) -> tuple[uuid.UUID, uuid.UUID]:
-        waiting = await _request(
-            session, (await _item(session, await _agent(session))).work_item
-        )
+        waiting = await _request(session, (await _item(session, await _agent(session))).work_item)
         assert waiting.request is not None
         return waiting.work_item.id, waiting.request.id
 
@@ -1767,16 +2002,20 @@ def test_terminal_and_link_races_cannot_win_after_sticky_cancellation(
 
     async def verify(session: AsyncSession) -> None:
         row = (
-            await session.execute(
-                text(
-                    "SELECT w.version AS work_version, w.cancelled_at, "
-                    "w.publication_lineage_id, r.status, r.version AS request_version "
-                    "FROM curie.work_items w JOIN curie.execution_requests r "
-                    "ON r.work_item_id = w.id WHERE w.id = :id AND r.id = :request_id"
-                ),
-                {"id": item_id, "request_id": request_id},
+            (
+                await session.execute(
+                    text(
+                        "SELECT w.version AS work_version, w.cancelled_at, "
+                        "w.publication_lineage_id, r.status, r.version AS request_version "
+                        "FROM curie.work_items w JOIN curie.execution_requests r "
+                        "ON r.work_item_id = w.id WHERE w.id = :id AND r.id = :request_id"
+                    ),
+                    {"id": item_id, "request_id": request_id},
+                )
             )
-        ).mappings().one()
+            .mappings()
+            .one()
+        )
         assert row.cancelled_at is not None
         assert (
             row.work_version,
@@ -1840,9 +2079,7 @@ def test_owner_lost_cancellation_fails_with_observation_and_yields_to_issue_canc
 ) -> None:
     async def body(session: AsyncSession) -> None:
         agent_id = await _agent(session)
-        item_id, request_id = await _elapsed_running_with_lapsed_heartbeat(
-            session, agent_id
-        )
+        item_id, request_id = await _elapsed_running_with_lapsed_heartbeat(session, agent_id)
         marked = await workitems.request_owner_lost_cancellation(
             session,
             work_item_id=item_id,
@@ -1896,27 +2133,232 @@ def test_owner_lost_cancellation_fails_with_observation_and_yields_to_issue_canc
     with_session(body)
 
 
-def test_start_execution_spends_exactly_one_attempt(clean_db: None) -> None:
+@pytest.mark.parametrize("past_grace", [False, True], ids=["within_grace", "past_grace"])
+def test_owner_lost_cancellation_waits_one_runtime_ttl_after_heartbeat_expiry(
+    clean_db: None, past_grace: bool
+) -> None:
     async def body(session: AsyncSession) -> None:
-        waiting = await _request(
-            session, (await _item(session, await _agent(session))).work_item
+        running = await _start(
+            session,
+            await _request(session, (await _item(session, await _agent(session))).work_item),
         )
-        assert waiting.request is not None
-        waiting_attempts = await session.scalar(
+        assert running.request is not None
+        ttl = get_settings().work_item_runtime_ttl_seconds
+        elapsed = ttl + 5 if past_grace else 5
+        await session.execute(
             text(
-                "SELECT execution_attempts FROM curie.execution_requests "
+                "UPDATE curie.execution_requests SET runtime_owner = 'worker-a', "
+                "runtime_epoch = 1, runtime_heartbeat_expires_at = :expired "
                 "WHERE id = :id"
             ),
+            {
+                "id": running.request.id,
+                "expired": await _now(session) - timedelta(seconds=elapsed),
+            },
+        )
+        await session.commit()
+        result = await workitems.request_owner_lost_cancellation(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=running.request.id,
+            expected_work_item_version=running.work_item.version,
+            expected_request_version=running.request.version,
+        )
+        if past_grace:
+            assert isinstance(result, workitems.WorkItemOutcome), result
+            assert result.request is not None
+            assert (
+                result.request.status,
+                result.request.terminal_cause,
+                result.request.version,
+                result.work_item.version,
+                result.work_item.cancelled_at,
+            ) == (
+                "cancellation_requested",
+                "owner_lost",
+                running.request.version + 1,
+                running.work_item.version,
+                None,
+            )
+        else:
+            refused = _conflict(result, "illegal_transition")
+            assert refused.request_version == running.request.version
+            assert refused.work_item_version == running.work_item.version
+        row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT status, terminal_cause, version, cancellation_requested_at "
+                        "FROM curie.execution_requests WHERE id = :id"
+                    ),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert (row.status, row.terminal_cause, row.version) == (
+            ("cancellation_requested", "owner_lost", running.request.version + 1)
+            if past_grace
+            else ("running", None, running.request.version)
+        )
+        assert (row.cancellation_requested_at is not None) == past_grace
+
+    with_session(body)
+
+
+@pytest.mark.parametrize("stale", ["work_item", "request"])
+def test_owner_lost_cancellation_preserves_stale_version_fencing(
+    clean_db: None, stale: str
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        running = await _start(
+            session,
+            await _request(session, (await _item(session, await _agent(session))).work_item),
+        )
+        assert running.request is not None
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET runtime_owner = 'worker-a', "
+                "runtime_epoch = 1, runtime_heartbeat_expires_at = :expired "
+                "WHERE id = :id"
+            ),
+            {
+                "id": running.request.id,
+                "expired": await _now(session)
+                - timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+            },
+        )
+        await session.commit()
+        result = await workitems.request_owner_lost_cancellation(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=running.request.id,
+            expected_work_item_version=running.work_item.version - (stale == "work_item"),
+            expected_request_version=running.request.version - (stale == "request"),
+        )
+        _conflict(result, "stale_version")
+        row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT w.version AS work_item_version, r.version AS request_version, "
+                        "r.status, r.terminal_cause, r.cancellation_requested_at "
+                        "FROM curie.work_items w JOIN curie.execution_requests r "
+                        "ON r.work_item_id = w.id WHERE r.id = :id"
+                    ),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert (
+            row.work_item_version,
+            row.request_version,
+            row.status,
+            row.terminal_cause,
+            row.cancellation_requested_at,
+        ) == (running.work_item.version, running.request.version, "running", None, None)
+        accepted = await workitems.request_owner_lost_cancellation(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=running.request.id,
+            expected_work_item_version=running.work_item.version,
+            expected_request_version=running.request.version,
+        )
+        assert isinstance(accepted, workitems.WorkItemOutcome), accepted
+        assert accepted.request is not None
+        assert (accepted.request.status, accepted.request.terminal_cause) == (
+            "cancellation_requested",
+            "owner_lost",
+        )
+
+    with_session(body)
+
+
+@pytest.mark.parametrize("past_ttl", [False, True], ids=["recent_start", "owner_absent"])
+def test_owner_absent_cancellation_keeps_its_start_time_threshold(
+    clean_db: None, past_ttl: bool
+) -> None:
+    async def body(session: AsyncSession) -> None:
+        running = await _start(
+            session,
+            await _request(session, (await _item(session, await _agent(session))).work_item),
+        )
+        assert running.request is not None
+        ttl = get_settings().work_item_runtime_ttl_seconds
+        now = await _now(session)
+        started_at = now - timedelta(seconds=ttl + 5 if past_ttl else ttl / 2)
+        # Seed the historical window before restoring the immutable-field guard.
+        await session.execute(text("ALTER TABLE curie.execution_requests DISABLE TRIGGER USER"))
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET started_at = :started, "
+                "execution_deadline = :deadline, runtime_owner = NULL, "
+                "runtime_heartbeat_expires_at = :live WHERE id = :id"
+            ),
+            {
+                "id": running.request.id,
+                "started": started_at,
+                "deadline": started_at + timedelta(seconds=1800),
+                "live": now + timedelta(seconds=ttl),
+            },
+        )
+        await session.execute(text("ALTER TABLE curie.execution_requests ENABLE TRIGGER USER"))
+        await session.commit()
+        result = await workitems.request_owner_lost_cancellation(
+            session,
+            work_item_id=running.work_item.id,
+            request_id=running.request.id,
+            expected_work_item_version=running.work_item.version,
+            expected_request_version=running.request.version,
+        )
+        if past_ttl:
+            assert isinstance(result, workitems.WorkItemOutcome), result
+            assert result.request is not None
+            assert (result.request.status, result.request.terminal_cause) == (
+                "cancellation_requested",
+                "owner_lost",
+            )
+        else:
+            refused = _conflict(result, "illegal_transition")
+            assert refused.request_version == running.request.version
+        row = (
+            (
+                await session.execute(
+                    text(
+                        "SELECT status, terminal_cause, version "
+                        "FROM curie.execution_requests WHERE id = :id"
+                    ),
+                    {"id": running.request.id},
+                )
+            )
+            .mappings()
+            .one()
+        )
+        assert (row.status, row.terminal_cause, row.version) == (
+            ("cancellation_requested", "owner_lost", running.request.version + 1)
+            if past_ttl
+            else ("running", None, running.request.version)
+        )
+
+    with_session(body)
+
+
+def test_start_execution_spends_exactly_one_attempt(clean_db: None) -> None:
+    async def body(session: AsyncSession) -> None:
+        waiting = await _request(session, (await _item(session, await _agent(session))).work_item)
+        assert waiting.request is not None
+        waiting_attempts = await session.scalar(
+            text("SELECT execution_attempts FROM curie.execution_requests WHERE id = :id"),
             {"id": waiting.request.id},
         )
         assert waiting_attempts == 0
         running = await _start(session, waiting)
         assert running.request is not None
         started_attempts = await session.scalar(
-            text(
-                "SELECT execution_attempts FROM curie.execution_requests "
-                "WHERE id = :id"
-            ),
+            text("SELECT execution_attempts FROM curie.execution_requests WHERE id = :id"),
             {"id": running.request.id},
         )
         assert started_attempts == 1
@@ -1935,10 +2377,7 @@ def test_an_opened_pull_request_completes_after_the_execution_deadline(
             session, agent_id, lineage_id=lineage_id, issue=2924
         )
         deployment_id = await session.scalar(
-            text(
-                "SELECT deployment_id FROM curie.thread_publication_lineages "
-                "WHERE id = :id"
-            ),
+            text("SELECT deployment_id FROM curie.thread_publication_lineages WHERE id = :id"),
             {"id": lineage_id},
         )
         approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
@@ -2008,7 +2447,7 @@ async def _seed_transcript(session: AsyncSession, agent_id: uuid.UUID, thread: s
     await session.execute(
         text(
             "INSERT INTO curie.thread_transcripts (id, agent_id, thread_key, value) "
-            "VALUES (:id, :agent, :thread, CAST('[{\"role\": \"user\"}]' AS jsonb))"
+            'VALUES (:id, :agent, :thread, CAST(\'[{"role": "user"}]\' AS jsonb))'
         ),
         {"id": uuid.uuid4(), "agent": agent_id, "thread": thread},
     )
@@ -2209,5 +2648,546 @@ def test_execution_request_check_refuses_a_deadline_past_10800(clean_db: None) -
         with pytest.raises(IntegrityError) as excinfo:
             await _insert_running_with_span(session, 10801)
         assert "execution_requests_deadline_ck" in str(excinfo.value)
+
+    with_session(body)
+
+
+# --- owner_lost successor (ADR 0206, #4168) ---------------------------------
+
+SNAPSHOT = {
+    "objective": "Fix the flaky retry test",
+    "requester": "github:6601:octocat",
+    "reply_kind": "github",
+    "reply_address": REPO,
+    "reply_conversation_id": "issue-2573",
+}
+SNAPSHOT_COLUMNS = tuple(SNAPSHOT)
+PR_OBJECTIVE = (
+    f"https://github.com/{REPO}/pull/123#discussion_r88201\n\n"
+    "Review feedback asked for another revision."
+)
+
+
+async def _set_snapshot(
+    session: AsyncSession, request_id: uuid.UUID, **overrides: str
+) -> dict[str, str]:
+    """Write the dispatch snapshot once, as intake does after admission."""
+
+    snapshot = SNAPSHOT | overrides
+    await session.execute(
+        text(
+            "UPDATE curie.execution_requests SET objective = :objective, "
+            "requester = :requester, reply_kind = :reply_kind, "
+            "reply_address = :reply_address, "
+            "reply_conversation_id = :reply_conversation_id WHERE id = :id"
+        ),
+        {"id": request_id, **snapshot},
+    )
+    await session.commit()
+    return snapshot
+
+
+async def _versions(session: AsyncSession, request_id: uuid.UUID) -> Any:
+    return (
+        (
+            await session.execute(
+                text(
+                    "SELECT r.work_item_id, w.version AS work_version, "
+                    "r.version AS request_version, r.status "
+                    "FROM curie.execution_requests r "
+                    "JOIN curie.work_items w ON w.id = r.work_item_id WHERE r.id = :id"
+                ),
+                {"id": request_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+
+
+async def _start_by_id(session: AsyncSession, request_id: uuid.UUID) -> None:
+    row = await _versions(session, request_id)
+    started = await workitems.start_execution(
+        session,
+        work_item_id=row.work_item_id,
+        request_id=request_id,
+        expected_work_item_version=row.work_version,
+        expected_request_version=row.request_version,
+    )
+    assert isinstance(started, workitems.WorkItemOutcome), started
+
+
+async def _mark_owner_lost(
+    session: AsyncSession, request_id: uuid.UUID
+) -> workitems.WorkItemOutcome:
+    """Start the request if needed, lapse its heartbeat and declare it owner_lost."""
+
+    if (await _versions(session, request_id)).status == "waiting":
+        await _start_by_id(session, request_id)
+    await session.execute(
+        text(
+            "UPDATE curie.execution_requests SET runtime_owner = 'worker-a', "
+            "runtime_epoch = GREATEST(runtime_epoch, 1), "
+            "runtime_heartbeat_expires_at = :expired WHERE id = :id"
+        ),
+        {
+            "id": request_id,
+            "expired": await _now(session)
+            - timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+        },
+    )
+    await session.commit()
+    row = await _versions(session, request_id)
+    marked = await workitems.request_owner_lost_cancellation(
+        session,
+        work_item_id=row.work_item_id,
+        request_id=request_id,
+        expected_work_item_version=row.work_version,
+        expected_request_version=row.request_version,
+    )
+    assert isinstance(marked, workitems.WorkItemOutcome), marked
+    assert marked.request is not None
+    assert (marked.request.status, marked.request.terminal_cause) == (
+        "cancellation_requested",
+        "owner_lost",
+    )
+    return marked
+
+
+async def _observe(session: AsyncSession, request_id: uuid.UUID) -> workitems.WorkItemOutcome:
+    """Record the termination observation the worker's teardown reports."""
+
+    row = await _versions(session, request_id)
+    observed = await workitems.record_runtime_termination(
+        session,
+        work_item_id=row.work_item_id,
+        request_id=request_id,
+        termination_observation=FIXTURE_TERMINATION,
+        expected_work_item_version=row.work_version,
+        expected_request_version=row.request_version,
+    )
+    assert isinstance(observed, workitems.WorkItemOutcome), observed
+    assert observed.request is not None
+    return observed
+
+
+async def _lose(session: AsyncSession, request_id: uuid.UUID) -> None:
+    await _mark_owner_lost(session, request_id)
+    observed = await _observe(session, request_id)
+    assert observed.request is not None
+    assert (observed.request.status, observed.request.terminal_cause) == (
+        "failed",
+        "owner_lost",
+    )
+
+
+async def _requests(session: AsyncSession, work_item_id: uuid.UUID) -> list[Any]:
+    return list(
+        (
+            await session.execute(
+                text(
+                    "SELECT id, sequence, status, terminal_cause, wait_deadline, "
+                    f"{', '.join(SNAPSHOT_COLUMNS)} FROM curie.execution_requests "
+                    "WHERE work_item_id = :id ORDER BY sequence"
+                ),
+                {"id": work_item_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+
+async def _owner_lost_retry(session: AsyncSession, request_id: uuid.UUID) -> bool:
+    value = await session.scalar(
+        text("SELECT owner_lost_retry FROM curie.execution_requests WHERE id = :id"),
+        {"id": request_id},
+    )
+    assert isinstance(value, bool)
+    return value
+
+
+async def _snapshotted_waiting(
+    session: AsyncSession, agent_id: uuid.UUID
+) -> tuple[uuid.UUID, uuid.UUID]:
+    waiting = await _request(session, (await _item(session, agent_id)).work_item)
+    assert waiting.request is not None
+    await _set_snapshot(session, waiting.request.id)
+    return waiting.work_item.id, waiting.request.id
+
+
+def test_an_owner_lost_request_is_followed_by_one_successor(clean_db: None) -> None:
+    """AC1: same transaction, sequence + 1, copied snapshot, fresh wait budget."""
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item_id, lost_id = await _snapshotted_waiting(session, agent_id)
+        await _seed_transcript(session, agent_id, CONVERSATION)
+        await _mark_owner_lost(session, lost_id)
+
+        budget = timedelta(seconds=get_settings().work_item_wait_budget_seconds)
+        before = await _now(session)
+        await _observe(session, lost_id)
+        after = await _now(session)
+
+        rows = await _requests(session, item_id)
+        lost, *successors = rows
+        assert (lost.id, lost.status, lost.terminal_cause) == (lost_id, "failed", "owner_lost")
+        assert len(successors) == 1, rows
+        (successor,) = successors
+        assert successor.id != lost_id
+        assert (successor.sequence, successor.status, successor.terminal_cause) == (
+            lost.sequence + 1,
+            "waiting",
+            None,
+        )
+        assert (
+            {c: successor[c] for c in SNAPSHOT_COLUMNS}
+            == {c: lost[c] for c in SNAPSHOT_COLUMNS}
+            == SNAPSHOT
+        )
+        assert before + budget <= successor.wait_deadline <= after + budget
+        assert await _owner_lost_retry(session, successor.id) is True
+        assert await _owner_lost_retry(session, lost_id) is False
+        # The WorkItem continues, so its history survives (ADR 0170).
+        assert await _transcript_threads(session, agent_id) == {CONVERSATION}
+
+    with_session(body)
+
+
+def test_the_third_consecutive_owner_lost_admits_no_successor(clean_db: None) -> None:
+    """AC2: losses one and two are retried; the third leaves the WorkItem terminal."""
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item_id, current = await _snapshotted_waiting(session, agent_id)
+        await _seed_transcript(session, agent_id, CONVERSATION)
+        for loss in (1, 2):
+            await _lose(session, current)
+            rows = await _requests(session, item_id)
+            assert len(rows) == loss + 1, rows
+            successor = rows[-1]
+            assert (successor.status, successor.sequence) == ("waiting", loss + 1)
+            assert {c: successor[c] for c in SNAPSHOT_COLUMNS} == SNAPSHOT
+            assert await _owner_lost_retry(session, successor.id) is True
+            assert await _transcript_threads(session, agent_id) == {CONVERSATION}
+            current = successor.id
+
+        await _lose(session, current)
+        rows = await _requests(session, item_id)
+        assert [(r.sequence, r.status, r.terminal_cause) for r in rows] == [
+            (1, "failed", "owner_lost"),
+            (2, "failed", "owner_lost"),
+            (3, "failed", "owner_lost"),
+        ]
+        # Nothing continues the WorkItem now, so its history expires.
+        assert await _transcript_threads(session, agent_id) == set()
+
+    with_session(body)
+
+
+def test_a_different_terminal_between_losses_resets_the_owner_lost_count(
+    clean_db: None,
+) -> None:
+    """AC2: only consecutive owner_lost terminals count toward the limit."""
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item_id, first = await _snapshotted_waiting(session, agent_id)
+        await _lose(session, first)
+        rows = await _requests(session, item_id)
+        assert len(rows) == 2, rows
+        await _lose(session, rows[-1].id)
+        rows = await _requests(session, item_id)
+        assert len(rows) == 3, rows
+        third = rows[-1]
+        assert third.status == "waiting", third
+
+        # The retried run fails for its own reason: the streak ends here.
+        await _start_by_id(session, third.id)
+        row = await _versions(session, third.id)
+        failed = await workitems.fail_execution(
+            session,
+            work_item_id=item_id,
+            request_id=third.id,
+            cause="runner_escalated",
+            expected_work_item_version=row.work_version,
+            expected_request_version=row.request_version,
+        )
+        assert isinstance(failed, workitems.WorkItemOutcome), failed
+        assert len(await _requests(session, item_id)) == 3
+
+        fresh_id = uuid.uuid4()
+        fresh = await workitems.create_execution_request(
+            session,
+            work_item_id=item_id,
+            request_id=fresh_id,
+            wait_deadline=await _now(session) + timedelta(hours=1),
+            expected_work_item_version=(await _versions(session, third.id)).work_version,
+        )
+        assert isinstance(fresh, workitems.WorkItemOutcome), fresh
+        await _set_snapshot(session, fresh_id)
+        # Three owner_lost terminals on the WorkItem, but only one in a row.
+        await _lose(session, fresh_id)
+
+        rows = await _requests(session, item_id)
+        assert [(r.sequence, r.status, r.terminal_cause) for r in rows] == [
+            (1, "failed", "owner_lost"),
+            (2, "failed", "owner_lost"),
+            (3, "failed", "runner_escalated"),
+            (4, "failed", "owner_lost"),
+            (5, "waiting", None),
+        ]
+        assert await _owner_lost_retry(session, rows[-1].id) is True
+
+    with_session(body)
+
+
+def test_issue_cancel_during_owner_lost_admits_no_successor(clean_db: None) -> None:
+    """AC3: a cancelled WorkItem; the cancel rewrites the cause to issue_cancelled."""
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item_id, lost_id = await _snapshotted_waiting(session, agent_id)
+        marked = await _mark_owner_lost(session, lost_id)
+        cancelled = await workitems.request_cancellation(
+            session, work_item_id=item_id, expected_work_item_version=marked.work_item.version
+        )
+        assert isinstance(cancelled, workitems.WorkItemOutcome), cancelled
+        assert cancelled.request is not None
+        assert cancelled.request.terminal_cause == "issue_cancelled"
+        observed = await _observe(session, lost_id)
+        assert observed.request is not None
+        assert (observed.request.status, observed.request.terminal_cause) == (
+            "cancelled",
+            "issue_cancelled",
+        )
+        assert observed.work_item.cancelled_at is not None
+        assert [r.id for r in await _requests(session, item_id)] == [lost_id]
+
+    with_session(body)
+
+
+def test_a_pending_relabel_wins_over_an_owner_lost_successor(clean_db: None) -> None:
+    """AC3: the relabel is admitted by its own path; no retry is added beside it."""
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item_id, lost_id = await _snapshotted_waiting(session, agent_id)
+        await _mark_owner_lost(session, lost_id)
+        relabel_id = uuid.uuid4()
+        deferred = await workitems.readmit(
+            session,
+            work_item_id=item_id,
+            request_id=relabel_id,
+            wait_deadline=await _now(session) + timedelta(hours=1),
+            objective="Fix the flaky retry test, again",
+            requester="github:6601:octocat",
+        )
+        assert isinstance(deferred, workitems.WorkItemOutcome), deferred
+        assert (
+            await session.scalar(
+                text("SELECT readmit_request_id FROM curie.work_items WHERE id = :id"),
+                {"id": item_id},
+            )
+            == relabel_id
+        )
+        observed = await _observe(session, lost_id)
+        assert observed.request is not None
+        assert (observed.request.status, observed.request.terminal_cause) == (
+            "cancelled",
+            "issue_cancelled",
+        )
+        assert [r.id for r in await _requests(session, item_id)] == [lost_id]
+
+        admitted = await workitems.admit_pending_readmit(
+            session,
+            work_item_id=item_id,
+            wait_deadline=await _now(session) + timedelta(hours=1),
+        )
+        assert isinstance(admitted, workitems.WorkItemOutcome), admitted
+        rows = await _requests(session, item_id)
+        assert [(r.id, r.status) for r in rows] == [
+            (lost_id, "cancelled"),
+            (relabel_id, "waiting"),
+        ]
+        assert rows[1].objective == "Fix the flaky retry test, again"
+
+    with_session(body)
+
+
+def test_an_execution_deadline_expiry_admits_no_successor(clean_db: None) -> None:
+    """AC3: only owner_lost is retried; an elapsed run settles expired."""
+
+    async def body(session: AsyncSession) -> None:
+        item_id, request_id, _, _ = await _elapsed_running(session, await _agent(session))
+        await _set_snapshot(session, request_id)
+        marked = await workitems.request_execution_deadline_cancellation(
+            session,
+            work_item_id=item_id,
+            request_id=request_id,
+            expected_work_item_version=2,
+            expected_request_version=2,
+        )
+        assert isinstance(marked, workitems.WorkItemOutcome), marked
+        observed = await _observe(session, request_id)
+        assert observed.request is not None
+        assert (observed.request.status, observed.request.terminal_cause) == (
+            "expired",
+            "execution_deadline",
+        )
+        assert [r.id for r in await _requests(session, item_id)] == [request_id]
+
+    with_session(body)
+
+
+@pytest.mark.parametrize(
+    ("lineage", "retried"),
+    [("missing", False), ("closed", False), ("other_pr", False), ("open", True)],
+)
+def test_a_pr_targeted_owner_lost_is_retried_only_on_its_open_lineage(
+    clean_db: None, lineage: str, retried: bool
+) -> None:
+    """AC3: the admit_next_revision lineage rule; an open matching lineage retries."""
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        lineage_id = (
+            None
+            if lineage == "missing"
+            else await _lineage(
+                session,
+                agent_id,
+                pr=124 if lineage == "other_pr" else 123,
+                status="closed" if lineage == "closed" else "open",
+            )
+        )
+        item_id, request_id, _, _ = await _elapsed_running(session, agent_id, lineage_id=lineage_id)
+        await _set_snapshot(session, request_id, objective=PR_OBJECTIVE)
+        await _lose(session, request_id)
+
+        rows = await _requests(session, item_id)
+        if not retried:
+            assert [r.id for r in rows] == [request_id]
+            return
+        assert len(rows) == 2, rows
+        successor = rows[1]
+        assert (successor.status, successor.objective) == ("waiting", PR_OBJECTIVE)
+        assert await _owner_lost_retry(session, successor.id) is True
+
+    with_session(body)
+
+
+async def _attach_own_publication(
+    session: AsyncSession, work_item_id: uuid.UUID, request_id: uuid.UUID, *, status: str
+) -> None:
+    """Give the request its own publication row on a fresh lineage, in ``status``."""
+
+    item = (
+        (
+            await session.execute(
+                text(
+                    "SELECT agent_id, conversation_id, repo_full_name "
+                    "FROM curie.work_items WHERE id = :id"
+                ),
+                {"id": work_item_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+    lineage_id = await _lineage(session, item["agent_id"], conversation=item["conversation_id"])
+    deployment_id = await session.scalar(
+        text("SELECT deployment_id FROM curie.thread_publication_lineages WHERE id = :id"),
+        {"id": lineage_id},
+    )
+    approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
+    await session.execute(
+        text(
+            "INSERT INTO curie.approvals "
+            "(id, agent_id, conversation_id, author, summary, reply_kind, "
+            "reply_channel, dedupe_key, status, purpose) VALUES "
+            "(:id, :agent, :conversation, 'U0REQUEST1', "
+            "'Publish repository changes', 'github', :channel, :dedupe, "
+            "'approved', 'publication')"
+        ),
+        {
+            "id": approval_id,
+            "agent": item["agent_id"],
+            "conversation": item["conversation_id"],
+            "channel": item["repo_full_name"],
+            "dedupe": f"owner-lost-publication-{publication_id.hex}",
+        },
+    )
+    await session.execute(
+        text(
+            "INSERT INTO curie.publications "
+            "(id, approval_id, deployment_id, workspace_conversation_id, "
+            "lineage_id, execution_request_id, revision_number, repo_full_name, "
+            "status, base_sha, changed_paths, title, body, reply_kind, reply_channel) "
+            "VALUES "
+            "(:id, :approval, :deployment, :conversation, :lineage, :request, 1, "
+            ":repo, :status, :base_sha, CAST('[\"README.md\"]' AS jsonb), "
+            "'Update README', 'Approved platform publication.', 'github', :channel)"
+        ),
+        {
+            "id": publication_id,
+            "approval": approval_id,
+            "deployment": deployment_id,
+            "conversation": item["conversation_id"],
+            "lineage": lineage_id,
+            "request": request_id,
+            "repo": item["repo_full_name"],
+            "status": status,
+            "channel": item["repo_full_name"],
+            "base_sha": "0123456789abcdef0123456789abcdef01234567",
+        },
+    )
+    await session.commit()
+
+
+@pytest.mark.parametrize("publication_status", ["pending", "approved", "launching", "running"])
+def test_an_owner_lost_request_waiting_on_its_publication_admits_no_successor(
+    clean_db: None, publication_status: str
+) -> None:
+    """ADR 0206 item 6: a request waiting on publication is never re-admitted.
+
+    The no-publication neighbour is AC1 above, which must still retry.
+    """
+
+    async def body(session: AsyncSession) -> None:
+        agent_id = await _agent(session)
+        item_id, lost_id = await _snapshotted_waiting(session, agent_id)
+        await _start_by_id(session, lost_id)
+        await _attach_own_publication(session, item_id, lost_id, status=publication_status)
+
+        # Rows cancelled before this fix can still await their own publication.
+        # Reproduce that persisted state without retaining the forbidden path.
+        await session.execute(
+            text(
+                "UPDATE curie.execution_requests SET status = 'cancellation_requested', "
+                "terminal_cause = 'owner_lost', cancellation_requested_at = clock_timestamp(), "
+                "runtime_owner = 'worker-a', runtime_epoch = GREATEST(runtime_epoch, 1), "
+                "runtime_heartbeat_expires_at = :expired, version = version + 1, "
+                "updated_at = clock_timestamp() WHERE id = :id"
+            ),
+            {
+                "id": lost_id,
+                "expired": await _now(session)
+                - timedelta(seconds=get_settings().work_item_runtime_ttl_seconds + 5),
+            },
+        )
+        await session.commit()
+        observed = await _observe(session, lost_id)
+        assert observed.request is not None
+        assert (observed.request.status, observed.request.terminal_cause) == (
+            "failed",
+            "owner_lost",
+        )
+
+        rows = await _requests(session, item_id)
+        assert [(r.id, r.status, r.terminal_cause) for r in rows] == [
+            (lost_id, "failed", "owner_lost")
+        ], rows
 
     with_session(body)

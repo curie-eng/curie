@@ -103,6 +103,33 @@
             }
           }
         },
+        "githubFactoryMetadataCi": {
+          "type": "object",
+          "description": "Checks and commit statuses that rerun after a pull request metadata edit, keyed by owner/name.",
+          "propertyNames": {
+            "pattern": "^[^/]+/[^/]+$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "checks": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "statuses": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        },
         "githubFactoryPythonCi": {
           "type": "object",
           "description": "Required Python CI per repository, keyed by owner/name. A repository without an entry is judged on its own checks.",
@@ -143,6 +170,20 @@
           "items": {
             "type": "string",
             "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?:[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9_-])?|\\*)$"
+          }
+        }
+      }
+    },
+    "security": {
+      "type": "object",
+      "properties": {
+        "dataTierNetworkPolicy": {
+          "type": "object",
+          "properties": {
+            "allowMcpConnectorValkeyIngress": {
+              "type": "boolean",
+              "description": "Keep the MCP connector peer in the in-chart Valkey allow-ingress policy (issue #4318)."
+            }
           }
         }
       }
@@ -290,6 +331,7 @@
               "type": "array",
               "items": {"type": "string", "minLength": 1, "maxLength": 512}
             },
+            "allowDependencyAdditions": {"type": "boolean"},
             "githubHttpsCidrs": {
               "type": "array",
               "minItems": 1,

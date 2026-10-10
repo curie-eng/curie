@@ -32,6 +32,12 @@ metadata:
     app.kubernetes.io/component: api
 spec:
   replicas: {{ .Values.api.replicas }}
+  # Keep an API pod available while its replacement becomes ready (#4174).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 6 }}
@@ -149,6 +155,11 @@ spec:
         - name: api
           image: {{ include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) | quote }}
           imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+          # Allow Service endpoint removal to propagate before shutdown (#4174).
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
           {{- with .Values.api.containerSecurityContext }}
           {{- include "curie.containerSecurityContext" . | nindent 10 }}
           {{- end }}
@@ -263,6 +274,8 @@ spec:
               value: {{ .Values.api.githubFactoryPythonCi | default dict | toJson | quote }}
             - name: GITHUB_FACTORY_BASES
               value: {{ .Values.api.githubFactoryBases | default dict | toJson | quote }}
+            - name: GITHUB_FACTORY_METADATA_CI
+              value: {{ .Values.api.githubFactoryMetadataCi | default dict | toJson | quote }}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
             # Outbound GitHub credential: the eval commit status AND the

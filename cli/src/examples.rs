@@ -830,6 +830,10 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/.gitignore"),
     ),
     (
+        ".dockerignore",
+        include_bytes!("../../examples/dark-factory/.dockerignore"),
+    ),
+    (
         "connectors.yaml",
         include_bytes!("../../examples/dark-factory/connectors.yaml"),
     ),
@@ -888,6 +892,29 @@ pub struct DarkFactoryRenderOpts {
 pub const DARK_FACTORY_RUNNER_REPOSITORY: &str = "ghcr.io/curie-eng/curie-dark-factory-runner";
 /// The platform runner the published layer is built on, at the same version.
 const PLATFORM_RUNNER_REPOSITORY: &str = "ghcr.io/curie-eng/curie-runner";
+
+/// The dark factory runner layer published for one version, and the platform
+/// runner it was built on, both digest-pinned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PublishedStockRunner {
+    pub(crate) layer_image: String,
+    pub(crate) base_image: String,
+}
+
+/// The dark factory runner layer the release published for `version` (#3747,
+/// #4321). Asks for the layer, then its base; `None` when either tag is
+/// absent. A registry error on either read is an error.
+pub(crate) async fn published_stock_runner(version: &str) -> Result<Option<PublishedStockRunner>> {
+    let layer = published_index_digest(DARK_FACTORY_RUNNER_REPOSITORY, version).await?;
+    let base = published_index_digest(PLATFORM_RUNNER_REPOSITORY, version).await?;
+    Ok(match (layer, base) {
+        (Some(layer), Some(base)) => Some(PublishedStockRunner {
+            layer_image: format!("{DARK_FACTORY_RUNNER_REPOSITORY}@{layer}"),
+            base_image: format!("{PLATFORM_RUNNER_REPOSITORY}@{base}"),
+        }),
+        _ => None,
+    })
+}
 
 pub struct DarkFactoryRenderOutput {
     pub path: PathBuf,
@@ -960,29 +987,21 @@ pub async fn render_dark_factory(opts: DarkFactoryRenderOpts) -> Result<DarkFact
              published for it."
         )),
         crate::artifacts::Channel::Release => {
-            let layer = published_index_digest(DARK_FACTORY_RUNNER_REPOSITORY, version).await?;
-            let base = published_index_digest(PLATFORM_RUNNER_REPOSITORY, version).await?;
-            match (layer, base) {
-                (Some(layer), Some(base)) => Ok((layer, base)),
-                _ => Err(format!(
+            published_stock_runner(version).await?.ok_or_else(|| {
+                format!(
                     "no dark factory runner layer is published for curie {version} \
-                     ({DARK_FACTORY_RUNNER_REPOSITORY}:{version} or \
-                     {PLATFORM_RUNNER_REPOSITORY}:{version} was not found)."
-                )),
-            }
+                 ({DARK_FACTORY_RUNNER_REPOSITORY}:{version} or \
+                 {PLATFORM_RUNNER_REPOSITORY}:{version} was not found)."
+                )
+            })
         }
     };
     match published {
-        Ok((layer, base)) => {
-            let image = format!("{DARK_FACTORY_RUNNER_REPOSITORY}@{layer}");
-            lock_published_runner(
-                &out,
-                &image,
-                &format!("{PLATFORM_RUNNER_REPOSITORY}@{base}"),
-            )?;
+        Ok(published) => {
+            lock_published_runner(&out, &published.layer_image, &published.base_image)?;
             Ok(DarkFactoryRenderOutput {
                 path: out,
-                runner_image: Some(image),
+                runner_image: Some(published.layer_image),
                 runner_note: None,
             })
         }

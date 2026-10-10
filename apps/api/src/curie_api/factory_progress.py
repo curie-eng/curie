@@ -9,6 +9,7 @@ the pure phase view the status comment and the SVG card render from.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from collections.abc import Sequence
@@ -16,11 +17,14 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import ExecutionRequest, ExecutionRequestPhaseReport, FactoryStatusComment
 from .workitems import _lock_active_request
+
+logger = logging.getLogger(__name__)
 
 PROGRESS_SCOPE = "work_item.progress"
 REPORT_LIMIT = 200
@@ -252,6 +256,7 @@ def verification_route(
 class RecordResult:
     outcome: Literal[
         "recorded",
+        "replayed",
         "request_not_found",
         "no_active_request",
         "declaration_changed",
@@ -285,25 +290,31 @@ async def record_report(
     # Read before any rollback below expires the instance.
     active_id = active.id
 
-    row: FactoryStatusComment | None = await session.scalar(
-        select(FactoryStatusComment)
-        .where(FactoryStatusComment.execution_request_id == active.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )
-    if row is None:
-        # Admitted before 0055 and still active: give it its status row now.
-        row = FactoryStatusComment(
-            execution_request_id=active.id,
+    # Admitted before 0055 and still active: give it its status row now.
+    await session.execute(
+        insert(FactoryStatusComment)
+        .values(
+            execution_request_id=active_id,
             work_item_id=active.work_item_id,
             applied_label=None,
         )
-        session.add(row)
-
+        .on_conflict_do_nothing(index_elements=["execution_request_id"])
+    )
     declaration = body.declaration.model_dump(exclude_none=True)
-    if row.declaration is None:
-        row.declaration = declaration
-    elif row.declaration != declaration:
+    await session.execute(
+        update(FactoryStatusComment)
+        .where(
+            FactoryStatusComment.execution_request_id == active_id,
+            FactoryStatusComment.declaration.is_(None),
+        )
+        .values(declaration=declaration)
+    )
+    stored = await session.scalar(
+        select(FactoryStatusComment.declaration).where(
+            FactoryStatusComment.execution_request_id == active_id
+        )
+    )
+    if stored != declaration:
         await session.rollback()
         return RecordResult("declaration_changed", active_id)
 
@@ -325,7 +336,11 @@ async def record_report(
         )
     )
     if body.activity is not None:
-        row.activity = body.activity.model_dump(exclude_none=True)
+        await session.execute(
+            update(FactoryStatusComment)
+            .where(FactoryStatusComment.execution_request_id == active_id)
+            .values(activity=body.activity.model_dump(exclude_none=True))
+        )
     await session.commit()
     return RecordResult("recorded", active.id)
 
@@ -339,9 +354,10 @@ async def record_verification(
     """Store one immutable preflight observation per declared check on the token's
     active request.
 
-    A repeated check id, a second ``not_declared`` record, or mixing
-    ``not_declared`` with declared checks is ``verification_exists``; the first
-    stored rows stand.
+    A repeated check id with the same command is ``replayed``; the first
+    observation stays authoritative, even when the replay's result differs.
+    A changed command, mixing ``not_declared`` with declared checks, or a fifth
+    distinct check is ``verification_exists``.
     """
 
     token_request: ExecutionRequest | None = await session.scalar(
@@ -362,13 +378,27 @@ async def record_verification(
         # Unreadable stored evidence is never extended; the gates fail closed on it.
         await session.rollback()
         return RecordResult("verification_exists", active_id)
+    for observation in existing:
+        if observation.check != body.check:
+            continue
+        if observation.command != body.command:
+            await session.rollback()
+            return RecordResult("verification_exists", active_id)
+        if observation != body:
+            logger.info(
+                "verification replay retained first observation: "
+                "request_id=%s check=%s stored_outcome=%s replayed_outcome=%s",
+                active_id,
+                body.check,
+                observation.outcome,
+                body.outcome,
+            )
+        await session.rollback()
+        return RecordResult("replayed", active_id)
     if existing and (
         body.outcome == "not_declared"
         or len(existing) >= VERIFICATION_CHECK_LIMIT
-        or any(
-            observation.outcome == "not_declared" or observation.check == body.check
-            for observation in existing
-        )
+        or any(observation.outcome == "not_declared" for observation in existing)
     ):
         await session.rollback()
         return RecordResult("verification_exists", active_id)
@@ -766,17 +796,21 @@ _PILLS: dict[str, tuple[str, str, bool]] = {
     "running": ("RUNNING", "#2f81f7", True),
     "cancellation_requested": ("STOPPING", "#bc4c00", True),
     "completed": ("SUCCEEDED", "#1a7f37", False),
-    "failed": ("FAILED", "#cf222e", False),
-    "expired": ("EXPIRED", "#953800", False),
+    # Failed and expired runs need a human unless an owner_lost successor was admitted.
+    "failed": ("NEEDS HUMAN", "#bf8700", False),
+    "expired": ("NEEDS HUMAN", "#bf8700", False),
     "cancelled": ("CANCELLED", "#6e7781", False),
 }
 _PUBLISHING = ("PUBLISHING", "#8250df", True)
+_RETRYING = ("RETRYING", "#2f81f7", False)
 _UNKNOWN_COLOR = "#6e7781"
 
 
-def pill_for(status: str, publishing: bool) -> tuple[str, str, bool]:
+def pill_for(status: str, publishing: bool, *, retrying: bool = False) -> tuple[str, str, bool]:
     """The status pill: label, color, and whether its dot pulses."""
 
+    if retrying:
+        return _RETRYING
     if status == "running" and publishing:
         return _PUBLISHING
     return _PILLS.get(status, (status.upper(), _UNKNOWN_COLOR, False))

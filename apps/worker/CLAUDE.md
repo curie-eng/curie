@@ -34,7 +34,7 @@ stop -- that is scope creep on the sacred module.
    `side_effect_flag` escalates to a human instead of retrying; the flag is
    persisted to Valkey the instant it is seen so a crash mid-side-effect
    still escalates on reclaim. Flag-clean failures retry by classification
-   (`rate-limit`/`runner-error`/`runner-timeout`/`sandbox-capacity`/`sandbox-terminated`/`workspace-error` transient,
+   (`rate-limit`/`runner-error`/`runner-timeout`/`sandbox-capacity`/`sandbox-terminated`/`workspace-error`/`model-unreachable` transient,
    everything else escalates). `workspace-error` (#2004) is a workspace
    preparation FAULT before the turn was accepted; it must log a WARNING naming
    the agent, deployment, repository and stage, because a silent one acks the
@@ -124,6 +124,10 @@ semaphore. Runs and eval consumers therefore use the same
 (`apps/worker/src/curie_worker/consumer_liveness.py::ConsumerLivenessStore`)
 beside the stream broker, rather than widening `StreamBroker` with generic
 string-key verbs.
+
+Delivery and liveness renewals retain authority after an unconfirmed raise only
+until the last confirmed send plus TTL minus refresh interval, while a refused
+renewal drops authority immediately (ADR 0207).
 
 - **Publish before reading.** A generation writes its renewable short `alive`
   lease before its renewable `capability` marker, and does not issue

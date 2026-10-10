@@ -12,15 +12,26 @@ Payload capture:
   * every ``kubectl patch --patch-file <file>`` document is copied to
     ``patch-<n>.json``
 
-``helm get values`` returns the most recently APPLIED overlay when one exists,
-falling back to ``retained.json``. A real release retains what was last handed
-to it, and that is what makes a second run a resume of the first rather than a
-replay of the same input.
+``helm get values`` selects the requested revision, defaulting to the newest.
+Scenarios can give each revision distinct values; otherwise it returns the
+most recently APPLIED overlay when one exists, falling back to ``retained.json``.
+A real release retains what was last handed to it, and that is what makes a
+second run a resume of the first rather than a replay of the same input.
 
 Behaviour is selected by ``$UPGRADE_DRIVER_SCENARIO`` from SCENARIOS below.
 Optional per-test inputs read from the root directory:
   * ``retained.json`` -- the document ``helm get values`` returns (JSON is YAML)
   * ``checkpoint.json`` -- the complete upgrade checkpoint ConfigMap
+  * ``chart-values.json`` -- the target chart's own values, which
+    ``helm show values`` prints. Absent, that read exits 64 as it always has,
+    so no existing test starts resolving a runner tag over the network.
+
+``kubectl get sandboxtemplates...`` renders the SandboxTemplates the chart
+would produce from the values Helm was last handed (the most recent
+``values-<n>.yaml``, else ``retained.json``) over ``chart-values.json``, the way
+``curie.sandboxTemplate`` and ``curie.agentSandboxPoolAgents`` in
+``charts/curie/templates/agent-sandbox.yaml`` do. It never reads the CLI's own
+plan back, so a canary that compares against it compares against the chart.
 
 Three observable moments drive the fixtures, derived from the argv log rather
 than from a call ordinal (the number of `helm get metadata` reads is an
@@ -53,8 +64,8 @@ REPO = "ghcr.io/curie-eng/curie-api"
 WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 
 # One dict, not a pile of branches. Keys:
-#   before/after      chart version `helm get metadata` reports before and after
-#                     `helm upgrade`
+#   before/after      deployed chart version in history and revision-pinned
+#                     metadata before and after `helm upgrade`
 #   after_converge    chart version `helm get metadata` reports once
 #                     convergence has observed the live workloads; defaults to
 #                     `after`. Only a
@@ -105,6 +116,22 @@ WORKLOADS = "deployments,statefulsets,daemonsets,pods,jobs"
 #   alembic_fail      that exec exits 1 (unreadable live revision)
 #   compat_metadata   object served as ConfigMap data.compatibility.json from
 #                     `helm template --show-only templates/schema-compat.yaml`
+#   template_ignores_runner_images  the rendered per-agent SandboxTemplates run
+#                     the platform runner even where `runnerImages` binds a
+#                     layer, so a canary that checks the plan against the
+#                     rendered templates has something to catch (#4321)
+#   stale_agent_templates  {agent: image}. Each named agent's per-agent
+#                     SandboxTemplate exists and renders that image whatever the
+#                     values say, the way a template a failed or partial render
+#                     left behind survives (#4321)
+#   pending_status    orphaned newest revision status above serving revision 4
+#   no_serving_revision  history contains only the pending revision
+#   hook_jobs_shape   "valid" | "failed" | "malformed" | "not-list"
+#   active_hook       a selected hook Job still has active pods
+#   active_plain_job  a selected non-hook Job has active pods
+#   takeover_conflict  a writer replaces the holder before the takeover patch
+#   rollback_fails    Helm rollback's wait fails after creating a failed revision
+#   revision_values   retained values per revision, independent of chart version
 DEFAULT_COMPAT_METADATA = {
     "schema_min": "0043",
     "schema_head": "0043",
@@ -166,10 +193,73 @@ BASE = {
     "upgrade_fails": False,
     "history_after_upgrade": None,
     "revision_versions": None,
+    "revision_values": None,
+    "pending_status": None,
+    "no_serving_revision": False,
+    "hook_jobs_shape": "valid",
+    "active_hook": False,
+    "active_plain_job": False,
+    "takeover_conflict": False,
+    "rollback_fails": False,
+    "template_ignores_runner_images": False,
+    "stale_agent_templates": {},
 }
 
 SCENARIOS = {
     "healthy": {},
+    "pending-revision": {"pending_status": "pending-upgrade"},
+    "pending-divergent-values": {
+        "pending_status": "pending-upgrade",
+        "revision_values": {
+            "4": {
+                "config": {"schemaVersion": "0.8.6"},
+                "worker": {
+                    "extraEnv": [
+                        {"name": "CURIE_RUNNER_TOTAL_TIMEOUT_S", "value": "120"},
+                        {"name": "SERVING_REVISION_ONLY", "value": "keep"},
+                    ],
+                },
+                "connectorCaller": {"existingSecret": "acme-caller-pair"},
+            },
+            "5": {
+                "config": {"schemaVersion": "0.9.0"},
+                "worker": {
+                    "runnerTotalTimeoutSeconds": 999,
+                    "extraEnv": [{"name": "PENDING_REVISION_ONLY", "value": "must-not-win"}],
+                },
+                "connectorCaller": {"existingSecret": "acme-caller-pair"},
+            },
+        },
+    },
+    "take-over-running-hook": {
+        "pending_status": "pending-upgrade",
+        "active_hook": True,
+    },
+    "take-over-active-plain-job": {
+        "pending_status": "pending-upgrade",
+        "active_plain_job": True,
+    },
+    "take-over-jobs-failed": {"hook_jobs_shape": "failed"},
+    "take-over-jobs-malformed": {"hook_jobs_shape": "malformed"},
+    "take-over-jobs-not-list": {"hook_jobs_shape": "not-list"},
+    "take-over-cas-conflict": {
+        "pending_status": "pending-upgrade",
+        "takeover_conflict": True,
+    },
+    "take-over-rollback-failed": {
+        "pending_status": "pending-upgrade",
+        "rollback_fails": True,
+    },
+    "pending-no-serving": {
+        "pending_status": "pending-upgrade",
+        "no_serving_revision": True,
+    },
+    "failed-no-serving": {
+        "pending_status": "failed",
+        "no_serving_revision": True,
+    },
+    "pending-install": {"pending_status": "pending-install"},
+    "pending-rollback": {"pending_status": "pending-rollback"},
     # Keep the release cache target distinct from the running CLI version so
     # the resolver test can prove that --to owns the cache key.
     "release-cache-prior": {
@@ -275,7 +365,7 @@ SCENARIOS = {
     "namespace-absent": {"namespace_absent": True},
     "namespace-disappears": {"namespace_disappears": True},
     # A local chart directory whose own metadata is not the requested --to.
-    # No release yet: `helm get metadata` fails until something is installed,
+    # No release yet: `helm history` fails until something is installed,
     # so the Drain phase is skipped for having nothing in flight.
     "fresh-install": {"metadata_missing_before": True},
     "local-chart-mismatch": {"show_chart": "0.8.7"},
@@ -304,6 +394,20 @@ SCENARIOS = {
     # Drain's worker Deployment probe fails with a non-NotFound error, so
     # live_drain retries until the phase budget expires and returns false.
     "undrained-deploy": {},
+    # Helm accepts the rebound layer, but the per-agent SandboxTemplate still
+    # renders the platform runner. Only the canary's template read sees it.
+    "stock-layer-dropped": {"template_ignores_runner_images": True},
+    # Run as the RESUME of a `healthy` run interrupted after Apply cleared
+    # acme-bot's owner-built layer (the argv log already holds that run's
+    # `helm upgrade`), while acme-bot's per-agent SandboxTemplate still renders
+    # the old layer. Only a canary that remembers the original plan names
+    # acme-bot at all.
+    "stale-cleared-template": {
+        "stale_agent_templates": {
+            "acme-bot": "ghcr.io/acme/acme-bot-runner@sha256:"
+            + "a" * 64,
+        },
+    },
 }
 
 root = Path(os.environ["UPGRADE_DRIVER_ROOT"])
@@ -320,6 +424,8 @@ with log.open("a") as handle:
     handle.write(json.dumps([program, *args]) + "\n")
 
 upgraded = any(call[:2] == ["helm", "upgrade"] for call in previous)
+rollback_attempted = any(call[:2] == ["helm", "rollback"] for call in previous)
+rolled_back = rollback_attempted and not scenario["rollback_fails"]
 converged = any(call[:1] == ["kubectl"] and WORKLOADS in call for call in previous)
 
 if upgraded and converged:
@@ -350,6 +456,64 @@ def capture(prefix, suffix, source):
 
 def flag_value(name):
     return args[args.index(name) + 1] if name in args else None
+
+
+def history_row(revision, status, version, description):
+    """Helm's history formatter exposes chart version separately from revision.
+
+    https://github.com/helm/helm/blob/v3.20.0/cmd/helm/history.go
+    Rollback creates a new revision rather than changing the old one in place:
+    https://github.com/helm/helm/blob/v3.20.0/pkg/action/rollback.go
+    """
+    return {
+        "revision": revision,
+        "updated": "2026-09-12T00:00:00Z",
+        "status": status,
+        "chart": f"curie-{version}",
+        "app_version": version,
+        "description": description,
+    }
+
+
+def release_history():
+    if upgraded and scenario["history_after_upgrade"] is not None:
+        return copy.deepcopy(scenario["history_after_upgrade"])
+    pending = scenario["pending_status"]
+    if scenario["metadata_missing_before"] and not upgraded:
+        return None
+    if pending:
+        rows = [] if scenario["no_serving_revision"] else [
+            history_row(4, "deployed", scenario["before"], "Upgrade complete")
+        ]
+        rows.append(history_row(5, pending, scenario["target"], "Preparing upgrade"))
+        if rollback_attempted:
+            # Helm leaves the old pending row unchanged. A successful
+            # rollback supersedes deployed rows; a wait failure stores the
+            # new rollback revision as failed and leaves the old deployed
+            # revision serving.
+            # https://github.com/helm/helm/blob/v3.20.0/pkg/action/rollback.go
+            if rolled_back:
+                for row in rows:
+                    if row["status"] == "deployed":
+                        row["status"] = "superseded"
+            status = "deployed" if rolled_back else "failed"
+            rows.append(history_row(6, status, scenario["before"], "Rollback to 4"))
+        if upgraded and not scenario["upgrade_fails"]:
+            for row in rows:
+                if row["status"] == "deployed":
+                    row["status"] = "superseded"
+            revision = 7 if rollback_attempted else 6
+            rows.append(history_row(revision, "deployed", chart_version, "Upgrade complete"))
+        return rows
+    # #3849: Helm can fail before it stores a revision. Keep the original
+    # deployed row in that case, including its old chart metadata.
+    if scenario["metadata_missing_before"]:
+        return [history_row(1, "deployed", chart_version, "Install complete")]
+    rows = [history_row(1, "deployed", scenario["before"], "Install complete")]
+    if upgraded and not scenario["upgrade_fails"]:
+        rows[0]["status"] = "superseded"
+        rows.append(history_row(2, "deployed", chart_version, "Upgrade complete"))
+    return rows
 
 
 CHECKPOINT = f"{RELEASE}-upgrade-checkpoint"
@@ -504,6 +668,12 @@ def patch_kind(operations):
         return "release"
     if "/data" in paths or "/data/record" in paths:
         return "record"
+    if any(
+        operation.get("op") == "replace"
+        and operation.get("path") == "/metadata/annotations/curietech.ai~1upgrade-holder"
+        for operation in operations
+    ):
+        return "takeover"
     if any(patch_adds_holder(operation) for operation in operations):
         return "acquire"
     return "unknown"
@@ -592,6 +762,145 @@ DRIFTED_VALUES = {
     "connectorCaller": {"existingSecret": "acme-caller-pair"},
 }
 
+# The SandboxTemplate CRD the chart renders one runner template per agent into.
+SANDBOX_TEMPLATES = "sandboxtemplates.extensions.agents.x-k8s.io"
+# `charts/curie/values.yaml` `agentSandbox.runner.image`.
+DEFAULT_RUNNER_IMAGE = "ghcr.io/curie-eng/curie-runner"
+# `.Chart.Name` of `charts/curie`.
+CHART_NAME = "curie"
+# The per-agent maps `curie.agentSandboxPoolAgents` unions; `poolAgents` is a
+# list and handled beside them.
+POOL_AGENT_MAPS = ("connectorSecrets", "registryEgress", "runnerImages", "workspaceSizeLimits")
+
+
+def chart_values():
+    path = root / "chart-values.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def release_values(revision=None):
+    """Revision-pinned retained values, or Helm's newest revision by default.
+
+    https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_values.go
+    """
+    revision_values = scenario["revision_values"]
+    if revision_values is not None:
+        history = release_history() or []
+        row = history[-1] if revision is None and history else next(
+            (row for row in history if str(row["revision"]) == revision), None
+        )
+        if row is None:
+            raise ValueError(f"release revision {revision} not found")
+        key = str(row["revision"])
+        if key in revision_values:
+            return copy.deepcopy(revision_values[key])
+        if row["description"].startswith("Rollback to "):
+            return copy.deepcopy(revision_values[row["description"].split()[-1]])
+    applied = captured("values", ".yaml")
+    source = applied[-1] if applied else root / "retained.json"
+    text = source.read_text() if source.exists() else "{}"
+    return json.loads(text or "{}")
+
+
+def helm_trunc_trim(text):
+    """`trunc 63 | trimSuffix "-"`: sprig's trimSuffix removes exactly one dash."""
+    text = text[:63]
+    return text[:-1] if text.endswith("-") else text
+
+
+def effective_name_value(values, key):
+    """`.Values.<key>` as Helm sees it: merged by key presence.
+
+    A release value that is present wins even when it is "" or None (Helm
+    deletes a null key, and an empty string renders as empty); only an absent
+    key falls back to the chart default.
+    """
+    if key in values:
+        return values[key]
+    return chart_values().get(key)
+
+
+def fullname(values):
+    """`curie.fullname` in `charts/curie/templates/_helpers.tpl` for RELEASE.
+
+    Reads the effective values: a `fullnameOverride` or `nameOverride` set only
+    in the target chart's defaults (`chart-values.json`) still names the
+    templates, the way Helm coalesces chart defaults beneath release values.
+    """
+    override = effective_name_value(values, "fullnameOverride")
+    if override:
+        return helm_trunc_trim(str(override))
+    name = effective_name_value(values, "nameOverride") or CHART_NAME
+    if name in RELEASE:
+        return helm_trunc_trim(RELEASE)
+    return helm_trunc_trim(f"{RELEASE}-{name}")
+
+
+def sandbox_template(name, image):
+    return {
+        "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+        "kind": "SandboxTemplate",
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "labels": {
+                "app.kubernetes.io/name": "curie",
+                "app.kubernetes.io/instance": RELEASE,
+                "app.kubernetes.io/component": "agent-sandbox",
+            },
+        },
+        "spec": {"podTemplate": {"spec": {"containers": [{"name": "runner", "image": image}]}}},
+    }
+
+
+def sandbox_templates():
+    """The SandboxTemplates `charts/curie/templates/agent-sandbox.yaml` renders."""
+    values = release_values()
+    sandbox = values.get("agentSandbox") or {}
+    prefix = fullname(values)
+    runner = {}
+    for source in (
+        (chart_values().get("agentSandbox") or {}).get("runner") or {},
+        sandbox.get("runner") or {},
+    ):
+        for key, value in source.items():
+            if value is None:
+                runner.pop(key, None)
+            else:
+                runner[key] = value
+    # `curie.image`: a digest wins, else the tag, else the chart appVersion.
+    image = runner.get("image") or DEFAULT_RUNNER_IMAGE
+    if runner.get("digest"):
+        platform = f"{image}@{runner['digest']}"
+    else:
+        platform = f"{image}:{runner.get('tag') or scenario['show_chart']}"
+    agents = set()
+    for key in POOL_AGENT_MAPS:
+        if isinstance(sandbox.get(key), dict):
+            agents.update(sandbox[key])
+    if isinstance(sandbox.get("poolAgents"), list):
+        agents.update(sandbox["poolAgents"])
+    layers = sandbox.get("runnerImages") or {}
+    stale = scenario["stale_agent_templates"]
+    agents.update(stale)
+    items = [sandbox_template(f"{prefix}-runner", platform)]
+    for agent in sorted(agents):
+        layer = layers.get(agent)
+        agent_image = platform if scenario["template_ignores_runner_images"] or not layer else layer
+        agent_image = stale.get(agent, agent_image)
+        items.append(sandbox_template(f"{prefix}-agent-{agent}-runner", agent_image))
+    return items
+
+
+def matches_selector(item, selector):
+    labels = item["metadata"].get("labels", {})
+    for term in filter(None, (selector or "").split(",")):
+        key, _, value = term.partition("=")
+        if labels.get(key) != value:
+            return False
+    return True
+
+
 HOOK_NAMES = {
     "upgrade-drain": f"{RELEASE}-upgrade-drain",
     "upgrade-drain-attest": f"{RELEASE}-upgrade-drain-attest",
@@ -601,7 +910,18 @@ HOOK_NAMES = {
 hooks = []
 jobs = []
 for key, name in HOOK_NAMES.items():
-    manifest = {"kind": "Job", "metadata": {"name": name, "namespace": NAMESPACE}}
+    manifest = {
+        "kind": "Job",
+        "metadata": {
+            "name": name,
+            "namespace": NAMESPACE,
+            "labels": {
+                "app.kubernetes.io/instance": RELEASE,
+                "app.kubernetes.io/managed-by": "Helm",
+            },
+            "annotations": {"helm.sh/hook": "pre-upgrade"},
+        },
+    }
     failed = scenario["failed_hook"] == key
     hooks.append(
         {
@@ -612,6 +932,7 @@ for key, name in HOOK_NAMES.items():
             "manifest": json.dumps(manifest),
         }
     )
+
     jobs.append(
         {
             "kind": "Job",
@@ -624,16 +945,31 @@ for key, name in HOOK_NAMES.items():
         }
     )
 
+# Hook membership comes from Helm's documented annotation, and JobStatus.active
+# counts pending and running pods. A selected active Job without the annotation
+# must not block takeover.
+# https://helm.sh/docs/topics/charts_hooks/
+# https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/job-v1/#JobStatus
+ownership_jobs = copy.deepcopy(jobs)
+if scenario["active_hook"]:
+    ownership_jobs[0]["status"] = {"active": 1}
+if scenario["active_plain_job"]:
+    plain_job = copy.deepcopy(ownership_jobs[0])
+    plain_job["metadata"]["name"] = f"{RELEASE}-ordinary-job"
+    plain_job["metadata"].pop("annotations")
+    plain_job["status"] = {"active": 1}
+    ownership_jobs.append(plain_job)
+
 if program == "helm":
     # Helm v3.20 removes rel.Chart before serializing status and keeps the
     # numeric release revision at version:
     # https://github.com/helm/helm/blob/v3.20.0/cmd/helm/status.go
     if args[0] == "history":
-        if upgraded and scenario.get("history_after_upgrade"):
-            print(json.dumps(scenario["history_after_upgrade"]))
-            sys.exit(0)
-        print("Error: release: not found", file=sys.stderr)
-        sys.exit(1)
+        history = release_history()
+        if history is None:
+            print("Error: release: not found", file=sys.stderr)
+            sys.exit(1)
+        emit(history)
     if args[0] == "status":
         if "json" in args:
             emit(
@@ -652,11 +988,22 @@ if program == "helm":
     if args[:2] == ["get", "metadata"]:
         # Helm v3.20 maps this string from rel.Chart.Metadata.Version:
         # https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_metadata.go
-        if scenario["metadata_missing_before"] and not upgraded:
+        history = release_history()
+        if history is None:
             print('Error: release: not found', file=sys.stderr)
             sys.exit(1)
         shape = scenario["metadata_after_shape"] if upgraded else "valid"
         revision = flag_value("--revision")
+        # Without --revision Helm reads the newest release, even while pending.
+        # Keep that behavior so a missing pin exposes the actual bug.
+        # https://github.com/helm/helm/blob/v3.20.0/pkg/action/action.go
+        row = history[-1] if revision is None else next(
+            (row for row in history if str(row["revision"]) == revision), None
+        )
+        if row is None:
+            print(f"Error: release revision {revision} not found", file=sys.stderr)
+            sys.exit(1)
+        chart_version = row["app_version"]
         revision_versions = scenario.get("revision_versions") or {}
         if revision and revision in revision_versions:
             chart_version = revision_versions[revision]
@@ -671,8 +1018,8 @@ if program == "helm":
             "version": chart_version,
             "appVersion": chart_version,
             "namespace": NAMESPACE,
-            "revision": 2,
-            "status": "deployed",
+            "revision": row["revision"],
+            "status": row["status"],
             "deployedAt": "2026-09-12T00:00:00Z",
         }
         if shape == "missing":
@@ -680,7 +1027,25 @@ if program == "helm":
         elif shape == "numeric":
             metadata["version"] = 2
         emit(metadata)
+    if args[0] == "rollback":
+        history = release_history() or []
+        requested = args[2] if len(args) > 2 else ""
+        serving = next((row for row in history if row["status"] == "deployed"), None)
+        if serving is None or requested != str(serving["revision"]):
+            print("Error: rollback must name the serving revision", file=sys.stderr)
+            sys.exit(1)
+        if scenario["rollback_fails"]:
+            print("Error: rollback failed: password=acme-rollback-token", file=sys.stderr)
+            sys.exit(1)
+        print(f'Rollback to {requested} was a success')
+        sys.exit(0)
     if args[:2] == ["get", "values"]:
+        # An absent Helm release cannot have retained values. GetValues.Run
+        # uses the same revision lookup as GetMetadata.Run:
+        # https://github.com/helm/helm/blob/v3.20.0/pkg/action/get_values.go
+        if scenario["metadata_missing_before"] and not upgraded:
+            print("Error: release: not found", file=sys.stderr)
+            sys.exit(1)
         if scenario["values_fail"]:
             print('Error from server (NotFound): namespaces "ns" not found', file=sys.stderr)
             sys.exit(1)
@@ -688,6 +1053,12 @@ if program == "helm":
             reads = sum(1 for call in previous if call[:3] == ["helm", "get", "values"])
             print(json.dumps(DRIFTED_VALUES if reads else FIRST_VALUES))
             sys.exit(0)
+        if scenario["revision_values"] is not None:
+            try:
+                emit(release_values(flag_value("--revision")))
+            except ValueError as error:
+                print(f"Error: {error}", file=sys.stderr)
+                sys.exit(1)
         applied_values = captured("values", ".yaml")
         if applied_values:
             # The release retains the overlay it was last handed. A second run
@@ -706,6 +1077,10 @@ if program == "helm":
         print(
             "name: curie\nversion: {v}\nappVersion: {v}".format(v=scenario["show_chart"])
         )
+        sys.exit(0)
+    if args[:2] == ["show", "values"] and (root / "chart-values.json").exists():
+        # JSON is YAML. Without the file this falls through to exit 64 below.
+        print((root / "chart-values.json").read_text())
         sys.exit(0)
     if args[0] == "template":
         show_only = flag_value("--show-only")
@@ -792,9 +1167,34 @@ if program == "helm":
         sys.exit(0)
 
 if program == "kubectl":
+    if args[:2] == ["get", "jobs"]:
+        shape = scenario["hook_jobs_shape"]
+        if shape == "failed":
+            print("Error from server (Forbidden): jobs is forbidden", file=sys.stderr)
+            sys.exit(1)
+        if shape == "malformed":
+            print("{")
+            sys.exit(0)
+        if shape == "not-list":
+            emit({"apiVersion": "v1", "kind": "List", "items": {"unexpected": "map"}})
+        selector = flag_value("-l")
+        emit({
+            "apiVersion": "v1",
+            "kind": "List",
+            "items": [item for item in ownership_jobs if matches_selector(item, selector)],
+        })
     if args[:1] == ["-n"] and "delete" in args and "sandboxclaim" in args:
         print("sandboxclaim deleted")
         sys.exit(0)
+    if args[:2] == ["-n", NAMESPACE] and args[2:4] == ["get", SANDBOX_TEMPLATES]:
+        selector = flag_value("-l")
+        emit(
+            {
+                "apiVersion": "v1",
+                "kind": "List",
+                "items": [item for item in sandbox_templates() if matches_selector(item, selector)],
+            }
+        )
     if scenario["workloads_fail"] and args[:3] == ["get", WORKLOADS, "-n"]:
         print("Error from server (Forbidden): workloads is forbidden", file=sys.stderr)
         sys.exit(1)
@@ -843,6 +1243,9 @@ if program == "kubectl":
             )
             sys.exit(1)
         if kind == "acquire" and scenario["acquire_conflict"] == "patch":
+            save_checkpoint(winning_checkpoint(PATCH_WINNER, next_resource_version(current)))
+            conflict("the object has been modified")
+        if kind == "takeover" and scenario["takeover_conflict"]:
             save_checkpoint(winning_checkpoint(PATCH_WINNER, next_resource_version(current)))
             conflict("the object has been modified")
         if kind == "record" and scenario["stale_record_cas"]:

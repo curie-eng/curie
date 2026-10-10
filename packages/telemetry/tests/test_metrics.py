@@ -204,7 +204,12 @@ def test_schedule_fire_counter_has_closed_run_outcome_and_trigger_domains() -> N
     domains = definition["attributes"]
     assert domains["service.name"] == ["curie-worker"]
     assert set(domains["outcome"]) == {
-        "ran", "deferred", "skipped", "blocked", "reclaimed", "failed"
+        "ran",
+        "deferred",
+        "skipped",
+        "blocked",
+        "reclaimed",
+        "failed",
     }
     assert set(domains["trigger"]) == {"cron", "bind", "webhook", "test"}
     assert set(domains) == {"service.name", "outcome", "trigger"}
@@ -343,9 +348,10 @@ def test_retry_metrics_separate_bounded_retry_causes(
             "workspace-error",
             "sandbox-terminated",
             "sandbox-capacity",
+            "model-unreachable",
         ],
     }
-    assert queue["cardinality_bound"] == 14
+    assert queue["cardinality_bound"] == 16
     record_metric(
         "curie.queue.retry",
         attributes={
@@ -611,7 +617,7 @@ def test_deadline_halted_is_a_declared_terminal_turn_outcome(
             assert sibling in outcomes
         assert "capacity_wait_expired" in outcomes
         assert "fenced_out" not in outcomes
-        assert manifest[name]["cardinality_bound"] == 216
+        assert manifest[name]["cardinality_bound"] == 240
 
 
 def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
@@ -841,8 +847,7 @@ def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
     )
     assert provider.force_flush(timeout_millis=5000)
     labels = {
-        dict(point)["agent"]
-        for point in _exported_series(reader)["curie.agent.turn.completed"]
+        dict(point)["agent"] for point in _exported_series(reader)["curie.agent.turn.completed"]
     }
     assert "acme-0" in labels
     assert "acme-31" in labels
@@ -852,7 +857,7 @@ def test_agent_turn_metric_keeps_a_named_agent_and_folds_past_the_ceiling(
     assert "not a slug" not in labels
     manifest = declared_metric_manifest()["metrics"]["curie.agent.turn.completed"]
     assert manifest["attributes"]["agent"]["ceiling"] == 32
-    assert manifest["cardinality_bound"] == 9 * (32 + 2)
+    assert manifest["cardinality_bound"] == 10 * (32 + 2)
 
 
 def test_record_metric_still_rejects_unknown_turn_outcome(

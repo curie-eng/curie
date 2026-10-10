@@ -53,3 +53,39 @@ def parse_reply_target(
     if pr_number > _MAX_PR or comment_id > _MAX_ID:
         return ISSUE_TARGET
     return ReplyTarget(_FRAGMENTS[match.group(2)], pr_number, comment_id, first)
+
+
+def is_follow_up(
+    objective: str | None, *, repo_full_name: str, issue_number: int, clone_base: str
+) -> bool:
+    """Whether this request came from an issue mention or pull request feedback."""
+
+    if parse_reply_target(objective, repo_full_name=repo_full_name, clone_base=clone_base).kind in {
+        "thread",
+        "pr",
+    }:
+        return True
+    if not isinstance(objective, str) or not objective:
+        return False
+    first = objective.split("\n", 1)[0]
+    pattern = (
+        rf"{re.escape(clone_base.rstrip('/'))}/{re.escape(repo_full_name)}"
+        rf"/issues/{issue_number}#issuecomment-([1-9][0-9]{{0,18}})"
+    )
+    match = re.fullmatch(pattern, first)
+    return match is not None and int(match.group(1)) <= _MAX_ID
+
+
+def is_relabel_objective(
+    objective: str | None, *, repo_full_name: str, issue_number: int, clone_base: str
+) -> bool:
+    """Whether this request came from a relabel: the bare issue URL, no fragment."""
+
+    if not isinstance(objective, str) or not objective:
+        return False
+    first = objective.split("\n", 1)[0]
+    pattern = (
+        rf"{re.escape(clone_base.rstrip('/'))}/{re.escape(repo_full_name)}"
+        rf"/issues/{issue_number}"
+    )
+    return re.fullmatch(pattern, first) is not None

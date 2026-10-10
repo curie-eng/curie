@@ -547,8 +547,9 @@ of the Namespace object.
 Any interruption after ownership acquisition, including Ctrl C, SIGINT, and
 SIGTERM, leaves the holder in place. A normal exit that reports an ownership
 release CAS failure can also leave the holder. Do not rerun the upgrade in
-either case until the checked recovery below is complete. There is no expiry,
-heartbeat, or automatic takeover. First read the live checkpoint:
+either case until the checked recovery below is complete.
+There is no expiry, heartbeat, or automatic takeover. First read the live
+checkpoint:
 
 ```bash
 kubectl --context <context> -n <namespace> get configmap <release>-upgrade-checkpoint -o json
@@ -561,8 +562,43 @@ its Helm action is no longer running. Clearing a live holder can let another
 upgrade overlap the original operation. Never delete the checkpoint as a
 recovery step because it also contains the resumable lifecycle record.
 
-Only after those checks, replace both values in this conditional patch with the
-exact values just observed:
+After those checks, use the exact observed holder to plan and run recovery:
+
+```bash
+curie cluster upgrade --to <version> --namespace <namespace> --release <release> \
+  --take-over <observed-holder> --dry-run
+curie cluster upgrade --to <version> --namespace <namespace> --release <release> \
+  --take-over <observed-holder> --yes
+```
+
+Both runs refuse if the holder differs, there is nothing to take over, or a
+release Helm hook Job still has active pods. An unreadable hook Job list also
+refuses. The CLI cannot verify that the local CLI or Helm process has stopped;
+that remains the operator's check. The real run tests the observed checkpoint
+resource version and named holder in one conditional patch, replaces the holder
+with its own, and preserves the durable lifecycle record for resumption. A
+failed comparison reports the currently observed holder and action.
+
+The installed and known-good versions in a dry run come from the serving
+`deployed` revision, including when a newer revision is `pending-upgrade`.
+A dry run reads ownership without creating or patching it. A held checkpoint
+requires a matching `--take-over` even for a dry run, whose plan names the
+takeover and any rollback before the upgrade command.
+
+If the newest Helm revision is pending, a plain upgrade refuses after releasing
+its claim. The message names the pending revision and status, the serving
+revision and version, and the rollback command. With `--take-over`, an orphaned
+`pending-upgrade` revision is rolled back to the serving revision using
+`helm rollback <release> <serving-revision> -n <namespace> --wait --timeout 15m`
+before the CLI reads retained snapshots or resumes the lifecycle. A failed
+rollback fails the command and releases ownership without changing the durable
+record. `pending-install`, `pending-rollback`, and a pending history with no
+deployed revision refuse without automated recovery.
+
+The conditional manual patch remains a fallback. After verifying that the
+holder and Helm action have stopped and no release hook Job is running, recover
+any orphaned pending upgrade with the rollback command above. Then replace both
+values in this patch with the exact checkpoint values just observed:
 
 ```bash
 kubectl --context <context> -n <namespace> patch configmap <release>-upgrade-checkpoint \
@@ -631,10 +667,17 @@ curie cluster rollback
 | `--allow-failed-revision` | Permit a `--revision` that Helm never finished applying. |
 | `--live-schema-revision <rev>` | Assert the live Alembic revision instead of reading it from the API pod. The schema-window check still runs against this value. |
 | `--yes` | Skip the confirmation prompt. |
-| `--dry-run` | Print the commands that would run and exit. |
+| `--dry-run` | Read Helm history and print the selected revision and commands. The live-schema probe and rollback do not run. |
 
-`curie cluster rollback` puts the release back on the newest revision that
-Helm actually finished applying.
+`curie cluster rollback` selects the newest `deployed` revision as the serving
+revision. When the newest history row is above it and is not `deployed` or
+`superseded`, the rollback targets the serving revision. For example, deployed
+revision 4 followed by pending revision 5 rolls back to revision 4, clearing
+the unfinished upgrade while retaining known good state.
+
+Otherwise, it selects the newest `deployed` or `superseded` revision below
+the serving revision. If no revision is deployed, it selects below the highest
+revision in the history.
 
 That is not what a bare `helm rollback` does, and the difference bites on a
 cluster without gVisor. `cluster up` tries the install with the chart's
@@ -642,14 +685,21 @@ gVisor default first; if the cluster has no `runsc` RuntimeClass, that attempt
 is recorded as a **failed** Helm revision before the successful retry with
 gVisor off. Do that a few times and the release history alternates
 failed/superseded/failed/superseded. `helm rollback` with no revision targets
-the immediately preceding revision -- which, on that history, is a failed one:
+the immediately preceding revision, which, on that history, is a failed one:
 a manifest Helm never finished putting on the cluster. Rolling back to it does
 not restore a working release, it re-applies a broken one.
 
-So this verb reads the history first, skips every revision whose status is not
-`deployed` or `superseded`, and rolls back to the newest one that is. It prints
-which revisions it passed over, so you can see exactly what a bare
+This verb reads the history first and only selects a revision whose status is
+`deployed` or `superseded`. It prints which ineligible revisions it passed over,
+so you can see exactly what a bare
 `helm rollback` would have landed on instead.
+
+`--dry-run` also reads Helm history and applies the same target selection and
+status refusals. It prints the resolved revision number, status and chart,
+the revision it rolls back from, and any skipped revisions. `--json` carries
+these same lines in the plan. A failed history read or refused selection exits
+nonzero. The plan lists the live-schema probe, but neither that probe nor
+`helm rollback` runs during a dry run.
 
 Status is not the whole story. Every API pod still runs `alembic upgrade head`
 at startup, so an older image refuses a live database revision it does not
@@ -966,26 +1016,45 @@ installation discovery.
 
 Give the App **Checks: Read** and **Commit statuses: Read** (the factory
 preflight names whichever of those two the installation does not grant), and
-**Actions: Read**.
-The Actions permission lets repair rounds include the failing job's log tail.
+**Actions: Read and write**.
+The Actions permission lets the factory rerun failed jobs once before entering
+a repair round and include the failing job's log tail.
+Existing App owners must raise Actions to **Read and write** in the App's
+permissions settings, then have the updated permissions accepted on every
+installation.
 Without it, CI verdicts still use checks and commit statuses; the repair prompt
 keeps the check summary and says `Job log unavailable.` After a factory
 run publishes, it waits on the pull request's checks inside its execution
 deadline; the request completes only when CI is green. A failure resumes the
 same run to fix the code and push to the same pull request, for at most 3
 rounds, then the issue gets `Could not complete:` with the failing checks and
-what each round tried. No checks within 120 s of the push completes with a
-note only when no required check applies. A factory Python publication needs
-in-sandbox verification evidence; beyond that it is judged on the repository's
+what each round tried. A failing check or commit status that is also failing
+on the commit the pull request's base branch points to is not counted against
+the change: it neither fails the run nor reaches a fix round, and a run that is
+otherwise green completes with the note `Also failing on the base branch, not
+caused by this change: <names>`. The required Python check and any check a
+sandbox check delegated to are the exception: failing on the base too leaves
+the run `ci_unverified`. When the base branch cannot be read, every failure
+counts. With no required check, zero checks after the 120 s grace complete with
+a note only when GitHub reports the pull request mergeable or already merged.
+A pull request with merge conflicts waits through that grace, then ends as
+`merge_conflict`, regardless of any checks, without a CI fix round. The pull
+request stays open for a person to resolve the conflicts. Unknown mergeability,
+including GitHub's `null` while it computes the result, keeps a zero-check run
+waiting with reason `mergeability_unknown` until the CI deadline, then ends as
+`ci_unverified` with that reason. Each observation reads mergeability again;
+check-backed verdicts do not depend on unknown mergeability.
+A factory Python publication needs in-sandbox verification evidence; beyond
+that it is judged on the repository's
 own checks unless the repository has a required Python CI policy (below).
 Checks still pending when the CI wait (by default 1200 s from the push, or the
 execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
 `api.githubFactoryCiWaitSeconds` (API env `GITHUB_FACTORY_CI_WAIT_S`, default
 1200, 1 to 10800, checked at boot) when the repository's required checks take
 longer than 20 minutes; the wait still ends at the execution deadline if that
-comes first. Unreadable CI, such as missing Checks or Commit statuses permission,
-ends as `ci_unverified`, which is never success;
-the pull request stays open either way. The work item detail route still
+comes first. CI that cannot be verified, including unreadable checks or missing
+required evidence, ends as `ci_unverified`, which is never success. The notice's
+Reason line explains why. The pull request stays open. The work item detail route still
 reports CI as `unavailable` / `github_forbidden` without the permission.
 
 Required Python CI is set per repository with `api.githubFactoryPythonCi` (API
@@ -1010,8 +1079,9 @@ api:
 ```
 
 Checks that must rerun after a pull request metadata edit are configured per
-repository with API env `GITHUB_FACTORY_METADATA_CI`, a JSON object, default
-`{}`, checked at boot. Each `owner/name` key is matched case insensitively.
+repository with `api.githubFactoryMetadataCi` (API env
+`GITHUB_FACTORY_METADATA_CI`, a JSON object, default `{}`, checked at boot).
+Each `owner/name` key is matched case insensitively.
 Each value supplies `checks` for check run names and `statuses` for commit
 status contexts. An omitted list is empty, but at least one name is required.
 Every configured guard must appear with a timestamp after the metadata edit;
@@ -1020,8 +1090,11 @@ Checks on the unchanged commit retain their passing, pending or failing evidence
 Without a repository policy, a metadata revision ends as `ci_unverified` with
 reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
 
-Set this environment value through the chart's existing `api.extraEnv` or in
-the Compose environment. For Curie's own repository, the value is:
+Set the chart value with a values file or `--set-json`. Installs that previously
+set `GITHUB_FACTORY_METADATA_CI` through `api.extraEnv` must move the JSON object
+to `api.githubFactoryMetadataCi` and remove that extraEnv entry; the chart now
+reserves the environment variable. Compose installs set it in the environment.
+For Curie's own repository, the value is:
 
 ```json
 {"curie-eng/curie":{"checks":["PR body (real newlines)","Fix pin verification"],"statuses":[]}}
@@ -1114,7 +1187,17 @@ It does not pass a null override. A null map entry is not a deletion, and the
 chart refuses it as a digest before Helm creates a revision. After that upgrade it deletes those agents'
 SandboxClaims, as `curie cluster deploy` does, so a live thread's next turn
 starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
-layer until their owners rebuild with `curie build` and redeploy. Both checks
+layer until their owners rebuild with `curie build` and redeploy. An agent bound
+to the project's published dark factory layer
+(`ghcr.io/curie-eng/curie-dark-factory-runner@...`) is instead rebound to the
+layer published for the target version when that layer's base is the target
+runner. The plan lists it separately, and its sandboxes are retired the same
+way. When it cannot be rebound (no published layer, another base, or an
+unreachable registry) it is cleared, and the notice names `curie cluster factory
+--runner-image <agent>=<repository>@sha256:<digest>`, or `curie example
+dark-factory render` then `curie cluster deploy`, instead of `curie build`. The
+canary then reads every layered agent's SandboxTemplate and fails the upgrade
+when its image is not the planned one. Both checks
 resolve runner digests by reading the registry directly, so the operator host
 needs no docker. A registry that refuses anonymous reads falls back to `docker
 buildx imagetools` and its registry login when docker is on PATH. When no digest
@@ -1170,11 +1253,12 @@ until chart-owned values land):
 | `CURIE_WORK_ITEM_BATCH_LIMIT` | `50` | Due rows claimed per pass |
 | `CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS` | `86400` | Waiting deadline from admission |
 | `CURIE_WORK_ITEM_DISPATCH_LEASE_SECONDS` | `30` | Reconciler publish lease |
-| `CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS` | `300` | Worker acquire lease |
+| `CURIE_WORK_ITEM_ACQUIRE_LEASE_SECONDS` | `60` | Worker acquire lease; the worker renews it every 20 s until start or defer, so a dead worker's unstarted requests re-dispatch within about 75 s. Minimum 40 |
 | `CURIE_WORK_ITEM_RUNTIME_TTL_SECONDS` | `45` | Runtime heartbeat expiry; interval is ttl / 3 |
 | `CURIE_WORK_ITEM_CANCEL_SETTLE_SECONDS` | `120` | A cancellation with no worker teardown receipt settles as cancelled after this |
 | `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` | `10` | Defer backoff base |
-| `CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS` | `120` | Capacity defer backoff cap |
+| `CURIE_WORK_ITEM_BACKOFF_MAX_SECONDS` | `120` | Defer backoff cap |
+| `CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` | `5` | The `not_started` defer that reaches this count fails the request with cause `start_failed`; only `not_started` defers count, and other non-capacity waits (such as `thread_busy`) keep the flat base backoff |
 | `CURIE_WORK_ITEM_TERMINATE_RETRY_SECONDS` | `30` | Terminate wake republish window |
 | `CURIE_CONSUMER_GROUP` | `curie-workers` | Runs consumer group the reconciler ensures |
 
@@ -1196,6 +1280,16 @@ Capacity wait expiry is visible as `expired` / `capacity_wait_expired` on
 `GET /v1/internal/work-items/requests/{id}`. It is not written to the
 dead-letter graveyard.
 
+A delivery whose sandbox did not start defers with a `not_started` reason on
+the same backoff curve as capacity, counted separately. Only `not_started`
+defers count toward the limit. The one that reaches
+`CURIE_WORK_ITEM_START_DEFERRAL_LIMIT` ends the request as `failed` /
+`start_failed`, frees its quota slot, and names the attempt count and the last
+deferral reason on the status comment. Every other non-capacity defer is a
+wait rather than a failed start, such as `thread_busy` while another turn holds
+the work item's thread: it waits `CURIE_WORK_ITEM_BACKOFF_BASE_SECONDS` and
+never counts.
+
 Each factory execution request owns exactly one App-authored status comment.
 The reconciler creates it on its first pass after admission and then edits it
 in place; there is no separate final comment. While the run is live the
@@ -1206,8 +1300,13 @@ not edited again. A comment a person deletes is re-created once on the next
 pass; unlabel the issue to stop the run instead.
 
 When publication succeeds, the result names the exact pull request
-URL. When the run cannot complete, the result starts with `Could not complete:`
-and a plain sentence for the cause. When the model provider refused the run,
+URL. A follow-up that needs no change, including a relabel that continues the
+open pull request, ends with `Status: SUCCEEDED` and a result starting
+`No changes needed:` that names the open pull request.
+When the run cannot complete, the result starts with `Could not complete:`
+and a plain sentence for the cause. A request lost with its worker and retried
+as a new run shows `Status: RETRYING` and its result starts with `Retrying:`.
+When the model provider refused the run,
 a `Provider message:` line follows with the provider's own error text, redacted
 of keys and tokens. An execute turn that ends without publishing is prompted
 once more in the same session. If it still does not publish, it ends as
@@ -1215,12 +1314,12 @@ once more in the same session. If it still does not publish, it ends as
 `no_pull_request`, and an `Agent's last message:` block carries the agent's
 final reply, redacted and shown inside a code fence so none of it renders.
 A last `Cause:` line names the platform cause code
-(`capacity_wait_expired`, `execution_deadline`, `issue_cancelled`,
+(`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
-classified run failure: `model_credit_exhausted`, `model_credential_rejected`,
-`model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
+classified run failure: `model_credit_exhausted`, `model_usage_limited`,
+`model_credential_rejected`, `model_rate_limited`, `model_error`, `model_unreachable`, `budget_exceeded`, `runner_timeout`,
 `sandbox_terminated`, `workspace_error`, or `history_capacity`). A sandbox
 termination includes the Kubernetes reason and, for an EmptyDir eviction, the
 volume limit in a `Details:` line. When the cause has a runner failure
@@ -1235,8 +1334,14 @@ Other escalations use that same first line with their own token
 A history capacity result tells the
 operator to inspect work already done and retry. A model provider that answers
 HTTP 402 or reports exhausted
-credits ends the run as `model_credit_exhausted` without retrying. A run that a
-relabel replaced ends with `Stopped: the label was added again, so a new run
+credits, including an OpenRouter key's HTTP 403 spend limit, ends the run as
+`model_credit_exhausted` without retrying. An SDK `rate_limit` error or a
+subscription session, weekly or model usage limit ends the run as
+`model_usage_limited` with failure class `model-usage-limited`, without retrying.
+The status comment says that the model provider's usage limit for the credential
+was reached; re-add the factory label after the limit resets. Ordinary usage
+warnings and rejected rate-limit events keep their existing behavior. A run that
+a relabel replaced ends with `Stopped: the label was added again, so a new run
 replaced this one.`, and the new run gets its own status comment. The
 work item reconciler writes the result after the terminal row and any
 publication lineage commit. A refused create or edit is recorded on the status
@@ -1540,7 +1645,9 @@ request, a `state` and an `actionable_cause`. The states:
   request already opened is kept.
 - `expired`: `capacity_wait_expired` or `execution_deadline`.
 - `failed`: the cause names the terminal cause verbatim. For
-  `deadline_halted`, raise `worker.deliveryBudgetSeconds`.
+  `deadline_halted`, raise `worker.deliveryBudgetSeconds`. For `start_failed`,
+  the sandbox never started; the cause names the attempt count and the last
+  deferral reason.
 - `awaiting_approval`: a publication approval or a tool approval on the same
   conversation is pending.
 - `publishing`: the publication is approved and in flight.
@@ -2056,9 +2163,10 @@ The boot env tokens (`CURIE_HISTORY_TOKEN`, `CURIE_MEMORY_TOKEN`, and
 `CURIE_STATE_TOKEN`) expire at the turn's stream deadline plus 60 seconds,
 and no later than 24 hours. When the worker deletes the sandbox claim, it
 tells the API, and the API refuses that credential immediately (403, "this
-sandbox credential has been released") even though it has not expired. The
-report is best effort. A failed report stays in Valkey until a later
-cleanup pass lands it, or until that record expires with the token. A warm
+sandbox credential has been released") even though it has not expired. Each
+claim gets its own credential id, so a retry after a failed claim boots with a
+credential the API still accepts. The report is best effort. A failed report
+stays in Valkey until a later cleanup pass lands it, or until that record expires with the token. A warm
 sandbox keeps the token it booted with only while that token still covers the
 next turn. Otherwise the next new turn replaces the sandbox. A token minted before this change has no
 credential id. It stays valid until its own expiry. Upgrade the worker with
