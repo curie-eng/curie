@@ -179,6 +179,7 @@ class _Engine:
 def _reader(row: tuple[object, ...] | None) -> tuple[BindingResolver, _Engine]:
     resolver = BindingResolver.__new__(BindingResolver)
     resolver._config = WorkerConfig()
+    resolver._tenant_id = binding.DEFAULT_TENANT_ID
     engine = _Engine(row)
     resolver._engine = engine  # type: ignore[assignment]
     return resolver, engine
@@ -198,6 +199,8 @@ def test_memory_writes_for_reads_the_agent_setting(
     assert "memory_writes" in sql
     assert f"{WorkerConfig().db_schema}.agents" in sql
     assert _AGENT in params.values()
+    assert "tenant_id = :tenant_id" in sql
+    assert params["tenant_id"] == binding.DEFAULT_TENANT_ID
 
 
 def test_memory_writes_for_is_called_on_the_turn_path() -> None:

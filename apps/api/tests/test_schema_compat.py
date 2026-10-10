@@ -42,8 +42,9 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 CONTRACT = "0041"
 # @spec PROTECTED-HOOK-SOURCE-2 and DEPLOY-NOTICE-RELEASE-1.
-# Agent reads require deploy notifications after the published source-control ledger.
-APP_SCHEMA_MIN = "0082"
+# Agent reads require deploy notifications after the published source-control ledger,
+# and the Agent ORM and resolver read the tenant-scope columns of 0101 (#2911).
+APP_SCHEMA_MIN = "0101"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -104,11 +105,11 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
     assert result.rollback_compatible is True
     pending = {step.revision for step in result.pending}
     if branch_head == "0093":
-        assert {"0082", "0091a", "0092a", "0093a", "0098", "0099", "0100"} <= pending
+        assert {"0082", "0091a", "0092a", "0093a", "0098", "0099", "0100", "0101"} <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
-        assert pending == {"0091", "0092", "0093", "0099", "0100"}
-    assert current_revision() == "0100"
+        assert pending == {"0091", "0092", "0093", "0099", "0100", "0101"}
+    assert current_revision() == "0101"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -180,7 +181,11 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
         "0081",
     ):
         assert can_serve(released, window, known) is False
-    assert can_serve("0082", window, known) is True
+    # #2911: the Agent ORM and the resolver read 0101's tenant-scope columns, so
+    # the schemas below it are refused too.
+    for below_tenant_scope in sorted(known - {"0101"}):
+        assert can_serve(below_tenant_scope, window, known) is False
+    assert can_serve("0101", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

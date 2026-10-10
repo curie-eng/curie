@@ -2049,3 +2049,345 @@ def test_reviewer_model_resolves_on_channel_and_agent_binding_paths(
             await engine.dispose()
 
     asyncio.run(go())
+
+
+# --- tenant scope (#2911) ------------------------------------------------------
+#
+# The resolver is constructed for ONE tenant and only matches rows whose agent
+# AND binding are both in it. Another tenant's agent answers exactly as an
+# unknown one does.
+
+
+async def _insert_tenant(engine: AsyncEngine) -> uuid.UUID:
+    tenant_id = uuid.uuid4()
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                f"INSERT INTO {_SCHEMA}.tenants (id, deployment_id, status) "
+                "VALUES (:id, gen_random_uuid()::text, 'active')"
+            ),
+            {"id": tenant_id},
+        )
+    return tenant_id
+
+
+async def _move_to_tenant(
+    engine: AsyncEngine,
+    agent_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    *,
+    tables: tuple[str, ...] = ("agents", "agent_channels", "agent_versions", "deployments"),
+) -> None:
+    async with engine.begin() as conn:
+        for table in tables:
+            column = "id" if table == "agents" else "agent_id"
+            await conn.execute(
+                text(f"UPDATE {_SCHEMA}.{table} SET tenant_id = :tenant WHERE {column} = :id"),
+                {"tenant": tenant_id, "id": agent_id},
+            )
+
+
+async def _cleanup_tenant(
+    engine: AsyncEngine, agent_ids: list[uuid.UUID], tenant_id: uuid.UUID | None
+) -> None:
+    async with engine.begin() as conn:
+        for agent_id in agent_ids:
+            for table in ("deployments", "agent_versions", "agent_channels"):
+                await conn.execute(
+                    text(f"DELETE FROM {_SCHEMA}.{table} WHERE agent_id = :id"), {"id": agent_id}
+                )
+            await conn.execute(
+                text(f"DELETE FROM {_SCHEMA}.agents WHERE id = :id"), {"id": agent_id}
+            )
+        if tenant_id is not None:
+            await conn.execute(
+                text(f"DELETE FROM {_SCHEMA}.tenants WHERE id = :id"), {"id": tenant_id}
+            )
+
+
+def _tenant_resolver(engine: AsyncEngine, tenant_id: uuid.UUID) -> BindingResolver:
+    return BindingResolver(engine, WorkerConfig(db_schema=_SCHEMA), tenant_id=tenant_id)
+
+
+def test_default_tenant_id_is_the_fixed_default_tenant() -> None:
+    assert binding_module.DEFAULT_TENANT_ID == uuid.UUID("00000000-0000-0000-0000-000000000001")
+
+
+def test_an_agent_in_another_tenant_resolves_only_under_that_tenant() -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-tenant-{token}"
+            agent_id = await _seed_agent(
+                engine, channel=channel, name=f"tenant-b-{token}", max_usd=None, max_tokens=None
+            )
+            second: uuid.UUID | None = None
+            try:
+                await _seed_deployment(
+                    engine, agent_id=agent_id, environment="prod", bundle_ref=f"bundles/{token}.zip"
+                )
+                second = await _insert_tenant(engine)
+                await _move_to_tenant(engine, agent_id, second)
+
+                assert await _resolver(engine).resolve("slack", "default", channel) is None
+                resolved = await _tenant_resolver(engine, second).resolve(
+                    "slack", "default", channel
+                )
+                assert resolved is not None
+                assert resolved.agent_id == agent_id
+            finally:
+                await _cleanup_tenant(engine, [agent_id], second)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_a_binding_in_a_different_tenant_than_its_agent_fails_closed() -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-mismatch-{token}"
+            agent_id = await _seed_agent(
+                engine, channel=channel, name=f"mismatch-{token}", max_usd=None, max_tokens=None
+            )
+            second: uuid.UUID | None = None
+            try:
+                await _seed_deployment(
+                    engine, agent_id=agent_id, environment="prod", bundle_ref=f"bundles/{token}.zip"
+                )
+                second = await _insert_tenant(engine)
+                # Only the binding moves: the agent and its deployment stay default.
+                await _move_to_tenant(engine, agent_id, second, tables=("agent_channels",))
+
+                for tenant in (binding_module.DEFAULT_TENANT_ID, second):
+                    resolver = _tenant_resolver(engine, tenant)
+                    assert await resolver.resolve("slack", "default", channel) is None, tenant
+                    assert await resolver.undeployed_binding("slack", "default", channel) is None, (
+                        tenant
+                    )
+                # Pin: the explicit-agent route has no binding, so it still answers.
+                default = _resolver(engine)
+                resolved = await default.resolve_agent(agent_id)
+                assert resolved is not None and resolved.agent_id == agent_id
+            finally:
+                await _cleanup_tenant(engine, [agent_id], second)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_undeployed_binding_in_another_tenant_is_found_only_under_that_tenant() -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            channel = f"C-undeployed-tenant-{token}"
+            agent_id = await _seed_agent(
+                engine, channel=channel, name=f"undeployed-b-{token}", max_usd=None, max_tokens=None
+            )
+            second: uuid.UUID | None = None
+            try:
+                second = await _insert_tenant(engine)
+                await _move_to_tenant(engine, agent_id, second)
+
+                default = _resolver(engine)
+                assert await default.undeployed_binding("slack", "default", channel) is None
+                bound = await _tenant_resolver(engine, second).undeployed_binding(
+                    "slack", "default", channel
+                )
+                assert bound is not None
+                assert bound.agent_id == agent_id
+            finally:
+                await _cleanup_tenant(engine, [agent_id], second)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_resolve_agent_in_another_tenant_resolves_only_under_that_tenant() -> None:
+    """The targetless cron route (#2963) is tenant-scoped like a binding route."""
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            agent_id = await _seed_unbound_agent(engine, name=f"cron-b-{token}")
+            second: uuid.UUID | None = None
+            try:
+                await _seed_deployment(
+                    engine, agent_id=agent_id, environment="prod", bundle_ref=f"bundles/{token}.zip"
+                )
+                second = await _insert_tenant(engine)
+                await _move_to_tenant(engine, agent_id, second)
+
+                assert await _resolver(engine).resolve_agent(agent_id) is None
+                resolved = await _tenant_resolver(engine, second).resolve_agent(agent_id)
+                assert resolved is not None
+                assert resolved.agent_id == agent_id
+            finally:
+                await _cleanup_tenant(engine, [agent_id], second)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_identity_for_address_reads_only_the_resolvers_tenant() -> None:
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            inbox = f"ops-{token}@example.com"
+            agent_id = await _seed_agent(
+                engine,
+                channel=inbox,
+                name=f"identity-b-{token}",
+                max_usd=None,
+                max_tokens=None,
+                kind="email",
+                endpoint="https://mail.test/",
+                adapter="mail-b",
+            )
+            second: uuid.UUID | None = None
+            try:
+                default = _resolver(engine)
+                assert await default.identity_for_address("email", inbox) == "mail-b"
+
+                second = await _insert_tenant(engine)
+                await _move_to_tenant(engine, agent_id, second)
+
+                assert await default.identity_for_address("email", inbox) is None
+                scoped = _tenant_resolver(engine, second)
+                assert await scoped.identity_for_address("email", inbox) == "mail-b"
+            finally:
+                await _cleanup_tenant(engine, [agent_id], second)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_per_agent_reads_answer_unknown_for_an_agent_in_another_tenant() -> None:
+    """Every per-agent read is tenant-scoped.
+
+    An agent in another tenant gets each read's unknown-id answer and its real
+    values only under a resolver built for that tenant.
+    """
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            name = f"per-agent-b-{token}"
+            agent_id = await _seed_agent(
+                engine,
+                channel=f"C-per-agent-{token}",
+                name=name,
+                max_usd=None,
+                max_tokens=None,
+                secrets={"ACME_TOKEN": "s3cret"},
+            )
+            resources = {"cpu": "2"}
+            second: uuid.UUID | None = None
+            try:
+                async with engine.begin() as conn:
+                    await conn.execute(
+                        text(
+                            f"UPDATE {_SCHEMA}.agents SET repo_full_name = :repo, "
+                            "model = :model, reviewer_model = :reviewer, thinking = :thinking, "
+                            "runner_resources = CAST(:resources AS jsonb), "
+                            "memory_writes = true, execution_deadline_seconds = :deadline "
+                            "WHERE id = :id"
+                        ),
+                        {
+                            "repo": "acme/widgets",
+                            "model": "agent_model",
+                            "reviewer": "acme-reviewer-model",
+                            "thinking": "high",
+                            "resources": json.dumps(resources),
+                            "deadline": 600,
+                            "id": agent_id,
+                        },
+                    )
+                second = await _insert_tenant(engine)
+                await _move_to_tenant(engine, agent_id, second)
+
+                default = _resolver(engine)
+                assert await default.repo_full_name(agent_id) is None
+                assert await default.secrets_for(agent_id) is None
+                assert await default.name_for(agent_id) is None
+                assert await default.runner_resources_for(agent_id) is None
+                assert await default.memory_writes_for(agent_id) is False
+                assert (
+                    await default.execution_deadline_seconds_for(agent_id)
+                    == binding_module.DEFAULT_EXECUTION_DEADLINE_SECONDS
+                )
+                assert await default.model_settings_for(agent_id) == (None, None, None, None)
+
+                scoped = _tenant_resolver(engine, second)
+                assert await scoped.repo_full_name(agent_id) == "acme/widgets"
+                assert await scoped.secrets_for(agent_id) == {"ACME_TOKEN": "s3cret"}
+                assert await scoped.name_for(agent_id) == name
+                assert await scoped.runner_resources_for(agent_id) == resources
+                assert await scoped.memory_writes_for(agent_id) is True
+                assert await scoped.execution_deadline_seconds_for(agent_id) == 600
+                assert await scoped.model_settings_for(agent_id) == (
+                    "agent_model",
+                    "acme-reviewer-model",
+                    "high",
+                    resources,
+                )
+            finally:
+                await _cleanup_tenant(engine, [agent_id], second)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
+
+
+def test_routes_for_agent_reads_only_the_resolvers_tenant() -> None:
+    """ADR 0205's re-fetch routes are tenant-scoped like every other read."""
+
+    async def go() -> None:
+        engine = create_async_engine(_DB_URL)
+        try:
+            await pg_connect_or_skip(engine)
+            token = uuid.uuid4().hex[:8]
+            agent_id = await _seed_agent(
+                engine,
+                channel=f"C-routes-{token}",
+                name=f"routes-b-{token}",
+                max_usd=None,
+                max_tokens=None,
+            )
+            second: uuid.UUID | None = None
+            try:
+                default = _resolver(engine)
+                routes = await default.routes_for_agent(agent_id)
+                assert [(r.kind, r.adapter, r.endpoint) for r in routes] == [
+                    ("slack", "default", None)
+                ]
+
+                second = await _insert_tenant(engine)
+                await _move_to_tenant(engine, agent_id, second)
+
+                assert await default.routes_for_agent(agent_id) == []
+                scoped = await _tenant_resolver(engine, second).routes_for_agent(agent_id)
+                assert scoped == routes
+            finally:
+                await _cleanup_tenant(engine, [agent_id], second)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(go())
