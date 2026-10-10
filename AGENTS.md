@@ -139,6 +139,17 @@ Set `base=next` when your worktree targets `next`.
   uv lock --check
   uv sync
   uv run python scripts/check-alembic-revisions.py
+  case "$base" in
+    main) other_train=next ;;
+    next) other_train=main ;;
+    *) other_train= ;;
+  esac
+  if [[ -n "$other_train" ]]; then
+    git fetch --no-tags origin "$other_train"
+    uv run python scripts/check-alembic-revisions.py --other-train-ref "origin/$other_train"
+  else
+    echo "cross-train lineage skipped: base $base is not a train branch"
+  fi
   uv run python scripts/check-schema-window.py
   uv run ruff check .
   uv run mypy

@@ -310,6 +310,20 @@ jobs:
         run: uv sync
       - name: Alembic revision gate
         run: uv run python scripts/check-alembic-revisions.py
+      - name: Alembic cross-train lineage
+        env:
+          BASE: ${{ github.base_ref || github.ref_name }}
+        run: |
+          case "$BASE" in
+            main) other_train=next ;;
+            next) other_train=main ;;
+            *)
+              echo "cross-train lineage skipped: base $BASE is not a train branch"
+              exit 0
+              ;;
+          esac
+          git fetch --no-tags origin "$other_train"
+          uv run python scripts/check-alembic-revisions.py --other-train-ref "origin/$other_train"
       - name: Schema window gate
         run: uv run python scripts/check-schema-window.py
       - name: Ruff
