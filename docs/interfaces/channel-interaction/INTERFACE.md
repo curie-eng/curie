@@ -204,7 +204,10 @@ back into the contract:
 3. **Mail**: `apps/mail-adapter/src/curie_mail_adapter/egress.py`. A `ReplyPost`
    whose interaction is a `ConfirmIntent` becomes an approval-card email through
    `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.record_approval_card`,
-   answered by an emailed APPROVE or REJECT with an optional note (ADR-0177). Other
+   carrying APPROVE or REJECT reply instructions (ADR-0177). The reply interpreter is
+   implemented, but the current AgentMail inbound gate refuses every message before
+   reaching it because sender authentication cannot be verified
+   (`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.handle_inbound`). Other
    posts and updates are recorded as the turn's one reply text. A settling
    `reply.update` closes the card through
    `apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter.settle_approval_card`.
@@ -240,17 +243,20 @@ owes, and no deliverer calls an adapter with it.
 
 ## Known leakage
 
-- **The terminal renderer is a hand-written mirror, not generated.** The source of
+1. **The terminal renderer is a hand-written mirror, not generated.** The source of
   truth is the Pydantic model in
   `packages/channel-protocol/src/channel_protocol/models.py` with a committed JSON
   Schema (`packages/channel-protocol/schema/channel-protocol.schema.json`), but
   `channel-protocol` ships **no Rust binding**. `cli/src/channel.rs` re-declares the
-  wire shape by hand (`#[serde(deny_unknown_fields)]` on each struct). Nothing gates
-  that mirror against the schema the way ADR-0017 gates the ACI's tri-language
-  contract, so a field added in Python is not mechanically caught here — and
-  `deny_unknown_fields` means the mirror *rejects* the new field rather than
-  ignoring it. This is the seam's real drift risk, and it is why "4 renderers" does
-  not imply "4 generated adapters".
+  wire shape by hand (`#[serde(deny_unknown_fields)]` on each struct). Both the Rust
+  renderer's `matches_the_shared_schema_corpus` and the Python model tests in
+  `packages/channel-protocol/tests/test_corpus.py` consume
+  `packages/channel-protocol/schema/channel-protocol.corpus.json`. This gates the
+  represented field bounds and explicit `allow_free_text` values, but omits the
+  defaults for an absent `allow_free_text` and does not regenerate the Rust model
+  from the schema. A Python field added without extending the corpus can therefore
+  escape that gate; `deny_unknown_fields` makes the mirror reject it. The handwritten
+  model still carries drift risk, and four renderers do not imply four generated adapters.
 - **Capability negotiation is modeled but unwired.**
   `packages/channel-protocol/src/channel_protocol/models.py::ChannelCapability`
   and

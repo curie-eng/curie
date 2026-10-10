@@ -71,7 +71,7 @@ which also adds the second, non-default `agent-skills-strict` validation profile
 Those are the Claude-Code-shaped surfaces. `validate_bundle` also validates three **Curie-only root
 files**, each absent from a bundle that needs none, all three invisible to Claude Code:
 
-- `connectors.yaml` (ADR-0086, `packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`)
+1. `connectors.yaml` (ADR-0086, `packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`)
   declares the MCP servers Curie should run or reach on the bundle's behalf, keyed by connector name.
   Each entry is a `packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec` in exactly
   one of three mutually exclusive forms: hosted by reference (`image`, plus `args`/`env`/`port`
@@ -121,7 +121,7 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `connectors.build_no_platforms`, `connectors.ambiguous_name` (a connector name that contains
   `-mcp-` or STARTS with `mcp-`, forging the `-mcp-` join used to render the connector's object
   name, so two different (agent, connector) pairs would render byte-identical objects — checked
-  only for a hosted connector, one declaring `image:`; a remote connector, declaring `url:`,
+  only for a hosted connector, one declaring `image:` or `build:`; a remote connector, declaring `url:`,
   derives no Kubernetes object name, since `render()` emits no objects for it and its `.mcp.json`
   entry is the authored URL, so its name is not checked), `connectors.direct_service_collision` (a
   hosted connector named `x-direct` beside a hosted `x`, whose direct Service behind a caller proxy

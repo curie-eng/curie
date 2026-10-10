@@ -1,7 +1,7 @@
 ---
 seam: Harness in-proc / ModelSession
 kind: CLEAN
-impls: 1 + fake
+impls: 1 production + fake + blocked-preflight
 grade: A-
 vision_row: Harness / runtime
 epics:
@@ -13,7 +13,7 @@ epic_note: folds into
 
 > Part of the Curie swappable-seam catalog — see the [seam index](../../interfaces.md).
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 + fake &nbsp;·&nbsp; **Swap-readiness grade:** A-
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 production + fake + blocked-preflight &nbsp;·&nbsp; **Swap-readiness grade:** A-
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol`/typed port class · SOFT = swap via env/URL/prefix/wire, no code interface · NONE = not built yet.
@@ -104,7 +104,7 @@ and fails loud on an unregistered name.
 
 ## Implementations today
 
-Two, both in `runner/src/curie_runner/`:
+Three session implementations in `runner/src/curie_runner/`, with one production harness:
 
 - **Real:** `ClaudeAgentSession` (`runner/src/curie_runner/adapter.py::ClaudeAgentSession`), wrapping `ClaudeSDKClient` in
   streaming-input mode. Its `receive_turn` normalization iterator wraps
