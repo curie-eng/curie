@@ -53,7 +53,7 @@ def worker_db(worker_templates: Any) -> Iterator[Any]:
     saved = os.environ.get("DATABASE_URL")
     clone = support.IsolatedMigrationDb(base, name, templates)
     try:
-        clone.at("0082")
+        clone.at("0101")
         url = support.render_url(base.set(database=name))
         os.environ["DATABASE_URL"] = url
         support.get_settings.cache_clear()
@@ -74,7 +74,7 @@ def adapter() -> Any:
     return method
 
 
-@pytest.mark.parametrize("revision", ["0082", "future-expand"])
+@pytest.mark.parametrize("revision", ["0101", "future-expand"])
 def test_worker_adapter_reads_actual_compatible_schema_without_writes_or_live_backend(
     worker_db: Any, revision: str
 ) -> None:
@@ -92,7 +92,7 @@ def test_worker_adapter_reads_actual_compatible_schema_without_writes_or_live_ba
     ) == [{"peers": 0}]
 
 
-@pytest.mark.parametrize("kind", ["old", "missing", "future_missing"])
+@pytest.mark.parametrize("kind", ["old", "below_tenant_scope", "missing", "future_missing"])
 def test_worker_adapter_refuses_actual_incompatible_schema_without_booting(
     worker_db: Any, kind: str
 ) -> None:
@@ -101,6 +101,9 @@ def test_worker_adapter_refuses_actual_incompatible_schema_without_booting(
     method = adapter()
     if kind == "old":
         clone.at("0075")
+    elif kind == "below_tenant_scope":
+        # #2911: the resolver reads 0101's columns, so a real 0100 schema is refused.
+        clone.at("0100")
     else:
         if kind == "future_missing":
             support.sql_dicts("UPDATE curie.alembic_version SET version_num='future-expand'")
@@ -109,7 +112,9 @@ def test_worker_adapter_refuses_actual_incompatible_schema_without_booting(
     with pytest.raises(RuntimeError) as caught:
         asyncio.run(asyncio.wait_for(method(WorkerConfig(database_url=url)), 35))
     assert getattr(caught.value, "code", None) == (
-        "schema_below_min" if kind == "old" else "schema_structure_unavailable"
+        "schema_below_min"
+        if kind in ("old", "below_tenant_scope")
+        else "schema_structure_unavailable"
     )
     assert url not in str(caught.value)
     assert support.sql_dicts("SELECT * FROM curie.alembic_version") == before
@@ -184,7 +189,9 @@ asyncio.run(exercise())
         assert result.returncode == 0, "owned worker startup process failed unexpectedly"
         outcome = json.loads(result.stdout)
         assert outcome["code"] == (
-            "schema_below_min" if kind == "old" else "schema_structure_unavailable"
+            "schema_below_min"
+            if kind in ("old", "below_tenant_scope")
+            else "schema_structure_unavailable"
         )
         assert (
             not heartbeat.exists() and not client.exists(stream) and not client.exists(eval_stream)

@@ -125,6 +125,10 @@ semaphore. Runs and eval consumers therefore use the same
 beside the stream broker, rather than widening `StreamBroker` with generic
 string-key verbs.
 
+Delivery and liveness renewals retain authority after an unconfirmed raise only
+until the last confirmed send plus TTL minus refresh interval, while a refused
+renewal drops authority immediately (ADR 0207).
+
 - **Publish before reading.** A generation writes its renewable short `alive`
   lease before its renewable `capability` marker, and does not issue
   `XREADGROUP` until that ordered publication succeeds. Both markers refresh

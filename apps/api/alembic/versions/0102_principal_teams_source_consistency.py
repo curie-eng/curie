@@ -11,8 +11,8 @@ referenced team's ``source`` and rejects a mismatch. A membership whose team
 cannot be found yet is left to the existing composite foreign keys, which run
 after this trigger and reject it on their own terms.
 
-Revision ID: 0089
-Revises: 0088
+Revision ID: 0102
+Revises: 0101
 Create Date: 2026-10-07
 """
 
@@ -20,8 +20,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0089"
-down_revision: str | None = "0088"
+revision: str = "0102"
+down_revision: str | None = "0101"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -2064,6 +2064,52 @@ fn retained_manifest_fix(common: &CommonOpts, revision: u32, published_head: &st
     )
 }
 
+/// After the catalog window refuses an unambiguous target, admit it only when
+/// its retained manifest carries the build's own ADR 0142 schema-compat
+/// metadata, that declared head is strictly later than the catalog head and no
+/// later than the next catalogued release's head, and the declared window
+/// contains the live revision. Requiring a later head keeps every published
+/// release judged by its catalog window. The upper bound admits only a build
+/// cut between its release and the next one, so a chart packaged from a newer
+/// tree under an older version keeps the catalog refusal. Any failure keeps
+/// the original refusal.
+async fn declared_window_admits_rollback(
+    common: &CommonOpts,
+    ui: &crate::ui::Ui,
+    revision: u32,
+    target_app: &str,
+    catalog_head: &str,
+    live: &str,
+    history_apps: &[String],
+) -> bool {
+    let manifest_cmd = helm_retained_manifest_cmd(common, revision);
+    ui.plumbing(&format!("+ {}", manifest_cmd.display()));
+    let Ok((true, manifest_out, _)) = run_capture(&manifest_cmd).await else {
+        return false;
+    };
+    let Ok(crate::schema_compat::RetainedManifestIdentity::Candidate(metadata)) =
+        crate::schema_compat::classify_retained_manifest(&manifest_out, target_app)
+    else {
+        return false;
+    };
+    let Ok(declared) =
+        crate::schema_window::candidate_window(&metadata.schema_min, &metadata.schema_head)
+    else {
+        return false;
+    };
+    // candidate_window refuses a min after its head, so this orders the heads.
+    let later_head = declared.schema_head != catalog_head
+        && crate::schema_window::candidate_window(catalog_head, &declared.schema_head).is_ok();
+    let before_next_release =
+        crate::schema_window::next_release_head(target_app).is_none_or(|next_head| {
+            crate::schema_window::candidate_window(&declared.schema_head, &next_head).is_ok()
+        });
+    later_head
+        && before_next_release
+        && crate::schema_window::check_target_schema(target_app, &declared, live, history_apps)
+            .is_ok()
+}
+
 async fn probe_live_schema_revision(common: &CommonOpts, ui: &crate::ui::Ui) -> Result<String> {
     require_on_path("kubectl")?;
     let probe = live_schema_revision_cmd(common);
@@ -2175,9 +2221,9 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
                 .with_fix(refusal.fix)
                 .into());
         };
-        let (resolved_window, published_identity_fix) = if catalog_window
-            .artifact_identity_ambiguous
-        {
+        let catalog_ambiguous = catalog_window.artifact_identity_ambiguous;
+        let catalog_head = catalog_window.schema_head.clone();
+        let (resolved_window, published_identity_fix) = if catalog_ambiguous {
             let manifest_cmd = helm_retained_manifest_cmd(&opts.common, choice.to_revision);
             ui.plumbing(&format!("+ {}", manifest_cmd.display()));
             let (ok, manifest_out, manifest_err) = run_capture(&manifest_cmd).await?;
@@ -2242,12 +2288,25 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
             &live,
             &history_apps,
         ) {
-            let fix = published_identity_fix
-                .map(|identity| format!("{}. {identity}", refusal.fix))
-                .unwrap_or(refusal.fix);
-            return Err(crate::exit::CliError::failure(refusal.message)
-                .with_fix(fix)
-                .into());
+            let admitted = !catalog_ambiguous
+                && declared_window_admits_rollback(
+                    &opts.common,
+                    ui,
+                    choice.to_revision,
+                    &target_app,
+                    &catalog_head,
+                    &live,
+                    &history_apps,
+                )
+                .await;
+            if !admitted {
+                let fix = published_identity_fix
+                    .map(|identity| format!("{}. {identity}", refusal.fix))
+                    .unwrap_or(refusal.fix);
+                return Err(crate::exit::CliError::failure(refusal.message)
+                    .with_fix(fix)
+                    .into());
+            }
         }
         if opts.live_schema_revision.is_some() {
             ui.warn(&format!(

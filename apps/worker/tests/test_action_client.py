@@ -244,6 +244,7 @@ async def test_a_refused_write_is_raised_not_swallowed() -> None:
                 event_id="e",
                 conversation_id="C1",
                 agent_id=None,
+                budget_s=0,
             )
 
 
@@ -318,6 +319,7 @@ async def test_an_attributed_completion_carries_the_worker_token() -> None:
             SideEffectFlag(tool="mcp__grafana__scale", call_id="c", result={"ok": True}),
             connector="grafana",
             connector_digest=_DIGEST,
+            budget_s=0,
         )
 
     assert seen[0]["path"] == "/actions/a1/complete"
@@ -366,6 +368,7 @@ async def _attributed_complete(handler: Any) -> dict[str, Any]:
             SideEffectFlag(tool="mcp__grafana__scale", call_id="c", result={"ok": True}),
             connector="grafana",
             connector_digest=_DIGEST,
+            budget_s=0,
         )
 
 
@@ -406,14 +409,14 @@ async def test_a_repost_that_is_refused_too_surfaces_and_is_not_retried_again(
 
 
 @pytest.mark.parametrize("status", [403, 422, 503])
-async def test_a_refused_plain_completion_still_raises_without_a_retry(status: int) -> None:
+async def test_a_zero_budget_plain_completion_refusal_has_no_retry(status: int) -> None:
     handler, seen = _refusing_attribution(200, plain_status=status)
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
         with pytest.raises(ActionBackendError):
             await ActionClient(
                 api_base_url="http://api", api_key="k", client=http, worker_token="wt"
-            ).complete("a1", SideEffectFlag(tool="t", call_id="c", result={"ok": True}))
+            ).complete("a1", SideEffectFlag(tool="t", call_id="c", result={"ok": True}), budget_s=0)
 
     assert len(seen) == 1
 
@@ -427,3 +430,140 @@ async def test_a_server_error_on_an_attributed_completion_is_not_a_refusal() -> 
         await _attributed_complete(handler)
 
     assert len(seen) == 1
+
+
+@pytest.fixture
+def retry_clock(monkeypatch):
+    from curie_worker import api_retry
+
+    class Clock:
+        now = 0.0
+        sleeps: list[float]
+
+        def __init__(self) -> None:
+            self.sleeps = []
+
+        def __call__(self) -> float:
+            return self.now
+
+        async def sleep(self, delay: float) -> None:
+            self.sleeps.append(delay)
+            self.now += delay
+
+    clock = Clock()
+    monkeypatch.setattr(api_retry, "_clock", clock)
+    monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
+    return clock
+
+
+# The replay contract is defined by routers/actions.py::create_action and complete_action.
+@pytest.mark.parametrize("operation", ["record", "complete"])
+async def test_ledger_transient_writes_replay_the_same_payload(operation, retry_clock) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if len(seen) == 1:
+            error = httpx.ConnectError if operation == "record" else httpx.ReadTimeout
+            raise error("API restarting", request=request)
+        if len(seen) == 2:
+            return httpx.Response(503)
+        return httpx.Response(
+            201 if operation == "record" else 200, json={"id": "a1", "status": "succeeded"}
+        )
+
+    client, seen = _client(handler)
+    async with client:
+        actions = ActionClient(api_base_url="http://api", api_key="k", client=client)
+        frame = SideEffectFlag(tool="deploy", call_id="call-1", arguments={"replicas": 2})
+        if operation == "record":
+            result = await actions.record(
+                frame, event_id="event-1", conversation_id="thread", agent_id=None
+            )
+            assert result.id == "a1"
+        else:
+            await actions.complete("a1", frame)
+    assert len(seen) == 3
+    assert all(request["body"] == seen[0]["body"] for request in seen)
+    if operation == "record":
+        assert [request["body"]["dedupe_key"] for request in seen] == ["event-1:call-1"] * 3
+    assert retry_clock.sleeps == [0.5, 1.0]
+
+
+@pytest.mark.parametrize("status", [400, 404, 409, 422])
+@pytest.mark.parametrize("operation", ["record", "complete"])
+async def test_ledger_refusals_are_never_retried(status, operation, retry_clock) -> None:
+    client, seen = _client(lambda _request: httpx.Response(status))
+    async with client:
+        actions = ActionClient(api_base_url="http://api", api_key="k", client=client)
+        frame = SideEffectFlag(tool="deploy", call_id="call-1")
+        with pytest.raises(ActionBackendError):
+            if operation == "record":
+                await actions.record(
+                    frame, event_id="event", conversation_id="thread", agent_id=None
+                )
+            else:
+                await actions.complete("a1", frame)
+    assert len(seen) == 1
+    assert retry_clock.sleeps == []
+
+
+async def test_ledger_transport_failure_exhausts_only_the_requested_window(retry_clock) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("API still absent", request=request)
+
+    client, seen = _client(handler)
+    async with client:
+        with pytest.raises(ActionBackendError):
+            await ActionClient(api_base_url="http://api", api_key="k", client=client).record(
+                SideEffectFlag(tool="deploy", call_id="call-1"),
+                event_id="event",
+                conversation_id="thread",
+                agent_id=None,
+                budget_s=3,
+            )
+    assert retry_clock.sleeps == [0.5, 1.0, 1.5]
+    assert sum(retry_clock.sleeps) == 3
+    assert retry_clock.now == 3
+    assert len(seen) == 4
+
+
+async def test_transient_attributed_completion_replays_sealed_state_and_worker_authority(
+    retry_clock,
+) -> None:
+    # ACTION-EXECUTOR-12 attribution and /actions completion are replay safe.
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            {
+                "body": json.loads(request.content),
+                "api_key": request.headers.get("X-API-Key"),
+                "worker_token": request.headers.get("X-Curie-Worker-Token"),
+            }
+        )
+        return httpx.Response(503 if len(seen) < 3 else 200, json={"id": "a1"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        row = await ActionClient(
+            api_base_url="http://api", api_key="k", client=http, worker_token="wt"
+        ).complete(
+            "a1",
+            SideEffectFlag(
+                tool="mcp__grafana__scale",
+                call_id="c",
+                result={
+                    "prior": _ENVELOPE,
+                    "version": "rv-1041",
+                    "target": {"kind": "Deployment", "name": "acme-api"},
+                },
+            ),
+            connector="grafana",
+            connector_digest=_DIGEST,
+        )
+
+    assert row["id"] == "a1"
+    assert len(seen) == 3
+    assert all(request == seen[0] for request in seen)
+    assert seen[0]["body"]["prior_state"] == _ENVELOPE
+    assert seen[0]["body"]["post_version"] == "rv-1041"
+    assert seen[0]["body"]["connector_digest"] == _DIGEST
+    assert seen[0]["api_key"] == "k" and seen[0]["worker_token"] == "wt"
+    assert retry_clock.sleeps == [0.5, 1.0]

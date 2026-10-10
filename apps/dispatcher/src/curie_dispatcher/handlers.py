@@ -55,8 +55,11 @@ not the dispatcher's.
 
 import logging
 import re
+import threading
+import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
+from queue import Full, Queue
 from typing import TYPE_CHECKING, Any
 
 from aci_protocol import Attachment, QueuedTurn, ReplyHandle, TurnSource
@@ -64,6 +67,7 @@ from aci_protocol.turn import DEFAULT_IDENTITY
 from curie_telemetry import operation_span, record_metric
 from opentelemetry.trace import SpanKind
 from slack_bolt import App
+from slack_bolt.response import BoltResponse
 from slack_sdk.errors import SlackApiError
 from slack_sdk.web import WebClient
 
@@ -83,6 +87,7 @@ from .approval_actions import (
     render_approval_action,
     render_note_submission,
     resolve_approval_action,
+    resolve_driver_reply,
     resolve_note_submission,
     this_release_owns_action,
 )
@@ -90,6 +95,7 @@ from .config import DispatcherConfig, release_identity
 from .identities import delivery_key, minted_adapter
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
+from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
 from .queue import claim_event, enqueue, release_event
 from .relevance import DropReason, Lane, classify, drop, missing_envelope_fields
 from .thread_context import SlackThreadContext
@@ -383,6 +389,7 @@ def process_event(
     bot_user_id: str | None = None,
     bot_id: str | None = None,
     identity_bots: Mapping[str, str] | None = None,
+    approval_resolver: ApprovalResolveClient | None = None,
     clock: Clock = _utc_now_iso,
     logger: logging.Logger | None = None,
 ) -> str | None:
@@ -444,11 +451,17 @@ def process_event(
         return None
 
     bots = identity_bots or {}
+    # Derive the full Block Kit/attachment body before reading the mark; a
+    # non-empty top-level text remains byte-identical (#2006).
+    text = _strip_self_mention(derive_text(event), bot_user_id)
+    marked = lane == "mention" and bool(event.get("bot_id")) and text.startswith(MARK)
+    driver = declared_driver(config, event) if marked else None
     reason = classify(
         event,
         lane=lane,
         threaded_bot_allowlist=config.slack_threaded_bot_allowlist,
         identity_bot_ids=bots.keys(),
+        marked_test_action=marked,
     )
     if reason is not None:
         drop(log, reason, event_id=slack_event_id, lane=lane)
@@ -461,8 +474,11 @@ def process_event(
     ):
         sender_bot = event.get("bot_id")
         author = (
-            bots.get(sender_bot, "") if isinstance(sender_bot, str) else ""
-        ) or str(event.get("user") or "")
+            driver.bot_user_id
+            if driver is not None
+            else (bots.get(sender_bot, "") if isinstance(sender_bot, str) else "")
+            or str(event.get("user") or "")
+        )
         delivery_id = delivery_key(slack_event_id, slack_identity)
         if _refused_caller(
             admission=admission,
@@ -473,7 +489,13 @@ def process_event(
             # The turn's author as well: for a sibling identity's bot that is
             # its bot user id (ADR-0168 decision 6), which an operator may
             # have listed instead of the bot id.
-            callers=list(dict.fromkeys([author, *_event_callers(event)])),
+            callers=list(
+                dict.fromkeys(
+                    [author, str(sender_bot)]
+                    if driver is not None
+                    else [author, *_event_callers(event)]
+                )
+            ),
             lane=lane,
         ):
             return None
@@ -481,12 +503,59 @@ def process_event(
             drop(log, DropReason.DUPLICATE_DELIVERY, event_id=delivery_id)
             return None
 
-        # NOT `event.get("text", "")`: a Block Kit or attachment-shaped post
-        # carries an empty or fallback-only top-level `text` and its real body in
-        # `blocks`/`attachments`, so that read emptied the turn while still
-        # burning a placeholder (#2006). `derive_text` returns a non-empty
-        # top-level text byte-identically, so existing enqueues are unchanged.
-        text = _strip_self_mention(derive_text(event), bot_user_id)
+        if marked:
+            admitted = (
+                config.test_installation_enabled
+                and driver is not None
+                and driver.channel_id == channel
+            )
+            # Reserved approval verbs always terminate here, including malformed
+            # forms: they never become a turn or consume the thread turn budget.
+            command = text[len(MARK) :].strip().split()
+            if command and command[0] in ("approve", "reject"):
+                handled = (
+                    admitted
+                    and len(command) == 2
+                    and bool(event.get("thread_ts"))
+                    and approval_resolver is not None
+                    and resolve_driver_reply(
+                        approval_id=command[1],
+                        decision="approved" if command[0] == "approve" else "rejected",
+                        subject=author,
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        bot_user_id=bot_user_id,
+                        bot_id=bot_id,
+                        web_client=web_client,
+                        resolver=approval_resolver,
+                        log=log,
+                    )
+                )
+                if not handled:
+                    drop(log, DropReason.TEST_ACTION_REFUSED, event_id=delivery_id, lane=lane)
+                    web_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=REFUSAL)
+                return None
+            is_ping = text == f"{MARK} ping"
+            ping = is_ping and not event.get("thread_ts")
+            if admitted and ping:
+                assert driver is not None
+                web_client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f"This installation accepts test actions from <@{driver.bot_user_id}>.",
+                )
+                return None
+            if (
+                not admitted
+                or (is_ping and not ping)
+                or not reserve_turn(
+                    redis_client, config, identity=slack_identity, channel=channel, thread=thread_ts
+                )
+            ):
+                drop(log, DropReason.TEST_ACTION_REFUSED, event_id=delivery_id, lane=lane)
+                web_client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=REFUSAL)
+                return None
+
         # @spec slack-alert-followup-context: Decision. After the claim, so a
         # duplicate asks Slack nothing; before the placeholder, and it never
         # raises, so the claim -> placeholder -> XADD order holds. A reply in a
@@ -659,6 +728,63 @@ def process_action(
         )
 
 
+class _DriverApprovalProbe:
+    """One read-only worker, no backlog, and a bounded per-envelope result wait.
+
+    Only the requesting middleware can continue a delivery. A late worker may
+    refresh the ordinary admission cache but cannot acknowledge, claim, mint,
+    or resolve anything. A stuck read holds this lane closed until it recovers
+    or the process restarts; it cannot grow more workers or queued requests.
+    """
+
+    def __init__(self) -> None:
+        self._busy = threading.Lock()
+        self._started = False
+        self._work: Queue[tuple[Callable[[], int | None], threading.Event, list[int | None]]] = (
+            Queue(maxsize=1)
+        )
+
+    def _run(self) -> None:
+        while True:
+            call, done, result = self._work.get()
+            try:
+                result.append(call())
+            except Exception as exc:  # noqa: BLE001 - worker boundary must fail closed
+                logging.getLogger(__name__).warning(
+                    "test driver ownership check failed: %s", type(exc).__name__
+                )
+                result.append(503)
+            finally:
+                # Keep the slot until the actual read-only task exits. Results
+                # are local to this envelope and published before signalling.
+                self._busy.release()
+                done.set()
+                self._work.task_done()
+
+    def check(self, call: Callable[[], int | None], *, wait_s: float = 1.0) -> int | None:
+        deadline = time.monotonic() + wait_s
+        if not self._busy.acquire(blocking=False):
+            return 503
+        done = threading.Event()
+        result: list[int | None] = []
+        try:
+            if not self._started:
+                threading.Thread(
+                    target=self._run, daemon=True, name="driver-approval-probe"
+                ).start()
+                self._started = True
+            self._work.put_nowait((call, done, result))
+        except (RuntimeError, Full):
+            self._busy.release()
+            return 503
+        if not done.wait(max(0.0, deadline - time.monotonic())):
+            return 503
+        # Completion racing the deadline never authorizes a late delivery.
+        if time.monotonic() >= deadline:
+            return 503
+        return result[0]
+
+
 def register_handlers(
     app: App,
     *,
@@ -688,7 +814,66 @@ def register_handlers(
     # one is the single logger every drop must land on.
     log = logger or logging.getLogger(__name__)
 
-    @app.event("app_mention")
+    driver_approval_probe = _DriverApprovalProbe()
+
+    def _driver_approval_owner(
+        body: dict[str, Any],
+        event: dict[str, Any],
+        context: dict[str, Any],
+        next: Callable[[], BoltResponse],
+    ) -> BoltResponse:
+        """Check release affinity before Events API's automatic acknowledgement.
+
+        Bolt event listeners auto-ack before their body runs (slack_bolt 1.30.0
+        App.event / ThreadListenerRunner.run). Supported listener middleware
+        runs first. One second bounds the aggregate local result wait, including
+        admission, cache/dedupe reads and ownership. Unknown or late answers
+        decline with 503 for retry; exact row misses retain 404. Never call
+        Slack here, and ask caller admission before dedupe and ownership.
+        """
+        text = _strip_self_mention(derive_text(event), context.get("bot_user_id"))
+        driver = declared_driver(config, event)
+        command = text[len(MARK) :].strip().split() if text.startswith(MARK) else []
+        event_id = str(body.get("event_id") or "")
+        channel = str(event.get("channel") or "")
+        if (
+            not config.test_installation_enabled
+            or driver is None
+            or not event.get("bot_id")
+            or driver.channel_id != channel
+            or len(command) != 2
+            or command[0] not in ("approve", "reject")
+            or not event_id
+            or not channel
+            or not event.get("thread_ts")
+            or not event.get("ts")
+        ):
+            return next()
+        delivery_id = delivery_key(event_id, slack_identity)
+
+        def read_owner() -> int | None:
+            refusal = admission_gate.refusal(
+                address=channel,
+                adapter=minted_adapter(slack_identity),
+                callers=list(dict.fromkeys([driver.bot_user_id, driver.bot_id])),
+            )
+            if refusal is not None:
+                drop(log, refusal, event_id=delivery_id, lane="mention")
+                return 503 if refusal is DropReason.ADMISSION_UNAVAILABLE else 200
+            if redis_client.exists(config.dedupe_key(delivery_id)):
+                return None
+            owned = approval_resolver.exists(command[1])
+            if owned is False:
+                log.warning("test driver approval was not found in this release")
+                return 404
+            return None if owned is True else 503
+
+        status = driver_approval_probe.check(read_owner)
+        if status is not None:
+            return BoltResponse(status=status, body="")
+        return next()
+
+    @app.event("app_mention", middleware=[_driver_approval_owner])
     def _on_app_mention(
         body: dict[str, Any], event: dict[str, Any], context: dict[str, Any]
     ) -> None:
@@ -696,6 +881,7 @@ def register_handlers(
             body=body,
             event=event,
             lane="mention",
+            approval_resolver=approval_resolver,
             web_client=web_client,
             redis_client=redis_client,
             config=config,

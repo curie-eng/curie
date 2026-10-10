@@ -1,27 +1,33 @@
-# Agent validator: slice 1 and proposed action validation
+# Agent validator: read-only and admitted marked actions
 
 <!-- @spec VALIDATOR-1 -->
-A ship decision needs both a target-owned fixed acceptance suite and realistic
-user scenario campaigns. Slice 1 implements planning and read-or-ask grading;
-it never authorizes a target action, uploads an attachment, resolves a card,
-invokes target state tools, injects a fault, or restores state. The existing
-manifest and ADR 0181 policy remain unchanged. An installation mark is proposed
-metadata, not implemented authorization. A slice 1 report cannot issue full GO.
+A ship decision needs a target-owned fixed acceptance suite and realistic user
+scenario campaigns. Read-or-ask remains available everywhere. Accepted ADR 0202
+adds marked action probes only after a listed driver's own admission ping.
+The seven-tool manifest is unchanged: there is no upload, human button-click,
+platform API credential or arbitrary state/restore capability in this example.
+The gate checks campaign observations; it is not authentication or attestation.
 
 ## Modes and the installation mark
 
-**Read-or-ask** is available for an existing installation in production or test.
-Every sent message must remain safe under the current policy, even if the target
-has approval gates. Recorded exchanges can describe actions without performing
-those actions. No separate validation installation is required.
+Read-or-ask never performs an action and does not need a separate installation.
+Action validation requires the installation's operator declaration, listed
+channel/bot/user pair and target-owned verification and restoration contracts.
+A name containing "test", a request or bundle prose grants no authority.
 
-**Action validation**, proposed for slice 2, operates only on an existing
-installation an operator has marked for testing. The platform must attest the
-mark, target installation identity, permitted scope and run identity at execution
-time. A name containing “test”, a request, or bundle prose grants no authority.
-Snapshot before the first action, preserve base content, restore after the run,
-and verify restored content. Never wipe. The operator schedules around demos;
-this design adds no scheduler or installation lock.
+Before the first action, the driver sends its own root
+`<@target> [test action] ping` and accepts only the first reply in that thread,
+from the configured target bot/user, inside a chosen 1–60-second window:
+`This installation accepts test actions from <@driver>.` A generic refusal,
+wrong thread/author, earlier reply, expired observation or incomplete provider
+page leaves every action unsent. The admission is independent of target turns.
+Every action then begins `<@target> [test action] [mean test <id>]`; the mark
+must follow the target mention, before the campaign label.
+
+The driver retains the owned pre-state before any action and the actual own-read
+observations afterward. Preserve base content and unrelated revisions; never
+wipe. The operator schedules around demos. The tester adds no scheduler or lock,
+and does not change a route, app scope or installation configuration to pass.
 
 ## Target-owned acceptance suite
 
@@ -42,8 +48,9 @@ case records `probe`, `mode` (`read-or-ask` or `action`), `attachments`,
 and positive integer `repeat`. Unknown fields, duplicate IDs, invalid criterion
 references, empty cases, unsupported versions and invalid types are malformed.
 An action-bearing probe is an action even if mislabelled `read-or-ask`.
-Attachments, card actions and state assertions require slice 2; never send them
-under slice 1. Plain pasted text is permitted only when the probe itself reads
+Card actions and state assertions require admitted action validation.
+Attachments and `click-as-non-approver` remain BLOCKED: slice 2 because this
+bundle lacks those transports. Plain pasted text is permitted only when the probe itself reads
 or asks; do not change an attachment case into pasted text and count it covered.
 
 Intake has explicit states: `READY`, `MISSING`, `MALFORMED`, and
@@ -65,9 +72,9 @@ paragraphs; edits deep inside a line; changed numbers; forgotten attachments,
 re-attachment, vague categories and follow-ups depending on earlier answers,
 as far as the target's users would do them. Plan the whole
 ask/file/approve-or-reject/check flow for every target that can perform one; a
-target that only reads and answers has no such flow to plan. Mark action, attachment,
-card and state-check steps `BLOCKED: slice 2`; run only independent read-or-ask
-steps. Do not grade a downstream check as PASS when its prerequisite was blocked.
+target that only reads and answers has no such flow to plan. Run action/card/state steps only after admission and with their declared
+contracts. Unsupported attachment and non-approver click steps stay
+`BLOCKED: slice 2`; only independent read-or-ask steps may bypass them. Do not grade a downstream check as PASS when its prerequisite was blocked.
 If threaded bot follow-ups are unavailable, report that conversation coverage
 is blocked; a new independent thread does not prove conversational continuity.
 
@@ -120,10 +127,12 @@ and retain evidence of restoration failure. Office metadata may be rewritten;
 content equivalence, not byte equality, determines successful restoration.
 
 The validator owns the cards it creates, records their IDs and asks people not
-to clear them. Its future principal must be authenticated, scope-limited to the
-marked installation and eligible for the route's actual approver set. An
-operator token must not manufacture channel/group evidence. See phase 0 before
-choosing a principal design. State restore must not undo unrelated user changes;
+to clear them. Its approve/reject reply must match the actual pending native card in the
+same owned channel/thread. The platform alone mints a bounded `test_driver`
+principal, independently checks its setting/subject, and admits only actual
+ExplicitUsers routes. Channel/group/email, unbound and invalid routes remain
+refused. The tester never mints a principal or changes an approver set.
+State restore must not undo unrelated user changes;
 revision conflicts require a recorded refusal and operator intervention.
 
 ## Fault injection and continuation
@@ -142,7 +151,9 @@ state is lost, mark NOT RUN rather than inventing earlier successes. Pace new
 threads by the target's sandbox quota and operator-assigned share; follow-ups
 reuse a thread's sandbox only when its bot allowlist permits them. A clock rate
 alone is not a quota proof. Stop starting work with the existing five-minute
-report margin. Pending slice 2 steps do not become `Next:` live action requests.
+report margin. Unsupported or unadmitted steps do not become unguarded `Next:` action requests.
+Continuations require a new own ping before new actions, preserving original
+pre-state, identity and prior observations.
 
 ## Ship verdict
 
@@ -154,7 +165,7 @@ runner layer as `mean-tester-gate`), validates the suite against
 recorded verdicts and aggregates it. The report carries the gate's `Ship:`,
 `Coverage:` and `Ledger:` lines unedited.
 
-**GO (read-only scope)** is the one GO slice 1 can issue. It requires: a READY
+**GO (read-only scope)** remains the verdict for read-or-ask campaigns. It requires: a READY
 suite, its copy matching the Git blob it was read from when it came from Git; no
 action-bearing case (mode `action`, attachments, a card action, an expected
 state, or a probe the tester flags as asking for an action); every case passing
@@ -168,8 +179,10 @@ smoke, and no marked installation is involved, so no configuration diff
 applies. It covers the installation the probes reached and only what a person
 can do there by reading and asking.
 
-An action-bearing suite needs slice 2: slice 1 never issues full GO for it.
-Full GO requires all of the above for every case, verified restoration with no
+An unadmitted action-bearing suite remains NO-GO. Admitted slice 2 can issue
+full GO as **GO (action scope)** only with every eligible marked action
+observation and all the same coverage conditions. It additionally requires
+verified restoration with no
 cleanup failure, an explained configuration diff between marked and production
 installations, and a post-deploy read-only production smoke; the pre-deploy
 report cannot claim that later smoke occurred.
@@ -185,27 +198,106 @@ campaign or suite is refused, never reused. A fresh sandbox restores it
 with `mean-tester-gate import`. The checksum catches a token that was not copied
 exactly; it is not a security boundary against the tester itself.
 
-## Next decisions before slice 2
+## Observation inputs and gate commands
 
-The platform side of slice 2 is proposed in Draft ADR 0202
-([#4059](https://github.com/curie-eng/curie/pull/4059)), which revives the capability first proposed in #3122. It covers the
-installation mark and its authority, a driver principal that only an explicit
-approver list accepts, route eligibility, card ownership and the admission check
-a driver runs before acting. Until it is Accepted, nothing here sends an action.
+The gate performs no provider requests, writes, snapshots or restores. Supply
+actual observations from the existing permitted reads. The model still judges
+reply quality; exact state assertions and campaign aggregation run in the gate.
+No boolean `admitted` or installation name can replace the observed messages.
+Do not paste whole configs, credentials, sealed snapshots or raw private content.
+Keep bounded readonly projections, content fingerprints and stable object IDs.
+A supplied observation is evidence to check, never authenticated authority.
 
-Once it is Accepted, this tester's own slice 2 rules belong in this bundle's
-documentation, not in another ADR (`AGENTS.md`, "Decisions: ADR vs. GitHub
-issue"). Those rules cover marked action probes, the admission ping, answering
-cards and checking state. ADR 0181's frozen body stays as it is; ADR 0202
-supersedes it in part on acceptance.
+`admit --suite <file> --ledger <file> --campaign <id> --evidence <file>` takes:
 
-ADR 0202 leaves these decisions to the owner:
-- verification and restore capabilities;
-- content equivalence;
-- conflict cleanup;
-- fault controls;
-- the full GO policy for action-bearing suites.
+- `campaign` and `suite`: the exact campaign and suite SHA-256 from intake.
+- `channel`, `driver_user`, `driver_bot`, `target_user`, `target_bot`: the
+  operator's pinned identities, not names guessed from a message.
+- `window_seconds`: the chosen integer from 1 to 60.
+- `thread`: actual provider `ok: true`, `has_more: false`, no remaining cursor,
+  and `messages` including the own root and every reply. Keep actual `ts`,
+  `thread_ts`, `user`, `bot_id`, `text`; do not synthesize missing fields.
+- `snapshot`: `at` as observed Unix seconds, `source: "read-own-observation"`,
+  a nonempty credential-free `content` projection and a named `restore_contract`.
+  Its observation must precede the campaign. The contract names supported
+  connector/policy/digest and object scope; it is not permission to execute.
 
-The request's ADR 0174 reference is incorrect: that ADR concerns publication
-precheck capabilities. Phase 0 records measured facts and unresolved external
-evidence.
+Admission validates the complete thread in timestamp order and prints the
+eligible plan. Readonly intake by itself still blocks action cases. Admission
+must be recorded while its reply remains fresh inside the chosen window.
+Action probes are checked within a 600-second part after its reply, not against
+an unrelated historical response. This is the driver's conservative window,
+not an extension of the platform's 60-second approval principal.
+
+`record ... --evidence <file>` for an action case takes:
+
+- `channel` and actual `probe` message fields, with the exact marked fixed
+  text, case repeat and current campaign. A follow-up includes the actual
+  driver-authored `root` in its same thread.
+- For `card_action: approve/reject`, `card` with the actual target bot/user,
+  timestamps and native blocks carrying one identical approval id in both
+  Approve and Reject buttons; `decision` with the actual driver's exact
+  marked approve/reject reply in that thread. The card precedes the decision.
+- For `expected_state`, `state` with `at`, `source: "read-own-observation"`
+  and the actual nonempty `content` projection read after the action, within
+  180 seconds of its probe. PASS requires every expected key/value to match
+  exact JSON, including types. Owner-defined fingerprints are supported;
+  descriptive conditions without a supported readonly projection stay
+  unverified. A target success claim is not this read.
+
+Scenario/invented action records add `--action` and their planned `card_action`
+and `expected_state` to the evidence. Record the action before grading further
+steps. The ledger separates case, scenario and probe identities, so matching
+names cannot overwrite each other's evidence. Mark every action in the skill;
+the gate does not classify arbitrary natural-language probes automatically.
+
+A continuation imports the unchanged token, then obtains a new own admission
+with `admit ... --refresh --evidence <file>` before sending further actions.
+The new ping must be later and fresh; campaign, identities, channel and original
+snapshot must be identical. Each previous action retains its own admission
+observation, which import rechecks along with the suite/campaign and every
+required action field. New action records additionally require current admission freshness
+inside the 600-second part. Completed historical evidence does not expire as a
+claim about its past run, and never becomes a new execution grant.
+
+`closeout ... --evidence <file>` takes actual later observations:
+
+- `restoration`: `at`, `source: "read-own-observation"`, the same owned
+  `content` projection as before, `cleanup_failures: []` and `pending_cards: []`.
+  It must follow all recorded actions/decisions/state reads. Preserve the
+  connector's actual restore receipt privately; conflicts/failures prevent GO.
+- `configuration`: bounded credential-free `test` and `production` projections
+  and `explanations`, keyed by every changed top-level projection key using exact JSON
+  comparison. Include `testInstallation: true` in `test` and
+  `testInstallation: false` in `production`. Choose
+  sufficiently explicit keys to explain security, credentials references,
+  downstream account scope and runtime differences individually. Missing or
+  extra explanations are refused; equality does not require an explanation.
+- `deployment`: actual readback `identity` and `at` for production.
+- `smoke`: actual `at`, matching `deployment`, `read_only: true`, `verdict: "PASS"`,
+  and observed `probe`/`reply`. It must follow deployment, which follows
+  restoration. Future timestamps or pre-deploy fabricated smoke are refused.
+
+Closeout closes action recording; it never fills missing cases or overrides a
+FAIL/UNCLEAR. The gate then computes the ordinary verdict. If later production
+proof is unavailable, report NO-GO now, retain the gap and collect it only after
+it actually happens. No deployment is authorized by this bundle or document.
+
+The lossless `mt1` token includes action observations so import revalidates them.
+It is checksummed, not signed or secret: keep it private where its observations
+are private. The checkpoint limit is 1,800 characters to leave room in a bounded
+Slack report. Oversize evidence produces NO-GO and no partial `Ledger:` line.
+Preserve the full private ledger; a sandbox that loses it has unknown prior
+coverage, never counts reconstructed successes. Do not truncate or discard
+negative evidence to make the token fit.
+
+## Decision and capability boundary
+
+Accepted ADR 0202 governs the platform admission and principal; its body is
+unchanged. This bundle implements decision 6's driver behavior using the seven
+existing tools. ADR 0121 governs connector-native restoration, ADR 0124 keeps
+sealed snapshots with their connector, and ADR 0117 governs actual tool outcome
+observations. The historical [phase 0 measurements](PHASE-0.md) remain evidence
+of their earlier candidate, not a claim about this implementation's live proof.
+The bundle adds no downstream access, fault controls, credential or restore
+capability. Unsupported cases remain blocked and cannot receive full GO.

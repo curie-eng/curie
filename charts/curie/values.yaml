@@ -791,8 +791,17 @@ connectorCaller:
 # `get` on Deployments so it can read the digest a connector ran at
 # (ACTION-EXECUTOR-12, -14); with the executor off that grant is absent and
 # actions record no digest, so they are not undoable.
+#
+# maxConcurrentSandboxes (AUTOMATED-REMEDIATION-12, executor amendment E9) is the
+# most executions live (claimed or dispatched) across the installation at once,
+# rendered as CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES into both the API,
+# whose claim route enforces it across worker replicas, and the worker, whose
+# executor loop runs up to that many at once. While two or more slots exist one
+# is kept for write-kind executions, so remediation samples never starve a
+# write. It leaves sandbox quota to ordinary turns; an integer of at least 1.
 actionExecutor:
   enabled: false
+  maxConcurrentSandboxes: 2
 
 # Automated remediation (AUTOMATED-REMEDIATION-1). One switch, rendered as
 # CURIE_REMEDIATION_ENABLED into both the API and the worker. Closed by default.
@@ -836,6 +845,10 @@ remediation:
 testInstallation:
   enabled: false
   drivers: []
+  # Maximum driver-started turns per Slack identity/channel/thread in any ten
+  # minutes, shared by all listed drivers (1–100). Pings and duplicate deliveries
+  # spend no turn budget. Valkey reservations make the cap atomic across replicas.
+  threadTurnLimit: 10
 
 rustfs:
   deploy: true
@@ -1382,6 +1395,10 @@ api:
   # an entry may only use its default branch. Rendered as JSON into
   # GITHUB_FACTORY_BASES.
   githubFactoryBases: {}
+  # Checks and commit statuses that rerun after a pull request metadata edit,
+  # keyed by owner/name: {checks: [name, ...], statuses: [name, ...]}.
+  # Rendered as JSON into GITHUB_FACTORY_METADATA_CI.
+  githubFactoryMetadataCi: {}
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
@@ -2551,11 +2568,19 @@ preflights:
   controllerReady:
     enabled: true
     image: alpine/k8s:1.31.2
-    # Max seconds to wait for "Starting workers" or positive successful-reconcile
-    # metrics after checking for controller failures. Sized for a fresh install;
-    # an upgrade over a crash-looping controller may need a manual pod delete
-    # + `helm test`.
+    # Max seconds to wait for a stable serving leader, "Starting workers" or
+    # positive successful-reconcile metrics after checking for controller
+    # failures. Sized for a fresh install; an upgrade over a crash-looping
+    # controller may need a manual pod delete + `helm test`.
     timeoutSeconds: 180
+    # How long the current controller pod must have held its leader-election
+    # Lease, while still renewing it, for the gate to accept it as serving
+    # without a fresh startup log (issue #4197). This is what lets an upgrade
+    # that does not restart the controller pass. It must exceed the
+    # controller's 120s cache-sync timeout, after which a manager whose
+    # informers cannot sync exits and loses the lease; the chart refuses
+    # values below 150.
+    stableLeaderSeconds: 180
     resources:
       requests: { cpu: 50m, memory: 64Mi }
       limits: { cpu: 250m, memory: 128Mi }

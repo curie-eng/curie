@@ -1,4 +1,4 @@
-"""Migration 0089 adds the principal_teams/teams source-match trigger (#3002)."""
+"""Migration 0102 adds the principal_teams/teams source-match trigger (#3002)."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _function_present() -> bool:
     return bool(rows)
 
 
-def test_0089_round_trip_creates_and_drops_source_match_trigger(
+def test_0102_round_trip_creates_and_drops_source_match_trigger(
     isolated_migration_db: IsolatedMigrationDb,
 ) -> None:
     config = alembic_config()
@@ -30,7 +30,7 @@ def test_0089_round_trip_creates_and_drops_source_match_trigger(
     assert _trigger_present() is True
     assert _function_present() is True
     try:
-        command.downgrade(config, "0088")
+        command.downgrade(config, "0101")
         assert _trigger_present() is False
         assert _function_present() is False
         # principal_teams itself (added by 0057) must outlive this downgrade.

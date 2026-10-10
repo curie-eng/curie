@@ -14,7 +14,7 @@ from curie_api.workitems.lifecycle import WorkItemConflict, WorkItemOutcome
 from .. import workitem_dispatch
 from ..auth import require_internal_worker_token
 from ..config import get_settings
-from ..deps import SessionDep
+from ..deps import LivenessSessionDep, SessionDep
 from ..workitem_dispatch import DispatchConflict
 
 router = APIRouter(
@@ -231,6 +231,7 @@ async def defer_work_item_request(
     return {
         "dispatch_generation": result.dispatch_generation,
         "not_before": result.not_before,
+        "terminal_cause": result.terminal_cause,
     }
 
 
@@ -259,7 +260,7 @@ async def start_work_item_request(
 
 @router.post("/requests/{request_id}/heartbeat")
 async def heartbeat_work_item_request(
-    request_id: uuid.UUID, body: HeartbeatBody, session: SessionDep
+    request_id: uuid.UUID, body: HeartbeatBody, session: LivenessSessionDep
 ) -> dict[str, Any]:
     result = await workitem_dispatch.heartbeat(
         session, request_id, runtime_epoch=body.runtime_epoch

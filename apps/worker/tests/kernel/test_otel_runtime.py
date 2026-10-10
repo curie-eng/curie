@@ -786,7 +786,7 @@ class _Approvals:
     def __init__(self) -> None:
         self.requests: list[ApprovalRequest] = []
 
-    async def create(self, request: ApprovalRequest) -> CreatedApproval:
+    async def create(self, request: ApprovalRequest, *, budget_s: float = 120) -> CreatedApproval:
         self.requests.append(request)
         return CreatedApproval(id=f"appr-example-{len(self.requests)}", status="pending")
 

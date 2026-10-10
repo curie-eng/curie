@@ -144,6 +144,39 @@ def _run_gate(repo_root: Path | None = None) -> subprocess.CompletedProcess[str]
     return run_script(CHECKER, *args)
 
 
+def _commit_and_tag(repo_root: Path, version: str) -> None:
+    """Turn a fixture tree into a git repository whose HEAD is tagged ``v<version>``."""
+    git = [
+        "git",
+        "-c", "user.name=Schema Window Test",
+        "-c", "user.email=schema-window@example.invalid",
+        "-c", "commit.gpgsign=false",
+        "-c", "tag.gpgsign=false",
+        "-c", "core.hooksPath=/dev/null",
+        "-C", str(repo_root),
+    ]
+    subprocess.run(["git", "init", "-q", str(repo_root)], check=True)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", f"release {version}"], check=True)
+    subprocess.run([*git, "tag", f"v{version}"], check=True)
+
+
+def _released_fixture_tagged_at_0001(repo_root: Path) -> None:
+    """0.10.1 is registered and tagged with windows['0.10.1'] at 0001..0001."""
+    _write_chart(repo_root, app_version="0.10.1")
+    _write_catalog(
+        repo_root,
+        revisions=["0001"],
+        window_heads={"0.10.1": "0001"},
+        candidate_head="0001",
+        published_versions=("0.10.1",),
+    )
+    _write_revision(repo_root, "0001_base.py", "0001", None)
+    _commit_and_tag(repo_root, "0.10.1")
+    # A post-release migration lands on top of the tag.
+    _write_revision(repo_root, "0002_next.py", "0002", "0001")
+
+
 def test_real_tree_window_matches_alembic_head() -> None:
     """The one real CLI run; every other case drives the gate in-process."""
     chart = yaml.safe_load((REPO_ROOT / "charts" / "curie" / "Chart.yaml").read_text())
@@ -151,6 +184,10 @@ def test_real_tree_window_matches_alembic_head() -> None:
     catalog = json.loads(
         (REPO_ROOT / "cli" / "src" / "application_schema_windows.json").read_text()
     )
+    atlas = json.loads(
+        (REPO_ROOT / "docs" / "architecture-atlas" / "versions.json").read_text()
+    )
+    registered = any(item["id"] == f"v{app_version}" for item in atlas["versions"])
     result = subprocess.run(
         [sys.executable, str(CHECKER)],
         cwd=REPO_ROOT,
@@ -161,8 +198,17 @@ def test_real_tree_window_matches_alembic_head() -> None:
 
     assert result.returncode == 0, result.stderr
     assert app_version in catalog["windows"]
-    assert catalog["windows"][app_version]["schema_min"] == catalog["candidate"]["schema_min"]
-    assert catalog["windows"][app_version]["schema_head"] == catalog["candidate"]["schema_head"]
+    # A released window is pinned by its tag, so only an unreleased appVersion
+    # must track the candidate.
+    if not registered:
+        assert (
+            catalog["windows"][app_version]["schema_min"]
+            == catalog["candidate"]["schema_min"]
+        )
+        assert (
+            catalog["windows"][app_version]["schema_head"]
+            == catalog["candidate"]["schema_head"]
+        )
     assert f"appVersion {app_version}" in result.stdout
     assert f"candidate schema_head {catalog['candidate']['schema_head']}" in result.stdout
 
@@ -289,16 +335,19 @@ def test_current_release_candidate_window_matches_candidate_head(tmp_path: Path)
 
 
 @pytest.mark.parametrize(
-    ("published_versions", "expected_action"),
+    ("published_versions", "expected_fragments", "expected_action"),
     [
-        (("0.10.1",), "bump"),
-        ((), "rerun"),
+        # Released but the tag is not readable (no git repository): the
+        # equality rule holds and the fix is fetching the release tag.
+        (("0.10.1",), ("v0.10.1", "git fetch --tags origin"), None),
+        ((), ("differs from candidate",), "rerun"),
     ],
 )
 def test_current_chart_head_mismatch_refuses_with_the_correct_release_action(
     tmp_path: Path,
     published_versions: tuple[str, ...],
-    expected_action: str,
+    expected_fragments: tuple[str, ...],
+    expected_action: str | None,
 ) -> None:
     _write_chart(tmp_path, app_version="0.10.1")
     _write_catalog(
@@ -313,8 +362,79 @@ def test_current_chart_head_mismatch_refuses_with_the_correct_release_action(
 
     assert result.returncode == 1, result.stdout
     assert "0.10.1" in result.stderr
-    assert "differs from candidate" in result.stderr
-    assert expected_action in result.stderr.lower()
+    for fragment in expected_fragments:
+        assert fragment in result.stderr
+    if expected_action is not None:
+        assert expected_action in result.stderr.lower()
+
+
+def test_released_window_from_tag_lets_only_the_candidate_advance(
+    tmp_path: Path,
+) -> None:
+    """Liveness for the tag rule: the released window stays put, the candidate moves."""
+    _released_fixture_tagged_at_0001(tmp_path)
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.10.1": "0001"},
+        candidate_head="0002",
+        published_versions=("0.10.1",),
+    )
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "candidate schema_head 0002" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("released_min", "released_head"),
+    [
+        # Edited to equal the candidate: still refused, released is immutable.
+        ("0001", "0002"),
+        ("0002", "0002"),
+    ],
+)
+def test_editing_a_tagged_released_window_is_refused(
+    tmp_path: Path, released_min: str, released_head: str
+) -> None:
+    _released_fixture_tagged_at_0001(tmp_path)
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.10.1": released_head},
+        window_mins={"0.10.1": released_min},
+        candidate_head="0002",
+        published_versions=("0.10.1",),
+    )
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert "0.10.1" in result.stderr
+    assert "immutable" in result.stderr
+
+
+def test_adding_a_key_to_a_tagged_released_window_is_refused(tmp_path: Path) -> None:
+    """Every key of the released window is compared, not only its bounds."""
+    _released_fixture_tagged_at_0001(tmp_path)
+    _write_catalog(
+        tmp_path,
+        revisions=["0001", "0002"],
+        window_heads={"0.10.1": "0001"},
+        candidate_head="0002",
+        published_versions=("0.10.1",),
+    )
+    catalog_path = tmp_path / "cli" / "src" / "application_schema_windows.json"
+    payload = json.loads(catalog_path.read_text())
+    payload["windows"]["0.10.1"]["artifact_identity_ambiguous"] = True
+    catalog_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    result = _run_gate(tmp_path)
+
+    assert result.returncode == 1, result.stdout
+    assert "0.10.1" in result.stderr
+    assert "immutable" in result.stderr
 
 
 def test_current_chart_minimum_mismatch_refuses_even_when_heads_match(
@@ -484,9 +604,19 @@ def test_catalog_missing_app_version_window_fails(tmp_path: Path) -> None:
     assert "0.9.9" in result.stderr
 
 
+def _assert_checkout_fetches_tags(steps: list[dict]) -> None:
+    # The gate reads the release tag, so the job needs full history and tags.
+    checkouts = [
+        step for step in steps if str(step.get("uses", "")).startswith("actions/checkout")
+    ]
+    assert len(checkouts) == 1
+    assert checkouts[0].get("with", {}).get("fetch-depth") == 0
+
+
 def test_python_ci_job_runs_schema_window_after_alembic_gate() -> None:
     workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text())
     steps = workflow["jobs"]["python"]["steps"]
+    _assert_checkout_fetches_tags(steps)
 
     matching_steps = [step for step in steps if step.get("run") == CHECK_COMMAND]
     assert len(matching_steps) == 1
@@ -507,6 +637,7 @@ def test_python_ci_job_runs_schema_window_after_alembic_gate() -> None:
 def test_rust_ci_job_runs_schema_window_gate() -> None:
     workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text())
     steps = workflow["jobs"]["rust-lint"]["steps"]
+    _assert_checkout_fetches_tags(steps)
 
     matching_steps = [step for step in steps if step.get("run") == CHECK_COMMAND]
     assert len(matching_steps) == 1

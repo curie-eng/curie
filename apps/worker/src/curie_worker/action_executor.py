@@ -9,11 +9,16 @@ Each is frozen with the runner and the reference connector by
 ``tests/vectors/executor-restore-calls.json``.
 
 The loop itself (claim, sandbox, dispatch, report) is plan task 11.
+
+@spec AUTOMATED-REMEDIATION-12: ``sample_report``, the body a read execution's
+one sample is relayed in, frozen with the runner and the API by
+``tests/vectors/remediation-predicate.json``.
 """
 
 from __future__ import annotations
 
 import hmac
+import json
 from collections.abc import Mapping
 from typing import Any, Final, Literal
 
@@ -82,6 +87,40 @@ def restore_call(
     if _declares(restore_input_schema, EXPECTED_VERSION_KEY):
         ruled[EXPECTED_VERSION_KEY] = recorded_version
     return connector_grant.canonical_arguments(ruled)
+
+
+# @spec AUTOMATED-REMEDIATION-12: remediation-predicate.json ``sample_kinds``
+# and ``value_max_chars``. ``skipped`` is the API's own record, never a report.
+SAMPLE_KINDS: Final = frozenset(
+    {"value", "pointer_absent", "not_scalar", "value_too_long", "tool_error", "result_unstructured"}
+)
+SAMPLE_VALUE_MAX_CHARS: Final = 256
+
+
+def sample_report(response: Mapping[str, Any], *, lease_owner: str, attempt: int) -> dict[str, Any]:
+    """The ``POST /action-executions/{id}/samples`` body for one ``read`` answer.
+
+    @spec AUTOMATED-REMEDIATION-12. The fence plus the runner's ``sample`` and
+    ``value``, relayed unjudged and unchanged (one read execution is one
+    sample, so there is no index). Raises ``ValueError`` for an answer that is
+    not a frozen sample: an unknown kind, a missing value, a non-scalar or
+    over-long value, or a value on a kind that carries none.
+    """
+
+    sample = response.get("sample")
+    if not isinstance(sample, str) or sample not in SAMPLE_KINDS or "value" not in response:
+        raise ValueError("not a frozen sample")
+    value = response["value"]
+    if sample != "value":
+        if value is not None:
+            raise ValueError("only a value sample carries a value")
+    else:
+        if isinstance(value, (dict, list)):
+            raise ValueError("a sample value is a JSON scalar")
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        if len(text) > SAMPLE_VALUE_MAX_CHARS:
+            raise ValueError("a sample value is at most 256 characters of JSON")
+    return {"lease_owner": lease_owner, "attempt": attempt, "sample": sample, "value": value}
 
 
 def call_outcome(*, is_error: bool, structured: object) -> tuple[CallState, str | None]:

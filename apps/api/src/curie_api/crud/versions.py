@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.schemas.versions import VersionCreate
 
-from ..models import AgentVersion
+from ..models import Agent, AgentVersion
 
 
 async def get_version(session: AsyncSession, version_id: uuid.UUID) -> AgentVersion | None:
@@ -37,6 +37,9 @@ async def create_version_row(
 ) -> AgentVersion:
     version = AgentVersion(
         agent_id=agent_id,
+        # The agent's tenant, read inside the INSERT so there is no
+        # read-then-write window (ADR 0166 decision 3).
+        tenant_id=select(Agent.tenant_id).where(Agent.id == agent_id).scalar_subquery(),
         version_label=version_label,
         created_by=created_by,
         commit_sha=commit_sha,

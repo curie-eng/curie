@@ -19,9 +19,10 @@ undo ruling goes through ``undo_refusal``. Both answer from one derivation, so
 the single read, the list read and the ruling cannot disagree. Each missing
 ingredient maps to its ruling code (``refused_no_agent``, ``refused_unsealed``,
 ``refused_unversioned``, ``refused_no_digest``, ``refused_restore_in_flight``,
-``refused_not_restore_capable``, ``refused_key_custody``), and a record a
-forward execution created is ``refused_authority_unresolved`` before any of
-them (ACTION-EXECUTOR-19).
+``refused_not_restore_capable``, ``refused_key_custody``). A record a forward
+execution created is undoable on the same terms; who may undo it is the
+ruling's authority-aware authorization (AUTOMATED-REMEDIATION-19), not this
+derivation.
 
 The checks run cheapest first and only for records still in the running, so a
 read of rows that are not sealed (every legacy row) never touches the database
@@ -115,39 +116,37 @@ async def sealing_custody(
 
     wanted = sorted(set(agent_ids))
     custody: dict[uuid.UUID, frozenset[str]] = dict.fromkeys(wanted, frozenset())
-    if not wanted:
-        return custody
-    rows = (
-        await session.execute(text(_IN_FORCE_BUNDLES_SQL), {"agent_ids": wanted})
-    ).mappings()
-    for row in rows:
-        bundle_ref = row["bundle_ref"]
-        if bundle_ref is None:
-            continue
+    for agent_id, bundle_ref in (await in_force_bundle_refs(session, wanted)).items():
         try:
-            data = await store.get(str(bundle_ref))
-            custody[row["agent_id"]] = await run_in_threadpool(_sealed_connectors, data)
+            data = await store.get(bundle_ref)
+            custody[agent_id] = await run_in_threadpool(_sealed_connectors, data)
         except Exception as exc:  # noqa: BLE001 - an unreadable bundle is no custody
             # The exception type only: a parser error could echo bundle input.
             logger.warning(
                 "in-force bundle unreadable; treating sealing key custody as absent",
-                extra={"agent_id": str(row["agent_id"]), "error": type(exc).__name__},
+                extra={"agent_id": str(agent_id), "error": type(exc).__name__},
             )
     return custody
 
 
-def authority_refusal(action: AgentAction) -> str | None:
-    """``refused_authority_unresolved`` for a platform-executed forward record.
+async def in_force_bundle_refs(
+    session: AsyncSession, agent_ids: Iterable[uuid.UUID]
+) -> dict[uuid.UUID, str]:
+    """Per agent, the stored bundle of the version in force now.
 
-    @spec ACTION-EXECUTOR-19: a record a forward execution created carries the
-    authority that permitted it (``policy`` or ``approval``). Until #4068
-    delivers authority-aware undo authorization, its undo is refused, and ADR
-    0117 decision 3's ungated default must not apply: its ``gate_approval_id``
-    is null because no turn gated it, not because nothing authorized it. Any
-    recorded authority counts, so an authority kind added later fails closed.
+    The platform's in-force rule (``_IN_FORCE_BUNDLES_SQL``). An agent with no
+    in-force version, or whose version has no stored bundle, is absent.
     """
 
-    return "refused_authority_unresolved" if action.authority_kind is not None else None
+    wanted = sorted(set(agent_ids))
+    if not wanted:
+        return {}
+    rows = (
+        await session.execute(text(_IN_FORCE_BUNDLES_SQL), {"agent_ids": wanted})
+    ).mappings()
+    return {
+        row["agent_id"]: str(row["bundle_ref"]) for row in rows if row["bundle_ref"] is not None
+    }
 
 
 async def _refusals(
@@ -162,8 +161,7 @@ async def _refusals(
     """
 
     refusals: dict[uuid.UUID, str | None] = {
-        action.id: authority_refusal(action) or action.restore_record_refusal()
-        for action in actions
+        action.id: action.restore_record_refusal() for action in actions
     }
     candidates = [action for action in actions if refusals[action.id] is None]
     if not candidates:

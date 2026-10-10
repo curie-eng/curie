@@ -729,3 +729,184 @@ def test_console_session_rows_store_the_bound_subject(
             await engine.dispose()
 
     assert asyncio.run(read_subject()) == SUBJECT
+
+
+@pytest.fixture
+def driver_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    from curie_internal.driver_declaration import DeclaredDriver
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "test_installation_enabled", True)
+    monkeypatch.setattr(
+        settings,
+        "test_installation_drivers",
+        (DeclaredDriver(CARD_CHANNEL, "B0EXAMPLE1", SUBJECT),),
+    )
+
+
+def _driver_token(
+    approval_id: str,
+    *,
+    subject: str = SUBJECT,
+    channel: str = CARD_CHANNEL,
+    signing_key: str | None = None,
+    exp: int | None = None,
+) -> str:
+    return approval_principal.mint(
+        signing_key or get_settings().approval_chat_attester_secret,
+        subject=subject,
+        kind="test_driver",
+        actor_channel=channel,
+        approval_id=approval_id,
+        scope=approval_principal.APPROVE_SCOPE,
+        exp=exp if exp is not None else int(time.time()) + 60,
+    )
+
+
+@pytest.mark.parametrize("decision", ["approved", "rejected"])
+def test_declared_driver_resolves_explicit_route_and_records_kind(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    driver_settings: None,
+    decision: str,
+    valkey: redis.Redis,
+) -> None:
+    created = _explicit_approval(approvals_client, auth_headers, users=[SUBJECT])
+    response = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": decision},
+        headers={PRINCIPAL_HEADER: _driver_token(created["id"])},
+    )
+    assert response.status_code == 200, response.text
+    assert (response.json()["status"], response.json()["resolved_by"]) == (decision, SUBJECT)
+    audit = approvals_client.get(f"/approvals/{created['id']}/audit", headers=auth_headers).json()
+    assert [(row["principal_kind"], row["authenticated"], row["authorized"]) for row in audit] == [
+        ("test_driver", True, True)
+    ]
+    loser = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": decision},
+        headers={PRINCIPAL_HEADER: _driver_token(created["id"])},
+    )
+    assert loser.status_code == 409
+
+
+@pytest.mark.parametrize(
+    "violation",
+    [
+        "off",
+        "subject",
+        "channel",
+        "card_channel",
+        "unlisted",
+        "membership",
+        "group",
+        "missing_route",
+    ],
+)
+def test_api_independently_refuses_driver_and_audits(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    driver_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+    violation: str,
+) -> None:
+    if violation == "membership":
+        created = _create_approval(approvals_client, auth_headers)
+    elif violation == "group":
+        created = _group_approval(approvals_client, auth_headers)
+    else:
+        created = _explicit_approval(
+            approvals_client, auth_headers, users=[OTHER] if violation == "unlisted" else [SUBJECT]
+        )
+    if violation == "off":
+        monkeypatch.setattr(get_settings(), "test_installation_enabled", False)
+    if violation == "missing_route":
+        # Delete the real binding, preserving the pending approval's named route.
+        patched = approvals_client.patch(
+            f"/agents/{created['agent_id']}", json={"approval_routes": {}}, headers=auth_headers
+        )
+        assert patched.status_code == 200, patched.text
+    channel = SOURCE_CHANNEL if violation in ("channel", "card_channel") else CARD_CHANNEL
+    if violation == "card_channel":
+        from curie_internal.driver_declaration import DeclaredDriver
+
+        monkeypatch.setattr(
+            get_settings(),
+            "test_installation_drivers",
+            (DeclaredDriver(SOURCE_CHANNEL, "B0EXAMPLE1", SUBJECT),),
+        )
+    response = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": "approved"},
+        headers={
+            PRINCIPAL_HEADER: _driver_token(
+                created["id"], subject=OTHER if violation == "subject" else SUBJECT, channel=channel
+            )
+        },
+    )
+    assert response.status_code == 403, response.text
+    current = approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers).json()
+    assert current["status"] == "pending"
+    audit = approvals_client.get(f"/approvals/{created['id']}/audit", headers=auth_headers).json()
+    assert len(audit) == 1
+    assert (audit[0]["action"], audit[0]["principal_kind"], audit[0]["authorized"]) == (
+        "denied",
+        "test_driver",
+        False,
+    )
+
+
+@pytest.mark.parametrize("violation", ["forged", "platform_key", "wrong_approval", "expired"])
+def test_driver_credential_cannot_cross_authentication_boundary(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    driver_settings: None,
+    violation: str,
+) -> None:
+    created = _explicit_approval(approvals_client, auth_headers, users=[SUBJECT])
+    token = _driver_token(
+        str(uuid.uuid4()) if violation == "wrong_approval" else created["id"],
+        signing_key=(
+            get_settings().api_key
+            if violation == "platform_key"
+            else "forged-key"
+            if violation == "forged"
+            else None
+        ),
+        exp=1 if violation == "expired" else None,
+    )
+    response = approvals_client.post(
+        f"/approvals/{created['id']}/resolve",
+        json={"decision": "approved"},
+        headers={PRINCIPAL_HEADER: token},
+    )
+    assert response.status_code == 401
+    assert (
+        approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers).json()["status"]
+        == "pending"
+    )
+
+
+def test_driver_credential_is_not_a_recovery_principal(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    driver_settings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(get_settings(), "approval_recovery_enabled", True)
+    created = _explicit_approval(approvals_client, auth_headers, users=[SUBJECT])
+    response = approvals_client.post(
+        f"/approvals/{created['id']}/recover",
+        json={
+            "disposition": "rejected",
+            "reason": "Example recovery",
+            "recovery_key": f"example-{uuid.uuid4().hex}",
+        },
+        headers={**auth_headers, PRINCIPAL_HEADER: _driver_token(created["id"])},
+    )
+    assert response.status_code == 401, response.text
+    assert (
+        approvals_client.get(f"/approvals/{created['id']}", headers=auth_headers).json()["status"]
+        == "pending"
+    )

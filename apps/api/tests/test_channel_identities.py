@@ -377,7 +377,7 @@ def test_duplicate_tenant_provider_name_rejected(migrated: None) -> None:
     _rolled_back(body)
 
 
-def test_identities_can_share_an_installation_with_different_names(migrated: None) -> None:
+def test_identities_can_share_an_installation_with_different_names(clean_identities: None) -> None:
     """Two bots in one Slack workspace: one installation, two names.
 
     ADR 0168 decision 1's whole point -- a row is a channel identity, not a
@@ -1175,13 +1175,14 @@ def test_lifespan_retries_until_table_appears(
     isolated_migration_db: None, env: pytest.MonkeyPatch, auth_headers: dict[str, str]
 ) -> None:
     config = _alembic_config()
-    # 0082 is the candidate schema minimum and immediately precedes the
-    # channel identity migration, so this models a supported rolling boot.
-    command.upgrade(config, "0082")
+    # schema_min is now 0101 (#2911), above the migration that creates this
+    # table, so the API can no longer boot below it. The table is hidden by a
+    # rename instead: the boot sees it missing, and it appears while the API runs.
+    command.upgrade(config, "head")
+    _sql("ALTER TABLE curie.channel_identities RENAME TO channel_identities_hidden")
     try:
         with _app(env, CANARY):
-            # Boot succeeded below this migration; it now lands while the API runs.
-            command.upgrade(config, "head")
+            _sql("ALTER TABLE curie.channel_identities_hidden RENAME TO channel_identities")
             deadline = time.monotonic() + 15
             rows: list[dict[str, Any]] = []
             while time.monotonic() < deadline:
@@ -1190,7 +1191,7 @@ def test_lifespan_retries_until_table_appears(
                     break
                 time.sleep(0.25)
     finally:
-        command.upgrade(config, "head")
+        _sql("ALTER TABLE IF EXISTS curie.channel_identities_hidden RENAME TO channel_identities")
     assert [str(r["id"]) for r in rows] == [STATIC_ID]
 
 

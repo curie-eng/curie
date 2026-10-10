@@ -15,6 +15,12 @@ claim is ``RUNNER_MODE_ENV`` = ``EXECUTOR_MODE`` in the same module.
 
 Each test serves the frozen runner answer from a real aiohttp server, so the
 client's real HTTP path is what is read.
+
+@spec AUTOMATED-REMEDIATION-12 @spec AUTOMATED-REMEDIATION-26. The remediation
+``read`` phase (executor amendments E3, E4 and E6): the ``read`` request alone
+adds ``pointer`` to the frozen keys, the client posts and reads the ``read`` phase, maps
+``tool_not_read_only`` to its pre-dispatch code, and never reports a read as
+``response_lost``, because a read cannot write.
 """
 
 from __future__ import annotations
@@ -56,7 +62,18 @@ _KEYS = {
     "unauthenticated",
     "status_body",
     "other_routes",
+    "read",
+    "remediation_codes",
 }
+
+
+def _request_keys(phase: str) -> set[str]:
+    """@spec AUTOMATED-REMEDIATION-12: only the ``read`` request adds ``pointer``."""
+
+    keys = set(_VECTOR["request_keys"])
+    if phase == "read":
+        keys |= set(_VECTOR["read"]["request_keys_added"])
+    return keys
 
 
 def test_the_vector_has_only_known_keys() -> None:
@@ -67,7 +84,7 @@ def test_the_vector_has_only_known_keys() -> None:
     )
     assert set(_VECTOR) == _KEYS
     for phase, spec in _VECTOR["phases"].items():
-        assert set(spec["request"]) == set(_VECTOR["request_keys"]), phase
+        assert set(spec["request"]) == _request_keys(phase), phase
         assert spec["request"]["phase"] == phase
 
 
@@ -129,7 +146,7 @@ def test_each_phase_posts_the_frozen_request_and_reads_the_frozen_response(phase
     assert sent["path"] == route["path"]
     assert sent["authorization"] == f"{route['auth_scheme']} {_TOKEN}"
     assert sent["body"] == spec["request"]
-    assert set(sent["body"]) == set(_VECTOR["request_keys"])
+    assert set(sent["body"]) == _request_keys(phase)
     assert response == spec["response"]
     assert set(response) == set(spec["response_keys"])
 
@@ -190,3 +207,59 @@ def test_an_oversized_call_result_fails_the_execution() -> None:
     assert response == over["response"]
     state, code = call_outcome(is_error=response["is_error"], structured=response["structured"])
     assert (state, code) == (over["worker_state"], over["worker_code"])
+
+
+def test_the_client_knows_the_read_phase() -> None:
+    """@spec AUTOMATED-REMEDIATION-12: the existing request shape is unchanged.
+
+    ``pointer`` rides the ``read`` request only; every other phase keeps
+    exactly ``request_keys``.
+    """
+
+    assert set(runner_client.EXECUTE_REQUEST_KEYS) == set(_VECTOR["request_keys"])
+    assert set(runner_client.EXECUTE_PHASES) == set(_VECTOR["phases"])
+
+
+def test_an_unrecognized_read_refusal_is_never_response_lost() -> None:
+    """@spec AUTOMATED-REMEDIATION-12: a read never writes, so it is a pre-dispatch code."""
+
+    read = _VECTOR["read"]
+    failure = _VECTOR["call_transport_failure"]
+
+    async def answer(_request: web.Request) -> web.StreamResponse:
+        return web.json_response(failure["body"], status=failure["status"])
+
+    with pytest.raises(runner_client.ExecuteRefused) as refused:
+        _run(answer, _VECTOR["phases"]["read"]["request"])
+    assert refused.value.code == read["unknown_refusal_worker_code"]
+
+
+def test_the_read_refusal_codes_are_pre_dispatch_codes() -> None:
+    """@spec AUTOMATED-REMEDIATION-12: ``tool_not_read_only`` is reported as itself.
+
+    Executor amendment E6: the code joins the closed pre-dispatch set; the
+    worker's code for it is the vector's.
+    """
+
+    codes = _VECTOR["remediation_codes"]
+    reported = set(codes["worker_reported"])
+    assert reported <= set(codes["pre_dispatch_added"])
+    read_refusals = [r for r in _VECTOR["refusals"] if "read" in r["phases"]]
+    assert {r["code"] for r in read_refusals} >= {_VECTOR["read"]["not_read_only_refusal"]}
+    for refusal in read_refusals:
+        if refusal["code"] in reported:
+            assert refusal["worker_code"] == refusal["code"]
+
+
+@pytest.mark.parametrize("code", [r["code"] for r in _VECTOR["refusals"] if "read" in r["phases"]])
+def test_each_read_refusal_reaches_the_worker_as_its_frozen_code(code: str) -> None:
+    """@spec AUTOMATED-REMEDIATION-12: the client maps every read refusal as frozen."""
+
+    refusal = next(r for r in _VECTOR["refusals"] if r["code"] == code)
+
+    async def answer(_request: web.Request) -> web.StreamResponse:
+        return web.json_response({"refused": code}, status=refusal["status"])
+
+    with pytest.raises(runner_client.ExecuteRefused) as refused:
+        _run(answer, _VECTOR["phases"]["read"]["request"])
+    assert refused.value.code == refusal["worker_code"]

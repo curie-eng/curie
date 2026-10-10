@@ -710,7 +710,7 @@ contract"). Concretely:
   documented guidance;
 * the sandbox carries only the read connector's credentials, which requires the
   executor's per-claim stripped template ([#4204](https://github.com/curie-eng/curie/issues/4204),
-  unmerged); without it the pool template would put the acting connector's
+  merged); without it the pool template would put the acting connector's
   credential in the verifier's sandbox and defeat REMEDIATION-15.
 
 Acceptance: against a read fixture, one `read` returns the pointed scalar and the
@@ -732,20 +732,33 @@ nomination, or an approved remediation approval, creates one `forward`
 execution through the AE-19 creation function: connector, tool and canonical
 arguments come from the nomination row, never from a caller; `authority_kind` is
 `policy` with `authority_ref` `policy:<agent_id>:<hook>:<generation>:<nomination
-id>`, or `approval` with the approval id; the idempotency key is
-`remediation:<nomination id>`. At dispatch the API creates exactly one
+id>`, or `approval` with the approval id; the idempotency key is per authority,
+`remediation:<nomination id>:policy` or
+`remediation:<nomination id>:approval:<approval id>`, so each authority yields at
+most one execution and a replay of either adopts its own. (Refinement: a single
+`remediation:<nomination id>` key would make the approval that follows a
+`not_reversible_now` refusal adopt the refused policy execution, contradicting
+the rule below. A nomination has at most one approval, because the approval's
+own `dedupe_key` of AUTOMATED-REMEDIATION-15 is unique across all statuses; an
+approval id other than the one recorded on the nomination authorizes nothing.)
+At dispatch the API creates exactly one
 `agent_actions` row (AE-19) carrying those authority fields, the connector and
 digest, `gate_approval_id` set to the approval id for an approval authority, and
 the new columns `delivery_event_id` and `nomination_id`. A forward execution of a
 `reversible` action whose capability or custody no longer holds at dispatch is
-refused `not_reversible_now` and its nomination goes to approval. The kill switch
+refused `not_reversible_now` and its nomination goes to approval; this applies
+to a `policy` authority only, since an approver accepted the action as it stands.
+The kill switch
 and digest checks of AE-14 and AE-21 apply unchanged.
 
 Acceptance (cluster, reference connector): one admitted nomination yields one
 execution, one ledger row with `authority_kind` `policy` and the generation in
 `authority_ref`, and one write call; a replayed admission creates nothing; an
 approval authority yields `gate_approval_id` equal to the approval id; arguments
-differing from the nomination are refused `arguments_mismatch`.
+differing from the nomination are refused `arguments_mismatch`; a policy
+execution refused `not_reversible_now` followed by the nomination's approval
+yields a second, approval execution that dispatches, and a replay of either
+authority adopts its own execution.
 
 <!-- @spec AUTOMATED-REMEDIATION-14 -->
 **AUTOMATED-REMEDIATION-14. Authority, verification and actor on the record.**
@@ -1166,7 +1179,7 @@ executor spec text in the same change.
   `not_reversible_now` and `policy_changed`; `pointer_absent`, `result_unstructured`
   and a skipped sample are sample results, not refusals. The `runner-execute` vector carries all of them.
 * **E7, AE-5 (sandbox credentials).** Read executions require the per-claim
-  stripped template proposed by #4204 (unmerged); this contract does not ship
+  stripped template of #4204 (merged); this contract does not ship
   verification on the pool template.
 * **E8, AE-17 and AE-21 (claim-time authority re-check).** AE-21 leaves limits,
   the breaker and disarm to admission. For a `policy`-authorized forward

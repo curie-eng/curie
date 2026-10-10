@@ -28,6 +28,10 @@ PRE_DISPATCH_CODES: Final = frozenset(
         "sandbox_unavailable",
         "runner_unavailable",
         "connector_unreachable",
+        # @spec AUTOMATED-REMEDIATION-12 (executor amendment E6): the runner's
+        # refusal of a declared read whose tool its own ``list`` did not
+        # advertise ``readOnlyHint: true``. Reported by the worker.
+        "tool_not_read_only",
     }
 )
 CONNECTOR_REFUSAL_CODES: Final = frozenset(
@@ -44,6 +48,27 @@ _ACCEPTED: Final = {
     "failed": CONNECTOR_REFUSAL_CODES | POST_DISPATCH_CODES,
     "indeterminate": POST_DISPATCH_CODES,
 }
+
+# @spec AUTOMATED-REMEDIATION-13 (executor amendment E6): the pre-dispatch code
+# the API itself ends a policy-authorized forward execution with when its action
+# is declared ``reversible`` but its restore capability or sealing key custody
+# no longer holds at dispatch. Decided by the API, never reported by a worker,
+# so it is not in ``PRE_DISPATCH_CODES``.
+NOT_REVERSIBLE_NOW_CODE: Final = "not_reversible_now"
+# @spec AUTOMATED-REMEDIATION-11 (executor amendment E8): the pre-dispatch code
+# the claim route ends a policy-authorized forward execution with when its
+# remediation authority no longer holds (generation no longer current and armed,
+# or a breaker open on its target key). Decided by the API before any sandbox
+# claim, never reported by a worker.
+POLICY_CHANGED_CODE: Final = "policy_changed"
+
+# @spec AUTOMATED-REMEDIATION-12: the sample kinds a read execution stores
+# (remediation-predicate.json ``sample_kinds``), and the one the API records
+# itself for a sample that missed its slot. Sample results, never refusals.
+SAMPLE_KINDS: Final = frozenset(
+    {"value", "pointer_absent", "not_scalar", "value_too_long", "tool_error", "result_unstructured"}
+)
+SKIPPED_SAMPLE: Final = "skipped"
 
 # The pre-dispatch code a row ends with when its lease expired in ``claimed``
 # on the last permitted attempt (ACTION-EXECUTOR-17). The holder vanished

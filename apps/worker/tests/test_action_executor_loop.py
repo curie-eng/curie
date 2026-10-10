@@ -88,6 +88,8 @@ from executor_loop_fixtures import (  # noqa: E402
     OTHER_SECRET,
     PRIOR_STATE,
     QUOTA_REJECTION,
+    READ_CONNECTOR,
+    READ_SECRET,
     RECORDED_VERSION,
     TARGET,
     TARGET_SECRET,
@@ -142,12 +144,15 @@ def _binding_boot_env() -> dict[str, str]:
             BootEnv.env_key("budget"): "{}",
             BootEnv.env_key("bundle_ref"): "bundles/example-agent.tar.gz",
             BootEnv.env_key("connector_caller_token"): "cct.placeholder.signature",
-            BootEnv.env_key("connector_secret_keys"): f"{OTHER_SECRET},{TARGET_SECRET}",
+            BootEnv.env_key("connector_secret_keys"): (
+                f"{OTHER_SECRET},{TARGET_SECRET},{READ_SECRET}"
+            ),
             BootEnv.env_key("model_env_key"): "ANTHROPIC_API_KEY",
             "CURIE_CREDENTIALS": "placeholder-model-credential",
             "ANTHROPIC_API_KEY": "placeholder-model-key",
             TARGET_SECRET: "placeholder-target-secret",
             OTHER_SECRET: "placeholder-other-secret",
+            READ_SECRET: "placeholder-read-secret",
         }
     )
     return env
@@ -281,12 +286,14 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
     runner_client = _BudgetRecordingRunner(rig, connect_timeout_s=2.0, total_timeout_s=10.0)
     rig.substrate = substrate
 
+    # @spec AUTOMATED-REMEDIATION-12: a read execution runs under the read
+    # connector's own binding, so the rig resolves both connectors.
     async def deployment_name(agent_id: str | None, connector: str) -> str | None:
-        assert (agent_id, connector) == (AGENT_ID, CONNECTOR)
+        assert agent_id == AGENT_ID and connector in {CONNECTOR, READ_CONNECTOR}
         return DEPLOYMENT
 
     async def in_force_digest(agent_id: str, connector: str) -> str | None:
-        assert (str(agent_id), connector) == (AGENT_ID, CONNECTOR)
+        assert str(agent_id) == AGENT_ID and connector in {CONNECTOR, READ_CONNECTOR}
         return rig.in_force["digest"]
 
     async def executor_boot(agent_id: str, connector: str, **kwargs: Any) -> ExecutorBoot:
@@ -294,7 +301,9 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
         rig.boot_kwargs.append(dict(kwargs))
         return ExecutorBoot(
             boot_env=_binding_boot_env(),
-            header_secret_names=frozenset({TARGET_SECRET}),
+            header_secret_names=frozenset(
+                {READ_SECRET if connector == READ_CONNECTOR else TARGET_SECRET}
+            ),
             agent_name=AGENT_NAME,
         )
 
@@ -305,6 +314,9 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
             "dispatch_deadline_s": DISPATCH_DEADLINE_S,
             **overrides,
         }
+        # @spec AUTOMATED-REMEDIATION-12 (E9): the loop's concurrency, passed
+        # only when a test sets it so the existing loop keeps its signature.
+        extra = {name: settings[name] for name in ("max_concurrent_sandboxes",) if name in settings}
         return ActionExecutorLoop(
             api=ExecutionApi(
                 api_base_url=API_BASE, api_key=API_KEY, worker_token=WORKER_TOKEN, client=http
@@ -322,6 +334,7 @@ async def _rig(valkey: tuple[redis.Redis, str]) -> AsyncIterator[Rig]:
             lease_seconds=settings["lease_seconds"],
             dispatch_deadline_s=settings["dispatch_deadline_s"],
             interval_seconds=0.01,
+            **extra,
         )
 
     rig._make = make
@@ -1937,6 +1950,38 @@ async def test_a_stopped_agent_refuses_a_forward_execution_before_any_sandbox(
         assert rig.runner.requests == []
 
 
+async def test_killing_the_agent_after_admission_refuses_a_policy_forward_with_no_write(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec AUTOMATED-REMEDIATION-11 @spec ACTION-EXECUTOR-21: "The kill switch is
+    read at admission (check 2) and again by the executor at claim and before
+    dispatch, so a kill between admission and dispatch refuses ``agent_stopped``
+    with no write call." A policy-authorized forward execution whose agent is
+    stopped after the sandbox's ``list`` and before the dispatch commit ends
+    ``agent_stopped``: no dispatch, no grant minted, no call at the connector.
+    """
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.runner.call_reply = _forward_reply()
+        execution = rig.api.add_forward()
+
+        def stop(body: dict[str, Any]) -> None:
+            rig.killswitch.killed = True
+
+        rig.runner.hooks["list"] = stop
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "agent_stopped")
+        assert rig.killswitch.reads >= 2
+        assert "dispatch" not in _api_routes(rig)
+        assert rig.runner.writes == []
+        assert "call" not in _phases(rig)
+        assert minted == []
+        rig.assert_released()
+
+
 async def test_a_lost_forward_call_is_indeterminate_and_never_repeated(
     valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
 ) -> None:
@@ -1953,4 +1998,233 @@ async def test_a_lost_forward_call_is_indeterminate_and_never_repeated(
         assert _final(rig, execution) == ("indeterminate", "response_lost")
         assert len(rig.runner.writes) == 1
         assert len(minted) == 1
+        rig.assert_released()
+
+
+# --------------------------------------------------------------------------- #
+# The runner's call preflight is judged from ``list``, before dispatch
+# (ACTION-EXECUTOR-6, ACTION-EXECUTOR-20; .projects/plans/task-executor-gating.tests.md)
+#
+# ACTION-EXECUTOR-20 makes ``tool_not_advertised``, ``restore_not_advertised``,
+# ``restore_schema_mismatch``, ``reserved_verb_via_forward`` and
+# ``arguments_mismatch`` pre-dispatch refusals: provable non-writes. The runner
+# re-checks them in its ``call`` preflight, but by then the worker has
+# committed ``dispatched`` and a refusal can only end ``indeterminate``
+# (ACTION-EXECUTOR-17). So every condition the runner's preflight would refuse
+# on must be read by the worker from the ``list`` reply (and its own phase
+# order) before the dispatch commit, and end ``refused <code>`` with no call.
+# ``call_mode = "preflight"`` makes the double answer ``call`` with the real
+# runner's rules over the list it served, so any condition the worker misses
+# shows up as a dispatched row and a refused call.
+# --------------------------------------------------------------------------- #
+
+
+def _with(tools: list[dict[str, Any]], name: str, **changes: Any) -> list[dict[str, Any]]:
+    for tool in tools:
+        if tool["name"] == name:
+            for key, value in changes.items():
+                if value is None:
+                    tool.pop(key, None)
+                else:
+                    tool[key] = value
+    return tools
+
+
+def _observe_schema(required: list[str]) -> dict[str, Any]:
+    return {"type": "object", "properties": {"target": {"type": "object"}}, "required": required}
+
+
+_PAIR_DEFECTS = [
+    pytest.param(
+        [t for t in list_tools() if t["name"] != "restore"],
+        "restore_not_advertised",
+        id="restore_absent",
+    ),
+    pytest.param(
+        [t for t in list_tools() if t["name"] != "observe_version"],
+        "restore_not_advertised",
+        id="observe_version_absent",
+    ),
+    pytest.param(
+        _with(list_tools(), "restore", annotations={"readOnlyHint": True}),
+        "restore_schema_mismatch",
+        id="restore_read_only",
+    ),
+    pytest.param(
+        _with(list_tools(), "restore", input_schema=None),
+        "restore_schema_mismatch",
+        id="restore_without_schema",
+    ),
+    pytest.param(
+        _with(list_tools(), "observe_version", annotations={}),
+        "restore_schema_mismatch",
+        id="observe_version_not_read_only",
+    ),
+    pytest.param(
+        _with(list_tools(), "observe_version", input_schema=_observe_schema([])),
+        "restore_schema_mismatch",
+        id="observe_version_without_target",
+    ),
+]
+
+
+async def test_the_runner_preflight_double_lets_a_conforming_restore_confirm(
+    valkey: tuple[redis.Redis, str],
+) -> None:
+    """The oracle below is sound: a conforming restore passes the runner's own rules."""
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+        rig.runner.call_mode = "preflight"
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("confirmed", None)
+        assert len(rig.runner.writes) == 1
+        rig.assert_released()
+
+
+@pytest.mark.parametrize(("tools", "code"), _PAIR_DEFECTS)
+async def test_a_restore_the_runner_would_refuse_is_refused_from_list_before_dispatch(
+    valkey: tuple[redis.Redis, str],
+    minted: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    code: str,
+) -> None:
+    """@spec ACTION-EXECUTOR-20 @spec ACTION-EXECUTOR-13 @spec ACTION-EXECUTOR-6:
+    each verb-pair defect the runner's ``call`` preflight refuses on is read
+    from the ``list`` reply and ends ``refused <code>``: no observe, no dispatch
+    commit, no grant, no call.
+    """
+
+    async with _rig(valkey) as rig:
+        execution = rig.api.add_restore()
+        rig.runner.tools = tools
+        rig.runner.call_mode = "preflight"
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", code)
+        assert _phases(rig) == ["list"]
+        assert rig.api.calls_to("dispatch") == []
+        assert minted == []
+        assert rig.runner.writes == []
+        rig.assert_released()
+
+
+async def test_a_forward_of_the_paired_restore_is_reserved_and_never_dispatched(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-20 @spec ACTION-EXECUTOR-8 @spec ACTION-EXECUTOR-19:
+    when the live list advertises the pair, ``restore`` is the executor's restore
+    verb, not a forward tool. The runner would refuse a ``restore`` call that did
+    not follow ``observe``; the worker must refuse ``reserved_verb_via_forward``
+    from the list, before the dispatch commit creates a ledger row.
+    """
+
+    restore_text = connector_grant.canonical_arguments(
+        {"target": TARGET, "prior_state": PRIOR_STATE}
+    )
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.runner.call_mode = "preflight"
+        execution = rig.api.add_forward(
+            arguments={"target": TARGET, "prior_state": PRIOR_STATE},
+            tool="restore",
+            arguments_sha256=connector_grant.arguments_sha256(restore_text),
+        )
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "reserved_verb_via_forward")
+        assert _phases(rig) == ["list"]
+        assert rig.api.calls_to("dispatch") == []
+        assert rig.execution(execution).subject_action_id is None
+        assert minted == []
+        assert rig.runner.writes == []
+        rig.assert_released()
+
+
+async def test_a_forward_of_a_lone_restore_never_ends_dispatched_and_refused(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-8 @spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-20:
+    a lone ``restore`` (no ``observe_version``) is an ordinary tool the API
+    lets a forward name, but the runner refuses any ``restore`` call that did
+    not follow ``observe``. The worker can see the lone verb in ``list``, so the
+    run must not commit a dispatch the runner will refuse: it either ends
+    ``refused`` with no dispatch, or the call is made. Never ``indeterminate``
+    over a call that provably dialed nothing.
+    """
+
+    restore_text = connector_grant.canonical_arguments(
+        {"target": TARGET, "prior_state": PRIOR_STATE}
+    )
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.runner.tools = [t for t in list_tools() if t["name"] != "observe_version"]
+        rig.runner.call_mode = "preflight"
+        execution = rig.api.add_forward(
+            arguments={"target": TARGET, "prior_state": PRIOR_STATE},
+            tool="restore",
+            arguments_sha256=connector_grant.arguments_sha256(restore_text),
+        )
+
+        await rig.loop().run_once()
+
+        state, _code = _final(rig, execution)
+        assert state != "indeterminate", "a dispatched call the runner refused before dialing"
+        if state == "refused":
+            assert rig.api.calls_to("dispatch") == []
+            assert minted == []
+        else:
+            assert rig.runner.writes, "a dispatched lone restore must reach the connector"
+        rig.assert_released()
+
+
+async def test_a_forward_tool_the_runner_would_refuse_is_refused_from_list(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-20: ``tool_not_advertised`` against the runner's own
+    preflight: the worker judges the list and never commits the dispatch.
+    """
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.runner.tools = [t for t in list_tools() if t["name"] != FORWARD_TOOL]
+        rig.runner.call_mode = "preflight"
+        execution = rig.api.add_forward()
+
+        await rig.loop().run_once()
+
+        assert _final(rig, execution) == ("refused", "tool_not_advertised")
+        assert _phases(rig) == ["list"]
+        assert rig.api.calls_to("dispatch") == []
+        assert minted == []
+        rig.assert_released()
+
+
+async def test_a_runner_refusal_only_the_call_can_see_still_ends_post_dispatch(
+    valkey: tuple[redis.Redis, str], minted: list[dict[str, Any]]
+) -> None:
+    """@spec ACTION-EXECUTOR-17 @spec ACTION-EXECUTOR-20: a refusal the runner
+    makes during ``call`` on a condition ``list`` cannot show (here
+    ``connector_not_hosted``, decided from the connector's derived entry at
+    call time) lands after the dispatch commit, so it is never ``refused``: it
+    ends ``indeterminate`` with ``response_lost``, once, and is never repeated.
+    """
+
+    async with _rig(valkey) as rig:
+        rig.deployments.current = _forward_deployment()
+        rig.runner.call_mode = "refuse:connector_not_hosted"
+        execution = rig.api.add_forward()
+
+        await rig.loop().run_once()
+        await rig.loop("worker-b").run_once()
+
+        assert _final(rig, execution) == ("indeterminate", "response_lost")
+        assert _phases(rig) == ["list", "call"]
+        assert len(rig.api.calls_to("dispatch")) == 1
+        assert len(minted) == 1
+        assert all(r["body"]["state"] != "refused" for r in rig.api.calls_to("outcome"))
         rig.assert_released()

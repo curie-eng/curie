@@ -402,6 +402,34 @@
       "schema": "ActionOut",
       "omissions": [
         {
+          "field": "authority_kind",
+          "why": "AUTOMATED-REMEDIATION-13/-14 authority of a forward execution. The actions verbs print what was done and whether it is undoable; authority and actor attribution belong to the remediation receipts (task 13), so the mirror drops them on decode."
+        },
+        {
+          "field": "authority_ref",
+          "why": "The policy generation or approval behind a forward execution; dropped on decode for the same reason as authority_kind."
+        },
+        {
+          "field": "actor_kind",
+          "why": "AUTOMATED-REMEDIATION-14 actor attribution; dropped on decode for the same reason as authority_kind."
+        },
+        {
+          "field": "delivery_event_id",
+          "why": "The protected delivery a remediation came from; dropped on decode for the same reason as authority_kind."
+        },
+        {
+          "field": "nomination_id",
+          "why": "The remediation nomination behind a forward execution; dropped on decode for the same reason as authority_kind."
+        },
+        {
+          "field": "verification_outcome",
+          "why": "The remediation verifier's outcome (AUTOMATED-REMEDIATION-18), shown by the remediation receipts rather than the actions verbs."
+        },
+        {
+          "field": "verified_at",
+          "why": "When the remediation verifier settled; dropped on decode for the same reason as verification_outcome."
+        },
+        {
           "field": "prior_state",
           "why": "The sealed snapshot envelope. ACTION-EXECUTOR-23: the actions verbs never print snapshot material, so the mirror drops it on decode and no output can carry it."
         },
@@ -445,6 +473,26 @@
     {
       "struct": "RemediationPolicyGeneration",
       "schema": "RemediationPolicyOut",
+      "omissions": []
+    },
+    {
+      "struct": "RemediationBreaker",
+      "schema": "RemediationBreakerOut",
+      "omissions": []
+    },
+    {
+      "struct": "RemediationNomination",
+      "schema": "RemediationNominationOut",
+      "omissions": []
+    },
+    {
+      "struct": "RemediationQualificationOut",
+      "schema": "RemediationQualificationOut",
+      "omissions": []
+    },
+    {
+      "struct": "RemediationVerifierRunOut",
+      "schema": "RemediationVerifierRunOut",
       "omissions": []
     }
   ],
@@ -657,6 +705,21 @@
       "struct": "RemediationPolicyWrite",
       "schema": "RemediationPolicyWrite",
       "omissions": []
+    },
+    {
+      "struct": "RemediationBreakerClose",
+      "schema": "RemediationBreakerClose",
+      "omissions": []
+    },
+    {
+      "struct": "RemediationQualificationWrite",
+      "schema": "RemediationQualificationWrite",
+      "omissions": []
+    },
+    {
+      "struct": "RemediationVerifierRunStart",
+      "schema": "RemediationVerifierRunStart",
+      "omissions": []
     }
   ],
   "requests": [
@@ -809,6 +872,24 @@
       "struct": "RemediationPolicyMutation",
       "method": "post",
       "path": "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm"
+    },
+    {
+      "function": "close_remediation_breaker",
+      "struct": "RemediationBreakerClose",
+      "method": "post",
+      "path": "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close"
+    },
+    {
+      "function": "put_remediation_qualification",
+      "struct": "RemediationQualificationWrite",
+      "method": "put",
+      "path": "/agents/{agent_id}/remediation-qualifications/{qualification_id}"
+    },
+    {
+      "function": "start_remediation_verifier_run",
+      "struct": "RemediationVerifierRunStart",
+      "method": "post",
+      "path": "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs"
     }
   ],
   "_emits_comment": "The second, emit-hop gate (#699): a CliOutput::to_json can hand-project one of the mirror structs above into a serde_json::json! literal and drop a field the struct-level gate already proved it carries (the named drift was VersionsOutput dropping Version.id, fixed in #691). Each entry below declares that a specific `output` type's to_json projects a specific mirror `struct`, and every allowlisted omission needs a consumer-derived justification just like the mirrors list above. Check with: curie dev emit-parity. This is a narrower gate than the struct-level one: it verifies every DECLARED (output, struct) pair stays honest, but (unlike mirrors' UndeclaredStruct check) it cannot discover a NEW projection on its own -- see cli/tests/support/emit_parity.rs's module doc for why that reach is out of scope for a syntax-only check.",

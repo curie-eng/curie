@@ -19,8 +19,15 @@ execution's id; it never hands back the ``target`` or the sealed snapshot, and
 never marks the action undone. The executor observes the live version through
 the pinned connector and reports through ``routers/action_executions.py``,
 which writes ``undone_at`` only when the restore is confirmed.
+
+The ruling (``rule_undo``) is the one creator of a ``restore`` execution and
+requires the authenticated principal. It is reached from ``POST
+/actions/{id}/undo`` and from approving an undo approval
+(AUTOMATED-REMEDIATION-19); a record the platform executed under a ``policy`` or
+an ``approval`` is authorized against that authority's route, never ungated.
 """
 
+import functools
 import hashlib
 import json
 import logging
@@ -45,7 +52,7 @@ from curie_api.schemas.actions import (
     ActionUndoOut,
 )
 
-from ..action_undoable import authority_refusal, undo_refusal, undoable_action_ids
+from ..action_undoable import undo_refusal, undoable_action_ids
 from ..approval_auth import (
     ADAPTER_PRINCIPAL_HEADER,
     APPROVAL_ACTOR_HEADER,
@@ -54,6 +61,7 @@ from ..approval_auth import (
     authenticate_principal,
     principal_credentials_presented,
 )
+from ..approvers import ApproverSet, ApproverSetSelector
 from ..auth import CONSOLE_SESSION_COOKIE, require_api_key, verify_internal_worker_token
 from ..config import get_settings
 from ..deps import ApproverSetSelectorDep, SessionDep, StoreDep, get_store
@@ -66,6 +74,8 @@ from ..models import (
     ExecutionKind,
     ExecutionState,
 )
+from ..remediation_escalation import undo_route_approval
+from ..remediation_forward import APPROVAL_AUTHORITY, POLICY_AUTHORITY
 from ..storage import BundleStore, ObjectStore
 
 logger = logging.getLogger(__name__)
@@ -249,10 +259,6 @@ _INGREDIENT_REASONS = {
     "refused_key_custody": (
         "the agent's in-force version does not hold the sealing key for this connector"
     ),
-    "refused_authority_unresolved": (
-        "the platform executed this action under a policy or an approval, and undo "
-        "authorization for that authority is not available yet"
-    ),
 }
 
 # The authorizer name recorded when nothing gated the forward call. Not "none":
@@ -261,39 +267,11 @@ _INGREDIENT_REASONS = {
 UNGATED = "ungated"
 
 
-async def _authorize_undo(
-    session: SessionDep,
-    action: AgentAction,
-    principal: AuthenticatedApprovalPrincipal,
-    approver_sets: ApproverSetSelectorDep,
+async def _membership(
+    approver_set: ApproverSet, principal: AuthenticatedApprovalPrincipal
 ) -> tuple[str, bool, str]:
-    """Decide whether ``principal`` may undo ``action`` (ADR-0117 decision 3).
+    """Whether ``principal`` is in ``approver_set``, failing closed when undetermined."""
 
-    Symmetry, in both directions. A call nobody had to approve is not gated on
-    the way back: the state being restored is one the cluster was already in, and
-    it got there without anyone approving it. A call that WAS gated needs an
-    authorizer of that same route, resolved against membership the way ADR-0034
-    resolves an approver -- someone who could have permitted the change.
-
-    @spec ACTION-EXECUTOR-3: a ruling now causes a real restore, so the actor
-    and its channel evidence are the authenticated ADR-0106 principal's, never a
-    body field. Membership is asked about that principal exactly as the approval
-    resolver asks it. No distinct-requester rule is added; one would demand MORE
-    authorization than the forward action needed, which decision 3 rules out in
-    the same sentence that requires the route.
-    """
-
-    if action.gate_approval_id is None:
-        return UNGATED, True, ""
-
-    approval = await session.get(Approval, action.gate_approval_id)
-    if approval is None:
-        # The gate is unreadable, not absent. Treating it as absent would let a
-        # deleted approval turn a gated action into a freely undoable one.
-        return UNGATED, False, "the approval that gated this action can no longer be read"
-
-    binding = await crud_approvals.get_approval_route_binding(session, approval)
-    approver_set = approver_sets(approval, binding)
     verdict = await approver_set.contains(principal.subject, principal.actor_channel)
     if verdict.undetermined:
         # `member` is meaningless here. Failing open would let an outage at the
@@ -304,6 +282,108 @@ async def _authorize_undo(
             verdict.reason or "could not establish whether the actor may undo this",
         )
     return approver_set.audit_name, verdict.member, verdict.reason
+
+
+async def _route_membership(
+    session: AsyncSession,
+    approval: Approval,
+    principal: AuthenticatedApprovalPrincipal,
+    approver_sets: ApproverSetSelector,
+) -> tuple[str, bool, str]:
+    """Membership in the approver set of ``approval``'s route, read fresh."""
+
+    binding = await crud_approvals.get_approval_route_binding(session, approval)
+    return await _membership(approver_sets(approval, binding), principal)
+
+
+# @spec AUTOMATED-REMEDIATION-19: the authorizer recorded when a platform-executed
+# record's authority resolves to no route. Never ``ungated``: something did
+# authorize the forward call, and no principal is in an unreadable set.
+_UNRESOLVED_AUTHORIZER = {
+    POLICY_AUTHORITY: "policy-route-unresolved",
+    APPROVAL_AUTHORITY: "approval-route-unresolved",
+}
+
+
+async def _authorize_authority(
+    session: AsyncSession,
+    action: AgentAction,
+    principal: AuthenticatedApprovalPrincipal,
+    approver_sets: ApproverSetSelector,
+) -> tuple[str, bool, str]:
+    """Authority-aware undo authorization of a platform-executed record.
+
+    @spec AUTOMATED-REMEDIATION-19: "a record with ``authority_kind`` ``policy``
+    requires a principal in the policy route's approver set, and a record with
+    ``authority_kind`` ``approval`` requires one in the approval route's set
+    (through ``gate_approval_id``)", replacing ACTION-EXECUTOR-19's interim
+    ``refused_authority_unresolved``. ADR 0117 decision 3's ungated default
+    never applies: a record whose authority resolves to no route admits nobody.
+    Any other authority kind fails closed.
+    """
+
+    kind = str(action.authority_kind)
+    unresolved = _UNRESOLVED_AUTHORIZER.get(kind, f"{kind}-authority")
+    if kind == APPROVAL_AUTHORITY:
+        approval = (
+            await session.get(Approval, action.gate_approval_id)
+            if action.gate_approval_id is not None
+            else None
+        )
+        if approval is None:
+            return unresolved, False, "the approval that authorized this action cannot be read"
+        return await _route_membership(session, approval, principal, approver_sets)
+    if kind == POLICY_AUTHORITY:
+        approval = await undo_route_approval(session, action)
+        if approval is None:
+            return (
+                unresolved,
+                False,
+                "the policy that authorized this action names no route that can be read",
+            )
+        return await _route_membership(session, approval, principal, approver_sets)
+    return unresolved, False, "no route authorizes an undo of this action's authority"
+
+
+async def _authorize_undo(
+    session: AsyncSession,
+    action: AgentAction,
+    principal: AuthenticatedApprovalPrincipal,
+    approver_sets: ApproverSetSelector,
+) -> tuple[str, bool, str]:
+    """Decide whether ``principal`` may undo ``action`` (ADR-0117 decision 3).
+
+    Symmetry, in both directions. A call nobody had to approve is not gated on
+    the way back: the state being restored is one the cluster was already in, and
+    it got there without anyone approving it. A call that WAS gated needs an
+    authorizer of that same route, resolved against membership the way ADR-0034
+    resolves an approver -- someone who could have permitted the change.
+
+    @spec AUTOMATED-REMEDIATION-19: a record the platform executed under an
+    authority (``policy`` or ``approval``) is never ungated: its authority's
+    route decides (``_authorize_authority``).
+
+    @spec ACTION-EXECUTOR-3: a ruling now causes a real restore, so the actor
+    and its channel evidence are the authenticated ADR-0106 principal's, never a
+    body field. Membership is asked about that principal exactly as the approval
+    resolver asks it. No distinct-requester rule is added; one would demand MORE
+    authorization than the forward action needed, which decision 3 rules out in
+    the same sentence that requires the route.
+    """
+
+    if action.authority_kind is not None:
+        return await _authorize_authority(session, action, principal, approver_sets)
+
+    if action.gate_approval_id is None:
+        return UNGATED, True, ""
+
+    approval = await session.get(Approval, action.gate_approval_id)
+    if approval is None:
+        # The gate is unreadable, not absent. Treating it as absent would let a
+        # deleted approval turn a gated action into a freely undoable one.
+        return UNGATED, False, "the approval that gated this action can no longer be read"
+
+    return await _route_membership(session, approval, principal, approver_sets)
 
 
 async def _refuse(
@@ -330,6 +410,8 @@ async def _refuse(
             action=kind,
             actor=principal.subject,
             actor_channel=principal.actor_channel,
+            # @spec AUTOMATED-REMEDIATION-14: the undo ruling's principal acted.
+            actor_kind="undo_ruling",
             authorizer=authorizer,
             authorized=False,
             reason=reason,
@@ -499,24 +581,44 @@ async def undo_action(
             authorizer="principal",
         )
 
-    # @spec ACTION-EXECUTOR-19: a forward-executed record's authority is not
-    # resolvable until #4068, so authorization itself cannot be decided; the
-    # ungated default below must not apply to it.
-    unresolved = authority_refusal(action)
-    if unresolved is not None:
-        await _refuse(
-            session,
-            action.id,
-            principal,
-            kind=unresolved,
-            reason=_INGREDIENT_REASONS[unresolved],
-            code=status.HTTP_409_CONFLICT,
-            authorizer=str(action.authority_kind),
-        )
+    return await rule_undo(
+        session, action, principal=principal, approver_sets=approver_sets, store=store
+    )
+
+
+async def rule_undo(
+    session: AsyncSession,
+    action: AgentAction,
+    *,
+    principal: AuthenticatedApprovalPrincipal,
+    approver_sets: ApproverSetSelector,
+    store: ObjectStore | None,
+    approval_id: uuid.UUID | None = None,
+) -> ActionUndoOut:
+    """The undo ruling (ACTION-EXECUTOR-3): authorize, check, request one restore.
+
+    @spec AUTOMATED-REMEDIATION-19 @spec AUTOMATED-REMEDIATION-14: the one place
+    a ``restore`` execution is created, and only under ``principal``, which is
+    required: the ruling route and an approved undo approval
+    (``routers/approvals.py``) both call it with the authenticated principal,
+    and nothing calls it without one. Raises the refusal as an
+    ``HTTPException`` after committing its audit row.
+
+    ``approval_id`` is the undo approval driving the ruling, when one is. Every
+    audit row the ruling writes then names it in its evidence, and the restore
+    is keyed ``restore:<action id>:approval:<approval id>``, so an approval
+    yields at most one restore however often its ruling is rerun
+    (``remediation_undo_recovery``) and a rerun can tell that it was decided.
+    """
+
+    ruling_evidence: dict[str, object] | None = (
+        {"approval_id": str(approval_id)} if approval_id is not None else None
+    )
+    refuse = functools.partial(_refuse, evidence=ruling_evidence)
 
     authorizer, allowed, reason = await _authorize_undo(session, action, principal, approver_sets)
     if not allowed:
-        await _refuse(
+        await refuse(
             session,
             action.id,
             principal,
@@ -527,7 +629,7 @@ async def undo_action(
         )
 
     if action.undone_at is not None:
-        await _refuse(
+        await refuse(
             session,
             action.id,
             principal,
@@ -536,7 +638,7 @@ async def undo_action(
             code=status.HTTP_409_CONFLICT,
         )
     if action.status != ActionStatus.succeeded:
-        await _refuse(
+        await refuse(
             session,
             action.id,
             principal,
@@ -557,14 +659,14 @@ async def undo_action(
             # The connector's own words when it had them: the receipt and the
             # refusal state the same sentence.
             reason = action.detail
-        await _refuse(
+        await refuse(
             session, action.id, principal, kind=code, reason=reason, code=status.HTTP_409_CONFLICT
         )
     # @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-20: the last ruling check.
     # Off, an undo that would authorize a restore is refused with 503, one
     # audit row and no execution.
     if not get_settings().action_executor_enabled:
-        await _refuse(
+        await refuse(
             session,
             action.id,
             principal,
@@ -593,8 +695,13 @@ async def undo_action(
         authority_ref=str(audit_id),
         requested_by=principal.subject,
         arguments_sha256=restore_arguments_sha256(action.target, action.prior_state),
-        # @spec ACTION-EXECUTOR-2: keyed by the authorizing audit row.
-        idempotency_key=f"restore:{subject_id}:{audit_id}",
+        # @spec ACTION-EXECUTOR-2: keyed by the authorizing audit row, or by
+        # the undo approval that drives it (AUTOMATED-REMEDIATION-19).
+        idempotency_key=(
+            f"restore:{subject_id}:approval:{approval_id}"
+            if approval_id is not None
+            else f"restore:{subject_id}:{audit_id}"
+        ),
         state=ExecutionState.requested.value,
         attempt=0,
     )
@@ -606,6 +713,8 @@ async def undo_action(
             action="authorized",
             actor=principal.subject,
             actor_channel=principal.actor_channel,
+            # @spec AUTOMATED-REMEDIATION-14: the undo ruling's principal acted.
+            actor_kind="undo_ruling",
             authorizer=authorizer,
             authorized=True,
             # @spec ACTION-EXECUTOR-3: the execution id, the key identifier and
@@ -614,6 +723,7 @@ async def undo_action(
                 "execution_id": str(execution_id),
                 "kid": action.prior_state.get("kid"),
                 "version": action.post_version,
+                **(ruling_evidence or {}),
             },
             created_at=func.clock_timestamp(),
         )
@@ -630,7 +740,7 @@ async def undo_action(
         if mapped is None:
             raise
         kind, reason = mapped
-        await _refuse(
+        await refuse(
             session,
             subject_id,
             principal,

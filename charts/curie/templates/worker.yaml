@@ -92,6 +92,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get"]
+  # A claim that never became Ready logs the runner's last 8 KB before cleanup.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["list"]
@@ -398,6 +402,11 @@ spec:
             # the same value from the same helper; the two must never differ.
             - name: CURIE_ACTION_EXECUTOR_ENABLED
               value: {{ include "curie.actionExecutorEnabled" . | quote }}
+            # The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12,
+            # executor amendment E9): the executor loop runs up to this many at
+            # once. The API renders the same value from the same helper.
+            - name: CURIE_ACTION_EXECUTOR_MAX_CONCURRENT_SANDBOXES
+              value: {{ include "curie.actionExecutorMaxConcurrentSandboxes" . | quote }}
             # The automated remediation switch (AUTOMATED-REMEDIATION-1). The API
             # renders the same value from the same helper; the two must never differ.
             - name: CURIE_REMEDIATION_ENABLED

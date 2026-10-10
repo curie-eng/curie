@@ -616,7 +616,7 @@ def build_options(
         else (
             "claude-opus-5-5"
             if credential.startswith("sk-ant-")
-            else "anthropic/claude-opus-5.5"
+            else "openai/gpt-6.1-sol"
         )
     )
     title_model = sdk_env.get(_SDK_TITLE_MODEL_ENV, os.environ.get(_SDK_TITLE_MODEL_ENV, ""))

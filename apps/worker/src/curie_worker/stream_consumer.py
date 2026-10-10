@@ -211,6 +211,7 @@ class StreamConsumer:
         # lock. It never covers handler execution or a capacity-semaphore wait.
         self._reclaim_lock = asyncio.Lock()
         self._last_liveness_renewal: float | None = None
+        self._liveness_token: str | None = None
 
     @property
     def _spec(self) -> DeliverySpec:
@@ -381,96 +382,85 @@ class StreamConsumer:
         self._peer_absent_since.clear()
         self._inflight_ids.clear()
         self._last_liveness_renewal = None
+        self._liveness_token = None
 
     def _liveness_timeout_s(self) -> float:
-        # One renewal attempt may consume at most one sixth of the lease, so a
-        # timed-out attempt plus a retry still fit before the pre-expiry guard.
-        # The
-        # 1ms floor keeps deliberately tiny integration-test leases usable.
+        # Initial publication and cleanup keep their existing bounded timeout;
+        # renewals instead use the refresh interval and local ownership time.
         return max(0.001, self._spec.heartbeat_ttl_ms / 6000)
+
+    def _liveness_refresh_interval_s(self) -> float:
+        heartbeat_s = self._leases.heartbeat_interval_s if self._leases else 10.0
+        return min(self._spec.heartbeat_ttl_ms / 3000, heartbeat_s)
 
     async def _publish_liveness(self) -> None:
         if self._liveness_store is None:
             raise RuntimeError("consumer generation has no liveness store")
+        anchor_monotonic = time.monotonic()
         async with asyncio.timeout(self._liveness_timeout_s()):
-            await self._liveness_store.publish(
+            token = await self._liveness_store.publish(
                 stream=self._spec.stream,
                 group=self._spec.group,
                 consumer=self._spec.consumer,
                 heartbeat_ttl_ms=self._spec.heartbeat_ttl_ms,
                 capability_ttl_ms=self._spec.capability_ttl_ms,
             )
-        self._last_liveness_renewal = time.monotonic()
+        self._liveness_token = token
+        self._last_liveness_renewal = anchor_monotonic
 
     async def _liveness_refresh_loop(self) -> None:
         """Renew alive/capability until this run generation ends.
 
-        One transient failure is not terminal. What matters is monotonic time
-        since the last confirmed renewal: before the alive lease can silently
-        expire, this task raises and structured teardown leaves owned entries in
-        the PEL for a replacement generation/process.
+        Unconfirmed attempts retain only the last confirmed send's local
+        deadline. Refusal is immediately terminal; raising attempts retry on
+        the normal cadence until that conservative deadline (ADR-0207).
         """
 
         assert self._liveness_store is not None
+        assert self._liveness_token is not None
+        assert self._last_liveness_renewal is not None
         ttl_s = self._spec.heartbeat_ttl_ms / 1000
-        refresh_s = ttl_s / 3
-        expiry_guard_s = max(0.001, ttl_s - refresh_s)
-        retry_s = max(0.001, min(refresh_s / 4, 0.25))
-        failed_once = False
+        refresh_s = self._liveness_refresh_interval_s()
+        next_due = self._last_liveness_renewal + refresh_s
 
-        await self._sleep_generation(refresh_s)
         while not self._generation_stop.is_set():
-            last = self._last_liveness_renewal
+            deadline = self._last_liveness_renewal + ttl_s - refresh_s
             now = time.monotonic()
-            elapsed = 0.0 if last is None else now - last
-            remaining_guard = expiry_guard_s - elapsed
-            remaining_lease = ttl_s - elapsed
-            # Guard minus 1ms on the first pass so a hang-forever attempt can
-            # still retry. Once that window is thinner than retry_s, remaining
-            # key TTL keeps a recovered SET alive instead of a 1ms floor.
-            # Cap by leftover TTL minus retry_s so a late refresh sleep still
-            # leaves room for one retry before the key expires.
-            if remaining_guard - 0.001 >= retry_s:
-                computed = remaining_guard - 0.001
-            else:
-                computed = max(0.001, remaining_lease)
-            attempt_timeout = min(computed, max(0.001, ttl_s - elapsed - retry_s))
+            if now < min(next_due, deadline):
+                await self._sleep_generation(min(next_due, deadline) - now)
+                continue
+            if now >= deadline:
+                raise ConsumerLivenessExpired(
+                    "ownership store unreachable past the local consumer liveness "
+                    f"deadline for {self._spec.consumer}"
+                )
+            anchor_monotonic = time.monotonic()
+            next_due = anchor_monotonic + refresh_s
             try:
-                async with asyncio.timeout(attempt_timeout):
-                    await self._liveness_store.renew(
+                async with asyncio.timeout(min(refresh_s, deadline - anchor_monotonic)):
+                    renewed = await self._liveness_store.renew(
                         stream=self._spec.stream,
                         group=self._spec.group,
                         consumer=self._spec.consumer,
                         heartbeat_ttl_ms=self._spec.heartbeat_ttl_ms,
                         capability_ttl_ms=self._spec.capability_ttl_ms,
+                        token=self._liveness_token,
                     )
-            except Exception as exc:
+            except Exception:
                 # ``CancelledError`` remains a BaseException and propagates.
-                last = self._last_liveness_renewal
-                elapsed = float("inf") if last is None else time.monotonic() - last
-                # A first timeout that crossed the pre-expiry guard still retries
-                # if the key TTL has not elapsed. Raise after a second failure
-                # in that window, or once the key itself is past TTL.
-                if elapsed >= ttl_s or (elapsed >= expiry_guard_s and failed_once):
-                    raise ConsumerLivenessExpired(
-                        "consumer liveness renewal could not be confirmed before "
-                        f"lease expiry for {self._spec.consumer}"
-                    ) from exc
-                failed_once = True
                 self._spec.logger.warning(
                     "consumer liveness renewal failed transiently for %s; retrying",
                     self._spec.consumer,
                     exc_info=True,
                 )
-                leftover = expiry_guard_s - elapsed
-                # Do not sleep past the guard; retry immediately when leftover
-                # is too small for retry_s.
-                if leftover > retry_s:
-                    await self._sleep_generation(retry_s)
                 continue
-            failed_once = False
-            self._last_liveness_renewal = time.monotonic()
-            await self._sleep_generation(refresh_s)
+            # Refusal is outside the transport retry handler, so it can never
+            # be swallowed as an unconfirmed renewal.
+            if not renewed:
+                raise ConsumerLivenessExpired(
+                    f"consumer liveness renewal refused for {self._spec.consumer}"
+                )
+            self._last_liveness_renewal = anchor_monotonic
 
     async def _cleanup_alive(self) -> None:
         if self._liveness_store is None:
@@ -617,21 +607,64 @@ class StreamConsumer:
         if lease is None:
             await self._redis.xack(self._spec.stream, self._spec.group, entry_id)
             return
-        async with lease.settlement_lock:
-            # A vanished entry has no successor (ADR-0131). XACK of a missing
-            # id removes nothing and must not fail the graveyard settlement.
+        assert self._leases is not None
+        retry_s = 0.5
+        first_attempt = True
+        while True:
             vanished = lease.entry_vanished.is_set()
             if not vanished:
                 lease.raise_if_lost()
-            removed = await self._redis.xack(
-                self._spec.stream, self._spec.group, entry_id
-            )
-            if not vanished and removed != 1:
-                lease.lost.set()
-                raise LeaseLostError(
-                    f"entry {entry_id} was not pending at terminal acknowledgement"
+            remaining = lease.remaining_s()
+            if not first_attempt and remaining <= 0:
+                raise TimeoutError("delivery budget exhausted while acknowledging")
+            # The initial ACK must settle an already-terminal expired delivery.
+            # Exhaustion bars retries, not that first fenced settlement attempt.
+            timeout_s = self._leases.heartbeat_interval_s
+            if remaining > 0:
+                timeout_s = min(timeout_s, remaining)
+            if not vanished:
+                ownership_remaining = lease.local_deadline_monotonic - time.monotonic()
+                if ownership_remaining <= 0:
+                    raise LeaseLostError("local lease deadline passed while acknowledging")
+                timeout_s = min(timeout_s, ownership_remaining)
+            try:
+                # Include lock acquisition in the bound. A hung XACK releases
+                # it within one heartbeat interval so renewal can progress.
+                async with asyncio.timeout(timeout_s), lease.settlement_lock:
+                    # A vanished entry has no successor (ADR-0131). XACK of a
+                    # missing id must still settle its graveyard record.
+                    vanished = lease.entry_vanished.is_set()
+                    if not vanished:
+                        lease.raise_if_lost()
+                        if time.monotonic() >= lease.local_deadline_monotonic:
+                            raise LeaseLostError(
+                                "local lease deadline passed while acknowledging"
+                            )
+                    removed = await self._redis.xack(
+                        self._spec.stream, self._spec.group, entry_id
+                    )
+                    if not vanished and removed != 1:
+                        lease.lost.set()
+                        raise LeaseLostError(
+                            f"entry {entry_id} was not pending at terminal acknowledgement"
+                        )
+                    lease.acknowledged.set()
+                return
+            except LeaseLostError:
+                raise
+            except Exception:
+                self._spec.logger.warning(
+                    "terminal acknowledgement failed for entry %s; retrying",
+                    entry_id,
+                    exc_info=True,
                 )
-            lease.acknowledged.set()
+            first_attempt = False
+            if lease.remaining_s() <= 0:
+                raise TimeoutError("delivery budget exhausted while acknowledging")
+            # Neither backoff nor the wait for another attempt holds the
+            # settlement lock. The overall delivery budget remains unchanged.
+            await asyncio.sleep(min(retry_s, max(0.0, lease.remaining_s())))
+            retry_s = min(retry_s * 2, 5.0)
 
     async def _settle_delivery(self, entry_id: str) -> None:
         """Remove this delivery's lease AND its state after a terminal settlement.
@@ -849,62 +882,100 @@ class StreamConsumer:
         termination grace is sized to cover the budget plus the shutdown
         reserve precisely so this loop may keep running through shutdown.
 
-        Any refusal OR any exception is lease-lost. ADR-0131: "if Valkey cannot
-        confirm renewal, the owner fails closed as lease-lost."
+        A refusal loses authority immediately. A raising attempt retries on
+        the normal cadence while the prior confirmed send's local deadline
+        remains; an outage cannot extend that deadline (ADR-0207).
         """
         assert self._leases is not None
         spec = self._spec
+        interval_s = self._leases.heartbeat_interval_s
+        next_due = (
+            lease.local_deadline_monotonic - self._leases.ownership_window_s + interval_s
+        )
         while True:
-            await asyncio.sleep(self._leases.heartbeat_interval_s)
-            async with lease.settlement_lock:
-                if lease.acknowledged.is_set():
-                    return
-                try:
-                    budget = await self._leases.heartbeat(
-                        spec.stream,
-                        spec.group,
-                        entry_id,
-                        consumer=spec.consumer,
-                        owner=lease.owner,
-                        generation=lease.generation,
-                        resume_event_id=lease.resume_event_id,
-                    )
-                except Exception as exc:  # noqa: BLE001 - any failure is lease-lost
-                    budget = None
-                    reason = f"renewal raised {type(exc).__name__}: {exc}"
-                else:
-                    reason = "renewal refused by Valkey"
-                if budget is None:
-                    # Authority drops before the vanished probe. The probe is
-                    # extra Valkey reads and must not keep this owner live.
-                    lease.lost.set()
-                else:
-                    # The deadline does not move; only this clock anchor does.
-                    lease.budget = budget
-            if budget is None:
-                # Settlement and the placeholder edit run off this task. The
-                # handler cancels the heartbeat when the body exits, which is
-                # exactly when a lost lease makes the body return, so a notice
-                # awaited here is cancelled before it can edit.
-                self._notice_lease[entry_id] = lease
-                task = asyncio.create_task(
-                    self._finish_lease_loss(lease, entry_id, fields, reason)
-                )
-                self._lease_loss_tasks.add(task)
-                task.add_done_callback(self._lease_loss_tasks.discard)
-                if self._on_lease_lost is not None:
-                    try:
-                        await self._on_lease_lost(entry_id, fields)
-                    except Exception:
-                        # A failure to stop the runner must not mask the loss
-                        # itself, which ``lease.lost`` has already recorded and
-                        # which the settle boundaries enforce on their own.
-                        spec.logger.exception(
-                            "lease-lost handler failed for entry %s on stream %s",
-                            entry_id,
-                            spec.stream,
-                        )
+            if lease.acknowledged.is_set():
                 return
+            now = time.monotonic()
+            deadline = lease.local_deadline_monotonic
+            if not lease.lost.is_set() and now < min(next_due, deadline):
+                await asyncio.sleep(min(next_due, deadline) - now)
+                continue
+            if lease.lost.is_set():
+                reason = "delivery lease authority already lost"
+            elif now >= deadline:
+                reason = "ownership store unreachable past the local lease deadline"
+            else:
+                attempt_send = time.monotonic()
+                next_due = attempt_send + interval_s
+                try:
+                    # Waiting for terminal settlement is part of the attempt
+                    # bound too; a blocked lock cannot carry authority past TTL.
+                    async with asyncio.timeout(
+                        min(interval_s, deadline - attempt_send)
+                    ), lease.settlement_lock:
+                        if lease.acknowledged.is_set():
+                            return
+                        if lease.lost.is_set():
+                            budget = None
+                            reason = "delivery lease authority already lost"
+                        elif time.monotonic() >= lease.local_deadline_monotonic:
+                            budget = None
+                            reason = "ownership store unreachable past the local lease deadline"
+                        else:
+                            attempt_send = time.monotonic()
+                            next_due = attempt_send + interval_s
+                            budget = await self._leases.heartbeat(
+                                spec.stream,
+                                spec.group,
+                                entry_id,
+                                consumer=spec.consumer,
+                                owner=lease.owner,
+                                generation=lease.generation,
+                                resume_event_id=lease.resume_event_id,
+                            )
+                            reason = "renewal refused by Valkey"
+                        if budget is None:
+                            # Drop authority before probing the vanished entry.
+                            lease.lost.set()
+                        else:
+                            lease.budget = budget
+                            lease.local_deadline_monotonic = (
+                                budget.anchor_monotonic + self._leases.ownership_window_s
+                            )
+                            next_due = budget.anchor_monotonic + interval_s
+                except Exception:
+                    spec.logger.warning(
+                        "delivery lease renewal failed for entry %s; retrying",
+                        entry_id,
+                        exc_info=True,
+                    )
+                    continue
+                if budget is not None:
+                    continue
+            lease.lost.set()
+            # Settlement and the placeholder edit run off this task. The
+            # handler cancels the heartbeat when the body exits, which is
+            # exactly when a lost lease makes the body return, so a notice
+            # awaited here is cancelled before it can edit.
+            self._notice_lease[entry_id] = lease
+            task = asyncio.create_task(
+                self._finish_lease_loss(lease, entry_id, fields, reason)
+            )
+            self._lease_loss_tasks.add(task)
+            task.add_done_callback(self._lease_loss_tasks.discard)
+            if self._on_lease_lost is not None:
+                try:
+                    await self._on_lease_lost(entry_id, fields)
+                except Exception:
+                    # A failure to stop the runner must not mask the loss
+                    # itself, which ``lease.lost`` has already recorded and
+                    # which the settle boundaries enforce on their own.
+                    spec.logger.exception(
+                        "lease-lost handler failed for entry %s on stream %s",
+                        entry_id,
+                        spec.stream,
+                    )
+            return
 
     async def _finish_lease_loss(
         self,

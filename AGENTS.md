@@ -295,33 +295,24 @@ Drain task or launch a second copy to apply the guidance.
 
 ### Preflight checks
 
-The full and fast preflight requirements in this section apply only when the
-checkout being checked contains both the `curie dev preflight` command and
-`tools/preflight/preflight.py`. Check the selected release train and worktree,
-even when these instructions were loaded from a different launch checkout.
-If that train does not contain preflight, run its applicable required checks
-directly using its own instructions and CI workflow, and require current-head
-PR checks to pass. Do not run another checkout's preflight against it or port
-preflight into the train to satisfy this section. Missing prerequisites or a
-failing preflight in a checkout that supports it remain failures.
+There is no required pre-PR preflight. Do not run the full tier (`curie dev
+preflight` without `--fast`) while implementing a change or before opening or
+updating a pull request. It starts a private Compose project with the full
+Langfuse, ClickHouse, and OTel stack and runs the changed Python suites, and
+several agent runs doing that at once overload the shared host. CI runs those
+suites and the PR body and Fix pin guards on every pull request; require
+current-head PR checks to pass instead. Run the full tier only when a person
+asks for it explicitly.
 
-Before opening or updating a pull request, run the full tier from the source
-checkout: `curie dev preflight --pr-body <file> --title <text>`. The full tier
-is the default. It fetches the base and refuses a head that does not contain
-its current tip, printing `git merge origin/<base>` without merging for you.
-Failing required checks on the base produce a warning. It runs the PR body and
-Fix pin guards, then tests the changed Python workspace members and their
-transitive dependents in a private Compose project that it tears down on exit.
-Without `--pr-body`, the body and Fix pin checks are reported as skipped.
-Selected end to end tiers and kind jobs are listed as runs in CI only.
-
-After committing and before pushing, run `curie dev preflight --fast` from the
-source checkout. It selects the cheap PR gates for the committed change and
-runs their CI commands. The default base is `main`; use `--base <branch>`
-to compare against another fetched `origin/<branch>`. Use `--dry-run` to inspect
-the selected commands and `--json` for one structured report. A failing gate
-includes its output tail. This fast tier does not replace any required
-verification below.
+The fast tier starts no services. The tracked pre-push hook runs it on every
+push, so do not run it separately. It selects the cheap PR gates for the
+committed change and runs their CI commands. To run it by hand, use
+`curie dev preflight --fast` from the source checkout. The default base is
+`main`; use `--base <branch>` to compare against another fetched
+`origin/<branch>`. Use `--dry-run` to inspect the selected commands and
+`--json` for one structured report. A failing gate includes its output tail
+and is a failure to fix before pushing. This fast tier does not replace any
+required verification below.
 
 `curie install`, `curie update`, and `curie dev hooks install` configure the
 shared relative `core.hooksPath=.githooks`. Each linked worktree runs its own
@@ -746,9 +737,28 @@ as a whole; remembered only):
   phase, the route's refusal codes and the worker code each maps to, the status
   body and the mode variable are frozen together. The `observe_version` and
   `restore` call arguments and the reply-to-outcome mapping the two sides apply
-  around those phases are frozen beside it.
+  around those phases are frozen beside it. The remediation `read` phase
+  (AUTOMATED-REMEDIATION-12: the request's `pointer`, one `read` per sandbox,
+  `tool_not_read_only` without dialing, the read refusals' worker codes) and
+  the codes it adds, which the API's
+  `apps/api/src/curie_api/action_execution_codes.py` also reads (the
+  worker-reported pre-dispatch code and the sample results that are never
+  refusals), are frozen in the same vector.
   [vector: `tests/vectors/runner-execute.json`]
   [vector: `tests/vectors/executor-restore-calls.json`]
+- runner vs worker remediation sample (AUTOMATED-REMEDIATION-12, -17) -- the
+  runner's pointer extraction in the `read` phase
+  (`runner/src/curie_runner/executor.py`: structured content, or a single text
+  block's strict JSON, otherwise `result_unstructured`) and the worker's sample
+  report (`apps/worker/src/curie_worker/action_executor.py::sample_report`) ship
+  in different images, so every pointer, result shape and sample kind is frozen
+  together with the comparator cases the API's evaluator
+  (`apps/api/src/curie_api/remediation_predicate.py::evaluate_sample`, which
+  judges each verifier sample, plan task 11) reads too: ordering comparators
+  read a JSON number or a strict numeric string, `eq`, `ne` and `in` never
+  coerce, and every unsuccessful sample (including the API's own `skipped`) is
+  `unsuccessful`. Read by `apps/api/tests/test_remediation_predicate_vector.py`.
+  [vector: `tests/vectors/remediation-predicate.json`]
 - API vs CLI remediation policy validation and policy refusal codes
   (AUTOMATED-REMEDIATION-3) -- the API validator
   (`apps/api/src/curie_api/remediation_policy_document.py`) and the CLI's
@@ -758,6 +768,12 @@ as a whole; remembered only):
   refusal codes the API returns (`POLICY_REFUSALS` in
   `apps/api/src/curie_api/remediation_codes.py`) are the set the CLI renders
   (`POLICY_REFUSALS` in `cli/src/remediation.rs`), frozen as `policy_refusals`.
+  The receipt vocabulary (AUTOMATED-REMEDIATION-20) is a third reader: the
+  worker's thread receipts (`apps/worker/src/curie_worker/remediation_receipts.py`:
+  `RECEIPT_STAGES`, `VERIFICATION_OUTCOMES`, `AUTHORITIES`, `RECEIPT_CODES`), the
+  API's nomination read (`remediation_codes.py`) and the CLI's `remediation list`
+  and `show` (`NOMINATION_STATES`, `RECEIPT_STAGES` and the rest in
+  `cli/src/remediation.rs`) all read the same frozen sets.
   [vector: `tests/vectors/remediation-policy.json`]
   [vector: `tests/vectors/remediation-codes.json`]
 - runner vs worker sealed envelope (ACTION-EXECUTOR-9, -10) -- the runner's
@@ -915,7 +931,7 @@ required and proved, not carried on the original classification.
 | Tier | Required when the change reaches | Command |
 | --- | --- | --- |
 | skill | plugin or skill packaging, the runner turn loop, ACI events, skill eval or check | `CURIE_E2E_TIERS=skill curie dev e2e-ladder` |
-| local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder` |
+| local | compose services, dispatcher, worker, or API wiring, boot env crossing a service boundary, the console UI, or any `curie` verb whose output, exit code, or `--json` shape changed | `CURIE_E2E_TIERS=local curie dev e2e-ladder`; for console login (OIDC against a real Dex, login codes, sessions, logout) also `curie dev oidc-e2e` |
 | local-release | released binary or image identity, the install path, version pins, release compose | `CURIE_E2E_TIERS=local-release curie dev e2e-ladder` |
 | cluster | chart templates, RBAC, securityContext, NetworkPolicy, sandbox claims, init containers | `CURIE_E2E_TIERS=cluster curie dev e2e-ladder`, or `curie dev chart-runtime-e2e` for a chart, sandbox, or bundle slice |
 | live provider | model routing, credential resolution, provider auth, token or cost accounting, meaning the product's own model and integration credentials, never the agent tooling that runs this workflow; also the MCP/workspace/coding-tool path set below | the required rungs with `CURIE_E2E_LIVE=1`, since a fake-tier pass proves wiring and nothing about a real model |

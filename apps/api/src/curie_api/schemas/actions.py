@@ -103,6 +103,16 @@ class ActionOut(BaseModel):
     completed_at: datetime | None
     undone_at: datetime | None
     undone_by: str | None
+    # @spec AUTOMATED-REMEDIATION-14: what permitted a platform-executed call
+    # (null for a call a turn recorded), who acted, the protected delivery and
+    # nomination a remediation came from, and its verification outcome.
+    authority_kind: str | None
+    authority_ref: str | None
+    actor_kind: str | None
+    delivery_event_id: str | None
+    nomination_id: uuid.UUID | None
+    verification_outcome: str | None
+    verified_at: datetime | None
     # Derived at read time, never stored, so a record cannot claim a
     # reversibility nothing captured the state for (ADR-0117). Computed by
     # ``curie_api.action_undoable`` (ACTION-EXECUTOR-11).
@@ -151,3 +161,6 @@ class ActionAuditOut(BaseModel):
     reason: str | None
     evidence: dict[str, Any] | None
     created_at: datetime
+    # @spec AUTOMATED-REMEDIATION-14: ``model_turn``, ``policy``, ``approval``
+    # or ``undo_ruling``; null on entries written before it was recorded.
+    actor_kind: str | None

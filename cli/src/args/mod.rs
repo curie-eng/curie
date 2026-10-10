@@ -540,6 +540,39 @@ pub(crate) enum RemediationPolicyCommand<C: clap::Args> {
         #[command(flatten)]
         conn: C,
     },
+    // @spec AUTOMATED-REMEDIATION-11
+    /// List a hook's circuit breakers, newest first, so the id `close-breaker`
+    /// needs can be found (`GET .../remediation-policy/breakers`). Read only.
+    Breakers {
+        /// Agent name or id.
+        agent: String,
+        /// Protected hook name.
+        hook: String,
+        /// `open` (the default), `closed` or `all`; checked by the verb so a
+        /// bad value is one ADR-0021 error object.
+        #[arg(long, value_name = "STATE")]
+        state: Option<String>,
+        #[command(flatten)]
+        conn: C,
+    },
+    // @spec AUTOMATED-REMEDIATION-11
+    /// Close an open circuit breaker so automatic remediation of its target may
+    /// resume (`POST .../remediation-policy/breakers/{id}/close`).
+    CloseBreaker {
+        /// Agent name or id.
+        agent: String,
+        /// Protected hook name.
+        hook: String,
+        /// The breaker's id (a UUID).
+        breaker_id: String,
+        /// Why the breaker may close, recorded with the closing operator.
+        /// Required and never blank; checked by the verb so its absence is
+        /// one ADR-0021 error object like every other input refusal.
+        #[arg(long, value_name = "TEXT")]
+        reason: Option<String>,
+        #[command(flatten)]
+        conn: C,
+    },
 }
 
 impl<C: clap::Args> RemediationPolicyCommand<C> {
@@ -604,6 +637,27 @@ impl<C: clap::Args> RemediationPolicyCommand<C> {
                 },
                 conn,
             ),
+            RemediationPolicyCommand::Breakers {
+                agent,
+                hook,
+                state,
+                conn,
+            } => (Verb::Breakers { agent, hook, state }, conn),
+            RemediationPolicyCommand::CloseBreaker {
+                agent,
+                hook,
+                breaker_id,
+                reason,
+                conn,
+            } => (
+                Verb::CloseBreaker {
+                    agent,
+                    hook,
+                    breaker_id,
+                    reason,
+                },
+                conn,
+            ),
         }
     }
 
@@ -614,7 +668,9 @@ impl<C: clap::Args> RemediationPolicyCommand<C> {
             | RemediationPolicyCommand::Apply { conn, .. }
             | RemediationPolicyCommand::Arm { conn, .. }
             | RemediationPolicyCommand::Disarm { conn, .. }
-            | RemediationPolicyCommand::Remove { conn, .. } => conn,
+            | RemediationPolicyCommand::Remove { conn, .. }
+            | RemediationPolicyCommand::Breakers { conn, .. }
+            | RemediationPolicyCommand::CloseBreaker { conn, .. } => conn,
         }
     }
 
@@ -625,7 +681,220 @@ impl<C: clap::Args> RemediationPolicyCommand<C> {
             | RemediationPolicyCommand::Apply { conn, .. }
             | RemediationPolicyCommand::Arm { conn, .. }
             | RemediationPolicyCommand::Disarm { conn, .. }
-            | RemediationPolicyCommand::Remove { conn, .. } => conn,
+            | RemediationPolicyCommand::Remove { conn, .. }
+            | RemediationPolicyCommand::Breakers { conn, .. }
+            | RemediationPolicyCommand::CloseBreaker { conn, .. } => conn,
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-20
+/// The `remediation` receipt verbs, shared by `local` and `cluster`. Reads on
+/// the platform key; no operator principal.
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum RemediationCommand<C: clap::Args> {
+    /// List nominations, newest first (`GET /remediation-nominations`): the
+    /// operator receipt of each decision and verification outcome.
+    List {
+        /// Agent name or id; omitted, every agent's nominations are listed.
+        agent: Option<String>,
+        /// Only this nomination state (for example `refused` or `finished`).
+        #[arg(long, value_name = "STATE")]
+        state: Option<String>,
+        /// The most nominations to list, 1 to 200 (default 50).
+        #[arg(long, value_name = "N")]
+        limit: Option<u32>,
+        #[command(flatten)]
+        conn: C,
+    },
+    /// Show one nomination's receipt (`GET /remediation-nominations/{id}`).
+    Show {
+        /// The nomination id (a UUID).
+        nomination_id: String,
+        #[command(flatten)]
+        conn: C,
+    },
+}
+
+impl<C: clap::Args> RemediationCommand<C> {
+    /// Split the verb from its connection flags.
+    pub(crate) fn into_parts(self) -> (commands::RemediationVerb, C) {
+        use commands::RemediationVerb as Verb;
+        match self {
+            RemediationCommand::List {
+                agent,
+                state,
+                limit,
+                conn,
+            } => (
+                Verb::List {
+                    agent,
+                    state,
+                    limit,
+                },
+                conn,
+            ),
+            RemediationCommand::Show {
+                nomination_id,
+                conn,
+            } => (Verb::Show { nomination_id }, conn),
+        }
+    }
+
+    /// The leaf's connection flags.
+    pub(crate) fn conn(&self) -> &C {
+        match self {
+            RemediationCommand::List { conn, .. } | RemediationCommand::Show { conn, .. } => conn,
+        }
+    }
+
+    /// The leaf's connection flags, mutably.
+    pub(crate) fn conn_mut(&mut self) -> &mut C {
+        match self {
+            RemediationCommand::List { conn, .. } | RemediationCommand::Show { conn, .. } => conn,
+        }
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-22
+/// The `remediation-qualification` verbs, shared by `local` and `cluster`.
+/// `record` and `start-run` run as the operator principal in
+/// CURIE_APPROVAL_PRINCIPAL_TOKEN.
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum RemediationQualificationCommand<C: clap::Args> {
+    /// Record a qualification of an action declaration
+    /// (`PUT /agents/{id}/remediation-qualifications/{qualification id}`).
+    Record {
+        /// Agent name or id.
+        agent: String,
+        /// The qualification's id (a UUID you choose).
+        qualification_id: String,
+        /// Protected hook name.
+        #[arg(long)]
+        hook: String,
+        /// The action the policy declares.
+        #[arg(long)]
+        action: String,
+        /// The policy generation whose declaration was qualified.
+        #[arg(long, value_name = "N")]
+        generation: String,
+        /// A JSON object of the execution and run ids that are the evidence.
+        #[arg(long, value_name = "PATH")]
+        evidence_file: PathBuf,
+        /// The worst case of the action, in a sentence.
+        #[arg(long, value_name = "TEXT")]
+        worst_case: String,
+        #[command(flatten)]
+        conn: C,
+    },
+    /// Start a run of the action's declared verifier against one allowed
+    /// target (`POST .../verifier-runs`).
+    StartRun {
+        /// Agent name or id.
+        agent: String,
+        /// The qualification's id (a UUID).
+        qualification_id: String,
+        /// Protected hook name.
+        #[arg(long)]
+        hook: String,
+        /// The action the policy declares.
+        #[arg(long)]
+        action: String,
+        /// A literal member of the action's allowed targets; a number or
+        /// boolean literal is sent as that type.
+        #[arg(long, value_name = "LITERAL")]
+        target: String,
+        #[command(flatten)]
+        conn: C,
+    },
+    /// Read a verifier run and its outcome
+    /// (`GET .../verifier-runs/{run id}`). Read only.
+    ShowRun {
+        /// Agent name or id.
+        agent: String,
+        /// The qualification's id (a UUID).
+        qualification_id: String,
+        /// The run's id (a UUID).
+        run_id: String,
+        #[command(flatten)]
+        conn: C,
+    },
+}
+
+impl<C: clap::Args> RemediationQualificationCommand<C> {
+    /// Split the verb from its connection flags.
+    pub(crate) fn into_parts(self) -> (commands::RemediationQualificationVerb, C) {
+        use commands::RemediationQualificationVerb as Verb;
+        match self {
+            RemediationQualificationCommand::Record {
+                agent,
+                qualification_id,
+                hook,
+                action,
+                generation,
+                evidence_file,
+                worst_case,
+                conn,
+            } => (
+                Verb::Record {
+                    agent,
+                    qualification_id,
+                    hook,
+                    action,
+                    generation,
+                    evidence_file,
+                    worst_case,
+                },
+                conn,
+            ),
+            RemediationQualificationCommand::StartRun {
+                agent,
+                qualification_id,
+                hook,
+                action,
+                target,
+                conn,
+            } => (
+                Verb::StartRun {
+                    agent,
+                    qualification_id,
+                    hook,
+                    action,
+                    target,
+                },
+                conn,
+            ),
+            RemediationQualificationCommand::ShowRun {
+                agent,
+                qualification_id,
+                run_id,
+                conn,
+            } => (
+                Verb::ShowRun {
+                    agent,
+                    qualification_id,
+                    run_id,
+                },
+                conn,
+            ),
+        }
+    }
+
+    /// The leaf's connection flags.
+    pub(crate) fn conn(&self) -> &C {
+        match self {
+            RemediationQualificationCommand::Record { conn, .. }
+            | RemediationQualificationCommand::StartRun { conn, .. }
+            | RemediationQualificationCommand::ShowRun { conn, .. } => conn,
+        }
+    }
+
+    /// The leaf's connection flags, mutably.
+    pub(crate) fn conn_mut(&mut self) -> &mut C {
+        match self {
+            RemediationQualificationCommand::Record { conn, .. }
+            | RemediationQualificationCommand::StartRun { conn, .. }
+            | RemediationQualificationCommand::ShowRun { conn, .. } => conn,
         }
     }
 }

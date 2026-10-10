@@ -185,6 +185,33 @@
             }
           }
         },
+        "githubFactoryMetadataCi": {
+          "type": "object",
+          "description": "Checks and commit statuses that rerun after a pull request metadata edit, keyed by owner/name.",
+          "propertyNames": {
+            "pattern": "^[^/]+/[^/]+$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "checks": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "statuses": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        },
         "githubFactoryPythonCi": {
           "type": "object",
           "description": "Required Python CI per repository, keyed by owner/name. A repository without an entry is judged on its own checks.",
@@ -454,7 +481,12 @@
       "type": "object",
       "description": "The connector action executor switch (ACTION-EXECUTOR-1), rendered into both the API and the worker. A boolean, so a quoted \"false\" cannot turn it on.",
       "properties": {
-        "enabled": {"type": "boolean"}
+        "enabled": {"type": "boolean"},
+        "maxConcurrentSandboxes": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The installation-wide executor sandbox cap (AUTOMATED-REMEDIATION-12, executor amendment E9), rendered into both the API and the worker. An integer of at least 1, so 0 or a quoted \"3\" does not render."
+        }
       }
     },
     "remediation": {
@@ -469,6 +501,7 @@
       "description": "The test installation declaration (ADR 0202 decision 1), rendered into the API and the dispatcher. enabled is a boolean, so a quoted \"true\" cannot turn it on. Each driver is a channel id, a Slack bot id and that bot's user id; a sibling driver also names its agent. A new key, so typed in full; the template fail in _test-installation.tpl is the backstop for the values coalescing gap.",
       "properties": {
         "enabled": {"type": "boolean"},
+        "threadTurnLimit": {"type": "integer", "minimum": 1, "maximum": 100},
         "drivers": {
           "type": "array",
           "items": {

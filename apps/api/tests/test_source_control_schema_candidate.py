@@ -33,8 +33,8 @@ def test_candidate_requires_deploy_notices_after_ledger_schema(resource: str) ->
         else catalog()["candidate"]
     )
     # The next-only migrations follow the immutable published 0.12.2 chain.
-    # The minimum tracks the deployment notification ledger schema.
-    assert window == {"schema_min": "0082", "schema_head": "0088"}
+    # The minimum tracks the newest schema the app reads (#2911's tenant scope).
+    assert window == {"schema_min": "0101", "schema_head": "0101"}
 
 
 @pytest.mark.parametrize("field", ["cargo", "chart", "app"])
@@ -51,8 +51,10 @@ def test_new_candidate_release_fields_are_0130(field: str) -> None:
 def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
     data = catalog()
-    assert data["windows"].get("0.13.0") == {"schema_min": "0082", "schema_head": "0088"}
-    assert data["revisions"][-3:] == ["0086", "0087", "0088"]
+    assert data["windows"].get("0.12.2") == {"schema_min": "0076", "schema_head": "0081"}
+    assert data["windows"].get("0.12.3") == {"schema_min": "0076", "schema_head": "0093"}
+    assert data["windows"].get("0.13.0") == {"schema_min": "0101", "schema_head": "0101"}
+    assert data["revisions"][-7:] == ["0095", "0096", "0097", "0098", "0099", "0100", "0101"]
     assert (
         json.loads((ROOT / "apps/api/src/curie_api/revision_kinds.json").read_text())["0082"]
         == "expand"
@@ -69,10 +71,10 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     actual = catalog()["windows"]
     assert {name: actual[name] for name in expected} == expected
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
-    assert set(actual) - set(expected) <= {"0.12.1", "0.12.2", "0.13.0"}
+    assert set(actual) - set(expected) <= {"0.12.1", "0.12.2", "0.12.3", "0.13.0"}
 
 
-def test_released_0076_startup_refuses_without_migrating_then_0082_starts(
+def test_released_0076_startup_refuses_without_migrating_then_0101_starts(
     isolated_migration_db: IsolatedMigrationDb, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """@spec PROTECTED-HOOK-SOURCE-2/10."""
@@ -93,8 +95,15 @@ def test_released_0076_startup_refuses_without_migrating_then_0082_starts(
             with TestClient(create_app()):
                 pass
         assert current_revision() == "0076"
-        command.upgrade(alembic_config(), "0082")
-        assert current_revision() == "0082"
+        # 0100 is still below the min: the Agent ORM reads 0101's columns (#2911).
+        command.upgrade(alembic_config(), "0100")
+        get_settings.cache_clear()
+        with pytest.raises(RuntimeError, match="below application min"):
+            with TestClient(create_app()):
+                pass
+        assert current_revision() == "0100"
+        command.upgrade(alembic_config(), "0101")
+        assert current_revision() == "0101"
         with TestClient(create_app()) as client:
             response = client.get("/health")
             assert response.status_code == 200

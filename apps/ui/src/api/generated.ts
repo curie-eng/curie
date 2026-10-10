@@ -13,7 +13,7 @@ export interface paths {
         put?: never;
         /**
          * Claim Execution
-         * @description Claim the oldest claimable execution under a lease, or ``204``.
+         * @description Claim the oldest due execution under a lease, or ``204``.
          *
          *     @spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a
          *     ``requested`` row is claimable, and so is a ``claimed`` row whose lease
@@ -21,6 +21,21 @@ export interface paths {
          *     fence is stale. A reclaim forgets the earlier attempt's observation, so the
          *     new holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.
          *     @spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.
+         *
+         *     @spec AUTOMATED-REMEDIATION-12 (executor amendments E5 and E9): only due
+         *     executions (``not_before`` NULL or past) are handed out, oldest
+         *     ``not_before`` first (an unscheduled row by its creation time); never more
+         *     than ``action_executor_max_concurrent_sandboxes`` are live (claimed or
+         *     dispatched) across the installation, and while two or more slots exist at
+         *     most all but one are reads. An expired read is refused ``runner_unavailable``
+         *     and never reclaimed; a due read whose series successor is due is skipped.
+         *
+         *     @spec AUTOMATED-REMEDIATION-11 (executor amendment E8): a ``policy`` forward
+         *     execution is handed out only while its remediation authority holds
+         *     (``remediation_admission.authority_refusal``); otherwise it ends ``refused``
+         *     ``policy_changed`` before any sandbox claim, its nomination goes back to
+         *     approval, and the next due execution is considered. An expired precondition
+         *     read decides its nomination's check 12 (AUTOMATED-REMEDIATION-9).
          */
         post: operations["claim_execution_action_executions_claim_post"];
         delete?: never;
@@ -68,6 +83,11 @@ export interface paths {
          *     before dispatch; ``ExecutionOut`` never carries them. The body is exactly
          *     the fence (a body naming a tool or arguments is a 422), a stale fence is a
          *     ``409``, and only a ``claimed`` forward execution answers. Nothing moves.
+         *
+         *     @spec AUTOMATED-REMEDIATION-12: a ``claimed`` read execution answers its
+         *     bound tool, arguments and pointer the same way; an observe-only execution
+         *     (AUTOMATED-REMEDIATION-18) answers ``observe_version``, the recorded target
+         *     and a null pointer.
          */
         post: operations["read_arguments_action_executions__execution_id__arguments_post"];
         delete?: never;
@@ -94,6 +114,10 @@ export interface paths {
          *     probe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a
          *     ``claimed`` forward execution dispatches without observing, and the commit
          *     creates its one ledger row; a replay answers the row it already names.
+         *     @spec AUTOMATED-REMEDIATION-13: a policy remediation of a ``reversible``
+         *     action whose capability or custody no longer holds ends ``refused``
+         *     ``not_reversible_now`` instead, with no ledger row, and its nomination goes
+         *     back to approval.
          */
         post: operations["dispatch_execution_action_executions__execution_id__dispatch_post"];
         delete?: never;
@@ -148,8 +172,47 @@ export interface paths {
          *     the verbs it observed. An unknown post-dispatch code is normalized by stage.
          *     A replay of the stored outcome returns the row unchanged; a different one
          *     is refused and the first stands.
+         *
+         *     @spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending
+         *     schedules its verifier (``confirmed``) or finishes it ``not-recovered``
+         *     with the execution's code (``failed``, ``indeterminate``, ``refused``) in
+         *     the same transaction; a refused read
+         *     is evaluated by its verification.
+         *
+         *     @spec AUTOMATED-REMEDIATION-9: a refused precondition read sends its
+         *     nomination to approval ``precondition_unavailable`` once this commits.
          */
         post: operations["report_outcome_action_executions__execution_id__outcome_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/action-executions/{execution_id}/samples": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Report Sample
+         * @description Record the one sample a claimed read execution took, ending it ``confirmed``.
+         *
+         *     @spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and
+         *     ``value`` (remediation-predicate.json ``sample_report``); the API evaluates
+         *     the predicate from the stored sample (AUTOMATED-REMEDIATION-18). Only a ``claimed`` read
+         *     reports one; a replay of the stored sample answers the row unchanged and a
+         *     different one is refused (``409``). The answer is the receipt, which never
+         *     carries the value or the pointer.
+         *
+         *     @spec AUTOMATED-REMEDIATION-9: a precondition read's sample decides its
+         *     nomination's check 12 once this commits (``remediation_admission``).
+         */
+        post: operations["report_sample_action_executions__execution_id__samples_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -536,6 +599,55 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Remediation Breakers
+         * @description The hook's breakers, newest opened first: how an operator finds an id to close.
+         *
+         *     Scoped as the close route is: only breakers on a connector and tool the
+         *     hook's policy declares. A read needs the platform key and no operator
+         *     principal.
+         */
+        get: operations["list_remediation_breakers_agents__agent_id__hooks__hook__remediation_policy_breakers_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/hooks/{hook}/remediation-policy/breakers/{breaker_id}/close": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Close Remediation Breaker
+         * @description Close an open breaker, recording the operator principal and the reason.
+         *
+         *     Only this route closes a breaker: no nomination, delivery, verifier or
+         *     approval does. The breaker must hold an action this hook's policy
+         *     declares; any other id is ``404``. Closing an already closed breaker
+         *     answers it unchanged.
+         */
+        post: operations["close_remediation_breaker_agents__agent_id__hooks__hook__remediation_policy_breakers__breaker_id__close_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agents/{agent_id}/hooks/{hook}/remediation-policy/disarm": {
         parameters: {
             query?: never;
@@ -806,6 +918,73 @@ export interface paths {
          *     ``remember`` time -- it does not re-derive or invent provenance.
          */
         get: operations["memory_trace_back_agents__agent_id__memory__index__provenance_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Put Remediation Qualification
+         * @description Record a qualification of one action declaration, recorded by the operator principal.
+         *
+         *     The evidence references are checked by state and digest; any refusal writes
+         *     nothing. A replay answers the record; another body under the same id is
+         *     ``qualification_conflict``.
+         */
+        put: operations["put_remediation_qualification_agents__agent_id__remediation_qualifications__qualification_id__put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start Remediation Verifier Run
+         * @description Start a verifier evaluation of the declared verifier for a qualification.
+         *
+         *     Only ``read`` executions of the declared verifier are created, against a
+         *     target that is a literal member of the action's allowed list.
+         */
+        post: operations["start_remediation_verifier_run_agents__agent_id__remediation_qualifications__qualification_id__verifier_runs_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agents/{agent_id}/remediation-qualifications/{qualification_id}/verifier-runs/{run_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Remediation Verifier Run
+         * @description A qualification verifier run and its outcome.
+         */
+        get: operations["get_remediation_verifier_run_agents__agent_id__remediation_qualifications__qualification_id__verifier_runs__run_id__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1606,6 +1785,111 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/console/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logout
+         * @description Revoke the session in the cookie, whichever login minted it, and clear it.
+         *
+         *     Deliberately no credential beyond the cookie itself: the cookie names the
+         *     one session this can end, and ``X-API-Key`` is not a way to name one.
+         *     Always the same 204, whether the cookie was live, unknown, already revoked
+         *     or absent, so logout is idempotent and says nothing about which it was.
+         *     SameSite=Strict keeps a cross-site page from logging someone out, but not a
+         *     same-site cross-origin form (#3000), so a present cookie's origin must also
+         *     match before the session is touched.
+         */
+        post: operations["logout_console_logout_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/console/oidc/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Oidc Callback
+         * @description Finish an OIDC login and mint a principal console session.
+         *
+         *     The order is the security argument: bind ``state`` to this browser's
+         *     cookie, then spend the server-side attempt (single use, committed before
+         *     anything else can fail), and only then touch the IdP with the code and the
+         *     stored PKCE verifier. The ID token is validated against the attempt's
+         *     nonce, the principal is resolved and must be active in an active tenant,
+         *     and only then does a session exist. Every terminal response clears the
+         *     state cookie, and every refusal looks the same. A rate-limited 429 is not
+         *     terminal: it comes before the attempt is touched and keeps the cookie, so
+         *     the same callback can complete after ``Retry-After``.
+         *
+         *     The ``code`` and ``state`` in the query may land in access logs. That is
+         *     tolerated: the code is useless without the verifier that never left the
+         *     server, and the state is single-use and cookie-bound.
+         */
+        get: operations["oidc_callback_console_oidc_callback_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/console/oidc/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Oidc Login
+         * @description Start an OIDC login: persist an attempt and redirect to the IdP.
+         *
+         *     Discovery runs first so a misconfigured or mixed-up IdP fails here, before
+         *     an attempt row exists and before the browser is sent anywhere.
+         */
+        get: operations["oidc_login_console_oidc_login_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/console/principal": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Current Principal
+         * @description Return the principal the OIDC session cookie authenticates.
+         */
+        get: operations["current_principal_console_principal_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/console/session": {
         parameters: {
             query?: never;
@@ -2158,6 +2442,46 @@ export interface paths {
         };
         /** Ready */
         get: operations["ready_ready_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/remediation-nominations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Remediation Nominations
+         * @description Nominations, newest first: the operator receipt list.
+         */
+        get: operations["list_remediation_nominations_remediation_nominations_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/remediation-nominations/{nomination_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Show Remediation Nomination
+         * @description One nomination's receipt.
+         */
+        get: operations["show_remediation_nomination_remediation_nominations__nomination_id__get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2999,6 +3323,8 @@ export interface components {
             actor: string;
             /** Actor Channel */
             actor_channel: string | null;
+            /** Actor Kind */
+            actor_kind: string | null;
             /** Authorized */
             authorized: boolean;
             /** Authorizer */
@@ -3062,12 +3388,18 @@ export interface components {
         };
         /** ActionOut */
         ActionOut: {
+            /** Actor Kind */
+            actor_kind: string | null;
             /** Agent Id */
             agent_id: string | null;
             /** Arguments */
             arguments: {
                 [key: string]: unknown;
             } | null;
+            /** Authority Kind */
+            authority_kind: string | null;
+            /** Authority Ref */
+            authority_ref: string | null;
             /** Call Id */
             call_id: string;
             /** Completed At */
@@ -3081,6 +3413,8 @@ export interface components {
             created_at: string;
             /** Dedupe Key */
             dedupe_key: string;
+            /** Delivery Event Id */
+            delivery_event_id: string | null;
             /** Detail */
             detail: string | null;
             /** Gate Approval Id */
@@ -3090,6 +3424,8 @@ export interface components {
              * Format: uuid
              */
             id: string;
+            /** Nomination Id */
+            nomination_id: string | null;
             /** Post State */
             post_state: {
                 [key: string]: unknown;
@@ -3116,6 +3452,10 @@ export interface components {
             undone_at: string | null;
             /** Undone By */
             undone_by: string | null;
+            /** Verification Outcome */
+            verification_outcome: string | null;
+            /** Verified At */
+            verified_at: string | null;
         };
         /**
          * ActionRecord
@@ -3601,7 +3941,7 @@ export interface components {
              */
             id: string;
             /** Principal Kind */
-            principal_kind: ("chat" | "console" | "operator" | "adapter" | "platform") | null;
+            principal_kind: ("chat" | "console" | "operator" | "adapter" | "platform" | "test_driver") | null;
             /** Principal Subject */
             principal_subject: string | null;
             /** Reason */
@@ -5319,6 +5659,26 @@ export interface components {
             /** State */
             state: string;
         };
+        /**
+         * ExecutionSample
+         * @description @spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and ``value``.
+         *
+         *     remediation-predicate.json ``sample_report``: the sample kind the runner
+         *     answered and, for ``value``, the pointed JSON scalar (at most
+         *     ``SAMPLE_VALUE_MAX_CHARS`` characters of compact JSON); null otherwise.
+         *     ``skipped`` is the API's own record, never a report. The API never receives
+         *     more than the scalar.
+         */
+        ExecutionSample: {
+            /** Attempt */
+            attempt: number;
+            /** Lease Owner */
+            lease_owner: string;
+            /** Sample */
+            sample: string;
+            /** Value */
+            value: unknown;
+        };
         /** FinishBody */
         FinishBody: {
             /** Cause */
@@ -6093,6 +6453,35 @@ export interface components {
             pod: string;
         };
         /**
+         * PrincipalOut
+         * @description The principal an OIDC console session authenticates (#2908).
+         *
+         *     Identity and display attributes only. ``idp_issuer`` and the authorization
+         *     version are server bookkeeping the console has no use for, and the session
+         *     token never appears here for the same reason it is absent from
+         *     ``ConsoleSessionOut``.
+         */
+        PrincipalOut: {
+            /** Display Name */
+            display_name: string | null;
+            /** Email */
+            email: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Idp Subject */
+            idp_subject: string;
+            /** Status */
+            status: string;
+            /**
+             * Tenant Id
+             * Format: uuid
+             */
+            tenant_id: string;
+        };
+        /**
          * ProbeCreate
          * @description @spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13: exactly these three keys.
          */
@@ -6619,6 +7008,73 @@ export interface components {
             tool_access?: components["schemas"]["ToolAccess"] | null;
         };
         /**
+         * ReadArguments
+         * @description A claimed read execution's bound call and pointer, read by its holder only.
+         *
+         *     @spec AUTOMATED-REMEDIATION-12: the read is the declaration's, never a
+         *     caller's. Answered only by ``POST /action-executions/{id}/arguments``.
+         *     @spec AUTOMATED-REMEDIATION-18 (executor amendment E3): ``pointer`` is null
+         *     only for an observe-only execution (``observe_version`` of the target).
+         */
+        ReadArguments: {
+            /** Arguments */
+            arguments: {
+                [key: string]: unknown;
+            };
+            /** Pointer */
+            pointer: string | null;
+            /** Tool */
+            tool: string;
+        };
+        /**
+         * RemediationBreakerClose
+         * @description Why an operator closes a breaker; exactly ``{"reason"}``.
+         *
+         *     @spec AUTOMATED-REMEDIATION-11.
+         */
+        RemediationBreakerClose: {
+            /**
+             * Reason
+             * @description Why the breaker is closed, recorded with the operator principal.
+             */
+            reason: string;
+        };
+        /**
+         * RemediationBreakerOut
+         * @description One breaker on an agent's connector, tool and target key.
+         *
+         *     @spec AUTOMATED-REMEDIATION-11.
+         */
+        RemediationBreakerOut: {
+            /** Agent Id */
+            agent_id: string;
+            /** Close Reason */
+            close_reason: string | null;
+            /** Closed At */
+            closed_at: string | null;
+            /**
+             * Closed By
+             * @description The operator principal that closed it.
+             */
+            closed_by: string | null;
+            /** Connector */
+            connector: string;
+            /** Id */
+            id: string;
+            /**
+             * Opened At
+             * Format: date-time
+             */
+            opened_at: string;
+            /**
+             * Target
+             * @description The target key: the connector and the canonical target.
+             */
+            target: string;
+            /** Tool */
+            tool: string;
+        };
+        /**
          * RemediationNominationAccepted
          * @description The event's accepted submission: its nominations in block order.
          *
@@ -6629,6 +7085,57 @@ export interface components {
             event_id: string;
             /** Nomination Ids */
             nomination_ids: string[];
+        };
+        /**
+         * RemediationNominationOut
+         * @description One nomination as the operator receipt: its stage, authority and code.
+         *
+         *     @spec AUTOMATED-REMEDIATION-20. Exactly these fields; the arguments (past
+         *     the target key), the model's reason, any read result and the alert body are
+         *     never part of it. ``stage``, ``authority`` and ``code`` are derived from the
+         *     row by ``curie_api.remediation_receipts``, the one derivation the worker's
+         *     thread receipts and the CLI share.
+         */
+        RemediationNominationOut: {
+            /** Action */
+            action: string | null;
+            /**
+             * Agent Id
+             * Format: uuid
+             */
+            agent_id: string;
+            /** Approval Id */
+            approval_id: string | null;
+            /** Authority */
+            authority: string;
+            /** Code */
+            code: string | null;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Decided At */
+            decided_at: string | null;
+            /** Execution Id */
+            execution_id: string | null;
+            /** Hook */
+            hook: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Kind */
+            kind: string | null;
+            /** Stage */
+            stage: string;
+            /** State */
+            state: string;
+            /** Target */
+            target: string | null;
+            /** Verification Outcome */
+            verification_outcome: string | null;
         };
         /**
          * RemediationNominationRefusal
@@ -6744,6 +7251,135 @@ export interface components {
             policy: {
                 [key: string]: unknown;
             };
+        };
+        /**
+         * RemediationQualificationOut
+         * @description One qualification record. @spec AUTOMATED-REMEDIATION-22.
+         */
+        RemediationQualificationOut: {
+            /** Action */
+            action: string | null;
+            /** Agent Id */
+            agent_id: string;
+            /** Connector */
+            connector: string;
+            /**
+             * Connector Digest
+             * @description The acting connector's in-force digest at write.
+             */
+            connector_digest: string;
+            /**
+             * Created At
+             * Format: date-time
+             */
+            created_at: string;
+            /** Evidence */
+            evidence: {
+                [key: string]: unknown;
+            };
+            /** Generation */
+            generation: string | null;
+            /** Hook */
+            hook: string | null;
+            /** Id */
+            id: string;
+            /**
+             * Recorded By
+             * @description The operator principal that recorded it.
+             */
+            recorded_by: string;
+            /** Reversibility */
+            reversibility: string;
+            /** Tool */
+            tool: string;
+            /**
+             * Verifier Sha256
+             * @description SHA-256 of the canonical verifier declaration.
+             */
+            verifier_sha256: string;
+            /** Worst Case */
+            worst_case: string;
+        };
+        /**
+         * RemediationQualificationWrite
+         * @description One qualification record: the declaration it qualifies and its evidence.
+         *
+         *     @spec AUTOMATED-REMEDIATION-22.
+         */
+        RemediationQualificationWrite: {
+            /** Action */
+            action: string;
+            /**
+             * Evidence
+             * @description References to rows of this installation: restore_execution_id and conflict_execution_id (reversible) or forward_execution_ids (idempotent), and verified_run_id and not_recovered_run_id.
+             */
+            evidence: {
+                [key: string]: unknown;
+            };
+            /**
+             * Generation
+             * @description The policy generation whose action declaration and bounds were qualified.
+             */
+            generation: string;
+            /** Hook */
+            hook: string;
+            /**
+             * Worst Case
+             * @description The worst case statement, 1 to 2000 characters.
+             */
+            worst_case: string;
+        };
+        /**
+         * RemediationVerifierRunOut
+         * @description One qualification verifier run. @spec AUTOMATED-REMEDIATION-22.
+         */
+        RemediationVerifierRunOut: {
+            /** Action */
+            action: string;
+            /** Decided At */
+            decided_at: string | null;
+            /** Generation */
+            generation: string;
+            /** Hook */
+            hook: string;
+            /** Id */
+            id: string;
+            /**
+             * Outcome
+             * @description verified, not-recovered or verifier-unavailable once decided.
+             */
+            outcome: string | null;
+            /** Qualification Id */
+            qualification_id: string;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /**
+             * Started By
+             * @description The operator principal that started it.
+             */
+            started_by: string;
+            /** Target */
+            target: string | number | boolean;
+        };
+        /**
+         * RemediationVerifierRunStart
+         * @description Start a qualification verifier run; exactly ``{"hook", "action", "target"}``.
+         *
+         *     @spec AUTOMATED-REMEDIATION-22.
+         */
+        RemediationVerifierRunStart: {
+            /** Action */
+            action: string;
+            /** Hook */
+            hook: string;
+            /**
+             * Target
+             * @description A literal member of the action's target.allowed list.
+             */
+            target: string | number | boolean;
         };
         /**
          * ReplyHandle
@@ -8106,7 +8742,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ExecutionArguments"];
+                    "application/json": components["schemas"]["ExecutionArguments"] | components["schemas"]["ReadArguments"];
                 };
             };
             /** @description Validation Error */
@@ -8208,6 +8844,43 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["ExecutionOutcome"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExecutionOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    report_sample_action_executions__execution_id__samples_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-Curie-Worker-Token"?: string | null;
+            };
+            path: {
+                execution_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExecutionSample"];
             };
         };
         responses: {
@@ -9217,6 +9890,107 @@ export interface operations {
             };
         };
     };
+    list_remediation_breakers_agents__agent_id__hooks__hook__remediation_policy_breakers_get: {
+        parameters: {
+            query?: {
+                state?: "open" | "closed" | "all";
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationBreakerOut"][];
+                };
+            };
+            /** @description Policy refusal */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    close_remediation_breaker_agents__agent_id__hooks__hook__remediation_policy_breakers__breaker_id__close_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                hook: string;
+                breaker_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationBreakerClose"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationBreakerOut"];
+                };
+            };
+            /** @description Policy refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description No such breaker under this policy */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     disarm_remediation_policy_agents__agent_id__hooks__hook__remediation_policy_disarm_post: {
         parameters: {
             query?: never;
@@ -9991,6 +10765,162 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["MemoryTraceBackOut"];
                 };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    put_remediation_qualification_agents__agent_id__remediation_qualifications__qualification_id__put: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                qualification_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationQualificationWrite"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationQualificationOut"];
+                };
+            };
+            /** @description Named refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Named refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    start_remediation_verifier_run_agents__agent_id__remediation_qualifications__qualification_id__verifier_runs_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+                "X-Curie-Approval-Principal"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                qualification_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RemediationVerifierRunStart"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationVerifierRunOut"];
+                };
+            };
+            /** @description Named refusal */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Named refusal */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+            /** @description Validation error or named refusal */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"] | components["schemas"]["RemediationPolicyRefusal"];
+                };
+            };
+        };
+    };
+    get_remediation_verifier_run_agents__agent_id__remediation_qualifications__qualification_id__verifier_runs__run_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                agent_id: string;
+                qualification_id: string;
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationVerifierRunOut"];
+                };
+            };
+            /** @description No such verifier run */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Validation Error */
             422: {
@@ -11693,6 +12623,124 @@ export interface operations {
             };
         };
     };
+    logout_console_logout_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    oidc_callback_console_oidc_callback_get: {
+        parameters: {
+            query?: {
+                code?: string | null;
+                state?: string | null;
+                error?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_oidc_state"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            303: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The login was refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    oidc_login_console_oidc_login_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            302: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    current_principal_console_principal_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: {
+                "__Host-curie_console_session"?: string | null;
+            };
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PrincipalOut"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     current_session_console_session_get: {
         parameters: {
             query?: never;
@@ -12792,6 +13840,81 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_remediation_nominations_remediation_nominations_get: {
+        parameters: {
+            query?: {
+                agent_id?: string | null;
+                state?: ("received" | "refused" | "precondition_pending" | "admitted" | "approval_requested" | "approved" | "rejected" | "expired" | "executing" | "verifying" | "finished") | null;
+                limit?: number;
+            };
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationNominationOut"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    show_remediation_nomination_remediation_nominations__nomination_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "x-api-key"?: string | null;
+            };
+            path: {
+                nomination_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RemediationNominationOut"];
+                };
+            };
+            /** @description No such nomination */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
             };
         };
     };

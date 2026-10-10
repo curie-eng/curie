@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 
 from curie_telemetry import operation_span, record_metric
@@ -55,6 +56,13 @@ from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import publications as crud_publications
 
 from .config import get_settings
+from .models import ApprovalStatus
+from .remediation_approvals import (
+    REMEDIATION_PURPOSE,
+    reconcile_remediation_approvals,
+    settle_remediation_approval,
+)
+from .remediation_undo_recovery import reconcile_undo_approvals
 from .resumequeue import (
     ResumeQueue,
     approval_trace_context,
@@ -148,7 +156,11 @@ async def sweep_expired_approvals(
                 authorized=True,
                 reason=f"approval expired at {expired.expires_at}",
             )
-            if expired.purpose == "publication":
+            if expired.purpose == REMEDIATION_PURPOSE:
+                # AUTOMATED-REMEDIATION-16: no execution and no model wake; the
+                # nominations end expired.
+                await settle_remediation_approval(session, expired.id, ApprovalStatus.expired)
+            if expired.purpose in crud_approvals.NO_WAKE_PURPOSES:
                 flipped += 1
                 continue
             stream_id = await resume_queue.enqueue(
@@ -200,6 +212,20 @@ async def sweep_expired_approvals(
                 retry,
             )
             continue
+    # AUTOMATED-REMEDIATION-16: complete resolved remediation approvals whose
+    # post-claim step (execution, nominations) did not commit.
+    try:
+        await reconcile_remediation_approvals(session, limit=limit)
+    except Exception:
+        await session.rollback()
+        logger.exception("remediation approval reconciliation pass failed")
+    # AUTOMATED-REMEDIATION-19: complete approved undo approvals whose undo
+    # ruling did not commit, under the approving principal, at most once.
+    try:
+        await reconcile_undo_approvals(session, limit=limit)
+    except Exception:
+        await session.rollback()
+        logger.exception("remediation undo approval reconciliation pass failed")
     await observe_pending_approvals(session, now=now)
     return flipped
 
@@ -211,8 +237,14 @@ async def run_expiry_sweeper(
     stop: asyncio.Event,
     *,
     publication_patch_retention_seconds: int = 3600,
+    remediation_admissions: Callable[[AsyncSession], Awaitable[int]] | None = None,
 ) -> None:
     """Periodic loop driving ``sweep_expired_approvals`` until ``stop`` is set.
+
+    ``remediation_admissions``, when given, runs each pass after the sweep: it
+    finishes remediation admission work a crash or an unreadable store left
+    undone (``remediation_admission.reconcile_admissions``,
+    AUTOMATED-REMEDIATION-8).
 
     Mirrors the worker heartbeat's sleep-or-stop shape (an
     ``asyncio.wait_for(stop.wait(), timeout=interval_s)`` that wakes early on
@@ -255,6 +287,8 @@ async def run_expiry_sweeper(
                         - timedelta(seconds=publication_patch_retention_seconds),
                         limit=100,
                     )
+                    if remediation_admissions is not None:
+                        await remediation_admissions(session)
             except Exception as exc:  # noqa: BLE001 - existing broad catch retained
                 error = exc
                 if hasattr(span, "set_status"):

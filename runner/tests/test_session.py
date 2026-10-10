@@ -641,6 +641,79 @@ def test_capacity_loss_stays_sticky_after_a_later_successful_append() -> None:
     assert runner.history_durable is False
 
 
+def _max_turns_turn() -> list:
+    return [
+        AssistantMessage(content=[TextBlock(text="still probing")], model="stub-model"),
+        ResultMessage(
+            subtype="error_max_turns",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=20,
+            session_id="sdk-session",
+            result=None,
+        ),
+    ]
+
+
+def _turns_then_max_turns(store) -> tuple[SessionRunner, list[list]]:
+    scripts = iter((default_turn(), _max_turns_turn()))
+    runner, _fake = _runner_with_history(store, script_factory=lambda: next(scripts))
+
+    async def go() -> list[list]:
+        await runner.start()
+        turns: list[list] = []
+        for text, ts in (("first", "1"), ("probe until done", "2")):
+            lines = [
+                line
+                async for line in runner.run_turn(
+                    Event(type="message", text=text, user="U", ts=ts)
+                )
+            ]
+            turns.append(parse_ndjson("".join(lines)))
+        return turns
+
+    return runner, anyio.run(go)
+
+
+def test_a_max_turns_failure_leaves_durable_replay_whole() -> None:
+    """#4188: a failed turn is never recorded, so replay still holds every turn.
+
+    The worker replaces this runner on the next turn only when it reports
+    ``history_durable``. Leaving it False after a failed turn locked the thread:
+    only a new turn could clear it, and the fence refused the new turn.
+    """
+
+    store = _RecordingTranscriptStore()
+    runner, (first, failed) = _turns_then_max_turns(store)
+
+    assert first[-1].status is SessionStatus.DONE
+    errors = [event for event in failed if isinstance(event, ErrorEvent)]
+    assert [error.classification for error in errors] == ["max-turns"]
+    assert failed[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    assert [record.user for record in store.turns] == ["first"]
+    assert runner.status is SessionStatus.CLASSIFIED_FAILURE
+    assert runner.turn_active is False
+    assert runner.history_durable is True
+
+
+def test_a_max_turns_failure_does_not_repair_an_earlier_history_loss() -> None:
+    class FirstAppendFails(_RecordingTranscriptStore):
+        async def append(self, record: TurnRecord) -> bool:
+            from curie_runner.history import HistoryCapacityError
+
+            self.attempts.append(record)
+            raise HistoryCapacityError(413)
+
+    store = FirstAppendFails()
+    runner, (first, failed) = _turns_then_max_turns(store)
+
+    assert first[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    assert failed[-1].status is SessionStatus.CLASSIFIED_FAILURE
+    assert store.turns == []
+    assert runner.history_durable is False
+
+
 @pytest.mark.parametrize("mode", ("error", "timeout"))
 def test_optional_replay_export_failure_still_appends_portable_history(
     mode: str,

@@ -1147,11 +1147,24 @@ pub(crate) enum ClusterAction {
         verb: ActionsCommand<ClusterConn>,
     },
     /// A protected hook's remediation policy: show it, apply a document, arm,
-    /// disarm or remove it. Writes run as the operator principal in
-    /// CURIE_APPROVAL_PRINCIPAL_TOKEN.
+    /// disarm or remove it, or close an open circuit breaker. Writes run as the
+    /// operator principal in CURIE_APPROVAL_PRINCIPAL_TOKEN.
     RemediationPolicy {
         #[command(subcommand)]
         verb: RemediationPolicyCommand<ClusterConn>,
+    },
+    /// The operator receipt of each remediation nomination: list them, or show
+    /// one with its stage, authority and code. Read only.
+    Remediation {
+        #[command(subcommand)]
+        verb: RemediationCommand<ClusterConn>,
+    },
+    /// Record a remediation qualification and run its verifier against an
+    /// allowed target. Writes run as the operator principal in
+    /// CURIE_APPROVAL_PRINCIPAL_TOKEN.
+    RemediationQualification {
+        #[command(subcommand)]
+        verb: RemediationQualificationCommand<ClusterConn>,
     },
     /// The human-in-the-loop plane: list and resolve pending approval records,
     /// and view or set the tools whose calls require approval. Which channel an

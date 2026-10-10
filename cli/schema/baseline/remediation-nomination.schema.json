@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.curietech.ai/cli/remediation-nomination/v1.0.json",
+  "title": "curie <tier> remediation show --json",
+  "description": "One nomination's receipt exactly as the API's `RemediationNominationOut` carries it (AUTOMATED-REMEDIATION-20): the stage, authority and code, the target key and the identifiers. Never the arguments, the model's reason, a read result or the alert body. Refusals are the shared error object.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "agent_id",
+    "hook",
+    "kind",
+    "action",
+    "target",
+    "state",
+    "stage",
+    "authority",
+    "code",
+    "verification_outcome",
+    "approval_id",
+    "execution_id",
+    "created_at",
+    "decided_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "agent_id": {
+      "type": "string"
+    },
+    "hook": {
+      "type": "string"
+    },
+    "kind": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "action": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "target": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The target key, the only argument value a receipt carries."
+    },
+    "state": {
+      "type": "string"
+    },
+    "stage": {
+      "type": "string",
+      "description": "The receipt stage the row has reached."
+    },
+    "authority": {
+      "type": "string",
+      "enum": [
+        "policy",
+        "approval",
+        "none"
+      ]
+    },
+    "code": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The refusal, approval reason or execution code, from the closed vocabulary."
+    },
+    "verification_outcome": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "approval_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "execution_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "created_at": {
+      "type": "string"
+    },
+    "decided_at": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  }
+}

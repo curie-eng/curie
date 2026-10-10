@@ -71,7 +71,10 @@ EXECUTE_PATH = "/v1/execute"
 EXECUTE_REQUEST_KEYS = frozenset(
     {"execution_id", "phase", "connector", "tool", "arguments", "grant", "target"}
 )
-EXECUTE_PHASES = frozenset({"list", "observe", "call"})
+EXECUTE_PHASES = frozenset({"list", "observe", "call", "read"})
+# @spec AUTOMATED-REMEDIATION-12 (executor amendment E3): the ``read`` request
+# alone adds the predicate's pointer to the frozen keys.
+EXECUTE_READ_KEYS = EXECUTE_REQUEST_KEYS | {"pointer"}
 # @spec ACTION-EXECUTOR-20. A route refusal that provably dialed nothing (or, for
 # ``connector_unreachable`` on ``list``/``observe``, only a read) maps to one
 # pre-dispatch code. Ordering and shape refusals are the worker's own fault
@@ -87,7 +90,14 @@ _EXECUTE_REFUSALS = {
     # route refuses before dialing, so it is pre-dispatch, never response_lost.
     "connector_not_hosted": "connector_not_hosted",
 }
-_READ_PHASE_REFUSALS = {**_EXECUTE_REFUSALS, "connector_unreachable": "connector_unreachable"}
+# ``list``, ``observe`` and ``read`` dial reads only, so an unknown refusal is
+# ``runner_unavailable``, never ``response_lost`` (AUTOMATED-REMEDIATION-12).
+_READ_PHASE_REFUSALS = {
+    **_EXECUTE_REFUSALS,
+    "connector_unreachable": "connector_unreachable",
+    # Executor amendment E4: a read tool not advertised ``readOnlyHint: true``.
+    "tool_not_read_only": "tool_not_read_only",
+}
 _EXECUTE_REFUSAL_BODY_KEY = "refused"
 _EXECUTE_BODY_MAX_BYTES = 1_048_576
 
@@ -162,6 +172,10 @@ def _execute_failure_code(phase: str, status: int | None, refused: object) -> st
     if isinstance(refused, str) and refused in _READ_PHASE_REFUSALS:
         return _READ_PHASE_REFUSALS[refused]
     return "runner_unavailable"
+
+
+class RunnerSnapshotReadError(RunnerError):
+    """The publication snapshot could not be read or validated at its boundary."""
 
 
 class RunnerStreamTimeout(TimeoutError):
@@ -713,11 +727,15 @@ class RunnerClient:
         ) as resp:
             if resp.status != 200:
                 body = await resp.text()
+                if resp.status >= 500:
+                    raise RunnerSnapshotReadError(f"/v1/snapshot -> {resp.status}: {body}")
                 raise RunnerError(f"/v1/snapshot -> {resp.status}: {body}")
+            raw = bytearray()
             try:
-                raw = await resp.content.read(self._snapshot_body_max_bytes + 1)
-                if len(raw) > self._snapshot_body_max_bytes:
-                    raise ValueError("snapshot response exceeds its encoded byte limit")
+                async for chunk in resp.content.iter_chunked(65_536):
+                    raw.extend(chunk)
+                    if len(raw) > self._snapshot_body_max_bytes:
+                        raise ValueError("snapshot response exceeds its encoded byte limit")
                 body = json.loads(raw)
                 encoded = body["patch_base64"]
                 if not isinstance(encoded, str):
@@ -755,7 +773,10 @@ class RunnerClient:
                     publication_body=description,
                 )
             except (KeyError, TypeError, ValueError, binascii.Error, json.JSONDecodeError) as exc:
-                raise RunnerError("/v1/snapshot returned an invalid bounded payload") from exc
+                raise RunnerSnapshotReadError(
+                    "/v1/snapshot returned an invalid bounded payload "
+                    f"after {len(raw)} bytes: {type(exc).__name__}: {str(exc)[:160]}"
+                ) from exc
 
     async def status(
         self,
@@ -847,7 +868,8 @@ class RunnerClient:
     ) -> dict[str, Any]:
         """Run one executor phase on an executor-mode runner. @spec ACTION-EXECUTOR-24.
 
-        Posts ``request`` (exactly the ACTION-EXECUTOR-6 keys) to
+        Posts ``request`` (exactly the ACTION-EXECUTOR-6 keys, plus ``pointer``
+        on a ``read``, AUTOMATED-REMEDIATION-12) to
         ``/v1/execute`` with the per-sandbox bearer and returns the phase's
         response body. Every other ending raises ``ExecuteRefused`` with the
         code the worker reports; nothing about the arguments, grant or reply is
@@ -856,11 +878,12 @@ class RunnerClient:
 
         if not token:
             raise RunnerError("/v1/execute requires a runner token")
-        if set(request) != EXECUTE_REQUEST_KEYS:
-            raise RunnerError("/v1/execute request does not carry exactly the frozen keys")
-        phase = request["phase"]
+        phase = request.get("phase")
         if phase not in EXECUTE_PHASES:
             raise RunnerError("/v1/execute request names an unknown phase")
+        expected = EXECUTE_READ_KEYS if phase == "read" else EXECUTE_REQUEST_KEYS
+        if set(request) != expected:
+            raise RunnerError("/v1/execute request does not carry exactly the frozen keys")
         body = dict(request)
 
         async def send(headers: dict[str, str] | None) -> tuple[dict[str, Any], str]:

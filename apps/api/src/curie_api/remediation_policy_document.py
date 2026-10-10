@@ -20,7 +20,17 @@ Codes:
 * ``kind_not_automatic``: ``automatic`` true on ``prevent`` or ``tune``
   (AUTOMATED-REMEDIATION-24).
 
+A ``tune`` action has its own closed shape (AUTOMATED-REMEDIATION-25): the rule
+owner's ``connector`` and ``tool``, ``rules`` (the closed set of rule
+identifiers, each with ``current`` reads keyed by change field and ``evidence``
+reads keyed by name; a tune read is ``connector``, ``tool``, ``arguments`` and
+``pointer``, with no comparator) and ``change`` (a closed map from the five
+tunable fields to an argument schema, ``retire`` declaring ``duplicate_of``).
+It has no ``arguments``, ``target``, ``reversibility``, ``precondition`` or
+``verifier``.
+
 @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-24
+@spec AUTOMATED-REMEDIATION-25
 """
 
 from __future__ import annotations
@@ -78,6 +88,18 @@ _ACTION_KEYS: Final = frozenset(
 _ACTION_REQUIRED: Final = frozenset(
     {"name", "kind", "connector", "tool", "arguments", "target", "reversibility", "automatic"}
 )
+_TUNE_ACTION_KEYS: Final = frozenset(
+    {"name", "kind", "connector", "tool", "rules", "change", "automatic", "qualification"}
+)
+_TUNE_ACTION_REQUIRED: Final = frozenset(
+    {"name", "kind", "connector", "tool", "rules", "change", "automatic"}
+)
+# AUTOMATED-REMEDIATION-25: the closed set of tunable rule fields.
+TUNE_FIELDS: Final = frozenset({"threshold", "for_duration", "group_by", "dedupe", "retire"})
+TUNE_RETIRE: Final = "retire"
+_TUNE_RULE_KEYS: Final = frozenset({"current", "evidence"})
+_TUNE_READ_KEYS: Final = frozenset({"connector", "tool", "arguments", "pointer"})
+_TUNE_RETIRE_KEYS: Final = frozenset({"duplicate_of"})
 _ARGUMENT_KEYS: Final = frozenset({"type", "allowed", "minimum", "maximum"})
 _DELTA_KEYS: Final = frozenset({"max_delta", "min_delta", "delta"})
 _TARGET_KEYS: Final = frozenset({"argument", "allowed"})
@@ -90,6 +112,12 @@ _VERIFIER_KEYS: Final = _READ_KEYS | _VERIFIER_TIMING_KEYS
 _ACTION_NAME: Final = re.compile(r"[a-z0-9][a-z0-9_-]{0,62}")
 _IDENTIFIER: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}")
 _POINTER: Final = re.compile(r"(/([^~/]|~[01])*)*")
+
+
+def valid_pointer(value: object) -> bool:
+    """An RFC 6901 JSON pointer (remediation-predicate.json ``invalid_pointers``)."""
+
+    return type(value) is str and _POINTER.fullmatch(value) is not None
 _IN_LIST_MAXIMUM: Final = 16
 _ALLOWED_MAXIMUM: Final = 256
 _VERIFIER_INTERVAL_MINIMUM: Final = 10
@@ -329,13 +357,102 @@ def _validate_verifier_timing(read: Mapping[str, Any], path: str) -> None:
         raise _refuse("policy_document_invalid", f"{path}/consecutive", "must be at least 1")
 
 
+def _validate_tune_read(read: Any, path: str) -> None:
+    """A tune action's declared read: no comparator, the value is shown, not judged.
+
+    @spec AUTOMATED-REMEDIATION-25.
+    """
+    read = _closed(read, path, _TUNE_READ_KEYS)
+    _require(read, path, frozenset({"connector", "tool", "pointer"}))
+    _identifier(read["connector"], f"{path}/connector")
+    _identifier(read["tool"], f"{path}/tool")
+    if not isinstance(read.get("arguments", {}), dict):
+        raise _refuse("policy_document_invalid", f"{path}/arguments", "must be an object")
+    if not valid_pointer(read["pointer"]):
+        raise _refuse("policy_document_invalid", f"{path}/pointer", "must be an RFC 6901 pointer")
+
+
+def _validate_tune_reads(reads: Any, path: str) -> Mapping[str, Any]:
+    """A map from a field or evidence name to a declared read. @spec AUTOMATED-REMEDIATION-25."""
+    if not isinstance(reads, dict):
+        raise _refuse("policy_document_invalid", path, "must be an object")
+    for key, read in reads.items():
+        _identifier(key, f"{path}/{key}")
+        _validate_tune_read(read, f"{path}/{key}")
+    return reads
+
+
+def _validate_tune(action: Mapping[str, Any], path: str) -> None:
+    """The AUTOMATED-REMEDIATION-25 shape, after the common name, kind, connector and tool.
+
+    @spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-25.
+    """
+    automatic = action["automatic"]
+    if type(automatic) is not bool:
+        raise _refuse("policy_document_invalid", f"{path}/automatic", "must be a boolean")
+
+    rules = action["rules"]
+    if not isinstance(rules, dict) or not rules:
+        raise _refuse("policy_document_invalid", f"{path}/rules", "must be a non-empty object")
+    for rule, declared in rules.items():
+        rule_path = f"{path}/rules/{rule}"
+        _identifier(rule, rule_path)
+        declared = _closed(declared, rule_path, _TUNE_RULE_KEYS)
+        for reads in ("current", "evidence"):
+            if reads in declared:
+                _validate_tune_reads(declared[reads], f"{rule_path}/{reads}")
+
+    change = action["change"]
+    if not isinstance(change, dict) or not change:
+        raise _refuse("policy_document_invalid", f"{path}/change", "must be a non-empty object")
+    change = _closed(change, f"{path}/change", TUNE_FIELDS)
+    for field, spec in change.items():
+        field_path = f"{path}/change/{field}"
+        if field != TUNE_RETIRE:
+            _validate_argument(spec, field_path)
+            continue
+        spec = _closed(spec, field_path, _TUNE_RETIRE_KEYS)
+        _require(spec, field_path, _TUNE_RETIRE_KEYS)
+        duplicate_of = spec["duplicate_of"]
+        if not isinstance(duplicate_of, list) or not duplicate_of:
+            raise _refuse(
+                "policy_document_invalid",
+                f"{field_path}/duplicate_of",
+                "must be a non-empty list of declared rules",
+            )
+        for index, rule in enumerate(duplicate_of):
+            if type(rule) is not str or rule not in rules:
+                raise _refuse(
+                    "policy_document_invalid",
+                    f"{field_path}/duplicate_of/{index}",
+                    "must name a rule the action declares",
+                )
+
+    for rule, declared in rules.items():
+        for field in declared.get("current", {}):
+            if field not in change:
+                raise _refuse(
+                    "policy_document_invalid",
+                    f"{path}/rules/{rule}/current/{field}",
+                    "must be a field the change declares",
+                )
+
+    if automatic:
+        raise _refuse("kind_not_automatic", f"{path}/automatic", "a tune action is never automatic")
+
+
 def _validate_action(action: Any, path: str) -> str:
     """One action; returns its name.
 
-    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-24.
+    The closed key set is the action kind's: ``tune`` has its own
+    (AUTOMATED-REMEDIATION-25), and any other or unknown kind the
+    ``remediate``/``prevent`` set.
+
+    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-25.
     """
-    action = _closed(action, path, _ACTION_KEYS)
-    _require(action, path, _ACTION_REQUIRED)
+    tune = isinstance(action, dict) and _member(action.get("kind"), frozenset({"tune"}))
+    action = _closed(action, path, _TUNE_ACTION_KEYS if tune else _ACTION_KEYS)
+    _require(action, path, _TUNE_ACTION_REQUIRED if tune else _ACTION_REQUIRED)
     name = action["name"]
     if type(name) is not str or not _ACTION_NAME.fullmatch(name):
         raise _refuse(
@@ -346,6 +463,10 @@ def _validate_action(action: Any, path: str) -> str:
         raise _refuse("policy_document_invalid", f"{path}/kind", "is not a known kind")
     _identifier(action["connector"], f"{path}/connector")
     _identifier(action["tool"], f"{path}/tool")
+    if tune:
+        _validate_tune(action, path)
+        _validate_qualification(action, path)
+        return name
     if not _member(action["reversibility"], REVERSIBILITIES):
         raise _refuse(
             "policy_document_invalid", f"{path}/reversibility", "is not a known reversibility"
@@ -394,12 +515,17 @@ def _validate_action(action: Any, path: str) -> str:
             "kind_not_automatic", f"{path}/automatic", f"a {kind} action is never automatic"
         )
 
+    _validate_qualification(action, path)
+    return name
+
+
+def _validate_qualification(action: Mapping[str, Any], path: str) -> None:
+    """@spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-22."""
     qualification = action.get("qualification")
     if qualification is not None and (type(qualification) is not str or not qualification):
         raise _refuse(
             "policy_document_invalid", f"{path}/qualification", "must be null or a reference"
         )
-    return name
 
 
 def _refuse_unrepresentable(value: Any, path: str, *, limit_field: bool = False) -> None:
@@ -435,7 +561,8 @@ def _refuse_unrepresentable(value: Any, path: str, *, limit_field: bool = False)
 def validate_document(document: Any) -> dict[str, Any]:
     """Validate a whole policy document; returns it unchanged.
 
-    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-24.
+    @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-24
+    @spec AUTOMATED-REMEDIATION-25.
     """
     _refuse_unrepresentable(document, "")
     document = _closed(document, "", _TOP_KEYS)

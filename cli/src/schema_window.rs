@@ -141,6 +141,24 @@ fn version_key(version: &str) -> Option<VersionKey> {
     Some((major, minor, patch, stable, rc))
 }
 
+/// Catalog head of the first catalogued version released after `app_version`.
+/// A build carrying `app_version` was cut before that release, so it cannot
+/// declare a later schema head. `None` when no later version is catalogued;
+/// callers pass a catalogued version, so an unparseable one never reaches the
+/// open bound. Version order stands in for release order on one schema chain:
+/// a patch cut after a later line was catalogued is refused, which fails
+/// closed with a fail forward hint.
+pub fn next_release_head(app_version: &str) -> Option<String> {
+    let key = version_key(app_version)?;
+    catalog()
+        .windows
+        .iter()
+        .filter_map(|(version, window)| Some((version_key(version)?, window)))
+        .filter(|(candidate, _)| *candidate > key)
+        .min_by_key(|(candidate, _)| *candidate)
+        .map(|(_, window)| window.schema_head.clone())
+}
+
 /// Newest catalogued application version in `candidates` whose window contains
 /// `live`. That is the fail-forward target a refused rollback must name.
 pub fn newest_fail_forward<'a>(
@@ -268,6 +286,110 @@ pub fn redact_probe_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn migration_graph(
+        versions: &std::path::Path,
+    ) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli is not the repo root");
+        let output = std::process::Command::new("python3")
+            .args([
+                "-c",
+                r#"
+import json
+import runpy
+import sys
+from pathlib import Path
+
+read_revision = runpy.run_path(sys.argv[1])["_revision_fields"]
+graph = {}
+for path in sorted(Path(sys.argv[2]).glob("*.py")):
+    revision, parents = read_revision(path)
+    if revision is None:
+        if path.name != "__init__.py":
+            raise ValueError(f"migration has no literal revision: {path.name}")
+        continue
+    if revision in graph:
+        raise ValueError(f"duplicate Alembic revision: {revision}")
+    graph[revision] = parents
+print(json.dumps(graph))
+"#,
+            ])
+            .arg(root.join("scripts/check-schema-window.py"))
+            .arg(versions)
+            .output()
+            .map_err(|error| format!("cannot inspect migration graph: {error}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("migration graph is invalid JSON: {error}"))
+    }
+
+    #[test]
+    fn migration_graph_reads_tuple_parents_and_refuses_duplicate_ids() {
+        let directory = tempfile::tempdir().expect("migration sources");
+        std::fs::write(
+            directory.path().join("base.py"),
+            "revision = 'base'\ndown_revision = None\n",
+        )
+        .expect("base migration");
+        std::fs::write(
+            directory.path().join("stable.py"),
+            "revision: str = 'stable'\ndown_revision: str | None = 'base'\n",
+        )
+        .expect("stable migration");
+        std::fs::write(
+            directory.path().join("feature.py"),
+            "revision: str = 'feature'\ndown_revision: str | None = 'base'\n",
+        )
+        .expect("feature migration");
+        std::fs::write(
+            directory.path().join("merge.py"),
+            "revision: str = 'merge'\ndown_revision: tuple[str, str] = (\n 'feature',\n 'stable',\n)\n",
+        )
+        .expect("merge migration");
+        let graph = migration_graph(directory.path()).expect("both merge parents are readable");
+        assert_eq!(graph["merge"], ["feature", "stable"]);
+        let parents: std::collections::BTreeSet<&String> = graph.values().flatten().collect();
+        let heads: Vec<&str> = graph
+            .keys()
+            .filter(|revision| !parents.contains(revision))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(heads, ["merge"]);
+        std::fs::write(
+            directory.path().join("duplicate.py"),
+            "revision = 'stable'\n",
+        )
+        .expect("duplicate migration");
+        let error = migration_graph(directory.path()).expect_err("duplicate IDs are invalid");
+        assert!(error.contains("duplicate Alembic revision: stable"));
+    }
+
+    #[test]
+    fn next_release_head_is_the_head_of_the_next_catalogued_version() {
+        assert_eq!(next_release_head("0.10.0").as_deref(), Some("0058"));
+        assert_eq!(next_release_head("v0.10.0-rc.1").as_deref(), Some("0057"));
+        assert_eq!(next_release_head("0.10.3").as_deref(), Some("0070"));
+        assert_eq!(next_release_head("0.12.1").as_deref(), Some("0081"));
+        assert_eq!(next_release_head("not-a-version"), None);
+    }
+
+    #[test]
+    fn newest_catalogued_version_has_no_next_release_head() {
+        let newest = catalog()
+            .windows
+            .keys()
+            .max_by_key(|version| version_key(version))
+            .expect("the catalog has released windows");
+        assert_eq!(
+            next_release_head(newest),
+            None,
+            "a main build carrying the newest release must keep an open upper bound"
+        );
+    }
 
     #[test]
     fn v084_cannot_start_against_0039() {
@@ -438,23 +560,24 @@ mod tests {
     fn candidate_window_tracks_the_catalog_without_changing_released_windows() {
         // @spec DEPLOY-NOTICE-RELEASE-1.
         let candidate = source_candidate_window();
-        assert_eq!(candidate.schema_min, "0082");
-        assert_eq!(candidate.schema_head, "0089");
+        assert_eq!(candidate.schema_min, "0101");
+        assert_eq!(candidate.schema_head, "0102");
         assert_eq!(
             candidate.schema_head.as_str(),
             catalog().revisions.last().unwrap()
         );
-
         let current = candidate_window(&candidate.schema_min, &candidate.schema_head)
             .expect("candidate bounds are catalogued and ordered");
-        assert!(live_in_window("0082", &current));
-        assert!(live_in_window("0083", &current));
-        assert!(live_in_window("0084", &current));
-        assert!(live_in_window("0085", &current));
-        assert!(live_in_window("0086", &current));
-        assert!(live_in_window("0087", &current));
-        assert!(live_in_window("0088", &current));
-        assert!(live_in_window("0089", &current));
+        // #2911: the Agent ORM and resolver read 0101's tenant-scope columns, so
+        // every revision the window admitted below it is no longer live.
+        for below in [
+            "0082", "0083", "0084", "0085", "0086", "0087", "0088", "0089", "0090", "0091a",
+            "0092a", "0093a", "0094", "0095", "0096", "0097", "0098", "0099", "0100", "0093",
+        ] {
+            assert!(!live_in_window(below, &current), "{below}");
+        }
+        assert!(live_in_window("0101", &current));
+        assert!(live_in_window("0102", &current));
         assert!(!live_in_window("0075", &current));
         assert!(!live_in_window("0076", &current));
         let retained = window_for("0.12.0").expect("published foundation remains catalogued");
@@ -470,10 +593,21 @@ mod tests {
         let released = window_for("0.12.2").expect("published patch is catalogued");
         assert_eq!(released.schema_min, "0076");
         assert_eq!(released.schema_head, "0081");
+        let published_stable = window_for("0.12.3").expect("published stable is catalogued");
+        assert_eq!(published_stable.schema_min, "0076");
+        assert_eq!(published_stable.schema_head, "0093");
+        for revision in ["0081", "0091", "0092", "0093"] {
+            assert!(live_in_window(revision, &published_stable));
+        }
+        for revision in ["0082", "0091a", "0098", "0099"] {
+            assert!(!live_in_window(revision, &published_stable));
+        }
         let candidate_release = window_for("0.13.0").expect("feature candidate is catalogued");
         assert_eq!(candidate_release.schema_min, candidate.schema_min);
         assert_eq!(candidate_release.schema_head, candidate.schema_head);
-        assert!(live_in_window("0089", &candidate_release));
+        assert!(live_in_window("0101", &candidate_release));
+        assert!(live_in_window("0102", &candidate_release));
+        assert!(!live_in_window("0100", &candidate_release));
         assert!(!live_in_window("0075", &candidate_release));
         let published =
             window_for("0.12.1").expect("released source control window remains catalogued");
@@ -546,53 +680,44 @@ mod tests {
             !chart_window.artifact_identity_ambiguous,
             "Chart.yaml appVersion {app_version} must have one unambiguous artifact identity"
         );
-        assert_eq!(
-            chart_window.schema_min,
-            catalog().candidate.schema_min,
-            "Chart.yaml appVersion {app_version} minimum must match the candidate"
-        );
-        assert_eq!(
-            chart_window.schema_head,
-            catalog().candidate.schema_head,
-            "Chart.yaml appVersion {app_version} head must match the candidate"
-        );
-
-        let mut found = Vec::new();
-        let mut down_of = Vec::new();
-        let versions = root.join("apps/api/alembic/versions");
-        for entry in std::fs::read_dir(&versions).expect("alembic versions") {
-            let path = entry.expect("entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("py") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read migration");
-            let mut revision = None;
-            for line in text.lines() {
-                if let Some(rest) = line.strip_prefix("revision: str = \"") {
-                    revision = rest.strip_suffix('"').map(str::to_string);
-                }
-                if let Some(rest) = line.strip_prefix("down_revision: str | None = ") {
-                    let token = rest.trim().trim_matches('"');
-                    if token != "None" && !token.is_empty() {
-                        down_of.push(token.to_string());
-                    }
-                }
-            }
-            if let Some(id) = revision {
-                found.push(id);
-            }
+        // A registered (released) appVersion keeps its released window while the
+        // candidate moves ahead; scripts/check-schema-window.py owns comparing
+        // that window to the release tag. Only an unregistered appVersion must
+        // still equal the candidate.
+        let atlas: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("docs/architecture-atlas/versions.json"))
+                .expect("architecture atlas versions.json"),
+        )
+        .expect("versions.json is valid JSON");
+        let release_id = format!("v{app_version}");
+        let registered = atlas["versions"]
+            .as_array()
+            .expect("versions.json versions array")
+            .iter()
+            .any(|entry| entry["id"].as_str() == Some(release_id.as_str()));
+        if !registered {
+            assert_eq!(
+                chart_window.schema_min,
+                catalog().candidate.schema_min,
+                "unregistered Chart.yaml appVersion {app_version} minimum must match the candidate"
+            );
+            assert_eq!(
+                chart_window.schema_head,
+                catalog().candidate.schema_head,
+                "unregistered Chart.yaml appVersion {app_version} head must match the candidate"
+            );
         }
-        for id in &found {
+
+        let versions = root.join("apps/api/alembic/versions");
+        let graph = migration_graph(&versions).expect("migration graph has unique literal IDs");
+        for id in graph.keys() {
             assert!(
                 catalog().revisions.iter().any(|item| item == id),
                 "catalog revisions missing alembic id {id}"
             );
         }
-        let mut heads: Vec<&String> = found
-            .iter()
-            .filter(|id| !down_of.iter().any(|down| down == *id))
-            .collect();
-        heads.sort();
+        let down_of: std::collections::BTreeSet<&String> = graph.values().flatten().collect();
+        let heads: Vec<&String> = graph.keys().filter(|id| !down_of.contains(id)).collect();
         assert_eq!(heads.len(), 1, "expected one alembic head, got {heads:?}");
         let tree_head = heads[0];
         assert!(

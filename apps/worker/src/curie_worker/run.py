@@ -79,6 +79,8 @@ from .publication_loop import (
     PublicationReconciler,
 )
 from .publication_store import PostgresPublicationStore
+from .remediation_cards import PostgresRemediationCardStore, RemediationCardLoop
+from .remediation_receipts import PostgresRemediationReceiptStore, RemediationReceiptLoop
 from .reply_sink import ObservedReplySink, ReplySinkRouter, build_reply_sink
 from .runner_client import RunnerClient
 from .sandbox import (
@@ -142,6 +144,14 @@ class Runtime:
     # Runtime constructed elsewhere need not name it.
     cron_loop: CronSchedulerLoop | None = None
     publication_loop: PublicationReconcileLoop | None = None
+    # None unless automated remediation is on (AUTOMATED-REMEDIATION-15): posts
+    # remediation approval cards beside the publication loop, outside the
+    # consumer and the stream path.
+    remediation_cards: RemediationCardLoop | None = None
+    # None unless automated remediation is on (AUTOMATED-REMEDIATION-20): posts
+    # one thread message per remediation stage, beside the card loop and outside
+    # the consumer, the thread lock and the markers.
+    remediation_receipts: RemediationReceiptLoop | None = None
     # None unless the action executor is enabled (ACTION-EXECUTOR-1). Launched
     # beside the connector reconcile loop, never inside the consumer.
     action_executor: ActionExecutorLoop | None = None
@@ -679,6 +689,7 @@ def build(
         # read from, so the kernel knows it without asking the API.
         bundles=BundleStore(config),
     )
+    owner.register_close("work-item-settlement", kernel.close, order=5)
     killswitch = KillSwitch(async_redis, on_kill=kernel.interrupt_agent)
     kernel.attach_killswitch(killswitch)
     # Delivery ownership leases (ADR-0131), built from the CONCRETE async client
@@ -802,6 +813,8 @@ def build(
             default_max_output_tokens_per_run=config.default_max_output_tokens_per_run,
         ),
         publication_loop=publication_loop,
+        remediation_cards=_build_remediation_cards(config, engine, sink, card_store),
+        remediation_receipts=_build_remediation_receipts(config, engine, sink),
         stream_retention=build_stream_retention(config, async_redis),
     )
 
@@ -1141,6 +1154,8 @@ def _build_action_executor(
         lease_seconds=lease_seconds,
         dispatch_deadline_s=_ACTION_EXECUTOR_DISPATCH_DEADLINE_S,
         interval_seconds=_ACTION_EXECUTOR_INTERVAL_S,
+        # @spec AUTOMATED-REMEDIATION-12 (E9): the chart's cap, also the API's.
+        max_concurrent_sandboxes=config.action_executor_max_concurrent_sandboxes,
     )
 
 
@@ -1286,6 +1301,48 @@ def _build_e2e_reaper(
         request_status=request_status_lookup(work_items),
         scope=scope,
         interval_s=config.e2e_reaper_interval_s,
+    )
+
+
+def _build_remediation_cards(
+    config: WorkerConfig,
+    engine: AsyncEngine,
+    sink: ReplySinkRouter,
+    card_store: ApprovalCardStore,
+) -> RemediationCardLoop | None:
+    """The remediation approval card loop, behind the remediation switch.
+
+    @spec AUTOMATED-REMEDIATION-15. Its own observed reply sink and the shared
+    ``ApprovalCardStore``, as the publication loop delivers its cards.
+    """
+
+    if not config.remediation_enabled:
+        return None
+    return RemediationCardLoop(
+        store=PostgresRemediationCardStore(
+            engine, schema=config.db_schema, lease_owner=config.consumer_name
+        ),
+        replies=ObservedReplySink(sink),
+        card_store=card_store,
+    )
+
+
+def _build_remediation_receipts(
+    config: WorkerConfig, engine: AsyncEngine, sink: ReplySinkRouter
+) -> RemediationReceiptLoop | None:
+    """The remediation receipt loop, behind the remediation switch.
+
+    @spec AUTOMATED-REMEDIATION-20. Its own observed reply sink, as the card
+    loop has; it needs no card store, since a receipt carries no buttons.
+    """
+
+    if not config.remediation_enabled:
+        return None
+    return RemediationReceiptLoop(
+        store=PostgresRemediationReceiptStore(
+            engine, schema=config.db_schema, lease_owner=config.consumer_name
+        ),
+        replies=ObservedReplySink(sink),
     )
 
 
@@ -1500,6 +1557,14 @@ async def _run_runtime(rt: Runtime, config: WorkerConfig, resources: WorkerResou
         tasks.append(launch("cron", lambda: rt.cron_loop.run_forever(shutdown)))  # type: ignore[union-attr]
     if getattr(rt, "publication_loop", None) is not None:
         tasks.append(launch("publications", lambda: rt.publication_loop.run_forever(shutdown)))  # type: ignore[union-attr]
+    if getattr(rt, "remediation_cards", None) is not None:
+        tasks.append(
+            launch("remediation-cards", lambda: rt.remediation_cards.run_forever(shutdown))  # type: ignore[union-attr]
+        )
+    if getattr(rt, "remediation_receipts", None) is not None:
+        tasks.append(
+            launch("remediation-receipts", lambda: rt.remediation_receipts.run_forever(shutdown))  # type: ignore[union-attr]
+        )
     if sweeper is not None:
         tasks.append(launch("work-item-orphans", lambda: sweeper.run_forever(shutdown)))
     if retention is not None:

@@ -91,6 +91,7 @@ async def process_event(
     routing._check_targetless_shape(qevent)
     error: BaseException | None = None
     hook_token = constants._HOOK_RUN_CARRY.set(hooks._HookRunCarry())
+    lease_token = constants._DELIVERY_LEASE.set(lease)
     # A redelivery must never inherit an earlier delivery's terminal-send mark
     # from this process (#2433).
     self._terminal_reply_attempted.discard(qevent.event_id)
@@ -165,6 +166,7 @@ async def process_event(
             constants._TURN_AGENT.reset(agent_token)
             constants._LIFECYCLE_SPAN.reset(token)
             constants._HOOK_RUN_CARRY.reset(hook_token)
+            constants._DELIVERY_LEASE.reset(lease_token)
     if error is not None:
         raise error
 
@@ -953,6 +955,8 @@ async def _process_event(
             )
         termination_detail: str | None = None
         attempt = 0
+        capacity_refusals = 0
+        capacity_wait_run: WorkItemRun | None = None
         while True:
             attempt += 1
             hook_carry = constants._HOOK_RUN_CARRY.get()
@@ -960,8 +964,8 @@ async def _process_event(
                 hook_carry.this_attempt_started = False
             # The delivery's overall deadline gates every attempt, and the
             # attempts CONSUME it: a retry never restarts it.
-            if lease is not None:
-                if lease.lost.is_set():
+            if lease is not None or capacity_wait_run is not None:
+                if lease is not None and lease.lost.is_set():
                     # Fenced out between attempts. Start nothing: a
                     # replacement holds this delivery and is entitled to run
                     # it. Returning without completing leaves the entry
@@ -974,8 +978,10 @@ async def _process_event(
                         event_id,
                     )
                     return
-                remaining = lease.remaining_s()
-                if remaining <= constants._MIN_ATTEMPT_BUDGET_S:
+                remaining = claim._remaining_budget(lease)
+                if capacity_wait_run is not None:
+                    remaining = capacity_wait_run.bound_remaining_s(remaining)
+                if remaining is not None and remaining <= constants._MIN_ATTEMPT_BUDGET_S:
                     if (
                         sweep.parse_continuation(event_id) is not None
                         and qevent.source is TurnSource.CRON
@@ -1245,13 +1251,17 @@ async def _process_event(
                     run = self._run_for_event(qevent.event_id)
                     if run is not None:
                         try:
-                            await run.finish(
+                            await self._finish_or_settle(
+                                run,
                                 outcome="failed",
                                 cause="approval_create_failed",
                                 detail=pause.failure_detail,
                             )
                         except WorkItemConflict as exc:
-                            if exc.code != "publication_pending":
+                            # work_item_cancelled means what it does in
+                            # completion._complete (#3208): the request is settled as
+                            # cancelled and accepts no finish (#4191).
+                            if exc.code not in {"publication_pending", "work_item_cancelled"}:
                                 raise
                             run.finished = True
                 await self._complete(
@@ -1337,6 +1347,19 @@ async def _process_event(
                 return
 
             retryable = outcome.classification in constants.RETRYABLE_CLASSIFICATIONS
+            capacity_continuation = None
+            if outcome.classification == "sandbox-capacity" and (
+                (parsed_work_item is not None and parsed_work_item.is_ci_fix)
+                or self._is_approval_resume(event_id)
+            ):
+                capacity_continuation = self._run_for_event(event_id)
+            if capacity_continuation is not None:
+                # The execution already started, so SQL defer cannot hold
+                # this continuation. Waiting for quota consumes its delivery
+                # and execution deadlines, never a runner attempt (#4275).
+                capacity_wait_run = capacity_continuation
+                capacity_refusals += 1
+                attempt -= 1
             if outcome.classification == "sandbox-terminated":
                 termination_detail = outcome.error_message
             if (
@@ -1420,16 +1443,30 @@ async def _process_event(
                     "retry_class": cast("str", outcome.classification),
                 },
             )
-            backoff_s = self._backoff(attempt)
-            if lease is not None:
+            backoff_s = self._backoff(
+                capacity_refusals if capacity_continuation is not None else attempt
+            )
+            remaining = claim._remaining_budget(lease)
+            if capacity_continuation is not None:
+                remaining = capacity_continuation.bound_remaining_s(remaining)
+            if remaining is not None:
                 # The backoff CONSUMES the delivery budget; it never extends
                 # it. Clamped, because an unclamped backoff longer than the
                 # remaining deadline burns the whole thing asleep and then
                 # escalates without ever having retried -- the worst of both.
-                backoff_s = min(backoff_s, max(0.0, lease.remaining_s()))
+                backoff_s = min(backoff_s, max(0.0, remaining))
+            if capacity_continuation is not None:
+                logger.info(
+                    "sandbox capacity retry for event %s: refusal=%d backoff=%.3fs",
+                    event_id,
+                    capacity_refusals,
+                    backoff_s,
+                )
             await asyncio.sleep(backoff_s)
     finally:
         if owned_work_item_id is not None:
+            # A settlement handoff already removed the active entry. Its
+            # task exclusively owns heartbeat close and sandbox release.
             owned_run = self._work_item_runs.get(owned_work_item_id)
             if owned_run is not None and owned_run.held:
                 self._held_work_items[owned_run.thread_key] = owned_run

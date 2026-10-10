@@ -32,7 +32,10 @@ NOMINATION_STATES: Final = frozenset(
     }
 )
 # End a nomination with nothing for a person to approve (AUTOMATED-REMEDIATION-7,
-# and a stopped agent under AUTOMATED-REMEDIATION-8 check 2).
+# a stopped agent under AUTOMATED-REMEDIATION-8 check 2, and a delivery that
+# recorded no reply surface to ask on, AUTOMATED-REMEDIATION-15), and every
+# nomination of an approved tuning request, which executes nothing
+# (AUTOMATED-REMEDIATION-25).
 NOMINATION_REFUSALS: Final = frozenset(
     {
         "nomination_malformed",
@@ -40,6 +43,8 @@ NOMINATION_REFUSALS: Final = frozenset(
         "nomination_duplicate",
         "arguments_schema_mismatch",
         "agent_stopped",
+        "reply_surface_unavailable",
+        "tune_execution_not_automated",
     }
 )
 # The nomination route's refusals; each writes no row (AUTOMATED-REMEDIATION-1, -6).

@@ -71,7 +71,7 @@ class PluginManifest(BaseModel):
     # time and delivered into the sandbox env, where ``.mcp.json`` ``${VAR}``
     # expansion consumes them. Validated env-var-style by ``validate.py``.
     secrets: list[str] | None = None
-    # Curie authoring extension (ADR 0209, #4129): the named secrets a
+    # Curie authoring extension (ADR 0210, #4129): the named secrets a
     # connector can use but does not need, e.g. a token that only widens what an
     # MCP server can read. Same NAMES-only policy and validation as ``secrets``;
     # a name may not appear in both. A deploy may leave one unbound, and an

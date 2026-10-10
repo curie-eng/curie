@@ -15,6 +15,7 @@ from sqlalchemy.orm import selectinload
 from curie_api.schemas.agents import AgentCreate, HookPartitionConfig, SourceBindingConfig
 
 from ..models import (
+    DEFAULT_TENANT_ID,
     Agent,
     AgentChannel,
     AgentVersion,
@@ -43,6 +44,7 @@ async def refresh_with_channels(session: AsyncSession, agent: Agent) -> Agent:
 async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
     agent = Agent(
         name=data.name,
+        tenant_id=DEFAULT_TENANT_ID,
         # Attached through the relationship rather than inserted separately, so
         # the agent row and its binding are one transaction: a unique-constraint
         # collision on either rolls BOTH back, and no agent is ever left behind
@@ -56,6 +58,7 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
         # singular); the rest arrive through `add_channel_binding`.
         channels=[
             AgentChannel(
+                tenant_id=DEFAULT_TENANT_ID,
                 kind=data.channel.kind,
                 address=data.channel.address,
                 endpoint=data.channel.endpoint,

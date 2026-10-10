@@ -110,6 +110,127 @@ the approval, execution and verification outcome that later admission fills,
 and `created_at` and `decided_at`. Both tables cascade with the agent and a
 nomination cascades with its submission.
 
+Migration `0089_remediation_ledger_fields.py` (automated remediation,
+AUTOMATED-REMEDIATION-14) is additive. `agent_actions`
+(`apps/api/src/curie_api/models.py::AgentAction`) gains `delivery_event_id` (the
+protected delivery a remediation was nominated from), `nomination_id` (not a
+foreign key, so the record outlives the nomination), `verification_outcome`,
+`verified_at` and `actor_kind`; `action_audit_entries`
+(`apps/api/src/curie_api/models.py::ActionAuditEntry`) gains `actor_kind`. All
+are nullable with no backfill, so existing rows read NULL. Check constraints
+close `authority_kind` on `agent_actions` and `action_executions` to
+`undo_ruling`, `capability_probe`, `policy`, `approval` and `qualification`
+(NULL allowed on the ledger), `actor_kind` on both ledger tables to
+`model_turn`, `policy`, `approval` and `undo_ruling`, and
+`verification_outcome` to `verified`, `not-recovered`, `verifier-unavailable`
+and `superseded`. A model turn's record carries `actor_kind` `model_turn`; a
+remediation's forward record carries its authority, actor, delivery and
+nomination from the dispatch commit
+(`apps/api/src/curie_api/remediation_forward.py`).
+
+Migration `0090_remediation_read_executions.py` (automated remediation,
+AUTOMATED-REMEDIATION-12, executor amendments E2 and E9) is additive.
+`action_executions` (`apps/api/src/curie_api/models.py::ActionExecution`) gains
+`not_before` (the claim route hands out an execution once due; NULL is due),
+`pointer` (a read's RFC 6901 pointer) and `sample` (a read's reported
+`{sample, value}`, or the API's `skipped`), all nullable with no backfill. The
+kind check is replaced so `kind` gains `read`. Read executions are created only by
+`apps/api/src/curie_api/remediation_reads.py::create_read_execution`; the
+downgrade deletes them before restoring the check.
+
+Migration `0091_remediation_execution_code.py` (automated remediation,
+AUTOMATED-REMEDIATION-18) is additive. `remediation_nominations`
+(`apps/api/src/curie_api/models.py::RemediationNomination`) gains
+`execution_code`, nullable with no backfill: the code of a forward execution
+that ended `failed`, `indeterminate` or `refused` after admission, written when
+the nomination finishes `not-recovered` without a verifier
+(`apps/api/src/curie_api/remediation_verifier.py`). The downgrade drops it.
+
+Migration `0092_remediation_approvals.py` (automated remediation,
+AUTOMATED-REMEDIATION-15) is additive. `approvals_purpose_ck` is replaced so
+`approvals.purpose` gains `remediation`; existing rows are untouched. The new
+`remediation_approval_requests` table
+(`apps/api/src/curie_api/models.py::RemediationApprovalRequest`) holds one row per
+remediation approval: the raising nomination, its agent, hook, action and
+`arguments_sha256` (the deduplication identity), the failed admission check and
+the observed precondition value the card names, the count and newest `event_id`
+of attached nominations, and the card delivery outbox the worker's remediation
+card loop leases. It cascades with its approval, nomination and agent. Rows are
+written by `apps/api/src/curie_api/remediation_approvals.py`; the downgrade drops
+the table and deletes remediation approvals before restoring the check.
+
+Migration `0093_remediation_admission.py` (automated remediation,
+AUTOMATED-REMEDIATION-8 to -11) is additive. `remediation_breakers`
+(`apps/api/src/curie_api/models.py::RemediationBreaker`) holds one row per
+breaker keyed by agent, connector, tool and target key, with at most one open
+per key (a partial unique index); it opens on any verification outcome other
+than `verified` and records `closed_at`, `closed_by` (the operator principal)
+and `close_reason` when the policy's administrative route closes it.
+`remediation_reservations` (`RemediationReservation`) holds the check 11
+reservation of each nomination admitted to its precondition read (policy,
+action, target key, turn, `reserved_at`, `released_at`), counted under the
+per-agent admission lock. Both cascade with the agent (reservations also with
+the nomination). `remediation_nominations.approval_reason` names the admission
+check that sent a nomination to approval, one of the frozen `approval_reasons`
+of `tests/vectors/remediation-codes.json`, and
+`remediation_delivery_surfaces` (`RemediationDeliverySurface`) records, per
+protected delivery event id, the reply surface the hook route chose (written by
+`apps/api/src/curie_api/routers/hooks.py` with remediation on, committed before
+the broker admits the delivery; pruned once a submission copied it); it cascades with
+the agent. `remediation_nomination_submissions` gains `conversation_id` and the
+reply surface (`reply_kind`, `reply_channel`, `reply_endpoint`, `reply_adapter`)
+copied from that row at nomination time, which the approval request is raised on;
+existing rows read NULL. `remediation_nominations_refusal_ck` gains
+`reply_surface_unavailable`.
+Rows are written by `apps/api/src/curie_api/remediation_admission.py` and
+`remediation_limits.py`; the downgrade drops the three tables and the added columns,
+deletes nominations refused `reply_surface_unavailable` and restores the refusal
+check.
+
+Migration `0094_remediation_qualifications.py` (automated remediation,
+AUTOMATED-REMEDIATION-22) is additive. `remediation_qualifications`
+(`apps/api/src/curie_api/models.py::RemediationQualification`) holds one
+immutable record per qualification id for one agent, connector, tool, connector
+digest and verifier declaration digest: the reversibility, the operator
+principal that recorded it, the worst case statement (at most 2000 characters,
+a check), the evidence references checked by state and digest at write, and the
+hook, action and policy generation it was evaluated against.
+`remediation_qualification_verifier_runs` (`RemediationQualificationVerifierRun`)
+holds each qualification verifier run (hook, action, generation, verifier
+digest, literal target, operator principal, `started_at`, outcome); its samples
+are `read` executions with `authority_kind` `qualification`. Both cascade with
+the agent. Rows are written by
+`apps/api/src/curie_api/remediation_qualifications.py`; the downgrade drops both
+tables.
+
+Migration `0095_remediation_escalations.py` (automated remediation,
+AUTOMATED-REMEDIATION-19) is additive. `remediation_escalations`
+(`apps/api/src/curie_api/models.py::RemediationEscalation`) holds one row per
+nomination whose verification outcome is not `verified` (unique
+`nomination_id`): the agent, the ledger record when the forward left one, the
+outcome, and the undo approval when one was offered (`undo_approval_id`, set
+null if that approval is deleted). The undo approval is an `approvals` row of
+purpose `remediation` with a `remediation-undo:<nomination id>` dedupe key and
+no `remediation_approval_requests` row. Rows are written by
+`apps/api/src/curie_api/remediation_escalation.py` in the transaction that
+writes the outcome; the downgrade deletes the undo approvals the table names,
+then drops it.
+
+Migration `0096_remediation_tune_refusal.py` (automated remediation,
+AUTOMATED-REMEDIATION-25) widens `remediation_nominations_refusal_ck` to accept
+`tune_execution_not_automated`, the refusal every nomination of an approved
+alert rule tuning request ends with (it executes nothing). The downgrade moves
+such rows to `finished` with the code in `execution_code`, then restores the
+narrower check.
+
+Migration `0097_remediation_receipts.py` (automated remediation,
+AUTOMATED-REMEDIATION-20) adds the nullable
+`remediation_delivery_surfaces.reply_conversation`, the thread the protected
+hook ingress records for the receipts, and `remediation_receipt_posts`, one row
+per (nomination, stage) the worker receipt loop has claimed: its lease, attempt
+count and `posted_at`. The row holds no message text, argument or reason and
+cascades with its nomination. The downgrade drops both.
+
 The candidate application serving window and ordered revision ancestry live in
 `packages/protected-hooks/src/curie_protected_hooks/schema_serving.json`,
 validated against the actual API migration graph and CLI candidate catalog.

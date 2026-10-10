@@ -49,6 +49,7 @@ from plugin_format.connector_render import object_name
 from sqlalchemy import text
 
 from .actions import ActionClient, RecordedAction
+from .api_retry import DEFAULT_BUDGET_S
 
 if TYPE_CHECKING:
     from kubernetes.client import AppsV1Api
@@ -191,6 +192,7 @@ class DigestAttributingRecorder:
         conversation_id: str,
         agent_id: str | None,
         gate_approval_id: str | None = None,
+        budget_s: float = DEFAULT_BUDGET_S,
     ) -> RecordedAction:
         recorded = await self._inner.record(
             frame,
@@ -198,6 +200,7 @@ class DigestAttributingRecorder:
             conversation_id=conversation_id,
             agent_id=agent_id,
             gate_approval_id=gate_approval_id,
+            budget_s=budget_s,
         )
         connector = hosted_connector(frame.tool)
         if self._deployments is None or connector is None:
@@ -207,7 +210,9 @@ class DigestAttributingRecorder:
             self._remember(recorded.id, opened)
         return recorded
 
-    async def complete(self, action_id: str, frame: SideEffectFlag) -> dict[str, Any]:
+    async def complete(
+        self, action_id: str, frame: SideEffectFlag, *, budget_s: float = DEFAULT_BUDGET_S
+    ) -> dict[str, Any]:
         pending = self._pending.pop(action_id, None)
         digest: str | None = None
         if pending is not None:
@@ -225,6 +230,7 @@ class DigestAttributingRecorder:
             frame,
             connector=pending.connector if pending is not None and digest else None,
             connector_digest=digest,
+            budget_s=budget_s,
         )
 
     # -- reads ---------------------------------------------------------------

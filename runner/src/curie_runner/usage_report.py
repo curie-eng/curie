@@ -9,6 +9,11 @@ whole call, not the turn that just finished. The reporter subtracts the previous
 total for the same session before it posts, so a later turn does not store the
 earlier turn again. See the Agent SDK cost guide:
 https://code.claude.com/docs/en/agent-sdk/cost-tracking
+
+A turn that ends without a ``ResultMessage`` (a closed stream, a cancellation,
+an iterator error) posts the per-message counts it observed under a fresh
+``unfinished:`` turn id, and a later drain of that turn's leftover result only
+advances the baseline, so its tokens are not counted again (#4190).
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import re
 from collections.abc import Collection, Mapping
 from dataclasses import replace
 from typing import Any, Protocol, cast
+from uuid import uuid4
 
 import aiohttp
 from claude_agent_sdk import AssistantMessage, ResultMessage
@@ -59,6 +65,10 @@ class UsageSink(Protocol):
     def observe(self, message: AssistantMessage) -> None: ...
 
     async def report(self, message: ResultMessage, primary_model: str | None) -> None: ...
+
+    async def report_unfinished(self, primary_model: str | None) -> None: ...
+
+    def absorb(self, message: ResultMessage) -> None: ...
 
 
 def _count(raw: object) -> int:
@@ -246,13 +256,19 @@ class UsageReporter:
         self._token = token
         self._observed: dict[tuple[str, str], dict[str, int]] = {}
         self._seen_message_ids: set[tuple[str, str, str]] = set()
+        # The SDK session of this turn's latest observed message.
+        self._observed_session: str | None = None
         # Session-cumulative model_usage already accepted by the API.
         # A new session id, or a drop in any count, means the SDK restarted the total.
         self._cumulative: dict[str, dict[str, int]] = {}
         self._cumulative_session: str | None = None
-        # Reviewer observations reported before they appear in cumulative totals.
-        # Queued bodies count too: their replay must retain the same usage.
+        # Usage posted before it appears in cumulative totals, per model: the
+        # reviewer entries of report bodies, and every observed count of an
+        # unfinished body. Queued bodies count too: their replay must retain
+        # the same usage.
         self._unmatched_reviewer: dict[str, dict[str, int]] = {}
+        # The SDK session an unfinished turn's counts came from.
+        self._unmatched_session: str | None = None
         # Bodies whose POST has not been accepted, each with the baseline that
         # becomes current once that body is accepted. Replay keeps the original
         # turn id and roles. record_usage treats a replayed turn as a no-op.
@@ -277,6 +293,9 @@ class UsageReporter:
         # per-model totals for a subagent model are not booked to the implementer.
         if not isinstance(usage, dict):
             usage = {}
+        session_id = getattr(message, "session_id", None)
+        if isinstance(session_id, str) and session_id:
+            self._observed_session = session_id
         role = REVIEWER if getattr(message, "parent_tool_use_id", None) is not None else IMPLEMENTER
         message_id = getattr(message, "message_id", None)
         if isinstance(message_id, str) and message_id:
@@ -307,7 +326,12 @@ class UsageReporter:
         session_id = session_id if isinstance(session_id, str) else None
         restarted = session_id != previous_session or _cumulative_decreased(previous, parsed)
         if restarted:
-            self._unmatched_reviewer.clear()
+            # Unfinished counts tagged with this SDK session carry onto any restart
+            # of it: a reset that came before them would otherwise post them twice.
+            carried = session_id is not None and session_id == self._unmatched_session
+            if not carried:
+                self._unmatched_reviewer.clear()
+                self._unmatched_session = None
             turn = {model: dict(counts) for model, counts in parsed.items()}
             baseline = {model: dict(counts) for model, counts in parsed.items()}
         else:
@@ -382,6 +406,7 @@ class UsageReporter:
     async def report(self, message: ResultMessage, primary_model: str | None) -> None:
         observed, self._observed = self._observed, {}
         self._seen_message_ids.clear()
+        self._observed_session = None
         try:
             model_usage = getattr(message, "model_usage", None)
             parsed: dict[str, dict[str, int]] = {}
@@ -426,3 +451,88 @@ class UsageReporter:
             logger.warning("usage report build failure: %s", type(exc).__name__)
             return
         await self._flush()
+
+    async def report_unfinished(self, primary_model: str | None) -> None:
+        """Post the observed per-message counts of a turn that has no result.
+
+        Called for every turn ending; a turn that reached its result already
+        emptied the observations in ``report``, so this posts nothing more.
+        The body carries a fresh turn id and does not move the baseline.
+        """
+
+        observed, self._observed = self._observed, {}
+        self._seen_message_ids.clear()
+        observed_session, self._observed_session = self._observed_session, None
+        try:
+            models: list[dict[str, Any]] = []
+            for (role, model), counts in observed.items():
+                entry: dict[str, Any] = {"model": model, "role": role}
+                entry.update({key: _count(counts.get(key)) for key in _WIRE_KEYS})
+                if any(entry[key] for key in _WIRE_KEYS):
+                    models.append(entry)
+            if not models:
+                return
+            # Every posted count, whatever its role, reaches model_usage later, in
+            # the drained result or a following turn; catch up by model total there.
+            owner = self._unmatched_session or (
+                self._speculative[0] if self._speculative else self._cumulative_session
+            )
+            # Counts left from another SDK session can never catch up in this one.
+            if (
+                self._unmatched_reviewer
+                and observed_session is not None
+                and owner is not None
+                and observed_session != owner
+            ):
+                self._unmatched_reviewer.clear()
+            self._unmatched_session = observed_session
+            for entry in models:
+                unmatched = self._unmatched_reviewer.setdefault(
+                    entry["model"], dict.fromkeys(_WIRE_KEYS, 0)
+                )
+                for key in _WIRE_KEYS:
+                    unmatched[key] += entry[key]
+            body: dict[str, Any] = {
+                "turn_id": f"unfinished:{uuid4().hex}",
+                "primary_model": primary_model,
+                "models": models,
+            }
+            session_id, baseline = self._speculative or (
+                self._cumulative_session,
+                self._cumulative,
+            )
+            copied = {model: dict(counts) for model, counts in baseline.items()}
+            self._queue.append((body, session_id, copied))
+        except Exception as exc:  # noqa: BLE001 - never fail the turn over a cost line
+            logger.warning("usage report build failure: %s", type(exc).__name__)
+            return
+        await self._flush()
+
+    def absorb(self, message: ResultMessage) -> None:
+        """Advance the baseline from a result that is not reported.
+
+        An abandoned turn's leftover result is drained by the next turn. Its
+        tokens were already posted as an unfinished body, so its cumulative
+        ``model_usage`` only moves the baseline the next turn subtracts from.
+        """
+
+        self._observed = {}
+        self._seen_message_ids.clear()
+        self._observed_session = None
+        try:
+            model_usage = getattr(message, "model_usage", None)
+            parsed: dict[str, dict[str, int]] = {}
+            if isinstance(model_usage, dict) and model_usage:
+                parsed = _parse_model_usage(model_usage)
+            if not parsed:
+                return
+            previous_session, previous = self._speculative or (
+                self._cumulative_session,
+                self._cumulative,
+            )
+            _, session_id, baseline = self._isolate_turn(
+                message, parsed, previous, previous_session
+            )
+            self._remember(session_id, baseline)
+        except Exception as exc:  # noqa: BLE001 - never fail the turn over a cost line
+            logger.warning("usage absorb failure: %s", type(exc).__name__)

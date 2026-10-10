@@ -41,6 +41,10 @@ pub(super) async fn run(action: DevAction) -> Result<()> {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             commands::dev_script("cli/scripts/factory-e2e.sh", &args).await
         }
+        DevAction::OidcE2e { args } => {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            commands::dev_script("cli/scripts/oidc-e2e.sh", &args).await
+        }
         DevAction::GithubStub { args } => {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             commands::dev_script("cli/scripts/github-stub.sh", &args).await

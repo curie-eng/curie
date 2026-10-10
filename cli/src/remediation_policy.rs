@@ -1,7 +1,7 @@
 //! The CLI mirror of the API's remediation policy document validator.
 //!
 //! @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-3 @spec AUTOMATED-REMEDIATION-10
-//! @spec AUTOMATED-REMEDIATION-24
+//! @spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-25
 //!
 //! `apps/api/src/curie_api/remediation_policy_document.py` validates a policy
 //! document; `curie <tier> remediation-policy apply` runs this mirror first so
@@ -18,8 +18,8 @@
 //! [`parse_policy_text`], as the API's pre-check refuses it. One deliberate
 //! difference, unreachable by a document the API accepts: the CLI's JSON
 //! objects iterate keys in sorted order rather than document order, so when
-//! several keys of one `limits` or `arguments` object are each invalid the
-//! CLI may name a different one first.
+//! several keys of one `limits`, `arguments`, `rules`, `change` or tune read
+//! map are each invalid the CLI may name a different one first.
 
 use std::fmt;
 
@@ -74,6 +74,31 @@ const ACTION_REQUIRED: &[&str] = &[
     "reversibility",
     "automatic",
 ];
+const TUNE_ACTION_KEYS: &[&str] = &[
+    "name",
+    "kind",
+    "connector",
+    "tool",
+    "rules",
+    "change",
+    "automatic",
+    "qualification",
+];
+const TUNE_ACTION_REQUIRED: &[&str] = &[
+    "name",
+    "kind",
+    "connector",
+    "tool",
+    "rules",
+    "change",
+    "automatic",
+];
+/// AUTOMATED-REMEDIATION-25: the closed set of tunable rule fields.
+const TUNE_FIELDS: &[&str] = &["threshold", "for_duration", "group_by", "dedupe", "retire"];
+const TUNE_RETIRE: &str = "retire";
+const TUNE_RULE_KEYS: &[&str] = &["current", "evidence"];
+const TUNE_READ_KEYS: &[&str] = &["connector", "tool", "arguments", "pointer"];
+const TUNE_RETIRE_KEYS: &[&str] = &["duplicate_of"];
 const ARGUMENT_KEYS: &[&str] = &["type", "allowed", "minimum", "maximum"];
 const DELTA_KEYS: &[&str] = &["max_delta", "min_delta", "delta"];
 const TARGET_KEYS: &[&str] = &["argument", "allowed"];
@@ -554,11 +579,157 @@ fn validate_verifier_timing(read: &Map<String, Value>, path: &str) -> Checked<()
     Ok(())
 }
 
-// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-24
-/// One action; returns its name.
+// @spec AUTOMATED-REMEDIATION-25
+/// A tune action's declared read: no comparator, the value is shown, not
+/// judged.
+fn validate_tune_read(read: &Value, path: &str) -> Checked<()> {
+    let read = closed(read, path, TUNE_READ_KEYS)?;
+    require(read, path, &["connector", "tool", "pointer"])?;
+    identifier(&read["connector"], &format!("{path}/connector"))?;
+    identifier(&read["tool"], &format!("{path}/tool"))?;
+    if read
+        .get("arguments")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(invalid(format!("{path}/arguments"), "must be an object"));
+    }
+    if !read["pointer"].as_str().is_some_and(is_pointer) {
+        return Err(invalid(
+            format!("{path}/pointer"),
+            "must be an RFC 6901 pointer",
+        ));
+    }
+    Ok(())
+}
+
+// @spec AUTOMATED-REMEDIATION-25
+/// A map from a field or evidence name to a declared read.
+fn validate_tune_reads(reads: &Value, path: &str) -> Checked<()> {
+    let Some(reads) = reads.as_object() else {
+        return Err(invalid(path, "must be an object"));
+    };
+    for (key, read) in reads {
+        let read_path = format!("{path}/{key}");
+        if !is_identifier(key) {
+            return Err(invalid(read_path, "must be a non-empty identifier"));
+        }
+        validate_tune_read(read, &read_path)?;
+    }
+    Ok(())
+}
+
+// @spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-25
+/// The AUTOMATED-REMEDIATION-25 shape, after the common name, kind,
+/// connector and tool.
+fn validate_tune(action: &Map<String, Value>, path: &str) -> Checked<()> {
+    let Some(automatic) = action["automatic"].as_bool() else {
+        return Err(invalid(format!("{path}/automatic"), "must be a boolean"));
+    };
+
+    let Some(rules) = action["rules"]
+        .as_object()
+        .filter(|rules| !rules.is_empty())
+    else {
+        return Err(invalid(
+            format!("{path}/rules"),
+            "must be a non-empty object",
+        ));
+    };
+    for (rule, declared) in rules {
+        let rule_path = format!("{path}/rules/{rule}");
+        if !is_identifier(rule) {
+            return Err(invalid(rule_path, "must be a non-empty identifier"));
+        }
+        let declared = closed(declared, &rule_path, TUNE_RULE_KEYS)?;
+        for reads in TUNE_RULE_KEYS {
+            if let Some(value) = declared.get(*reads) {
+                validate_tune_reads(value, &format!("{rule_path}/{reads}"))?;
+            }
+        }
+    }
+
+    let change_path = format!("{path}/change");
+    let Some(change) = action["change"]
+        .as_object()
+        .filter(|change| !change.is_empty())
+    else {
+        return Err(invalid(change_path, "must be a non-empty object"));
+    };
+    closed(&action["change"], &change_path, TUNE_FIELDS)?;
+    for (field, spec) in change {
+        let field_path = format!("{change_path}/{field}");
+        if field != TUNE_RETIRE {
+            validate_argument(spec, &field_path)?;
+            continue;
+        }
+        let spec = closed(spec, &field_path, TUNE_RETIRE_KEYS)?;
+        require(spec, &field_path, TUNE_RETIRE_KEYS)?;
+        let Some(duplicate_of) = spec["duplicate_of"]
+            .as_array()
+            .filter(|list| !list.is_empty())
+        else {
+            return Err(invalid(
+                format!("{field_path}/duplicate_of"),
+                "must be a non-empty list of declared rules",
+            ));
+        };
+        for (index, rule) in duplicate_of.iter().enumerate() {
+            if !rule.as_str().is_some_and(|rule| rules.contains_key(rule)) {
+                return Err(invalid(
+                    format!("{field_path}/duplicate_of/{index}"),
+                    "must name a rule the action declares",
+                ));
+            }
+        }
+    }
+
+    for (rule, declared) in rules {
+        let current = declared.get("current").and_then(Value::as_object);
+        for field in current.into_iter().flat_map(Map::keys) {
+            if !change.contains_key(field) {
+                return Err(invalid(
+                    format!("{path}/rules/{rule}/current/{field}"),
+                    "must be a field the change declares",
+                ));
+            }
+        }
+    }
+
+    if automatic {
+        return Err(refuse(
+            "kind_not_automatic",
+            format!("{path}/automatic"),
+            "a tune action is never automatic",
+        ));
+    }
+    Ok(())
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-22
+fn validate_qualification(action: &Map<String, Value>, path: &str) -> Checked<()> {
+    match action.get("qualification") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(reference)) if !reference.is_empty() => Ok(()),
+        Some(_) => Err(invalid(
+            format!("{path}/qualification"),
+            "must be null or a reference",
+        )),
+    }
+}
+
+// @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-24 @spec AUTOMATED-REMEDIATION-25
+/// One action; returns its name. The closed key set is the action kind's:
+/// `tune` has its own, and any other or unknown kind the `remediate`/`prevent`
+/// set.
 fn validate_action<'a>(action: &'a Value, path: &str) -> Checked<&'a str> {
-    let action = closed(action, path, ACTION_KEYS)?;
-    require(action, path, ACTION_REQUIRED)?;
+    let tune = action.get("kind").and_then(Value::as_str) == Some("tune");
+    let (keys, required) = if tune {
+        (TUNE_ACTION_KEYS, TUNE_ACTION_REQUIRED)
+    } else {
+        (ACTION_KEYS, ACTION_REQUIRED)
+    };
+    let action = closed(action, path, keys)?;
+    require(action, path, required)?;
     let Some(name) = action["name"].as_str().filter(|name| is_action_name(name)) else {
         return Err(invalid(
             format!("{path}/name"),
@@ -572,6 +743,11 @@ fn validate_action<'a>(action: &'a Value, path: &str) -> Checked<&'a str> {
     let kind = kind.as_str().unwrap_or_default();
     identifier(&action["connector"], &format!("{path}/connector"))?;
     identifier(&action["tool"], &format!("{path}/tool"))?;
+    if tune {
+        validate_tune(action, path)?;
+        validate_qualification(action, path)?;
+        return Ok(name);
+    }
     if !one_of(&action["reversibility"], REVERSIBILITIES) {
         return Err(invalid(
             format!("{path}/reversibility"),
@@ -636,28 +812,20 @@ fn validate_action<'a>(action: &'a Value, path: &str) -> Checked<&'a str> {
         ));
     }
 
-    match action.get("qualification") {
-        None | Some(Value::Null) => {}
-        Some(Value::String(reference)) if !reference.is_empty() => {}
-        Some(_) => {
-            return Err(invalid(
-                format!("{path}/qualification"),
-                "must be null or a reference",
-            ))
-        }
-    }
+    validate_qualification(action, path)?;
     Ok(name)
 }
 
 // @spec AUTOMATED-REMEDIATION-2 @spec AUTOMATED-REMEDIATION-10 @spec AUTOMATED-REMEDIATION-24
+// @spec AUTOMATED-REMEDIATION-25
 /// Validate a whole policy document as the API's `validate_document` does,
 /// returning the API's first refusal.
 pub fn validate_policy_document(document: &Value) -> Result<(), PolicyRefusal> {
     let document = closed(document, "", TOP_KEYS)?;
     require(document, "", TOP_KEYS)?;
-    if !document["route"]
+    if document["route"]
         .as_str()
-        .is_some_and(|route| !python_strip(route).is_empty())
+        .is_none_or(|route| python_strip(route).is_empty())
     {
         return Err(invalid("/route", "must name an approval route"));
     }

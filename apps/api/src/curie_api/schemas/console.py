@@ -1,6 +1,7 @@
+import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ConsoleLoginCodeMint(BaseModel):
@@ -44,3 +45,22 @@ class ConsoleSessionOut(BaseModel):
 
     subject: str | None
     expires_at: datetime
+
+
+class PrincipalOut(BaseModel):
+    """The principal an OIDC console session authenticates (#2908).
+
+    Identity and display attributes only. ``idp_issuer`` and the authorization
+    version are server bookkeeping the console has no use for, and the session
+    token never appears here for the same reason it is absent from
+    ``ConsoleSessionOut``.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    idp_subject: str
+    display_name: str | None
+    email: str | None
+    status: str

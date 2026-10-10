@@ -22,9 +22,11 @@ version, ends the execution ``refused`` with ``version_conflict`` and writes the
 ``refused_conflict`` audit row naming both versions, in the same transaction,
 so no ``dispatched`` commit (and so no write call) can follow it.
 
-Every route uses the platform key the worker already holds
-(``require_platform_key``), never a console session. No response, audit row or
-refusal body carries an envelope, a state, an argument or a result.
+The probe and every claim, observation, arguments, dispatch and outcome route
+require the internal worker token (``require_internal_worker_token``), never
+the platform or operator key or a console session; only the receipt,
+``GET /action-executions/{id}``, takes the platform key for the operator CLI.
+No response, audit row or refusal body carries an envelope, a state, an argument or a result.
 """
 
 from __future__ import annotations
@@ -34,19 +36,22 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..action_execution_codes import (
     EXHAUSTED_CLAIM_CODE,
     EXPIRED_DISPATCH_CODE,
+    NOT_REVERSIBLE_NOW_CODE,
+    POLICY_CHANGED_CODE,
+    SKIPPED_SAMPLE,
     CodeRejected,
     outcome_code,
 )
 from ..auth import require_internal_worker_token, require_platform_key
 from ..config import get_settings
-from ..deps import SessionDep
+from ..deps import KillSwitchDep, SessionDep, StoreDep
 from ..models import (
     ActionAuditEntry,
     ActionExecution,
@@ -56,6 +61,31 @@ from ..models import (
     ConnectorCapability,
     ExecutionKind,
     ExecutionState,
+    RemediationNomination,
+)
+from ..remediation_admission import (
+    authority_refusal,
+    precondition_nomination,
+    preconditions_ended,
+    raise_approval,
+    refuse_changed_authority,
+    return_to_approval,
+)
+from ..remediation_forward import (
+    ADMITTED,
+    APPROVAL_AUTHORITY,
+    POLICY_AUTHORITY,
+    nomination_for_execution,
+    not_reversible_now,
+    policy_generation,
+)
+from ..remediation_qualifications import qualification_reads_ended
+from ..remediation_reads import missed_samples
+from ..remediation_verifier import (
+    finish_unverified,
+    is_observe_only,
+    reads_ended,
+    schedule_verification,
 )
 from ..schemas.action_executions import (
     ExecutionArguments,
@@ -65,7 +95,9 @@ from ..schemas.action_executions import (
     ExecutionObservation,
     ExecutionOut,
     ExecutionOutcome,
+    ExecutionSample,
     ProbeCreate,
+    ReadArguments,
 )
 
 # Route decisions: the writing routes take the internal worker token, never
@@ -173,6 +205,8 @@ def _audit(
         action=kind,
         actor=execution.requested_by or _EXECUTOR,
         actor_channel=None,
+        # @spec AUTOMATED-REMEDIATION-14: a restore's rows belong to its ruling.
+        actor_kind="undo_ruling",
         authorizer=_EXECUTOR,
         authorized=authorized,
         reason=reason,
@@ -344,6 +378,8 @@ async def _expire_dispatched(session: AsyncSession, now: datetime) -> None:
     """@spec ACTION-EXECUTOR-17: a ``dispatched`` lease that expired is ``indeterminate``.
 
     The call may have reached the connector, so it is never repeated.
+    @spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending so
+    finishes its nomination ``not-recovered`` with the code.
     """
 
     expired = (
@@ -358,6 +394,72 @@ async def _expire_dispatched(session: AsyncSession, now: datetime) -> None:
     ).all()
     for execution in expired:
         _finish(session, execution, ExecutionState.indeterminate, EXPIRED_DISPATCH_CODE, now)
+    if expired:
+        await session.flush()
+    for execution in expired:
+        await finish_unverified(session, execution, now)
+
+
+# @spec AUTOMATED-REMEDIATION-12 (executor amendment E9): one transaction-scoped
+# advisory lock serializes every claim across API replicas, so the live count
+# read under it is the installation's and the cap cannot be overrun.
+_CLAIM_LOCK = text(
+    "SELECT pg_advisory_xact_lock(hashtextextended('curie.action_executions.claim', 0))"
+)
+_LIVE = (ExecutionState.claimed, ExecutionState.dispatched)
+
+
+async def _expire_claimed_reads(session: AsyncSession, now: datetime) -> list[ActionExecution]:
+    """@spec AUTOMATED-REMEDIATION-12: a read whose lease expired is never re-queued.
+
+    It ends ``refused`` with ``runner_unavailable``, an unsuccessful sample,
+    so a crashed holder never holds a slot or reads twice.
+    """
+
+    expired = (
+        await session.scalars(
+            select(ActionExecution)
+            .where(
+                ActionExecution.kind == ExecutionKind.read,
+                ActionExecution.state == ExecutionState.claimed,
+                ActionExecution.lease_expires_at <= now,
+            )
+            .with_for_update(skip_locked=True)
+        )
+    ).all()
+    for execution in expired:
+        _finish(session, execution, ExecutionState.refused, EXHAUSTED_CLAIM_CODE, now)
+    return list(expired)
+
+
+async def _skip_missed_samples(session: AsyncSession, now: datetime) -> list[str]:
+    """@spec AUTOMATED-REMEDIATION-12: a sample whose successor is due is ``skipped``.
+
+    It never claims a sandbox. It ends ``confirmed`` with the sample
+    ``{"sample": "skipped", "value": null}``, an unsuccessful sample and never a
+    refusal code. Returns the skipped reads' keys for the verifier.
+    """
+
+    skipped = await session.scalars(
+        update(ActionExecution)
+        .where(missed_samples(now))
+        .values(
+            state=ExecutionState.confirmed.value,
+            sample={"sample": SKIPPED_SAMPLE, "value": None},
+            finished_at=now,
+        )
+        .returning(ActionExecution.idempotency_key)
+        .execution_options(synchronize_session=False)
+    )
+    return list(skipped.all())
+
+
+def _due(now: datetime) -> Any:
+    """A requested execution with no ``not_before``, or one at or before now."""
+
+    return (ActionExecution.state == ExecutionState.requested) & (
+        ActionExecution.not_before.is_(None) | (ActionExecution.not_before <= now)
+    )
 
 
 @router.post(
@@ -365,8 +467,10 @@ async def _expire_dispatched(session: AsyncSession, now: datetime) -> None:
     response_model=ExecutionOut,
     responses={204: {"description": "Nothing is claimable."}},
 )
-async def claim_execution(data: ExecutionClaim, session: SessionDep) -> Any:
-    """Claim the oldest claimable execution under a lease, or ``204``.
+async def claim_execution(
+    data: ExecutionClaim, session: SessionDep, store: StoreDep, kill_switch: KillSwitchDep
+) -> Any:
+    """Claim the oldest due execution under a lease, or ``204``.
 
     @spec ACTION-EXECUTOR-17 and the ACTION-EXECUTOR-20 amendment: a
     ``requested`` row is claimable, and so is a ``claimed`` row whose lease
@@ -374,23 +478,92 @@ async def claim_execution(data: ExecutionClaim, session: SessionDep) -> Any:
     fence is stale. A reclaim forgets the earlier attempt's observation, so the
     new holder must observe again. After ``MAX_ATTEMPTS`` the row is refused.
     @spec ACTION-EXECUTOR-1: with the executor off, nothing is handed out.
+
+    @spec AUTOMATED-REMEDIATION-12 (executor amendments E5 and E9): only due
+    executions (``not_before`` NULL or past) are handed out, oldest
+    ``not_before`` first (an unscheduled row by its creation time); never more
+    than ``action_executor_max_concurrent_sandboxes`` are live (claimed or
+    dispatched) across the installation, and while two or more slots exist at
+    most all but one are reads. An expired read is refused ``runner_unavailable``
+    and never reclaimed; a due read whose series successor is due is skipped.
+
+    @spec AUTOMATED-REMEDIATION-11 (executor amendment E8): a ``policy`` forward
+    execution is handed out only while its remediation authority holds
+    (``remediation_admission.authority_refusal``); otherwise it ends ``refused``
+    ``policy_changed`` before any sandbox claim, its nomination goes back to
+    approval, and the next due execution is considered. An expired precondition
+    read decides its nomination's check 12 (AUTOMATED-REMEDIATION-9).
     """
 
-    if not get_settings().action_executor_enabled:
+    owed: list[uuid.UUID] = []
+    expired_reads: list[ActionExecution] = []
+    answer = await _claim(data, session, owed, expired_reads)
+    preconditions = [r.id for r in expired_reads if precondition_nomination(r.idempotency_key)]
+    # After the claim transaction ended: the approvals of nominations a changed
+    # authority returned, and the preconditions an expiry ended.
+    for nomination_id in owed:
+        await raise_approval(session, nomination_id)
+    await preconditions_ended(session, store, kill_switch, preconditions)
+    return answer
+
+
+async def _claim(
+    data: ExecutionClaim,
+    session: AsyncSession,
+    owed: list[uuid.UUID],
+    expired_reads: list[ActionExecution],
+) -> Any:
+    settings = get_settings()
+    if not settings.action_executor_enabled:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
+    await session.execute(_CLAIM_LOCK)
     now = await _now(session)
     await _expire_dispatched(session, now)
+    expired_reads.extend(await _expire_claimed_reads(session, now))
+    ended = [execution.idempotency_key for execution in expired_reads]
+    ended += await _skip_missed_samples(session, now)
+    await session.flush()
+    # @spec AUTOMATED-REMEDIATION-18: a read the claim route ended may decide
+    # its verification, which ends the rest of that series before any is handed out.
+    await reads_ended(session, ended, now)
+    await qualification_reads_ended(session, ended, now)
+    await session.flush()
+
+    cap = settings.action_executor_max_concurrent_sandboxes
+    read_cap = cap - 1 if cap >= 2 else cap
+    live = (ActionExecution.state.in_(_LIVE)) & (ActionExecution.lease_expires_at > now)
+    by_kind: dict[str, int] = {
+        kind: int(count)
+        for kind, count in (
+            await session.execute(
+                select(ActionExecution.kind, func.count())
+                .where(live)
+                .group_by(ActionExecution.kind)
+            )
+        ).all()
+    }
+    live_reads = by_kind.get(ExecutionKind.read.value, 0)
+    if sum(by_kind.values()) >= cap:
+        await session.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    claimable = or_(
+        _due(now),
+        (ActionExecution.state == ExecutionState.claimed)
+        & (ActionExecution.kind != ExecutionKind.read)
+        & (ActionExecution.lease_expires_at <= now),
+    )
+    if live_reads >= read_cap:
+        claimable = claimable & (ActionExecution.kind != ExecutionKind.read)
     while True:
         execution = await session.scalar(
             select(ActionExecution)
-            .where(
-                or_(
-                    ActionExecution.state == ExecutionState.requested,
-                    (ActionExecution.state == ExecutionState.claimed)
-                    & (ActionExecution.lease_expires_at <= now),
-                )
+            .where(claimable)
+            .order_by(
+                func.coalesce(ActionExecution.not_before, ActionExecution.created_at),
+                ActionExecution.created_at,
+                ActionExecution.id,
             )
-            .order_by(ActionExecution.created_at, ActionExecution.id)
             .limit(1)
             .with_for_update(skip_locked=True)
         )
@@ -400,6 +573,15 @@ async def claim_execution(data: ExecutionClaim, session: SessionDep) -> Any:
         if execution.state == ExecutionState.claimed and execution.attempt >= MAX_ATTEMPTS:
             _finish(session, execution, ExecutionState.refused, EXHAUSTED_CLAIM_CODE, now)
             await session.flush()
+            await finish_unverified(session, execution, now)
+            continue
+        if await authority_refusal(session, execution) is not None:
+            # @spec AUTOMATED-REMEDIATION-11 (E8): before any sandbox claim.
+            _finish(session, execution, ExecutionState.refused, POLICY_CHANGED_CODE, now)
+            await session.flush()
+            returned = await refuse_changed_authority(session, execution)
+            if returned is not None:
+                owed.append(returned)
             continue
         execution.state = ExecutionState.claimed
         execution.attempt = execution.attempt + 1
@@ -446,6 +628,8 @@ async def record_observation(
     execution = await _locked(session, execution_id)
     now = await _now(session)
     _check_fence(execution, data, now)
+    if is_observe_only(execution):
+        return await _record_observe_only(session, execution, data, now)
     if execution.kind != ExecutionKind.restore:
         raise _conflict("only a restore observes a version")
     seen, version = _observed(execution)
@@ -477,6 +661,38 @@ async def record_observation(
     return _out(execution)
 
 
+async def _record_observe_only(
+    session: AsyncSession,
+    execution: ActionExecution,
+    data: ExecutionObservation,
+    now: datetime,
+) -> ExecutionOut:
+    """@spec AUTOMATED-REMEDIATION-18 (executor amendment E3): an observe-only read.
+
+    The version is recorded unjudged and the execution ends ``confirmed``; the
+    verifier compares it with the action's ``post_version`` (``superseded``).
+    Attribution, never success. A replay of the same version answers the row
+    unchanged; another version is a conflicting report.
+    """
+
+    observed = data.version[:_MAX_VERSION] if data.version is not None else None
+    seen, version = _observed(execution)
+    if seen:
+        if version != observed:
+            raise _conflict("a different version was already observed")
+        return _out(execution)
+    if execution.state != ExecutionState.claimed:
+        raise _conflict(f"an execution in state {execution.state} observes nothing")
+    execution.outcome = {"observed_version": observed}
+    _finish(session, execution, ExecutionState.confirmed, None, now)
+    await session.flush()
+    await reads_ended(session, [execution.idempotency_key], now)
+    await qualification_reads_ended(session, [execution.idempotency_key], now)
+    await session.commit()
+    await session.refresh(execution)
+    return _out(execution)
+
+
 # --------------------------------------------------------------------------- #
 # Dispatch and outcome (ACTION-EXECUTOR-17, -18, -20)
 # --------------------------------------------------------------------------- #
@@ -484,7 +700,7 @@ async def record_observation(
 
 @router.post("/{execution_id}/dispatch", response_model=ExecutionOut)
 async def dispatch_execution(
-    execution_id: uuid.UUID, data: ExecutionFence, session: SessionDep
+    execution_id: uuid.UUID, data: ExecutionFence, session: SessionDep, store: StoreDep
 ) -> ExecutionOut:
     """Commit ``dispatched``, the last step before a write call.
 
@@ -493,6 +709,10 @@ async def dispatch_execution(
     probe never does (ACTION-EXECUTOR-1). @spec ACTION-EXECUTOR-19: a
     ``claimed`` forward execution dispatches without observing, and the commit
     creates its one ledger row; a replay answers the row it already names.
+    @spec AUTOMATED-REMEDIATION-13: a policy remediation of a ``reversible``
+    action whose capability or custody no longer holds ends ``refused``
+    ``not_reversible_now`` instead, with no ledger row, and its nomination goes
+    back to approval.
     """
 
     execution = await _locked(session, execution_id)
@@ -509,6 +729,24 @@ async def dispatch_execution(
     if execution.state != ExecutionState.claimed:
         raise _conflict(f"an execution in state {execution.state} cannot dispatch")
     if execution.kind == ExecutionKind.forward:
+        nomination = await nomination_for_execution(session, execution)
+        if nomination is not None and await not_reversible_now(
+            session, store, execution, nomination
+        ):
+            _finish(session, execution, ExecutionState.refused, NOT_REVERSIBLE_NOW_CODE, now)
+            # Only a nomination still ``admitted`` goes back to approval; one
+            # already rejected, expired or finished keeps its state.
+            # @spec AUTOMATED-REMEDIATION-10: it did not execute, so its
+            # reservation is released.
+            returned = await return_to_approval(
+                session, nomination.id, NOT_REVERSIBLE_NOW_CODE, from_states=(ADMITTED,)
+            )
+            await session.commit()
+            await session.refresh(execution)
+            answer = _out(execution)
+            if returned:
+                await raise_approval(session, nomination.id)
+            return answer
         await _record_forward_action(session, execution)
     elif execution.kind != ExecutionKind.restore:
         raise _conflict(f"a {execution.kind} execution cannot dispatch")
@@ -543,6 +781,11 @@ async def _record_forward_action(session: AsyncSession, execution: ActionExecuti
     if not execution.tool or execution.forward_arguments is None:
         raise _conflict("this forward execution has no bound call")
     key = f"{_FORWARD_CALL_PREFIX}{execution.id}"
+    # @spec AUTOMATED-REMEDIATION-13 @spec AUTOMATED-REMEDIATION-14: a
+    # remediation's record carries its delivery, nomination and actor, and an
+    # approval authority's gating approval. Other forward calls keep them NULL.
+    nomination = await nomination_for_execution(session, execution)
+    provenance = _remediation_provenance(execution, nomination)
     action_id = await session.scalar(
         insert(AgentAction)
         .values(
@@ -552,17 +795,19 @@ async def _record_forward_action(session: AsyncSession, execution: ActionExecuti
             call_id=key,
             tool=f"mcp__{execution.connector}__{execution.tool}",
             arguments=execution.forward_arguments,
-            gate_approval_id=None,
             status=ActionStatus.pending.value,
             dedupe_key=key,
             connector=execution.connector,
             connector_digest=execution.connector_digest,
             authority_kind=execution.authority_kind,
             authority_ref=execution.authority_ref,
+            **provenance,
         )
         .on_conflict_do_nothing(index_elements=["dedupe_key"])
         .returning(AgentAction.id)
     )
+    if action_id is not None and nomination is not None:
+        session.add(await _remediation_audit(session, execution, nomination, action_id))
     if action_id is None:
         action_id = await session.scalar(
             select(AgentAction.id).where(
@@ -574,10 +819,70 @@ async def _record_forward_action(session: AsyncSession, execution: ActionExecuti
     execution.subject_action_id = action_id
 
 
-@router.post("/{execution_id}/arguments", response_model=ExecutionArguments)
+def _remediation_provenance(
+    execution: ActionExecution, nomination: RemediationNomination | None
+) -> dict[str, Any]:
+    """The ledger columns a remediation adds (AUTOMATED-REMEDIATION-13, -14)."""
+
+    if nomination is None or execution.authority_kind not in (
+        POLICY_AUTHORITY,
+        APPROVAL_AUTHORITY,
+    ):
+        return {"gate_approval_id": None}
+    approval = execution.authority_kind == APPROVAL_AUTHORITY
+    return {
+        "gate_approval_id": nomination.approval_id if approval else None,
+        "actor_kind": execution.authority_kind,
+        "delivery_event_id": nomination.event_id,
+        "nomination_id": nomination.id,
+    }
+
+
+async def _remediation_audit(
+    session: AsyncSession,
+    execution: ActionExecution,
+    nomination: RemediationNomination,
+    action_id: uuid.UUID,
+) -> ActionAuditEntry:
+    """@spec AUTOMATED-REMEDIATION-14: the audit row naming a remediation's actor.
+
+    A policy actor is ``actor_kind`` ``policy`` with the policy reference as
+    ``actor``; the evidence names the policy, its generation and the operator
+    principal that bound it, the delivery and the nomination. An approval actor
+    is ``approval`` with the approval as ``actor``. Never an empty human field.
+    """
+
+    generation = await policy_generation(session, nomination, execution.authority_kind)
+    approval = execution.authority_kind == APPROVAL_AUTHORITY
+    return ActionAuditEntry(
+        action_id=action_id,
+        action="authorized",
+        actor=f"approval:{execution.authority_ref}" if approval else execution.authority_ref,
+        actor_channel=None,
+        actor_kind=execution.authority_kind,
+        authorizer="remediation-approval" if approval else "remediation-policy",
+        authorized=True,
+        reason=(
+            "an approved remediation approval authorized this call"
+            if approval
+            else "an admitted nomination under a bound policy authorized this call"
+        ),
+        evidence={
+            "execution_id": str(execution.id),
+            "nomination_id": str(nomination.id),
+            "delivery_event_id": nomination.event_id,
+            "policy": f"{nomination.agent_id}:{nomination.hook}",
+            "generation": generation.generation if generation is not None else None,
+            "bound_by": generation.bound_by if generation is not None else None,
+        },
+        created_at=func.clock_timestamp(),
+    )
+
+
+@router.post("/{execution_id}/arguments", response_model=ExecutionArguments | ReadArguments)
 async def read_arguments(
     execution_id: uuid.UUID, data: ExecutionFence, session: SessionDep
-) -> ExecutionArguments:
+) -> ExecutionArguments | ReadArguments:
     """The bound tool and arguments of the claimed forward execution this fence holds.
 
     @spec ACTION-EXECUTOR-7 @spec ACTION-EXECUTOR-19. The worker recomputes
@@ -586,18 +891,35 @@ async def read_arguments(
     before dispatch; ``ExecutionOut`` never carries them. The body is exactly
     the fence (a body naming a tool or arguments is a 422), a stale fence is a
     ``409``, and only a ``claimed`` forward execution answers. Nothing moves.
+
+    @spec AUTOMATED-REMEDIATION-12: a ``claimed`` read execution answers its
+    bound tool, arguments and pointer the same way; an observe-only execution
+    (AUTOMATED-REMEDIATION-18) answers ``observe_version``, the recorded target
+    and a null pointer.
     """
 
     execution = await _locked(session, execution_id)
     now = await _now(session)
     _check_fence(execution, data, now)
-    if execution.kind != ExecutionKind.forward:
+    if execution.kind not in (ExecutionKind.forward, ExecutionKind.read):
         raise _conflict(f"a {execution.kind} execution has no bound arguments")
     if execution.state != ExecutionState.claimed:
         raise _conflict(f"an execution in state {execution.state} reads no arguments")
     if not execution.tool or execution.forward_arguments is None:
-        raise _conflict("this forward execution has no bound call")
-    answer = ExecutionArguments(tool=execution.tool, arguments=execution.forward_arguments)
+        raise _conflict(f"this {execution.kind} execution has no bound call")
+    answer: ExecutionArguments | ReadArguments
+    if execution.kind == ExecutionKind.read:
+        # @spec AUTOMATED-REMEDIATION-18 (E3): only an observe-only execution
+        # carries no pointer.
+        if execution.pointer is None and not is_observe_only(execution):
+            raise _conflict("this read execution has no bound pointer")
+        answer = ReadArguments(
+            tool=execution.tool,
+            arguments=execution.forward_arguments,
+            pointer=execution.pointer,
+        )
+    else:
+        answer = ExecutionArguments(tool=execution.tool, arguments=execution.forward_arguments)
     await session.commit()
     return answer
 
@@ -610,7 +932,11 @@ def _reported(execution: ActionExecution) -> tuple[str, str | None, bool | None]
 
 @router.post("/{execution_id}/outcome", response_model=ExecutionOut)
 async def report_outcome(
-    execution_id: uuid.UUID, data: ExecutionOutcome, session: SessionDep
+    execution_id: uuid.UUID,
+    data: ExecutionOutcome,
+    session: SessionDep,
+    store: StoreDep,
+    kill_switch: KillSwitchDep,
 ) -> ExecutionOut:
     """Record how an execution ended.
 
@@ -622,6 +948,15 @@ async def report_outcome(
     the verbs it observed. An unknown post-dispatch code is normalized by stage.
     A replay of the stored outcome returns the row unchanged; a different one
     is refused and the first stands.
+
+    @spec AUTOMATED-REMEDIATION-18: a remediation's forward execution ending
+    schedules its verifier (``confirmed``) or finishes it ``not-recovered``
+    with the execution's code (``failed``, ``indeterminate``, ``refused``) in
+    the same transaction; a refused read
+    is evaluated by its verification.
+
+    @spec AUTOMATED-REMEDIATION-9: a refused precondition read sends its
+    nomination to approval ``precondition_unavailable`` once this commits.
     """
 
     try:
@@ -649,6 +984,10 @@ async def report_outcome(
 
     state = ExecutionState(data.state)
     allowed_from: ExecutionState | None
+    if execution.kind == ExecutionKind.read and state != ExecutionState.refused:
+        # @spec AUTOMATED-REMEDIATION-12 (E5): a read ends ``confirmed`` only
+        # through its sample, and never dispatches to fail.
+        raise _conflict("a read execution ends confirmed only through its sample")
     if state == ExecutionState.refused:
         allowed_from = ExecutionState.claimed
     elif execution.kind == ExecutionKind.probe:
@@ -681,6 +1020,79 @@ async def report_outcome(
         )
     elif state == ExecutionState.confirmed and execution.kind == ExecutionKind.restore:
         await _confirm_restore(session, execution, now)
+    elif execution.kind == ExecutionKind.forward:
+        await session.flush()
+        await schedule_verification(session, store, execution, now)
+    elif execution.kind == ExecutionKind.read:
+        await session.flush()
+        await reads_ended(session, [execution.idempotency_key], now)
+        await qualification_reads_ended(session, [execution.idempotency_key], now)
     await session.commit()
     await session.refresh(execution)
-    return _out(execution)
+    answer = _out(execution)
+    if precondition_nomination(execution.idempotency_key) is not None:
+        await preconditions_ended(session, store, kill_switch, [execution_id])
+    return answer
+
+
+# --------------------------------------------------------------------------- #
+# Samples (AUTOMATED-REMEDIATION-12)
+# --------------------------------------------------------------------------- #
+
+
+def _same_sample(stored: dict[str, Any] | None, reported: dict[str, Any]) -> bool:
+    """Equal kind and value, a boolean never equal to a number."""
+
+    if stored is None or stored.get("sample") != reported["sample"]:
+        return False
+    before, after = stored.get("value"), reported["value"]
+    return isinstance(before, bool) == isinstance(after, bool) and before == after
+
+
+@router.post("/{execution_id}/samples", response_model=ExecutionOut)
+async def report_sample(
+    execution_id: uuid.UUID,
+    data: ExecutionSample,
+    session: SessionDep,
+    store: StoreDep,
+    kill_switch: KillSwitchDep,
+) -> ExecutionOut:
+    """Record the one sample a claimed read execution took, ending it ``confirmed``.
+
+    @spec AUTOMATED-REMEDIATION-12: the fence plus exactly ``sample`` and
+    ``value`` (remediation-predicate.json ``sample_report``); the API evaluates
+    the predicate from the stored sample (AUTOMATED-REMEDIATION-18). Only a ``claimed`` read
+    reports one; a replay of the stored sample answers the row unchanged and a
+    different one is refused (``409``). The answer is the receipt, which never
+    carries the value or the pointer.
+
+    @spec AUTOMATED-REMEDIATION-9: a precondition read's sample decides its
+    nomination's check 12 once this commits (``remediation_admission``).
+    """
+
+    execution = await _locked(session, execution_id)
+    now = await _now(session)
+    _check_fence(execution, data, now)
+    if execution.kind != ExecutionKind.read or is_observe_only(execution):
+        raise _conflict(f"a {execution.kind} execution takes no sample")
+    reported = {"sample": data.sample, "value": data.value}
+    if execution.state in _TERMINAL:
+        if execution.state != ExecutionState.confirmed or not _same_sample(
+            execution.sample, reported
+        ):
+            raise _conflict("this read execution already ended with another result")
+        return _out(execution)
+    if execution.state != ExecutionState.claimed:
+        raise _conflict(f"a read execution in state {execution.state} takes no sample")
+    execution.sample = reported
+    _finish(session, execution, ExecutionState.confirmed, None, now)
+    await session.flush()
+    # @spec AUTOMATED-REMEDIATION-18: the API evaluates the predicate.
+    await reads_ended(session, [execution.idempotency_key], now)
+    await qualification_reads_ended(session, [execution.idempotency_key], now)
+    await session.commit()
+    await session.refresh(execution)
+    answer = _out(execution)
+    if precondition_nomination(execution.idempotency_key) is not None:
+        await preconditions_ended(session, store, kill_switch, [execution_id])
+    return answer

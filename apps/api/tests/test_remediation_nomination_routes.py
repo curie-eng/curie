@@ -377,7 +377,12 @@ def test_a_block_writes_one_row_per_entry_resolved_from_the_binding(
     the policy) and whose current generation is the bound one; arguments are
     canonical with their digest, the reason is stored, and each row's target
     key names the connector and the literal target value, distinct per target.
-    No parse refusal, approval or execution.
+    No parse refusal and no execution.
+
+    Admission (task 9, AUTOMATED-REMEDIATION-8) then runs in the same route: a
+    delivery admitted before any policy existed fails check 3, so each
+    well-formed row is ``approval_requested`` with ``generation_not_current``
+    and its own argument-bound approval (AUTOMATED-REMEDIATION-4, -15).
     """
 
     remediation(monkeypatch, enabled=True)
@@ -408,14 +413,23 @@ def test_a_block_writes_one_row_per_entry_resolved_from_the_binding(
                 assert arguments_text(row["arguments"]) == text
                 assert row["arguments_sha256"] == hashlib.sha256(text.encode()).hexdigest()
                 assert row["reason"] == item.get("reason")
-                assert row["state"] != "refused" and row["refusal_code"] is None, row
-                assert row["approval_id"] is None and row["execution_id"] is None
+                assert row["state"] == "approval_requested", row
+                assert row["refusal_code"] is None, row
+                assert row["approval_id"] is not None and row["execution_id"] is None, row
                 assert row["created_at"] is not None
                 target = target_text(row["target"])
                 assert CONNECTOR in target, target
                 assert canonical(item["arguments"]["deployment"]) in target, target
             assert target_text(found[0]["target"]) != target_text(found[1]["target"])
-            assert await side_effect_counts() == before
+            reasons = await asyncio.to_thread(
+                sql_dicts,
+                "SELECT approval_reason FROM curie.remediation_nominations WHERE event_id = :e",
+                {"e": event},
+            )
+            assert [r["approval_reason"] for r in reasons] == ["generation_not_current"] * 2
+            assert found[0]["approval_id"] != found[1]["approval_id"]
+            after = await side_effect_counts()
+            assert after == {**before, "approvals": before["approvals"] + 2}, after
 
     run(scenario)
 

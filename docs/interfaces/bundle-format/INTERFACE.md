@@ -28,7 +28,7 @@ validates unchanged. On top of that base the package **does add eleven Curie aut
 extensions**: `systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`, `approvalPolicy`,
 `toolPolicy`, `channelRead`, `canvasList`, `canvasRead` and `canvasEdit` on `packages/plugin-format/src/plugin_format/models.py::PluginManifest`, optional
 fields Claude Code does not define. `secrets` names the secrets a deploy must bind;
-`optionalSecrets` (ADR 0209) names the ones it may leave unbound, validated the same
+`optionalSecrets` (ADR 0210) names the ones it may leave unbound, validated the same
 way, and a name may not appear in both (`secrets.optional_overlap`). Leniency is what lets the Claude Code base and these
 extensions coexist; the earlier "does not invent format extensions" framing was wrong.
 
