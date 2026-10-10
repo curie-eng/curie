@@ -127,6 +127,8 @@ def test_extra_revisions_on_both_trains_do_not_block_shared_merge(repo: Path) ->
     result = _run_gate(repo, "--other-train-ref", OTHER_TRAIN_REF)
 
     assert result.returncode == 0, result.stderr
+    assert "4 shared" in result.stdout
+    assert OTHER_TRAIN_REF in result.stdout
     assert "local_extra" in result.stdout
 
 
@@ -138,7 +140,25 @@ def test_reordered_merge_parent_tuple_has_the_same_lineage(repo: Path) -> None:
     result = _run_gate(repo, "--other-train-ref", OTHER_TRAIN_REF)
 
     assert result.returncode == 0, result.stderr
+    assert "4 shared" in result.stdout
+    assert OTHER_TRAIN_REF in result.stdout
     assert "merged" in result.stdout
+
+
+def test_parent_string_does_not_match_a_singleton_parent_tuple(repo: Path) -> None:
+    _write_revision(repo, "0001_base.py", "base", None)
+    _write_revision(repo, "0002_shared.py", "shared", "base")
+    _record_other_train(repo)
+    _write_revision(repo, "0002_shared.py", "shared", ("base",))
+
+    result = _run_gate(repo, "--other-train-ref", OTHER_TRAIN_REF)
+
+    assert result.returncode == 1, result.stderr
+    assert "shared" in result.stderr
+    assert result.stderr.count("0002_shared.py") >= 2
+    assert OTHER_TRAIN_REF in result.stderr
+    assert "down_revision='base'" in result.stderr
+    assert "down_revision=('base',)" in result.stderr
 
 
 def test_annotated_module_assignments_are_compared(repo: Path) -> None:
@@ -170,6 +190,8 @@ def test_remote_migration_module_is_not_executed(repo: Path) -> None:
     result = _run_gate(repo, "--other-train-ref", OTHER_TRAIN_REF)
 
     assert result.returncode == 0, result.stderr
+    assert "1 shared" in result.stdout
+    assert OTHER_TRAIN_REF in result.stdout
     assert "base" in result.stdout
 
 
@@ -229,4 +251,6 @@ def test_explicit_script_location_overrides_repo_default(repo: Path) -> None:
     )
 
     assert result.returncode == 0, result.stderr
+    assert "1 shared" in result.stdout
+    assert OTHER_TRAIN_REF in result.stdout
     assert "base" in result.stdout
