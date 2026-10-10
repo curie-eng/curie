@@ -130,6 +130,7 @@ pub struct UpgradeOpts {
     pub chart: UpgradeChart,
     pub yes: bool,
     pub forward_only: bool,
+    pub allow_stock_layer_clear: bool,
     pub take_over: Option<String>,
 }
 
@@ -986,7 +987,8 @@ pub(crate) fn needs_stock_lookup(
 /// stop matching when the runner changes, and an unknown side counts as a
 /// change. An affected stock binding is rebound only to the registry's answer
 /// for `--to`, never to its own digest, and only when that layer's base is the
-/// target runner (ADR 0173 decision 5). Every other affected binding clears.
+/// target runner (ADR 0173 decision 5). Every other affected binding is planned
+/// for clearing; unbindable stock layers refuse Validate unless opted in.
 pub(crate) fn plan_runner_layers(
     bindings: &BTreeMap<String, String>,
     current: Option<&str>,
@@ -1056,6 +1058,63 @@ pub(crate) fn runner_layer_rebind_line(plan: &RunnerLayerPlan, to: &str) -> Opti
     ))
 }
 
+/// The Validate refusal for stock layers that cannot be rebound (#4344).
+/// Owner-built clears remain the owner's responsibility. `None` when every
+/// stock binding can be rebound or kept.
+pub(crate) fn stock_runner_layer_refusal(plan: &RunnerLayerPlan, to: &str) -> Option<String> {
+    let mut stock: Vec<_> = plan
+        .clears
+        .iter()
+        .filter_map(|(agent, reason)| {
+            let (why, remediation): (String, &str) = match reason {
+                LayerClearReason::OwnerBuilt => return None,
+                LayerClearReason::StockLayerUnpublished => (
+                    format!(
+                        "the dark factory runner layer for {to} is not published at {}:{to}",
+                        crate::examples::DARK_FACTORY_RUNNER_REPOSITORY
+                    ),
+                    "rerun once that tag is published, or choose a --to whose layer is published",
+                ),
+                LayerClearReason::StockBaseMismatch {
+                    published_base,
+                    target,
+                } => (
+                    format!(
+                        "the layer published for {to} is built on {published_base}, not the \
+                         target runner {target}"
+                    ),
+                    "remove the agentSandbox.runner image or digest override from the \
+                     installation's values so the target renders the published runner, then rerun",
+                ),
+                LayerClearReason::StockRegistryUnreachable(detail) => (
+                    format!(
+                        "the registry could not say which layer is published for {to}: {detail}"
+                    ),
+                    "restore read access to ghcr.io from this host, then rerun",
+                ),
+                LayerClearReason::TargetRunnerUnknown => (
+                    "the target runner is unknown, so no published layer can be proven to match it"
+                        .into(),
+                    "set the chart value agentSandbox.runner.digest so the target runner is \
+                     known, then rerun",
+                ),
+            };
+            Some((agent, format!("{agent} ({why}; {remediation})")))
+        })
+        .collect();
+    if stock.is_empty() {
+        return None;
+    }
+    stock.sort_by(|a, b| a.0.cmp(b.0));
+    let entries: Vec<String> = stock.into_iter().map(|(_, entry)| entry).collect();
+    Some(format!(
+        "stock runner layer cannot be rebound for {to}: {}. To clear these bindings anyway, \
+         so the agents run the platform runner without their layer until rebound, rerun with \
+         --allow-stock-layer-clear.",
+        entries.join("; ")
+    ))
+}
+
 /// The operator-facing line naming every stock agent the upgrade clears, why,
 /// and the stock remedy (#4321). Owner-built clears stay in
 /// [`runner_layer_notice`]. `None` when there are none.
@@ -1117,16 +1176,16 @@ pub(crate) fn stock_runner_layer_notice(
     ))
 }
 
-/// The owner-built notice, then the stock notice, for every cleared agent.
+/// The owner-built notice, then the opted-in stock notice, for cleared agents.
 fn runner_layer_warnings(plan: &RunnerLayerPlan, opts: &UpgradeOpts) -> Vec<String> {
+    let stock_notice = if opts.allow_stock_layer_clear {
+        stock_runner_layer_notice(plan, &opts.common.namespace, &opts.common.release, &opts.to)
+    } else {
+        None
+    };
     runner_layer_notice(&plan.owner_built_clears())
         .into_iter()
-        .chain(stock_runner_layer_notice(
-            plan,
-            &opts.common.namespace,
-            &opts.common.release,
-            &opts.to,
-        ))
+        .chain(stock_notice)
         .collect()
 }
 
@@ -1895,6 +1954,8 @@ struct LiveHost {
     overlay: Option<String>,
     /// Why the configuration migration refused, if it did (#2299, R7).
     config_refusal: Option<String>,
+    /// Why a stock runner layer cannot be rebound without consent to clear it.
+    runner_layer_refusal: Option<String>,
     /// Why the chart cannot install `--to`, if it cannot (Ruling 2, R1).
     chart_refusal: Option<String>,
     /// The redacted configuration schema plan line (#2299).
@@ -2103,6 +2164,7 @@ impl LiveHost {
             secret: None,
             overlay: None,
             config_refusal: None,
+            runner_layer_refusal: None,
             chart_refusal: None,
             schema_plan: None,
             schema_decision: None,
@@ -2683,6 +2745,7 @@ impl LiveHost {
     /// exists to prevent, and running the platform runner is always servable.
     /// A stock dark factory binding asks the registry for the layer published
     /// for `--to` and is rebound to it when its base is the target runner.
+    /// Otherwise Validate refuses unless the operator consents to clearing it.
     fn compute_runner_layers(&mut self) {
         let Some(overlay) = self
             .overlay
@@ -2743,6 +2806,14 @@ impl LiveHost {
         };
         self.runner_layers =
             plan_runner_layers(&bindings, current.as_deref(), target.as_deref(), &stock);
+        self.runner_layer_refusal = if self.opts.allow_stock_layer_clear {
+            None
+        } else {
+            stock_runner_layer_refusal(&self.runner_layers, &self.opts.to)
+        };
+        if self.runner_layer_refusal.is_some() {
+            return;
+        }
         if self.runner_layers.is_empty() {
             return;
         }
@@ -3503,6 +3574,7 @@ impl UpgradeDriver for LiveHost {
         self.chart_refusal
             .clone()
             .or_else(|| self.config_refusal.clone())
+            .or_else(|| self.runner_layer_refusal.clone())
             .or_else(|| self.timeout_refusal.clone())
             .or_else(|| self.schema_refusal.clone())
     }
@@ -3809,6 +3881,7 @@ mod hook_tests {
             chart: UpgradeChart::AvailableLocal("charts/curie".into()),
             yes: true,
             forward_only: false,
+            allow_stock_layer_clear: false,
             take_over: None,
         }
     }
@@ -4626,6 +4699,109 @@ mod runner_layer_guard_tests {
 
     /// #4321 AC4: a stock agent that cannot be rebound is told its reason and
     /// the stock remedy, never the owner-built `curie build` one.
+    #[test]
+    fn stock_refusal_ignores_rebinds_kept_bindings_and_owner_built_clears() {
+        for plan in [
+            RunnerLayerPlan::default(),
+            RunnerLayerPlan {
+                rebinds: vec![("dark-factory".into(), STOCK_NEW.into())],
+                ..RunnerLayerPlan::default()
+            },
+            RunnerLayerPlan {
+                kept: vec![("dark-factory".into(), STOCK_OLD.into())],
+                ..RunnerLayerPlan::default()
+            },
+            RunnerLayerPlan {
+                clears: owner_clears(&["acme-bot"]),
+                ..RunnerLayerPlan::default()
+            },
+        ] {
+            assert_eq!(stock_runner_layer_refusal(&plan, "0.12.3"), None);
+        }
+    }
+
+    #[test]
+    fn stock_refusal_has_each_exact_reason_and_remediation() {
+        for (reason, detail) in [
+            (
+                LayerClearReason::StockLayerUnpublished,
+                "the dark factory runner layer for 0.12.3 is not published at \
+                 ghcr.io/curie-eng/curie-dark-factory-runner:0.12.3; rerun once that tag is \
+                 published, or choose a --to whose layer is published"
+                    .to_string(),
+            ),
+            (
+                LayerClearReason::StockBaseMismatch {
+                    published_base: RUNNER_OTHER.into(),
+                    target: RUNNER_NEW.into(),
+                },
+                format!(
+                    "the layer published for 0.12.3 is built on {RUNNER_OTHER}, not the target \
+                     runner {RUNNER_NEW}; remove the agentSandbox.runner image or digest override \
+                     from the installation's values so the target renders the published runner, \
+                     then rerun"
+                ),
+            ),
+            (
+                LayerClearReason::StockRegistryUnreachable("connection refused".into()),
+                "the registry could not say which layer is published for 0.12.3: connection \
+                 refused; restore read access to ghcr.io from this host, then rerun"
+                    .to_string(),
+            ),
+            (
+                LayerClearReason::TargetRunnerUnknown,
+                "the target runner is unknown, so no published layer can be proven to match it; \
+                 set the chart value agentSandbox.runner.digest so the target runner is known, \
+                 then rerun"
+                    .to_string(),
+            ),
+        ] {
+            let plan = RunnerLayerPlan {
+                clears: vec![("dark-factory".into(), reason)],
+                ..RunnerLayerPlan::default()
+            };
+            assert_eq!(
+                stock_runner_layer_refusal(&plan, "0.12.3"),
+                Some(format!(
+                    "stock runner layer cannot be rebound for 0.12.3: dark-factory ({detail}). \
+                     To clear these bindings anyway, so the agents run the platform runner \
+                     without their layer until rebound, rerun with --allow-stock-layer-clear."
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn stock_refusal_orders_agents_and_omits_owner_built_agents() {
+        let plan = RunnerLayerPlan {
+            clears: vec![
+                (
+                    "night-factory".into(),
+                    LayerClearReason::TargetRunnerUnknown,
+                ),
+                ("acme-bot".into(), LayerClearReason::OwnerBuilt),
+                (
+                    "dark-factory".into(),
+                    LayerClearReason::StockLayerUnpublished,
+                ),
+            ],
+            ..RunnerLayerPlan::default()
+        };
+        let refusal = stock_runner_layer_refusal(&plan, "0.12.3").expect("stock refusal");
+        assert_eq!(
+            refusal,
+            "stock runner layer cannot be rebound for 0.12.3: dark-factory (the dark factory \
+             runner layer for 0.12.3 is not published at \
+             ghcr.io/curie-eng/curie-dark-factory-runner:0.12.3; rerun once that tag is \
+             published, or choose a --to whose layer is published); night-factory (the target \
+             runner is unknown, so no published layer can be proven to match it; set the chart \
+             value agentSandbox.runner.digest so the target runner is known, then rerun). \
+             To clear these bindings anyway, so the agents run the platform runner without \
+             their layer until rebound, rerun with --allow-stock-layer-clear."
+        );
+        assert!(!refusal.contains("acme-bot"), "{refusal}");
+    }
+
     #[test]
     fn stock_notice_names_reason_and_stock_remedy_not_curie_build() {
         let plan = RunnerLayerPlan {
