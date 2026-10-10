@@ -1986,6 +1986,15 @@ pub fn compose_overlay(
             "security_opt".into(),
             serde_json::json!(["no-new-privileges"]),
         );
+        // Come back after a Docker daemon restart, like the stack this serves;
+        // without it the connector stayed Exited and the agent lost its tools.
+        // `local down` removes these with `docker rm -f`, so it is unaffected,
+        // and a crash-looping start still fails the readiness waiter on its
+        // restart count.
+        service.insert(
+            "restart".into(),
+            serde_json::Value::String("unless-stopped".into()),
+        );
         services.insert(name, serde_json::Value::Object(service));
     }
 

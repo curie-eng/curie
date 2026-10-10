@@ -1002,6 +1002,36 @@ def test_release_compose_init_containers_adopted():
     assert_init_containers_adopted(release_text, "compose.release.yaml")
 
 
+# One-shot jobs that run to completion and must not be restarted.
+ONESHOT_SERVICES = {
+    "rustfs-init",
+    "rustfs-perms",
+    "ollama-pull",
+    "otel-collector-perms",
+    "curie-migrate",
+}
+
+
+@pytest.mark.parametrize("label_index", [0, 1], ids=["dev", "release"])
+def test_long_running_services_restart_after_a_docker_restart(label_index):
+    """Every long-running service comes back when the Docker daemon restarts.
+
+    Without a restart policy, a Docker Desktop restart (host sleep, update)
+    leaves the data tier Exited while the API and worker come back and
+    crash-loop against it. `unless-stopped` still honours `curie local down`
+    and `docker compose stop`. One-shot jobs keep `restart: "no"`.
+    """
+    label, doc = compose_docs()[label_index]
+    services = doc["services"]
+    assert ONESHOT_SERVICES <= set(services), f"{label}: one-shot list is stale"
+    wrong = {}
+    for name, spec in services.items():
+        expected = "no" if name in ONESHOT_SERVICES else "unless-stopped"
+        if spec.get("restart") != expected:
+            wrong[name] = (spec.get("restart"), expected)
+    assert not wrong, f"{label}: services with the wrong restart policy (got, want): {wrong}"
+
+
 @pytest.mark.skipif(shutil.which("docker") is None, reason="docker not available")
 def test_generated_compose_validates_with_docker(tmp_path):
     generate = load_generate()
