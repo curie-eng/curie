@@ -355,6 +355,78 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
   need no equivalent vocabulary today, and extending the enumerated reasons to them if they
   ever grow relevance logic is deliberately deferred.
 
+## Sender identity field mapping (Slack)
+
+ADR 0198 decision 6 fixes the properties a sender's identity namespace must have
+(sender-bound, canonical, connection-scoped authority, fail-closed). ADR 0201 moves
+*which Slack fields* satisfy them out of the ADR and into the realization: the code in
+`apps/api/src/curie_api/identity/slack.py::derive`, the fixture tests, and this note. The
+dispatcher sends the fields below as
+`apps/api/src/curie_api/identity/slack.py::SlackEvidence` to `POST /identity/resolve`
+(`apps/api/src/curie_api/routers/identity.py`), and
+`apps/api/src/curie_api/identity/service.py::resolve_principal` runs ADR 0198 decision 7's
+ordered checks around the mapping. The native id is the payload's user id, unchanged:
+nothing is case-folded or trimmed.
+
+**Fields used, per delivery type.**
+
+| Delivery | Sender team | User id | Context fields checked |
+|---|---|---|---|
+| `block_actions`, `view_submission` | `user.team_id` (documented) | `user.id` | enterprise signals; the stored `auth.test` Grid check (`slack_auth_test` with a non-null `enterprise_id` or `is_enterprise_install: true` refuses) |
+| any event carrying `event.user_team` | `event.user_team` (documented); an `event.team` that differs is `namespace_conflict` | `event.user` | enterprise signals; the stored `auth.test` Grid check (`slack_auth_test` with a non-null `enterprise_id` or `is_enterprise_install: true` refuses) |
+| `app_mention` without `user_team` | `event.team`, only in the context below | `event.user` | enterprise signals; the stored `auth.test` Grid check; envelope `is_ext_shared_channel`; the identity's stored `auth.test` non-Grid evidence; the receiving installation's team and authority |
+
+**Fields refused.** The envelope `team_id`, `source_team` and `authorizations[]` describe
+the channel or the installation and are never a sender team. Any enterprise id (envelope
+`enterprise_id`, `authorizations[].enterprise_id`, `enterprise.id`, `team.enterprise_id`,
+`user.enterprise_id`, `event.enterprise_id`, a non-null `context_enterprise_id`), an
+`is_enterprise_install: true` on the event body, an `authorizations[]` entry or the
+interaction payload, and a stored `auth.test` answer with a non-null `enterprise_id` or
+`is_enterprise_install: true`, refuses the delivery on every path:
+canonical ids under Enterprise Grid cannot be confirmed from these payloads.
+
+**Contexts covered.**
+
+- `app_mention` uses `event.team` only when every statement is positive: the envelope has
+  `is_ext_shared_channel` present and `false`; the identity's stored
+  `attributes.slack_auth_test` (written only by `POST /identity/slack-reports`, from the
+  identity's own ok `auth.test`) has `enterprise_id` absent or null,
+  `is_enterprise_install` present and exactly `false` (absent or null is not evidence), and
+  a `team_id` equal to the receiving installation's `external_account_id`; and the
+  installation's `authority` is empty. `enterprise_id_present` is recorded but not
+  required: an ordinary workspace's `auth.test` omits `enterprise_id`, which Slack sends
+  only within an Enterprise organization. A present `enterprise_id` that is neither a
+  string nor null is malformed: the dispatcher does not report it, and the report route
+  refuses it with 422. `event.team` must
+  then equal the installation's team; a disagreement is `namespace_conflict`. The
+  installation's team is a consistency check, never a fallback.
+- Interactions use the documented `user.team_id` and need no stored evidence.
+- Enterprise Grid is refused, whatever else the payload carries.
+- Direct messages (`message`) without `user_team` are unobserved, so they are refused, as
+  is any other event type: `event.team` was observed on `app_mention` only.
+
+**Evidence.** A capture on 2026-10-05 of real Socket Mode deliveries to an app in an
+ordinary, non-Grid workspace recorded `app_mention`, `block_actions` and
+`view_submission`; a direct message was not captured. The anonymised records are
+`apps/api/tests/fixtures/slack_identity_capture.json` (ADR 0201, decision 3: placeholder
+ids, field presence and equalities kept, no text, names or tokens). In the capture
+`event.team`, the envelope `team_id`, `user.team_id` and `team.id` were all the app's own
+workspace, which is why `event.team` is accepted only in a context that establishes the
+sender's team by itself. The same workspace's bot-token `auth.test`, observed on
+2026-10-07, omitted `enterprise_id` and carried `is_enterprise_install: false`; its
+anonymised keys are `apps/api/tests/fixtures/slack_auth_test_capture.json`, the basis of
+the absent-or-null rule above.
+
+**Refusal reasons** (Slack mapping, decision 7 step 4):
+
+| Reason | When |
+|---|---|
+| `subject_unidentified` | No user id, or a blank one; no sender team on the path the delivery takes; an `app_mention` outside the positive context above; any other event type without `user_team`; any Enterprise Grid signal; no evidence sent at all. |
+| `namespace_conflict` | `event.user_team` and `event.team` disagree, or an in-context `app_mention`'s `event.team` differs from the receiving installation's team. |
+
+A changed mapping is a code change reviewed against ADR 0198's properties, with its own
+capture as fixture evidence (ADR 0201, decision 1); it needs no new ADR.
+
 ## Known leakage
 
 Two ends and the binding surface were cleaned; what remains is egress semantics and

@@ -37,8 +37,9 @@ BELOW = "0086"
 # revision (task 8), the read executions revision (task 7), the execution code
 # revision (task 11), the remediation approvals revision (task 10) and the rest
 # of the feature train follow the policy one, the OIDC login migration (#2908)
-# follows all of it, and #2911's tenant scope (0101) follows that.
-HEAD = "0101"
+# follows all of it, #2911's tenant scope (0101) follows that, and the
+# identity-links revision (#2910) follows the tenant scope.
+HEAD = "0102"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}
 GENERATION_COLUMNS = {

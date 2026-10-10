@@ -76,6 +76,7 @@ from .routers import (
     hook_fire,
     hook_source_policy,
     hooks,
+    identity,
     memory,
     observability,
     provider_installations,
@@ -555,6 +556,7 @@ def create_app() -> FastAPI:
     app.include_router(channels.router)
     app.include_router(provider_installations.router)
     app.include_router(channel_identities.router)
+    app.include_router(identity.router)
     app.include_router(hooks.router)
 
     @app.middleware("http")

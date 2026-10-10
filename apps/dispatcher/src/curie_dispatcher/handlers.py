@@ -93,6 +93,7 @@ from .approval_actions import (
 )
 from .config import DispatcherConfig, release_identity
 from .identities import delivery_key, minted_adapter
+from .identity import IdentityResolver, build_identity_client, principal_observer_middleware
 from .inbound_attachments import derive_attachments
 from .inbound_text import derive_text
 from .marked_actions import MARK, REFUSAL, declared_driver, reserve_turn
@@ -797,6 +798,7 @@ def register_handlers(
     slack_identity: str = DEFAULT_IDENTITY,
     identity_bots: Mapping[str, str] | None = None,
     admission: AdmissionGate | None = None,
+    identity_client: IdentityResolver | None = None,
 ) -> None:
     """Wire the app_mention, (direct-message) message, block-action, and
     approval-card listeners. ``resolver`` (the approvals API client) is
@@ -805,10 +807,20 @@ def register_handlers(
     mints carries it. ``identity_bots`` is passed to both lanes' ``process_event``.
     ``admission`` is the caller-list gate (ADR 0175); None builds the production
     one from config, and ``run`` passes one shared gate to every identity's app
-    so they share one cache."""
+    so they share one cache. ``identity_client`` is the log-only principal
+    lookup (#2910); None builds the production one from config, and a build
+    that yields None registers no lookup at all."""
 
     approval_resolver = resolver if resolver is not None else build_resolver(config)
     admission_gate = admission if admission is not None else build_admission(config, redis_client)
+    # Looked up as a module global so tests can keep the lookup offline.
+    lookup: IdentityResolver | None = (
+        identity_client if identity_client is not None else build_identity_client(config)
+    )
+    if lookup is not None:
+        # Registered first among this app's own middleware: it only submits to a
+        # background pool, so it adds nothing to the ack path (#1053/#1077).
+        app.use(principal_observer_middleware(lookup, identity_name=slack_identity))
     # Resolved once here rather than per listener: the lane filter below drops
     # outside `process_event`, so it needs a logger of its own, and the injected
     # one is the single logger every drop must land on.

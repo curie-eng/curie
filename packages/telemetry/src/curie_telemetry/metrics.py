@@ -393,6 +393,9 @@ _HTTP_OPERATIONS = [
     "/channel-identities/{identity_id}",
     "/provider-installations",
     "/provider-installations/{installation_id}",
+    # Principal resolution and Slack identity reports (#2910, #3039, ADR 0198).
+    "/identity/resolve",
+    "/identity/slack-reports",
     "/publications",
     "/publications/precheck",
     "/publications/{publication_id}",

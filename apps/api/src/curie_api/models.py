@@ -3366,3 +3366,111 @@ class RemediationReceiptPost(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class IdentityNamespace(Base):
+    """Where a provider's user ids are unique, per tenant (#2910, ADR 0198 decision 1).
+
+    For Slack, one ``slack_workspace`` per team id. ``authority`` is always the
+    receiving installation's, never the event's (ADR 0198 decision 6, property
+    3). Disabling a namespace keeps its links; resolution into it answers
+    ``namespace_disabled`` (decision 9).
+    """
+
+    __tablename__ = "identity_namespaces"
+    __table_args__ = (
+        CheckConstraint(_PROVIDER_CK, name="identity_namespaces_provider_ck"),
+        CheckConstraint("kind IN ('slack_workspace')", name="identity_namespaces_kind_ck"),
+        CheckConstraint("status IN ('active', 'disabled')", name="identity_namespaces_status_ck"),
+        CheckConstraint(
+            "kind <> 'slack_workspace' OR (provider = 'slack' AND key ~ '^T[A-Z0-9]{2,}$')",
+            name="identity_namespaces_slack_workspace_key_ck",
+        ),
+        CheckConstraint("length(key) > 0", name="identity_namespaces_key_ck"),
+        UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "authority",
+            "kind",
+            "key",
+            name="identity_namespaces_tenant_provider_authority_kind_key_key",
+        ),
+        # Target of identity_links' tenant-scoped namespace foreign key.
+        UniqueConstraint("tenant_id", "id", name="identity_namespaces_tenant_id_id_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(f"{SCHEMA}.tenants.id", name="identity_namespaces_tenant_id_fkey")
+    )
+    provider: Mapped[str] = mapped_column(String)
+    authority: Mapped[str] = mapped_column(String, default="", server_default="")
+    kind: Mapped[str] = mapped_column(String)
+    key: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="active", server_default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class IdentityLink(Base):
+    """One native id in one namespace, bound to one principal or one bot (#2910).
+
+    Immutable apart from ``revoked_at`` (ADR 0198 decision 5): changing a
+    mapping revokes the link and creates a new one. Only active links count toward uniqueness, so a
+    revoked row keeps its evidence. Every foreign key is NO ACTION, and the
+    namespace, principal and bot keys carry ``tenant_id``, so no link crosses a
+    tenant.
+    """
+
+    __tablename__ = "identity_links"
+    __table_args__ = (
+        CheckConstraint(
+            "(principal_id IS NULL) <> (bot_id IS NULL)", name="identity_links_target_xor_ck"
+        ),
+        CheckConstraint(
+            "verification_source IN ('provider_event_verified', 'admin_mapped')",
+            name="identity_links_verification_source_ck",
+        ),
+        CheckConstraint("length(provider_native_id) > 0", name="identity_links_native_id_ck"),
+        ForeignKeyConstraint(
+            ["tenant_id", "identity_namespace_id"],
+            [f"{SCHEMA}.identity_namespaces.tenant_id", f"{SCHEMA}.identity_namespaces.id"],
+            name="identity_links_namespace_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="identity_links_principal_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "created_by_principal_id"],
+            [f"{SCHEMA}.principals.tenant_id", f"{SCHEMA}.principals.id"],
+            name="identity_links_created_by_fkey",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "bot_id"],
+            [f"{SCHEMA}.agents.tenant_id", f"{SCHEMA}.agents.id"],
+            name="identity_links_bot_fkey",
+        ),
+        Index(
+            "identity_links_active_native_key",
+            "identity_namespace_id",
+            "provider_native_id",
+            unique=True,
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    identity_namespace_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    provider_native_id: Mapped[str] = mapped_column(String)
+    principal_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    bot_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), default=None)
+    verification_source: Mapped[str] = mapped_column(String)
+    created_by_principal_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    verified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)

@@ -7314,6 +7314,120 @@
         "title": "PrincipalOut",
         "type": "object"
       },
+      "PrincipalResolutionOut": {
+        "properties": {
+          "channel_identity_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Channel Identity Id"
+          },
+          "namespace_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Namespace Id"
+          },
+          "principal_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Principal Id"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "resolved",
+              "unresolved"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "reason",
+          "principal_id",
+          "channel_identity_id",
+          "namespace_id"
+        ],
+        "title": "PrincipalResolutionOut",
+        "type": "object"
+      },
+      "PrincipalResolveIn": {
+        "additionalProperties": false,
+        "description": "Which principal sent this event, as seen by one receiving channel identity.",
+        "properties": {
+          "channel_identity": {
+            "minLength": 1,
+            "title": "Channel Identity",
+            "type": "string"
+          },
+          "provider": {
+            "enum": [
+              "slack",
+              "m365",
+              "github",
+              "jira",
+              "linear",
+              "confluence",
+              "quickbooks",
+              "other"
+            ],
+            "title": "Provider",
+            "type": "string"
+          },
+          "slack": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SlackEvidence"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "tenant_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant Id"
+          }
+        },
+        "required": [
+          "provider",
+          "channel_identity"
+        ],
+        "title": "PrincipalResolveIn",
+        "type": "object"
+      },
       "ProbeCreate": {
         "additionalProperties": false,
         "description": "@spec ACTION-EXECUTOR-1 @spec ACTION-EXECUTOR-13: exactly these three keys.",
@@ -10349,6 +10463,186 @@
           }
         },
         "title": "SettingsPackConfig",
+        "type": "object"
+      },
+      "SlackEvidence": {
+        "additionalProperties": false,
+        "description": "The identity-bearing fields of one Slack delivery, as the dispatcher read them.\n\nStrict, so a string ``\"false\"`` is never taken as the positive statement\n``is_ext_shared_channel: false``; extra fields are refused, so a field this\nmapping does not use cannot be sent as if it were evidence.",
+        "properties": {
+          "delivery": {
+            "maxLength": 256,
+            "title": "Delivery",
+            "type": "string"
+          },
+          "enterprise_ids": {
+            "items": {
+              "maxLength": 256,
+              "type": "string"
+            },
+            "maxItems": 32,
+            "title": "Enterprise Ids",
+            "type": "array"
+          },
+          "event_team": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Team"
+          },
+          "event_user_team": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event User Team"
+          },
+          "interaction_user_team_id": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Interaction User Team Id"
+          },
+          "is_ext_shared_channel": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Ext Shared Channel"
+          },
+          "user_id": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Id"
+          }
+        },
+        "required": [
+          "delivery"
+        ],
+        "title": "SlackEvidence",
+        "type": "object"
+      },
+      "SlackReportIn": {
+        "additionalProperties": false,
+        "description": "What ``auth.test`` returned for one Slack identity's own token.",
+        "properties": {
+          "enterprise_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enterprise Id"
+          },
+          "enterprise_id_present": {
+            "title": "Enterprise Id Present",
+            "type": "boolean"
+          },
+          "is_enterprise_install": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Enterprise Install"
+          },
+          "name": {
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "team_id": {
+            "maxLength": 64,
+            "pattern": "^T[A-Z0-9]{2,}$",
+            "title": "Team Id",
+            "type": "string"
+          },
+          "tenant_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tenant Id"
+          }
+        },
+        "required": [
+          "name",
+          "team_id",
+          "enterprise_id",
+          "enterprise_id_present",
+          "is_enterprise_install"
+        ],
+        "title": "SlackReportIn",
+        "type": "object"
+      },
+      "SlackReportOut": {
+        "properties": {
+          "identity_id": {
+            "format": "uuid",
+            "title": "Identity Id",
+            "type": "string"
+          },
+          "installation_mismatch": {
+            "title": "Installation Mismatch",
+            "type": "boolean"
+          },
+          "namespace_id": {
+            "format": "uuid",
+            "title": "Namespace Id",
+            "type": "string"
+          },
+          "provider_installation_id": {
+            "format": "uuid",
+            "title": "Provider Installation Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity_id",
+          "provider_installation_id",
+          "namespace_id",
+          "installation_mismatch"
+        ],
+        "title": "SlackReportOut",
         "type": "object"
       },
       "SourceBindingConfig": {
@@ -21573,6 +21867,124 @@
         "summary": "Probe Hook Support",
         "tags": [
           "hooks"
+        ]
+      }
+    },
+    "/identity/resolve": {
+      "post": {
+        "operationId": "resolve_identity_resolve_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrincipalResolveIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrincipalResolutionOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resolve",
+        "tags": [
+          "identity"
+        ]
+      }
+    },
+    "/identity/slack-reports": {
+      "post": {
+        "operationId": "slack_report_identity_slack_reports_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "x-api-key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Api-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SlackReportIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SlackReportOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Slack Report",
+        "tags": [
+          "identity"
         ]
       }
     },
