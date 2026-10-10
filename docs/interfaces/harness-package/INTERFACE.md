@@ -134,8 +134,8 @@ tool access (`runner/src/curie_runner/__main__.py::_readonly_tools`). It also re
 
 The gate a registration must survive today is the import-linter contract set in
 the root `pyproject.toml`, run as `uv run lint-imports` in
-`.github/workflows/ci.yaml`. One of its four contracts guards this seam
-specifically, forbidding `claude_agent_sdk` inside
+`.github/workflows/ci.yaml`. The contract named `The harness port stays vendor-neutral`
+guards this seam specifically, forbidding `claude_agent_sdk` inside
 `runner/src/curie_runner/harness/contribution.py` and
 `runner/src/curie_runner/harness/registry.py` while deliberately exempting
 `runner/src/curie_runner/harness/claude.py`, which is the Claude harness itself.

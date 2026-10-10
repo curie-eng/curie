@@ -157,8 +157,10 @@ placeholder, and gives none to a remote or fallback URL. The signing key never
 enters a sandbox
 (`apps/worker/src/curie_worker/sandbox/types.py::HOST_APPLICATION_CREDENTIAL_ENV_NAMES`).
 
-When the API holds the matching public key, `render` puts a caller proxy in
-front of every hosted connector it renders
+Hosted rendering requires a caller proxy with a valid public key: `render`
+refuses a hosted connector without one with `hosted_connector_requires_caller_key`.
+A remote connector returns no objects and needs no caller key. Every hosted
+connector that renders has the proxy in front of it
 (`packages/plugin-format/src/plugin_format/connector_render.py::ConnectorProxy`).
 The proxy runs from the worker image as `python -m curie_connector_proxy`, pulled
 with the worker's pull policy and pull secrets, and holds the public keys, the
@@ -177,8 +179,8 @@ which selects the same pods and targets the server's own port
 (`packages/plugin-format/src/plugin_format/connector_render.py::render_direct_service`).
 No rendered policy opens that port, so a sandbox cannot use it. It admits only
 the peers of an operator-applied ingress policy naming the server's port,
-because policies are additive. An install with no caller key renders no
-`-direct` Service.
+because policies are additive. An install with no caller key cannot render a
+hosted connector, including its `-direct` Service.
 
 The proxy admits a request whose token either configured key
 verifies, that has not expired and that names a listed agent
@@ -219,8 +221,8 @@ challenge, and never reaches the server; the shape is frozen in
 connector refusing this sandbox
 (`runner/src/curie_runner/mcp_tool_capability.py::ConnectorCapabilityFailure`).
 The token wire is frozen in `tests/vectors/connector-caller-token.json`. An API
-with no public key renders no proxy, and the network policy is then the whole
-of the check again. A runner booted by a worker that held no key carries no
+with no public key refuses hosted rendering rather than relying only on network
+policy. A runner booted by a worker that held no key carries no
 token, and every proxied connector refuses its calls until the next turn on its
 thread that a worker holding the key takes, which claims a fresh one
 (`apps/worker/src/curie_worker/kernel.py::_boots_differently`). The minting

@@ -145,7 +145,7 @@ its specialized trace provider in `runner/src/curie_runner/otel.py`. Per ADR-007
 generation spans use a closed, versioned attribute schema, not an open bag of `gen_ai.*`
 keys:
 
-- **The vocabulary is closed and committed.** `SpanAttributeKey`
+1. **The vocabulary is closed and committed.** `SpanAttributeKey`
   (`packages/telemetry-schema/src/curie_telemetry_schema/__init__.py::SpanAttributeKey`) is the only key set the runner
   may attach: `langfuse.trace.name`, `langfuse.session.id`, `langfuse.user.id`,
   `gen_ai.approval.decision`, `gen_ai.request.model`, a bare `model`,
@@ -163,8 +163,8 @@ keys:
   (`[tool_result NAME]`, `[tool_result NAME error]`); output is assistant text and
   `[tool_use NAME]` markers. Tool arguments and tool results are never recorded.
   `curie.usage.scope` marks the ResultMessage usage fallback: when no generation in the
-  turn received per-message usage, the turn total is stamped on the final generation
-  with scope `turn`, earlier generations carry no usage, and if no generation is active
+  turn received nonzero per-message usage, the turn total is stamped on the final generation
+  with scope `turn`, earlier generations receive none of that total, and if no generation is active
   at the result the root gets scope `unrecorded`. Per-message usage sets no scope key.
   `SPAN_ATTRIBUTE_VALUE_TYPES`
   (`runner/src/curie_runner/otel.py::SPAN_ATTRIBUTE_VALUE_TYPES`) declares each key's
@@ -210,12 +210,15 @@ keys:
   is also a direct child of `agent.run`, never a generation child, so provider and tool
   phases are root siblings rather than a legacy monolithic generation containing
   zero-duration tool markers.
-- **Generation data belongs to its round.** The configured model, or the first non-empty
+8. **Generation data belongs to its round.** The configured model, or the first non-empty
   model reported by an `AssistantMessage`, stamps `gen_ai.request.model` and the bare
   `model` once on that generation. The four usage attributes accumulate only the
   non-negative integer increments on `AssistantMessage` objects in that round;
-  `ResultMessage.usage` is a whole-turn total and is never copied onto the final
-  generation. When the real SDK supplies an allowlisted `message_start` or
+  `ResultMessage.usage` is a whole-turn total. When no generation received any nonzero
+  per-message count, `record_result_usage` stamps that total on the active final
+  generation with `curie.usage.scope=turn`, or marks the root `unrecorded` if no
+  generation is active. Zero per-message placeholders do not disable this fallback;
+  any nonzero count does, preventing double counting. When the real SDK supplies an allowlisted `message_start` or
   `content_block_start` partial boundary, the adapter strips it to payload-free evidence
   and the active generation records `curie.generation.ttft_ms` once. TTFT is omitted when
   no such boundary is available: direct compatibility setters may populate model or
@@ -302,9 +305,12 @@ installable observability stack tracked by #1765.
 Three vendor-named attributes are set at the source on the root span rather than mapped in
 the collector. `RunTracer.run_span` stamps `langfuse.trace.name`, `langfuse.session.id`,
 and `langfuse.user.id` (`runner/src/curie_runner/otel.py::RunTracer.run_span`) so Langfuse
-maps them to its name/Sessions/Users features. The collector trace pipeline is
-receivers/`memory_limiter`/`batch`/`otlphttp` with no attributes processor
-(`charts/curie/templates/_helpers.tpl`), so nothing downstream renames them. A clean seam
+maps them to its name/Sessions/Users features. The default collector trace pipeline is
+receivers/`memory_limiter`/`batch`/`otlphttp` with no attributes processor.
+Operators may define `otelCollector.extraProcessors` and select ordered
+`otelCollector.extraTracePipelineProcessors` between `memory_limiter` and `batch`
+(`charts/curie/templates/_helpers.tpl`), including their own attribute mapping. No
+default mapping renames these source attributes. A clean seam
 would emit neutral attributes the collector maps to the vendor names; today all three
 vendor names are set at the source, and they are members of the closed schema, so a second
 backend inherits them.
