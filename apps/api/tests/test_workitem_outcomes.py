@@ -29,6 +29,7 @@ from curie_api.crud import approvals as crud_approvals
 from curie_api.crud import lineages as crud_lineages
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
 from curie_api.forges.github.ci import CiDetail
+from curie_api.forges.github.code_host import GitHubCodeHost
 from curie_api.forges.hosts import github_issue_ref, repository_ref
 from curie_api.forges.types import (
     GITHUB,
@@ -1474,15 +1475,15 @@ def test_routes_require_the_api_key(stack: TestClient) -> None:
 # --- live CI observer (unit) -------------------------------------------------
 
 
-def _ci_inputs(*, pr: bool = True, head_sha: str | None = HEAD_SHA) -> tuple[Any, Any]:
+def _ci_inputs() -> tuple[Any, Any]:
     lineage = SimpleNamespace(
         repo_full_name=REPO,
-        pr_number=PR_NUMBER if pr else None,
-        pr_url=PR_URL if pr else None,
-        head_sha=head_sha,
-        code_host_installation_id=None,
+        pr_number=PR_NUMBER,
+        pr_url=PR_URL,
+        head_sha=HEAD_SHA,
+        repository_project_id=None,
     )
-    work_item = SimpleNamespace(repository_path=REPO, code_host_installation_id=202)
+    work_item = SimpleNamespace(repository_path=REPO, repository_project_id="101")
     return lineage, work_item
 
 
@@ -1508,8 +1509,6 @@ def _observe(
     handler: Callable[[httpx.Request], httpx.Response],
     *,
     creds: _FakeCreds | None = None,
-    pr: bool = True,
-    head_sha: str | None = HEAD_SHA,
 ) -> tuple[Any, list[httpx.Request]]:
     from curie_api.forges.github import ci
 
@@ -1521,27 +1520,35 @@ def _observe(
         seen.append(request)
         return handler(request)
 
-    lineage, work_item = _ci_inputs(pr=pr, head_sha=head_sha)
+    lineage, work_item = _ci_inputs()
 
     async def run() -> Any:
+        settings = get_settings()
         async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
-            return await ci.observe_ci(
-                lineage, work_item, get_settings(), client
+            return await workitem_outcomes.observe_ci(
+                GitHubCodeHost(settings, client), settings, lineage, work_item
             )
 
     return asyncio.run(run()), seen
 
 
-def _runs(*runs: tuple[str, str | None], total: int | None = None) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            "total_count": len(runs) if total is None else total,
-            "check_runs": [
-                {"status": status, "conclusion": conclusion} for status, conclusion in runs
-            ],
-        },
-    )
+def _runs(
+    *runs: tuple[str, str | None], total: int | None = None
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(f"/commits/{HEAD_SHA}/status"):
+            return httpx.Response(200, json={"state": "pending", "statuses": []})
+        return httpx.Response(
+            200,
+            json={
+                "total_count": len(runs) if total is None else total,
+                "check_runs": [
+                    {"status": status, "conclusion": conclusion} for status, conclusion in runs
+                ],
+            },
+        )
+
+    return handle
 
 
 def _reason_is_clean(observation: Any) -> None:
@@ -1551,23 +1558,8 @@ def _reason_is_clean(observation: Any) -> None:
     assert "http" not in reason
 
 
-def test_ci_not_applicable_without_a_pull_request(monkeypatch: pytest.MonkeyPatch) -> None:
-    observation, seen = _observe(monkeypatch, lambda r: _runs(), pr=False)
-    assert observation.state == "not_applicable"
-    assert observation.reason == "no_pull_request"
-    assert seen == []
-
-
-def test_ci_unavailable_without_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
-    observation, seen = _observe(monkeypatch, lambda r: _runs(), head_sha=None)
-    assert (observation.state, observation.reason) == ("unavailable", "no_head_sha")
-    assert seen == []
-
-
 def test_ci_unavailable_when_no_app_is_configured(monkeypatch: pytest.MonkeyPatch) -> None:
-    observation, seen = _observe(
-        monkeypatch, lambda r: _runs(), creds=_FakeCreds(configured=False)
-    )
+    observation, seen = _observe(monkeypatch, _runs(), creds=_FakeCreds(configured=False))
     assert (observation.state, observation.reason) == ("unavailable", "app_not_configured")
     assert seen == []
 
@@ -1582,9 +1574,7 @@ def test_ci_unavailable_when_no_app_is_configured(monkeypatch: pytest.MonkeyPatc
 def test_ci_unavailable_when_the_token_mint_fails(
     monkeypatch: pytest.MonkeyPatch, error: Exception, reason: str
 ) -> None:
-    observation, seen = _observe(
-        monkeypatch, lambda r: _runs(), creds=_FakeCreds(error=error)
-    )
+    observation, seen = _observe(monkeypatch, _runs(), creds=_FakeCreds(error=error))
     assert observation.state == "unavailable"
     assert observation.reason in {reason, "installation_unverified"}
     assert seen == []
@@ -1631,9 +1621,7 @@ def test_ci_non_json_body_is_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_ci_more_runs_than_one_page_is_unavailable_not_partial(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    observation, _ = _observe(
-        monkeypatch, lambda r: _runs(("completed", "success"), total=101)
-    )
+    observation, _ = _observe(monkeypatch, _runs(("completed", "success"), total=101))
     assert (observation.state, observation.reason) == ("unavailable", "too_many_check_runs")
 
 
@@ -1654,16 +1642,18 @@ def test_ci_more_runs_than_one_page_is_unavailable_not_partial(
 def test_ci_verdicts_from_check_runs(
     monkeypatch: pytest.MonkeyPatch, runs: tuple[tuple[str, str | None], ...], state: str
 ) -> None:
-    observation, seen = _observe(monkeypatch, lambda r: _runs(*runs))
+    observation, seen = _observe(monkeypatch, _runs(*runs))
 
     assert observation.state == state
     assert observation.head_sha == HEAD_SHA
     assert observation.observed_at is not None
-    assert len(seen) == 1
-    request = seen[0]
-    assert request.method == "GET"
-    assert request.url.path.endswith(f"/repos/{REPO}/commits/{HEAD_SHA}/check-runs")
-    assert request.headers["authorization"].lower() == f"bearer {SECRET_SENTINEL}".lower()
+    assert [request.url.path for request in seen] == [
+        f"/repos/{REPO}/commits/{HEAD_SHA}/check-runs",
+        f"/repos/{REPO}/commits/{HEAD_SHA}/status",
+    ]
+    for request in seen:
+        assert request.method == "GET"
+        assert request.headers["authorization"].lower() == f"bearer {SECRET_SENTINEL}".lower()
 
 
 # --- review round 1 regressions ---------------------------------------------
@@ -1928,19 +1918,8 @@ def test_second_publication_revision_after_a_pr_does_not_deny_the_pr(
 def _observe_once(monkeypatch: pytest.MonkeyPatch, creds: Any) -> Any:
     """One live observation against ``creds`` and an always-passing CI."""
 
-    from curie_api.forges.github import ci
-
-    monkeypatch.setattr(ci, "credentials_for", lambda _s: creds)
-    lineage, work_item = _ci_inputs()
-
-    async def run() -> Any:
-        transport = httpx.MockTransport(lambda r: _runs(("completed", "success")))
-        async with httpx.AsyncClient(transport=transport) as client:
-            return await ci.observe_ci(
-                lineage, work_item, get_settings(), client
-            )
-
-    return asyncio.run(run())
+    observation, _ = _observe(monkeypatch, _runs(("completed", "success")), creds=creds)
+    return observation
 
 
 def test_ci_cancellation_before_the_mint_starts_releases_the_permit(
@@ -2133,61 +2112,74 @@ def _detail_handler(
 
 def _observe_detail(
     monkeypatch: pytest.MonkeyPatch,
-    handler: Callable[[httpx.Request], httpx.Response],
+    handler: Callable[[httpx.Request], httpx.Response | Awaitable[httpx.Response]],
     *,
     creds: Any = None,
     client_options: dict[str, Any] | None = None,
-    pr_number: int | None = PR_NUMBER,
-) -> tuple[Any, list[httpx.Request]]:
+    base_ref: str | None = None,
+) -> tuple[factory_ci.CiView, list[httpx.Request]]:
     from curie_api.forges.github import ci
 
     fake = creds or _FakeCreds()
     monkeypatch.setattr(ci, "credentials_for", lambda _s: fake)
     seen: list[httpx.Request] = []
 
-    def record(request: httpx.Request) -> httpx.Response:
+    async def record(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return handler(request)
+        answer = handler(request)
+        return await answer if isinstance(answer, Awaitable) else answer
 
-    lineage, work_item = _ci_inputs()
-    lineage.pr_number = pr_number
-
-    async def run() -> Any:
+    async def run() -> factory_ci.CiView:
+        settings = get_settings()
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(record), **(client_options or {})
         ) as client:
-            return await ci.observe_ci_detail(
-                lineage, work_item, get_settings(), client
+            return await factory_ci.observe(
+                GitHubCodeHost(settings, client),
+                repository_ref(settings, path=REPO, project_id="101"),
+                HEAD_SHA,
+                diagnostics=True,
+                base_ref=base_ref,
             )
 
     return asyncio.run(run()), seen
 
 
-def _annotation_messages(annotations: Any) -> list[str]:
-    groups = annotations.values() if isinstance(annotations, Mapping) else [annotations]
+def _annotation_messages(view: factory_ci.CiView) -> list[str]:
     return [
-        str(item.get("message"))
-        for group in groups
-        for item in (group or [])
-        if isinstance(item, Mapping)
+        str(note.message) for diagnostic in view.diagnostics for note in diagnostic.annotations
     ]
+
+
+def _job_logs(view: factory_ci.CiView) -> dict[str, str]:
+    return {
+        str(diagnostic.check_id): diagnostic.log
+        for diagnostic in view.diagnostics
+        if diagnostic.log is not None
+    }
+
+
+def _job_log_unavailable(view: factory_ci.CiView) -> set[str]:
+    return {
+        str(diagnostic.check_id) for diagnostic in view.diagnostics if diagnostic.log_unavailable
+    }
 
 
 def test_ci_detail_reads_check_runs_statuses_and_failing_annotations(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    detail, seen = _observe_detail(
+    view, seen = _observe_detail(
         monkeypatch,
         _detail_handler(
             statuses=[{"context": "ci/jenkins", "state": "error", "description": "boom"}]
         ),
     )
 
-    assert detail.reason is None
-    assert detail.head_sha == HEAD_SHA
-    assert {run["name"] for run in detail.check_runs} == {"unit-tests", "build"}
-    assert [s["context"] for s in detail.statuses] == ["ci/jenkins"]
-    assert _annotation_messages(detail.annotations) == ["AssertionError: expected 2, got 1"]
+    assert view.reason is None
+    assert view.head_sha == HEAD_SHA
+    assert {run.name for run in view.runs} == {"unit-tests", "build"}
+    assert [status.name for status in view.statuses] == ["ci/jenkins"]
+    assert _annotation_messages(view) == ["AssertionError: expected 2, got 1"]
     paths = [request.url.path for request in seen]
     # Annotations are read only for the failing run, never the passing one.
     assert not any(p.endswith(f"/check-runs/{FAILING_RUN_ID + 1}/annotations") for p in paths)
@@ -2203,16 +2195,11 @@ def _observe_detail_with_base(
     monkeypatch: pytest.MonkeyPatch,
     base_branch: Callable[[], Awaitable[httpx.Response]],
     base_runs: list[dict[str, Any]],
-) -> tuple[Any, list[str]]:
-    from curie_api.forges.github import ci
-
-    monkeypatch.setattr(ci, "credentials_for", lambda _s: _FakeCreds())
+) -> tuple[factory_ci.CiView, list[str]]:
     head = _detail_handler()
-    paths: list[str] = []
 
-    async def record(request: httpx.Request) -> httpx.Response:
+    async def answer(request: httpx.Request) -> httpx.Response:
         path = request.url.path
-        paths.append(path)
         if path.endswith(f"/repos/{REPO}/branches/main"):
             return await base_branch()
         if path.endswith(f"/repos/{REPO}/commits/{BASE_SHA}/check-runs"):
@@ -2225,16 +2212,8 @@ def _observe_detail_with_base(
             )
         return head(request)
 
-    lineage, work_item = _ci_inputs()
-    lineage.base_ref = "main"
-
-    async def run() -> Any:
-        async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
-            return await ci.observe_ci_detail(
-                lineage, work_item, get_settings(), client
-            )
-
-    return asyncio.run(run()), paths
+    view, seen = _observe_detail(monkeypatch, answer, base_ref="main")
+    return view, [request.url.path for request in seen]
 
 
 def test_ci_detail_slow_base_read_keeps_the_observed_head(
@@ -2248,13 +2227,12 @@ def test_ci_detail_slow_base_read_keeps_the_observed_head(
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 
-    detail, paths = _observe_detail_with_base(monkeypatch, never_answers, [])
+    view, paths = _observe_detail_with_base(monkeypatch, never_answers, [])
 
-    assert detail.state == "observed"
-    assert detail.reason is None
-    assert FAILING_RUN_ID in {run["id"] for run in detail.check_runs}
-    assert _annotation_messages(detail.annotations) == ["AssertionError: expected 2, got 1"]
-    assert detail.base_check_runs is None and detail.base_statuses is None
+    assert view.reason is None
+    assert str(FAILING_RUN_ID) in {run.check_id for run in view.runs}
+    assert _annotation_messages(view) == ["AssertionError: expected 2, got 1"]
+    assert view.base_failing == frozenset()
     annotations_at = next(
         i for i, p in enumerate(paths)
         if p.endswith(f"/repos/{REPO}/check-runs/{FAILING_RUN_ID}/annotations")
@@ -2279,11 +2257,11 @@ def test_ci_detail_reads_the_base_branch_failures(
     async def answers() -> httpx.Response:
         return httpx.Response(200, json={"name": "main", "commit": {"sha": BASE_SHA}})
 
-    detail, _paths = _observe_detail_with_base(monkeypatch, answers, [base_failure])
+    view, paths = _observe_detail_with_base(monkeypatch, answers, [base_failure])
 
-    assert detail.state == "observed"
-    assert detail.base_check_runs == [base_failure]
-    assert detail.base_statuses == []
+    assert view.reason is None
+    assert view.base_failing == frozenset({"unit-tests"})
+    assert f"/repos/{REPO}/commits/{BASE_SHA}/status" in paths
 
 
 def _actions_check_run(
@@ -2639,7 +2617,7 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
             return httpx.Response(200, text=log)
         return base(request)
 
-    detail, seen = _observe_detail(
+    view, seen = _observe_detail(
         monkeypatch,
         handle,
         client_options={
@@ -2652,18 +2630,18 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
         },
     )
 
-    assert (detail.state, detail.reason) == ("observed", None)
-    assert len(detail.check_runs) == 3
-    assert _annotation_messages(detail.annotations) == ["Process completed with exit code 1."]
-    assert set(detail.job_logs) == {FAILING_RUN_ID}
-    assert detail.job_log_unavailable == set()
-    excerpt = detail.job_logs[FAILING_RUN_ID]
+    assert view.reason is None
+    assert len(view.runs) == 3
+    assert _annotation_messages(view) == ["Process completed with exit code 1."]
+    assert set(_job_logs(view)) == {str(FAILING_RUN_ID)}
+    assert _job_log_unavailable(view) == set()
+    excerpt = _job_logs(view)[str(FAILING_RUN_ID)]
     assert "AssertionError: expected 2, got 1" in excerpt
     assert "old line 0" not in excerpt
     assert len(excerpt.splitlines()) <= 80
     assert token not in excerpt
     assert factory_ci.decide(
-        ci_view(detail),
+        view,
         python_ci=None,
         metadata_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
@@ -2677,7 +2655,7 @@ def test_ci_detail_adds_a_failing_actions_log_to_the_fix_report(
         PR_URL,
         HEAD_SHA,
         2,
-        ci_view(detail),
+        view,
         diagnostics=True,
     )
     lines = prompt.splitlines()
@@ -2747,19 +2725,19 @@ def test_actions_log_failure_keeps_the_failing_ci_observation(
                 raise httpx.ReadTimeout("download timed out", request=request)
         return base(request)
 
-    detail, seen = _observe_detail(monkeypatch, handle)
+    view, seen = _observe_detail(monkeypatch, handle)
 
-    assert (detail.state, detail.reason) == ("observed", None)
-    assert [run["name"] for run in detail.check_runs] == ["unit-tests"]
-    assert _annotation_messages(detail.annotations) == ["Process completed with exit code 1."]
-    assert detail.job_logs == {}
-    assert detail.job_log_unavailable == {FAILING_RUN_ID}
+    assert view.reason is None
+    assert [run.name for run in view.runs] == ["unit-tests"]
+    assert _annotation_messages(view) == ["Process completed with exit code 1."]
+    assert _job_logs(view) == {}
+    assert _job_log_unavailable(view) == {str(FAILING_RUN_ID)}
     prompt = factory_ci.continuation_text(
         f"https://github.com/{REPO}/issues/9101",
         PR_URL,
         HEAD_SHA,
         2,
-        ci_view(detail),
+        view,
         diagnostics=True,
     )
     report = json.loads(prompt.splitlines()[3])
@@ -2806,11 +2784,11 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
             return httpx.Response(200, text=log)
         return base(request)
 
-    detail, _ = _observe_detail(monkeypatch, handle)
+    view, _ = _observe_detail(monkeypatch, handle)
 
-    assert (detail.state, detail.reason) == ("observed", None)
-    assert detail.job_log_unavailable == set()
-    excerpt = detail.job_logs[FAILING_RUN_ID]
+    assert view.reason is None
+    assert _job_log_unavailable(view) == set()
+    excerpt = _job_logs(view)[str(FAILING_RUN_ID)]
     assert len(excerpt) <= 6000
     assert len(excerpt.splitlines()) <= 80
     assert "tail line 0" in excerpt
@@ -2819,7 +2797,7 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
     assert "early failure context" not in excerpt
     assert token not in excerpt
     assert factory_ci.decide(
-        ci_view(detail),
+        view,
         python_ci=None,
         metadata_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
@@ -2833,7 +2811,7 @@ def test_large_actions_log_preserves_a_bounded_diagnostic_tail(
         PR_URL,
         HEAD_SHA,
         2,
-        ci_view(detail),
+        view,
         diagnostics=True,
     )
     entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
@@ -2866,16 +2844,16 @@ def test_actions_log_redacts_generic_key_assignments_in_observation_and_prompt(
             return httpx.Response(200, text=log)
         return base(request)
 
-    detail, _ = _observe_detail(monkeypatch, handle)
+    view, _ = _observe_detail(monkeypatch, handle)
 
-    assert (detail.state, detail.reason) == ("observed", None)
-    excerpt = detail.job_logs[FAILING_RUN_ID]
+    assert view.reason is None
+    excerpt = _job_logs(view)[str(FAILING_RUN_ID)]
     prompt = factory_ci.continuation_text(
         f"https://github.com/{REPO}/issues/9101",
         PR_URL,
         HEAD_SHA,
         2,
-        ci_view(detail),
+        view,
         diagnostics=True,
     )
     entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
@@ -2908,13 +2886,13 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
             return httpx.Response(200, stream=OversizedLogStream())
         return base(request)
 
-    detail, _ = _observe_detail(monkeypatch, handle)
+    view, _ = _observe_detail(monkeypatch, handle)
 
-    assert (detail.state, detail.reason) == ("observed", None)
-    assert detail.job_logs == {}
-    assert detail.job_log_unavailable == {FAILING_RUN_ID}
+    assert view.reason is None
+    assert _job_logs(view) == {}
+    assert _job_log_unavailable(view) == {str(FAILING_RUN_ID)}
     assert factory_ci.decide(
-        ci_view(detail),
+        view,
         python_ci=None,
         metadata_ci=None,
         now=datetime(2026, 9, 24, 12, 0, tzinfo=UTC),
@@ -2928,7 +2906,7 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
         PR_URL,
         HEAD_SHA,
         2,
-        ci_view(detail),
+        view,
         diagnostics=True,
     )
     entry = json.loads(prompt.splitlines()[3])["failing_checks"][0]
@@ -2939,11 +2917,11 @@ def test_actions_log_over_eight_mib_is_optional_enrichment_failure(
 
 def test_non_actions_failure_does_not_request_job_logs(monkeypatch: pytest.MonkeyPatch) -> None:
     run = _actions_check_run(FAILING_RUN_ID, "external-check", "failure", app_slug="ci-bot")
-    detail, seen = _observe_detail(monkeypatch, _detail_handler(runs=[run]))
+    view, seen = _observe_detail(monkeypatch, _detail_handler(runs=[run]))
 
-    assert (detail.state, detail.reason) == ("observed", None)
-    assert detail.job_logs == {}
-    assert detail.job_log_unavailable == set()
+    assert view.reason is None
+    assert _job_logs(view) == {}
+    assert _job_log_unavailable(view) == set()
     assert not any("/actions/jobs/" in request.url.path for request in seen)
 
 
@@ -2960,10 +2938,10 @@ def test_ci_detail_notes_every_failing_actions_job_when_downloads_are_capped(
             return httpx.Response(403, json={"message": "Actions permission missing"})
         return base(request)
 
-    detail, seen = _observe_detail(monkeypatch, handle)
+    view, seen = _observe_detail(monkeypatch, handle)
 
-    assert (detail.state, detail.reason) == ("observed", None)
-    assert {run["id"] for run in runs} == set(detail.job_logs) | detail.job_log_unavailable
+    assert view.reason is None
+    assert {str(run["id"]) for run in runs} == set(_job_logs(view)) | _job_log_unavailable(view)
     job_requests = [request for request in seen if "/actions/jobs/" in request.url.path]
     assert len(job_requests) == 5
     prompt = factory_ci.continuation_text(
@@ -2971,7 +2949,7 @@ def test_ci_detail_notes_every_failing_actions_job_when_downloads_are_capped(
         PR_URL,
         HEAD_SHA,
         2,
-        ci_view(detail),
+        view,
         diagnostics=True,
     )
     checks = json.loads(prompt.splitlines()[3])["failing_checks"]
@@ -2982,7 +2960,7 @@ def test_ci_detail_notes_every_failing_actions_job_when_downloads_are_capped(
 def test_ci_detail_uses_the_statuses_list_not_the_combined_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    detail, _ = _observe_detail(
+    view, _ = _observe_detail(
         monkeypatch,
         _detail_handler(
             runs=[
@@ -2998,8 +2976,8 @@ def test_ci_detail_uses_the_statuses_list_not_the_combined_state(
             combined="pending",
         ),
     )
-    assert detail.reason is None
-    assert list(detail.statuses) == []
+    assert view.reason is None
+    assert view.statuses == []
 
 
 @pytest.mark.parametrize(
@@ -3009,11 +2987,11 @@ def test_ci_detail_uses_the_statuses_list_not_the_combined_state(
 def test_ci_detail_refusals_map_to_fixed_reasons(
     monkeypatch: pytest.MonkeyPatch, status: int, reason: str
 ) -> None:
-    detail, _ = _observe_detail(
+    view, _ = _observe_detail(
         monkeypatch, lambda r: httpx.Response(status, text=f"BODYTEXT {SECRET_SENTINEL}")
     )
-    assert (detail.state, detail.reason) == ("unavailable", reason)
-    _reason_is_clean(detail)
+    assert (view.reason, view.checks) == (reason, ())
+    _reason_is_clean(view)
 
 
 def test_ci_detail_stalled_mint_releases_the_caller_with_timeout(
@@ -3032,9 +3010,9 @@ def test_ci_detail_stalled_mint_releases_the_caller_with_timeout(
         raise AssertionError("the mint must never finish in this test")
 
     monkeypatch.setattr(anyio.to_thread, "run_sync", never_returns)
-    detail, seen = _observe_detail(monkeypatch, _detail_handler())
+    view, seen = _observe_detail(monkeypatch, _detail_handler())
 
-    assert (detail.state, detail.reason) == ("unavailable", "timeout")
+    assert (view.reason, view.checks) == ("timeout", ())
     assert seen == []
 
 
@@ -3045,13 +3023,11 @@ def test_ci_detail_shares_the_bounded_credential_slots(
 
     from curie_api.forges.github import ci
 
-    assert ci.mint_ci_token is not None
     for _ in range(ci.CI_CREDENTIAL_SLOTS + 1):
         failed, _ = _observe_detail(
             monkeypatch, _detail_handler(), creds=_FakeCreds(error=GitHubAppError("boom"))
         )
-        assert failed.state == "unavailable"
-        assert failed.reason != "observation_busy"
+        assert failed.reason == "github_error"
     healthy, _ = _observe_detail(monkeypatch, _detail_handler())
     assert healthy.reason is None
 

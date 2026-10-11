@@ -22,7 +22,7 @@ from curie_api.schemas.workitems import WorkItemCiOut
 
 CHECK_RUNS_PAGE = 100
 # One overall bound on a live CI observation: credential acquisition (lock,
-# discovery, token mint) and the check-runs request together.
+# discovery, token mint) and the check-runs and statuses requests together.
 CI_OBSERVATION_DEADLINE_SECONDS = 10.0
 # How many credential mints a live CI observation may have in flight across all
 # callers. A caller abandoned at the deadline cannot cancel the mint thread, so
@@ -109,31 +109,6 @@ def _verdict(payload: Any) -> str:
     return "pending" if pending else "passing"
 
 
-async def observe_ci(
-    lineage: Any, work_item: Any, settings: Settings, client: httpx.AsyncClient
-) -> CiObservation:
-    """Observe CI for the lineage's published head, live and never persisted.
-
-    The installation token lives only in a local here; every failure maps to a
-    fixed reason code, and no response text, header or URL is ever echoed. The
-    whole observation is bounded by ``CI_OBSERVATION_DEADLINE_SECONDS``; on
-    expiry the caller is released with ``unavailable``/``timeout`` (a blocked
-    credential thread is abandoned, not awaited).
-    """
-
-    head_sha = getattr(lineage, "head_sha", None) if lineage is not None else None
-    try:
-        return await asyncio.wait_for(
-            _observe_ci(lineage, work_item, settings, client),
-            timeout=CI_OBSERVATION_DEADLINE_SECONDS,
-        )
-    except TimeoutError:
-        return _unavailable(
-            "timeout",
-            head_sha if isinstance(head_sha, str) and SHA_RE.fullmatch(head_sha) else None,
-        )
-
-
 class _CredentialPermit:
     """One credential slot, released exactly once by whoever claims it.
 
@@ -180,28 +155,15 @@ def _mint_and_release(
             _CI_CREDENTIAL_GUARD.release()
 
 
-async def mint_ci_token(
-    lineage: Any, work_item: Any, settings: Settings, head_sha: str
+async def mint_repository_token(
+    settings: Settings, repo_full_name: str, installation_id: int | None, head_sha: str | None
 ) -> tuple[str | None, CiObservation | None]:
     """Mint a CI read token through the bounded credential slots.
 
     Returns ``(token, None)`` or ``(None, unavailable)``. The token lives only
-    in the caller's local; every failure maps to a fixed reason code.
+    in the caller's local; every failure maps to a fixed reason code. An
+    ``installation_id`` of ``None`` rediscovers the installation.
     """
-
-    return await mint_repository_token(
-        settings,
-        lineage.repo_full_name,
-        lineage.code_host_installation_id or work_item.code_host_installation_id,
-        head_sha,
-    )
-
-
-async def mint_repository_token(
-    settings: Settings, repo_full_name: str, installation_id: int | None, head_sha: str | None
-) -> tuple[str | None, CiObservation | None]:
-    """`mint_ci_token` for a repository named directly; ``None`` rediscovers
-    the installation."""
 
     resolver = credentials_for(settings)
     if not resolver.app_configured:
@@ -233,62 +195,6 @@ async def mint_repository_token(
         if permit.claim():
             _CI_CREDENTIAL_GUARD.release()
     return token, None
-
-
-async def _observe_ci(
-    lineage: Any, work_item: Any, settings: Settings, client: httpx.AsyncClient
-) -> CiObservation:
-    if lineage is None or lineage.pr_number is None:
-        return CiObservation(state="not_applicable", reason="no_pull_request")
-    head_sha = lineage.head_sha
-    if not isinstance(head_sha, str) or not SHA_RE.fullmatch(head_sha):
-        return _unavailable("no_head_sha")
-    token, refused = await mint_ci_token(lineage, work_item, settings, head_sha)
-    if refused is not None:
-        return refused
-    assert token is not None
-    try:
-        url = (
-            f"{settings.github_api_url.rstrip('/')}/repos/"
-            f"{repo_url_path(lineage.repo_full_name)}/commits/{head_sha}/check-runs"
-        )
-    except ValueError:
-        return _unavailable("github_error", head_sha)
-    try:
-        response = await client.get(
-            url,
-            params={"per_page": CHECK_RUNS_PAGE},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-            timeout=settings.github_app_timeout_seconds,
-            follow_redirects=False,
-        )
-    except httpx.TimeoutException:
-        return _unavailable("timeout", head_sha)
-    except httpx.HTTPError:
-        return _unavailable("github_error", head_sha)
-    finally:
-        del token
-    if response.status_code in _STATUS_REASONS:
-        return _unavailable(_STATUS_REASONS[response.status_code], head_sha)
-    if response.status_code != 200:
-        return _unavailable("github_error", head_sha)
-    try:
-        payload = response.json()
-    except ValueError:
-        return _unavailable("malformed_response", head_sha)
-    verdict = _verdict(payload)
-    if verdict not in ("passing", "failing", "pending", "none"):
-        return _unavailable(verdict, head_sha)
-    return CiObservation(
-        state=verdict,  # type: ignore[arg-type]
-        reason=None,
-        head_sha=head_sha,
-        observed_at=datetime.now(UTC),
-    )
 
 
 @dataclass(frozen=True)
@@ -465,50 +371,6 @@ async def _fetch_job_log(
             return "\n".join(redacted.splitlines()[-CI_JOB_LOG_MAX_LINES:])[-CI_JOB_LOG_MAX_CHARS:]
     except (TimeoutError, httpx.HTTPError, ValueError):
         return None
-
-
-async def observe_ci_detail(
-    lineage: Any, work_item: Any, settings: Settings, client: httpx.AsyncClient
-) -> CiDetail:
-    """Observe check runs, commit statuses and failing annotations for the head.
-
-    Shares ``observe_ci``'s bounded credential mint (``mint_ci_token``). The
-    whole observation is bounded by ``CI_DETAIL_DEADLINE_SECONDS``; on expiry
-    the caller is released with ``unavailable``/``timeout``.
-    """
-
-    raw = getattr(lineage, "head_sha", None) if lineage is not None else None
-    head_sha = raw if isinstance(raw, str) and SHA_RE.fullmatch(raw) else None
-    log_deadline = asyncio.get_running_loop().time() + CI_DETAIL_DEADLINE_SECONDS - 0.5
-    try:
-        return await asyncio.wait_for(
-            _observe_ci_detail(lineage, work_item, settings, client, log_deadline),
-            timeout=CI_DETAIL_DEADLINE_SECONDS,
-        )
-    except TimeoutError:
-        return _detail_unavailable("timeout", head_sha)
-
-
-async def _observe_ci_detail(
-    lineage: Any,
-    work_item: Any,
-    settings: Settings,
-    client: httpx.AsyncClient,
-    log_deadline: float,
-) -> CiDetail:
-    head_sha = getattr(lineage, "head_sha", None) if lineage is not None else None
-    if not isinstance(head_sha, str) or not SHA_RE.fullmatch(head_sha):
-        return _detail_unavailable("no_head_sha", None)
-    return await read_ci_detail(
-        settings,
-        client,
-        repo_full_name=lineage.repo_full_name,
-        installation_id=lineage.code_host_installation_id or work_item.code_host_installation_id,
-        head_sha=head_sha,
-        log_deadline=log_deadline,
-        diagnostics=True,
-        base_ref=getattr(lineage, "base_ref", None),
-    )
 
 
 async def read_ci_detail(
