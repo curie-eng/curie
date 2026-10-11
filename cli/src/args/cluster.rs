@@ -220,8 +220,7 @@ pub(crate) enum ClusterAction {
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
-        /// Read Helm history and print the selected revision and commands without
-        /// probing the live schema or running the rollback.
+        /// Print the commands that would run and exit without executing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -267,7 +266,8 @@ pub(crate) enum ClusterAction {
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
-        /// Print the commands that would run and exit without executing.
+        /// Read Helm history and print the selected revision and commands without
+        /// probing the live schema or running the rollback.
         #[arg(long)]
         dry_run: bool,
     },

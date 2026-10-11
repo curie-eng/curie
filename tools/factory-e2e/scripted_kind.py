@@ -107,7 +107,6 @@ def scripted_values(
     values["api"].update(
         githubApiUrl=github_api,
         githubCloneBase=clone_base,
-        githubStubCaConfigMap=ca_configmap,
         githubFactoryPollIntervalSeconds=5,
     )
     values["codeHostTrust"] = {

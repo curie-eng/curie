@@ -72,7 +72,10 @@ def test_scripted_values_put_the_proxy_on_the_worker() -> None:
     assert {"name": "CURIE_MODEL_BASE_URL", "value": "http://10.1.2.3:8080"} in values["worker"][
         "extraEnv"
     ]
-    assert values["api"]["githubStubCaConfigMap"] == "github-stub-ca"
+    assert "githubStubCaConfigMap" not in values["api"]
+    assert values["codeHostTrust"]["caBundle"]["configMapRef"] == {
+        "name": "github-stub-ca", "key": "ca.pem"
+    }
     assert {"cidr": "10.1.2.3/32", "ports": [{"protocol": "TCP", "port": 8080}]} in values[
         "security"
     ]["networkPolicy"]["allowedEgress"]

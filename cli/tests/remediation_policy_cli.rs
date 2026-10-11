@@ -33,7 +33,7 @@
 //! API, as `actions_cli.rs` does. Every error is the ADR-0021 `{"error","fix"}`
 //! object and every verb prints exactly one JSON object under `--json`.
 
-mod support;
+use crate::support;
 
 use std::path::Path;
 use std::process::{Command, Output};

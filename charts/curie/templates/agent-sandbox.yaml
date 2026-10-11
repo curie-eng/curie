@@ -177,7 +177,6 @@ roleRef:
 {{- end }}
 {{- end }}
 {{- $bf := $runner.bundleFetch }}
-{{- $stubCa := .Values.api.githubStubCaConfigMap }}
 {{- $wf := $runner.workspace }}
 {{- if $agent }}
 {{- with index (.Values.agentSandbox.workspaceSizeLimits | default dict) $agent }}
@@ -296,7 +295,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       {{- end }}
-      {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled $stubCa (include "curie.codeHostTrust.name" .) }}
+      {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled (include "curie.codeHostTrust.name" .) }}
       volumes:
         {{- include "curie.codeHostTrust.volume" . | nindent 8 }}
         {{- if $bf.enabled }}
@@ -342,11 +341,6 @@ spec:
           emptyDir:
             sizeLimit: {{ $runner.hardening.writablePathSizeLimit | quote }}
         {{- end }}
-        {{- end }}
-        {{- if $stubCa }}
-        - name: github-stub-ca
-          configMap:
-            name: {{ $stubCa }}
         {{- end }}
       {{- end }}
       {{- if or $bf.enabled $wf.enabled $af.enabled }}
@@ -978,14 +972,6 @@ spec:
             - name: GIT_CONFIG_VALUE_0
               value: {{ $wf.mountPath | quote }}
             {{- end }}
-            {{- if $stubCa }}
-            - name: SSL_CERT_FILE
-              value: /etc/curie/github-stub/ca.pem
-            - name: GIT_SSL_CAINFO
-              value: /etc/curie/github-stub/ca.pem
-            - name: REQUESTS_CA_BUNDLE
-              value: /etc/curie/github-stub/ca.pem
-            {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" $runner.extraEnv) | nindent 12 }}
             {{- include "curie.extraEnv" (dict "root" . "workload" "agentSandbox.runner" "env" $runner.extraEnv "additionalReserved" $connectorReservedEnv) | nindent 12 }}
           readinessProbe:
@@ -995,7 +981,7 @@ spec:
             {{- toYaml $runner.readinessProbe | nindent 12 }}
           resources:
             {{- toYaml $runner.resources | nindent 12 }}
-          {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled $stubCa (include "curie.codeHostTrust.name" .) }}
+          {{- if or $bf.enabled $wf.enabled $af.enabled $runner.hardening.enabled (include "curie.codeHostTrust.name" .) }}
           volumeMounts:
             {{- include "curie.codeHostTrust.volumeMount" . | nindent 12 }}
             {{- if $bf.enabled }}
@@ -1020,11 +1006,6 @@ spec:
             - name: writable-{{ $i }}
               mountPath: {{ $p }}
             {{- end }}
-            {{- end }}
-            {{- if $stubCa }}
-            - name: github-stub-ca
-              mountPath: /etc/curie/github-stub
-              readOnly: true
             {{- end }}
           {{- end }}
 {{/*

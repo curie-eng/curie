@@ -41,6 +41,9 @@ def pod(kind, suffix):
     fail(f"no {kind} named *{suffix} rendered")
 
 def env(container):
+    names = [e["name"] for e in container.get("env", []) or []]
+    if len(names) != len(set(names)):
+        fail("duplicate environment names in " + container["name"])
     return {e["name"]: e.get("value") for e in container.get("env", []) or []}
 
 def mounted(spec, container):
@@ -108,5 +111,14 @@ if render --set codeHostTrust.caBundle.configMapRef.name=corp-ca \
   exit 1
 fi
 echo "  ok: negative control (writable mount) fails the check"
+
+# Negative control: a repeated client CA env must never be flattened away.
+if render --set codeHostTrust.caBundle.configMapRef.name=corp-ca \
+  --set codeHostTrust.caBundle.configMapRef.key=bundle.pem \
+  | sed '/- name: SSL_CERT_FILE/{p;n;p;}' | check set >/dev/null 2>&1; then
+  echo "FAIL: duplicate client CA environment passed the check" >&2
+  exit 1
+fi
+echo "  ok: negative control (duplicate CA environment) fails the check"
 
 echo "code-host-trust-assertions: all assertions passed"

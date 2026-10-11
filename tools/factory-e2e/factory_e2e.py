@@ -6093,7 +6093,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=Path("tools/model-script/transcripts/unitconv-issue.json"),
     )
-    scripted.add_argument("--model-base-url")
 
     accept = sub.add_parser(
         "accept",

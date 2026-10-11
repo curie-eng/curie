@@ -4,6 +4,8 @@
 
 mod support;
 
+mod actions_cli;
+mod agent_update_body;
 mod api_deploy;
 mod api_emit_parity;
 mod api_field_parity;
@@ -117,6 +119,7 @@ mod local_up_build_channel_guard;
 mod local_up_fake_warning;
 mod mail_channel_health;
 mod memory_add;
+mod memory_facts;
 mod memory_guidance_clap_wiring;
 mod message_argv;
 mod message_ephemeral_ports;
@@ -133,12 +136,17 @@ mod pre_push_hook;
 mod probe_fanout;
 mod recovery_drill;
 mod release_accept;
+mod remediation_policy_cli;
+mod remediation_receipts_cli;
+mod remediation_vectors;
 mod remote_dev_workspace;
 mod resume_wait;
 mod runner_layer_build;
 mod runner_stream;
 mod schedules;
 mod schema_inventory;
+mod sealing_key_custody;
+mod sealing_key_custody_cli;
 mod shipped_bundle_runner_layers;
 mod skill_bundle_snapshot;
 mod skill_check;
