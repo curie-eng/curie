@@ -49,10 +49,10 @@ from .factory_usage import usage_line, work_item_usage
 from .forges.errors import ForgeError
 from .forges.github.comments import static_token
 from .forges.github.marked_comments import (
+    GitHubCalls,
     GitHubCommentClient,
-    _github_calls,
-    _GitHubCalls,
     deliver,
+    github_calls,
     patch_comment,
     subject_title,
 )
@@ -210,8 +210,6 @@ _USD_BUDGET_DETAIL = re.compile(
 # be a plain word. The colon form stays on ``_PROVIDER_WORKSPACE``.
 
 
-
-
 def cause_text(cause: str) -> str:
     """A plain sentence for a terminus cause; unknown codes get a generic one."""
 
@@ -222,8 +220,6 @@ def start_failed_sentence(attempts: int, reason: str) -> str:
     """The ``start_failed`` sentence naming the attempt count and last reason (#4170)."""
 
     return f"the sandbox did not start after {attempts} attempts. Last reason: {reason}."
-
-
 
 
 FINAL_MARKER = "<!-- curie-status:final -->"
@@ -591,8 +587,8 @@ async def sync_status_comments(
             if claim is None:
                 break
             attempted_ids.add(claim.row.execution_request_id)
-            calls = _GitHubCalls()
-            token = _github_calls.set(calls)
+            calls = GitHubCalls()
+            token = github_calls.set(calls)
             started = time.monotonic()
             try:
                 writes += await _sync_one(client, settings, claim)
@@ -601,7 +597,7 @@ async def sync_status_comments(
                     await _write_back(session, claim, owner=owner)
                     await session.commit()
             finally:
-                _github_calls.reset(token)
+                github_calls.reset(token)
                 elapsed_ms = (time.monotonic() - started) * 1000
                 logger.info(
                     "factory status sync calls=%d elapsed_ms=%.1f",
@@ -970,8 +966,6 @@ async def _superseded(
     return later is not None
 
 
-
-
 async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     """Add the desired state label and remove the others, on the issue.
 
@@ -999,21 +993,3 @@ async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
 
 async def _clock(session: AsyncSession) -> Any:
     return await session.scalar(select(func.clock_timestamp()))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

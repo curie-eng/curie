@@ -43,7 +43,7 @@ from curie_api.config import Settings
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable, Unsupported
 from curie_api.forges.github.comments import GitHubMarkedComments, TokenSource
-from curie_api.forges.github.marked_comments import REFUSED_STATUSES, _github_request
+from curie_api.forges.github.marked_comments import REFUSED_STATUSES, github_request
 from curie_api.forges.github.review_polling import human_actor
 from curie_api.forges.github.transport import (
     PollUnavailable,
@@ -554,7 +554,7 @@ class GitHubTracker:
         present = await self._present_labels(labels_path, template, headers)
         if add and add not in present:
             try:
-                added = await _github_request(
+                added = await github_request(
                     self._client,
                     "POST",
                     labels_path,
@@ -577,7 +577,7 @@ class GitHubTracker:
             if name not in present:
                 continue
             try:
-                removed = await _github_request(
+                removed = await github_request(
                     self._client,
                     "DELETE",
                     f"{labels_path}/{quote(name, safe=':')}",
@@ -614,7 +614,7 @@ class GitHubTracker:
         seen: set[str] = set()
         while True:
             try:
-                listed = await _github_request(
+                listed = await github_request(
                     self._client,
                     "GET",
                     url,

@@ -30,14 +30,14 @@ CommentList = Literal["issue", "review"]
 
 
 @dataclass
-class _GitHubCalls:
+class GitHubCalls:
     count: int = 0
 
 
-_github_calls: ContextVar[_GitHubCalls | None] = ContextVar("factory_github_calls", default=None)
+github_calls: ContextVar[GitHubCalls | None] = ContextVar("factory_github_calls", default=None)
 
 
-async def _github_request(
+async def github_request(
     client: httpx.AsyncClient,
     method: str,
     url: str,
@@ -45,7 +45,7 @@ async def _github_request(
     path_template: str,
     **kwargs: Any,
 ) -> httpx.Response:
-    calls = _github_calls.get()
+    calls = github_calls.get()
     if calls is not None:
         calls.count += 1
     started = time.monotonic()
@@ -71,6 +71,7 @@ async def _github_request(
                     "elapsed_ms": elapsed_ms,
                 },
             )
+
 
 @dataclass(frozen=True)
 class _MarkerScan:
@@ -102,7 +103,7 @@ async def subject_title(
         path = f"{github.repo_path}/pulls/{target.pull_request.number}"
         template = "/repos/{owner}/{repo}/pulls/{pull_number}"
     try:
-        found = await _github_request(
+        found = await github_request(
             github.client,
             "GET",
             f"{github.api}{path}",
@@ -201,7 +202,7 @@ async def patch_comment(
     kind = "pulls" if row.comment_list == "review" else "issues"
     url = f"{github.api}{github.repo_path}/{kind}/comments/{row.comment_id}"
     try:
-        edited = await _github_request(
+        edited = await github_request(
             github.client,
             "PATCH",
             url,
@@ -231,7 +232,7 @@ async def _thread_root(
     """Reply to the thread's first comment; replies to replies are refused."""
 
     try:
-        found = await _github_request(
+        found = await github_request(
             client,
             "GET",
             f"{api}{repo_path}/pulls/comments/{comment_id}",
@@ -258,7 +259,7 @@ async def _post(
     path_template: str,
 ) -> tuple[str, str] | None:
     try:
-        created = await _github_request(
+        created = await github_request(
             client,
             "POST",
             url,
@@ -304,7 +305,7 @@ async def find_marker(
     page = start_page
     for _ in range(_PAGES_PER_PASS):
         try:
-            listed = await _github_request(
+            listed = await github_request(
                 client,
                 "GET",
                 f"{api}{path}",
@@ -457,7 +458,7 @@ async def upsert_marker(
             return MarkerWrite("unchanged", found.comment_id, found.list_kind, body)
         kind = "pulls" if found.list_kind == "review" else "issues"
         try:
-            edited = await _github_request(
+            edited = await github_request(
                 client,
                 "PATCH",
                 f"{api}{repo_path}/{kind}/comments/{found.comment_id}",
