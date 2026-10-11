@@ -1104,6 +1104,178 @@ fn dev_subcommands_parse() {
     }
 }
 
+// #4398: `curie dev forge-fixture <kind> <action> --state-dir <dir>` drives a
+// local GitLab or Bitbucket Data Center fixture. Kind and action are closed sets.
+#[test]
+fn dev_forge_fixture_parses_every_field() {
+    let cli = try_parse_from([
+        "curie",
+        "dev",
+        "forge-fixture",
+        "bitbucket-dc",
+        "self-test",
+        "--state-dir",
+        "/tmp/forge-state",
+        "--advertise-host",
+        "10.0.0.7",
+        "--port",
+        "7990",
+    ])
+    .expect("dev forge-fixture with every flag should parse");
+    match cli.command {
+        Some(Command::Dev {
+            action:
+                DevAction::ForgeFixture {
+                    kind,
+                    action,
+                    state_dir,
+                    advertise_host,
+                    port,
+                },
+        }) => {
+            assert!(matches!(kind, ForgeFixtureKind::BitbucketDc));
+            assert!(matches!(action, ForgeFixtureAction::SelfTest));
+            assert_eq!(state_dir, std::path::PathBuf::from("/tmp/forge-state"));
+            assert_eq!(advertise_host.as_deref(), Some("10.0.0.7"));
+            assert_eq!(port, Some(7990));
+        }
+        _ => panic!("dev forge-fixture parsed as another command"),
+    }
+
+    let cli = try_parse_from([
+        "curie",
+        "dev",
+        "forge-fixture",
+        "gitlab",
+        "up",
+        "--state-dir",
+        "state",
+    ])
+    .expect("dev forge-fixture with only --state-dir should parse");
+    match cli.command {
+        Some(Command::Dev {
+            action:
+                DevAction::ForgeFixture {
+                    kind,
+                    action,
+                    state_dir,
+                    advertise_host,
+                    port,
+                },
+        }) => {
+            assert!(matches!(kind, ForgeFixtureKind::Gitlab));
+            assert!(matches!(action, ForgeFixtureAction::Up));
+            assert_eq!(state_dir, std::path::PathBuf::from("state"));
+            assert_eq!(advertise_host, None);
+            assert_eq!(port, None);
+        }
+        _ => panic!("dev forge-fixture parsed as another command"),
+    }
+
+    let cli = try_parse_from([
+        "curie",
+        "dev",
+        "forge-fixture",
+        "gitlab",
+        "down",
+        "--state-dir",
+        "state",
+    ])
+    .expect("dev forge-fixture down should parse");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Dev {
+            action: DevAction::ForgeFixture {
+                action: ForgeFixtureAction::Down,
+                ..
+            }
+        })
+    ));
+}
+
+#[test]
+fn dev_forge_fixture_requires_state_dir() {
+    let error = match try_parse_from(["curie", "dev", "forge-fixture", "gitlab", "up"]) {
+        Ok(_) => panic!("dev forge-fixture without --state-dir must be refused"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+    assert!(
+        error.to_string().contains("--state-dir"),
+        "error should name --state-dir: {error}"
+    );
+}
+
+#[test]
+fn dev_forge_fixture_refuses_unknown_kind() {
+    for kind in ["github", "gitlab-ce", "bitbucket", "GitLab"] {
+        let error = match try_parse_from([
+            "curie",
+            "dev",
+            "forge-fixture",
+            kind,
+            "up",
+            "--state-dir",
+            "state",
+        ]) {
+            Ok(_) => panic!("dev forge-fixture must refuse kind {kind:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::InvalidValue,
+            "kind {kind:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn dev_forge_fixture_refuses_unknown_action() {
+    for action in ["start", "self_test", "selftest", "status"] {
+        let error = match try_parse_from([
+            "curie",
+            "dev",
+            "forge-fixture",
+            "gitlab",
+            action,
+            "--state-dir",
+            "state",
+        ]) {
+            Ok(_) => panic!("dev forge-fixture must refuse action {action:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::InvalidValue,
+            "action {action:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn dev_forge_fixture_refuses_bad_port() {
+    for port in ["70000", "-1", "http", ""] {
+        assert!(
+            try_parse_from([
+                "curie",
+                "dev",
+                "forge-fixture",
+                "gitlab",
+                "up",
+                "--state-dir",
+                "state",
+                "--port",
+                port,
+            ])
+            .is_err(),
+            "dev forge-fixture must refuse --port {port:?}"
+        );
+    }
+}
+
 // Proves the `dev` verb set is closed: an unrecognized verb must fail to
 // parse rather than silently falling through. Without this negative case,
 // a typo'd verb name (e.g. a future rename that missed a call site) could
