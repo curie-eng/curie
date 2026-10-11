@@ -360,7 +360,13 @@ def test_git_smart_http_clones_pushes_and_exposes_the_pushed_ref(
     assert pull["head"]["ref"] == "factory/example"
     assert pull["head"]["sha"] == pushed_sha
     assert pull["base"]["ref"] == "main"
-    assert _ok(github.get(f"/repos/{REPO}/pulls/{pull['number']}"))["html_url"] == pull["html_url"]
+    fetched = _ok(github.get(f"/repos/{REPO}/pulls/{pull['number']}"))
+    assert fetched["html_url"] == pull["html_url"]
+    # GitHub returns a global node ID on every pull request
+    # (https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request), and the
+    # API's publication identity check refuses a pull request without one.
+    assert isinstance(pull["node_id"], str) and pull["node_id"]
+    assert fetched["node_id"] == pull["node_id"]
     listed = _ok(
         github.get(
             f"/repos/{REPO}/pulls",
