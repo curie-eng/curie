@@ -1,6 +1,6 @@
 {
   "schemaVersion": "1.0",
-  "defaultVersion": "audit-2026-10-10-f66c4aa5",
+  "defaultVersion": "v0.12.4",
   "versions": [
     {
       "id": "v0.7.1",
@@ -265,6 +265,14 @@
       "date": "2026-10-10",
       "branch": "main",
       "commit": "f66c4aa55523f474da50dc7261a3b9373ede988a"
+    },
+    {
+      "id": "v0.12.4",
+      "label": "v0.12.4",
+      "file": "snapshots/v0.12.4.json",
+      "date": "2026-10-11",
+      "branch": "main",
+      "commit": "a2f85d774b39bf5a84e490d2e439e81f4a0cfde9"
     }
   ]
 }
