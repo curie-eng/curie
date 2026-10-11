@@ -25,7 +25,7 @@ from curie_api.forges.errors import Ambiguous, NotFound, Unauthorized, Unavailab
 from curie_api.forges.github import ci
 from curie_api.forges.github import code_host as code_host_module
 from curie_api.forges.github.code_host import GitHubCodeHost
-from curie_api.forges.hosts import repository_ref, resolve_stored
+from curie_api.forges.hosts import github_host, repository_ref, resolve_stored
 from curie_api.forges.ports import CodeHost
 from curie_api.forges.types import (
     Actor,
@@ -133,6 +133,18 @@ def test_every_operation_is_declared_supported() -> None:
         assert (port.kind, port.host) == (types.GITHUB, "github.com")
 
     _with_host(lambda request: httpx.Response(500), body)
+
+
+def test_the_identity_host_keeps_a_ghe_port_like_the_tracker_and_stored_rows() -> None:
+    settings = _settings(GITHUB_API_URL="https://GHE.example.com:8443/api/v3")
+
+    host = _with_host(
+        lambda request: httpx.Response(500),
+        lambda host: asyncio.sleep(0, result=host.host),
+        settings=settings,
+    )
+
+    assert host == github_host(settings) == "ghe.example.com:8443"
 
 
 # --- pull requests (formerly the worker's GitHubPublicationLookup) -----------------
@@ -703,6 +715,33 @@ def test_a_refused_call_logs_github_diagnostics_but_raises_only_a_reason(
     assert "request_id=EXAMPLE:REQUEST:ID" in logged
     assert f"message={message[:200]}" in logged
     assert message[:201] not in logged
+
+
+def test_a_ci_read_mints_only_for_the_installation_stored_for_the_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected: list[int | None] = []
+
+    class Recording(_CiCredentials):
+        def fresh_installation_token(
+            self, repo_full_name: str, expected_installation_id: int | None = None
+        ) -> tuple[int, str]:
+            expected.append(expected_installation_id)
+            return super().fresh_installation_token(repo_full_name, expected_installation_id)
+
+    monkeypatch.setattr(ci, "credentials_for", lambda _settings: Recording())
+
+    async def run() -> None:
+        handler = _ci_handler([_run("unit", "success")])
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            stored = GitHubCodeHost(_settings(), client, installations={REPO.upper(): 41})
+            await stored.observe_ci(_repository(), REVISION_HEAD)
+            unknown = GitHubCodeHost(_settings(), client)
+            await unknown.observe_ci(_repository(), REVISION_HEAD)
+
+    asyncio.run(run())
+
+    assert expected == [41, None]
 
 
 # --- mergeability (#4263) -----------------------------------------------------------

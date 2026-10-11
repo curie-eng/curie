@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from curie_api.crud import agents as crud_agents
 from curie_api.schemas.workitems import WorkItemOutcomeList, WorkItemOutcomeOut, WorkItemUsageOut
 
-from .. import factory_usage, workitem_outcomes
+from .. import factory_ci, factory_usage, workitem_outcomes
 from ..auth import require_api_key
 from ..code_host_trust import code_host_verify
 from ..config import get_settings
@@ -65,7 +65,12 @@ async def get_work_item(
     view, item, lineage = loaded
     async with httpx.AsyncClient(verify=code_host_verify(settings)) as client:
         view.ci = await workitem_outcomes.observe_ci(
-            code_host_for(settings, client), settings, lineage, item
+            code_host_for(
+                settings, client, installations=factory_ci.stored_installation(lineage, item)
+            ),
+            settings,
+            lineage,
+            item,
         )
     return view
 

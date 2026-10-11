@@ -8,6 +8,7 @@ later in #3831 without changing any caller.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from urllib.parse import urlsplit
 
 import httpx
@@ -20,10 +21,19 @@ from curie_api.forges.ports import CodeHost
 from curie_api.forges.types import PullRequestRef, RepositoryRef, TrackerIssueRef
 
 
-def code_host_for(settings: Settings, client: httpx.AsyncClient) -> CodeHost:
-    """The code host for this install's repositories."""
+def code_host_for(
+    settings: Settings,
+    client: httpx.AsyncClient,
+    *,
+    installations: Mapping[str, int] | None = None,
+) -> CodeHost:
+    """The code host for this install's repositories.
 
-    return GitHubCodeHost(settings, client)
+    ``installations`` maps a repository path to the App installation stored for
+    it, which fences the reads that mint for that repository.
+    """
+
+    return GitHubCodeHost(settings, client, installations=installations)
 
 
 def github_host(settings: Settings) -> str:

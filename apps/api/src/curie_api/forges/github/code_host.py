@@ -338,6 +338,7 @@ class GitHubCodeHost:
         *,
         marked_comments: MarkedComments | None = None,
         repository_paths: Mapping[str, str] | None = None,
+        installations: Mapping[str, int] | None = None,
         page_size: int = _PER_PAGE,
     ) -> None:
         if page_size < 1:
@@ -346,7 +347,7 @@ class GitHubCodeHost:
         self._client = client
         self._api = settings.github_api_url.rstrip("/")
         self._html = settings.github_html_base.rstrip("/")
-        self.host = urlsplit(self._html).hostname or "github.com"
+        self.host = urlsplit(self._html).netloc.lower() or "github.com"
         self.capabilities: Mapping[Operation, Support] = dict.fromkeys(
             CODE_HOST_OPERATIONS, Support.SUPPORTED
         )
@@ -354,6 +355,12 @@ class GitHubCodeHost:
         # Immutable id -> configured path, so a numeric id resolves with a
         # token minted for its installation (commit 10 feeds this from config).
         self._paths = dict(repository_paths or {})
+        # Repository path -> the App installation stored when it was admitted.
+        # A CI read mints only for that installation, so a reinstalled App is
+        # refused instead of read under a different authority.
+        self._installations = {
+            path.casefold(): installation for path, installation in (installations or {}).items()
+        }
         self._page_size = page_size
 
     @property
@@ -707,7 +714,7 @@ class GitHubCodeHost:
                     self._settings,
                     self._client,
                     repo_full_name=repository.path,
-                    installation_id=None,
+                    installation_id=self._installations.get(repository.path.casefold()),
                     head_sha=head_sha,
                     log_deadline=loop.time() + deadline - 0.5,
                     diagnostics=diagnostics,

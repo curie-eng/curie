@@ -134,13 +134,9 @@ def test_0102_backfills_typed_targets_from_the_revision_objective_and_downgrades
             "reply_target_comment_id": None,
             "reply_target_url": review_url,
         }
-        assert targets[enterprise] == {
-            "reply_target_kind": "review_thread",
-            "reply_target_pr_number": "504",
-            "reply_target_comment_id": "88004",
-            "reply_target_url": enterprise_url,
-        }
         for refused in (
+            # Not under the configured clone base, so the old parser read the issue.
+            enterprise,
             issue,
             other_repo,
             suffix_repo,
@@ -155,6 +151,35 @@ def test_0102_backfills_typed_targets_from_the_revision_objective_and_downgrades
         command.downgrade(config, "0101")
 
         assert not (column_names("execution_requests") & _COLUMNS)
+    finally:
+        command.upgrade(config, "head")
+
+
+def test_0102_backfills_only_under_the_configured_enterprise_clone_base(
+    isolated_migration_db: IsolatedMigrationDb, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GITHUB_CLONE_BASE", "https://ghe.example.com/git/")
+    config = alembic_config()
+    isolated_migration_db.at("0101")
+    enterprise_url = f"https://ghe.example.com/git/{REPO}/pull/504#discussion_r88004"
+    try:
+        enterprise = _seed_request(_objective(enterprise_url))
+        public = _seed_request(_objective(f"https://github.com/{REPO}/pull/505#issuecomment-1"))
+        other_prefix = _seed_request(
+            _objective(f"https://ghe.example.com/other/{REPO}/pull/506#issuecomment-2")
+        )
+
+        command.upgrade(config, "0102")
+
+        targets = _targets()
+        assert targets[enterprise] == {
+            "reply_target_kind": "review_thread",
+            "reply_target_pr_number": "504",
+            "reply_target_comment_id": "88004",
+            "reply_target_url": enterprise_url,
+        }
+        assert targets[public] == _ISSUE
+        assert targets[other_prefix] == _ISSUE
     finally:
         command.upgrade(config, "head")
 

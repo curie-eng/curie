@@ -152,6 +152,12 @@ spec:
             */}}
             - name: GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
+            {{- /*
+            The API's clone base, so revision 0102 types a reply target only for
+            a feedback URL the API itself would have parsed.
+            */}}
+            - name: GITHUB_CLONE_BASE
+              value: {{ .Values.api.githubCloneBase | quote }}
             {{- with .Values.api.migrate.provenanceDeclarationsSecret }}
             {{- /*
             Optional, and a FILE rather than a value, on purpose: `helm get

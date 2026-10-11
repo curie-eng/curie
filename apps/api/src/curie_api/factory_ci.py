@@ -177,6 +177,23 @@ class CiView:
         return [check for check in self.checks if check.source is CheckSource.STATUS]
 
 
+def stored_installation(
+    lineage: ThreadPublicationLineage | None, work_item: WorkItem
+) -> dict[str, int]:
+    """The App installation stored for the published repository, keyed by path.
+
+    The lineage's installation wins over the WorkItem's, as before the port.
+    """
+
+    installation = (
+        lineage.code_host_installation_id if lineage is not None else None
+    ) or work_item.code_host_installation_id
+    if installation is None:
+        return {}
+    path = (lineage.repo_full_name if lineage is not None else None) or work_item.repository_path
+    return {path: installation}
+
+
 async def observe(
     code_host: CodeHost,
     repository: RepositoryRef,
@@ -1047,8 +1064,6 @@ async def gate(
     takes a later request's slot.
     """
 
-    code_host = code_host_for(settings, client)
-    capabilities = ci_capabilities(code_host.capabilities)
     async with sessionmaker() as session:
         facts = await _load(session, settlement)
         now = await lifecycle.database_now(session)
@@ -1058,6 +1073,10 @@ async def gate(
     if facts is None:
         return "waiting"
     request, work_item, lineage = facts.request, facts.work_item, facts.lineage
+    code_host = code_host_for(
+        settings, client, installations=stored_installation(lineage, work_item)
+    )
+    capabilities = ci_capabilities(code_host.capabilities)
     assert request.execution_deadline is not None
     round_ = len(facts.publications)
     if await valkey.exists(ci_key(request.id, round_ + 1)):
