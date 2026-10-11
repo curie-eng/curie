@@ -2121,7 +2121,12 @@ def recorded_github(
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    stub = module.GithubStub(tmp_path, recording)
+    seed_tree = tmp_path / "seed"
+    seed_tree.mkdir()
+    (seed_tree / "example.py").write_text("def example():\n    return 'example'\n")
+    issue_file = tmp_path / "issue.md"
+    issue_file.write_text("Update example.py.")
+    stub = module.GithubStub(tmp_path, recording, seed_tree=seed_tree, issue_file=issue_file)
     stream = f"test:curie:github-replay:{uuid.uuid4().hex}"
     app_key = (
         rsa.generate_private_key(public_exponent=65537, key_size=2048)

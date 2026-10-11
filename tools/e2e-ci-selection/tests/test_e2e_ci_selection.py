@@ -1300,12 +1300,14 @@ AGGREGATE_EXPRESSIONS = {
     "released_upgrade_selected": "${{ needs.changes.outputs.released_upgrade }}",
     "released_upgrade_full": "${{ needs.changes.outputs.released_upgrade_full }}",
     "approval_resume_selected": "${{ needs.changes.outputs.approval_resume }}",
+    "factory_selected": "${{ needs.changes.outputs.factory }}",
     "skill_local_result": "${{ needs.e2e-ladder.result }}",
     "local_release_result": "${{ needs.e2e-ladder-release.result }}",
     "cluster_result": "${{ needs.e2e-ladder-cluster.result }}",
     "cluster_chart_result": "${{ needs.e2e-cluster-chart-regressions.result }}",
     "rollout_recovery_result": "${{ needs.e2e-cluster-rollout-recovery.result }}",
     "approval_resume_result": ("${{ needs.e2e-cluster-approval-resume-restarts.result }}"),
+    "factory_result": "${{ needs.e2e-scripted-factory.result }}",
     "released_upgrade_result": "${{ needs.e2e-released-upgrade.result }}",
     "released_upgrade_negative_result": ("${{ needs.e2e-released-upgrade-negative.result }}"),
     "upgrade_matrix_shards_result": ("${{ needs.e2e-cluster-upgrade-matrix-shards.result }}"),
@@ -1886,6 +1888,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
         "e2e-cluster-chart-regressions",
         "e2e-cluster-rollout-recovery",
         "e2e-cluster-approval-resume-restarts",
+        "e2e-scripted-factory",
         "e2e-released-upgrade",
         "e2e-released-upgrade-negative",
         "e2e-cluster-upgrade-matrix-shards",
@@ -1929,12 +1932,14 @@ def _run_aggregate(
         "released_upgrade_selected": "false",
         "released_upgrade_full": "false",
         "approval_resume_selected": "false",
+        "factory_selected": "false",
         "skill_local_result": "skipped",
         "local_release_result": "skipped",
         "cluster_result": "skipped",
         "cluster_chart_result": "skipped",
         "rollout_recovery_result": "skipped",
         "approval_resume_result": "skipped",
+        "factory_result": "skipped",
         "released_upgrade_result": "skipped",
         "released_upgrade_negative_result": "skipped",
         "upgrade_matrix_shards_result": "success",
@@ -1965,6 +1970,7 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
         local_release_selected=outputs["local_release"],
         cluster_selected=outputs["cluster"],
         released_upgrade_selected=outputs["released_upgrade"],
+        factory_selected=outputs["factory"],
         upgrade_matrix_result="skipped",
     )
     assert skipped.returncode == 0, skipped.stdout + skipped.stderr
@@ -1975,6 +1981,7 @@ def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
         local_release_selected=outputs["local_release"],
         cluster_selected=outputs["cluster"],
         released_upgrade_selected=outputs["released_upgrade"],
+        factory_selected=outputs["factory"],
         skill_local_result="success",
     )
     assert unexpected_result.returncode != 0
@@ -1994,6 +2001,7 @@ def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
         "cluster_selected": outputs["cluster"],
         "released_upgrade_selected": outputs["released_upgrade"],
         "released_upgrade_full": outputs["released_upgrade_full"],
+        "factory_selected": outputs["factory"],
     }
 
     ran = _run_aggregate(**selection, local_release_result="success")
@@ -2009,6 +2017,7 @@ def test_e2e_required_accepts_a_version_only_selection(tmp_path: Path) -> None:
         {},
         {"skill_selected": "true", "skill_local_result": "success"},
         {"local_selected": "true", "skill_local_result": "success"},
+        {"factory_selected": "true", "factory_result": "success"},
         {
             "skill_selected": "true",
             "local_selected": "true",
@@ -2495,6 +2504,91 @@ def test_approval_resume_job_runs_on_pull_requests_and_gates_e2e_required() -> N
         return [step["uses"] for step in steps if "uses" in step]
 
     assert uses(job["steps"]) == uses(sibling["steps"])
+
+
+# #4111: factory replay has its own required result, independent of the other
+# kind scenarios. The selector's existing factory output owns this selection.
+SCRIPTED_FACTORY_JOB = "e2e-scripted-factory"
+
+
+@pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
+@pytest.mark.parametrize("result", ["failure", "skipped", "cancelled", ""])
+def test_aggregate_requires_scripted_factory_success_when_selected(
+    event_name: str, result: str
+) -> None:
+    state = {"event_name": event_name, "factory_selected": "true"}
+    ok = _run_aggregate(**state, factory_result="success")
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+
+    rejected = _run_aggregate(**state, factory_result=result)
+    assert rejected.returncode != 0, rejected.stdout + rejected.stderr
+
+
+@pytest.mark.parametrize("event_name", ["pull_request", "push", "workflow_dispatch"])
+@pytest.mark.parametrize("result", ["success", "failure", "cancelled", ""])
+def test_aggregate_requires_scripted_factory_skip_when_not_selected(
+    event_name: str, result: str
+) -> None:
+    ok = _run_aggregate(event_name=event_name, factory_result="skipped")
+    assert ok.returncode == 0, ok.stdout + ok.stderr
+
+    rejected = _run_aggregate(event_name=event_name, factory_result=result)
+    assert rejected.returncode != 0, rejected.stdout + rejected.stderr
+
+
+@pytest.mark.parametrize("selected", ["", "yes"])
+def test_aggregate_rejects_malformed_scripted_factory_selection(selected: str) -> None:
+    completed = _run_aggregate(factory_selected=selected)
+    assert completed.returncode != 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize(
+    ("selected", "result"), [("true", "success"), ("false", "skipped")]
+)
+def test_negative_control_covers_scripted_factory_result(
+    selected: str, result: str
+) -> None:
+    state = {
+        "event_name": "pull_request",
+        "factory_selected": selected,
+        "factory_result": result,
+    }
+    unmutated = _run_aggregate(**state)
+    assert unmutated.returncode == 0, unmutated.stdout + unmutated.stderr
+
+    check = '"$FACTORY_RESULT" != "$factory_expected" ||'
+
+    def accept_drift(script: str) -> str:
+        assert script.count(check) == 1
+        return script.replace(check, "", 1)
+
+    completed = _run_aggregate(script_transform=accept_drift, **state)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+    assert "Selected and skipped negative control failed for FACTORY_RESULT" in output
+
+
+def test_scripted_factory_job_runs_on_pull_requests_and_gates_e2e_required() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    job = jobs[SCRIPTED_FACTORY_JOB]
+    assert job["name"] == "E2E scripted factory scenario (kind, scripted model)"
+    assert job["if"] == "${{ needs.changes.outputs.factory == 'true' }}"
+    assert "pull_request" not in job["if"]
+    assert job["needs"] == ["rust-build", "changes", "ci-images"]
+    assert SCRIPTED_FACTORY_JOB in jobs["e2e-required"]["needs"]
+
+    scenario = [
+        step
+        for step in job["steps"]
+        if step.get("run") == "python3 tools/factory-e2e/factory_e2e.py scripted"
+    ]
+    assert len(scenario) == 1
+    assert scenario[0]["env"] == {
+        "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
+        "BUILDX_BUILDER": "default",
+    }
+    assert "if" not in scenario[0]
+    assert "continue-on-error" not in scenario[0]
 
 
 def test_controller_preflight_upgrade_scenario_runs_on_chart_pull_requests() -> None:

@@ -28,7 +28,9 @@ Serve it with isolated state:
 
 ```bash
 curie dev github-stub serve --root "${STUB_STATE_DIR:?set a private execution directory}" \
-  --recording tools/github-stub/recordings/curie-pr-3400.json
+  --recording tools/github-stub/recordings/curie-pr-3400.json \
+  --seed-tree tools/factory-e2e/fixtures/unitconv \
+  --issue-file tools/factory-e2e/fixtures/unitconv-issue.md
 ```
 
 The server prints one JSON startup object containing `base_url`, `clone_url`
@@ -37,7 +39,9 @@ and `api.githubCloneBase` with the HTTPS base. Trust the generated CA with
 `SSL_CERT_FILE` for Python clients and `GIT_SSL_CAINFO` for Git. Preserve TLS
 verification. The API accepts both root and Enterprise `/api/v3` paths.
 
-The fixture repository is `acme-corp/acme-bot`, repository id 4401, installation
+The required `--seed-tree` directory becomes the repository's initial Git tree,
+and the required `--issue-file` Markdown supplies the initial issue body. The
+fixture repository is `acme-corp/acme-bot`, repository id 4401, installation
 id 5501, and App id 51. Issue 3815 starts labelled `factory` by a human example
 actor, `octocat`, id 6601, with write permission. App comments carry Bot identity
 and App provenance. Git clone and push use actual Git smart HTTP against a
@@ -55,8 +59,9 @@ SIGTERM and remove only that execution's owned state. An unsupported call return
 HTTP 501 with `unsupported_request`, is retained in SQLite, and makes the server
 exit unsuccessfully. The Python API also raises on `close()` after such a call.
 
-Tests can construct `GithubStub(root, recording)`, call `start()`, set clients'
-trust to `ca_file`, advance replay time with `advance(seconds)`, and call `close()`
-in teardown. CLI serving advances time automatically. A replay proves local
+Tests can construct `GithubStub(root, recording, seed_tree=seed, issue_file=issue)`,
+call `start()`, set clients' trust to `ca_file`, advance replay time with
+`advance(seconds)`, and call `close()` in teardown. CLI serving advances time
+automatically. A replay proves local
 factory boundary behavior; it does not replace the required live factory and
 external integration evidence.

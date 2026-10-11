@@ -5150,14 +5150,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "scripted",
         help="kind-rung factory scenario with the GitHub stub and a scripted model",
     )
-    scripted.add_argument("--context", required=True)
-    scripted.add_argument("--namespace", default="test-factory-scripted")
     scripted.add_argument(
         "--transcript",
         type=Path,
         default=Path("tools/model-script/transcripts/unitconv-issue.json"),
     )
-    scripted.add_argument("--model-base-url")
+    scripted.add_argument("--build-images", action="store_true")
+    scripted.add_argument("--record", action="store_true")
     return parser.parse_args(argv)
 
 

@@ -52,10 +52,18 @@ class GithubStub:
         host: str = "127.0.0.1",
         port: int = 0,
         *,
+        seed_tree: Path,
+        issue_file: Path,
         bind: str | None = None,
     ) -> None:
         if recording.get("version") != 1:
             raise ValueError("unsupported GitHub recording version")
+        if not seed_tree.is_dir():
+            raise ValueError("GitHub stub seed_tree must be an existing directory")
+        if not issue_file.is_file():
+            raise ValueError("GitHub stub issue_file must be an existing Markdown file")
+        self.seed_tree = seed_tree.resolve()
+        self.issue_body = issue_file.read_text()
         try:
             advertised_ip = ipaddress.ip_address(host)
         except ValueError:
@@ -187,22 +195,28 @@ class GithubStub:
         self._repository.parent.mkdir(parents=True, exist_ok=True)
         self._run("git", "init", "--bare", "--initial-branch=main", str(self._repository))
         self._run("git", "--git-dir", str(self._repository), "config", "http.receivepack", "true")
-        blob = self._run(
+        seed_env = dict(os.environ)
+        seed_env["GIT_INDEX_FILE"] = str(self.root / "seed.index")
+        self._run(
             "git",
             "--git-dir",
             str(self._repository),
-            "hash-object",
-            "-w",
-            "--stdin",
-            input_=b"def example():\n    return 'example'\n",
-        ).strip()
+            "--work-tree",
+            str(self.seed_tree),
+            "add",
+            "--all",
+            "--",
+            ".",
+            cwd=self.seed_tree,
+            env=seed_env,
+        )
         tree = (
             self._run(
                 "git",
                 "--git-dir",
                 str(self._repository),
-                "mktree",
-                input_=b"100644 blob " + blob + b"\texample.py\n",
+                "write-tree",
+                env=seed_env,
             )
             .strip()
             .decode()
@@ -260,7 +274,7 @@ class GithubStub:
         self._put(
             "issue",
             3815,
-            self._issue(3815, "Example factory change", "Update example.py.", ["factory"]),
+            self._issue(3815, "Example factory change", self.issue_body, ["factory"]),
         )
         self._label_event(3815, "factory", "labeled", HUMAN)
         self._thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -345,6 +359,53 @@ class GithubStub:
             .decode()
             .strip()
         )
+
+    def _find_ref(self, branch: str) -> str | None:
+        result = subprocess.run(
+            (
+                "git",
+                "--git-dir",
+                str(self._repository),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch}",
+            ),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        return result.stdout.decode().strip() if result.returncode == 0 else None
+
+    def _commit(self, sha: str) -> dict[str, Any] | None:
+        """One commit as GitHub's Git database API returns it, or None."""
+
+        if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+            return None
+        result = subprocess.run(
+            ("git", "--git-dir", str(self._repository), "cat-file", "commit", sha),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        header, _, message = result.stdout.decode().partition("\n\n")
+        fields = [line.split(" ", 1) for line in header.splitlines()]
+        tree = next(value for key, value in fields if key == "tree")
+        parents = [value for key, value in fields if key == "parent"]
+        return {
+            "sha": sha,
+            "message": message,
+            "tree": {"sha": tree},
+            "parents": [
+                {
+                    "sha": parent,
+                    "url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/git/commits/{parent}",
+                }
+                for parent in parents
+            ],
+        }
 
     def _repository_row(self) -> dict[str, Any]:
         return {
@@ -464,6 +525,10 @@ class GithubStub:
                 "permissions": PERMISSIONS,
             }
         prefix = f"/repos/{REPOSITORY}"
+        # GitHub serves /repositories/{id}/... as the same resource tree.
+        by_id = f"/repositories/{self._repository_row()['id']}"
+        if path == by_id or path.startswith(by_id + "/"):
+            path = prefix + path[len(by_id) :]
         if path != prefix and not path.startswith(prefix + "/"):
             return None
         tail = path[len(prefix) :].strip("/")
@@ -480,13 +545,24 @@ class GithubStub:
             return 200, {"permission": "write", "user": HUMAN}
         if method == "GET" and tail.startswith("branches/"):
             branch = tail.removeprefix("branches/")
-            return 200, {"name": branch, "commit": {"sha": self._ref(branch)}}
+            sha = self._find_ref(branch)
+            if sha is None:
+                return 404, {"message": "Branch not found"}
+            return 200, {"name": branch, "commit": {"sha": sha}}
         if method == "GET" and tail.startswith("git/ref/heads/"):
             branch = tail.removeprefix("git/ref/heads/")
+            sha = self._find_ref(branch)
+            if sha is None:
+                return 404, {"message": "Not Found"}
             return 200, {
                 "ref": f"refs/heads/{branch}",
-                "object": {"sha": self._ref(branch), "type": "commit"},
+                "object": {"sha": sha, "type": "commit"},
             }
+        if method == "GET" and tail.startswith("git/commits/"):
+            commit = self._commit(tail.removeprefix("git/commits/"))
+            if commit is None:
+                return 404, {"message": "Not Found"}
+            return 200, commit
         if method == "GET" and tail.startswith("commits/"):
             if tail.endswith("/check-runs"):
                 runs = self._checks()
@@ -547,9 +623,10 @@ class GithubStub:
         if tail.startswith("issues/"):
             parts = tail.split("/")
             number = int(parts[1])
-            issue = self._get("issue", number)
-            if issue is None:
+            existing_issue = self._get("issue", number)
+            if existing_issue is None:
                 return 404, {"message": "Not Found"}
+            issue = existing_issue
             suffix = "/".join(parts[2:])
             if not suffix and method in {"GET", "PATCH"}:
                 if method == "PATCH":
@@ -638,6 +715,7 @@ class GithubStub:
                 repository = self._repository_row()
                 pull = {
                     "id": number,
+                    "node_id": f"PR_stub{number}",
                     "number": number,
                     "state": "open",
                     "merged": False,
@@ -656,9 +734,10 @@ class GithubStub:
             number = int(parts[1])
             if len(parts) == 3 and parts[2] in {"comments", "reviews"} and method == "GET":
                 return 200, []
-            pull = self._get("pull", number)
-            if pull is None:
+            existing_pull = self._get("pull", number)
+            if existing_pull is None:
                 return 404, {"message": "Not Found"}
+            pull = existing_pull
             if len(parts) == 3 and parts[2] == "files" and method == "GET":
                 fresh = self._fresh_pull(pull)
                 files = (
@@ -761,6 +840,8 @@ def main() -> int:
     serve.add_argument(
         "--recording", type=Path, default=Path(__file__).parent / "recordings/curie-pr-3400.json"
     )
+    serve.add_argument("--seed-tree", type=Path, required=True)
+    serve.add_argument("--issue-file", type=Path, required=True)
     serve.add_argument("--host", default="127.0.0.1", help="Advertised DNS name or IP address")
     serve.add_argument("--bind", help="Listening IP address, defaults to the advertised host")
     serve.add_argument("--port", type=int, default=0)
@@ -780,6 +861,8 @@ def main() -> int:
             json.loads(args.recording.read_text()),
             args.host,
             args.port,
+            seed_tree=args.seed_tree,
+            issue_file=args.issue_file,
             bind=args.bind,
         )
         stop = threading.Event()
