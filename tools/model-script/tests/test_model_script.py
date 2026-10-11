@@ -7,6 +7,7 @@ https://openrouter.ai/docs/api-reference/overview.
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import json
 import sys
@@ -362,6 +363,114 @@ def test_record_close_waits_for_an_in_flight_exchange_before_writing(
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5)
+
+
+def _close_within(script: Any, seconds: float) -> tuple[bool, list[BaseException]]:
+    """Run close() off-thread and report whether it returned in time."""
+
+    errors: list[BaseException] = []
+
+    def close() -> None:
+        try:
+            script.close()
+        except BaseException as exc:  # noqa: BLE001 - reported to the test
+            errors.append(exc)
+
+    closer = threading.Thread(target=close, daemon=True)
+    closer.start()
+    closer.join(timeout=seconds)
+    return not closer.is_alive(), errors
+
+
+def _keep_alive_exchange(
+    base: str, payload: dict[str, Any]
+) -> tuple[http.client.HTTPConnection, int, bytes]:
+    """Send one request on a persistent connection and leave it open and idle."""
+
+    host, port = base.removeprefix("http://").split(":")
+    connection = http.client.HTTPConnection(host, int(port), timeout=10)
+    connection.request(
+        "POST",
+        "/v1/messages",
+        body=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    response = connection.getresponse()
+    body = response.read()
+    assert not response.will_close, "the server must keep the HTTP/1.1 connection open"
+    return connection, response.status, body
+
+
+def test_record_close_is_bounded_with_an_idle_keep_alive_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An idle persistent connection must not hold close() or the transcript."""
+
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-provider-key")
+
+    class Provider(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            payload = json.dumps(_message("Edit", "recorded")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    output = tmp_path / "recorded.json"
+    recorder = ms.ModelScript(
+        output, record=True, upstream=f"http://127.0.0.1:{server.server_address[1]}"
+    )
+    recorder.start()
+    connection: http.client.HTTPConnection | None = None
+    try:
+        connection, status, body = _keep_alive_exchange(
+            recorder.base_url, _request("system", "add Kelvin")
+        )
+        assert status == 200
+        assert b"Edit" in body
+        returned, errors = _close_within(recorder, 5)
+        assert returned, "close() blocked on an idle keep-alive connection"
+        assert errors == []
+        saved = json.loads(output.read_text())
+        assert len(saved["exchanges"]) == 1
+        assert saved["exchanges"][0]["lane_key"] == "add Kelvin"
+        assert saved["exchanges"][0]["message"]["content"][0]["name"] == "Edit"
+    finally:
+        if connection is not None:
+            connection.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+def test_replay_close_is_bounded_with_an_idle_keep_alive_client(tmp_path: Path) -> None:
+    """Replay close() must not wait on a client that is merely holding a connection."""
+
+    path = tmp_path / "transcript.json"
+    ms.dump_transcript(path, [_exchange("plan the change", "Plan")])
+    script = ms.ModelScript(path)
+    script.start()
+    connection: http.client.HTTPConnection | None = None
+    try:
+        connection, status, body = _keep_alive_exchange(
+            script.base_url, _request("ignored system", "plan the change")
+        )
+        assert status == 200
+        assert json.loads(body)["content"][0]["name"] == "Plan"
+        returned, errors = _close_within(script, 5)
+        assert returned, "close() blocked on an idle keep-alive connection"
+        assert errors == []
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def test_committed_transcripts_store_no_requests_or_provider_keys() -> None:

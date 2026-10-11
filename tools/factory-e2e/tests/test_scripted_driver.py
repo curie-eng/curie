@@ -10,6 +10,7 @@ import json
 import socket
 import sqlite3
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -613,16 +614,16 @@ def test_real_proxy_counts_provider_requests_including_provider_failures(
 
 @pytest.mark.parametrize(
     ("remaining", "admitted"),
-    [(30.8, False), (31.5, True)],
-    ids=["under-one-usd-left-refused", "over-one-usd-left-admitted"],
+    [(31.8, False), (32.5, True)],
+    ids=["under-two-usd-left-refused", "over-two-usd-left-admitted"],
 )
-def test_real_proxy_admits_a_request_only_while_one_usd_of_budget_remains(
+def test_real_proxy_admits_a_request_only_while_two_usd_of_budget_remain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     remaining: float,
     admitted: bool,
 ) -> None:
-    """One request can spend past the completed-drop check, so reserve 1 USD."""
+    """One request can spend past the completed-drop check, so reserve 2 USD."""
 
     model_module = sk._module(
         "factory_reserve_model_script", REPO_ROOT / "tools/model-script/model_script.py"
@@ -682,6 +683,139 @@ def test_real_proxy_admits_a_request_only_while_one_usd_of_budget_remains(
             model.close()
         except model_module.UnexpectedRequest:
             assert not admitted
+
+
+def _concurrent_proxy_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining_after: list[float],
+    module_name: str,
+) -> tuple[sk.ScriptedRun, Any, Any, list[int], dict[str, int]]:
+    """Send two client requests at once through the real recording proxy.
+
+    The fake provider holds each upstream request briefly and records how
+    many were open at once. The provider balance drops to the next value in
+    ``remaining_after`` each time an upstream response completes.
+    """
+
+    model_module = sk._module(module_name, REPO_ROOT / "tools/model-script/model_script.py")
+    run = _recording_run(tmp_path, monkeypatch, remaining=50)
+    assert run.record_budget_start == 50
+    model = model_module.ModelScript(Path(run.args.transcript), record=True)
+    run.model = model
+    run.count_recording_requests(model_module)
+    counts = {"open": 0, "max_open": 0, "completed": 0}
+    counts_lock = threading.Lock()
+    message = {"type": "message", "content": [{"type": "text", "text": "done"}]}
+
+    class ProviderResponse:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self) -> ProviderResponse:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            with counts_lock:
+                counts["open"] -= 1
+                counts["completed"] += 1
+
+        def read(self) -> bytes:
+            return json.dumps(message).encode()
+
+    def provider(_request: Request, **_kwargs: Any) -> ProviderResponse:
+        with counts_lock:
+            counts["open"] += 1
+            counts["max_open"] = max(counts["max_open"], counts["open"])
+        time.sleep(0.5)
+        return ProviderResponse()
+
+    def remaining() -> float:
+        with counts_lock:
+            return remaining_after[min(counts["completed"], len(remaining_after) - 1)]
+
+    monkeypatch.setattr(model_module, "urlopen", provider)
+    monkeypatch.setattr(run, "provider_remaining", remaining)
+    model.start()
+    statuses: list[int] = []
+    barrier = threading.Barrier(2)
+
+    def client(text: str) -> None:
+        request = Request(
+            model.base_url + "/v1/messages",
+            data=json.dumps({"messages": [{"role": "user", "content": text}]}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        barrier.wait(timeout=5)
+        try:
+            with urlopen(request, timeout=10) as response:
+                assert json.load(response)["type"] == "message"
+                statuses.append(response.status)
+        except HTTPError as exc:
+            statuses.append(exc.code)
+            exc.close()
+
+    clients = [
+        threading.Thread(target=client, args=(text,), daemon=True)
+        for text in ("convert units", "convert currency")
+    ]
+    for thread in clients:
+        thread.start()
+    for thread in clients:
+        thread.join(timeout=15)
+    assert not any(thread.is_alive() for thread in clients)
+    return run, model_module, model, statuses, counts
+
+
+def test_real_proxy_admits_concurrent_requests_one_upstream_call_at_a_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second credit check must observe the balance after the first call.
+
+    Budget start is 50. The first request is admitted at a 17 USD drop. Once
+    its upstream call completes the drop is 19, so with the 2 USD reserve the
+    second request must be refused. Admitting both on the stale balance lets
+    two requests spend past the 20 USD budget.
+    """
+
+    run, model_module, model, statuses, counts = _concurrent_proxy_requests(
+        tmp_path, monkeypatch, [33.0, 31.0], "factory_serial_refuse_model_script"
+    )
+    try:
+        assert counts["max_open"] == 1
+        assert counts["completed"] == 1
+        assert sorted(statuses) == [200, 422]
+        assert run.record_error == "recording reached its total 20 USD provider budget"
+        assert run.evidence["recording_model_calls"] == 1
+        assert len(model.unexpected) == 1
+    finally:
+        try:
+            model.close()
+        except model_module.UnexpectedRequest:
+            pass
+        else:
+            raise AssertionError("the refused request must be reported at close")
+
+
+def test_real_proxy_forwards_concurrent_requests_serially_with_ample_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Serial forwarding must not refuse or drop a request that fits the budget."""
+
+    run, model_module, model, statuses, counts = _concurrent_proxy_requests(
+        tmp_path, monkeypatch, [45.0], "factory_serial_admit_model_script"
+    )
+    try:
+        assert counts["max_open"] == 1
+        assert counts["completed"] == 2
+        assert statuses == [200, 200]
+        assert run.record_error is None
+        assert run.evidence["recording_model_calls"] == 2
+        assert model.unexpected == []
+    finally:
+        model.close()
 
 
 @pytest.mark.parametrize("remaining", [None, -1, "nan", "inf"])
