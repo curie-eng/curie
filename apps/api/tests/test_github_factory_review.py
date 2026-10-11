@@ -45,7 +45,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_github_factory_ingress import (  # noqa: E402
+from forge_fakes.github import (  # noqa: E402
     _ENV,
     INSTALLATION_ID,
     LABEL,
@@ -55,14 +55,12 @@ from test_github_factory_ingress import (  # noqa: E402
     SENDER,
     SENDER_ID,
     GitHubAPI,
-    _code,
     _Credentials,
     _issue_event,
-    _mark_running,
     _post,
-    _rows,
     _sender,
 )
+from test_github_factory_ingress import _code, _mark_running, _rows  # noqa: E402
 
 HEAD = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 BASE_REF = "main"
@@ -202,6 +200,7 @@ def _patch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
         "curie_api.github_review_truth",
         "curie_api.github_factory_review",
         "curie_api.factory_notices",
+        "curie_api.repository_auth",
     ):
         try:
             module = importlib.import_module(name)
@@ -322,11 +321,12 @@ def _own_pull_request(
                         "INSERT INTO curie.thread_publication_lineages "
                         "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
                         "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
-                        "latest_revision, github_repository_id, github_installation_id, "
-                        "github_pr_node_id, base_ref) VALUES "
+                        "latest_revision, code_host_kind, code_host_host, "
+                        "repository_project_id, code_host_installation_id, "
+                        "code_host_pr_id, base_ref) VALUES "
                         "(:id, :agent, :deployment, :conversation, :repo, :base, :branch, "
-                        ":pr, :url, :head, :status, 1, 1, :repo_id, :installation, "
-                        ":node, :base_ref)"
+                        ":pr, :url, :head, :status, 1, 1, 'github', 'github.com', :repo_id, "
+                        ":installation, :node, :base_ref)"
                     ),
                     {
                         "id": lineage_id,
@@ -340,7 +340,7 @@ def _own_pull_request(
                         "url": _pr_url(pr),
                         "head": HEAD,
                         "status": lineage_status,
-                        "repo_id": REPO_ID,
+                        "repo_id": str(REPO_ID),
                         "installation": INSTALLATION_ID,
                         "node": f"PR_acme_{pr}",
                         "base_ref": BASE_REF,
@@ -374,13 +374,15 @@ def _requests(number: int) -> list[dict[str, Any]]:
     return _rows(
         "SELECT r.id, r.sequence, r.status, r.terminal_cause, "
         "r.objective, r.requester, r.reply_kind, "
-        "r.reply_address, r.reply_conversation_id, w.id AS work_item_id, "
+        "r.reply_address, r.reply_conversation_id, r.reply_target_kind, "
+        "r.reply_target_pr_number, r.reply_target_comment_id, r.reply_target_url, "
+        "w.id AS work_item_id, "
         "w.conversation_id AS work_item_conversation "
         "FROM curie.execution_requests r "
         "JOIN curie.work_items w ON w.id = r.work_item_id "
-        "WHERE w.github_repository_id = :repo AND w.github_issue_number = :number "
+        "WHERE w.tracker_scope_id = :repo AND w.tracker_issue_id = :number "
         "ORDER BY r.sequence",
-        {"repo": REPO_ID, "number": number},
+        {"repo": str(REPO_ID), "number": str(number)},
     )
 
 
@@ -397,6 +399,22 @@ def _owned(client: TestClient, api: ReviewGitHubAPI) -> tuple[int, int, dict[str
     _own_pull_request(first["work_item_id"], pr)
     _complete(first["id"])
     return number, pr, first
+
+
+def _reply_target(event: str, pr: int, fid: int) -> dict[str, Any]:
+    """Where the revision's status reply lands, as admission stores it (#3831)."""
+
+    thread = event == "pull_request_review_comment"
+    return {
+        "reply_target_kind": "review_thread" if thread else "pull_request",
+        "reply_target_pr_number": str(pr),
+        "reply_target_comment_id": str(fid) if thread else None,
+        "reply_target_url": f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}",
+    }
+
+
+def _stored_reply_target(row: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if key.startswith("reply_target_")}
 
 
 def _mention() -> str:
@@ -427,6 +445,13 @@ def test_authorized_mention_admits_the_next_request_on_the_same_work_item(
     assert revision["reply_address"] == REPO
     assert revision["reply_conversation_id"] == f"issue-{number}"
     assert revision["requester"] == f"github:{SENDER_ID}:{SENDER}"
+    assert _stored_reply_target(revision) == _reply_target(event, pr, fid)
+    assert _stored_reply_target(rows[0]) == {
+        "reply_target_kind": "issue",
+        "reply_target_pr_number": None,
+        "reply_target_comment_id": None,
+        "reply_target_url": None,
+    }
 
 
 def test_redelivery_of_the_same_comment_is_a_duplicate(
@@ -601,6 +626,7 @@ def test_review_mention_during_live_run_waits_then_becomes_next_request(
     assert revision["objective"].splitlines()[0] == (
         f"{_pr_url(pr)}#{FRAGMENTS[event].format(id=fid)}"
     )
+    assert _stored_reply_target(revision) == _reply_target(event, pr, fid)
     assert len(
         _rows(
             "SELECT execution_request_id FROM curie.factory_terminal_notices "

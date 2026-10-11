@@ -49,10 +49,13 @@ def graph_payload() -> dict[str, Any]:
         ("0076", False),
         ("0077", True),
         # #2911: 0101 tenant-scopes the core tables the app reads, so the
-        # revisions below it are refused and 0101 is the minimum.
+        # revisions below it are refused; #3831's tracker identity contract
+        # (0103) is the minimum.
         ("0082", False),
         ("0100", False),
-        ("0101", True),
+        ("0101", False),
+        ("0102", False),
+        ("0103", True),
         ("0000", True),
         ("future-expand", True),
     ],

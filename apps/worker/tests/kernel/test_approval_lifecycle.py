@@ -2395,7 +2395,7 @@ class _FactoryWorkItems:
             work_item_id=request_id,
             conversation_id=f"work-item-{request_id}",
             wait_deadline=(datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-            repo_full_name="acme-corp/widgets",
+            repository_path="acme-corp/widgets",
         )
 
     async def start(self, request_id: uuid.UUID, **_: object) -> object:

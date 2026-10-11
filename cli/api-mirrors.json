@@ -58,6 +58,16 @@
       ]
     },
     {
+      "struct": "WorkItemTracker",
+      "schema": "WorkItemTrackerOut",
+      "omissions": []
+    },
+    {
+      "struct": "WorkItemRepository",
+      "schema": "WorkItemRepositoryOut",
+      "omissions": []
+    },
+    {
       "struct": "WorkItemPr",
       "schema": "WorkItemPrOut",
       "omissions": []

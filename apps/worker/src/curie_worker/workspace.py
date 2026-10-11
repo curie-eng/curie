@@ -38,9 +38,25 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
+from aci_protocol import BootEnv
+
 WORKSPACE_REF_ENV = "CURIE_WORKSPACE_REF"
 WORKSPACE_SHA256_ENV = "CURIE_WORKSPACE_SHA256"
 WORKSPACE_MOUNT_PATH = "/workspace"
+# The workspace's code host facts in the boot contract (ADR 0197): the trusted
+# clone origin, the repository path under it, and the mounted CA bundle path.
+# Named from the one BootEnv declaration so a rename cannot drift.
+REPO_ORIGIN_ENV = BootEnv.env_key("repo_origin")
+REPO_PATH_ENV = BootEnv.env_key("repo_path")
+REPO_CA_BUNDLE_ENV = BootEnv.env_key("repo_ca_bundle")
+# How git presents each credential header form the API names (ADR 0197).
+# GitHub is Basic with x-access-token, exactly as before.
+_HEADER_NAMES = {
+    "authorization_basic": ("Authorization", "Basic "),
+    "authorization_bearer": ("Authorization", "Bearer "),
+    "private_token": ("PRIVATE-TOKEN", ""),
+}
+_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
 _GITHUB_URL = re.compile(r"https://github\.com/[^\s<>|]+", re.IGNORECASE)
 _REPO_FULL_NAME = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
@@ -245,14 +261,30 @@ class WorkspaceLimits:
             raise ValueError("workspace stage budgets exceed total_timeout_seconds")
 
 
+def _valid_repository_path(path: str) -> bool:
+    """A repository path of two or more plain segments, as the API named it."""
+
+    segments = path.split("/")
+    return len(segments) >= 2 and all(
+        _PATH_SEGMENT.fullmatch(segment) and segment not in {".", ".."} for segment in segments
+    )
+
+
 @dataclass(frozen=True)
 class WorkspaceCredential:
-    """One deployment-derived clone credential returned by the API."""
+    """One deployment-derived clone credential returned by the API.
+
+    ``origin``, ``header_form`` and ``ca_bundle_ref`` are the code host's
+    transport facts as the API issued them (ADR 0197); the worker derives no
+    forge URL itself.
+    """
 
     repo_full_name: str
     clone_url: str
     authorization_header: str
-    github_html_base: str
+    origin: str
+    header_form: str
+    ca_bundle_ref: str | None = None
     revision: str | None = None
     base_branch: str | None = None
     base_commit: str | None = None
@@ -262,10 +294,10 @@ class WorkspaceCredential:
             not self.repo_full_name
             or not self.clone_url
             or not self.authorization_header
-            or not self.github_html_base
+            or not self.origin
         ):
             raise ValueError("workspace credential response is incomplete")
-        base = urlsplit(self.github_html_base)
+        base = urlsplit(self.origin)
         clone = urlsplit(self.clone_url)
         # Accessing port also refuses malformed ports before Git receives auth.
         _ = base.port, clone.port
@@ -276,21 +308,33 @@ class WorkspaceCredential:
             or base.password is not None
             or base.query
             or base.fragment
-            or self.github_html_base.endswith("/")
+            or self.origin.endswith("/")
             or clone.scheme != "https"
             or clone.username is not None
             or clone.password is not None
             or clone.query
             or clone.fragment
         ):
-            raise ValueError("workspace clone URL must be a clean GitHub HTTPS URL")
+            raise ValueError("workspace clone URL must be a clean HTTPS URL")
         if (
-            not _REPO_FULL_NAME.fullmatch(self.repo_full_name)
-            or self.clone_url != f"{self.github_html_base}/{self.repo_full_name}.git"
+            not _valid_repository_path(self.repo_full_name)
+            or self.clone_url != f"{self.origin}/{self.repo_full_name}.git"
         ):
             raise ValueError("workspace clone URL does not match the server-derived repository")
         if any(character in self.authorization_header for character in ("\r", "\n", "\0")):
             raise ValueError("workspace authorization header contains control characters")
+        form = _HEADER_NAMES.get(self.header_form)
+        if form is None or not self.authorization_header.startswith(form[1]):
+            raise ValueError("workspace credential header form does not match its header")
+        if self.ca_bundle_ref is not None and not self.ca_bundle_ref.startswith("/"):
+            raise ValueError("workspace CA bundle reference is not an absolute path")
+
+    @property
+    def git_header(self) -> str:
+        """The one ``http.extraHeader`` line git sends to ``origin``."""
+
+        name, _ = _HEADER_NAMES[self.header_form]
+        return f"{name}: {self.authorization_header}"
 
 
 def parse_github_repo_fact(message: str) -> RepoFact | None:
@@ -454,17 +498,12 @@ class WorkspaceCredentialClient:
         self,
         *,
         api_url: str,
-        github_api_url: str,
         worker_token: str,
         transport: Callable[..., Any] = _url_transport,
     ) -> None:
         if not worker_token:
             raise ValueError("workspace delivery requires CURIE_INTERNAL_WORKER_TOKEN")
-        # config imports publication_validation, which imports this module.
-        from .config import github_html_base
-
         self._api_url = api_url.rstrip("/")
-        self._github_html_base = github_html_base(github_api_url)
         self._worker_token = worker_token
         self._transport = transport
 
@@ -585,7 +624,9 @@ class WorkspaceCredentialClient:
                 repo_full_name=str(payload["repo_full_name"]),
                 clone_url=str(payload["clone_url"]),
                 authorization_header=str(payload["authorization_header"]),
-                github_html_base=self._github_html_base,
+                origin=str(payload["origin"]),
+                header_form=str(payload["header_form"]),
+                ca_bundle_ref=_opt_str(payload, "ca_bundle_ref"),
                 revision=revision,
                 base_branch=base_branch,
                 base_commit=base_commit,
@@ -864,12 +905,37 @@ class PreparedWorkspace:
     materialized_head: str
     checkout_mode: int
     reference: WorkspaceRef
+    # The code host CA bundle the clone trusted, mounted at this path in the
+    # sandbox too; None for the public trust store.
+    ca_bundle_ref: str | None = None
+
+    @property
+    def repo_origin(self) -> str:
+        """The trusted clone origin: the clean clone URL less the repository path."""
+
+        suffix = f"/{self.repo_full_name}.git"
+        if not self.clean_clone_url.endswith(suffix):
+            raise WorkspacePreparationError(
+                "reference", "workspace clone URL does not end in its repository path"
+            )
+        return self.clean_clone_url.removesuffix(suffix)
 
     def claim_env(self) -> dict[str, str]:
-        return {
+        """The workspace capability plus the code host facts the boot contract carries.
+
+        The sandbox checks the checkout's origin against ``CURIE_REPO_ORIGIN``
+        and ``CURIE_REPO_PATH`` rather than deriving a host itself (ADR 0197).
+        """
+
+        env = {
             WORKSPACE_REF_ENV: self.reference.encode(),
             WORKSPACE_SHA256_ENV: self.sha256,
+            REPO_ORIGIN_ENV: self.repo_origin,
+            REPO_PATH_ENV: self.repo_full_name,
         }
+        if self.ca_bundle_ref is not None:
+            env[REPO_CA_BUNDLE_ENV] = self.ca_bundle_ref
+        return env
 
 
 _OWNERSHIP_PREFIX = "_ownership"
@@ -901,6 +967,7 @@ class _WorkspaceOwnership:
                     "materialized_head": prepared.materialized_head,
                     "checkout_mode": prepared.checkout_mode,
                     "reference": prepared.reference.encode(),
+                    "ca_bundle_ref": prepared.ca_bundle_ref,
                 },
             },
             separators=(",", ":"),
@@ -933,6 +1000,7 @@ class _WorkspaceOwnership:
                 ),
                 checkout_mode=int(prepared_raw["checkout_mode"]),
                 reference=WorkspaceRef.decode(str(prepared_raw["reference"])),
+                ca_bundle_ref=_opt_str(prepared_raw, "ca_bundle_ref"),
             )
             expires_at_epoch = int(raw["expires_at_epoch"])
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1158,11 +1226,17 @@ class WorkspacePreparer:
                     "GIT_CONFIG_COUNT": "2",
                     "GIT_CONFIG_KEY_0": "http.followRedirects",
                     "GIT_CONFIG_VALUE_0": "false",
-                    "GIT_CONFIG_KEY_1": (
-                        f"http.https://{urlsplit(credential.github_html_base).netloc}/.extraHeader"
-                    ),
-                    "GIT_CONFIG_VALUE_1": f"Authorization: {credential.authorization_header}",
+                    # The header is scoped to the origin the API named, in the
+                    # form it named (ADR 0197).
+                    "GIT_CONFIG_KEY_1": f"http.{credential.origin}/.extraHeader",
+                    "GIT_CONFIG_VALUE_1": credential.git_header,
                 }
+                if credential.ca_bundle_ref is not None:
+                    # The operator's code host trust bundle, mounted here at
+                    # the path the credential named.
+                    clone_env["GIT_CONFIG_COUNT"] = "3"
+                    clone_env["GIT_CONFIG_KEY_2"] = "http.sslCAInfo"
+                    clone_env["GIT_CONFIG_VALUE_2"] = credential.ca_bundle_ref
                 try:
                     clone_argv = [
                         "git",
@@ -1317,6 +1391,7 @@ class WorkspacePreparer:
                 materialized_head=base_sha,
                 checkout_mode=checkout.stat().st_mode,
                 reference=reference,
+                ca_bundle_ref=credential.ca_bundle_ref,
             )
         except Exception:
             if object_key is not None:
@@ -1400,7 +1475,7 @@ class WorkspacePreparer:
             ) from exc
         forbidden = (
             credential.authorization_header,
-            f"@{urlsplit(credential.github_html_base).netloc}",
+            f"@{urlsplit(credential.origin).netloc}",
         )
         if any(value and value in config for value in forbidden):
             raise WorkspacePreparationError(

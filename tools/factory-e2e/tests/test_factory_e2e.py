@@ -2845,6 +2845,23 @@ def test_locked_layer_needs_no_registry(tmp_path: Path) -> None:
     assert config.layer_registry is None
 
 
+def test_a_kind_candidate_build_refuses_a_locked_layer_without_a_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = tmp_path / "bundle"
+    shutil.copytree(fe.DEFAULT_BUNDLE, bundle)
+    (bundle / "connectors.lock.yaml").write_text("version: 1\n")
+    env = _env(_app_dir(tmp_path))
+    del env["CURIE_FACTORY_LAYER_REGISTRY"]
+    env["CURIE_FACTORY_BUNDLE_DIR"] = str(bundle)
+    preflight = _preflight(tmp_path, env)
+    preflight.kind_cluster = "candidate"
+    monkeypatch.setenv("BUILDX_BUILDER", "candidate-builder")
+    monkeypatch.setattr(fe.shutil, "which", lambda tool: f"/usr/bin/{tool}")
+    with pytest.raises(fe.ConfigError, match="CURIE_FACTORY_LAYER_REGISTRY"):
+        preflight.check_build_tools()
+
+
 def test_layer_is_built_into_a_private_copy_on_the_candidate_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

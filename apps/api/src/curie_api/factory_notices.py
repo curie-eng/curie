@@ -19,10 +19,7 @@ Pull request review comments:
 https://docs.github.com/en/rest/pulls/comments#create-a-reply-for-a-review-comment
 https://docs.github.com/en/rest/pulls/comments#list-review-comments-on-a-pull-request
 https://docs.github.com/en/rest/pulls/comments#update-a-review-comment-for-a-pull-request
-Labels:
-https://docs.github.com/en/rest/issues/labels#add-labels-to-an-issue
-https://docs.github.com/en/rest/issues/labels#list-labels-for-an-issue
-https://docs.github.com/en/rest/issues/labels#remove-a-label-from-an-issue
+State labels move through the tracker port's ``set_state_label``.
 """
 
 from __future__ import annotations
@@ -33,23 +30,36 @@ import math
 import re
 import time
 import uuid
-from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal
-from urllib.parse import quote, urlsplit
+from typing import Any
 
 import httpx
-from curie_telemetry.redact import redact_text
 from sqlalchemy import and_, case, exists, func, literal, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 from starlette.concurrency import run_in_threadpool
 
+from .code_host_trust import code_host_verify
 from .config import Settings
+from .factory_comment_text import marker_for, redact_factory_comment
 from .factory_progress import PhaseView, phase_view, pill_for
-from .factory_reply_target import ReplyTarget, parse_reply_target
+from .factory_reply_target import stored_reply_target
 from .factory_usage import usage_line, work_item_usage
+from .forges.errors import ForgeError
+from .forges.github.comments import static_token
+from .forges.github.marked_comments import (
+    GitHubCalls,
+    GitHubCommentClient,
+    deliver,
+    github_calls,
+    patch_comment,
+    subject_title,
+)
+from .forges.github.tracker import GitHubTracker
+from .forges.github.transport import github_headers
+from .forges.ports import Tracker
+from .forges.types import GITHUB, ReplyTarget, TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import (
     ExecutionRequest,
@@ -67,23 +77,6 @@ from .workitems.lifecycle import (
 )
 
 logger = logging.getLogger(__name__)
-
-_REFUSED_STATUSES = {401, 403, 404}
-_PAGES_PER_PASS = 5
-_UNPROCESSABLE = ("unprocessable", "http_422")
-# A thread target scans two lists with one stored page. Pages of the review
-# comment list are stored as-is; once that list is exhausted, the conversation
-# list page is stored above this offset.
-_SECOND_LIST_OFFSET = 1_000_000
-
-
-@dataclass(frozen=True)
-class _MarkerScan:
-    comment_id: int | None = None
-    body: str | None = None
-    refusal: str | None = None
-    unavailable: bool = False
-    next_page: int | None = None
 
 
 # The operator-facing sentence for each terminus cause (#3073). The raw code
@@ -204,114 +197,17 @@ _OUTPUT_TOKEN_BUDGET_DETAIL = re.compile(
 _USD_BUDGET_DETAIL = re.compile(
     r"USD budget exceeded \(max_usd_per_day=([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)\)"
 )
-_FACTORY_URL = re.compile(r"https?://[^\s<>\"'`]+", re.IGNORECASE)
-_KEY_MANAGEMENT_PATH = re.compile(
-    r"/(?:api[-_]?keys|keys|key[-_]management)(?:[/?#]|$)", re.IGNORECASE
-)
-_PULL_REQUEST_PATH = re.compile(r"/pull/[1-9][0-9]*(?:[/?#]|$)")
 # Horizontal space only: a label must not cross into the next publisher line
 # and swallow ``Cause:``. Quotes accept JSON escapes so an inner \" does not
 # end the value early. Emphasis or backticks may wrap the label, as in
 # ``**key_id**:`` or `` `workspace`: ``.
-_EMPHASIS = r"(?:[*_`]{1,3})?"
-_QUOTED_PROVIDER_VALUE = r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|`[^`\n]*`)"
-_PROVIDER_TOKEN = r"[^\s,;)}>" + r"\"'`]+"
-_PROVIDER_VALUE = r"(?P<value>" + _QUOTED_PROVIDER_VALUE + r"|" + _PROVIDER_TOKEN + r")"
-_PROVIDER_LABEL_TAIL = r"[\"']?[ \t]*(?=[:=\"'`])(?:[:=][ \t]*)?"
 # ``_`` is a word character, so ``\b`` misses ``_key_id_``. Bound the label
 # on letters and digits instead, then allow emphasis on either side.
-_LABEL_BEFORE = r"(?<![A-Za-z0-9])"
-_LABEL_AFTER = r"(?![A-Za-z0-9])"
-_PROVIDER_KEY_ID = re.compile(
-    r"(?P<label>"
-    + _EMPHASIS
-    + _LABEL_BEFORE
-    + r"(?:api[ _-]?)?key[ _-]?(?:id|identifier|hash)"
-    + _LABEL_AFTER
-    + _EMPHASIS
-    + _PROVIDER_LABEL_TAIL
-    + r")"
-    + _PROVIDER_VALUE,
-    re.IGNORECASE,
-)
 # The name phrase stays case sensitive so lowercase diagnostic prose
 # (``failed to prepare the repository``) is not a workspace name. A capitalized
 # phrase (``Acme Research Team``) is. A slug still matches in any case.
-_SLUG_TOKEN = r"(?![a-z]+[ \t]+[a-z])(?=[^\s,;)}>" + r"\"'`]*[0-9_-])" + _PROVIDER_TOKEN
-_WORKSPACE_NAME = r"[A-Z][A-Za-z0-9._-]*(?:[ \t]+[A-Z][A-Za-z0-9._-]*)*" r"|" + _SLUG_TOKEN
-_PROVIDER_WORKSPACE = re.compile(
-    r"(?P<label>"
-    + _EMPHASIS
-    + _LABEL_BEFORE
-    + r"(?i:workspace(?:[ _-]?name)?)"
-    + _LABEL_AFTER
-    + _EMPHASIS
-    + _PROVIDER_LABEL_TAIL
-    + r")(?P<value>"
-    + _QUOTED_PROVIDER_VALUE
-    + r"|"
-    + _WORKSPACE_NAME
-    + r")"
-)
 # ``workspace=acme`` is an assignment, not diagnostic prose, so the value may
 # be a plain word. The colon form stays on ``_PROVIDER_WORKSPACE``.
-_PROVIDER_WORKSPACE_ASSIGN = re.compile(
-    r"(?P<label>"
-    + _EMPHASIS
-    + _LABEL_BEFORE
-    + r"(?i:workspace(?:[ _-]?name)?)"
-    + _LABEL_AFTER
-    + _EMPHASIS
-    + r"[ \t]*=[ \t]*)(?P<value>"
-    + _QUOTED_PROVIDER_VALUE
-    + r"|"
-    + _PROVIDER_TOKEN
-    + r")"
-)
-
-
-def _redact_factory_comment(body: str) -> str:
-    """Redact secrets and contextual provider identifiers before publication."""
-
-    def redact_url(match: re.Match[str]) -> str:
-        url = match[0]
-        trimmed = url.rstrip(".,;:!)")
-        try:
-            parsed = urlsplit(trimmed)
-            path = parsed.path
-            github_pr = parsed.hostname in {"github.com", "www.github.com"} and bool(
-                _PULL_REQUEST_PATH.search(path)
-            )
-        except ValueError:
-            path = trimmed
-            github_pr = False
-        if _KEY_MANAGEMENT_PATH.search(path) and not github_pr:
-            return "[REDACTED:provider_key_url]" + url[len(trimmed) :]
-        return url
-
-    body = _FACTORY_URL.sub(redact_url, body)
-    body = redact_text(body)
-    for pattern, label in (
-        (_PROVIDER_KEY_ID, "provider_key_id"),
-        (_PROVIDER_WORKSPACE_ASSIGN, "provider_workspace"),
-        (_PROVIDER_WORKSPACE, "provider_workspace"),
-    ):
-
-        def redact_identifier(match: re.Match[str], label: str = label) -> str:
-            placeholder = f"[REDACTED:{label}]"
-            value = match["value"]
-            if value == placeholder or value in {
-                f'"{placeholder}"',
-                f"'{placeholder}'",
-                f"`{placeholder}`",
-            }:
-                return match[0]
-            if re.search(r"[A-Za-z0-9]", value) is None:
-                return match[0]
-            return f"{match['label']}{placeholder}"
-
-        body = pattern.sub(redact_identifier, body)
-    return body
 
 
 def cause_text(cause: str) -> str:
@@ -324,10 +220,6 @@ def start_failed_sentence(attempts: int, reason: str) -> str:
     """The ``start_failed`` sentence naming the attempt count and last reason (#4170)."""
 
     return f"the sandbox did not start after {attempts} attempts. Last reason: {reason}."
-
-
-def marker_for(request_id: uuid.UUID) -> str:
-    return f"<!-- curie-execution-request:{request_id} -->"
 
 
 FINAL_MARKER = "<!-- curie-status:final -->"
@@ -646,7 +538,7 @@ def status_body(
     if result is not None:
         parts.append(FINAL_MARKER)
     parts.append(marker_for(request_id))
-    return _redact_factory_comment("\n\n".join(parts) + "\n")
+    return redact_factory_comment("\n\n".join(parts) + "\n")
 
 
 def _digest(body: str) -> str:
@@ -679,7 +571,9 @@ async def sync_status_comments(
 
     writes = 0
     attempted_ids: set[uuid.UUID] = set()
-    async with httpx.AsyncClient(timeout=settings.github_app_timeout_seconds) as client:
+    async with httpx.AsyncClient(
+        timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+    ) as client:
         for _ in range(limit):
             async with sessionmaker() as session:
                 claim = await _claim_next(
@@ -693,8 +587,8 @@ async def sync_status_comments(
             if claim is None:
                 break
             attempted_ids.add(claim.row.execution_request_id)
-            calls = _GitHubCalls()
-            token = _github_calls.set(calls)
+            calls = GitHubCalls()
+            token = github_calls.set(calls)
             started = time.monotonic()
             try:
                 writes += await _sync_one(client, settings, claim)
@@ -703,7 +597,7 @@ async def sync_status_comments(
                     await _write_back(session, claim, owner=owner)
                     await session.commit()
             finally:
-                _github_calls.reset(token)
+                github_calls.reset(token)
                 elapsed_ms = (time.monotonic() - started) * 1000
                 logger.info(
                     "factory status sync calls=%d elapsed_ms=%.1f",
@@ -717,9 +611,9 @@ async def sync_status_comments(
 @dataclass(frozen=True)
 class _StatusClaim:
     row: FactoryStatusComment
-    repo_full_name: str
-    github_installation_id: int
-    github_issue_number: int
+    repository_path: str
+    code_host_installation_id: int | None
+    tracker_issue: TrackerIssueRef
     work_item_id: uuid.UUID
     status: str
     target: ReplyTarget
@@ -794,7 +688,6 @@ async def _claim_next(
     if selected is None:
         return None
     row, work_item, request, pr_url, latest = selected
-    assert request.objective is not None
     now = await _clock(session)
     await session.execute(
         update(FactoryStatusComment)
@@ -806,11 +699,7 @@ async def _claim_next(
         )
         .execution_options(synchronize_session=False)
     )
-    target = parse_reply_target(
-        request.objective,
-        repo_full_name=work_item.repo_full_name,
-        clone_base=settings.github_clone_base,
-    )
+    target = stored_reply_target(request, work_item)
     body = await _render(
         session,
         settings,
@@ -823,9 +712,9 @@ async def _claim_next(
     )
     claim = _StatusClaim(
         row=row,
-        repo_full_name=work_item.repo_full_name,
-        github_installation_id=work_item.github_installation_id,
-        github_issue_number=work_item.github_issue_number,
+        repository_path=work_item.repository_path,
+        code_host_installation_id=work_item.code_host_installation_id,
+        tracker_issue=work_item.tracker_issue,
         work_item_id=work_item.id,
         status=request.status,
         target=target,
@@ -873,101 +762,55 @@ async def _write_back(session: AsyncSession, claim: _StatusClaim, *, owner: str)
     return True
 
 
-@dataclass
-class _GitHubCalls:
-    count: int = 0
-
-
-_github_calls: ContextVar[_GitHubCalls | None] = ContextVar("factory_github_calls", default=None)
-
-
-async def _github_request(
-    client: httpx.AsyncClient,
-    method: str,
-    url: str,
-    *,
-    path_template: str,
-    **kwargs: Any,
-) -> httpx.Response:
-    calls = _github_calls.get()
-    if calls is not None:
-        calls.count += 1
-    started = time.monotonic()
-    status: int | str = "http_error"
-    try:
-        response = await client.request(method, url, **kwargs)
-        status = response.status_code
-        return response
-    finally:
-        elapsed_ms = (time.monotonic() - started) * 1000
-        failed = not isinstance(status, int) or (status != 404 and not 200 <= status < 300)
-        if elapsed_ms > 2000 or failed:
-            logger.warning(
-                "factory GitHub call method=%s path=%s status=%s elapsed_ms=%.1f",
-                method,
-                path_template,
-                status,
-                elapsed_ms,
-                extra={
-                    "method": method,
-                    "path_template": path_template,
-                    "status": status,
-                    "elapsed_ms": elapsed_ms,
-                },
-            )
-
-
-@dataclass(frozen=True)
-class _GitHub:
-    client: httpx.AsyncClient
-    api: str
-    repo_path: str
-    headers: dict[str, str]
-
-
 async def _sync_one(
     client: httpx.AsyncClient,
     settings: Settings,
     claim: _StatusClaim,
 ) -> int:
     row = claim.row
+    if claim.tracker_issue.kind != GITHUB or claim.code_host_installation_id is None:
+        # Only the GitHub tracker posts status comments today.
+        return 0
     try:
         token = await run_in_threadpool(
             credentials_for(settings).token_for_verified_installation,
-            claim.repo_full_name,
-            claim.github_installation_id,
+            claim.repository_path,
+            claim.code_host_installation_id,
         )
     except (GitHubInstallationRefused, GitHubAppError, ValueError):
         return 0
-    github = _GitHub(
+    github = GitHubCommentClient(
         client=client,
         api=settings.github_api_url.rstrip("/"),
-        repo_path=f"/repos/{repo_url_path(claim.repo_full_name)}",
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
+        repo_path=f"/repos/{repo_url_path(claim.repository_path)}",
+        headers=github_headers(token),
     )
     writes = 0
     if row.finalized_at is None:
         writes += await _sync_comment(github, claim)
     if claim.latest and row.refused_at is None:
-        writes += await _sync_labels(github, claim)
+        tracker = GitHubTracker.from_settings(
+            settings,
+            client,
+            repo_full_name=claim.repository_path,
+            repository_id=int(claim.tracker_issue.scope_id),
+            token=static_token(token),
+        )
+        writes += await _sync_labels(tracker, claim)
     return writes
 
 
 async def _sync_comment(
-    github: _GitHub,
+    github: GitHubCommentClient,
     claim: _StatusClaim,
 ) -> int:
     row, target, body, now = claim.row, claim.target, claim.body, claim.now
     if row.subject_title is None:
-        row.subject_title = await _subject_title(github, claim.github_issue_number, target)
+        row.subject_title = await subject_title(github, int(claim.tracker_issue.issue_id), target)
     terminal = FINAL_MARKER in body
     writes = 0
     if row.comment_id is None:
-        outcome = await _deliver(github, claim.github_issue_number, row, target, body)
+        outcome = await deliver(github, int(claim.tracker_issue.issue_id), row, target, body)
         if outcome is None:
             return 0
         if outcome[0] == "refused":
@@ -982,7 +825,7 @@ async def _sync_comment(
         row.rendered_digest = _digest(body) if created else None
         writes += int(created)
     if row.rendered_digest != _digest(body):
-        edited = await _patch(github, row, body)
+        edited = await patch_comment(github, row, body)
         if edited == "edited":
             row.rendered_digest = _digest(body)
             writes += 1
@@ -1045,7 +888,7 @@ async def _render(
             result = result_section(
                 cause,
                 pr_url=pr_url,
-                feedback_url=target.url,
+                feedback_url=request.reply_target_url,
                 detail=row.detail,
                 superseded=cause == "issue_cancelled"
                 and await _superseded(session, work_item, request),
@@ -1123,37 +966,13 @@ async def _superseded(
     return later is not None
 
 
-async def _subject_title(github: _GitHub, issue_number: int, target: ReplyTarget) -> str | None:
-    """The issue or PR title for the card, read once. A failed read stays NULL."""
-
-    if target.pr_number is None:
-        path = f"{github.repo_path}/issues/{issue_number}"
-        template = "/repos/{owner}/{repo}/issues/{issue_number}"
-    else:
-        path = f"{github.repo_path}/pulls/{target.pr_number}"
-        template = "/repos/{owner}/{repo}/pulls/{pull_number}"
-    try:
-        found = await _github_request(
-            github.client,
-            "GET",
-            f"{github.api}{path}",
-            path_template=template,
-            headers=github.headers,
-            follow_redirects=False,
-        )
-        payload = found.json() if found.status_code == 200 else None
-    except (httpx.HTTPError, ValueError):
-        return None
-    if isinstance(payload, dict) and isinstance(payload.get("title"), str):
-        return str(payload["title"])[:256]
-    return None
-
-
-async def _sync_labels(github: _GitHub, claim: _StatusClaim) -> int:
+async def _sync_labels(tracker: Tracker, claim: _StatusClaim) -> int:
     """Add the desired state label and remove the others, on the issue.
 
-    Only the four state labels are ever written. A refused write is logged and
-    given up; any other failure is retried next pass.
+    Only the four state labels are ever written. Legacy deletes stay
+    unconditional: a new request starts with applied_label NULL, and the issue
+    may still carry a legacy name. A refused write is logged and given up; any
+    other failure is retried next pass.
     """
 
     row = claim.row
@@ -1162,419 +981,15 @@ async def _sync_labels(github: _GitHub, claim: _StatusClaim) -> int:
     desired = desired_label(claim.status)
     if row.applied_label == desired:
         return 0
-    labels_path = f"{github.api}{github.repo_path}/issues/{claim.github_issue_number}/labels"
-    template = "/repos/{owner}/{repo}/issues/{issue_number}/labels"
-    resource = httpx.URL(labels_path)
-    url = labels_path
-    params: dict[str, int] | None = {"per_page": 100}
-    present: set[str] = set()
-    seen: set[str] = set()
-    # GitHub labels are paginated. Read every page before changing anything:
-    # https://docs.github.com/en/rest/issues/labels#list-labels-for-an-issue
-    while True:
-        try:
-            listed = await _github_request(
-                github.client,
-                "GET",
-                url,
-                path_template=template,
-                headers=github.headers,
-                params=params,
-                follow_redirects=False,
-            )
-            if listed.status_code != 200:
-                return 0
-            payload = listed.json()
-        except (httpx.HTTPError, ValueError):
-            return 0
-        if not isinstance(payload, list) or any(
-            not isinstance(label, dict) or not isinstance(label.get("name"), str)
-            for label in payload
-        ):
-            return 0
-        present.update(label["name"] for label in payload)
-        seen.add(str(listed.request.url))
-        next_link = listed.links.get("next")
-        if next_link is None:
-            break
-        next_url = next_link.get("url")
-        if not isinstance(next_url, str):
-            return 0
-        try:
-            next_resource = httpx.URL(next_url)
-        except httpx.InvalidURL:
-            return 0
-        if (next_resource.scheme, next_resource.host, next_resource.port, next_resource.path) != (
-            resource.scheme,
-            resource.host,
-            resource.port,
-            resource.path,
-        ) or str(next_resource) in seen:
-            return 0
-        url = str(next_resource)
-        params = None
-    writes = 0
-    complete = True
-    if desired and desired not in present:
-        try:
-            added = await _github_request(
-                github.client,
-                "POST",
-                labels_path,
-                path_template=template,
-                headers=github.headers,
-                json={"labels": [desired]},
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            return writes
-        writes += 1
-        if added.status_code in _REFUSED_STATUSES:
-            logger.info(
-                "factory state label refused",
-                extra={"work_item_id": str(claim.work_item_id), "status": added.status_code},
-            )
-        elif added.status_code not in {200, 201}:
-            return writes
-    for name in (*STATE_LABELS, *LEGACY_STATE_LABELS):
-        if name == desired or name not in present:
-            continue
-        try:
-            removed = await _github_request(
-                github.client,
-                "DELETE",
-                f"{labels_path}/{quote(name, safe=':')}",
-                path_template=template + "/{label}",
-                headers=github.headers,
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            complete = False
-            continue
-        writes += 1
-        # 404: the label was not on the issue, which is the goal.
-        if removed.status_code in {401, 403}:
-            logger.info(
-                "factory state label removal refused",
-                extra={"work_item_id": str(claim.work_item_id), "status": removed.status_code},
-            )
-        elif removed.status_code not in {200, 204, 404}:
-            complete = False
-    if complete:
-        row.applied_label = desired
-    return writes
+    issue = claim.tracker_issue
+    remove = [name for name in (*STATE_LABELS, *LEGACY_STATE_LABELS) if name != desired]
+    try:
+        await tracker.set_state_label(issue, add=desired or None, remove=remove)
+    except ForgeError:
+        return 0
+    row.applied_label = desired
+    return 1
 
 
 async def _clock(session: AsyncSession) -> Any:
     return await session.scalar(select(func.clock_timestamp()))
-
-
-CommentList = Literal["issue", "review"]
-
-
-async def _deliver(
-    github: _GitHub,
-    issue_number: int,
-    row: FactoryStatusComment,
-    target: ReplyTarget,
-    body: str,
-) -> tuple[Literal["refused"], str] | tuple[Literal["posted"], int, CommentList, bool] | None:
-    """Create the comment, or find one a lost response already created.
-
-    ``posted`` carries the comment id, the list it lives in, and whether this
-    call created it with ``body``.
-    """
-
-    api, repo_path, headers, client = github.api, github.repo_path, github.headers, github.client
-    number = issue_number if target.pr_number is None else target.pr_number
-    comments_path = f"{repo_path}/issues/{number}/comments"
-    marker = marker_for(row.execution_request_id)
-    stored = max(1, row.scan_page)
-    # (path, first page, offset stored for this list's next page, list)
-    scans: list[tuple[str, int, int, CommentList]] = [(comments_path, stored, 0, "issue")]
-    if target.kind == "thread":
-        # A thread reply lands on the review comment list; its 422 fallback on
-        # the conversation list. The marker may sit on either.
-        review_path = f"{repo_path}/pulls/{number}/comments"
-        if stored > _SECOND_LIST_OFFSET:
-            scans = [(comments_path, stored - _SECOND_LIST_OFFSET, _SECOND_LIST_OFFSET, "issue")]
-        else:
-            scans = [
-                (review_path, stored, 0, "review"),
-                (comments_path, 1, _SECOND_LIST_OFFSET, "issue"),
-            ]
-    for path, start, offset, listed in scans:
-        existing = await find_marker(
-            client,
-            api,
-            path,
-            headers,
-            marker,
-            start_page=start,
-        )
-        if existing.refusal is not None:
-            return ("refused", existing.refusal)
-        if existing.unavailable:
-            return None
-        if existing.comment_id is not None:
-            return ("posted", existing.comment_id, listed, False)
-        if existing.next_page is not None:
-            row.scan_page = existing.next_page + offset
-            return None
-    if target.kind == "thread":
-        assert target.comment_id is not None
-        root = await _thread_root(client, api, repo_path, headers, target.comment_id)
-        replied = await _post(
-            client,
-            f"{api}{repo_path}/pulls/{number}/comments/{root}/replies",
-            headers,
-            body,
-            path_template="/repos/{owner}/{repo}/pulls/{pull_number}/comments/{comment_id}/replies",
-        )
-        if replied != _UNPROCESSABLE:
-            return _created(row, replied, "review")
-    posted = await _post(
-        client,
-        f"{api}{comments_path}",
-        headers,
-        body,
-        path_template="/repos/{owner}/{repo}/issues/{issue_number}/comments",
-    )
-    # A comment GitHub cannot process stays pending, as before #2798.
-    if posted == _UNPROCESSABLE:
-        return None
-    return _created(row, posted, "issue")
-
-
-def _created(
-    row: FactoryStatusComment, outcome: tuple[str, str] | None, listed: CommentList
-) -> tuple[Literal["refused"], str] | tuple[Literal["posted"], int, CommentList, bool] | None:
-    if outcome is None:
-        # Lost response after a possible success: rescan every list next pass.
-        row.scan_page = 1
-        return None
-    if outcome[0] == "refused":
-        return ("refused", outcome[1])
-    return ("posted", int(outcome[1]), listed, True)
-
-
-async def _patch(
-    github: _GitHub, row: FactoryStatusComment, body: str
-) -> Literal["edited", "gone"] | str | None:
-    """Edit the comment in place: ``edited``, ``gone`` (404), a refusal, or None."""
-
-    kind = "pulls" if row.comment_list == "review" else "issues"
-    url = f"{github.api}{github.repo_path}/{kind}/comments/{row.comment_id}"
-    try:
-        edited = await _github_request(
-            github.client,
-            "PATCH",
-            url,
-            path_template=f"/repos/{{owner}}/{{repo}}/{kind}/comments/{{comment_id}}",
-            headers=github.headers,
-            json={"body": _redact_factory_comment(body)},
-            follow_redirects=False,
-        )
-    except httpx.HTTPError:
-        return None
-    if edited.status_code == 200:
-        return "edited"
-    if edited.status_code == 404:
-        return "gone"
-    if edited.status_code in {401, 403}:
-        return f"http_{edited.status_code}"
-    return None
-
-
-async def _thread_root(
-    client: httpx.AsyncClient,
-    api: str,
-    repo_path: str,
-    headers: dict[str, str],
-    comment_id: int,
-) -> int:
-    """Reply to the thread's first comment; replies to replies are refused."""
-
-    try:
-        found = await _github_request(
-            client,
-            "GET",
-            f"{api}{repo_path}/pulls/comments/{comment_id}",
-            path_template="/repos/{owner}/{repo}/pulls/comments/{comment_id}",
-            headers=headers,
-            follow_redirects=False,
-        )
-        payload = found.json() if found.status_code == 200 else None
-    except (httpx.HTTPError, ValueError):
-        payload = None
-    if isinstance(payload, dict):
-        root = payload.get("in_reply_to_id")
-        if type(root) is int and root > 0:
-            return root
-    return comment_id
-
-
-async def _post(
-    client: httpx.AsyncClient,
-    url: str,
-    headers: dict[str, str],
-    body: str,
-    *,
-    path_template: str,
-) -> tuple[str, str] | None:
-    try:
-        created = await _github_request(
-            client,
-            "POST",
-            url,
-            path_template=path_template,
-            headers=headers,
-            json={"body": _redact_factory_comment(body)},
-            follow_redirects=False,
-        )
-    except httpx.HTTPError:
-        return None
-    if created.status_code == 422:
-        return _UNPROCESSABLE
-    if created.status_code in _REFUSED_STATUSES:
-        return ("refused", f"http_{created.status_code}")
-    if created.status_code not in {200, 201}:
-        return None
-    try:
-        payload = created.json()
-    except ValueError:
-        return None
-    if not isinstance(payload, dict) or type(payload.get("id")) is not int:
-        return None
-    return ("posted", str(payload["id"]))
-
-
-async def find_marker(
-    client: httpx.AsyncClient,
-    api: str,
-    path: str,
-    headers: dict[str, str],
-    marker: str,
-    *,
-    start_page: int,
-    app_id: str | None = None,
-) -> _MarkerScan:
-    """Find a marker, or remember the next page so a later pass can continue.
-
-    A full page does not mean the marker is absent. Stopping there and posting
-    would duplicate a comment that sits further down the list. A short page is
-    the end, so a missing marker is safe to post.
-    """
-
-    page = start_page
-    for _ in range(_PAGES_PER_PASS):
-        try:
-            listed = await _github_request(
-                client,
-                "GET",
-                f"{api}{path}",
-                path_template="/repos/{owner}/{repo}/{comment_resource}/{subject_number}/comments",
-                headers=headers,
-                params={"per_page": 100, "page": page},
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            return _MarkerScan(unavailable=True)
-        if listed.status_code in _REFUSED_STATUSES:
-            return _MarkerScan(refusal=f"http_{listed.status_code}")
-        if listed.status_code != 200:
-            return _MarkerScan(unavailable=True)
-        try:
-            payload = listed.json()
-        except ValueError:
-            return _MarkerScan(unavailable=True)
-        found = _marked_comment(payload, marker, app_id=app_id)
-        if found is not None:
-            return _MarkerScan(comment_id=found[0], body=found[1])
-        if not isinstance(payload, list) or len(payload) < 100:
-            return _MarkerScan()
-        page += 1
-    return _MarkerScan(next_page=page)
-
-
-def _marked_comment(
-    payload: Any, marker: str, *, app_id: str | None = None
-) -> tuple[int, str] | None:
-    """The first comment carrying ``marker``.
-
-    ``app_id`` None reads every author. Otherwise only comments the app with
-    that id posted count, and an empty id matches none.
-    """
-
-    if not isinstance(payload, list):
-        return None
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        if app_id is not None:
-            via = item.get("performed_via_github_app")
-            if not app_id or not isinstance(via, dict) or str(via.get("id")) != app_id:
-                continue
-        body = item.get("body")
-        comment_id = item.get("id")
-        if isinstance(body, str) and marker in body and type(comment_id) is int:
-            return comment_id, body
-    return None
-
-
-async def upsert_issue_notice(
-    client: httpx.AsyncClient,
-    *,
-    api: str,
-    repo_path: str,
-    headers: dict[str, str],
-    issue_number: int,
-    marker: str,
-    body: str,
-    app_id: str = "",
-) -> Literal["written", "unchanged", "unavailable"]:
-    """Keep one marked issue comment carrying ``body``: post it, edit it, or leave it.
-
-    The marker scan is the same one the status comment uses. A scan that could
-    not reach the end of the list is ``unavailable``, never a second post.
-    """
-
-    body = _redact_factory_comment(body)
-    comments_path = f"{repo_path}/issues/{issue_number}/comments"
-    found = await find_marker(
-        client,
-        api,
-        comments_path,
-        headers,
-        marker,
-        start_page=1,
-        app_id=app_id.strip(),
-    )
-    if found.unavailable or found.refusal is not None or found.next_page is not None:
-        return "unavailable"
-    if found.comment_id is not None:
-        if found.body == body:
-            return "unchanged"
-        try:
-            edited = await _github_request(
-                client,
-                "PATCH",
-                f"{api}{repo_path}/issues/comments/{found.comment_id}",
-                path_template="/repos/{owner}/{repo}/issues/comments/{comment_id}",
-                headers=headers,
-                json={"body": body},
-                follow_redirects=False,
-            )
-        except httpx.HTTPError:
-            return "unavailable"
-        return "written" if edited.status_code == 200 else "unavailable"
-    posted = await _post(
-        client,
-        f"{api}{comments_path}",
-        headers,
-        body,
-        path_template="/repos/{owner}/{repo}/issues/{issue_number}/comments",
-    )
-    if posted is None or posted[0] != "posted":
-        return "unavailable"
-    return "written"

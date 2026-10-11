@@ -1824,6 +1824,30 @@ the changed files with the repository's Actions secrets before a person
 reviews the pull request. Keep those secrets in GitHub environments that
 require reviewers.
 
+The publication Job only pushes, using the origin, header form and CA path in
+the API's push credential. The API opens or updates the pull request (ADR 0197).
+
+### Code host CA bundle
+
+A self-managed code host whose certificate no public root covers needs one PEM
+bundle, supplied as a ConfigMap you create:
+
+```yaml
+codeHostTrust:
+  caBundle:
+    configMapRef:
+      name: corp-code-host-ca
+      key: ca.crt
+```
+
+The chart mounts that key read-only at `/etc/curie/code-host-trust/ca.crt` in
+the api, the worker, every sandbox runner and every publication Job. The api
+adds it to the public roots for its code host HTTP clients. git
+(`GIT_SSL_CAINFO`, `http.sslCAInfo`) and the sandbox's `SSL_CERT_FILE` and
+`REQUESTS_CA_BUNDLE` use it as their whole store, so include the public roots
+if the sandbox reaches public HTTPS hosts through them. Create the ConfigMap in
+the publication namespace too when `worker.publication.namespace` differs.
+
 One allowed root `https://github.com/owner/repository` URL in the initial
 message establishes the thread's selection and causes the worker to acquire its
 managed workspace at claim time. An initial message without a repository URL

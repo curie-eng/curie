@@ -709,21 +709,41 @@ def publish_through_worker(
 
     The real Postgres store, reconciler and API lineage client execute; only the
     Kubernetes Job, write credential, GitHub branch lookup and reply transport
-    are the worker suite's fixtures. The Job reports these exact PR markers.
+    are the worker suite's fixtures. The Job reports its pushed commit and the
+    code host reports this exact PR.
     """
     from curie_worker.publication_clients import PublicationLineageClient
     from curie_worker.publication_k8s import PublicationJobSettings
-    from curie_worker.publication_loop import PublicationJobObservation, PublicationReconciler
+    from curie_worker.publication_loop import PublicationReconciler
     from curie_worker.publication_store import PostgresPublicationStore
 
     from apps.worker.tests.test_publication_loop import (
         _Cluster,
+        _CodeHost,
         _Credentials,
-        _GitHub,
+        _job,
         _Replies,
     )
 
     pr_url = f"https://github.com/{pr_repo}/pull/{pr_number}"
+
+    class _ReportedPull(_CodeHost):
+        """The code host reports the PR the Job's pushed commit opened."""
+
+        branch = ""
+
+        def recover_pull_request(
+            self, publication_id: uuid.UUID, *, expected_head_sha: str
+        ) -> object:
+            assert expected_head_sha == head_sha
+            self.calls.append("recover_pull_request")
+            return self.module.PublicationPullState(
+                number=pr_number,
+                url=pr_url,
+                state="open",
+                head_sha=head_sha,
+                head_ref=self.branch,
+            )
 
     async def run() -> dict:
         import curie_worker.publication_loop as module
@@ -740,18 +760,17 @@ def publish_through_worker(
             work = await store.claim_next()
             assert work is not None
             cluster = _Cluster(module)
-            cluster.observation = PublicationJobObservation(
-                phase="succeeded",
-                pr_url=pr_url,
-                pr_number=pr_number,
-                commit_sha=head_sha,
-                logs="",
-            )
+            # The Job already ran and printed its pushed commit marker.
+            cluster.observation = _job(module, "succeeded", commit_sha=head_sha)
+            cluster.active_jobs.add(module.publication_resource_names(work.publication_id).job)
+            code_host = _ReportedPull(module)
+            code_host.branch = work.branch
+            code_host.allow_exact_revision(head_sha, work.revision_id, work.expected_prior_head)
             reconciler = PublicationReconciler(
                 store=store,
                 credentials=_Credentials(module),
                 cluster=cluster,
-                github=_GitHub(),
+                code_host=code_host,
                 replies=_Replies(),
                 lineage=PublicationLineageClient(
                     api_base_url="http://api",
@@ -1043,12 +1062,15 @@ def _review_stack(
             yield client, truth, valkey, stream
             return
         assert review_rows(
-            "SELECT github_repository_id, github_installation_id, github_pr_node_id, base_ref "
+            "SELECT code_host_kind, code_host_host, repository_project_id, "
+            "code_host_installation_id, code_host_pr_id, base_ref "
             "FROM curie.thread_publication_lineages"
         ) == [{
-            "github_repository_id": 21,
-            "github_installation_id": 11,
-            "github_pr_node_id": "PR_example_17",
+            "code_host_kind": "github",
+            "code_host_host": "github.com",
+            "repository_project_id": "21",
+            "code_host_installation_id": 11,
+            "code_host_pr_id": "PR_example_17",
             "base_ref": "main",
         }]
         truth.calls.clear()  # Attribute subsequent reads to the ingress under test.
@@ -1179,16 +1201,19 @@ def test_worker_publication_success_stamps_verified_identity_on_the_lineage(
     client, truth, valkey, stream = approved_review_producer
     publish_through_worker(client, pr_number=17)
     assert review_rows(
-        "SELECT l.pr_number, l.head_sha, l.github_repository_id, l.github_installation_id, "
-        "l.github_pr_node_id, l.base_ref, p.status, p.lease_owner "
+        "SELECT l.pr_number, l.head_sha, l.code_host_kind, l.code_host_host, "
+        "l.repository_project_id, l.code_host_installation_id, "
+        "l.code_host_pr_id, l.base_ref, p.status, p.lease_owner "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.publications p ON p.lineage_id = l.id"
     ) == [{
         "pr_number": 17,
         "head_sha": HEAD,
-        "github_repository_id": 21,
-        "github_installation_id": 11,
-        "github_pr_node_id": "PR_example_17",
+        "code_host_kind": "github",
+        "code_host_host": "github.com",
+        "repository_project_id": "21",
+        "code_host_installation_id": 11,
+        "code_host_pr_id": "PR_example_17",
         "base_ref": "main",
         "status": "succeeded",
         "lease_owner": None,
@@ -1203,10 +1228,10 @@ def test_worker_publication_accepts_github_canonical_repository_casing(
     # operator configured in lowercase; repository names are case-insensitive.
     publish_through_worker(client, pr_number=17, pr_repo="Acme-Corp/Acme-Bot")
     assert review_rows(
-        "SELECT l.pr_number, l.github_repository_id, p.status "
+        "SELECT l.pr_number, l.repository_project_id, p.status "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.publications p ON p.lineage_id = l.id"
-    ) == [{"pr_number": 17, "github_repository_id": 21, "status": "succeeded"}]
+    ) == [{"pr_number": 17, "repository_project_id": "21", "status": "succeeded"}]
 
 
 def test_worker_publication_with_mismatched_github_identity_is_refused(
@@ -1216,16 +1241,19 @@ def test_worker_publication_with_mismatched_github_identity_is_refused(
     truth.repo["id"] = 22  # GitHub's repository no longer matches the PR's base repo.
     publish_through_worker(client, pr_number=17)
     assert review_rows(
-        "SELECT l.pr_number, l.head_sha, l.github_repository_id, l.github_installation_id, "
-        "l.github_pr_node_id, l.base_ref, p.status, p.reconcile_attempts, p.error "
+        "SELECT l.pr_number, l.head_sha, l.code_host_kind, l.code_host_host, "
+        "l.repository_project_id, l.code_host_installation_id, "
+        "l.code_host_pr_id, l.base_ref, p.status, p.reconcile_attempts, p.error "
         "FROM curie.thread_publication_lineages l "
         "JOIN curie.publications p ON p.lineage_id = l.id"
     ) == [{
         "pr_number": None,
         "head_sha": None,
-        "github_repository_id": None,
-        "github_installation_id": None,
-        "github_pr_node_id": None,
+        "code_host_kind": None,
+        "code_host_host": None,
+        "repository_project_id": None,
+        "code_host_installation_id": None,
+        "code_host_pr_id": None,
         "base_ref": None,
         "status": "launching",
         "reconcile_attempts": 1,
@@ -1436,7 +1464,6 @@ def test_real_review_consumer_waits_for_active_turn_and_revalidates_before_new_t
                         preparer=WorkspacePreparer(
                             credentials=WorkspaceCredentialClient(
                                 api_url=api_url,
-                                github_api_url=settings.github_api_url,
                                 worker_token="fixture-review-worker-token",
                             ),
                             commands=SubprocessCommands(),
@@ -1762,7 +1789,6 @@ def test_reserved_review_keeps_ordinary_slack_routing(
                         preparer=WorkspacePreparer(
                             credentials=WorkspaceCredentialClient(
                                 api_url=api_url,
-                                github_api_url=settings.github_api_url,
                                 worker_token="fixture-review-worker-token",
                             ),
                             commands=SubprocessCommands(),
@@ -2048,7 +2074,6 @@ def test_review_history_capacity_failure_posts_one_pr_notice_end_to_end(
                         preparer=WorkspacePreparer(
                             credentials=WorkspaceCredentialClient(
                                 api_url=api_url,
-                                github_api_url=settings.github_api_url,
                                 worker_token="fixture-review-worker-token",
                             ),
                             commands=SubprocessCommands(),
@@ -2626,7 +2651,7 @@ def test_legacy_name_only_lineage_cannot_override_verified_github_owner(
     # A name/number-only historical row cannot become review authority when the
     # verified owner is no longer open. Keep the valid queued receipt untouched.
     review_rows("UPDATE curie.thread_publication_lineages SET status='closed' "
-                "WHERE github_repository_id IS NOT NULL")
+                "WHERE repository_project_id IS NOT NULL")
     truth.payload["comment"].update(
         id=72, html_url=f"https://github.com/{REPO}/pull/17#issuecomment-72"
     )
@@ -2641,12 +2666,13 @@ def test_legacy_name_only_lineage_cannot_override_verified_github_owner(
 @pytest.mark.parametrize(
     ("mutation", "code"),
     [
-        ("UPDATE curie.thread_publication_lineages SET github_installation_id=12",
+        ("UPDATE curie.thread_publication_lineages SET code_host_installation_id=12",
          "lineage_authority_unproved"),
         # Migration 0042 makes GitHub identity all-or-nothing, so the only
         # identity-less lineage is a historical one with none of it.
-        ("UPDATE curie.thread_publication_lineages SET github_repository_id=NULL,"
-         "github_installation_id=NULL,github_pr_node_id=NULL,base_ref=NULL",
+        ("UPDATE curie.thread_publication_lineages SET code_host_kind=NULL,"
+         "code_host_host=NULL,repository_project_id=NULL,"
+         "code_host_installation_id=NULL,code_host_pr_id=NULL,base_ref=NULL",
          "lineage_absent_or_ambiguous"),
         ("UPDATE curie.thread_publication_lineages SET binding_id=NULL",
          "lineage_authority_unproved"),
@@ -3807,9 +3833,9 @@ def _identity_pending_review(client: TestClient, truth: GitHubTruth, valkey, str
     """Deliver a review while the PR exists on GitHub but the lineage lacks identity (#2962)."""
     valkey.delete(stream)  # Only the fixture's approval-resume input; no review yet.
     assert review_rows(
-        "SELECT github_repository_id, pr_number, binding_id IS NOT NULL AS bound "
+        "SELECT repository_project_id, pr_number, binding_id IS NOT NULL AS bound "
         "FROM curie.thread_publication_lineages"
-    ) == [{"github_repository_id": None, "pr_number": None, "bound": True}]
+    ) == [{"repository_project_id": None, "pr_number": None, "bound": True}]
     return post_review(client, truth)
 
 

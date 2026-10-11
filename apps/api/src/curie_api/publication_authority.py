@@ -6,6 +6,7 @@ from a repository name that may have been deleted and recreated meanwhile.
 
 from dataclasses import dataclass
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 import httpx
 from starlette.concurrency import run_in_threadpool
@@ -13,6 +14,7 @@ from starlette.concurrency import run_in_threadpool
 from curie_api.schemas.publications import PublicationLineageAdvance
 
 from .config import Settings
+from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .models import ThreadPublicationLineage
 from .repo_full_name import repo_url_path
@@ -36,10 +38,25 @@ class AuthorityUnavailable(RuntimeError):
 
 @dataclass(frozen=True)
 class VerifiedPublicationIdentity:
+    """The pull request identity GitHub confirmed, on the code host ``host``."""
+
+    host: str
     repository_id: int
     installation_id: int
     pr_node_id: str
     base_ref: str
+
+    def lineage_values(self) -> dict[str, Any]:
+        """The lineage's code host identity columns (ADR 0197)."""
+
+        return {
+            "code_host_kind": GITHUB,
+            "code_host_host": self.host,
+            "repository_project_id": str(self.repository_id),
+            "code_host_installation_id": self.installation_id,
+            "code_host_pr_id": self.pr_node_id,
+            "base_ref": self.base_ref,
+        }
 
 
 def _positive_id(value: Any) -> bool:
@@ -112,7 +129,9 @@ def validated_identity(
     if not isinstance(base_ref, str) or not base_ref or len(base_ref) > 1024:
         raise AuthorityRefused("publication GitHub base reference was refused")
     assert isinstance(repository_id, int)
-    return VerifiedPublicationIdentity(repository_id, installation_id, node_id, base_ref)
+    return VerifiedPublicationIdentity(
+        urlsplit(github_html_base).netloc.lower(), repository_id, installation_id, node_id, base_ref
+    )
 
 
 async def verify_publication_identity(
@@ -124,19 +143,19 @@ async def verify_publication_identity(
     # A newly captured binding proves this producer created the lineage. Existing
     # PRs without immutable IDs remain ineligible even if an App is added later.
     if lineage.binding_id is None or (
-        lineage.pr_number is not None and lineage.github_repository_id is None
+        lineage.pr_number is not None and lineage.repository_project_id is None
     ):
         return None
     resolver = credentials_for(settings)
     if not resolver.app_configured:
-        if lineage.github_repository_id is not None:
+        if lineage.repository_project_id is not None:
             raise AuthorityUnavailable("publication App identity is not configured")
         return None
     try:
         installation_id, token = await run_in_threadpool(
             resolver.fresh_installation_token,
             lineage.repo_full_name,
-            lineage.github_installation_id,
+            lineage.code_host_installation_id,
         )
     except GitHubInstallationRefused:
         raise AuthorityRefused("publication App installation identity was refused") from None

@@ -43,8 +43,10 @@ from sqlalchemy.ext.asyncio import create_async_engine
 CONTRACT = "0041"
 # @spec PROTECTED-HOOK-SOURCE-2 and DEPLOY-NOTICE-RELEASE-1.
 # Agent reads require deploy notifications after the published source-control ledger,
-# and the Agent ORM and resolver read the tenant-scope columns of 0101 (#2911).
-APP_SCHEMA_MIN = "0101"
+# the Agent ORM and resolver read the tenant-scope columns of 0101 (#2911), and
+# factory status replies read the typed reply target columns of 0102, and
+# WorkItems are keyed by their tracker issue (0103 contract, #3831).
+APP_SCHEMA_MIN = "0103"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -79,7 +81,9 @@ def test_released_application_declares_a_machine_readable_window() -> None:
     assert window.schema_head == HEAD
     kinds = load_kinds()
     assert kinds[CONTRACT] == KIND_CONTRACT
-    assert kinds[APP_SCHEMA_MIN] == KIND_EXPAND
+    # 0103 drops the GitHub identity columns (ADR 0197), so the floor is a contract.
+    assert kinds[APP_SCHEMA_MIN] == KIND_CONTRACT
+    assert kinds["0102"] == KIND_EXPAND
     assert kinds["0070"] == KIND_CONTRACT
     assert kinds[REVIEW_SCHEMA_MIN] == KIND_CONTRACT
     if HEAD != APP_SCHEMA_MIN:
@@ -99,17 +103,33 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
         "INSERT INTO curie.agents(id,name) VALUES (:id,'merge-example')",
         {"id": agent_id},
     )
-    result = apply_upgrade(forward_only=False, alembic_config=alembic_config())
+    # The tracker identity contract (0103, #3831) is pending, so a rollback-safe
+    # upgrade is refused and only a forward-only one converges.
+    refused = apply_upgrade(forward_only=False, alembic_config=alembic_config())
+    assert refused.outcome == "refused"
+    assert current_revision() == branch_head
+    result = apply_upgrade(forward_only=True, alembic_config=alembic_config())
     assert result.action == "apply"
     assert result.outcome == "applied"
-    assert result.rollback_compatible is True
+    assert result.rollback_compatible is False
     pending = {step.revision for step in result.pending}
     if branch_head == "0093":
-        assert {"0082", "0091a", "0092a", "0093a", "0098", "0099", "0100", "0101"} <= pending
+        assert {
+            "0082",
+            "0091a",
+            "0092a",
+            "0093a",
+            "0098",
+            "0099",
+            "0100",
+            "0101",
+            "0102",
+            "0103",
+        } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
-        assert pending == {"0091", "0092", "0093", "0099", "0100", "0101"}
-    assert current_revision() == "0101"
+        assert pending == {"0091", "0092", "0093", "0099", "0100", "0101", "0102", "0103"}
+    assert current_revision() == "0103"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -179,13 +199,23 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
         "0079",
         "0080",
         "0081",
+        "0082",
+        "0083",
+        "0084",
+        "0085",
+        "0086",
+        "0087",
+        "0088",
+        "0089",
     ):
         assert can_serve(released, window, known) is False
-    # #2911: the Agent ORM and the resolver read 0101's tenant-scope columns, so
-    # the schemas below it are refused too.
-    for below_tenant_scope in sorted(known - {"0101"}):
+    # #2911: the Agent ORM and the resolver read 0101's tenant-scope columns, and
+    # factory status replies read 0102's typed reply target and 0103 keys
+    # WorkItems by their tracker issue (#3831), so the
+    # schemas below it are refused too.
+    for below_tenant_scope in sorted(known - {"0103"}):
         assert can_serve(below_tenant_scope, window, known) is False
-    assert can_serve("0101", window, known) is True
+    assert can_serve("0103", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

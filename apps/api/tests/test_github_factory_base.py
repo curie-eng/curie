@@ -1,7 +1,7 @@
 """A factory ticket declares its base branch and keeps it (#3095, ADR 0186).
 
 GitHub REST shapes follow:
-https://docs.github.com/en/rest/branches/branches#get-a-branch
+https://docs.github.com/en/rest/git/refs#get-a-reference
 https://docs.github.com/en/rest/issues/events
 https://docs.github.com/en/rest/issues/comments#list-issue-comments
 https://docs.github.com/en/rest/issues/comments#create-an-issue-comment
@@ -29,22 +29,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from curie_api.config import Settings, get_settings
 from curie_api.main import create_app
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import create_async_engine
-from test_github_factory_ingress import (
+from forge_fakes.github import (
     _ENV,
     INSTALLATION_ID,
     LABEL,
     REPO,
     REPO_ID,
     GitHubAPI,
-    _code,
     _Credentials,
     _issue_event,
     _post,
-    _rows,
 )
+from pydantic import ValidationError
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
+from test_github_factory_ingress import _code, _rows
 
 MARKER = "<!-- curie-factory-base-refusal -->"
 MAIN_SHA = "1" * 40
@@ -77,7 +76,7 @@ class BaseGitHubAPI(GitHubAPI):
                     "default_branch": self.default_branch,
                 },
             )
-        branch_prefix = f"/repos/{REPO}/branches/"
+        branch_prefix = f"/repos/{REPO}/git/ref/heads/"
         if path.startswith(branch_prefix):
             name = path[len(branch_prefix) :]
             self.branch_requests.append(name)
@@ -85,8 +84,8 @@ class BaseGitHubAPI(GitHubAPI):
                 return httpx.Response(502, json={"message": "Bad Gateway"})
             sha = self.branches.get(name)
             if sha is None:
-                return httpx.Response(404, json={"message": "Branch not found"})
-            return httpx.Response(200, json={"name": name, "commit": {"sha": sha}})
+                return httpx.Response(404, json={"message": "Not Found"})
+            return httpx.Response(200, json={"ref": f"refs/heads/{name}", "object": {"sha": sha}})
         parts = path.split("/")
         # /repos/{owner}/{name}/issues/{number}/comments
         if len(parts) == 7 and parts[4] == "issues" and parts[6] == "comments":
@@ -139,10 +138,8 @@ def base_app(monkeypatch: pytest.MonkeyPatch, clean_db: None) -> Any:
     for key, value in _ENV.items():
         monkeypatch.setenv(key, value)
     _configure(monkeypatch, TRAIN)
-    monkeypatch.setattr(
-        "curie_api.github_factory.credentials_for",
-        lambda _settings: _Credentials(),
-    )
+    for module in ("github_factory", "repository_auth"):
+        monkeypatch.setattr(f"curie_api.{module}.credentials_for", lambda _settings: _Credentials())
     api = BaseGitHubAPI()
     with TestClient(create_app()) as client:
         external = httpx.AsyncClient(transport=httpx.MockTransport(api.handle))
@@ -166,8 +163,8 @@ def _work_item(number: int) -> dict[str, Any] | None:
     rows = _rows(
         "SELECT id, base_branch, base_source, base_commit, base_label_ignored, "
         "publication_lineage_id FROM curie.work_items "
-        "WHERE github_repository_id = :repo AND github_issue_number = :number",
-        {"repo": REPO_ID, "number": number},
+        "WHERE tracker_scope_id = :repo AND tracker_issue_id = :number",
+        {"repo": str(REPO_ID), "number": str(number)},
     )
     return rows[0] if rows else None
 
@@ -195,7 +192,7 @@ def _open_lineage(work_item_id: uuid.UUID, *, status: str = "open") -> None:
     """Attach a thread publication lineage (an open factory PR) to the WorkItem."""
 
     item = _rows(
-        "SELECT agent_id, conversation_id, repo_full_name FROM curie.work_items WHERE id = :id",
+        "SELECT agent_id, conversation_id, repository_path FROM curie.work_items WHERE id = :id",
         {"id": work_item_id},
     )[0]
     version_id, deployment_id, lineage_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
@@ -220,7 +217,7 @@ def _open_lineage(work_item_id: uuid.UUID, *, status: str = "open") -> None:
             "agent": item["agent_id"],
             "deployment": deployment_id,
             "conversation": item["conversation_id"],
-            "repo": item["repo_full_name"],
+            "repo": item["repository_path"],
             "base": NEXT_SHA,
             "branch": f"curie/publication-{lineage_id.hex}",
             "url": f"https://github.com/{REPO}/pull/77",
@@ -463,8 +460,8 @@ def test_a_missing_base_branch_is_refused_once_and_not_substituted(
     assert _work_item(number) is None
     assert _rows(
         "SELECT r.id FROM curie.execution_requests r JOIN curie.work_items w "
-        "ON w.id = r.work_item_id WHERE w.github_issue_number = :number",
-        {"number": number},
+        "ON w.id = r.work_item_id WHERE w.tracker_issue_id = :number",
+        {"number": str(number)},
     ) == []
     # No fallback to the default: main is never read.
     assert "main" not in api.branch_requests
@@ -675,7 +672,7 @@ def test_reconcile_refuses_a_missing_base_with_one_comment_across_passes(
     from curie_api.factory_label_reconcile import reconcile_missed_labels
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
-    for module in ("github_factory", "factory_label_reconcile"):
+    for module in ("github_factory", "factory_label_reconcile", "repository_auth"):
         monkeypatch.setattr(
             f"curie_api.{module}.credentials_for", lambda _s: _ReconcileCredentials()
         )

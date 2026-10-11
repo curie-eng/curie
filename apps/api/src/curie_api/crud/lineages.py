@@ -11,6 +11,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from curie_api.schemas.publications import PublicationLineageAdvance, ReviewRevisionReserve
 
 from ..config import get_settings
+from ..forges.types import GITHUB
 from ..models import (
     AgentChannel,
     Deployment,
@@ -27,6 +28,21 @@ from ..workspace_policy import repository_is_allowed
 from .deployments import get_deployment
 from .errors import PublicationLineageConflict
 from .workspaces import get_thread_workspace
+
+# The lineage columns that hold its verified code host identity, in the order
+# `VerifiedPublicationIdentity.lineage_values` returns them.
+_IDENTITY_COLUMNS = (
+    "code_host_kind",
+    "code_host_host",
+    "repository_project_id",
+    "code_host_installation_id",
+    "code_host_pr_id",
+    "base_ref",
+)
+
+
+def lineage_identity(lineage: ThreadPublicationLineage) -> tuple[Any, ...]:
+    return tuple(getattr(lineage, column) for column in _IDENTITY_COLUMNS)
 
 
 async def _bind_running_work_item_lineage(
@@ -54,19 +70,37 @@ async def _bind_running_work_item_lineage(
         WorkItem.conversation_id.in_(
             await thread_key_forms(session, lineage.agent_id, lineage.conversation_id)
         ),
-        func.lower(WorkItem.repo_full_name) == lineage.repo_full_name.casefold(),
+        func.lower(WorkItem.repository_path) == lineage.repo_full_name.casefold(),
         WorkItem.cancelled_at.is_(None),
         WorkItem.publication_lineage_id.is_(None),
         request_owns_item,
     ]
-    repository_id = identity.repository_id if identity is not None else lineage.github_repository_id
-    installation_id = (
-        identity.installation_id if identity is not None else lineage.github_installation_id
+    values = identity.lineage_values() if identity is not None else None
+    kind, host, project_id, installation_id = (
+        (
+            values["code_host_kind"],
+            values["code_host_host"],
+            values["repository_project_id"],
+            values["code_host_installation_id"],
+        )
+        if values is not None
+        else (
+            lineage.code_host_kind,
+            lineage.code_host_host,
+            lineage.repository_project_id,
+            lineage.code_host_installation_id,
+        )
     )
-    if repository_id is not None:
-        predicates.append(WorkItem.github_repository_id == repository_id)
+    if project_id is not None:
+        predicates.extend(
+            (
+                WorkItem.code_host_kind == kind,
+                WorkItem.code_host_host == host,
+                WorkItem.repository_project_id == project_id,
+            )
+        )
     if installation_id is not None:
-        predicates.append(WorkItem.github_installation_id == installation_id)
+        predicates.append(WorkItem.code_host_installation_id == installation_id)
     await session.execute(
         update(WorkItem)
         .where(*predicates)
@@ -444,23 +478,14 @@ async def advance_publication_lineage(
 
     identity_values: dict[str, Any] = {}
     if identity is not None:
-        if lineage.github_repository_id is None:
+        verified = identity.lineage_values()
+        if lineage.repository_project_id is None:
             if lineage.pr_number is not None or lineage.binding_id is None:
                 raise PublicationLineageConflict(
                     "publication.review_ineligible",
                     "historical lineage identity cannot be reconstructed",
                 )
-        elif (
-            lineage.github_repository_id,
-            lineage.github_installation_id,
-            lineage.github_pr_node_id,
-            lineage.base_ref,
-        ) != (
-            identity.repository_id,
-            identity.installation_id,
-            identity.pr_node_id,
-            identity.base_ref,
-        ):
+        elif lineage_identity(lineage) != tuple(verified[column] for column in _IDENTITY_COLUMNS):
             raise PublicationLineageConflict(
                 "publication.lineage_stale",
                 "immutable GitHub lineage identity changed",
@@ -471,13 +496,8 @@ async def advance_publication_lineage(
             conflict_code="publication.lineage_stale",
             conflict_message="publication workspace or deployment is no longer authorized",
         )
-        identity_values = {
-            "github_repository_id": identity.repository_id,
-            "github_installation_id": identity.installation_id,
-            "github_pr_node_id": identity.pr_node_id,
-            "base_ref": identity.base_ref,
-        }
-    elif lineage.github_repository_id is not None:
+        identity_values = verified
+    elif lineage.repository_project_id is not None:
         raise PublicationLineageConflict(
             "publication.lineage_stale",
             "verified lineage advance requires current GitHub identity",
@@ -655,10 +675,14 @@ async def reserve_review_revision(
     is consumed only by PublicationCreate naming its exact accepted origin.
     """
 
+    from ..forges.hosts import github_host
+
     lineage = await session.scalar(
         select(ThreadPublicationLineage)
         .where(
-            ThreadPublicationLineage.github_repository_id == data.repository_id,
+            ThreadPublicationLineage.code_host_kind == GITHUB,
+            ThreadPublicationLineage.code_host_host == github_host(get_settings()),
+            ThreadPublicationLineage.repository_project_id == str(data.repository_id),
             ThreadPublicationLineage.pr_number == data.pr_number,
         )
         .with_for_update()
@@ -668,8 +692,8 @@ async def reserve_review_revision(
         lineage is None
         or lineage.status != "open"
         or lineage.head_sha is None
-        or lineage.github_installation_id is None
-        or lineage.github_pr_node_id is None
+        or lineage.code_host_installation_id is None
+        or lineage.code_host_pr_id is None
         or lineage.base_ref is None
     ):
         raise PublicationLineageConflict(

@@ -679,7 +679,9 @@ class ApprovalGate:
 
     def bind_publication_context(self, context: PublicationContext | None) -> None:
         if self.publication_precheck is None and context is not None:
-            self.publication_precheck = PublicationPrecheck(None, None, network_enabled=False)
+            self.publication_precheck = PublicationPrecheck(
+                None, None, network_enabled=False, repo_origin=None, repo_path=None
+            )
         if self.publication_precheck is not None:
             self.publication_precheck.bind(context)
 

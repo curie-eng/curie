@@ -2323,3 +2323,44 @@ for --reuse-values from a release that predates the key.
 true
 {{- else -}}false{{- end -}}
 {{- end -}}
+
+{{/* Code host trust (ADR 0197): renders nothing when no ConfigMap is named. */}}
+{{- define "curie.codeHostTrust.name" -}}
+{{- dig "caBundle" "configMapRef" "name" "" (.Values.codeHostTrust | default dict) -}}
+{{- end -}}
+{{- define "curie.codeHostTrust.key" -}}
+{{- dig "caBundle" "configMapRef" "key" "ca.crt" (.Values.codeHostTrust | default dict) -}}
+{{- end -}}
+{{- define "curie.codeHostTrust.dir" -}}/etc/curie/code-host-trust{{- end -}}
+{{- define "curie.codeHostTrust.path" -}}{{ include "curie.codeHostTrust.dir" . }}/ca.crt{{- end -}}
+{{- define "curie.codeHostTrust.volume" -}}
+{{- if include "curie.codeHostTrust.name" . }}
+- name: code-host-trust
+  configMap:
+    name: {{ include "curie.codeHostTrust.name" . | quote }}
+    items:
+      - key: {{ include "curie.codeHostTrust.key" . | quote }}
+        path: ca.crt
+{{- end }}
+{{- end -}}
+{{- define "curie.codeHostTrust.volumeMount" -}}
+{{- if include "curie.codeHostTrust.name" . }}
+- name: code-host-trust
+  mountPath: {{ include "curie.codeHostTrust.dir" . }}
+  readOnly: true
+{{- end }}
+{{- end -}}
+{{/* git and HTTP clients in a sandbox read the one bundle. */}}
+{{- define "curie.codeHostTrust.clientEnv" -}}
+{{- if include "curie.codeHostTrust.name" . }}
+{{- $path := include "curie.codeHostTrust.path" . }}
+- name: CURIE_REPO_CA_BUNDLE
+  value: {{ $path | quote }}
+- name: GIT_SSL_CAINFO
+  value: {{ $path | quote }}
+- name: SSL_CERT_FILE
+  value: {{ $path | quote }}
+- name: REQUESTS_CA_BUNDLE
+  value: {{ $path | quote }}
+{{- end }}
+{{- end -}}

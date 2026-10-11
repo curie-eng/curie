@@ -260,7 +260,7 @@ function LaneCard({
         fontSize: 13,
       }}
     >
-      <ExtLink href={item.issue_url} style={{ fontFamily: C.mono, fontSize: 11 }}>
+      <ExtLink href={item.tracker.url} style={{ fontFamily: C.mono, fontSize: 11 }}>
         {ref}
       </ExtLink>
       <div style={{ margin: "4px 0 8px", lineHeight: 1.35 }}>{item.title ?? ref}</div>

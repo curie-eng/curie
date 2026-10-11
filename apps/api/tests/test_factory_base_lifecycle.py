@@ -25,6 +25,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
 from curie_api.factory_notices import FINAL_MARKER
+from forge_fakes.github import LABEL, REPO_ID, _issue_event, _post, _signature
+from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401  (fixtures)
 from test_factory_status_comment import _blocked_status_sync, _marked
 from test_factory_terminus import (  # noqa: F401  (fixtures)
     _LABELS,
@@ -37,19 +39,9 @@ from test_factory_terminus import (  # noqa: F401  (fixtures)
     _published_issue,
     _reconcile,
     _request,
-    _rows,
     _start_running,
-    admitted,
-    comments,
 )
-from test_github_factory_ingress import (
-    LABEL,
-    REPO_ID,
-    _code,
-    _issue_event,
-    _post,
-    _signature,
-)
+from test_github_factory_ingress import _code
 
 pytestmark = pytest.mark.usefixtures("clean_db")
 
@@ -78,8 +70,8 @@ def _item(number: int) -> dict[str, Any]:
     (row,) = _rows(
         "SELECT id, agent_id, conversation_id, base_branch, base_source, base_commit, "
         "base_label_ignored FROM curie.work_items "
-        "WHERE github_repository_id = :repo AND github_issue_number = :number",
-        {"repo": REPO_ID, "number": number},
+        "WHERE tracker_scope_id = :repo AND tracker_issue_id = :number",
+        {"repo": str(REPO_ID), "number": str(number)},
     )
     return row
 
@@ -87,8 +79,8 @@ def _item(number: int) -> dict[str, Any]:
 def _requests(number: int) -> list[dict[str, Any]]:
     return _rows(
         "SELECT r.id, r.status FROM curie.execution_requests r JOIN curie.work_items w "
-        "ON w.id = r.work_item_id WHERE w.github_issue_number = :number ORDER BY r.sequence",
-        {"number": number},
+        "ON w.id = r.work_item_id WHERE w.tracker_issue_id = :number ORDER BY r.sequence",
+        {"number": str(number)},
     )
 
 
@@ -96,8 +88,11 @@ def _redeemed_base(client: Any, number: int, monkeypatch: pytest.MonkeyPatch) ->
     """What credential redemption returns for the WorkItem's conversation."""
 
     monkeypatch.setattr(
-        "curie_api.routers.workspaces.resolve_repository_credential",
-        lambda _repo, _settings: (f"https://github.com/{REPO}.git", "Basic fixture"),
+        "curie_api.forges.github.code_host.resolve_repository_credential",
+        lambda _repo, _settings: (
+            f"https://github.com/{REPO}.git",
+            "Basic eC1hY2Nlc3MtdG9rZW46Zml4dHVyZQ==",  # x-access-token:fixture
+        ),
     )
     item = _item(number)
     headers = {"X-API-Key": get_settings().api_key}

@@ -272,7 +272,6 @@ def _executor_claim_env(env: dict[str, str], secret_names: frozenset[str]) -> di
 # explicitly, the bundle ref names a RustFS object the worker already fetched,
 # workspace ref/digest name the archive the worker already fetched and mounted,
 # and the credential is forwarded by name (never as a value in the argv).
-# The GitHub API URL comes from trusted worker config, never from the claim.
 # CURIE_BUNDLE_VERSION is deliberately not in this set: it is the agent-readable
 # version_label and must reach the child env (#2174).
 # The attachment capability is redeemed HERE, by this driver, exactly as
@@ -285,7 +284,6 @@ _WORKER_OWNED_ENV = frozenset(
         BUNDLE_REF_ENV,
         PLUGIN_DIR_ENV,
         "CURIE_SANDBOX_ID",
-        "CURIE_GITHUB_API_URL",
         CREDENTIALS_ENV,
         WORKSPACE_REF_ENV,
         WORKSPACE_SHA256_ENV,
@@ -447,7 +445,6 @@ class DockerSandboxClient:
         *,
         image: str,
         bundle_store: BundleReader,
-        github_api_url: str,
         network: str | None = None,
         otel_endpoint: str | None = None,
         host: str = "127.0.0.1",
@@ -463,7 +460,6 @@ class DockerSandboxClient:
     ) -> None:
         self._image = image
         self._bundles = bundle_store
-        self._github_api_url = github_api_url
         self._network = network
         self._otel_endpoint = otel_endpoint
         self._host = host
@@ -587,8 +583,6 @@ class DockerSandboxClient:
             f"CURIE_SANDBOX_ID={name}",
             "-e",
             f"CURIE_RUNNER_PORT={RUNNER_CONTAINER_PORT}",
-            "-e",
-            f"CURIE_GITHUB_API_URL={self._github_api_url}",
         ]
         if self._otel_endpoint:
             args += [

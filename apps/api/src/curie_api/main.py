@@ -32,6 +32,7 @@ from curie_api.crud import agents as crud_agents
 
 from . import __version__, oidc
 from .channel_identities import start_static_slack_bootstrap
+from .code_host_trust import code_host_verify
 from .commitpoller import CommitPoller, GitHubBranchTip
 from .config import get_settings
 from .db import (
@@ -48,6 +49,7 @@ from .graveyardwatcher import GraveyardWatcher
 from .k8s import build_lazy_pod_lister, build_lazy_pod_log_reader
 from .killswitch import KillSwitch
 from .langfuse import LangfuseClient
+from .lineage_reconciler import start_lineage_reconciler
 from .protected_reconciler import ProtectedAdmissionReconciler
 from .remediation_admission import reconcile_admissions
 from .resumequeue import ResumeQueue
@@ -79,6 +81,7 @@ from .routers import (
     memory,
     observability,
     provider_installations,
+    publication_code_host,
     publication_precheck,
     publications,
     remediation_nominations,
@@ -122,7 +125,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = create_engine()
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
-    http_client = httpx.AsyncClient(timeout=10.0)
+    # The shared client reaches the code host, so it trusts the operator's
+    # code host CA bundle as well as the public roots (#3831).
+    http_client = httpx.AsyncClient(timeout=10.0, verify=code_host_verify(settings))
     app.state.http_client = http_client
     app.state.langfuse = LangfuseClient(settings, http_client)
     store = BundleStore(settings)
@@ -233,6 +238,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         asyncio.create_task(reconciler.run_forever())
         if settings.resume_reconciler_enabled
         else None
+    )
+    app.state.lineage_reconciler_task = start_lineage_reconciler(
+        app.state.sessionmaker, settings, http_client
     )
     # The expiry sweeper (#412) flips lapsed pending approvals and resumes their
     # stranded sessions. It shares this lifecycle's resources (sessionmaker,
@@ -368,6 +376,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 work_item_task.cancel()
                 try:
                     await work_item_task
+                except asyncio.CancelledError:
+                    pass
+            lineage_task = getattr(app.state, "lineage_reconciler_task", None)
+            if lineage_task is not None:
+                lineage_task.cancel()
+                try:
+                    await lineage_task
                 except asyncio.CancelledError:
                     pass
             task = getattr(app.state, "resume_reconciler_task", None)
@@ -541,6 +556,7 @@ def create_app() -> FastAPI:
     app.include_router(publication_precheck.router)
     app.include_router(publications.router)
     app.include_router(publications.internal_router)
+    app.include_router(publication_code_host.router)
     app.include_router(work_item_issue.router)
     app.include_router(work_item_issue.internal_router)
     app.include_router(channel_read.router)

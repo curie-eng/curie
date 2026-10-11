@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Any
 from urllib.parse import quote
 
+import httpx
 import pytest
 from _migration_support import IsolatedMigrationDb, alembic_config, sql_dicts
 from alembic import command
@@ -55,11 +56,16 @@ def _api_client() -> Iterator[TestClient]:
 
     app = create_app()
     app.dependency_overrides[get_session] = isolated_session
+    # The credential route resolves the repository through the code host on the
+    # app's shared HTTP client, which lifespan would otherwise create.
+    http_client = httpx.AsyncClient()
+    app.state.http_client = http_client
     client = TestClient(app)
     try:
         yield client
     finally:
         client.close()
+        asyncio.run(http_client.aclose())
         asyncio.run(engine.dispose())
 
 

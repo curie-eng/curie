@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 from curie_api.config import get_settings
+from curie_api.forges.types import GITHUB, RepositoryRef, TrackerIssueRef
 from curie_api.models import ThreadPublicationLineage
 from curie_api.workitems import lifecycle as workitems
 from sqlalchemy import DateTime, event, literal, select, text
@@ -23,6 +24,14 @@ from sqlalchemy.sql.visitors import replacement_traverse
 REPO = "acme-corp/acme-bot"
 CONVERSATION = "slack:C0EXAMPLE1:1700000000.000100"
 FIXTURE_TERMINATION = "fixture observation: runtime termination was observed"
+
+
+def _issue(number: int = 2573) -> TrackerIssueRef:
+    return TrackerIssueRef(GITHUB, "github.com", "101", str(number))
+
+
+def _repository(path: str = REPO) -> RepositoryRef:
+    return RepositoryRef(GITHUB, "github.com", "101", path)
 
 
 def with_session[T](body: Callable[[AsyncSession], Awaitable[T]]) -> T:
@@ -64,11 +73,10 @@ async def _item(
 ) -> workitems.WorkItemOutcome:
     result = await workitems.create_or_get_work_item(
         session,
-        github_repository_id=101,
-        github_issue_number=issue,
-        github_installation_id=installation,
+        issue=_issue(issue),
+        repository=_repository(repo),
+        code_host_installation_id=installation,
         agent_id=agent_id,
-        repo_full_name=repo,
         conversation_id=conversation,
     )
     assert isinstance(result, workitems.WorkItemOutcome), result
@@ -129,8 +137,8 @@ async def _lineage(
     repo: str = REPO,
     pr: int = 123,
     status: str = "open",
-    github_repository_id: int | None = None,
-    github_installation_id: int | None = None,
+    repository_project_id: str | None = None,
+    code_host_installation_id: int | None = None,
 ) -> uuid.UUID:
     version_id, deployment_id, lineage_id = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     await session.execute(
@@ -154,12 +162,13 @@ async def _lineage(
             "INSERT INTO curie.thread_publication_lineages "
             "(id, agent_id, deployment_id, conversation_id, repo_full_name, "
             "base_sha, branch, pr_number, pr_url, head_sha, status, version, "
-            "latest_revision, github_repository_id, github_installation_id, "
-            "github_pr_node_id, base_ref) VALUES "
+            "latest_revision, code_host_kind, code_host_host, "
+            "repository_project_id, code_host_installation_id, code_host_pr_id, "
+            "base_ref) VALUES "
             "(:id, :agent, :deployment, :conversation, :repo, :base_sha, "
             ":branch, :pr, :url, :head_sha, :status, 1, 1, "
-            ":github_repository_id, :github_installation_id, :github_pr_node_id, "
-            ":base_ref)"
+            ":code_host_kind, :code_host_host, :repository_project_id, "
+            ":code_host_installation_id, :code_host_pr_id, :base_ref)"
         ),
         {
             "id": lineage_id,
@@ -173,12 +182,14 @@ async def _lineage(
             "url": f"https://github.com/{repo}/pull/{pr}",
             "head_sha": "1123456789abcdef0123456789abcdef01234567",
             "status": status,
-            "github_repository_id": github_repository_id,
-            "github_installation_id": github_installation_id,
-            "github_pr_node_id": (
-                f"PR_kwDO{lineage_id.hex}" if github_repository_id is not None else None
+            "code_host_kind": GITHUB if repository_project_id is not None else None,
+            "code_host_host": "github.com" if repository_project_id is not None else None,
+            "repository_project_id": repository_project_id,
+            "code_host_installation_id": code_host_installation_id,
+            "code_host_pr_id": (
+                f"PR_kwDO{lineage_id.hex}" if repository_project_id is not None else None
             ),
-            "base_ref": "main" if github_repository_id is not None else None,
+            "base_ref": "main" if repository_project_id is not None else None,
         },
     )
     await session.commit()
@@ -200,17 +211,17 @@ async def _grant_opened_pull_request(
         session,
         item.agent_id,
         conversation=item.conversation_id,
-        repo=item.repo_full_name,
+        repo=item.repository.path,
         pr=pr,
-        github_repository_id=item.github_repository_id,
-        github_installation_id=item.github_installation_id,
+        repository_project_id=item.repository.project_id,
+        code_host_installation_id=item.code_host_installation_id,
     )
     deployment_id = await session.scalar(
         text("SELECT deployment_id FROM curie.thread_publication_lineages WHERE id = :id"),
         {"id": lineage_id},
     )
     approval_id, publication_id = uuid.uuid4(), uuid.uuid4()
-    pr_url = f"https://github.com/{item.repo_full_name}/pull/{pr}"
+    pr_url = f"https://github.com/{item.repository.path}/pull/{pr}"
     await session.execute(
         text(
             "INSERT INTO curie.approvals "
@@ -224,7 +235,7 @@ async def _grant_opened_pull_request(
             "id": approval_id,
             "agent": item.agent_id,
             "conversation": item.conversation_id,
-            "channel": item.repo_full_name,
+            "channel": item.repository.path,
             "dedupe": f"opened-pr-{publication_id.hex}",
         },
     )
@@ -248,8 +259,8 @@ async def _grant_opened_pull_request(
             "conversation": item.conversation_id,
             "lineage": lineage_id,
             "request": request.id,
-            "repo": item.repo_full_name,
-            "channel": item.repo_full_name,
+            "repo": item.repository.path,
+            "channel": item.repository.path,
             "base_sha": "0123456789abcdef0123456789abcdef01234567",
             "result_url": pr_url,
         },
@@ -282,14 +293,16 @@ async def _elapsed_running(
     await session.execute(
         text(
             "INSERT INTO curie.work_items "
-            "(id, github_repository_id, github_issue_number, "
-            "github_installation_id, agent_id, repo_full_name, conversation_id, "
+            "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+            "code_host_kind, code_host_host, repository_project_id, "
+            "code_host_installation_id, agent_id, repository_path, conversation_id, "
             "publication_lineage_id, version, next_sequence) VALUES "
-            "(:id, 101, :issue, 202, :agent, :repo, :conversation, :lineage, 2, 2)"
+            "(:id, 'github', 'github.com', '101', :issue, 'github', 'github.com', "
+            "'101', 202, :agent, :repo, :conversation, :lineage, 2, 2)"
         ),
         {
             "id": item_id,
-            "issue": issue,
+            "issue": str(issue),
             "agent": agent_id,
             "repo": REPO,
             "conversation": CONVERSATION,
@@ -328,17 +341,16 @@ def test_work_item_identity_replay_and_conflicting_provenance(clean_db: None) ->
         assert replay.work_item == created.work_item
 
         variants: list[dict[str, Any]] = [
-            {"github_installation_id": 999},
+            {"code_host_installation_id": 999},
             {"agent_id": await _agent(session, "other-agent")},
-            {"repo_full_name": "acme-corp/another-bot"},
+            {"repository": _repository("acme-corp/another-bot")},
             {"conversation_id": "slack:C0EXAMPLE1:1700000000.000200"},
         ]
         base: dict[str, Any] = {
-            "github_repository_id": 101,
-            "github_issue_number": 2573,
-            "github_installation_id": 202,
+            "issue": _issue(),
+            "repository": _repository(),
+            "code_host_installation_id": 202,
             "agent_id": agent_id,
-            "repo_full_name": REPO,
             "conversation_id": CONVERSATION,
         }
         for variant in variants:
@@ -379,11 +391,10 @@ def test_concurrent_duplicate_work_item_intake_returns_one_replay(clean_db: None
             async with maker() as session:
                 return await workitems.create_or_get_work_item(
                     session,
-                    github_repository_id=101,
-                    github_issue_number=2573,
-                    github_installation_id=202,
+                    issue=_issue(),
+                    repository=_repository(),
+                    code_host_installation_id=202,
                     agent_id=agent_id,
-                    repo_full_name=REPO,
                     conversation_id=CONVERSATION,
                 )
 
@@ -405,7 +416,8 @@ def test_concurrent_duplicate_work_item_intake_returns_one_replay(clean_db: None
             await session.scalar(
                 text(
                     "SELECT count(*) FROM curie.work_items "
-                    "WHERE github_repository_id = 101 AND github_issue_number = 2573"
+                    "WHERE tracker_kind = 'github' AND tracker_host = 'github.com' "
+                    "AND tracker_scope_id = '101' AND tracker_issue_id = '2573'"
                 )
             )
             == 1
@@ -846,11 +858,11 @@ def test_publication_linkage_validates_lineage_identity(clean_db: None, mismatch
 
 @pytest.mark.parametrize(
     ("repository_id", "installation_id", "matches"),
-    [(101, 202, True), (999, 202, False), (101, 999, False)],
+    [("101", 202, True), ("999", 202, False), ("101", 999, False)],
 )
 def test_publication_linkage_validates_verified_github_identity(
     clean_db: None,
-    repository_id: int,
+    repository_id: str,
     installation_id: int,
     matches: bool,
 ) -> None:
@@ -863,13 +875,13 @@ def test_publication_linkage_validates_verified_github_identity(
         lineage_id = await _lineage(
             session,
             agent_id,
-            github_repository_id=repository_id,
-            github_installation_id=installation_id,
+            repository_project_id=repository_id,
+            code_host_installation_id=installation_id,
         )
         stored_identity = (
             await session.execute(
                 text(
-                    "SELECT github_repository_id, github_installation_id "
+                    "SELECT repository_project_id, code_host_installation_id "
                     "FROM curie.thread_publication_lineages WHERE id = :id"
                 ),
                 {"id": lineage_id},
@@ -915,7 +927,7 @@ def test_publication_linkage_refreshes_cached_verified_github_identity(
             select(ThreadPublicationLineage).where(ThreadPublicationLineage.id == lineage_id)
         )
         assert cached is not None
-        assert (cached.github_repository_id, cached.github_installation_id) == (
+        assert (cached.repository_project_id, cached.code_host_installation_id) == (
             None,
             None,
         )
@@ -926,8 +938,9 @@ def test_publication_linkage_refreshes_cached_verified_github_identity(
                 await updater.execute(
                     text(
                         "UPDATE curie.thread_publication_lineages SET "
-                        "github_repository_id = 999, github_installation_id = 999, "
-                        "github_pr_node_id = :node_id, base_ref = 'main' WHERE id = :id"
+                        "code_host_kind = 'github', code_host_host = 'github.com', "
+                        "repository_project_id = '999', code_host_installation_id = 999, "
+                        "code_host_pr_id = :node_id, base_ref = 'main' WHERE id = :id"
                     ),
                     {"id": lineage_id, "node_id": f"PR_kwDO{lineage_id.hex}"},
                 )
@@ -938,14 +951,14 @@ def test_publication_linkage_refreshes_cached_verified_github_identity(
         persisted_identity = (
             await session.execute(
                 text(
-                    "SELECT github_repository_id, github_installation_id "
+                    "SELECT repository_project_id, code_host_installation_id "
                     "FROM curie.thread_publication_lineages WHERE id = :id"
                 ),
                 {"id": lineage_id},
             )
         ).one()
-        assert tuple(persisted_identity) == (999, 999)
-        assert (cached.github_repository_id, cached.github_installation_id) == (
+        assert tuple(persisted_identity) == ("999", 999)
+        assert (cached.repository_project_id, cached.code_host_installation_id) == (
             None,
             None,
         )
@@ -987,7 +1000,7 @@ def test_publication_link_is_unique_idempotent_and_restricts_deletion(
         historical_identity = (
             await session.execute(
                 text(
-                    "SELECT status, github_repository_id, github_installation_id "
+                    "SELECT status, repository_project_id, code_host_installation_id "
                     "FROM curie.thread_publication_lineages WHERE id = :id"
                 ),
                 {"id": lineage_id},
@@ -1437,10 +1450,12 @@ def test_link_rechecks_deadline_after_a_real_database_lock_wait(clean_db: None) 
                 await setup.execute(
                     text(
                         "INSERT INTO curie.work_items "
-                        "(id, github_repository_id, github_issue_number, "
-                        "github_installation_id, agent_id, repo_full_name, "
-                        "conversation_id, version, next_sequence) VALUES "
-                        "(:id, 101, 2577, 202, :agent, :repo, :conversation, 2, 2)"
+                        "(id, tracker_kind, tracker_host, tracker_scope_id, "
+                        "tracker_issue_id, code_host_kind, code_host_host, "
+                        "repository_project_id, code_host_installation_id, agent_id, "
+                        "repository_path, conversation_id, version, next_sequence) "
+                        "VALUES (:id, 'github', 'github.com', '101', '2577', 'github', "
+                        "'github.com', '101', 202, :agent, :repo, :conversation, 2, 2)"
                     ),
                     {
                         "id": item_id,
@@ -1813,14 +1828,16 @@ async def _elapsed_running_with_lapsed_heartbeat(
     await session.execute(
         text(
             "INSERT INTO curie.work_items "
-            "(id, github_repository_id, github_issue_number, "
-            "github_installation_id, agent_id, repo_full_name, conversation_id, "
+            "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+            "code_host_kind, code_host_host, repository_project_id, "
+            "code_host_installation_id, agent_id, repository_path, conversation_id, "
             "version, next_sequence) VALUES "
-            "(:id, 101, :issue, 202, :agent, :repo, :conversation, 2, 2)"
+            "(:id, 'github', 'github.com', '101', :issue, 'github', 'github.com', "
+            "'101', 202, :agent, :repo, :conversation, 2, 2)"
         ),
         {
             "id": item_id,
-            "issue": issue,
+            "issue": str(issue),
             "agent": agent_id,
             "repo": REPO,
             "conversation": CONVERSATION,
@@ -2385,10 +2402,12 @@ async def _insert_running_with_span(session: AsyncSession, seconds: int) -> None
     await session.execute(
         text(
             "INSERT INTO curie.work_items "
-            "(id, github_repository_id, github_issue_number, "
-            "github_installation_id, agent_id, repo_full_name, conversation_id, "
+            "(id, tracker_kind, tracker_host, tracker_scope_id, tracker_issue_id, "
+            "code_host_kind, code_host_host, repository_project_id, "
+            "code_host_installation_id, agent_id, repository_path, conversation_id, "
             "version, next_sequence) VALUES "
-            "(:id, 101, 2573, 202, :agent, :repo, :conversation, 2, 2)"
+            "(:id, 'github', 'github.com', '101', '2573', 'github', 'github.com', "
+            "'101', 202, :agent, :repo, :conversation, 2, 2)"
         ),
         {"id": item_id, "agent": agent_id, "repo": REPO, "conversation": CONVERSATION},
     )
@@ -2440,6 +2459,19 @@ PR_OBJECTIVE = (
     f"https://github.com/{REPO}/pull/123#discussion_r88201\n\n"
     "Review feedback asked for another revision."
 )
+
+
+async def _set_pr_reply_target(session: AsyncSession, request_id: uuid.UUID) -> None:
+    """Store PR_OBJECTIVE's review thread as the typed reply target admission writes."""
+
+    await session.execute(
+        text(
+            "UPDATE curie.execution_requests SET reply_target_kind = 'review_thread', "
+            "reply_target_pr_number = '123', reply_target_comment_id = '88201', "
+            "reply_target_url = :url WHERE id = :id"
+        ),
+        {"id": request_id, "url": PR_OBJECTIVE.splitlines()[0]},
+    )
 
 
 async def _set_snapshot(
@@ -2561,6 +2593,7 @@ async def _requests(session: AsyncSession, work_item_id: uuid.UUID) -> list[Any]
             await session.execute(
                 text(
                     "SELECT id, sequence, status, terminal_cause, wait_deadline, "
+                    "reply_target_kind, reply_target_pr_number, reply_target_comment_id, "
                     f"{', '.join(SNAPSHOT_COLUMNS)} FROM curie.execution_requests "
                     "WHERE work_item_id = :id ORDER BY sequence"
                 ),
@@ -2838,6 +2871,7 @@ def test_a_pr_targeted_owner_lost_is_retried_only_on_its_open_lineage(
         )
         item_id, request_id, _, _ = await _elapsed_running(session, agent_id, lineage_id=lineage_id)
         await _set_snapshot(session, request_id, objective=PR_OBJECTIVE)
+        await _set_pr_reply_target(session, request_id)
         await _lose(session, request_id)
 
         rows = await _requests(session, item_id)
@@ -2847,6 +2881,12 @@ def test_a_pr_targeted_owner_lost_is_retried_only_on_its_open_lineage(
         assert len(rows) == 2, rows
         successor = rows[1]
         assert (successor.status, successor.objective) == ("waiting", PR_OBJECTIVE)
+        # The successor replies where the lost request did (#3831 reply targets).
+        assert (
+            successor.reply_target_kind,
+            successor.reply_target_pr_number,
+            successor.reply_target_comment_id,
+        ) == ("review_thread", "123", "88201")
         assert await _owner_lost_retry(session, successor.id) is True
 
     with_session(body)
@@ -2861,7 +2901,7 @@ async def _attach_own_publication(
         (
             await session.execute(
                 text(
-                    "SELECT agent_id, conversation_id, repo_full_name "
+                    "SELECT agent_id, conversation_id, repository_path "
                     "FROM curie.work_items WHERE id = :id"
                 ),
                 {"id": work_item_id},
@@ -2889,7 +2929,7 @@ async def _attach_own_publication(
             "id": approval_id,
             "agent": item["agent_id"],
             "conversation": item["conversation_id"],
-            "channel": item["repo_full_name"],
+            "channel": item["repository_path"],
             "dedupe": f"owner-lost-publication-{publication_id.hex}",
         },
     )
@@ -2911,9 +2951,9 @@ async def _attach_own_publication(
             "conversation": item["conversation_id"],
             "lineage": lineage_id,
             "request": request_id,
-            "repo": item["repo_full_name"],
+            "repo": item["repository_path"],
             "status": status,
-            "channel": item["repo_full_name"],
+            "channel": item["repository_path"],
             "base_sha": "0123456789abcdef0123456789abcdef01234567",
         },
     )

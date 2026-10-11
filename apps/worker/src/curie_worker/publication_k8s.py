@@ -1,9 +1,15 @@
 """Deterministic, secret-minimizing Kubernetes publication resources.
 
-The patch is carried as ConfigMap ``binaryData`` and the short-lived GitHub
+The patch is carried as ConfigMap ``binaryData`` and the short-lived push
 credential lives only in a Secret volume.  Neither value appears in Job argv,
 environment, labels, or logs.  Names are publication-id-derived so a worker
 restart adopts the same resource set instead of starting a second push.
+
+The Job only pushes (ADR 0197, "Two ports" item 6). It clones the origin the
+API named, applies the approved patch as one marked commit, and pushes it with
+a lease on the expected remote head. It calls no code host API: the worker asks
+the API to check the stored pull request before the Job launches and to find
+or open it after the push.
 """
 
 from __future__ import annotations
@@ -13,28 +19,41 @@ import copy
 import hashlib
 import hmac
 import json
+import posixpath
 import re
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast, get_args
 from urllib.parse import urlsplit
 
+from aci_protocol import BootEnv
 from kubernetes import client as k8s_client
 from kubernetes import config as k8s_config
-
-from .config import github_html_base
 
 if TYPE_CHECKING:
     from .publication_loop import PublicationJobObservation
 
 MAX_PATCH_BYTES = 900_000
 _AUTHORIZATION_LOG = re.compile(
-    r"Authorization:\s*(?:Basic|Bearer|token)\s+[^\s]+", re.IGNORECASE
+    r"(?:Authorization|PRIVATE-TOKEN):\s*(?:(?:Basic|Bearer|token)\s+)?[^\s]+", re.IGNORECASE
 )
 _URL_USERINFO = re.compile(r"(https?://)[^/\s@]+@", re.IGNORECASE)
 _MARKER_LOG_LINE = re.compile(r"^CURIE_[A-Z_]+=")
 # Failed Job text leaves the cluster into thread history; keep it bounded.
 _MAX_JOB_ERROR = 1500
+_REPOSITORY_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+
+# How git sends the push credential, as the API names it (ADR 0197). GitHub
+# is ``authorization_basic`` with ``x-access-token``; GitLab refuses a Bearer
+# header, so the form travels with the credential instead of being assumed.
+HeaderForm = Literal["authorization_basic", "authorization_bearer", "private_token"]
+HEADER_FORMS: frozenset[str] = frozenset(get_args(HeaderForm))
+# The Job's env names for the transport facts, read back on adoption.
+_ORIGIN_ENV = "CODE_HOST_ORIGIN"
+_HEADER_FORM_ENV = "CODE_HOST_HEADER_FORM"
+# The same boot contract key the sandbox reads, named from its one declaration.
+_CA_BUNDLE_ENV = BootEnv.env_key("repo_ca_bundle")
+_CA_VOLUME = "code-host-trust"
 
 
 def _redact(text: str) -> str:
@@ -50,6 +69,50 @@ def _field(obj: Any, name: str, attr: str | None = None) -> Any:
 
 class PublicationResourceError(RuntimeError):
     """A publication cannot be represented by the hardened Job contract."""
+
+
+@dataclass(frozen=True)
+class PublicationTransport:
+    """Where and how the Job pushes, as the API's credential named it.
+
+    None of these is secret. ``origin`` is the code host's scheme, host and
+    optional base path; the clone URL is the origin plus the repository path.
+    ``ca_bundle_ref`` is the path of a PEM bundle mounted in the Job, or None
+    for the public trust store.
+    """
+
+    origin: str
+    header_form: HeaderForm
+    ca_bundle_ref: str | None = None
+
+
+def clean_origin(origin: str) -> bool:
+    """Whether ``origin`` is a credential-free HTTPS origin with no trailing slash."""
+
+    try:
+        parsed = urlsplit(origin)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.query
+        and not parsed.fragment
+        and not origin.endswith("/")
+    )
+
+
+def valid_repository_path(path: str) -> bool:
+    """A repository path of two or more plain segments (``owner/name`` or deeper)."""
+
+    segments = path.split("/")
+    return len(segments) >= 2 and all(
+        _REPOSITORY_SEGMENT.fullmatch(segment) and segment not in {".", ".."}
+        for segment in segments
+    )
 
 
 @dataclass(frozen=True)
@@ -72,12 +135,11 @@ class PublicationJobSettings:
     owner_uid: str | None = None
     active_deadline_seconds: int = 300
     git_timeout_seconds: int = 60
-    github_timeout_seconds: int = 30
-    github_api_url: str = "https://api.github.com"
-
-    @property
-    def github_html_base(self) -> str:
-        return github_html_base(self.github_api_url)
+    # The ConfigMap holding the operator's code host CA bundle
+    # (codeHostTrust.caBundle.configMapRef), mounted read-only at the path the
+    # credential's ``ca_bundle_ref`` names. Empty means none is configured.
+    ca_bundle_config_map: str = ""
+    ca_bundle_key: str = "ca.crt"
 
 
 @dataclass(frozen=True)
@@ -92,17 +154,9 @@ class PublicationPayload:
     expected_remote_head: str | None
     patch: bytes
     branch: str
-    pr_number: int | None
-    pr_url: str | None
     title: str
-    body: str
-    observed_title_sha256: str | None
-    observed_body_sha256: str | None
-    github_repository_id: int | None
-    github_pr_node_id: str | None
-    open_as_draft: bool = False
+    transport: PublicationTransport
     branch_prefix: str | None = None
-    base_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -144,24 +198,26 @@ fi
 
 redact() {
   # Credentials are never deliberately logged. This filter is defence in depth
-  # for diagnostics returned by git or GitHub.
+  # for diagnostics git returns: it drops userinfo from any URL, including the
+  # configured origin's, and any credential header.
   auth_scheme='([Bb][Aa][Ss][Ii][Cc]|[Bb][Ee][Aa][Rr][Ee][Rr]|'
   auth_scheme+='[Tt][Oo][Kk][Ee][Nn])'
-  sed -E -e 's#https://[^/@[:space:]]*@github\.com#https://github.com#g' \
-      -e "s#Authorization:[[:space:]]*${auth_scheme}"\
-"[[:space:]]+[^[:space:]]+#Authorization: [REDACTED]#gI"
+  sed -E -e 's#(https?://)[^/@[:space:]]*@#\1#g' \
+      -e "s#(Authorization|PRIVATE-TOKEN):[[:space:]]*(${auth_scheme}[[:space:]]+)?"\
+"[^[:space:]]+#Authorization: [REDACTED]#gI"
 }
 
 git_with_timeout() {
   # Git must not forward an operator credential to a redirected origin. Keep
   # this invocation-scoped so no credential or transport setting is persisted
   # in the checkout configuration.
-  timeout --signal=TERM "${GIT_TIMEOUT_SECONDS}s" git -c http.followRedirects=false "$@"
+  timeout --signal=TERM "${GIT_TIMEOUT_SECONDS}s" git -c http.followRedirects=false \
+    -c include.path=/tmp/curie-git-auth.config "$@"
 }
 
 cleanup_auth() {
   rm -f /tmp/curie-git-user /tmp/curie-git-pass /tmp/curie-askpass \
-    /tmp/curie-github.py /tmp/curie-pr-facts.json
+    /tmp/curie-git-auth.config
 }
 trap cleanup_auth EXIT
 
@@ -170,23 +226,46 @@ patch_path="${CURIE_PATCH_PATH:-/publication/changes.patch}"
 work_dir="${CURIE_WORK_DIR:-/work}"
 export CURIE_CREDENTIAL_PATH="$credential_path"
 
+if [[ "$CLEAN_CLONE_URL" != "$CODE_HOST_ORIGIN/"* ]]; then
+  echo "publication clone URL is not under the code host origin" >&2
+  exit 1
+fi
+
+# The header form decides how git presents the credential (ADR 0197). Basic is
+# a username and password through askpass; any other form is one extra header
+# scoped to the origin, written to an include file so it never enters argv or
+# the environment.
 python - <<'PY'
 import base64
 import os
 from pathlib import Path
 
 value = Path(os.environ["CURIE_CREDENTIAL_PATH"]).read_text().strip()
-user, password = "x-access-token", value
-if value.lower().startswith("basic "):
+form = os.environ["CODE_HOST_HEADER_FORM"]
+origin = os.environ["CODE_HOST_ORIGIN"]
+user, password, header = "", "", ""
+if form == "authorization_basic":
+    scheme, _, encoded = value.partition(" ")
+    if scheme.lower() != "basic":
+        raise SystemExit("publication credential is not Basic authorization")
     try:
-        decoded = base64.b64decode(value.split(None, 1)[1]).decode()
-        user, password = decoded.split(":", 1)
+        user, password = base64.b64decode(encoded, validate=True).decode().split(":", 1)
     except (ValueError, UnicodeError):
         raise SystemExit("publication credential is not valid Basic authorization")
-elif value.lower().startswith(("bearer ", "token ")):
-    password = value.split(None, 1)[1]
+elif form == "authorization_bearer":
+    if not value.lower().startswith("bearer "):
+        raise SystemExit("publication credential is not Bearer authorization")
+    header = f"Authorization: {value}"
+elif form == "private_token":
+    header = f"PRIVATE-TOKEN: {value}"
+else:
+    raise SystemExit("publication credential header form is unknown")
+if any(char in value for char in "\r\n\0\"\\"):
+    raise SystemExit("publication credential contains a forbidden character")
 Path("/tmp/curie-git-user").write_text(user)
 Path("/tmp/curie-git-pass").write_text(password)
+config = f'[http "{origin}/"]\n\textraHeader = "{header}"\n' if header else ""
+Path("/tmp/curie-git-auth.config").write_text(config)
 PY
 
 cat >/tmp/curie-askpass <<'ASKPASS'
@@ -199,6 +278,11 @@ ASKPASS
 chmod 0700 /tmp/curie-askpass
 export GIT_ASKPASS=/tmp/curie-askpass
 export GIT_TERMINAL_PROMPT=0
+
+if [[ ! -s "$patch_path" ]]; then
+  echo "publication Job requires a non-empty patch" >&2
+  exit 1
+fi
 
 mkdir -p "$work_dir"
 cd "$work_dir"
@@ -217,343 +301,21 @@ if [[ "$remote_head" != "$EXPECTED_REMOTE_HEAD" ]]; then
   echo "publication branch head conflict" >&2
   exit 1
 fi
-if [[ -s "$patch_path" ]]; then
-  git_with_timeout apply --check --binary "$patch_path"
-  git_with_timeout apply --binary "$patch_path"
-  git_with_timeout add --all
-  if git_with_timeout diff --cached --quiet; then
-    echo "publication patch produced no changes" >&2
-    exit 1
-  fi
-  git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" commit \
-    -m "$PR_TITLE" -m "Curie-Revision: $REVISION_ID"
-  commit_sha=$(git_with_timeout rev-parse HEAD)
-else
-  if [[ -z "$PR_NUMBER" || -z "$PR_URL" ]]; then
-    echo "metadata-only publication requires a stored pull request" >&2
-    exit 1
-  fi
-  commit_sha="$BASE_SHA"
+git_with_timeout apply --check --binary "$patch_path"
+git_with_timeout apply --binary "$patch_path"
+git_with_timeout add --all
+if git_with_timeout diff --cached --quiet; then
+  echo "publication patch produced no changes" >&2
+  exit 1
 fi
-
-cat >/tmp/curie-github.py <<'PY'
-import base64
-import hashlib
-import json
-import os
-from datetime import UTC, datetime
-from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlsplit
-from urllib.request import HTTPRedirectHandler, Request, build_opener
-
-repo = os.environ["REPO_FULL_NAME"]
-branch = os.environ["BRANCH"]
-owner = repo.split("/", 1)[0]
-github_api = os.environ["GITHUB_API_URL"].rstrip("/")
-github_html = os.environ["GITHUB_HTML_BASE"]
-repo_api = f"{github_api}/repos/{repo}"
-api = f"{repo_api}/pulls"
-credential_path = Path(os.environ.get("CURIE_CREDENTIAL_PATH", "/credentials/credential"))
-facts_path = Path(os.environ.get("CURIE_PR_FACTS_PATH", "/tmp/curie-pr-facts.json"))
-phase = os.environ["CURIE_GITHUB_PHASE"]
-if phase not in {"pre-push", "post-push", "metadata-only"}:
-    raise SystemExit("invalid publication GitHub validation phase")
-expected_head = os.environ.get("CURIE_EXPECTED_HEAD", "")
-if len(expected_head) not in range(40, 65) or any(
-    char not in "0123456789abcdef" for char in expected_head
-):
-    raise SystemExit("expected publication commit is invalid")
-raw = credential_path.read_text().strip()
-if raw.lower().startswith(("basic ", "bearer ", "token ")):
-    authorization = raw
-else:
-    authorization = f"Bearer {raw}"
-headers = {
-    "Accept": "application/vnd.github+json",
-    "Authorization": authorization,
-    "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "curie-publication-job",
-}
-class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-opener = build_opener(_NoRedirect())
-
-def request(method, url, payload=None):
-    data = None if payload is None else json.dumps(payload).encode()
-    req = Request(url, data=data, headers=headers, method=method)
-    with opener.open(req, timeout=int(os.environ["GITHUB_TIMEOUT_SECONDS"])) as response:
-        return json.load(response)
-
-def validate_pull(
-    row,
-    expected_base,
-    *,
-    require_metadata,
-    expected_number=None,
-    expected_url=None,
-    require_merged=False,
-):
-    if not isinstance(row, dict):
-        raise SystemExit("GitHub returned an invalid pull request")
-    head = row.get("head")
-    base = row.get("base")
-    expected = {
-        "head_ref": branch,
-        "head_repo": repo,
-        "base_ref": expected_base,
-        "base_repo": repo,
-    }
-    actual = {
-        "head_ref": head.get("ref") if isinstance(head, dict) else None,
-        "head_repo": (
-            (head.get("repo") or {}).get("full_name")
-            if isinstance(head, dict) and isinstance(head.get("repo"), dict)
-            else None
-        ),
-        "head_sha": head.get("sha") if isinstance(head, dict) else None,
-        "base_ref": base.get("ref") if isinstance(base, dict) else None,
-        "base_repo": (
-            (base.get("repo") or {}).get("full_name")
-            if isinstance(base, dict) and isinstance(base.get("repo"), dict)
-            else None
-        ),
-    }
-    repo_fields = ("head_repo", "base_repo")
-    if require_metadata and (
-        row.get("title") != os.environ["PR_TITLE"]
-        or row.get("body") != os.environ["PR_BODY"]
-    ):
-        raise SystemExit(
-            "GitHub pull request does not match the approved publication contract"
-        )
-    if os.environ.get("PUBLICATION_OPEN_AS_DRAFT") == "true" and row.get("draft") is not True:
-        raise SystemExit("GitHub pull request is not the required draft")
-    if any(
-        not isinstance(actual[field], str)
-        or actual[field].casefold() != expected[field].casefold()
-        for field in repo_fields
-    ) or any(
-        actual[field] != expected[field]
-        for field in expected
-        if field not in repo_fields
-    ):
-        raise SystemExit(
-            "GitHub pull request does not match the approved publication contract"
-        )
-    if actual["head_sha"] != expected_head:
-        raise SystemExit(
-            "GitHub pull request head does not match the expected publication commit"
-        )
-    url = row.get("html_url")
-    prefix = f"{github_html}/{repo}/pull/"
-    if not isinstance(url, str) or not url.casefold().startswith(prefix.casefold()):
-        raise SystemExit("GitHub did not return a usable pull request URL")
-    parsed_url = urlsplit(url)
-    if (
-        parsed_url.scheme != "https"
-        or parsed_url.username is not None
-        or parsed_url.password is not None
-    ):
-        raise SystemExit("GitHub did not return a usable pull request URL")
-    url_number = url[len(prefix):]
-    number = row.get("number")
-    if (
-        not url_number.isdigit()
-        or isinstance(number, bool)
-        or not isinstance(number, int)
-        or number <= 0
-        or number != int(url_number)
-        or (expected_number is not None and number != expected_number)
-        or (
-            expected_url is not None
-            and url.casefold() != expected_url.casefold()
-        )
-    ):
-        raise SystemExit("GitHub did not return a usable pull request URL")
-    state = row.get("state")
-    merged = row.get("merged")
-    merged_at = row.get("merged_at")
-    if require_merged and not isinstance(merged, bool):
-        raise SystemExit("GitHub returned an invalid pull request state")
-    if merged is True or merged_at is not None:
-        print(f"CURIE_PR_URL={url}")
-        print(f"CURIE_PR_NUMBER={number}")
-        print(f"CURIE_COMMIT_SHA={actual['head_sha']}")
-        print("CURIE_PR_STATE=merged", flush=True)
-        raise SystemExit("stored pull request is merged")
-    if state != "open":
-        if state == "closed":
-            print(f"CURIE_PR_URL={url}")
-            print(f"CURIE_PR_NUMBER={number}")
-            print(f"CURIE_COMMIT_SHA={actual['head_sha']}")
-            print("CURIE_PR_STATE=closed", flush=True)
-            raise SystemExit("stored pull request is closed")
-        raise SystemExit("GitHub returned an invalid pull request state")
-    return url, number
-
-def existing(expected_base):
-    head=quote(f"{owner}:{branch}", safe="")
-    rows = request("GET", f"{api}?state=all&head={head}")
-    if not isinstance(rows, list):
-        raise SystemExit("GitHub deterministic-head lookup returned an invalid response")
-    if len(rows) > 1:
-        raise SystemExit("GitHub deterministic-head lookup returned multiple pull requests")
-    return validate_pull(rows[0], expected_base, require_metadata=True) if rows else None
-
-pr_number = os.environ.get("PR_NUMBER")
-if pr_number:
-    try:
-        expected_number = int(pr_number)
-    except ValueError:
-        raise SystemExit("stored pull request number is invalid") from None
-    expected_url = os.environ.get("PR_URL")
-    if not expected_url:
-        raise SystemExit("stored pull request URL is missing")
-    if phase in {"pre-push", "metadata-only"}:
-        repository = request("GET", repo_api)
-        default_base = os.environ.get("BASE_REF") or repository.get("default_branch")
-        if not isinstance(default_base, str) or not default_base:
-            raise SystemExit("GitHub repository has no default branch")
-        current_pull = request("GET", f"{api}/{pr_number}")
-        url, number = validate_pull(
-            current_pull,
-            default_base,
-            require_metadata=False,
-            expected_number=expected_number,
-            expected_url=expected_url,
-            require_merged=True,
-        )
-        if phase == "metadata-only":
-            expected_repository_id = int(os.environ["EXPECTED_GITHUB_REPOSITORY_ID"])
-            expected_pr_node_id = os.environ["EXPECTED_GITHUB_PR_NODE_ID"]
-            if repository.get("id") != expected_repository_id or (
-                current_pull.get("node_id") != expected_pr_node_id
-            ):
-                raise SystemExit("stored pull request identity changed")
-            current_body = current_pull.get("body")
-            if current_body is not None and not isinstance(current_body, str):
-                raise SystemExit("GitHub pull request body is invalid")
-            current_body = current_body or ""
-            expected_title = os.environ["OBSERVED_TITLE_SHA256"]
-            expected_body = os.environ["OBSERVED_BODY_SHA256"]
-            if any(
-                len(value) != 64 or any(char not in "0123456789abcdef" for char in value)
-                for value in (expected_title, expected_body)
-            ):
-                raise SystemExit("observed pull request metadata is missing")
-            if (
-                hashlib.sha256(str(current_pull.get("title", "")).encode()).hexdigest()
-                != expected_title
-                or hashlib.sha256(current_body.encode()).hexdigest()
-                != expected_body
-            ):
-                raise SystemExit("pull request metadata changed after publication approval")
-            if (
-                current_pull.get("title") == os.environ["PR_TITLE"]
-                and current_body == os.environ["PR_BODY"]
-            ):
-                raise SystemExit("pull request metadata already matches the proposal")
-            update = {}
-            if current_pull.get("title") != os.environ["PR_TITLE"]:
-                update["title"] = os.environ["PR_TITLE"]
-            if current_body != os.environ["PR_BODY"]:
-                update["body"] = os.environ["PR_BODY"]
-            try:
-                updated_pull = request(
-                    "PATCH", f"{api}/{pr_number}", update,
-                )
-            except (HTTPError, URLError):
-                raise SystemExit("GitHub pull request metadata update was not confirmed") from None
-            validate_pull(
-                updated_pull, default_base, require_metadata=True,
-                expected_number=expected_number, expected_url=expected_url,
-                require_merged=True,
-            )
-            if updated_pull.get("node_id") != expected_pr_node_id:
-                raise SystemExit("stored pull request identity changed")
-            updated_at = updated_pull.get("updated_at")
-            try:
-                timestamp = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-            except (AttributeError, ValueError):
-                raise SystemExit("GitHub pull request update time is invalid") from None
-            if timestamp.tzinfo is None:
-                raise SystemExit("GitHub pull request update time is invalid")
-            print(f"CURIE_PR_UPDATED_AT={timestamp.astimezone(UTC).isoformat()}")
-            print(f"CURIE_PR_URL={url}")
-            print(f"CURIE_PR_NUMBER={number}")
-            raise SystemExit(0)
-        facts_path.write_text(json.dumps({"base": default_base, "url": url, "number": number}))
-        raise SystemExit(0)
-    try:
-        facts = json.loads(facts_path.read_text())
-    except (OSError, ValueError):
-        raise SystemExit("stored pull request validation facts are missing") from None
-    if not isinstance(facts, dict):
-        raise SystemExit("stored pull request validation facts are invalid")
-    default_base = facts.get("base")
-    if (
-        not isinstance(default_base, str)
-        or facts.get("url") != expected_url
-        or facts.get("number") != expected_number
-    ):
-        raise SystemExit("stored pull request validation facts are invalid")
-    url, number = validate_pull(
-        request("GET", f"{api}/{pr_number}"),
-        default_base,
-        require_metadata=False,
-        expected_number=expected_number,
-        expected_url=expected_url,
-        require_merged=True,
-    )
-else:
-    if phase != "post-push":
-        raise SystemExit("new pull request cannot be validated before push")
-    # Query the deterministic head before POST, and again after an ambiguous
-    # REST failure. This is the idempotency boundary for a lost response.
-    repository = request("GET", repo_api)
-    default_base = os.environ.get("BASE_REF") or repository.get("default_branch")
-    if not isinstance(default_base, str) or not default_base:
-        raise SystemExit("GitHub repository has no default branch")
-    pull = existing(default_base)
-    if not pull:
-        try:
-            pull_body = {
-                "title": os.environ["PR_TITLE"],
-                "head": branch,
-                "base": default_base,
-                "body": os.environ["PR_BODY"],
-            }
-            if os.environ.get("PUBLICATION_OPEN_AS_DRAFT") == "true":
-                pull_body["draft"] = True
-            created = request("POST", api, pull_body)
-            pull = validate_pull(created, default_base, require_metadata=True)
-        except (HTTPError, URLError):
-            pull = existing(default_base)
-            if not pull:
-                raise
-    url, number = pull
-print(f"CURIE_PR_URL={url}")
-print(f"CURIE_PR_NUMBER={number}")
-PY
-
-if [[ ! -s "$patch_path" ]]; then
-  CURIE_EXPECTED_HEAD="$BASE_SHA" \
-    CURIE_GITHUB_PHASE=metadata-only python /tmp/curie-github.py
-  echo "CURIE_COMMIT_SHA=$BASE_SHA"
-  exit 0
-fi
-if [[ -n "$PR_NUMBER" ]]; then
-  CURIE_EXPECTED_HEAD="$EXPECTED_PRIOR_HEAD" \
-    CURIE_GITHUB_PHASE=pre-push python /tmp/curie-github.py
-fi
+git_with_timeout -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" commit \
+  -m "$COMMIT_TITLE" -m "Curie-Revision: $REVISION_ID"
+commit_sha=$(git_with_timeout rev-parse HEAD)
+# The lease is the branch guard: the push lands only if the remote branch still
+# holds the head this revision was approved against.
 git_with_timeout push \
   --force-with-lease=refs/heads/$BRANCH:$EXPECTED_REMOTE_HEAD \
   origin "HEAD:refs/heads/$BRANCH" 2> >(redact >&2)
-CURIE_EXPECTED_HEAD="$commit_sha" \
-  CURIE_GITHUB_PHASE=post-push python /tmp/curie-github.py
 echo "CURIE_COMMIT_SHA=$commit_sha"
 """
 
@@ -611,6 +373,47 @@ def _valid_publication_branch(payload: PublicationPayload) -> bool:
     return publication_branch_is_valid(payload.branch, payload.branch_prefix)
 
 
+def _check_transport(
+    payload: PublicationPayload, settings: PublicationJobSettings
+) -> tuple[str, str] | None:
+    """Refuse a transport the Job cannot honor; the CA mount directory and file, or None."""
+
+    transport = payload.transport
+    if not clean_origin(transport.origin):
+        raise PublicationResourceError("publication code host origin is not clean HTTPS")
+    if transport.header_form not in HEADER_FORMS:
+        raise PublicationResourceError("publication credential header form is unknown")
+    if not valid_repository_path(payload.repo_full_name):
+        raise PublicationResourceError("publication repository path is invalid")
+    parsed_clone = urlsplit(payload.clean_clone_url)
+    if (
+        parsed_clone.username is not None
+        or parsed_clone.password is not None
+        or payload.clean_clone_url != f"{transport.origin}/{payload.repo_full_name}.git"
+    ):
+        raise PublicationResourceError(
+            "publication clone URL does not match the requested repository"
+        )
+    ref = transport.ca_bundle_ref
+    if ref is None:
+        return None
+    directory, filename = posixpath.split(posixpath.normpath(ref))
+    if (
+        not ref.startswith("/")
+        or posixpath.normpath(ref) != ref
+        or not filename
+        or directory in {"", "/"}
+        or directory.startswith(("/publication", "/credentials", "/work", "/tmp"))
+    ):
+        raise PublicationResourceError("publication CA bundle reference is not a mountable path")
+    if not settings.ca_bundle_config_map:
+        raise PublicationResourceError(
+            "the credential names a code host CA bundle but no codeHostTrust "
+            "ConfigMap is configured for the publication Job"
+        )
+    return directory, filename
+
+
 def build_publication_resources(
     payload: PublicationPayload,
     *,
@@ -621,22 +424,9 @@ def build_publication_resources(
         raise PublicationResourceError(
             f"publication patch exceeds the {MAX_PATCH_BYTES} raw-byte limit"
         )
-    if not payload.patch and (payload.pr_number is None or payload.pr_url is None):
-        raise PublicationResourceError(
-            "metadata-only publication requires a stored pull request"
-        )
-    if not payload.patch and (
-        payload.observed_title_sha256 is None or payload.observed_body_sha256 is None
-    ):
-        raise PublicationResourceError("metadata-only publication requires observed metadata")
-    if not payload.patch and (
-        isinstance(payload.github_repository_id, bool)
-        or not isinstance(payload.github_repository_id, int)
-        or payload.github_repository_id <= 0
-        or not isinstance(payload.github_pr_node_id, str)
-        or not payload.github_pr_node_id.strip()
-    ):
-        raise PublicationResourceError("metadata-only publication requires stored GitHub identity")
+    if not payload.patch:
+        # A metadata-only revision has nothing to push; the API applies it.
+        raise PublicationResourceError("the publication Job only pushes a non-empty patch")
     if not _valid_publication_branch(payload):
         raise PublicationResourceError("publication branch is not a valid stored lineage branch")
     if re.fullmatch(r"[0-9a-f]{40,64}", payload.base_sha) is None:
@@ -658,31 +448,11 @@ def build_publication_resources(
         raise PublicationResourceError("publication expected remote head is invalid")
     if payload.revision_number <= 0:
         raise PublicationResourceError("publication revision number must be positive")
-    if (payload.pr_number is None) != (payload.pr_url is None):
-        raise PublicationResourceError("publication pull request identity is incomplete")
-    if payload.pr_number is not None and payload.pr_number <= 0:
-        raise PublicationResourceError("publication pull request number must be positive")
-    parsed_clone = urlsplit(payload.clean_clone_url)
-    if (
-        parsed_clone.scheme != "https"
-        or parsed_clone.username is not None
-        or parsed_clone.password is not None
-        or payload.clean_clone_url.casefold()
-        != f"{settings.github_html_base}/{payload.repo_full_name}.git".casefold()
-    ):
-        raise PublicationResourceError(
-            "publication clone URL does not match the requested repository"
-        )
+    ca_mount = _check_transport(payload, settings)
     if not credential.strip():
         raise PublicationResourceError("publication credential is empty")
-    if min(
-        settings.active_deadline_seconds,
-        settings.git_timeout_seconds,
-        settings.github_timeout_seconds,
-    ) <= 0:
+    if min(settings.active_deadline_seconds, settings.git_timeout_seconds) <= 0:
         raise PublicationResourceError("publication timeouts must be positive")
-    if not settings.github_api_url.startswith("https://"):
-        raise PublicationResourceError("publication GitHub API URL must use HTTPS")
     names = publication_resource_names(payload.publication_id)
     owner_uid = settings.owner_uid or str(
         uuid.uuid5(uuid.NAMESPACE_URL, f"curie:{settings.namespace}:{settings.owner_name}")
@@ -698,27 +468,22 @@ def build_publication_resources(
         "revision_number": payload.revision_number,
         "repo_full_name": payload.repo_full_name,
         "clean_clone_url": payload.clean_clone_url,
+        "origin": payload.transport.origin,
+        "header_form": payload.transport.header_form,
+        "ca_bundle_ref": payload.transport.ca_bundle_ref,
+        "ca_bundle_config_map": settings.ca_bundle_config_map if ca_mount else None,
+        "ca_bundle_key": settings.ca_bundle_key if ca_mount else None,
         "base_sha": payload.base_sha,
         "expected_prior_head": payload.expected_prior_head,
         "expected_remote_head": payload.expected_remote_head,
         "patch_sha256": hashlib.sha256(payload.patch).hexdigest(),
         "branch": payload.branch,
-        "pr_number": payload.pr_number,
-        "pr_url": payload.pr_url,
         "title": payload.title,
-        "body": payload.body,
-        "observed_title_sha256": payload.observed_title_sha256,
-        "observed_body_sha256": payload.observed_body_sha256,
-        "github_repository_id": payload.github_repository_id,
-        "github_pr_node_id": payload.github_pr_node_id,
-        "open_as_draft": payload.open_as_draft,
         "branch_prefix": payload.branch_prefix,
         "runner_image": settings.runner_image,
         "service_account_name": settings.service_account_name,
         "active_deadline_seconds": settings.active_deadline_seconds,
         "git_timeout_seconds": settings.git_timeout_seconds,
-        "github_timeout_seconds": settings.github_timeout_seconds,
-        "github_api_url": settings.github_api_url,
     }
     annotations = {
         "curietech.ai/publication-contract-sha256": hashlib.sha256(
@@ -752,36 +517,51 @@ def build_publication_resources(
     env = [
         {"name": "REPO_FULL_NAME", "value": payload.repo_full_name},
         {"name": "CLEAN_CLONE_URL", "value": payload.clean_clone_url},
+        {"name": _ORIGIN_ENV, "value": payload.transport.origin},
+        {"name": _HEADER_FORM_ENV, "value": payload.transport.header_form},
         {"name": "BASE_SHA", "value": payload.base_sha},
-        {"name": "BASE_REF", "value": payload.base_ref or ""},
         {"name": "BRANCH", "value": payload.branch},
         {"name": "REVISION_ID", "value": str(payload.revision_id)},
         {"name": "REVISION_NUMBER", "value": str(payload.revision_number)},
         {"name": "EXPECTED_PRIOR_HEAD", "value": payload.expected_prior_head},
         {"name": "EXPECTED_REMOTE_HEAD", "value": payload.expected_remote_head or ""},
-        {"name": "PR_NUMBER", "value": str(payload.pr_number or "")},
-        {"name": "PR_URL", "value": payload.pr_url or ""},
-        {"name": "PR_TITLE", "value": payload.title},
-        {"name": "PR_BODY", "value": payload.body},
-        {"name": "OBSERVED_TITLE_SHA256", "value": payload.observed_title_sha256 or ""},
-        {"name": "OBSERVED_BODY_SHA256", "value": payload.observed_body_sha256 or ""},
-        {
-            "name": "EXPECTED_GITHUB_REPOSITORY_ID",
-            "value": str(payload.github_repository_id or ""),
-        },
-        {"name": "EXPECTED_GITHUB_PR_NODE_ID", "value": payload.github_pr_node_id or ""},
-        {
-            "name": "PUBLICATION_OPEN_AS_DRAFT",
-            "value": "true" if payload.open_as_draft else "false",
-        },
+        {"name": "COMMIT_TITLE", "value": payload.title},
         {"name": "PUBLICATION_BRANCH_PREFIX", "value": payload.branch_prefix or ""},
         {"name": "GIT_USER_NAME", "value": settings.git_user_name},
         {"name": "GIT_USER_EMAIL", "value": settings.git_user_email},
         {"name": "GIT_TIMEOUT_SECONDS", "value": str(settings.git_timeout_seconds)},
-        {"name": "GITHUB_TIMEOUT_SECONDS", "value": str(settings.github_timeout_seconds)},
-        {"name": "GITHUB_API_URL", "value": settings.github_api_url},
-        {"name": "GITHUB_HTML_BASE", "value": settings.github_html_base},
     ]
+    volume_mounts: list[dict[str, Any]] = [
+        {"name": "publication", "mountPath": "/publication", "readOnly": True},
+        {"name": "credentials", "mountPath": "/credentials", "readOnly": True},
+        {"name": "work", "mountPath": "/work"},
+        {"name": "tmp", "mountPath": "/tmp"},
+    ]
+    volumes: list[dict[str, Any]] = [
+        {"name": "publication", "configMap": {"name": names.config_map}},
+        {"name": "credentials", "secret": {"secretName": names.secret}},
+        {"name": "work", "emptyDir": {"sizeLimit": "2Gi"}},
+        {"name": "tmp", "emptyDir": {"sizeLimit": "16Mi"}},
+    ]
+    if ca_mount is not None:
+        # One trust bundle for git and any HTTP client, at the path the
+        # credential named (ADR 0197). Unset, nothing here changes.
+        ca_directory, ca_file = ca_mount
+        ca_path = posixpath.join(ca_directory, ca_file)
+        env.extend(
+            {"name": name, "value": ca_path}
+            for name in (_CA_BUNDLE_ENV, "GIT_SSL_CAINFO", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
+        )
+        volume_mounts.append({"name": _CA_VOLUME, "mountPath": ca_directory, "readOnly": True})
+        volumes.append(
+            {
+                "name": _CA_VOLUME,
+                "configMap": {
+                    "name": settings.ca_bundle_config_map,
+                    "items": [{"key": settings.ca_bundle_key, "path": ca_file}],
+                },
+            }
+        )
     pod_spec: dict[str, Any] = {
         "serviceAccountName": settings.service_account_name,
         "automountServiceAccountToken": False,
@@ -820,20 +600,10 @@ def build_publication_resources(
                         "ephemeral-storage": settings.ephemeral_limit,
                     },
                 },
-                "volumeMounts": [
-                    {"name": "publication", "mountPath": "/publication", "readOnly": True},
-                    {"name": "credentials", "mountPath": "/credentials", "readOnly": True},
-                    {"name": "work", "mountPath": "/work"},
-                    {"name": "tmp", "mountPath": "/tmp"},
-                ],
+                "volumeMounts": volume_mounts,
             }
         ],
-        "volumes": [
-            {"name": "publication", "configMap": {"name": names.config_map}},
-            {"name": "credentials", "secret": {"secretName": names.secret}},
-            {"name": "work", "emptyDir": {"sizeLimit": "2Gi"}},
-            {"name": "tmp", "emptyDir": {"sizeLimit": "16Mi"}},
-        ],
+        "volumes": volumes,
     }
     job = {
         "apiVersion": "batch/v1",
@@ -1004,6 +774,35 @@ def validate_adopted_resource(
         )
 
 
+def job_transport(job: Any) -> PublicationTransport | None:
+    """The transport facts an existing Job was built with, from its env.
+
+    Adoption rebuilds the expected resources from these and validates the
+    whole Job against them, so a Job whose facts were altered fails the same
+    contract check as any other mismatch. None when the Job names none.
+    """
+
+    serialized = _as_serialized_mapping(job)
+    pod_spec = (((serialized.get("spec") or {}).get("template") or {}).get("spec")) or {}
+    containers = pod_spec.get("containers") or []
+    if len(containers) != 1:
+        return None
+    env = {
+        item.get("name"): item.get("value")
+        for item in containers[0].get("env") or []
+        if isinstance(item, dict)
+    }
+    origin, header_form = env.get(_ORIGIN_ENV), env.get(_HEADER_FORM_ENV)
+    ca_bundle_ref = env.get(_CA_BUNDLE_ENV)
+    if not isinstance(origin, str) or header_form not in HEADER_FORMS:
+        return None
+    return PublicationTransport(
+        origin=origin,
+        header_form=cast(HeaderForm, header_form),
+        ca_bundle_ref=ca_bundle_ref if isinstance(ca_bundle_ref, str) else None,
+    )
+
+
 class KubernetesPublicationCluster:
     """Create-or-adopt the deterministic resource set on a real apiserver."""
 
@@ -1146,8 +945,6 @@ class KubernetesPublicationCluster:
             if self._is_not_found(exc):
                 return PublicationJobObservation(
                     phase="pending",
-                    pr_url=None,
-                    pr_number=None,
                     commit_sha=None,
                     logs="",
                     error=None,
@@ -1305,30 +1102,15 @@ class KubernetesPublicationCluster:
                 head = _MAX_JOB_ERROR // 3
                 tail = _MAX_JOB_ERROR - head - len(" ... ")
                 error = error[:head] + " ... " + error[-tail:]
-        match = re.search(
-            r"^CURIE_PR_URL=(https://[^\s]+/pull/[1-9][0-9]*)$",
-            logs,
-            re.MULTILINE,
-        )
-        number_match = re.search(r"^CURIE_PR_NUMBER=([1-9][0-9]*)$", logs, re.MULTILINE)
         commit_match = re.search(
             r"^CURIE_COMMIT_SHA=([0-9a-f]{40,64})$", logs, re.MULTILINE
         )
-        state_match = re.search(
-            r"^CURIE_PR_STATE=(closed|merged)$", logs, re.MULTILINE
-        )
         return PublicationJobObservation(
             phase=phase,
-            pr_url=match.group(1) if match else None,
-            pr_number=int(number_match.group(1)) if number_match else None,
             commit_sha=commit_match.group(1) if commit_match else None,
-            pr_state=(
-                cast(Literal["closed", "merged"], state_match.group(1))
-                if state_match
-                else None
-            ),
             logs=logs,
             error=error,
+            transport=job_transport(job),
         )
 
     def cleanup_credentials(self, names: PublicationResourceNames) -> None:

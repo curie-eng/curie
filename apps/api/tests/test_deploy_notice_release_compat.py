@@ -31,6 +31,8 @@ def test_notice_migration_appends_to_released_head() -> None:
     assert revisions["0080"][0] == "0079"
     assert revisions["0081"][0] == "0080"
     assert revisions["0082"] == ("0081", "0082_agent_deploy_notifications.py")
+    assert revisions["0102"] == ("0101", "0102_execution_request_reply_targets.py")
+    assert revisions["0103"] == ("0102", "0103_tracker_issue_identity.py")
 
 
 def test_candidate_does_not_rewrite_released_windows() -> None:
@@ -40,8 +42,8 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     stable = {"schema_min": "0076", "schema_head": "0076"}
     # Feature migrations append after the published v0.12.2 head; published
     # application windows remain fixed while the candidate advances. The
-    # minimum is #2911's tenant scope, which the Agent ORM and resolver read.
-    candidate = {"schema_min": "0101", "schema_head": "0101"}
+    # minimum is #3831's tracker identity contract, which every WorkItem read needs.
+    candidate = {"schema_min": "0103", "schema_head": "0103"}
     assert catalog["windows"]["0.12.0"] == released
     assert catalog["windows"]["0.12.0-rc.1"] == released
     assert catalog["windows"]["0.12.1"] == stable
@@ -49,8 +51,8 @@ def test_candidate_does_not_rewrite_released_windows() -> None:
     assert catalog["windows"]["0.12.3"] == {"schema_min": "0076", "schema_head": "0093"}
     assert catalog["candidate"] == candidate
     assert catalog["windows"]["0.13.0"] == candidate
-    assert catalog["revisions"][-9:] == [
-        "0093a", "0094", "0095", "0096", "0097", "0098", "0099", "0100", "0101"
+    assert catalog["revisions"][-11:] == [
+        "0093a", "0094", "0095", "0096", "0097", "0098", "0099", "0100", "0101", "0102", "0103"
     ]
     assert "0074" not in catalog["revisions"]
     prior_windows = json.loads(

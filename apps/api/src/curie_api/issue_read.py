@@ -2,19 +2,18 @@
 
 The bundle holds no GitHub credential. It presents the execution scoped
 ``wir`` capability, and the API reads the WorkItem's issue and its comments
-with the App installation token, minted fresh on every read so a run longer
-than the token's one hour lifetime keeps reading. Nothing is parsed, modelled
-or stored: the title, body and comments are returned verbatim.
+through the GitHub tracker adapter with the App installation token, minted
+fresh on every read so a run longer than the token's one hour lifetime keeps
+reading. Nothing is parsed, modelled or stored: the title, body and comments
+are returned verbatim.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
 
 import httpx
 from sqlalchemy import func, select
@@ -22,17 +21,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
+from .forges.errors import ForgeError
+from .forges.github.comments import static_token
+from .forges.github.tracker import GitHubTracker, IssueContent
+from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubCredentials
-from .github_review_truth import github_headers
 from .models import MAX_EXECUTION_DEADLINE_SECONDS, ExecutionRequest, WorkItem
 
 ISSUE_READ_TIMEOUT_SECONDS = 20.0
 _PROVIDER_TIMEOUT_SECONDS = 5.0
-_MAX_RESPONSE_BYTES = 2_097_152
-_COMMENTS_PER_PAGE = 100
-# Ten pages is a thousand comments. A longer thread is truncated and says so,
-# rather than turning one tool call into an unbounded walk of the API.
-_MAX_COMMENT_PAGES = 10
 # The capability lives as long as the longest execution deadline
 # plus room for the boot and wait that precede the start grant. The read route
 # still refuses once the durable execution has ended or passed its deadline.
@@ -60,23 +57,6 @@ class IssueReadAuthority:
     execution_deadline: datetime | None
 
 
-@dataclass(frozen=True)
-class IssueComment:
-    author: str | None
-    created_at: str | None
-    body: str
-
-
-@dataclass(frozen=True)
-class IssueContent:
-    title: str
-    body: str
-    state: str | None
-    author: str | None
-    comments: list[IssueComment]
-    comments_truncated: bool
-
-
 async def read_issue_authority(
     session: AsyncSession, *, execution_request_id: uuid.UUID, running: bool
 ) -> IssueReadAuthority:
@@ -99,7 +79,13 @@ async def read_issue_authority(
     if row is None:
         raise IssueReadRefused
     item, execution, now = row
-    if item.cancelled_at is not None:
+    # The sandbox read goes through the GitHub tracker; another tracker has no
+    # read path yet, so its execution cannot mint one.
+    if (
+        item.cancelled_at is not None
+        or item.tracker_kind != GITHUB
+        or item.code_host_installation_id is None
+    ):
         raise IssueReadRefused
     if running:
         if (
@@ -118,46 +104,12 @@ async def read_issue_authority(
     return IssueReadAuthority(
         work_item_id=item.id,
         execution_request_id=execution.id,
-        repo_full_name=item.repo_full_name,
-        github_repository_id=item.github_repository_id,
-        github_installation_id=item.github_installation_id,
-        issue_number=item.github_issue_number,
+        repo_full_name=item.repository_path,
+        github_repository_id=int(item.tracker_scope_id),
+        github_installation_id=item.code_host_installation_id,
+        issue_number=int(item.tracker_issue_id),
         execution_deadline=execution.execution_deadline,
     )
-
-
-def _login(user: object) -> str | None:
-    login = user.get("login") if isinstance(user, dict) else None
-    return login if isinstance(login, str) else None
-
-
-def _text(value: object) -> str:
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        raise IssueReadUnavailable
-    return value
-
-
-async def _get_json(
-    client: httpx.AsyncClient, url: str, *, token: str, params: dict[str, Any] | None = None
-) -> tuple[Any, httpx.Headers]:
-    async with client.stream(
-        "GET",
-        url,
-        params=params,
-        headers=github_headers(token),
-        timeout=_PROVIDER_TIMEOUT_SECONDS,
-        follow_redirects=False,
-    ) as response:
-        if response.status_code != 200:
-            raise IssueReadUnavailable
-        body = bytearray()
-        async for chunk in response.aiter_bytes():
-            body.extend(chunk)
-            if len(body) > _MAX_RESPONSE_BYTES:
-                raise IssueReadUnavailable
-        return json.loads(body), response.headers
 
 
 async def read_issue(
@@ -178,10 +130,6 @@ async def read_issue(
             }
         )
     )
-    base = (
-        f"{settings.github_api_url.rstrip('/')}/repositories/"
-        f"{authority.github_repository_id}/issues/{authority.issue_number}"
-    )
     try:
         async with asyncio.timeout(ISSUE_READ_TIMEOUT_SECONDS):
             token = await run_in_threadpool(
@@ -189,49 +137,13 @@ async def read_issue(
                 authority.repo_full_name,
                 authority.github_installation_id,
             )
-            issue, _ = await _get_json(client, base, token=token)
-            comments: list[IssueComment] = []
-            truncated = False
-            for page in range(1, _MAX_COMMENT_PAGES + 1):
-                batch, headers = await _get_json(
-                    client,
-                    f"{base}/comments",
-                    token=token,
-                    params={"per_page": _COMMENTS_PER_PAGE, "page": page},
-                )
-                if not isinstance(batch, list):
-                    raise IssueReadUnavailable
-                for comment in batch:
-                    if not isinstance(comment, dict):
-                        raise IssueReadUnavailable
-                    created = comment.get("created_at")
-                    comments.append(
-                        IssueComment(
-                            author=_login(comment.get("user")),
-                            created_at=created if isinstance(created, str) else None,
-                            body=_text(comment.get("body")),
-                        )
-                    )
-                if 'rel="next"' not in headers.get("link", ""):
-                    break
-            else:
-                truncated = True
-    except (GitHubAppError, httpx.HTTPError, ValueError, TimeoutError):
+            tracker = GitHubTracker.from_settings(
+                settings,
+                client,
+                repo_full_name=authority.repo_full_name,
+                repository_id=authority.github_repository_id,
+                token=static_token(token),
+            )
+            return await tracker.read_issue_content(authority.issue_number)
+    except (GitHubAppError, ForgeError, ValueError, TimeoutError):
         raise IssueReadUnavailable from None
-    if (
-        not isinstance(issue, dict)
-        or type(issue.get("number")) is not int
-        or issue["number"] != authority.issue_number
-        or "pull_request" in issue
-        or not isinstance(issue.get("title"), str)
-    ):
-        raise IssueReadUnavailable
-    state = issue.get("state")
-    return IssueContent(
-        title=issue["title"],
-        body=_text(issue.get("body")),
-        state=state if isinstance(state, str) else None,
-        author=_login(issue.get("user")),
-        comments=comments,
-        comments_truncated=truncated,
-    )

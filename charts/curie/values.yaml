@@ -1260,6 +1260,15 @@ grafanaConnector:
 # dev/e2e use values-dev.yaml, which repoints each image at a locally-built,
 # cluster-imported image with imagePullPolicy Never (mirroring the runner pattern).
 # ---------------------------------------------------------------------------
+# Code host trust (ADR 0197): one PEM CA bundle from a ConfigMap you create,
+# for a code host no public root covers. See the README's "Code host CA
+# bundle". An empty name mounts nothing.
+codeHostTrust:
+  caBundle:
+    configMapRef:
+      name: ""
+      key: ca.crt
+# ---------------------------------------------------------------------------
 api:
   deploy: true
   # Runner sandbox egress to an external API endpoint (#2317, #2367). Rail 1
@@ -1476,7 +1485,7 @@ api:
   # is rejected with git.origin_mismatch. Set it to a GitHub Enterprise Server
   # base to deploy from GHE.
   githubCloneBase: "https://github.com"
-  # REST base used by credential minting, polling, and managed publication.
+  # REST base for credential minting, polling and the API's pull request calls.
   githubApiUrl: "https://api.github.com"
   # Optional ConfigMap name whose key ca.pem is a private CA for a GitHub
   # stub. Empty leaves TLS trust on the image bundle. When set, the api,

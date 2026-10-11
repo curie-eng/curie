@@ -1,42 +1,27 @@
-"""The worker branches from, and publishes against, a factory ticket's base (#3095, ADR 0186).
+"""The worker branches from a factory ticket's base (#3095, ADR 0186).
 
 Clone: the credential response carries the WorkItem's recorded base branch and
 commit; a fresh workspace clones that branch and pins that commit.
 
-Publication: the job receives BASE_REF and opens its pull request against it;
-deterministic-head recovery uses the same base and never asks GitHub for the
-repository default branch.
+Publication against that base is the API's: the publication Job only pushes,
+and the API opens or finds the pull request against the WorkItem's recorded
+base (ADR 0197; apps/api/tests/test_publication_code_host_routes.py).
 """
 
 from __future__ import annotations
 
 import importlib
 import json
-import os
 import subprocess
 import sys
-import threading
 import uuid
-from dataclasses import replace
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-import httpx
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from test_publication_k8s import (
-    LINEAGE_BRANCH,
-    REVISION_HEAD,
-    WRITE_CREDENTIAL,
-    _embedded_github_script,
-    _job_env,
-    _payload,
-    _settings,
-)
+from test_publication_k8s import LINEAGE_BRANCH
 from test_workspace import (
     CLEAN_URL,
     DEPLOYMENT_ID,
@@ -66,7 +51,8 @@ class _BaseCredentialClient:
             repo_full_name=REPO,
             clone_url=CLEAN_URL,
             authorization_header=GIT_CREDENTIAL,
-            github_html_base="https://github.com",
+            origin="https://github.com",
+            header_form="authorization_basic",
             **self._fields,
         )
 
@@ -100,6 +86,8 @@ def test_credential_redemption_parses_the_recorded_base() -> None:
                     "repo_full_name": REPO,
                     "clone_url": CLEAN_URL,
                     "authorization_header": GIT_CREDENTIAL,
+                    "origin": "https://github.com",
+                    "header_form": "authorization_basic",
                     "revision": None,
                     "base_branch": "next",
                     "base_commit": BASE_COMMIT,
@@ -109,7 +97,6 @@ def test_credential_redemption_parses_the_recorded_base() -> None:
 
     client = workspace.WorkspaceCredentialClient(
         api_url="https://api.example.com",
-        github_api_url="https://api.github.com",
         worker_token=WORKER_AUTH,
         transport=transport,
     )
@@ -125,7 +112,8 @@ def test_credential_without_a_base_defaults_to_none() -> None:
         repo_full_name=REPO,
         clone_url=CLEAN_URL,
         authorization_header=GIT_CREDENTIAL,
-        github_html_base="https://github.com",
+        origin="https://github.com",
+        header_form="authorization_basic",
     )
 
     assert credential.base_branch is None
@@ -194,210 +182,6 @@ def test_no_recorded_base_keeps_the_default_branch_clone(tmp_path: Path) -> None
     preparer.prepare(deployment_id=DEPLOYMENT_ID, thread_key=THREAD, generation="g5")
 
     assert "--branch" not in _call(commands, "clone")
-
-
-# --- Publication job ---------------------------------------------------------------------
-
-
-def _publication_k8s() -> Any:
-    return importlib.import_module("curie_worker.publication_k8s")
-
-
-def _resources(base_ref: str | None, **overrides: Any) -> Any:
-    module = _publication_k8s()
-    payload = replace(_payload(module), base_ref=base_ref, **overrides)
-    return module.build_publication_resources(
-        payload, credential=WRITE_CREDENTIAL, settings=_settings(module)
-    )
-
-
-def test_the_job_env_carries_the_recorded_base() -> None:
-    assert _job_env(_resources("next"))["BASE_REF"] == "next"
-    assert _job_env(_resources(None)).get("BASE_REF", "") == ""
-
-
-def test_the_loop_payload_carries_the_work_base_ref() -> None:
-    loop = importlib.import_module("curie_worker.publication_loop")
-    from test_publication_loop import _work
-
-    work = replace(_work(loop), base_ref="next")
-
-    payload = loop.PublicationReconciler._payload(work, clean_clone_url=CLEAN_URL)
-
-    assert payload.base_ref == "next"
-    assert loop.PublicationWork.__dataclass_fields__["base_ref"].default is None
-
-
-class _RoutedGitHub(BaseHTTPRequestHandler):
-    default_branch = "main"
-    pull_base = "next"
-    posts: list[dict[str, Any]] = []
-    gets: list[str] = []
-
-    def _send(self, status: int, payload: Any) -> None:
-        body = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _pull(self, base: str) -> dict[str, Any]:
-        return {
-            "number": 123,
-            "node_id": "PR_example_123",
-            "html_url": f"https://github.com/{REPO}/pull/123",
-            "state": "open",
-            "merged": False,
-            "title": "Update repository",
-            "body": "Approved platform publication.",
-            "updated_at": "2026-10-01T00:00:00Z",
-            "head": {"ref": LINEAGE_BRANCH, "sha": REVISION_HEAD, "repo": {"full_name": REPO}},
-            "base": {"ref": base, "repo": {"full_name": REPO}},
-        }
-
-    def do_GET(self) -> None:
-        type(self).gets.append(self.path)
-        path = self.path.split("?", 1)[0]
-        if path == f"/repos/{REPO}":
-            self._send(200, {"id": 9001, "full_name": REPO, "default_branch": self.default_branch})
-        elif path == f"/repos/{REPO}/pulls":
-            self._send(200, [])
-        elif path == f"/repos/{REPO}/pulls/123":
-            self._send(200, self._pull(type(self).pull_base))
-        else:
-            self._send(404, {"message": "missing fixture"})
-
-    def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(length))
-        type(self).posts.append(body)
-        self._send(201, self._pull(body["base"]))
-
-    def log_message(self, _format: str, *args: object) -> None:
-        return
-
-
-def _run_script(
-    tmp_path: Path, resources: Any, *, phase: str, expected_head: str
-) -> subprocess.CompletedProcess[str]:
-    credential = tmp_path / "credential"
-    credential.write_text(WRITE_CREDENTIAL)
-    _RoutedGitHub.posts = []
-    _RoutedGitHub.gets = []
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _RoutedGitHub)
-    thread = threading.Thread(target=server.serve_forever)
-    thread.start()
-    try:
-        return subprocess.run(
-            ["python3", "-c", _embedded_github_script(resources)],
-            env={
-                **os.environ,
-                **_job_env(resources),
-                "GITHUB_API_URL": f"http://127.0.0.1:{server.server_port}",
-                "CURIE_GITHUB_PHASE": phase,
-                "CURIE_EXPECTED_HEAD": expected_head,
-                "CURIE_CREDENTIAL_PATH": str(credential),
-                "CURIE_PR_FACTS_PATH": str(tmp_path / "pr-facts.json"),
-            },
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-    finally:
-        server.shutdown()
-        thread.join()
-        server.server_close()
-
-
-def test_the_job_opens_its_pull_request_against_the_recorded_base(tmp_path: Path) -> None:
-    completed = _run_script(
-        tmp_path, _resources("next"), phase="post-push", expected_head=REVISION_HEAD
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert [post["base"] for post in _RoutedGitHub.posts] == ["next"]
-    assert "CURIE_PR_NUMBER=123" in completed.stdout
-
-
-def test_the_job_without_a_base_still_targets_the_default_branch(tmp_path: Path) -> None:
-    completed = _run_script(
-        tmp_path, _resources(None), phase="post-push", expected_head=REVISION_HEAD
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert [post["base"] for post in _RoutedGitHub.posts] == ["main"]
-
-
-def test_a_stored_pull_on_the_recorded_base_validates_before_push(tmp_path: Path) -> None:
-    resources = _resources(
-        "next", pr_number=123, pr_url=f"https://github.com/{REPO}/pull/123"
-    )
-    _RoutedGitHub.pull_base = "next"
-
-    completed = _run_script(tmp_path, resources, phase="pre-push", expected_head=REVISION_HEAD)
-
-    assert completed.returncode == 0, completed.stderr
-    facts = json.loads((tmp_path / "pr-facts.json").read_text())
-    assert facts["base"] == "next"
-
-
-# --- Deterministic-head recovery ------------------------------------------------------------
-
-
-@pytest.mark.anyio
-@pytest.mark.parametrize("anyio_backend", ["asyncio"])
-async def test_recovery_posts_with_the_given_base_and_never_reads_the_repository(
-    anyio_backend: str,
-) -> None:
-    from curie_worker.publication_clients import GitHubPublicationLookup
-
-    requests: list[httpx.Request] = []
-    posted: list[dict[str, Any]] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        assert request.url.path != f"/repos/{REPO}", "repository default branch was read"
-        if request.url.raw_path.decode().endswith("/git/ref/heads/curie%2Fthread-lineage-example"):
-            return httpx.Response(200, json={"object": {"sha": REVISION_HEAD}})
-        assert request.url.path == f"/repos/{REPO}/pulls"
-        if request.method == "POST":
-            body = json.loads(request.content)
-            posted.append(body)
-            return httpx.Response(
-                201,
-                json={
-                    "number": 123,
-                    "html_url": f"https://github.com/{REPO}/pull/123",
-                    "state": "open",
-                    "merged_at": None,
-                    "title": body["title"],
-                    "body": body["body"],
-                    "head": {
-                        "ref": LINEAGE_BRANCH,
-                        "sha": REVISION_HEAD,
-                        "repo": {"full_name": REPO},
-                    },
-                    "base": {"ref": body["base"], "repo": {"full_name": REPO}},
-                },
-            )
-        return httpx.Response(200, json=[])
-
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        recovered = await GitHubPublicationLookup(client).recover_pr_by_head(
-            REPO,
-            LINEAGE_BRANCH,
-            "Update repository",
-            "Approved platform publication.",
-            expected_head_sha=REVISION_HEAD,
-            authorization_header="Bearer rotated-installation-token",
-            base="next",
-        )
-
-    assert recovered is not None
-    assert recovered.number == 123
-    assert [body["base"] for body in posted] == ["next"]
-    assert all(request.url.path != f"/repos/{REPO}" for request in requests)
 
 
 # --- Real git: the recorded commit, not the advanced branch tip -------------------------------

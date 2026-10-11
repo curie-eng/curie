@@ -153,6 +153,11 @@ class RunnerConfig:
     memory_max_facts: int = MAX_FACTS_PER_MEMORY
     # Channel kind of this boot (#3818). None is an unbound boot.
     channel_kind: str | None = None
+    # The managed workspace's code host origin and repository path (ADR 0197),
+    # which the publication snapshot trusts instead of the configured GitHub
+    # host and an owner/name path. None for both is a GitHub boot.
+    repo_origin: str | None = None
+    repo_path: str | None = None
     # The runner-local CURIE_RUNNER_ALLOW_TOKENLESS dev flag as parsed (#3821).
     # Only require_serving_token consumes it; a set token always wins.
     allow_tokenless: bool = False
@@ -271,4 +276,6 @@ class RunnerConfig:
                 else MAX_FACTS_PER_MEMORY
             ),
             channel_kind=boot.channel_kind,
+            repo_origin=boot.repo_origin,
+            repo_path=boot.repo_path,
         )
