@@ -1,8 +1,7 @@
 //! Binary and public surface regressions for cluster secret lifecycle and
 //! rendered Helm passthrough values.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::os::unix::process::ExitStatusExt;

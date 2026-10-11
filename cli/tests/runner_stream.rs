@@ -1,6 +1,6 @@
 //! Integration: the runner client against a wire-faithful NDJSON stream.
 
-mod support;
+use crate::support;
 
 use std::process::Command;
 

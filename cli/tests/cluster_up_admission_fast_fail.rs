@@ -1,8 +1,7 @@
 //! Binary regression contract for fast, ownership-checked admission failures
 //! during `curie cluster up` (#3354).
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::{Path, PathBuf};

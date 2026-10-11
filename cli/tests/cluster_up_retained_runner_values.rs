@@ -8,8 +8,7 @@
 //! and after (exactly what `cluster up` handed `helm upgrade`) and compares the
 //! workloads the recorded values feed.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::collections::BTreeMap;
 use std::fs;

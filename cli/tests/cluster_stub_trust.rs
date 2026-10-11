@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-mod support;
+use crate::support;
 use support::{serve, Response};
 
 const CHANNEL: &str = "C0EXAMPLE1";

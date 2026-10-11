@@ -24,7 +24,7 @@
 //! every one of these with "unrecognized subcommand". The usage test below is
 //! written to distinguish THAT exit 2 from the exit 2 it actually asserts.
 
-mod support;
+use crate::support;
 
 use std::process::Command;
 use support::{serve, MockServer, Response};

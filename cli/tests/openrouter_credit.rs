@@ -16,7 +16,7 @@
 //!
 //! An unknown key -> 401 {"error":{"message":"User not found.","code":401}}
 
-mod support;
+use crate::support;
 
 use curie::factory_quickstart::{credit_check_key, REVIEWER_MODEL, RUN_CREDIT_USD};
 use curie::openrouter_credit::{remaining_credit_usd, remaining_from};
@@ -25,10 +25,6 @@ use support::{serve, MockServer, Response};
 
 const KEY: &str = "sk-or-v1-PLACEHOLDER-test-key";
 const BASE_URL_ENV: &str = "CURIE_OPENROUTER_API_URL";
-
-// The base URL is read from the process environment, which every test in this
-// binary shares, so the tests that set it run one at a time.
-static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn key_body(limit: Value, limit_remaining: Value) -> Value {
     json!({"data":{
@@ -111,7 +107,7 @@ fn openrouter(credits_status: u16, credits: Value) -> MockServer {
 
 #[tokio::test]
 async fn the_live_check_sends_the_key_as_bearer_to_both_endpoints() {
-    let _env = ENV_LOCK.lock().await;
+    let _env = support::ENV_LOCK.lock().await;
     let server = openrouter(200, credits_body(800.0, 799.0));
     std::env::set_var(BASE_URL_ENV, &server.base_url);
     let remaining = remaining_credit_usd(KEY).await;
@@ -134,7 +130,7 @@ async fn the_live_check_sends_the_key_as_bearer_to_both_endpoints() {
 
 #[tokio::test]
 async fn an_unknown_key_is_an_error_that_does_not_echo_the_key() {
-    let _env = ENV_LOCK.lock().await;
+    let _env = support::ENV_LOCK.lock().await;
     let server =
         serve(|_| Response::json(401, r#"{"error":{"message":"User not found.","code":401}}"#));
     std::env::set_var(BASE_URL_ENV, &server.base_url);
@@ -147,7 +143,7 @@ async fn an_unknown_key_is_an_error_that_does_not_echo_the_key() {
 
 #[tokio::test]
 async fn a_refused_credits_endpoint_falls_back_to_the_key_limit() {
-    let _env = ENV_LOCK.lock().await;
+    let _env = support::ENV_LOCK.lock().await;
     let server = openrouter(403, json!({"error":{"message":"Forbidden","code":403}}));
     std::env::set_var(BASE_URL_ENV, &server.base_url);
     let remaining = remaining_credit_usd(KEY).await;

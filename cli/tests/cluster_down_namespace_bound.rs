@@ -4,11 +4,11 @@
 //!
 //! The PATH-mutating scenario lives in ONE async test. `down()` resolves
 //! `helm`/`kubectl` off the process PATH, so a second parallel test in this
-//! file would race on that shared state. The sync test below builds argv only
+//! file would race on that shared state, and it holds `support::ENV_LOCK`
+//! against every other test in the process. The sync test below builds argv only
 //! and never touches PATH. It is the fix pin.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::ffi::OsString;
 use std::fs;
@@ -77,6 +77,7 @@ fn sweep_command_carries_300s_timeout() {
 
 #[tokio::test]
 async fn cluster_down_names_a_remaining_configmap_and_exits_transient() {
+    let _env = crate::support::ENV_LOCK.lock().await;
     let original_path = std::env::var_os("PATH");
 
     // Scenario A: the sweep wait expires and a ConfigMap named hold is still

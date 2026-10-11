@@ -8,8 +8,7 @@
 //! implementation still compiles this file and makes the observable assertions
 //! red.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;

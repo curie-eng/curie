@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::io::Read;

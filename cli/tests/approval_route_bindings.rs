@@ -18,7 +18,7 @@
 //!   approval gate exists to prevent, so validation runs before the connection
 //!   is opened and the negative tests assert on `recorded()` being empty.
 
-mod support;
+use crate::support;
 
 use curie::commands::{approvals, AgentActionOpts, ApprovalCmd, ApprovalsOutput};
 use curie::credcheck::check_channel_id;

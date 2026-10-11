@@ -11,7 +11,7 @@
 
 #![cfg(unix)]
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

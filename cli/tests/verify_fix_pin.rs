@@ -1,5 +1,4 @@
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::{Path, PathBuf};

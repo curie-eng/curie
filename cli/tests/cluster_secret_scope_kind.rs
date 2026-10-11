@@ -37,6 +37,8 @@ async fn identity_for(kubeconfig: &str) -> String {
 #[tokio::test]
 #[ignore = "requires CURIE_E2E_TWO_CLUSTER=1 and disposable KUBECONFIG_A and KUBECONFIG_B"]
 async fn two_disposable_clusters_refuse_mismatch_and_warn_on_replace() {
+    // Held for the whole test: it repoints KUBECONFIG and CURIE_CONFIG_DIR.
+    let _env = crate::support::ENV_LOCK.lock().await;
     assert_eq!(
         std::env::var("CURIE_E2E_TWO_CLUSTER").expect("CURIE_E2E_TWO_CLUSTER"),
         "1"

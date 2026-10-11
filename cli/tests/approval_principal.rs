@@ -8,7 +8,7 @@
 //! flags, or an API client may quietly omit the principal header.  The API owns
 //! authorization; this suite owns the CLI's proof that it does not invent one.
 
-mod support;
+use crate::support;
 
 use std::process::{Command, Output};
 

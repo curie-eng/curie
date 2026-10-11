@@ -27,8 +27,7 @@
 //! existing `ci.yaml` and only breaks if someone arms `ci.yaml`'s fake seal
 //! off, proving the two workflows are pinned to opposite sides of the seam.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::io::{Read, Write};

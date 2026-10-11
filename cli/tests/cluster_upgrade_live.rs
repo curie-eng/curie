@@ -18,7 +18,7 @@
 //! sub-flags stay true: a binding that collapses every flag onto
 //! `issues.is_empty()` fails these tests just as loudly as a hardcoded `true`.
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
