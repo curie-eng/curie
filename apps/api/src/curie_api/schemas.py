@@ -2120,7 +2120,10 @@ class IssueReadComment(BaseModel):
 
 
 class IssueReadResult(BaseModel):
-    """The issue verbatim. The platform parses and stores none of it."""
+    """The issue verbatim with its execution deadline and total allowed seconds.
+
+    The platform parses and stores none of the issue content.
+    """
 
     repo_full_name: str
     issue_number: int
@@ -2130,6 +2133,8 @@ class IssueReadResult(BaseModel):
     author: str | None
     comments: list[IssueReadComment]
     comments_truncated: bool
+    execution_deadline: AwareDatetime
+    execution_seconds: int
 
 
 class PublicationLineageAdvance(BaseModel):

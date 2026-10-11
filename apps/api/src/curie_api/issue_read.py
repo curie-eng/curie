@@ -57,6 +57,7 @@ class IssueReadAuthority:
     github_repository_id: int
     github_installation_id: int
     issue_number: int
+    started_at: datetime | None
     execution_deadline: datetime | None
 
 
@@ -122,6 +123,7 @@ async def read_issue_authority(
         github_repository_id=item.github_repository_id,
         github_installation_id=item.github_installation_id,
         issue_number=item.github_issue_number,
+        started_at=execution.started_at,
         execution_deadline=execution.execution_deadline,
     )
 

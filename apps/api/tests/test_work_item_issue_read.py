@@ -327,9 +327,10 @@ def test_issue_read_reports_the_stored_execution_deadline_and_configured_duratio
     assert response.status_code == 200, response.text
     result = response.json()
     assert datetime.fromisoformat(result["execution_deadline"]) == execution["execution_deadline"]
-    assert datetime.fromisoformat(started.json()["execution_deadline"]) == execution[
-        "execution_deadline"
-    ]
+    assert (
+        datetime.fromisoformat(started.json()["execution_deadline"])
+        == execution["execution_deadline"]
+    )
     assert result["execution_seconds"] == execution_seconds
     assert (execution["execution_deadline"] - execution["started_at"]).total_seconds() == (
         execution_seconds
@@ -559,10 +560,13 @@ def test_a_budget_change_during_the_github_read_keeps_the_granted_timing(
     result = response.json()
     assert datetime.fromisoformat(result["execution_deadline"]) == execution["execution_deadline"]
     assert result["execution_seconds"] == 3600
-    assert _rows(
-        "SELECT execution_deadline_seconds FROM curie.agents WHERE id = :id",
-        {"id": case["agent_id"]},
-    )[0]["execution_deadline_seconds"] == 10800
+    assert (
+        _rows(
+            "SELECT execution_deadline_seconds FROM curie.agents WHERE id = :id",
+            {"id": case["agent_id"]},
+        )[0]["execution_deadline_seconds"]
+        == 10800
+    )
     assert _github_reads(case) != []
 
 
