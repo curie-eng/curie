@@ -157,6 +157,7 @@ mod skill_up_auto_reload;
 mod skill_up_replace;
 mod spec_scaffold;
 mod sre_observability_provision;
+mod surfaces_trigger_label;
 mod surfaces_verb;
 mod trajectory_eval;
 mod trajectory_platform_eval;
