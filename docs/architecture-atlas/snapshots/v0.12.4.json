@@ -4,8 +4,8 @@
   "repository": {
     "name": "curie-eng/curie",
     "branch": "main",
-    "commit": "2312f1275336d8b6ce076f3e2d0bc6cde3342ccb",
-    "shortCommit": "2312f127",
+    "commit": "0da08c943d930d17f3090d24934198f3253f17ec",
+    "shortCommit": "0da08c94",
     "release": "v0.12.4"
   },
   "title": "Curie architecture atlas",
@@ -3291,147 +3291,147 @@
       "type": "code",
       "title": "Ordered captured cluster values",
       "path": "cli/src/ops/lint_values.rs",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/src/ops/lint_values.rs"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/src/ops/lint_values.rs"
     },
     {
       "id": "cluster-install-v0124",
       "type": "code",
       "title": "Final install overlay admission",
       "path": "cli/src/ops/up.rs",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/src/ops/up.rs"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/src/ops/up.rs"
     },
     {
       "id": "cluster-upgrade-v0124",
       "type": "code",
       "title": "Stock runner layer and upgrade admission",
       "path": "cli/src/ops/upgrade.rs",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/src/ops/upgrade.rs"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/src/ops/upgrade.rs"
     },
     {
       "id": "config-migrate-v0124",
       "type": "code",
       "title": "Typed metadata CI migration",
       "path": "cli/src/config_migrate.rs",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/src/config_migrate.rs"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/src/config_migrate.rs"
     },
     {
       "id": "upgrade-drain-v0124",
       "type": "code",
       "title": "Renew-only post-drain lease handoff",
       "path": "apps/worker/src/curie_worker/upgrade_drain.py",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/apps/worker/src/curie_worker/upgrade_drain.py"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/apps/worker/src/curie_worker/upgrade_drain.py"
     },
     {
       "id": "upgrade-hooks-v0124",
       "type": "code",
       "title": "Final pre-upgrade hold hook",
       "path": "charts/curie/templates/worker-upgrade-drain.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/charts/curie/templates/worker-upgrade-drain.yaml"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/charts/curie/templates/worker-upgrade-drain.yaml"
     },
     {
       "id": "cluster-interface-v0124",
       "type": "code",
       "title": "Cluster lifecycle contract",
       "path": "docs/interfaces/cluster-lifecycle/INTERFACE.md",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/docs/interfaces/cluster-lifecycle/INTERFACE.md"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/docs/interfaces/cluster-lifecycle/INTERFACE.md"
     },
     {
       "id": "issue-deadline-v0124",
       "type": "code",
       "title": "Execution grant in scoped issue reads",
       "path": "apps/api/src/curie_api/routers/work_item_issue.py",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/apps/api/src/curie_api/routers/work_item_issue.py"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/apps/api/src/curie_api/routers/work_item_issue.py"
     },
     {
       "id": "factory-deadline-v0124",
       "type": "code",
       "title": "Factory workflow execution pacing",
       "path": "examples/dark-factory/skills/implement-issue/SKILL.md",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/examples/dark-factory/skills/implement-issue/SKILL.md"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/examples/dark-factory/skills/implement-issue/SKILL.md"
     },
     {
       "id": "sdk-diagnostics-v0124",
       "type": "code",
       "title": "Bounded SDK initialization diagnostics",
       "path": "runner/src/curie_runner/startup_diagnostics.py",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/runner/src/curie_runner/startup_diagnostics.py"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/runner/src/curie_runner/startup_diagnostics.py"
     },
     {
       "id": "workspace-diagnostic-v0124",
       "type": "code",
       "title": "Workspace failure terminal detail",
       "path": "apps/worker/src/curie_worker/kernel.py",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/apps/worker/src/curie_worker/kernel.py"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/apps/worker/src/curie_worker/kernel.py"
     },
     {
       "id": "publication-ca-v0124",
       "type": "code",
       "title": "Private CA in managed publication Jobs",
       "path": "apps/worker/src/curie_worker/publication_k8s.py",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/apps/worker/src/curie_worker/publication_k8s.py"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/apps/worker/src/curie_worker/publication_k8s.py"
     },
     {
       "id": "s3-region-v0124",
       "type": "code",
       "title": "Chart-owned API and worker S3 region",
       "path": "charts/curie/templates/worker.yaml",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/charts/curie/templates/worker.yaml"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/charts/curie/templates/worker.yaml"
     },
     {
       "id": "automatic-thread-v0124",
       "type": "code",
       "title": "Per-process automatic thread allocation",
       "path": "cli/src/chat.rs",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/src/chat.rs"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/src/chat.rs"
     },
     {
       "id": "namespace-dryrun-v0124",
       "type": "code",
       "title": "Controller-sensitive namespace ownership",
       "path": "cli/src/ops/up.rs",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/src/ops/up.rs"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/src/ops/up.rs"
     },
     {
       "id": "rust-ci-v0124",
       "type": "code",
       "title": "Single integration crate and nextest archive",
       "path": "cli/Cargo.toml",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/Cargo.toml"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/Cargo.toml"
     },
     {
       "id": "quickstart-deadline-v0124",
       "type": "code",
       "title": "Quickstart default execution grant",
       "path": "cli/src/factory_quickstart.rs",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/src/factory_quickstart.rs"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/src/factory_quickstart.rs"
     },
     {
       "id": "publication-startup-v0124",
       "type": "code",
       "title": "Publication CA startup admission",
       "path": "apps/worker/src/curie_worker/run.py",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/apps/worker/src/curie_worker/run.py"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/apps/worker/src/curie_worker/run.py"
     },
     {
       "id": "slack-hint-v0124",
       "type": "code",
       "title": "Selected release Slack disconnect hint",
       "path": "cli/src/interactive.rs",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/src/interactive.rs"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/src/interactive.rs"
     },
     {
       "id": "cli-stamp-v0124",
       "type": "code",
       "title": "Release-only source commit stamping",
       "path": "cli/build.rs",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/build.rs"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/build.rs"
     },
     {
       "id": "schema-catalog-v0124",
       "type": "code",
       "title": "Released v0.12.4 schema compatibility window",
       "path": "cli/src/application_schema_windows.json",
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/cli/src/application_schema_windows.json"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/cli/src/application_schema_windows.json"
     }
   ],
   "documentationDrift": [
@@ -9703,7 +9703,7 @@
       "seamIds": [
         "cluster-lifecycle"
       ],
-      "href": "https://github.com/curie-eng/curie/blob/2312f1275336d8b6ce076f3e2d0bc6cde3342ccb/docs/adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md"
+      "href": "https://github.com/curie-eng/curie/blob/0da08c943d930d17f3090d24934198f3253f17ec/docs/adr/0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md"
     },
     {
       "id": "ADR-0212",
