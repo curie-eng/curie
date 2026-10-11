@@ -1147,6 +1147,10 @@ if program == "helm":
         print((root / "chart-values.json").read_text())
         sys.exit(0)
     if args[0] == "template":
+        # @spec CLUSTER-VALUES-FILES c2: outside-boundary Helm parsing is real.
+        if args[1] == "curie-values-lint" and os.environ.get("VALUES_FILES_REAL_HELM"):
+            import subprocess
+            sys.exit(subprocess.call([os.environ["VALUES_FILES_REAL_HELM"], *args]))
         show_only = flag_value("--show-only")
         if show_only is None:
             for arg in args:
@@ -1154,6 +1158,9 @@ if program == "helm":
                     show_only = arg.split("=", 1)[1]
                     break
         if show_only == "templates/schema-compat.yaml":
+            values_file = flag_value("-f")
+            if values_file:
+                capture("schema-values", ".json", values_file)
             metadata = scenario["compat_metadata"] or DEFAULT_COMPAT_METADATA
             payload = (
                 metadata
@@ -1415,6 +1422,10 @@ if program == "kubectl":
                 file=sys.stderr,
             )
             sys.exit(1)
+        # @spec CLUSTER-VALUES-FILES c3: invalidate only this test-owned temp path.
+        removed_tmp = os.environ.get("VALUES_FILES_REMOVE_TMP_AFTER_SCHEMA_PROBE")
+        if removed_tmp:
+            os.rmdir(removed_tmp)
         print(scenario["alembic_current"])
         sys.exit(0)
 
