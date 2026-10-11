@@ -570,9 +570,7 @@ spec:
                   ).strip()
               except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
                   raise SystemExit("workspace-init: checkout origin is unreadable")
-              # The trusted origin and repository path come from the worker's
-              # claim, which took them from the API's credential (ADR 0197).
-              # The checkout must be exactly that path under that origin.
+              # Origin and path come from the API's credential (ADR 0197).
               trusted = os.environ.get("CURIE_REPO_ORIGIN", "")
               path = os.environ.get("CURIE_REPO_PATH", "")
               if not trusted or not path:

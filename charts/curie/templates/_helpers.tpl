@@ -2324,11 +2324,7 @@ true
 {{- else -}}false{{- end -}}
 {{- end -}}
 
-{{/* ---- Code host trust (ADR 0197, #3831) ----
-     One PEM CA bundle, from the ConfigMap codeHostTrust.caBundle.configMapRef
-     names, mounted read-only at one path everywhere a code host is reached:
-     the api, the worker, every agent sandbox, and (by the worker) every
-     publication Job. Every helper renders nothing when no name is set. */}}
+{{/* Code host trust (ADR 0197): renders nothing when no ConfigMap is named. */}}
 {{- define "curie.codeHostTrust.name" -}}
 {{- dig "caBundle" "configMapRef" "name" "" (.Values.codeHostTrust | default dict) -}}
 {{- end -}}

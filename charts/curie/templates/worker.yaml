@@ -342,8 +342,7 @@ spec:
             - name: CURIE_PUBLICATION_GIT_COMMAND_TIMEOUT_SECONDS
               value: {{ .Values.worker.publication.gitCommandTimeoutSeconds | quote }}
             {{- if include "curie.codeHostTrust.name" . }}
-            # The publication Job mounts the code host CA bundle from this
-            # ConfigMap at the path each push credential names (ADR 0197).
+            # Mounted into each publication Job (ADR 0197).
             - name: CURIE_CODE_HOST_CA_CONFIGMAP
               value: {{ include "curie.codeHostTrust.name" . | quote }}
             - name: CURIE_CODE_HOST_CA_CONFIGMAP_KEY
