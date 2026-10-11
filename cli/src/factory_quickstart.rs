@@ -1995,7 +1995,7 @@ mod tests {
         assert!(text.contains("--env prod"), "{text}");
         assert!(text.contains("--repo acme/widgets"), "{text}");
         assert!(text.contains("--add github=acme/widgets"), "{text}");
-        assert!(text.contains("--execution-deadline 3600"), "{text}");
+        assert!(text.contains("--execution-deadline 10800"), "{text}");
         assert!(text.contains("--policy auto"), "{text}");
         assert!(text.contains("--limit 5"), "{text}");
         assert!(text.contains("use CURIE_CREDENTIALS (no prompt)"), "{text}");

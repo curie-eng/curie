@@ -37,6 +37,8 @@ ISSUE = {
     "author": "octocat",
     "comments": [{"author": "hubot", "created_at": "2026-10-01T00:00:00Z", "body": "+1"}],
     "comments_truncated": False,
+    "execution_deadline": "2026-10-01T03:00:00Z",
+    "execution_seconds": 10800,
 }
 
 
@@ -107,7 +109,10 @@ def test_a_read_presents_the_capability_and_returns_the_issue_verbatim() -> None
     api = _Api()
     result = _call(api, ARGS)
     assert result.get("is_error") is not True
-    assert json.loads(_text(result)) == ISSUE
+    returned = json.loads(_text(result))
+    assert returned == ISSUE
+    assert returned["execution_deadline"] == ISSUE["execution_deadline"]
+    assert returned["execution_seconds"] == ISSUE["execution_seconds"]
     assert api.received == [
         ({"repo_full_name": "acme-corp/acme-bot", "issue_number": 7}, CAPABILITY)
     ]

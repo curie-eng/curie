@@ -282,6 +282,25 @@ def test_factory_skill_names_registry_egress_cause_with_guidance() -> None:
     assert re.search(r"addresses, not hostnames", step)
 
 
+def test_factory_skill_budgets_against_the_reported_deadline() -> None:
+    skill = SKILL.read_text(encoding="utf-8")
+    budget = skill.split("## Time budget", 1)[1].split("## Trust boundary", 1)[0]
+    for required in ("get_issue", "execution_deadline", "execution_seconds", "date -u"):
+        assert required in budget
+    for obsolete in ("10800", "3 hours", "minute 15", "minute 150", "minute 165"):
+        assert obsolete not in skill
+    checkpoints = re.split(r"[.!?](?:\s+|$)", budget)
+    for formula, milestone in (
+        (r"S\s*/\s*12", r"acceptance criteria"),
+        (r"deadline\s*-\s*S\s*/\s*6", r"implement"),
+        (r"deadline\s*-\s*S\s*/\s*12", r"stop"),
+    ):
+        assert any(
+            re.search(formula, checkpoint) and re.search(milestone, checkpoint, re.IGNORECASE)
+            for checkpoint in checkpoints
+        ), (formula, milestone)
+
+
 def test_factory_runner_pod_resolves_repository_lockfiles() -> None:
     image = os.environ.get(IMAGE_ENV, "").strip()
     if not image:
