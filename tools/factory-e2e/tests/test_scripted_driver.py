@@ -281,6 +281,10 @@ def test_unexpected_real_model_request_fails_and_records_evidence_after_endpoint
         assert "unexpected model request" in evidence["error"]
         assert len(evidence["unexpected_model_requests"]) == 1
         assert evidence["unexpected_model_requests"][0]["path"] == "/v1/messages"
+        # The refused request is the scenario failure, recorded above. Teardown
+        # itself completed, so it must not also read as an incomplete cleanup.
+        assert evidence["cleanup_errors"] == []
+        assert evidence["cleanup_verified"] is True
         with socket.socket() as probe:
             probe.settimeout(1)
             assert probe.connect_ex((model.host, model.port)) != 0
