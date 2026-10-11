@@ -6,6 +6,7 @@ kind scenario remains the proof that the product completes an issue.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import socket
 import sqlite3
@@ -71,9 +72,7 @@ def test_record_without_upstream_key_refuses_before_resource_mutation(
     "content",
     [
         '{"version": 1, "exchanges": [',
-        json.dumps(
-            {"version": 1, "exchanges": [{"lane_key": "add Kelvin tests", "ordinal": 0}]}
-        ),
+        json.dumps({"version": 1, "exchanges": [{"lane_key": "add Kelvin tests", "ordinal": 0}]}),
     ],
     ids=["invalid-json", "exchange-without-message"],
 )
@@ -1039,3 +1038,159 @@ def test_provider_balance_uses_remaining_limit_instead_of_usage(
 
     monkeypatch.setattr(sk, "urlopen", lambda *_args, **_kwargs: BalanceResponse())
     assert run.provider_remaining() == 35
+
+
+@pytest.mark.parametrize("release_lock", [True, False], ids=["lock-released", "lock-still-held"])
+def test_request_queued_on_the_recording_lock_is_refused_once_teardown_begins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    release_lock: bool,
+) -> None:
+    """A request admitted after teardown begins would spend credit cleanup never measures.
+
+    Another run sharing the ledger holds recording.lock, so this run's request
+    queues behind it. Once teardown begins, the queued request must be refused
+    without reaching the provider or being charged, whether the other run
+    releases the lock or keeps holding it: lock waiting must not stall teardown.
+    """
+
+    model_module = sk._module(
+        "factory_teardown_model_script", REPO_ROOT / "tools/model-script/model_script.py"
+    )
+    run = _recording_run(tmp_path, monkeypatch, remaining=50)
+    model = model_module.ModelScript(Path(run.args.transcript), record=True)
+    run.model = model
+    run.count_recording_requests(model_module)
+    provider_calls: list[str] = []
+
+    def provider(request: Request, **_kwargs: Any) -> Any:
+        provider_calls.append(request.full_url)
+        raise AssertionError("a request queued past teardown must not reach the provider")
+
+    monkeypatch.setattr(model_module, "urlopen", provider)
+    model.start()
+    assert run.record_ledger is not None
+    other_run_lock = open(run.record_ledger.with_name("recording.lock"), "a")
+    fcntl.flock(other_run_lock, fcntl.LOCK_EX)
+    held = True
+    statuses: list[int] = []
+
+    def client() -> None:
+        request = Request(
+            model.base_url + "/v1/messages",
+            data=json.dumps({"messages": [{"role": "user", "content": "convert units"}]}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urlopen(request, timeout=10) as response:
+                statuses.append(response.status)
+        except HTTPError as exc:
+            statuses.append(exc.code)
+            exc.close()
+        except OSError:
+            statuses.append(0)
+
+    thread = threading.Thread(target=client, daemon=True)
+    thread.start()
+    try:
+        time.sleep(0.5)
+        assert thread.is_alive(), "the request must queue behind the other run's lock"
+        run.begin_model_teardown()
+        if release_lock:
+            fcntl.flock(other_run_lock, fcntl.LOCK_UN)
+            held = False
+        thread.join(timeout=8)
+        assert not thread.is_alive(), "a queued request must not block teardown"
+        assert statuses == [422]
+        assert provider_calls == []
+        assert run.evidence["recording_model_calls"] == 0
+        with sqlite3.connect(run.record_ledger) as database:
+            assert database.execute("SELECT model_calls FROM attempts").fetchone() == (0,)
+    finally:
+        if held:
+            fcntl.flock(other_run_lock, fcntl.LOCK_UN)
+        other_run_lock.close()
+        thread.join(timeout=10)
+        try:
+            model.close()
+        except model_module.UnexpectedRequest:
+            pass
+
+
+_READ_ONLY_PREREQUISITES = {
+    ("kind", "version"),
+    ("docker", "info"),
+    ("helm", "version"),
+}
+
+
+def _image_check_commands(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing: str | None,
+) -> tuple[list[tuple[str, ...]], list[tuple[str, ...]]]:
+    """Answer read-only prerequisite probes; record anything that would mutate.
+
+    Returns every command seen and the commands outside the read-only probes
+    and image inspection. A mutating command fails, so the run stops there.
+    """
+
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.shutil, "which", lambda binary: f"/usr/bin/{Path(binary).name}")
+    monkeypatch.setattr(sk.ScriptedRun, "check_disk", lambda _self, _stage: None)
+    calls: list[tuple[str, ...]] = []
+    mutating: list[tuple[str, ...]] = []
+
+    def command(argv: tuple[str, ...], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        if argv[:2] in _READ_ONLY_PREREQUISITES:
+            output = "kind v0.24.0 go1.22 linux/amd64" if argv[0] == "kind" else ""
+            return subprocess.CompletedProcess(argv, 0, output, "")
+        if argv[:3] == ("docker", "image", "inspect"):
+            if argv[3] == missing:
+                return subprocess.CompletedProcess(argv, 1, "", f"Error: No such image: {missing}")
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        mutating.append(argv)
+        if argv[:3] in {("docker", "rm", "-f"), ("docker", "ps", "-aq")}:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return subprocess.CompletedProcess(argv, 1, "", "stop at first resource command")
+
+    monkeypatch.setattr(sk.subprocess, "run", command)
+    return calls, mutating
+
+
+@pytest.mark.parametrize("missing", sk.IMAGES)
+def test_missing_local_image_refuses_as_configuration_before_resource_creation(
+    missing: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without --build-images a missing candidate image is an operator setup error."""
+
+    calls, mutating = _image_check_commands(tmp_path, monkeypatch, missing)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_CONFIG
+    assert ("docker", "image", "inspect", missing) in calls
+    assert mutating == [], "no cluster, registry or build command may run"
+    evidence = _evidence(tmp_path)
+    assert missing in evidence["error"]
+    assert "--build-images" in evidence["error"]
+    assert evidence["cleanup_verified"] is True
+
+
+def test_present_local_images_pass_the_check_and_reach_resource_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls, mutating = _image_check_commands(tmp_path, monkeypatch, None)
+
+    assert sk.main(_replay_args(tmp_path)) == fe.EXIT_FAILED
+    inspected = [argv[3] for argv in calls if argv[:3] == ("docker", "image", "inspect")]
+    assert sorted(inspected) == sorted(sk.IMAGES)
+    assert mutating, "the run must proceed past the image check"
+    assert mutating[0][:2] in {("docker", "run"), ("kind", "create")}
+    first_mutation = calls.index(mutating[0])
+    assert all(
+        calls.index(("docker", "image", "inspect", image)) < first_mutation for image in sk.IMAGES
+    )
+    assert "stop at first resource command" in _evidence(tmp_path)["error"]
