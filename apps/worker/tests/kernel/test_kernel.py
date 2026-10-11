@@ -2176,7 +2176,6 @@ def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
         async with TestServer(app) as server:
             credentials = WorkspaceCredentialClient(
                 api_url=str(server.make_url("")),
-                github_api_url="https://api.github.com",
                 worker_token="workspace-test-token",
             )
             async with make_harness(
