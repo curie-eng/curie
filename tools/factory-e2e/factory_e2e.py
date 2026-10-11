@@ -74,24 +74,50 @@ after install every pod's container imageID must equal the built digest;
 both are recorded in the evidence. The default `published` installs the
 release workflow's `sha-<commit>` images as before.
 
-`github-loop [--issue-file] [--revision-file]` drives the whole loop through
-the GitHub entry of the forge-neutral loop driver (LoopDriver, forges/github.py):
-the labelled run opens a pull request; the test actor sets CI red on its first
-head with one failing commit status (the factory CI gate reads statuses, so
-the first head is red whatever the fixture workflow says, and the status
-names a small change to push); the factory's CI fix round pushes a new commit
-whose checks are green and the first request completes; a pull request review
-from the test actor that mentions the factory adds a second request that
-pushes another commit to the same pull request; the test actor merges it; and
-GitHub, the api work-items route and `curie cluster work-items <id> --json`
-must all read it merged. judge_github_loop decides. It needs
-CURIE_FACTORY_MODEL_API_KEY.
+`forge-loop --forge <name> [--issue-file] [--revision-file]` drives the
+whole loop and observes the forge only through the ForgeDriver protocol in
+tools/factory-e2e/forges/base.py. Each module in tools/factory-e2e/forges/
+registers one forge entry: `github` (forges/github.py) is installed, and the
+drivers for GitLab, Jira Cloud, Bitbucket Cloud and Bitbucket Data Center are
+reserved and not installed, so naming one is refused with "not installed"
+before anything is installed. `github-loop` is forge-loop with the GitHub
+driver. The driver opens and labels the ticket; the labelled run opens a pull
+request; the test actor sets CI red on its first head with one failing commit
+status (the factory CI gate reads statuses, so the first head is red whatever
+the fixture workflow says, and the status names a small change to push); the
+factory's CI fix round pushes a new commit whose checks are green and the
+first request completes; a pull request review from the test actor that
+mentions the factory adds a second request that pushes another commit to the
+same pull request; the test actor merges it; and the forge, the api
+work-items route and `curie cluster work-items <id> --json` must all read it
+merged. judge_github_loop decides. Both need CURIE_FACTORY_MODEL_API_KEY. A
+new forge is a new entry file that calls register_forge; nothing shared
+changes.
 
-`accept [--forge <name>]` is the acceptance runner: for each forge entry
-registered by a module in tools/factory-e2e/forges/ (only `github` today), it
-runs the preflight plus that entry's loop scenario as one `run`, then prints a
-summary and writes it to `--evidence` when given. A new forge is a new entry
-file that calls register_forge; nothing shared changes.
+`acceptance --pairing <tracker>+<code host> [--dry-run]` runs one entry of
+the acceptance table in tools/factory-e2e/acceptance.py. Each entry fixes its
+inputs, its `run` commands, a deadline per command, what the forge must show,
+the evidence fields that must hold, and the teardown checks. A real run
+executes each command as a subprocess under its deadline with the shared
+flags and its own evidence file, then checks that evidence and that the
+namespace is gone on the kube context, and writes a summary to `--evidence`
+when given. `--dry-run` lists every step and fails on an entry with an unset
+field. Only github+github is installed; the pairings that need the GitLab,
+Jira or Bitbucket drivers list their steps and report "not installed".
+
+`tls-code-host` (tls_code_host.py) never touches real GitHub. It needs only
+CURIE_FACTORY_MODEL_API_KEY and a kube context. It runs the recorded TLS
+GitHub stub (tools/github-stub) as one Pod in the test namespace on the
+candidate worker image, publishes only the stub's public CA as the ConfigMap
+`code-host-ca`, and installs with `codeHostTrust.caBundle.configMapRef`, the
+api's GitHub API and clone bases on the stub's Service name, and sandbox and
+publication egress limited to the stub and the model provider. A throwaway
+App key is generated per run. The stub's human-labelled seed issue carries
+the ticket. The judge requires that the request ran and completed, the
+sandbox claim carried CURIE_REPO_CA_BUNDLE, the publication Job mounted
+`code-host-trust` and completed, the stub repository got a pushed branch
+and exactly one pull request, the stub saw no unsupported request, and no
+log shows a TLS verification failure.
 
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
@@ -127,12 +153,42 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 if __name__ == "__main__":
     # Forge entry modules import this module by name; run as a script it must
     # be the same module object, not a second copy.
     sys.modules.setdefault("factory_e2e", sys.modules[__name__])
+
+FORGE_DIR = Path(__file__).resolve().parent / "forges"
+# The driver protocol module; the forge entry loader skips it.
+FORGE_BASE = "base.py"
+
+
+def _load_by_path(module_name: str, path: Path) -> Any:
+    """Import ``path`` once as ``module_name``, from a script run or an import alike."""
+
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[module_name]
+        raise
+    return module
+
+
+_forge_base = _load_by_path("factory_e2e_forges.base", FORGE_DIR / FORGE_BASE)
+ChangeRef = _forge_base.ChangeRef
+ForgeDriver = _forge_base.ForgeDriver
+ForgeNotInstalled = _forge_base.ForgeNotInstalled
+not_installed_driver = _forge_base.not_installed_driver
 
 GITHUB_API = "https://api.github.com"
 GHCR = "https://ghcr.io"
@@ -317,7 +373,9 @@ SCENARIOS: dict[str, ScenarioDriver | None] = {
     "cancel-running": None,
     "evaluation": None,
     "quiesce": None,
+    "forge-loop": None,
     "github-loop": None,
+    "tls-code-host": None,  # bound at the bottom from tls_code_host.py
 }
 SCENARIO_NAMES = tuple(SCENARIOS)
 
@@ -332,14 +390,19 @@ def resolve_scenario(name: str) -> ScenarioDriver:
     return driver
 
 
+# The loop scenarios and the forge each one fixes; None means `--forge` names it.
+LOOP_SCENARIOS: dict[str, str | None] = {"forge-loop": None, "github-loop": "github"}
+
+
 def scenario_opens_seed_issue(name: str | None) -> bool:
-    """The preflight seed issue is for every mode except evaluation.
+    """The preflight seed issue is for every mode except evaluation and the loops.
 
     Evaluation opens one issue per case itself. A seed issue would admit a
-    second, unjudged run beside the first case.
+    second, unjudged run beside the first case. A loop opens its ticket
+    through its forge driver.
     """
 
-    return name != "evaluation"
+    return name != "evaluation" and name not in LOOP_SCENARIOS
 
 
 # --------------------------------------------------------------------------
@@ -2538,7 +2601,19 @@ class Preflight:
             "verified_absent": True,
         }
 
-    def install(self) -> None:
+    def install(
+        self,
+        *,
+        egress_cidrs: Sequence[str] | None = None,
+        extra_values: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        """Install the candidate release.
+
+        ``egress_cidrs`` replaces the GitHub-plus-model sandbox egress (no
+        GitHub /meta read happens then), and ``extra_values`` layers a
+        scenario's own values on top (the tls-code-host stub code host).
+        """
+
         chart = self.extract_chart()
         consumer = bool(
             self.kubectl("get", "crd", SANDBOX_CRD, "--ignore-not-found", "-o", "name").strip()
@@ -2576,7 +2651,8 @@ class Preflight:
             f"--from-file=privateKey={key_file}",
         )
         self.chart_dir = chart
-        egress_cidrs = self.egress_cidrs()
+        if egress_cidrs is None:
+            egress_cidrs = self.egress_cidrs()
         # cancel-waiting holds the request in `waiting` by refusing every
         # sandbox claim through the namespace quota.
         # evaluation starts at quota 0 so cancel-waiting is judged before any
@@ -2595,6 +2671,8 @@ class Preflight:
             candidate_images=self.candidate_images,
             kind=self.kind_cluster is not None,
         )
+        if extra_values is not None:
+            values = extra_values(values)
         values_file = self.workdir / "values.json"
         fd = os.open(values_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
@@ -2643,14 +2721,18 @@ class Preflight:
         if not isinstance(ranges, list) or not ranges:
             raise PreflightFailed(f"could not read GitHub's API address ranges (HTTP {status})")
         cidrs = [str(cidr) for cidr in ranges if ":" not in str(cidr)]
-        if self.config.model_api_key:
-            try:
-                infos = socket.getaddrinfo(OPENROUTER_HOST, 443, socket.AF_INET, socket.SOCK_STREAM)
-            except OSError as exc:
-                raise PreflightFailed(f"could not resolve {OPENROUTER_HOST}: {exc}") from None
-            for address in sorted({str(info[4][0]) for info in infos}):
-                cidrs.append(f"{address}/32")
-        return cidrs
+        return cidrs + self.model_provider_cidrs()
+
+    def model_provider_cidrs(self) -> list[str]:
+        """OpenRouter's current IPv4 addresses with a real model, else none."""
+
+        if not self.config.model_api_key:
+            return []
+        try:
+            infos = socket.getaddrinfo(OPENROUTER_HOST, 443, socket.AF_INET, socket.SOCK_STREAM)
+        except OSError as exc:
+            raise PreflightFailed(f"could not resolve {OPENROUTER_HOST}: {exc}") from None
+        return [f"{address}/32" for address in sorted({str(info[4][0]) for info in infos})]
 
     def port_forward(self) -> None:
         if self._api_forward is not None:
@@ -2695,7 +2777,7 @@ class Preflight:
         self.worker_token = base64.b64decode(data["internalWorkerToken"]).decode()
         self.step("api reachable")
 
-    def bind_agent(self) -> None:
+    def bind_agent(self, *, github_token: bool = True) -> None:
         status, body = self.api(
             "POST",
             "/agents",
@@ -2722,7 +2804,7 @@ class Preflight:
                 f"setting the agent execution deadline failed (HTTP {status}): {patched}"
             )
         self.step("factory agent execution deadline set", seconds=EXECUTION_BOUND_SECONDS)
-        self.deploy_bundle()
+        self.deploy_bundle(github_token=github_token)
 
     def _write_kubeconfig(self) -> Path:
         result = subprocess.run(
@@ -2834,26 +2916,33 @@ class Preflight:
             raise PreflightFailed(f"curie build --plugin-dir failed: {tail}")
         return copy
 
-    def deploy_bundle(self) -> None:
+    def deploy_bundle(self, *, github_token: bool = True) -> None:
         """Deploy the default dark-factory bundle onto the bound agent and let
-        the platform resolve its publication approval (policy auto)."""
+        the platform resolve its publication approval (policy auto).
+
+        ``github_token=False`` deploys with no GitHub credential secret: the
+        bundle reads its issue through the platform's get_issue tool, and the
+        tls-code-host stub run mints nothing from real GitHub."""
 
         assert self.chart_dir is not None, "install() extracts the chart first"
         bundle = self.build_runner_layer(self.config.bundle_dir)
         manifest = json.loads((bundle / ".claude-plugin" / "plugin.json").read_text())
         kubeconfig = self._write_kubeconfig()
-        token = self._issue_read_token()
+        token = self._issue_read_token() if github_token else ""
         env = {
             "KUBECONFIG": str(kubeconfig),
             "CURIE_API_KEY": self.api_key,
-            "GITHUB_PERSONAL_ACCESS_TOKEN": token,
             # The secret arrives through the environment; an empty private
             # config dir keeps the operator's own vault out of this run.
             "CURIE_CONFIG_DIR": str(self._curie_config_dir()),
         }
-        self.issue_token = token
-        self._issue_token_minted = time.time()
-        secrets = [token, self.api_key, self.config.model_api_key, self.worker_token]
+        secret_args: list[str] = []
+        if github_token:
+            env["GITHUB_PERSONAL_ACCESS_TOKEN"] = token
+            secret_args = ["--secret", "GITHUB_PERSONAL_ACCESS_TOKEN"]
+            self.issue_token = token
+            self._issue_token_minted = time.time()
+        secrets = [token or None, self.api_key, self.config.model_api_key, self.worker_token]
         common = ["--namespace", self.namespace, "--release", RELEASE, "--api-url", self.api_url]
         log("curie cluster deploy (the default dark-factory bundle)")
         self._curie(
@@ -2868,8 +2957,7 @@ class Preflight:
                 "prod",
                 "--chart",
                 str(self.chart_dir),
-                "--secret",
-                "GITHUB_PERSONAL_ACCESS_TOKEN",
+                *secret_args,
                 *common,
             ],
             env,
@@ -2890,11 +2978,15 @@ class Preflight:
             "path": shown,
             "model": self.config.model if self.config.model_api_key else "fake",
             "publication_policy": "auto",
-            "issue_read_token": {
-                "permissions": {"issues": "read"},
-                "repository": self.config.repo,
-                "held": "in memory only; passed to curie through the environment",
-            },
+            "issue_read_token": (
+                {
+                    "permissions": {"issues": "read"},
+                    "repository": self.config.repo,
+                    "held": "in memory only; passed to curie through the environment",
+                }
+                if github_token
+                else None
+            ),
         }
         self.step(
             "default bundle deployed",
@@ -3489,6 +3581,11 @@ class Preflight:
             self.move_default_branch(self._fixture_base_sha)
 
     def run(self, scenario: ScenarioDriver | None) -> None:
+        if scenario is not None and self.scenario_name == "tls-code-host":
+            # The stub code host owns its whole flow (tls_code_host.py): no App,
+            # tunnel, webhook or fixture repository on real GitHub is touched.
+            self.evidence["scenario"] = scenario(self)
+            return
         self.check_tools()
         self._lock(f"app-{self.config.app_id}", "this App and its fixture repository")
         self._lock(f"context-{self.config.kube_context}", "this kube context")
@@ -5650,77 +5747,21 @@ DEFAULT_LOOP_REVIEW_TEXT = (
 
 
 @dataclasses.dataclass(frozen=True)
-class ChangeRef:
-    """The change request (a pull request on GitHub) a WorkItem published."""
-
-    number: int
-    url: str
-
-
-class LoopDriver(Protocol):
-    """The forge steps the loop needs. Each forge entry implements them once.
-
-    The WorkItem side is the platform's own api and CLI, so it is not here.
-    """
-
-    forge: str
-
-    def open_ticket(self, title: str, body: str) -> int: ...
-
-    def mark_ticket(self, ticket: int, since: float) -> str:
-        """Assert admission of the marked ticket; the admitted WorkItem id."""
-        ...
-
-    def await_change(self, work_item_id: str) -> ChangeRef | None: ...
-
-    def change_head(self, change: ChangeRef) -> tuple[str | None, int | None]: ...
-
-    def set_ci_red(self, sha: str) -> dict[str, Any]: ...
-
-    def ci_state(self, sha: str) -> dict[str, Any]: ...
-
-    def post_review(self, change: ChangeRef, text: str) -> dict[str, Any]:
-        """Request a change as the test actor; delivery facts in the result."""
-        ...
-
-    def merge(self, change: ChangeRef) -> dict[str, Any]: ...
-
-    def change_merged(self, change: ChangeRef) -> bool | None: ...
-
-    def changes_opened(self) -> list[int]: ...
-
-    def default_branch_head(self) -> str: ...
-
-
-@dataclasses.dataclass(frozen=True)
 class ForgeEntry:
-    """One forge the acceptance runner drives: its loop scenario and driver."""
+    """One forge the loop can drive: its driver and whether that driver is written."""
 
     name: str
-    scenario: str
-    driver: Callable[[Preflight], LoopDriver]
+    driver: Callable[[Preflight], ForgeDriver]
+    installed: bool
 
 
 # Populated by the entry modules in tools/factory-e2e/forges/, one file per
 # forge, so a new forge is a new file and no edit here.
 FORGES: dict[str, ForgeEntry] = {}
-FORGE_DIR = Path(__file__).resolve().parent / "forges"
-
-
-def forge_loop_scenario(name: str) -> ScenarioDriver:
-    def drive(p: Preflight) -> dict[str, Any]:
-        entry = FORGES.get(name)
-        if entry is None:
-            raise ConfigError(f"no forge entry {name!r}; expected {FORGE_DIR}/{name}.py")
-        return run_loop(p, entry.driver(p))
-
-    return drive
 
 
 def register_forge(entry: ForgeEntry) -> None:
     FORGES[entry.name] = entry
-    if SCENARIOS.get(entry.scenario) is None:
-        SCENARIOS[entry.scenario] = forge_loop_scenario(entry.name)
 
 
 def load_forge_entries(directory: Path = FORGE_DIR) -> list[str]:
@@ -5728,22 +5769,54 @@ def load_forge_entries(directory: Path = FORGE_DIR) -> list[str]:
 
     loaded: list[str] = []
     for path in sorted(directory.glob("*.py")):
-        if path.name.startswith("_"):
+        if path.name.startswith("_") or path.name == FORGE_BASE:
             continue
         module_name = f"factory_e2e_forges.{path.stem}"
         if module_name not in sys.modules:
-            spec = importlib.util.spec_from_file_location(module_name, path)
-            if spec is None or spec.loader is None:
-                raise ConfigError(f"cannot load forge entry {path}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
             try:
-                spec.loader.exec_module(module)
-            except BaseException:
-                del sys.modules[module_name]
-                raise
+                _load_by_path(module_name, path)
+            except ImportError as exc:
+                raise ConfigError(f"cannot load forge entry {path}: {exc}") from exc
         loaded.append(path.stem)
     return loaded
+
+
+def loop_forge(scenario: str, requested: str | None) -> str | None:
+    """The installed forge a loop scenario drives; None for any other scenario.
+
+    Decided before anything is installed: forge-loop needs ``--forge``,
+    github-loop is the GitHub forge, and a forge whose driver is not
+    installed raises ForgeNotInstalled.
+    """
+
+    if scenario not in LOOP_SCENARIOS:
+        if requested is not None:
+            raise ConfigError(f"--forge applies only to {' and '.join(LOOP_SCENARIOS)}")
+        return None
+    fixed = LOOP_SCENARIOS[scenario]
+    if fixed is not None and requested not in (None, fixed):
+        raise ConfigError(
+            f"{scenario} drives the {fixed} forge; use --scenario forge-loop --forge {requested}"
+        )
+    name = requested or fixed
+    if name is None:
+        raise ConfigError(f"forge-loop needs --forge <name>, one of {', '.join(sorted(FORGES))}")
+    entry = FORGES.get(name)
+    if entry is None:
+        raise ConfigError(f"no forge entry {name!r}; expected {FORGE_DIR}/{name}.py")
+    if not entry.installed:
+        raise ForgeNotInstalled(f"{name} forge driver is not installed")
+    return name
+
+
+def forge_loop(p: Preflight) -> dict[str, Any]:
+    """The loop scenario: drive the forge main recorded as ``evidence["forge"]``."""
+
+    name = p.evidence.get("forge")
+    entry = FORGES.get(name) if isinstance(name, str) else None
+    if entry is None:
+        raise ConfigError(f"the loop has no forge to drive (evidence forge {name!r})")
+    return run_loop(p, entry.driver(p))
 
 
 def work_item_cli_pr_status(stdout: str) -> str | None:
@@ -5878,7 +5951,7 @@ def _await_work_item_merged(p: Preflight, work_item_id: str) -> dict[str, Any]:
         time.sleep(POLL_SECONDS)
 
 
-def run_loop(p: Preflight, driver: LoopDriver) -> dict[str, Any]:
+def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
     """Drive one forge through the whole loop and judge it with judge_github_loop."""
 
     obs = _new_obs(p) if p.issue_number else {"cli": [], "cli_failures": []}
@@ -5887,8 +5960,7 @@ def run_loop(p: Preflight, driver: LoopDriver) -> dict[str, Any]:
         title, body = p.issue_spec or DEFAULT_LOOP_ISSUE
         since = time.time()
         p.labelled_at = since
-        ticket = driver.open_ticket(title, body)
-        driver.mark_ticket(ticket, since)
+        driver.open_and_label_ticket(title, body, since)
         obs.update(_new_obs(p))
         obs["forge"] = driver.forge
     work_item_id = str(obs["work_item_id"])
@@ -5979,7 +6051,8 @@ def run_loop(p: Preflight, driver: LoopDriver) -> dict[str, Any]:
     return _finish(p, obs, judge_github_loop(obs))
 
 
-SCENARIOS["github-loop"] = forge_loop_scenario("github")
+SCENARIOS["forge-loop"] = forge_loop
+SCENARIOS["github-loop"] = forge_loop
 
 
 # --------------------------------------------------------------------------
@@ -6049,6 +6122,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     scenario = sub.add_parser("run", parents=[common], help="preflight, then one scenario driver")
     scenario.add_argument("--scenario", required=True, choices=tuple(SCENARIOS))
     scenario.add_argument(
+        "--forge",
+        choices=tuple(FORGES),
+        help=(
+            "forge-loop (required) and github-loop (github only): the forge entry under "
+            "tools/factory-e2e/forges/ whose driver the loop observes through"
+        ),
+    )
+    scenario.add_argument(
         "--issue-file",
         type=Path,
         help=(
@@ -6061,7 +6142,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--revision-file",
         type=Path,
         help=(
-            "revision and github-loop: the mention or review text (default: a small "
+            "revision, forge-loop and github-loop: the mention or review text (default: a small "
             "follow-up change)"
         ),
     )
@@ -6094,90 +6175,34 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=Path("tools/model-script/transcripts/unitconv-issue.json"),
     )
 
-    accept = sub.add_parser(
-        "accept",
+    pairings = _acceptance_module().PAIRINGS
+    pairing = sub.add_parser(
+        "acceptance",
         parents=[common],
-        help="for each registered forge entry: preflight, then that forge's full loop",
+        help="run one tracker and code host pairing of the acceptance table",
     )
-    accept.add_argument(
-        "--forge",
-        action="append",
-        choices=tuple(FORGES),
-        default=[],
-        help="a forge entry to accept (repeatable; default every registered entry)",
+    pairing.add_argument(
+        "--pairing",
+        required=True,
+        choices=tuple(pairings),
+        help="the entry of tools/factory-e2e/acceptance.py to run, <tracker>+<code host>",
     )
-    accept.add_argument("--issue-file", type=Path, help="the loop ticket (default: a small task)")
-    accept.add_argument("--revision-file", type=Path, help="the review text")
+    pairing.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list every step of the entry and its install state; launch nothing",
+    )
+    pairing.add_argument("--issue-file", type=Path, help="the loop ticket (default: a small task)")
+    pairing.add_argument("--revision-file", type=Path, help="the review text")
     scripted.add_argument("--build-images", action="store_true")
     scripted.add_argument("--record", action="store_true")
     return parser.parse_args(argv)
 
 
-def accept_runs(args: argparse.Namespace) -> list[tuple[str, list[str]]]:
-    """The `run` argv for each forge the acceptance runner drives. Pure over FORGES."""
+def _acceptance_module() -> Any:
+    """tools/factory-e2e/acceptance.py, imported once under the name ``acceptance``."""
 
-    names = list(dict.fromkeys(args.forge)) or sorted(FORGES)
-    passthrough: list[str] = ["--candidate-images", args.candidate_images]
-    for flag, value in (
-        ("--context", args.context),
-        ("--candidate", args.candidate),
-        ("--kind-cluster", args.kind_cluster),
-        ("--namespace", args.namespace),
-        ("--issue-file", args.issue_file),
-        ("--revision-file", args.revision_file),
-    ):
-        if value is not None:
-            passthrough += [flag, str(value)]
-    passthrough += ["--admission-timeout", str(args.admission_timeout)]
-    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
-    base = args.evidence.parent if args.evidence else _repo_root() / "target" / "factory-e2e"
-    return [
-        (
-            name,
-            [
-                "run",
-                "--scenario",
-                FORGES[name].scenario,
-                *passthrough,
-                "--evidence",
-                str(base / f"accept-{name}-{stamp}.json"),
-            ],
-        )
-        for name in names
-    ]
-
-
-def accept(args: argparse.Namespace, *, run_one: Callable[[list[str]], int] | None = None) -> int:
-    """Preflight plus the full loop for every registered forge entry, one after another."""
-
-    runner = run_one or main
-    if not FORGES:
-        print(f"factory-e2e: no forge entries under {FORGE_DIR}", file=sys.stderr)
-        return EXIT_CONFIG
-    results = []
-    code = 0
-    for name, argv in accept_runs(args):
-        log(f"accept: forge {name}")
-        result = runner(argv)
-        results.append(
-            {
-                "forge": name,
-                "scenario": FORGES[name].scenario,
-                "exit_code": result,
-                "evidence": argv[argv.index("--evidence") + 1],
-            }
-        )
-        code = code or result
-    summary = {
-        "schema": "curie.factory-e2e.accept/v1",
-        "result": "passed" if code == 0 else "failed",
-        "forges": results,
-    }
-    if args.evidence:
-        args.evidence.parent.mkdir(parents=True, exist_ok=True)
-        args.evidence.write_text(json.dumps(summary, indent=2) + "\n")
-    print(json.dumps(summary, indent=2))
-    return code
+    return _load_by_path("acceptance", Path(__file__).resolve().parent / "acceptance.py")
 
 
 def _repo_root() -> Path:
@@ -6641,17 +6666,22 @@ def main(argv: list[str] | None = None) -> int:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return int(module.main(args))
-    if args.mode == "accept":
-        return accept(args)
+    if args.mode == "acceptance":
+        acceptance = _acceptance_module()
+        if args.dry_run:
+            return int(acceptance.dry_run(args.pairing, sys.stdout))
+        return int(acceptance.run(args))
     driver: ScenarioDriver | None = None
     issue_spec: tuple[str, str] | None = None
     expect = "any"
     expect_causes: list[str] = []
     expect_reasons: list[str] = []
     revision_text: str | None = None
+    forge: str | None = None
     try:
         if args.mode == "run":
             driver = resolve_scenario(args.scenario)
+            forge = loop_forge(args.scenario, args.forge)
             if args.scenario == "issue-to-pr":
                 if args.issue_file is None:
                     print(
@@ -6685,7 +6715,7 @@ def main(argv: list[str] | None = None) -> int:
                         raise ConfigError(
                             f"cannot read the revision file {args.revision_file}: {exc.strerror}"
                         ) from None
-            elif args.scenario in {entry.scenario for entry in FORGES.values()}:
+            elif args.scenario in LOOP_SCENARIOS:
                 issue_spec = (
                     parse_issue_file(args.issue_file)
                     if args.issue_file is not None
@@ -6704,12 +6734,16 @@ def main(argv: list[str] | None = None) -> int:
                     if args.issue_file is not None
                     else DEFAULT_CANCEL_RUNNING_ISSUE
                 )
-        config = load_config(os.environ, context=args.context)
+        if args.mode == "run" and args.scenario == "tls-code-host":
+            # The stub code host run reads only a model key and a context.
+            config = load_tls_code_host().load_tls_config(os.environ, context=args.context)
+        else:
+            config = load_config(os.environ, context=args.context)
         if args.model_base_url:
             config = dataclasses.replace(config, model_base_url=args.model_base_url)
         if args.mode == "run" and (
             args.scenario in ("revision", "cancel-running", "evaluation", "quiesce")
-            or args.scenario in {entry.scenario for entry in FORGES.values()}
+            or args.scenario in LOOP_SCENARIOS
         ):
             if not config.model_api_key:
                 raise ConfigError(
@@ -6732,7 +6766,7 @@ def main(argv: list[str] | None = None) -> int:
         namespace = (
             validate_namespace(args.namespace) if args.namespace else default_namespace(candidate)
         )
-    except ScenarioUnavailable as exc:
+    except (ScenarioUnavailable, ForgeNotInstalled) as exc:
         print(f"factory-e2e: {exc}", file=sys.stderr)
         return EXIT_SCENARIO
     except (ConfigError, PreflightFailed) as exc:
@@ -6758,6 +6792,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.mode == "run":
         preflight.evidence["mode"] = f"run:{args.scenario}"
+    if forge is not None:
+        preflight.evidence["forge"] = forge
 
     def _terminate(signum: int, _frame: Any) -> None:
         raise SystemExit(128 + signum)
@@ -6799,6 +6835,8 @@ def main(argv: list[str] | None = None) -> int:
         results = preflight.teardown.run()
         preflight.evidence["teardown"] = results
         preflight.evidence["teardown_clean"] = all(r["ok"] for r in results)
+        # By step name, so a check can name one step by a dotted evidence path.
+        preflight.evidence["teardown_ok"] = {r["step"]: r["ok"] for r in results}
         preflight.evidence["finished_at"] = dt.datetime.now(dt.UTC).isoformat(timespec="seconds")
         shutil.rmtree(preflight.workdir, ignore_errors=True)
         preflight.write_evidence()
@@ -6813,6 +6851,29 @@ def main(argv: list[str] | None = None) -> int:
 
 
 load_forge_entries()
+
+TLS_CODE_HOST_MODULE = Path(__file__).resolve().parent / "tls_code_host.py"
+
+
+def load_tls_code_host() -> Any:
+    """The tls-code-host scenario module, loaded once under its own name."""
+
+    module = sys.modules.get("tls_code_host")
+    if module is None:
+        spec = importlib.util.spec_from_file_location("tls_code_host", TLS_CODE_HOST_MODULE)
+        if spec is None or spec.loader is None:
+            raise ConfigError(f"cannot load {TLS_CODE_HOST_MODULE}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["tls_code_host"] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            del sys.modules["tls_code_host"]
+            raise
+    return module
+
+
+SCENARIOS["tls-code-host"] = load_tls_code_host().drive
 
 if __name__ == "__main__":
     sys.exit(main())

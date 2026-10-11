@@ -355,7 +355,11 @@ def _fail_one_persisted(evidence: dict[str, Any]) -> dict[str, Any]:
             lambda: _Runner({**_passing_evidence(), "teardown_clean": False}),
             _Kubectl,
         ),
-        ("persisted assertion", lambda: _Runner(_fail_one_persisted(_passing_evidence())), _Kubectl),
+        (
+            "persisted assertion",
+            lambda: _Runner(_fail_one_persisted(_passing_evidence())),
+            _Kubectl,
+        ),
         ("namespace remains", lambda: _Runner(_passing_evidence()), lambda: _Kubectl(gone=False)),
         ("no evidence", lambda: _Runner(None, code=fe.EXIT_FAILED), _Kubectl),
     ],
