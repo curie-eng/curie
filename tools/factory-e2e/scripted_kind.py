@@ -19,6 +19,7 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -35,6 +36,7 @@ TRANSCRIPT = REPO_ROOT / "tools/model-script/transcripts/unitconv-issue.json"
 IMAGES = ("curie-api:local", "curie-worker:local", "curie-ui:local", "curie-runner:latest")
 BOUND_SECONDS = 2400
 RECORD_BUDGET_USD = 20
+RECORD_REQUEST_RESERVE_USD = 1.0
 RECORD_ATTEMPTS = 3
 
 
@@ -59,6 +61,12 @@ def validate_configuration(args: argparse.Namespace) -> None:
             raise fe.ConfigError("recording requires CURIE_FACTORY_RECORD_KEY")
     elif not Path(args.transcript).is_file():
         raise fe.ConfigError(f"transcript {args.transcript} is missing; use scripted --record")
+    else:
+        loader = Path(__file__).resolve().parents[2] / "tools/model-script/model_script.py"
+        try:
+            _module("factory_model_script_check", loader).load_transcript(Path(args.transcript))
+        except (OSError, ValueError) as exc:
+            raise fe.ConfigError(f"transcript {args.transcript} is malformed: {exc}") from None
 
 
 def scripted_values(
@@ -191,6 +199,7 @@ class ScriptedRun:
         self.record_ledger: Path | None = None
         self.record_namespace = os.environ.get("FACTORY_RUN_ID", self.run_id)
         self.record_error: str | None = None
+        self.admission_lock = threading.Lock()
 
     def check_disk(self, stage: str) -> None:
         if shutil.disk_usage("/").free < 30 * 1024**3:
@@ -294,16 +303,21 @@ class ScriptedRun:
             )
         self.record_ledger = ledger
 
-    def assert_record_budget(self, remaining: float) -> None:
+    def assert_record_budget(self, remaining: float, reserve: float = 0.0) -> None:
         assert self.record_budget_start is not None
-        if self.record_budget_start - remaining >= RECORD_BUDGET_USD:
+        spent = self.record_budget_start - remaining
+        if spent >= RECORD_BUDGET_USD or (reserve and spent + reserve > RECORD_BUDGET_USD):
             raise fe.ConfigError("recording reached its total 20 USD provider budget")
 
     def record_model_call(self) -> None:
         """Charge one attempt at its first forwarded model request."""
 
         assert self.record_ledger is not None
-        self.assert_record_budget(self.provider_remaining())
+        with self.admission_lock:
+            self.admit_model_call()
+
+    def admit_model_call(self) -> None:
+        self.assert_record_budget(self.provider_remaining(), RECORD_REQUEST_RESERVE_USD)
         with sqlite3.connect(self.record_ledger) as database:
             database.execute("BEGIN IMMEDIATE")
             calls = database.execute(

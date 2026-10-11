@@ -263,6 +263,13 @@ def dump_transcript(path: Path, exchanges: list[dict[str, Any]]) -> None:
     )
 
 
+class _JoiningHTTPServer(ThreadingHTTPServer):
+    """Keeps handler threads joinable so close waits for in-flight exchanges."""
+
+    daemon_threads = False
+    block_on_close = True
+
+
 class ModelScript:
     """One loopback or pod-facing Messages server."""
 
@@ -317,7 +324,7 @@ class ModelScript:
                     return
                 script._serve(self, path, body)
 
-        self._server = ThreadingHTTPServer((host, port), Handler)
+        self._server = _JoiningHTTPServer((host, port), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._closed = False
 
