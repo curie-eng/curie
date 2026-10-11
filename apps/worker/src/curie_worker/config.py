@@ -1171,6 +1171,12 @@ class WorkerConfig(BaseSettings):
         default="https://api.github.com",
         validation_alias="CURIE_PUBLICATION_GITHUB_API_URL",
     )
+    # PEM file of a private CA for a GitHub stub; the worker hands its text to
+    # every publication Job. Empty keeps the runner image's default trust.
+    publication_github_ca_file: str = Field(
+        default="",
+        validation_alias="CURIE_PUBLICATION_GITHUB_CA_FILE",
+    )
 
     @property
     def publication_github_html_base(self) -> str:

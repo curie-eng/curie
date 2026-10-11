@@ -92,6 +92,11 @@
 # region as bundle fetches, with static credentials or web identity. Removing
 # either service's region must fail the same rendered-manifest assertion.
 #
+# Issue #4394, Assertion 25. With api.githubStubCaConfigMap set, the worker
+# points CURIE_PUBLICATION_GITHUB_CA_FILE at the CA it already mounts so the
+# publication Job trusts the same GitHub stub. Unset renders no variable, and
+# removing it while the value is set must fail the same assertion.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -3609,5 +3614,83 @@ for component in ("api", "worker"):
     print(f"  ok: missing {component} S3_REGION is rejected")
 PYEOF
 
+echo "=== Assertion 25: worker hands the GitHub stub CA to publication Jobs (#4394) ==="
+python3 - "$CHART" <<'PYEOF'
+import copy
+import posixpath
+import subprocess
+import sys
+
+import yaml
+
+chart = sys.argv[1]
+env_name = "CURIE_PUBLICATION_GITHUB_CA_FILE"
+ca_path = "/etc/curie/github-stub/ca.pem"
+
+
+def worker_container(documents):
+    workers = [
+        doc for doc in documents
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "worker"
+    ]
+    assert len(workers) == 1, f"expected one worker Deployment, found {len(workers)}"
+    containers = [
+        container for container in workers[0]["spec"]["template"]["spec"]["containers"]
+        if container["name"] == "worker"
+    ]
+    assert len(containers) == 1, f"expected one worker container, found {len(containers)}"
+    return containers[0]
+
+
+def ca_entries(documents):
+    return [entry for entry in worker_container(documents)["env"] if entry["name"] == env_name]
+
+
+def assert_ca_file(documents):
+    entries = ca_entries(documents)
+    assert entries == [{"name": env_name, "value": ca_path}], (
+        f"worker {env_name} must equal {ca_path!r} exactly once, found {entries!r}"
+    )
+    mounts = [
+        mount for mount in worker_container(documents).get("volumeMounts", [])
+        if mount["name"] == "github-stub-ca"
+    ]
+    assert len(mounts) == 1, f"expected one worker github-stub-ca mount, found {mounts!r}"
+    assert posixpath.dirname(ca_path) == mounts[0]["mountPath"], (
+        f"{env_name} directory must equal the github-stub-ca mountPath {mounts[0]['mountPath']!r}"
+    )
+
+
+def render(*args):
+    result = subprocess.run(
+        ["helm", "template", "acme", chart, *args],
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return list(yaml.safe_load_all(result.stdout))
+
+
+default = render()
+assert ca_entries(default) == [], f"default render must not set {env_name}"
+print(f"  ok: default render gives the worker no {env_name}")
+
+configured = render("--set", "api.githubStubCaConfigMap=github-stub-ca")
+assert_ca_file(configured)
+print(f"  ok: api.githubStubCaConfigMap renders {env_name}={ca_path} inside the worker's mounted CA directory")
+
+mutant = copy.deepcopy(configured)
+container = worker_container(mutant)
+container["env"] = [entry for entry in container["env"] if entry["name"] != env_name]
+try:
+    assert_ca_file(mutant)
+except AssertionError as error:
+    assert env_name in str(error), str(error)
+else:
+    raise AssertionError(f"a configured render without {env_name} passed the CA assertion")
+print(f"  ok: negative control, a configured render without {env_name} is rejected")
+PYEOF
+
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate, the API uses RollingUpdate with maxUnavailable 0 and maxSurge 1 plus a preStop sleep 5, proven by both removed-block negative controls, and other workloads keep their strategies; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate, the API uses RollingUpdate with maxUnavailable 0 and maxSurge 1 plus a preStop sleep 5, proven by both removed-block negative controls, and other workloads keep their strategies; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls; and api.githubStubCaConfigMap points the worker's CURIE_PUBLICATION_GITHUB_CA_FILE at its mounted stub CA and is absent by default, proven by a failing negative control."
