@@ -365,6 +365,69 @@ def test_record_close_waits_for_an_in_flight_exchange_before_writing(
         server_thread.join(timeout=5)
 
 
+def test_record_close_fails_when_the_in_flight_drain_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exhausted drain must fail close() after saving the completed exchanges.
+
+    Returning normally would let a recording run pass with an exchange the
+    provider charged for but the transcript never received.
+    """
+
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-provider-key")
+    monkeypatch.setattr(ms, "CLOSE_DRAIN_TIMEOUT_S", 0.3)
+    held = threading.Event()
+    release = threading.Event()
+
+    class Provider(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            if json.loads(raw)["messages"][0]["content"] == "hold the provider":
+                held.set()
+                release.wait(timeout=10)
+            payload = json.dumps(_message("Edit", "recorded")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    output = tmp_path / "recorded.json"
+    recorder = ms.ModelScript(
+        output, record=True, upstream=f"http://127.0.0.1:{server.server_address[1]}"
+    )
+    recorder.start()
+    client = threading.Thread(
+        target=lambda: _post(recorder.base_url, _request("system", "hold the provider")),
+        daemon=True,
+    )
+    try:
+        status, body, _ = _post(recorder.base_url, _request("system", "add Kelvin"))
+        assert status == 200
+        assert b"Edit" in body
+        client.start()
+        assert held.wait(timeout=5)
+        returned, errors = _close_within(recorder, 5)
+        assert returned, "close() must stay bounded by the drain timeout"
+        assert not release.is_set(), "the held request must still be in flight at close"
+        assert len(errors) == 1, "close() must fail when the drain times out"
+        assert "drain" in str(errors[0]).lower()
+        saved = json.loads(output.read_text())
+        assert [exchange["lane_key"] for exchange in saved["exchanges"]] == ["add Kelvin"]
+    finally:
+        release.set()
+        client.join(timeout=5)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
 def _close_within(script: Any, seconds: float) -> tuple[bool, list[BaseException]]:
     """Run close() off-thread and report whether it returned in time."""
 

@@ -818,6 +818,182 @@ def test_real_proxy_forwards_concurrent_requests_serially_with_ample_budget(
         model.close()
 
 
+def _cross_run_proxy_requests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining_after: list[float],
+    module_name: str,
+) -> tuple[list[sk.ScriptedRun], Any, list[Any], dict[str, int], dict[str, int]]:
+    """Send one request through each of two recording runs at once.
+
+    The runs are separate ScriptedRun instances with their own proxies,
+    run namespaces and forward locks, sharing only the SQLite ledger under
+    one XDG_STATE_HOME and repository, as two worktrees recording at once
+    would. The fake provider records how many upstream calls were open at
+    once across both runs, and its balance drops to the next value in
+    ``remaining_after`` each time an upstream response completes.
+    """
+
+    model_module = sk._module(module_name, REPO_ROOT / "tools/model-script/model_script.py")
+    runs = [
+        _recording_run(tmp_path, monkeypatch, run_id=run_id, remaining=50)
+        for run_id in ("first-run", "second-run")
+    ]
+    assert runs[0].record_ledger == runs[1].record_ledger
+    assert all(run.record_budget_start == 50 for run in runs)
+    counts = {"open": 0, "max_open": 0, "completed": 0}
+    counts_lock = threading.Lock()
+    message = {"type": "message", "content": [{"type": "text", "text": "done"}]}
+
+    class ProviderResponse:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self) -> ProviderResponse:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            with counts_lock:
+                counts["open"] -= 1
+                counts["completed"] += 1
+
+        def read(self) -> bytes:
+            return json.dumps(message).encode()
+
+    def provider(_request: Request, **_kwargs: Any) -> ProviderResponse:
+        with counts_lock:
+            counts["open"] += 1
+            counts["max_open"] = max(counts["max_open"], counts["open"])
+        time.sleep(0.5)
+        return ProviderResponse()
+
+    def remaining() -> float:
+        with counts_lock:
+            return remaining_after[min(counts["completed"], len(remaining_after) - 1)]
+
+    monkeypatch.setattr(model_module, "urlopen", provider)
+    models = []
+    for index, run in enumerate(runs):
+        model = model_module.ModelScript(tmp_path / f"record-{index}.json", record=True)
+        run.model = model
+        run.count_recording_requests(model_module)
+        monkeypatch.setattr(run, "provider_remaining", remaining)
+        model.start()
+        models.append(model)
+    statuses: dict[str, int] = {}
+    barrier = threading.Barrier(2)
+
+    def client(name: str, base_url: str) -> None:
+        request = Request(
+            base_url + "/v1/messages",
+            data=json.dumps({"messages": [{"role": "user", "content": name}]}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        barrier.wait(timeout=5)
+        try:
+            with urlopen(request, timeout=10) as response:
+                assert json.load(response)["type"] == "message"
+                statuses[name] = response.status
+        except HTTPError as exc:
+            statuses[name] = exc.code
+            exc.close()
+
+    clients = [
+        threading.Thread(target=client, args=(name, model.base_url), daemon=True)
+        for name, model in zip(("first-run", "second-run"), models, strict=True)
+    ]
+    for thread in clients:
+        thread.start()
+    for thread in clients:
+        thread.join(timeout=15)
+    assert not any(thread.is_alive() for thread in clients)
+    return runs, model_module, models, statuses, counts
+
+
+def _close_models(model_module: Any, models: list[Any], refused: set[int]) -> None:
+    for index, model in enumerate(models):
+        try:
+            model.close()
+        except model_module.UnexpectedRequest:
+            assert index in refused, "an admitted run must close without a refusal"
+        else:
+            assert index not in refused, "the refused request must be reported at close"
+
+
+def test_recording_runs_sharing_a_ledger_admit_one_upstream_call_at_a_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Admission across worktrees must see the credit left by the other run.
+
+    Budget start is 50. Whichever run is admitted first does so at a 17 USD
+    drop. Once its upstream call completes the drop is 19, so with the 2 USD
+    reserve the other run must be refused. A per-run lock lets both runs pass
+    the credit check on the stale balance and spend past the 20 USD budget.
+    """
+
+    runs, model_module, models, statuses, counts = _cross_run_proxy_requests(
+        tmp_path, monkeypatch, [33.0, 31.0], "factory_cross_run_refuse_model_script"
+    )
+    refused = {index for index, run in enumerate(runs) if run.record_error is not None}
+    try:
+        assert counts["max_open"] == 1
+        assert counts["completed"] == 1
+        assert sorted(statuses.values()) == [200, 422]
+        assert len(refused) == 1
+        (refused_run,) = (runs[index] for index in refused)
+        assert refused_run.record_error is not None
+        assert "20 USD" in refused_run.record_error
+        assert statuses[refused_run.record_namespace] == 422
+        assert sum(run.evidence["recording_model_calls"] for run in runs) == 1
+    finally:
+        _close_models(model_module, models, refused)
+
+
+def test_recording_runs_sharing_a_ledger_forward_serially_with_ample_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cross-run lock must not refuse or drop a request that fits the budget."""
+
+    runs, model_module, models, statuses, counts = _cross_run_proxy_requests(
+        tmp_path, monkeypatch, [45.0], "factory_cross_run_admit_model_script"
+    )
+    try:
+        assert counts["max_open"] == 1
+        assert counts["completed"] == 2
+        assert statuses == {"first-run": 200, "second-run": 200}
+        assert all(run.record_error is None for run in runs)
+        assert [run.evidence["recording_model_calls"] for run in runs] == [1, 1]
+        assert all(model.unexpected == [] for model in models)
+    finally:
+        _close_models(model_module, models, set())
+
+
+def test_driver_pins_the_local_docker_engine_over_an_inherited_remote_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """kind, docker and the registry must all talk to the same local engine."""
+
+    monkeypatch.setenv("DOCKER_CONTEXT", "remote-box")
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    assert run.env["DOCKER_CONTEXT"] == "default"
+
+
+def test_driver_pins_the_default_docker_context_and_keeps_an_inherited_docker_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default context is the engine DOCKER_HOST names, so keep DOCKER_HOST."""
+
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    monkeypatch.setenv("DOCKER_HOST", "unix:///run/example/docker.sock")
+    run = sk.ScriptedRun(_replay_args(tmp_path))
+    assert run.env["DOCKER_CONTEXT"] == "default"
+    assert run.env["DOCKER_HOST"] == "unix:///run/example/docker.sock"
+
+
 @pytest.mark.parametrize("remaining", [None, -1, "nan", "inf"])
 def test_provider_balance_requires_an_observed_finite_remaining_limit(
     tmp_path: Path,
