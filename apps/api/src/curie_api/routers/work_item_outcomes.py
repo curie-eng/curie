@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 
 from curie_api.crud import agents as crud_agents
 from curie_api.schemas.workitems import WorkItemOutcomeList, WorkItemOutcomeOut, WorkItemUsageOut
@@ -21,7 +21,8 @@ from ..auth import require_api_key
 from ..code_host_trust import code_host_verify
 from ..config import get_settings
 from ..deps import SessionDep
-from ..forges.hosts import code_host_for
+from ..forges.hosts import factory_code_host
+from ..forges.registry import ForgeRegistry
 
 router = APIRouter(
     prefix="/work-items",
@@ -51,6 +52,7 @@ async def list_work_items(
 @router.get("/{work_item_id}", response_model=WorkItemOutcomeOut)
 async def get_work_item(
     work_item_id: uuid.UUID,
+    request: Request,
     session: SessionDep,
     response: Response,
     agent_id: uuid.UUID | None = None,
@@ -63,11 +65,17 @@ async def get_work_item(
     if loaded is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
     view, item, lineage = loaded
+    registry: ForgeRegistry = request.app.state.forges
     async with httpx.AsyncClient(verify=code_host_verify(settings)) as client:
+        code_host = (
+            factory_code_host(
+                registry, client, installations=factory_ci.stored_installation(lineage, item)
+            )
+            if registry.github_code_host() is not None
+            else None
+        )
         view.ci = await workitem_outcomes.observe_ci(
-            code_host_for(
-                settings, client, installations=factory_ci.stored_installation(lineage, item)
-            ),
+            code_host,
             settings,
             lineage,
             item,

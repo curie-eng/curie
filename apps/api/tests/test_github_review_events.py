@@ -1134,6 +1134,8 @@ def test_review_ingress_truth_mints_with_the_settings_credential(
 
     settings_key, code_host_key = _pem_key(), _pem_key()
     forges = forges_env_json(forges_document(app_id="2222", private_key=code_host_key), tmp_path)
+    # Capture before the stack patches `httpx.Client` (the patch is module-global).
+    real_client = httpx.Client
     with _review_stack(
         request,
         monkeypatch,
@@ -1151,7 +1153,6 @@ def test_review_ingress_truth_mints_with_the_settings_credential(
                 issuers.append(str(claims["iss"]))
             return truth.handle(github_request)
 
-        real_client = httpx.Client
         monkeypatch.setattr(
             "curie_api.github_app.httpx.Client",
             lambda *a, **kw: real_client(transport=httpx.MockTransport(recording)),

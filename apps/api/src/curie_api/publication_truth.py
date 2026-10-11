@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 import httpx
@@ -20,7 +20,7 @@ from curie_api.crud import lineages as crud_lineages
 from .config import Settings
 from .forges.github.transport import github_headers, repository_identity_matches
 from .forges.types import GITHUB
-from .github_app import GitHubAppError, GitHubCredentials
+from .github_app import GitHubAppError, GitHubAuth, GitHubCredentials
 from .models import Deployment, ExecutionRequest, ThreadPublicationLineage, WorkItem
 from .repo_full_name import repo_url_path
 
@@ -221,14 +221,9 @@ async def read_publication_metadata(
 
     # This resolver has its own short request budget. Reusing the general
     # resolver would inherit its longer configured timeout and shared locks.
+    auth = GitHubAuth.from_settings(settings)
     resolver = GitHubCredentials(
-        settings=settings.model_copy(
-            update={
-                "github_app_timeout_seconds": min(
-                    settings.github_app_timeout_seconds, _PROVIDER_TIMEOUT_SECONDS
-                ),
-            }
-        )
+        auth=replace(auth, timeout_s=min(auth.timeout_s, _PROVIDER_TIMEOUT_SECONDS))
     )
     try:
         async with asyncio.timeout(PRECHECK_TIMEOUT_SECONDS):

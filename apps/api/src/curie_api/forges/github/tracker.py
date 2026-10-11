@@ -39,7 +39,6 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from curie_api.config import Settings
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
 from curie_api.forges.errors import NotFound, Unauthorized, Unavailable, Unsupported
 from curie_api.forges.github.comments import GitHubMarkedComments, TokenSource
@@ -244,28 +243,6 @@ class GitHubTracker:
             repository_id=repository_id,
             token=token,
             app_id=app_id,
-        )
-
-    @classmethod
-    def from_settings(
-        cls,
-        settings: Settings,
-        client: httpx.AsyncClient,
-        *,
-        repo_full_name: str,
-        repository_id: int,
-        token: TokenSource,
-    ) -> GitHubTracker:
-        return cls(
-            client,
-            api=settings.github_api_url,
-            html_base=settings.github_html_base,
-            repo_full_name=repo_full_name,
-            repository_id=repository_id,
-            token=token,
-            label=settings.github_factory_label,
-            mention=settings.github_factory_mention,
-            app_id=settings.github_app_id,
         )
 
     @property

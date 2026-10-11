@@ -56,11 +56,12 @@ from .forges.github.marked_comments import (
     patch_comment,
     subject_title,
 )
-from .forges.github.tracker import GitHubTracker
 from .forges.github.transport import github_headers
+from .forges.hosts import factory_credentials, factory_tracker
 from .forges.ports import Tracker
+from .forges.registry import forges_registry
 from .forges.types import GITHUB, ReplyTarget, TrackerIssueRef
-from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
+from .github_app import GitHubAppError, GitHubInstallationRefused
 from .models import (
     ExecutionRequest,
     ExecutionRequestPhaseReport,
@@ -798,17 +799,19 @@ async def _sync_one(
     if claim.tracker_issue.kind != GITHUB or claim.code_host_installation_id is None:
         # Only the GitHub tracker posts status comments today.
         return 0
+    registry = forges_registry(settings)
     try:
+        intake = factory_tracker(registry)
         token = await run_in_threadpool(
-            credentials_for(settings).token_for_verified_installation,
+            factory_credentials(registry).token_for_verified_installation,
             claim.repository_path,
             claim.code_host_installation_id,
         )
-    except (GitHubInstallationRefused, GitHubAppError, ValueError):
+    except (ForgeError, GitHubInstallationRefused, GitHubAppError, ValueError):
         return 0
     github = GitHubCommentClient(
         client=client,
-        api=settings.github_api_url.rstrip("/"),
+        api=intake.config.api_url.rstrip("/"),
         repo_path=f"/repos/{repo_url_path(claim.repository_path)}",
         headers=github_headers(token),
     )
@@ -816,8 +819,7 @@ async def _sync_one(
     if row.finalized_at is None:
         writes += await _sync_comment(github, claim)
     if claim.latest and row.refused_at is None:
-        tracker = GitHubTracker.from_settings(
-            settings,
+        tracker = intake.for_repository(
             client,
             repo_full_name=claim.repository_path,
             repository_id=int(claim.tracker_issue.scope_id),
@@ -999,7 +1001,7 @@ async def _render(
     elif request.status in {"waiting", "running", "cancellation_requested"} and pending_count:
         word = "revision" if pending_count == 1 else "revisions"
         waiting_line = f"{pending_count} {word} waiting on this run."
-    base = settings.github_factory_card_base_url
+    base = forges_registry(settings).card_base_url
     body = status_body(
         request_id=row.execution_request_id,
         card_url=f"{base}/v1/factory/cards/{row.card_token}.svg" if base else None,

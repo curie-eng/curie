@@ -33,9 +33,11 @@ from .config import Settings
 from .forges.errors import Unavailable
 from .forges.github.binding import GITHUB_CHANNEL_KIND
 from .forges.github.comments import static_token
-from .forges.github.tracker import GitHubTracker, last_label_event, read_repository
+from .forges.github.tracker import last_label_event, read_repository
+from .forges.hosts import factory_credentials, factory_tracker
 from .forges.identity import reconcile_delivery_id
-from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
+from .forges.registry import forges_registry
+from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import FactoryNotice
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable, human_sender
 from .models import AgentChannel
@@ -99,18 +101,19 @@ async def _reconcile_repository(
     repo: str,
     now: datetime,
 ) -> int:
-    label = settings.github_factory_label
+    registry = forges_registry(settings)
+    intake = factory_tracker(registry)
+    label = intake.config.label
     installation_id, token = await run_in_threadpool(
-        credentials_for(settings).fresh_installation_token, repo, None
+        factory_credentials(registry).fresh_installation_token, repo, None
     )
     repository = await read_repository(
-        client, api=settings.github_api_url, repo_full_name=repo, token=token
+        client, api=intake.config.api_url, repo_full_name=repo, token=token
     )
     repository_id = repository.get("id")
     if type(repository_id) is not int or repository_id <= 0:
         raise Unavailable(f"/repos/{repo}")
-    tracker = GitHubTracker.from_settings(
-        settings,
+    tracker = intake.for_repository(
         client,
         repo_full_name=repo,
         repository_id=repository_id,
@@ -133,7 +136,7 @@ async def _reconcile_repository(
             for number in numbers
             if await github_factory.work_item_for(session, tracker.issue(number)) is None
         ]
-    grace = timedelta(seconds=settings.github_factory_reconcile_grace_s)
+    grace = timedelta(seconds=settings.factory_reconcile_grace_s)
     admitted = 0
     for number in missing:
         try:
@@ -183,7 +186,7 @@ async def _admit(
 ) -> bool:
     async with sessionmaker() as session:
         try:
-            issue = github_factory.notice_issue(notice, settings)
+            issue = github_factory.notice_issue(notice, forges_registry(settings))
             await github_factory.lock_issue(session, issue)
             # A delivery may have admitted it since the listing; the lock orders us.
             if await github_factory.work_item_for(session, issue) is not None:

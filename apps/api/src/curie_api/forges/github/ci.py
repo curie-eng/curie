@@ -15,8 +15,7 @@ import anyio
 import httpx
 from curie_telemetry.redact import redact_text
 
-from curie_api.config import Settings
-from curie_api.github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
+from curie_api.github_app import GitHubAppError, GitHubInstallationRefused
 from curie_api.repo_full_name import repo_url_path
 from curie_api.schemas.workitems import WorkItemCiOut
 
@@ -146,9 +145,7 @@ def _mint_and_release(
 
     owns = permit.claim()
     try:
-        minted: tuple[int, str] = resolver.fresh_installation_token(
-            repo_full_name, installation_id
-        )
+        minted: tuple[int, str] = resolver.fresh_installation_token(repo_full_name, installation_id)
         return minted
     finally:
         if owns:
@@ -156,16 +153,17 @@ def _mint_and_release(
 
 
 async def mint_repository_token(
-    settings: Settings, repo_full_name: str, installation_id: int | None, head_sha: str | None
+    credentials: Any, repo_full_name: str, installation_id: int | None, head_sha: str | None
 ) -> tuple[str | None, CiObservation | None]:
     """Mint a CI read token through the bounded credential slots.
 
-    Returns ``(token, None)`` or ``(None, unavailable)``. The token lives only
-    in the caller's local; every failure maps to a fixed reason code. An
-    ``installation_id`` of ``None`` rediscovers the installation.
+    ``credentials`` is the code host's `GitHubCredentials`. Returns ``(token,
+    None)`` or ``(None, unavailable)``. The token lives only in the caller's
+    local; every failure maps to a fixed reason code. An ``installation_id`` of
+    ``None`` rediscovers the installation.
     """
 
-    resolver = credentials_for(settings)
+    resolver = credentials
     if not resolver.app_configured:
         return None, _unavailable("app_not_configured", head_sha)
     if not _CI_CREDENTIAL_GUARD.acquire(blocking=False):
@@ -350,9 +348,7 @@ async def _fetch_job_log(
             request = client.build_request("GET", url)
             for name in ("authorization", "proxy-authorization", "cookie", "x-github-api-version"):
                 request.headers.pop(name, None)
-            download = await client.send(
-                request, stream=True, auth=None, follow_redirects=False
-            )
+            download = await client.send(request, stream=True, auth=None, follow_redirects=False)
             try:
                 if download.status_code != 200:
                     return None
@@ -374,9 +370,11 @@ async def _fetch_job_log(
 
 
 async def read_ci_detail(
-    settings: Settings,
     client: httpx.AsyncClient,
     *,
+    api_url: str,
+    timeout_s: float,
+    credentials: Any,
     repo_full_name: str,
     installation_id: int | None,
     head_sha: str,
@@ -395,7 +393,7 @@ async def read_ci_detail(
     if not SHA_RE.fullmatch(head_sha):
         return _detail_unavailable("no_head_sha", None)
     token, refused = await mint_repository_token(
-        settings, repo_full_name, installation_id, head_sha
+        credentials, repo_full_name, installation_id, head_sha
     )
     if refused is not None:
         return _detail_unavailable(refused.reason or "github_error", head_sha)
@@ -407,7 +405,7 @@ async def read_ci_detail(
     }
     try:
         try:
-            base = f"{settings.github_api_url.rstrip('/')}/repos/{repo_url_path(repo_full_name)}"
+            base = f"{api_url.rstrip('/')}/repos/{repo_url_path(repo_full_name)}"
         except ValueError:
             return _detail_unavailable("github_error", head_sha)
 
@@ -417,7 +415,7 @@ async def read_ci_detail(
                     f"{base}{path}",
                     params=params,
                     headers=headers,
-                    timeout=settings.github_app_timeout_seconds,
+                    timeout=timeout_s,
                     auth=None,
                     follow_redirects=False,
                 )

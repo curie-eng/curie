@@ -25,8 +25,14 @@ def _context(bundle: str) -> ssl.SSLContext:
     return context
 
 
+def verify_for_bundle(bundle: str) -> ssl.SSLContext | bool:
+    """``verify=`` for an httpx client that trusts ``bundle`` beside the public roots."""
+
+    bundle = bundle.strip()
+    return _context(bundle) if bundle else True
+
+
 def code_host_verify(settings: Settings) -> ssl.SSLContext | bool:
     """``verify=`` for an httpx client that reaches a code host."""
 
-    bundle = settings.code_host_ca_bundle.strip()
-    return _context(bundle) if bundle else True
+    return verify_for_bundle(settings.code_host_ca_bundle)

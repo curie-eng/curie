@@ -12,7 +12,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
 from .forges.github.transport import get_github_json, repository_identity_matches
-from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
+from .github_app import GitHubAppError, GitHubCredentials, GitHubInstallationRefused
 from .github_review_events import (
     FeedbackIgnored,
     FeedbackUnavailable,
@@ -72,8 +72,14 @@ async def verify_feedback_truth(
     *,
     settings: Settings,
     client: httpx.AsyncClient,
+    credentials: GitHubCredentials,
+    api_url: str,
 ) -> str:
     """Return the exact current bound PR head, or a payload-free refusal.
+
+    ``credentials`` and ``api_url`` name the GitHub identity the reads use: the
+    install's own for review ingress, the factory code host's for factory
+    review feedback (#4397).
 
     Resource URLs are derived from persisted identity. No claimed webhook or
     REST response URL is fetched, and redirects cannot carry the App token to
@@ -88,7 +94,7 @@ async def verify_feedback_truth(
         raise FeedbackIgnored("lineage_mismatch")
     try:
         token = await run_in_threadpool(
-            credentials_for(settings).token_for_verified_installation,
+            credentials.token_for_verified_installation,
             lineage.repo_full_name,
             lineage.installation_id,
         )
@@ -97,7 +103,7 @@ async def verify_feedback_truth(
     except GitHubAppError:
         raise FeedbackUnavailable("installation_unavailable") from None
 
-    api = settings.github_api_url.rstrip("/")
+    api = api_url.rstrip("/")
     repo_path = f"/repos/{repo_url_path(lineage.repo_full_name)}"
 
     repository = await get_github_json(

@@ -379,7 +379,7 @@ async def create_publication(
             )
         ).all()
         changed_paths = [path for paths in prior_paths for path in paths] + data.changed_paths
-        python_ci = factory_ci.python_ci_policy(settings, data.repo_full_name)
+        python_ci = factory_ci.python_ci_policy(request.app.state.forges, data.repo_full_name)
         unselected = factory_ci.unselected_python_path(changed_paths, python_ci)
         if unselected is not None:
             raise HTTPException(

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 import httpx
@@ -23,7 +23,9 @@ from starlette.concurrency import run_in_threadpool
 from .config import Settings
 from .forges.errors import ForgeError
 from .forges.github.comments import static_token
-from .forges.github.tracker import GitHubTracker, IssueContent
+from .forges.github.tracker import IssueContent
+from .forges.hosts import factory_credentials, factory_tracker
+from .forges.registry import forges_registry
 from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubCredentials
 from .models import MAX_EXECUTION_DEADLINE_SECONDS, ExecutionRequest, WorkItem
@@ -123,24 +125,21 @@ async def read_issue(
     from redirecting the read to a different repository than the WorkItem's.
     """
 
-    resolver = GitHubCredentials(
-        settings=settings.model_copy(
-            update={
-                "github_app_timeout_seconds": min(
-                    settings.github_app_timeout_seconds, _PROVIDER_TIMEOUT_SECONDS
-                ),
-            }
-        )
-    )
     try:
+        registry = forges_registry(settings)
+        intake = factory_tracker(registry)
+        # The factory code host's App, with the provider timeout capped for this read.
+        auth = factory_credentials(registry).auth
+        resolver = GitHubCredentials(
+            auth=replace(auth, timeout_s=min(auth.timeout_s, _PROVIDER_TIMEOUT_SECONDS))
+        )
         async with asyncio.timeout(ISSUE_READ_TIMEOUT_SECONDS):
             token = await run_in_threadpool(
                 resolver.token_for_verified_installation,
                 authority.repo_full_name,
                 authority.github_installation_id,
             )
-            tracker = GitHubTracker.from_settings(
-                settings,
+            tracker = intake.for_repository(
                 client,
                 repo_full_name=authority.repo_full_name,
                 repository_id=authority.github_repository_id,

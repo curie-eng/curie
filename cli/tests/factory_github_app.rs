@@ -373,10 +373,16 @@ impl Fixture {
                 "environment":"dev",
                 "githubAppId":APP_ID,
                 "githubAppExistingSecret":"curie-github-app",
-                "githubFactoryIntake":"poll",
-                "githubFactoryMention":SLUG,
-                "githubFactoryLabel":"curie-factory",
                 "githubRepoAllowlist":["acme/bot"],
+            },
+            "factory": {
+                "intake":"poll",
+                "trackers":[{
+                    "name":"github",
+                    "kind":"github",
+                    "mention":SLUG,
+                    "label":"curie-factory",
+                }],
             }
         })
         .to_string();

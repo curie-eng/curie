@@ -32,7 +32,7 @@ pub struct FactoryIntakeOpts {
     pub webhook_secret: Option<String>,
     /// Agents that get GitHub API egress (`agentSandbox.connectorEgress.<agent>`).
     pub github_api_egress: Vec<String>,
-    /// Set `api.githubFactoryIngressEnabled=false` and nothing else.
+    /// Set `factory.enabled=false` and nothing else.
     pub disable: bool,
     /// Explicit helm `--timeout` seconds; `None` derives it from the release.
     pub timeout_seconds: Option<u64>,
@@ -42,7 +42,7 @@ pub struct FactoryIntakeOpts {
     pub private_key_file: Option<std::path::PathBuf>,
     /// Organization whose registration form the printed link opens.
     pub org: Option<String>,
-    /// `api.githubFactoryIntake` when this run must select a mode. `None`
+    /// `factory.intake` when this run must select a mode. `None`
     /// leaves the recorded value unchanged.
     pub intake: Option<String>,
     /// Digest-pinned runner image bound in the same upgrade as the intake
@@ -212,24 +212,104 @@ pub fn ipv4_cidrs(cidrs: &[String]) -> Vec<String> {
     cidrs.iter().filter(|c| !c.contains(':')).cloned().collect()
 }
 
+/// The chart's removed `api.*` factory keys (#4397), from the one file that
+/// names them. Each is written as null so a `--reuse-values` upgrade sheds it.
+fn legacy_factory_keys() -> Vec<String> {
+    serde_norway::from_str(include_str!(
+        "../../charts/curie/files/legacy-factory-keys.yaml"
+    ))
+    .expect("charts/curie/files/legacy-factory-keys.yaml is a list of dotted chart keys")
+}
+
+/// The name of the one GitHub entry this command writes in
+/// `factory.codeHosts` and `factory.trackers`.
+const GITHUB_ENTRY: &str = "github";
+
+/// The App credential a factory GitHub entry carries: its id and the Secret
+/// holding its private key. The key itself never enters the values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactoryCredential {
+    pub app_id: String,
+    pub secret_name: String,
+    pub secret_key: String,
+}
+
+impl FactoryCredential {
+    fn defaults(app_id: &str) -> Self {
+        Self {
+            app_id: app_id.to_string(),
+            secret_name: crate::factory_app::DEFAULT_SECRET_NAME.to_string(),
+            secret_key: crate::github_app::DEFAULT_APP_KEY_DATA_KEY.to_string(),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "github_app",
+            "appId": self.app_id,
+            "existingSecret": self.secret_name,
+            "existingSecretKey": self.secret_key,
+        })
+    }
+}
+
+/// The host GitHub's API answers for: `github.com` for the public API, else
+/// the API URL's own host (a GitHub Enterprise Server).
+fn github_host(api_url: &str) -> String {
+    if api_url == crate::github_app::DEFAULT_GITHUB_API_URL {
+        return "github.com".to_string();
+    }
+    reqwest::Url::parse(api_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default()
+}
+
+/// Write the GitHub code host and tracker entries. Helm replaces a list
+/// whole, so each list is written complete.
+fn set_github_entries(
+    values: &mut serde_json::Value,
+    credential: &FactoryCredential,
+    label: Option<&str>,
+    mention: Option<&str>,
+) {
+    let api_url = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+    let entry = serde_json::json!({
+        "name": GITHUB_ENTRY,
+        "kind": "github",
+        "host": github_host(&api_url),
+        "apiUrl": api_url,
+        "credential": credential.to_json(),
+    });
+    let mut tracker = entry.clone();
+    if let Some(label) = label {
+        tracker["label"] = serde_json::json!(label);
+    }
+    if let Some(mention) = mention {
+        tracker["mention"] = serde_json::json!(mention);
+    }
+    values["factory"]["codeHosts"] = serde_json::json!([entry]);
+    values["factory"]["trackers"] = serde_json::json!([tracker]);
+}
+
 /// The values document applied with `--reuse-values -f`.
 pub fn intake_values(opts: &FactoryIntakeOpts, cidrs: &[String]) -> serde_json::Value {
     let mut api = serde_json::Map::new();
-    api.insert(
-        "githubFactoryIngressEnabled".into(),
-        serde_json::json!(!opts.disable),
-    );
+    for key in legacy_factory_keys() {
+        if let Some(name) = key.strip_prefix("api.") {
+            api.insert(name.to_string(), serde_json::Value::Null);
+        }
+    }
+    let mut factory = serde_json::Map::new();
+    factory.insert("enabled".into(), serde_json::json!(!opts.disable));
     if opts.disable {
-        return serde_json::json!({ "api": api });
-    }
-    if let Some(label) = &opts.label {
-        api.insert("githubFactoryLabel".into(), serde_json::json!(label));
-    }
-    if let Some(mention) = &opts.mention {
-        api.insert("githubFactoryMention".into(), serde_json::json!(mention));
+        return serde_json::json!({ "api": api, "factory": factory });
     }
     if let Some(url) = &opts.card_base_url {
-        api.insert("githubFactoryCardBaseUrl".into(), serde_json::json!(url));
+        factory.insert("cardBaseUrl".into(), serde_json::json!(url));
+    }
+    if let Some(intake) = &opts.intake {
+        factory.insert("intake".into(), serde_json::json!(intake));
     }
     if !opts.repos.is_empty() {
         api.insert("githubRepoAllowlist".into(), serde_json::json!(opts.repos));
@@ -237,10 +317,13 @@ pub fn intake_values(opts: &FactoryIntakeOpts, cidrs: &[String]) -> serde_json::
     if let Some(secret) = &opts.webhook_secret {
         api.insert("githubWebhookSecret".into(), serde_json::json!(secret));
     }
-    if let Some(intake) = &opts.intake {
-        api.insert("githubFactoryIntake".into(), serde_json::json!(intake));
-    }
-    let mut values = serde_json::json!({ "api": api });
+    let mut values = serde_json::json!({ "api": api, "factory": factory });
+    set_github_entries(
+        &mut values,
+        &FactoryCredential::defaults(opts.app_id.as_deref().unwrap_or_default()),
+        opts.label.as_deref(),
+        opts.mention.as_deref(),
+    );
     if !opts.github_api_egress.is_empty() {
         let rules: Vec<serde_json::Value> = ipv4_cidrs(cidrs)
             .iter()
@@ -371,24 +454,50 @@ fn api_str<'a>(api: &'a serde_json::Value, key: &str) -> &'a str {
     api.get(key).and_then(|v| v.as_str()).unwrap_or("")
 }
 
+const LABEL_KEY: &str = "factory.trackers[github].label";
+const MENTION_KEY: &str = "factory.trackers[github].mention";
+const CARD_KEY: &str = "factory.cardBaseUrl";
+
+/// The recorded `section` map with the planned one laid over it key by key.
+/// A planned list replaces the recorded list whole, as `helm -f` does.
+fn overlay(
+    recorded: &serde_json::Value,
+    planned: &serde_json::Value,
+    section: &str,
+) -> serde_json::Value {
+    let mut merged = recorded
+        .get(section)
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if let Some(over) = planned.get(section).and_then(|v| v.as_object()) {
+        for (k, v) in over {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::Value::Object(merged)
+}
+
+/// The GitHub tracker entry of a `factory` map, if one is configured.
+fn github_tracker(factory: &serde_json::Value) -> Option<&serde_json::Value> {
+    factory
+        .get("trackers")
+        .and_then(|v| v.as_array())?
+        .iter()
+        .find(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("github"))
+}
+
 /// The API's ingress preconditions (apps/api config.py) evaluated against the
-/// recorded helm user values overlaid with the planned `api.*` values.
-/// Returns the offending setting names; empty means the API will start.
+/// recorded helm user values overlaid with the planned `api.*` and
+/// `factory.*` values. Returns the offending setting names; empty means the
+/// API will start.
 pub fn intake_gate_offenders(
     recorded: &serde_json::Value,
     planned: &serde_json::Value,
 ) -> Vec<&'static str> {
-    let mut api = recorded
-        .get("api")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
-    if let Some(over) = planned.get("api").and_then(|v| v.as_object()) {
-        for (k, v) in over {
-            api.insert(k.clone(), v.clone());
-        }
-    }
-    let api = serde_json::Value::Object(api);
+    let api = overlay(recorded, planned, "api");
+    let factory = overlay(recorded, planned, "factory");
+    let tracker = github_tracker(&factory).cloned().unwrap_or_default();
     let mut bad = Vec::new();
     if api_str(&api, "githubAppId").is_empty() {
         bad.push("GITHUB_APP_ID");
@@ -398,7 +507,7 @@ pub fn intake_gate_offenders(
     {
         bad.push("GITHUB_APP_PRIVATE_KEY");
     }
-    let intake = api_str(&api, "githubFactoryIntake");
+    let intake = api_str(&factory, "intake");
     let secret = api_str(&api, "githubWebhookSecret");
     let security_values = if planned.pointer("/security/allowDevDefaults").is_some() {
         planned
@@ -415,12 +524,12 @@ pub fn intake_gate_offenders(
     if published_secret || (intake == "webhook" && secret.trim().is_empty()) {
         bad.push("GITHUB_WEBHOOK_SECRET");
     }
-    let label = api_str(&api, "githubFactoryLabel");
+    let label = api_str(&tracker, "label");
     if label.is_empty() || label.chars().any(char::is_whitespace) || label.chars().count() > 50 {
-        bad.push("GITHUB_FACTORY_LABEL");
+        bad.push(LABEL_KEY);
     }
-    if !valid_github_login(api_str(&api, "githubFactoryMention")) {
-        bad.push("GITHUB_FACTORY_MENTION");
+    if !valid_github_login(api_str(&tracker, "mention")) {
+        bad.push(MENTION_KEY);
     }
     let repos_ok = api
         .get("githubRepoAllowlist")
@@ -433,8 +542,8 @@ pub fn intake_gate_offenders(
         .get("environment")
         .and_then(|v| v.as_str())
         .unwrap_or("dev");
-    if !card_base_url_valid(api_str(&api, "githubFactoryCardBaseUrl"), environment) {
-        bad.push("GITHUB_FACTORY_CARD_BASE_URL");
+    if !card_base_url_valid(api_str(&factory, "cardBaseUrl"), environment) {
+        bad.push(CARD_KEY);
     }
     bad
 }
@@ -483,9 +592,9 @@ fn offender_flag(name: &str) -> &'static str {
             "--app-id <ID> --private-key-file <PATH> (run without them for the App registration link)"
         }
         "GITHUB_WEBHOOK_SECRET" => "--webhook-secret-file",
-        "GITHUB_FACTORY_LABEL" => "--label (no whitespace, 50 chars max)",
-        "GITHUB_FACTORY_MENTION" => "--mention <app-slug> (the App login, no '@')",
-        "GITHUB_FACTORY_CARD_BASE_URL" => {
+        LABEL_KEY => "--label (no whitespace, 50 chars max)",
+        MENTION_KEY => "--mention <app-slug> (the App login, no '@')",
+        CARD_KEY => {
             "--card-base-url https://<host> (no query or fragment; http only for localhost on a dev install)"
         }
         _ => "--repo owner/name",
@@ -516,6 +625,70 @@ fn recorded_api_str(recorded: &serde_json::Value, key: &str) -> Option<String> {
             _ => None,
         })
         .filter(|s| !s.trim().is_empty())
+}
+
+/// A non-blank string field of the recorded GitHub tracker entry.
+fn recorded_tracker_str(recorded: &serde_json::Value, key: &str) -> Option<String> {
+    let factory = recorded.get("factory")?;
+    github_tracker(factory)?
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// The App credential the factory entries carry when this run configures no
+/// App: the recorded App id and the Secret the release already names.
+fn recorded_credential(recorded: &serde_json::Value) -> FactoryCredential {
+    FactoryCredential {
+        app_id: recorded_api_str(recorded, "githubAppId").unwrap_or_default(),
+        secret_name: recorded_api_str(recorded, "githubAppExistingSecret")
+            .unwrap_or_else(|| crate::factory_app::DEFAULT_SECRET_NAME.to_string()),
+        secret_key: recorded_api_str(recorded, "githubAppExistingSecretKey")
+            .unwrap_or_else(|| crate::github_app::DEFAULT_APP_KEY_DATA_KEY.to_string()),
+    }
+}
+
+/// The values this run applies: the intake document, the App's `api.*`
+/// values when it configures one, and the factory entries naming that App.
+/// A label or mention this run leaves unset keeps the recorded one, since the
+/// entry lists are written whole.
+fn planned_values(
+    opts: &FactoryIntakeOpts,
+    cidrs: &[String],
+    recorded: &serde_json::Value,
+    app_plan: Option<&AppPlan>,
+) -> serde_json::Value {
+    let mut values = intake_values(opts, cidrs);
+    if opts.disable {
+        return values;
+    }
+    let credential = match app_plan {
+        Some(plan) => {
+            merge_api(&mut values, &app_values(plan));
+            FactoryCredential {
+                app_id: plan.app_id.clone(),
+                secret_name: plan.secret_name.clone(),
+                secret_key: plan.secret_key.clone(),
+            }
+        }
+        None => recorded_credential(recorded),
+    };
+    let label = opts
+        .label
+        .clone()
+        .or_else(|| recorded_tracker_str(recorded, "label"));
+    let mention = opts
+        .mention
+        .clone()
+        .or_else(|| recorded_tracker_str(recorded, "mention"));
+    set_github_entries(
+        &mut values,
+        &credential,
+        label.as_deref(),
+        mention.as_deref(),
+    );
+    values
 }
 
 fn app_values(plan: &AppPlan) -> serde_json::Value {
@@ -560,7 +733,7 @@ async fn plan_app(
     opts.mention = Some(mention.clone());
     let (label, label_inferred) = match opts.label.clone() {
         Some(label) => (label, false),
-        None => match recorded_api_str(recorded, "githubFactoryLabel") {
+        None => match recorded_tracker_str(recorded, "label") {
             Some(label) => (label, false),
             None => (crate::factory_app::DEFAULT_LABEL.to_string(), true),
         },
@@ -718,6 +891,8 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
     }
     let mut app_plan = None;
     let mut publication = None;
+    // A disable writes no factory entries, so it reads nothing recorded.
+    let mut recorded = serde_json::Value::Null;
     if !opts.disable {
         // Repository auth and inference are a preflight, before any Helm read
         // or context-dependent setup. Reuse its tokens for the setup plan.
@@ -734,7 +909,7 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
                     .await?,
             );
         }
-        let recorded = fetch_release_values(&opts.common)
+        recorded = fetch_release_values(&opts.common)
             .await?
             .unwrap_or(serde_json::Value::Null);
         match &app_args {
@@ -770,10 +945,7 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
         }) {
             publication = None;
         }
-        let mut planned = intake_values(&opts, &[]);
-        if let Some(plan) = &app_plan {
-            merge_api(&mut planned, &app_values(plan));
-        }
+        let planned = planned_values(&opts, &[], &recorded, app_plan.as_ref());
         let offenders = intake_gate_offenders(&recorded, &planned);
         if !offenders.is_empty() {
             let fixes: Vec<String> = offenders
@@ -798,10 +970,7 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
     } else {
         Vec::new()
     };
-    let mut values = intake_values(&opts, &cidrs);
-    if let Some(plan) = &app_plan {
-        merge_api(&mut values, &app_values(plan));
-    }
+    let mut values = planned_values(&opts, &cidrs, &recorded, app_plan.as_ref());
     if let Some(identity) = &publication {
         values["worker"] = serde_json::json!({
             "publication": {

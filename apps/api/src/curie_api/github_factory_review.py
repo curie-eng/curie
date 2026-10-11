@@ -26,7 +26,8 @@ from curie_api.schemas.deployments import WebhookResult
 from . import workitem_dispatch
 from .config import Settings
 from .factory_reply_target import feedback_url
-from .forges.hosts import github_host
+from .forges.hosts import factory_code_host_entry, factory_tracker, github_host
+from .forges.registry import forges_registry
 from .forges.types import GITHUB, PullRequestRef, ReplyTarget
 from .github_factory import lock_issue
 from .github_factory_events import mentions_login
@@ -182,7 +183,8 @@ async def admit_parsed_feedback(
     settings: Settings,
     client: httpx.AsyncClient,
 ) -> WebhookResult:
-    if not mentions_login(feedback.body, settings.github_factory_mention):
+    registry = forges_registry(settings)
+    if not mentions_login(feedback.body, factory_tracker(registry).config.mention):
         raise FeedbackIgnored("ordinary_comment")
     if not repository_is_allowed(feedback.repo_full_name, settings.github_repo_allowlist):
         raise FeedbackIgnored("repository_not_allowed")
@@ -206,7 +208,15 @@ async def admit_parsed_feedback(
         or feedback.installation_id != bound.installation_id
     ):
         raise FeedbackIgnored("installation_mismatch")
-    await verify_feedback_truth(feedback, bound, settings=settings, client=client)
+    code_host = factory_code_host_entry(registry)
+    await verify_feedback_truth(
+        feedback,
+        bound,
+        settings=settings,
+        client=client,
+        credentials=code_host.credentials.credentials,
+        api_url=code_host.config.api_url,
+    )
     # Provider verification can overlap another WorkItem or lineage writer.
     # Keep both current rows locked through admission and reject changed proof.
     current_item = await session.scalar(

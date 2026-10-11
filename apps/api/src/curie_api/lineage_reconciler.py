@@ -39,7 +39,8 @@ from curie_api.forges.ports import CodeHost
 from curie_api.forges.types import PullRequestRef, PullRequestState
 
 from .config import Settings
-from .forges.hosts import code_host_for, pull_request_ref
+from .forges.hosts import factory_code_host, pull_request_ref
+from .forges.registry import forges_registry
 from .models import ThreadPublicationLineage, WorkItem
 
 logger = logging.getLogger(__name__)
@@ -228,7 +229,7 @@ def start_lineage_reconciler(
 
     interval = settings.factory_lineage_reconcile_interval_s
     if not (
-        settings.github_factory_ingress_enabled
+        settings.factory_enabled
         and settings.work_item_reconciler_enabled
         and interval > 0
     ):
@@ -236,7 +237,7 @@ def start_lineage_reconciler(
     reconciler = LineageReconciler(
         sessionmaker,
         settings,
-        lambda: code_host_for(settings, client),
+        lambda: factory_code_host(forges_registry(settings), client),
         interval_seconds=interval,
     )
     return asyncio.create_task(reconciler.run_forever())

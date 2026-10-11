@@ -287,7 +287,14 @@ async def admit_feedback(
     if existing is not None:
         return existing, False
     context = await review_context(session, feedback, settings)
-    await verify_feedback_truth(feedback, context.truth, settings=settings, client=client)
+    await verify_feedback_truth(
+        feedback,
+        context.truth,
+        settings=settings,
+        client=client,
+        credentials=credentials_for(settings),
+        api_url=settings.github_api_url,
+    )
     turn = review_turn(feedback, context)
     inserted = await session.execute(
         insert(GitHubReviewFeedback)
@@ -925,7 +932,14 @@ async def verify_queued_feedback(
     deployment = await session.get(Deployment, deployment_id)
     if deployment is None or deployment.agent_id != row.agent_id or deployment.status != "active":
         raise FeedbackIgnored("deployment_no_longer_authorized")
-    head = await verify_feedback_truth(feedback, context.truth, settings=settings, client=client)
+    head = await verify_feedback_truth(
+        feedback,
+        context.truth,
+        settings=settings,
+        client=client,
+        credentials=credentials_for(settings),
+        api_url=settings.github_api_url,
+    )
     if row.reservation_id is not None:
         reservation = await session.get(PublicationReviewReservation, row.reservation_id)
         if (
@@ -991,6 +1005,8 @@ async def reserve_queued_feedback(
         context.truth,
         settings=settings,
         client=client,
+        credentials=credentials_for(settings),
+        api_url=settings.github_api_url,
     )
     if verified_head != expected_head_sha:
         raise FeedbackIgnored("stale_feedback_head")

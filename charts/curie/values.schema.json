@@ -131,6 +131,27 @@
         }
       }
     },
+    "factory": {
+      "type": "object",
+      "description": "Rendered as CURIE_FORGES (#4397); the api validates the entries. appId stays untyped like api.githubAppId.",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "intake": {"type": "string", "enum": ["poll", "webhook"]},
+        "cardBaseUrl": {"type": "string"},
+        "ciWaitSeconds": {"type": "integer", "minimum": 1, "maximum": 10800},
+        "codeHosts": {"type": "array"},
+        "trackers": {"type": "array"},
+        "bindings": {"type": "array", "items": {"type": "object", "properties": {"repos": {"type": "array", "items": {"type": "object", "properties": {"ci": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "required": {"type": "object", "additionalProperties": false, "required": ["key", "paths"], "properties": {
+              "key": {"type": "string", "minLength": 1},
+              "paths": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+              "pendingKeyPrefix": {"type": ["string", "null"], "minLength": 1}}},
+            "metadataRerunKeys": {"type": "array", "items": {"type": "string", "minLength": 1}}}}}}}}}},
+        "sandboxEgress": {"type": "object"}
+      }
+    },
     "api": {
       "type": "object",
       "properties": {
@@ -149,123 +170,6 @@
           "type": "number",
           "exclusiveMinimum": 0,
           "description": "Positive cadence in seconds for reconciling accepted GitHub review feedback."
-        },
-        "githubFactoryIngressEnabled": {
-          "type": "boolean",
-          "description": "Opt-in gate for GitHub issue admission. Poll mode does not require a webhook secret. Webhook mode requires a non-default webhook secret. The API also validates the App credentials, label, mention login, and allowlist at boot."
-        },
-        "githubFactoryIntake": {
-          "type": "string",
-          "enum": ["poll", "webhook"],
-          "description": "Factory intake mode. poll is the default and reads GitHub on an interval. webhook keeps signed deliveries and the missed-label backstop."
-        },
-        "githubFactoryPollIntervalSeconds": {
-          "type": "number",
-          "exclusiveMinimum": 0,
-          "description": "Seconds between factory poll passes when intake is poll. Must be a positive finite number. Default 45."
-        },
-        "githubFactoryLabel": {
-          "type": "string",
-          "description": "Issue label that requests initial factory admission. Empty while intake is off."
-        },
-        "githubFactoryCardBaseUrl": {
-          "type": "string",
-          "description": "Public https origin GitHub's image proxy fetches the live factory status card from. Empty omits the card image."
-        },
-        "githubFactoryCiWaitSeconds": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 10800,
-          "description": "Seconds a published factory run waits on its pull request's CI, from the push. The execution deadline still caps it."
-        },
-        "githubFactoryBases": {
-          "type": "object",
-          "description": "Bases a factory ticket may start from and target, keyed by owner/name. A repository without an entry may only use its default branch.",
-          "propertyNames": {
-            "pattern": "^[^/]+/[^/]+$"
-          },
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["bases"],
-            "properties": {
-              "bases": {
-                "type": "array",
-                "minItems": 1,
-                "uniqueItems": true,
-                "items": {
-                  "type": "string",
-                  "minLength": 1,
-                  "pattern": "^[^\\s-][^\\s]*$"
-                }
-              },
-              "default_base": {
-                "type": ["string", "null"],
-                "minLength": 1
-              }
-            }
-          }
-        },
-        "githubFactoryMetadataCi": {
-          "type": "object",
-          "description": "Checks and commit statuses that rerun after a pull request metadata edit, keyed by owner/name.",
-          "propertyNames": {
-            "pattern": "^[^/]+/[^/]+$"
-          },
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "checks": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "minLength": 1
-                }
-              },
-              "statuses": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "minLength": 1
-                }
-              }
-            }
-          }
-        },
-        "githubFactoryPythonCi": {
-          "type": "object",
-          "description": "Required Python CI per repository, keyed by owner/name. A repository without an entry is judged on its own checks.",
-          "propertyNames": {
-            "pattern": "^[^/]+/[^/]+$"
-          },
-          "additionalProperties": {
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["check", "paths"],
-            "properties": {
-              "check": {
-                "type": "string",
-                "minLength": 1
-              },
-              "paths": {
-                "type": "array",
-                "minItems": 1,
-                "items": {
-                  "type": "string",
-                  "pattern": "^[^/].*[^/]$|^[^/]$"
-                }
-              },
-              "pendingCheckPrefix": {
-                "type": ["string", "null"],
-                "minLength": 1
-              }
-            }
-          }
-        },
-        "githubFactoryMention": {
-          "type": "string",
-          "description": "GitHub login an authorized human must mention to request another execution. Empty while intake is off."
         },
         "githubRepoAllowlist": {
           "type": "array",

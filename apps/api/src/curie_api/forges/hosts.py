@@ -1,9 +1,10 @@
-"""Build the code host the factory core talks to (ADR 0197, "Two ports").
+"""Build the code host a caller talks to (ADR 0197, "Two ports").
 
-The one place a forge-neutral caller turns settings into a `CodeHost`. Today
-every repository lives on the GitHub the settings name, so ``code_host_for``
-returns the GitHub adapter; the typed binding config replaces these settings
-later in #3831 without changing any caller.
+Two named constructors, and neither falls back to the other (#4397).
+``factory_code_host`` is the factory's: the GitHub code host entry of the forge
+registry, minting with that entry's App. ``code_host_for`` is the non-factory
+publication and workspace paths': the install's own GitHub settings, so
+publication works with no factory config at all.
 """
 
 from __future__ import annotations
@@ -15,10 +16,13 @@ import httpx
 
 from curie_api.config import Settings
 from curie_api.forges import types
-from curie_api.forges.errors import NotFound
+from curie_api.forges.errors import NotFound, Unavailable
 from curie_api.forges.github.code_host import PATH_ID_PREFIX, GitHubCodeHost
+from curie_api.forges.github.connection import GitHubCodeHostConnection, GitHubTrackerConnection
 from curie_api.forges.ports import CodeHost
+from curie_api.forges.registry import ForgeRegistry
 from curie_api.forges.types import PullRequestRef, RepositoryRef, TrackerIssueRef
+from curie_api.github_app import GitHubAuth, GitHubCredentials, credentials_for_auth
 
 
 def code_host_for(
@@ -27,13 +31,70 @@ def code_host_for(
     *,
     installations: Mapping[str, int] | None = None,
 ) -> CodeHost:
-    """The code host for this install's repositories.
+    """The install's own GitHub as a code host, for the non-factory publication
+    and workspace paths. It mints with the install's GitHub settings.
 
     ``installations`` maps a repository path to the App installation stored for
     it, which fences the reads that mint for that repository.
     """
 
-    return GitHubCodeHost(settings, client, installations=installations)
+    auth = GitHubAuth.from_settings(settings)
+    return GitHubCodeHost(
+        client,
+        api_url=auth.api_url,
+        html_base=settings.github_html_base,
+        timeout_s=auth.timeout_s,
+        credentials=credentials_for_auth(auth),
+        installations=installations,
+    )
+
+
+def factory_code_host(
+    registry: ForgeRegistry,
+    client: httpx.AsyncClient,
+    *,
+    installations: Mapping[str, int] | None = None,
+) -> GitHubCodeHost:
+    """The factory's code host: the forge registry's GitHub code host entry.
+
+    Refused ``unavailable`` when no GitHub code host is configured.
+    """
+
+    return factory_code_host_entry(registry).adapter(client, installations=installations)
+
+
+def factory_credentials(registry: ForgeRegistry) -> GitHubCredentials:
+    """The factory's GitHub App resolver: the GitHub code host entry's, which
+    every factory mint uses (tracker reads included; both entries name one App)."""
+
+    return factory_code_host_entry(registry).credentials.credentials
+
+
+def factory_tracker(registry: ForgeRegistry) -> GitHubTrackerConnection:
+    """The factory's GitHub tracker entry. Refused ``unavailable`` when none."""
+
+    connection = registry.github_tracker()
+    if connection is None:
+        raise Unavailable("tracker_unconfigured")
+    return connection
+
+
+def factory_repository(
+    registry: ForgeRegistry, *, path: str, project_id: int | str
+) -> RepositoryRef:
+    """A repository on the factory's GitHub code host, by its stored id and path."""
+
+    host = factory_code_host_entry(registry).config.host
+    return RepositoryRef(types.GITHUB, host, str(project_id), path)
+
+
+def factory_code_host_entry(registry: ForgeRegistry) -> GitHubCodeHostConnection:
+    """The factory's GitHub code host entry. Refused ``unavailable`` when none."""
+
+    connection = registry.github_code_host()
+    if connection is None:
+        raise Unavailable("code_host_unconfigured")
+    return connection
 
 
 def github_host(settings: Settings) -> str:

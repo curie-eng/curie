@@ -1286,16 +1286,35 @@ def install_values(
     values["api"].update(
         {
             "githubWebhookSecret": config.webhook_secret,
-            "githubFactoryIngressEnabled": True,
-            "githubFactoryLabel": config.label,
-            "githubFactoryMention": config.mention,
             "githubAppId": config.app_id,
             "githubAppExistingSecret": app_key_secret,
             "githubRepoAllowlist": [config.repo],
         }
     )
+    # The factory reads its GitHub App from the same Secret git-flow uses, as a
+    # mounted file named by CURIE_FORGES (#4397).
+    credential = {
+        "type": "github_app",
+        "appId": config.app_id,
+        "existingSecret": app_key_secret,
+        "existingSecretKey": "privateKey",
+    }
+    github = {"name": "github", "kind": "github", "host": "github.com", "apiUrl": GITHUB_API}
+    values["factory"] = {
+        "enabled": True,
+        "intake": "poll",
+        "codeHosts": [{**github, "credential": dict(credential)}],
+        "trackers": [
+            {
+                **github,
+                "credential": dict(credential),
+                "label": config.label,
+                "mention": config.mention,
+            }
+        ],
+    }
     if card_base_url:
-        values["api"]["githubFactoryCardBaseUrl"] = card_base_url
+        values["factory"]["cardBaseUrl"] = card_base_url
     runner_values: dict[str, Any] = {"tag": "latest" if local_images else tag}
     if local_images:
         runner_values["image"] = "curie-runner"

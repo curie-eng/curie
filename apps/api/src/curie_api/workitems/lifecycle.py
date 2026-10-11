@@ -24,6 +24,7 @@ from .. import transcripts
 from ..config import get_settings
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
 from ..forges.github.binding import github_reply_route
+from ..forges.registry import forges_registry
 from ..forges.types import RepositoryRef, TrackerIssueRef
 from ..models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
@@ -809,7 +810,12 @@ async def _unchanged_follow_up(
 
     if detail is None or not detail.strip().startswith("No changes needed:"):
         return False
-    clone_base = get_settings().github_clone_base
+    # The objective links the issue under the factory code host's web base
+    # (github_factory._facts), so the comparison reads the same base.
+    code_host = forges_registry(get_settings()).github_code_host()
+    if code_host is None:
+        return False
+    clone_base = code_host.html_base
     repo, issue = work_item.repository_path, int(work_item.tracker_issue_id)
     follow_up = request.reply_target_kind != "issue" or is_issue_follow_up(
         request.objective, repo_full_name=repo, issue_number=issue, clone_base=clone_base

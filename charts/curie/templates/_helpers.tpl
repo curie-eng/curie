@@ -2411,3 +2411,141 @@ true
   value: {{ $path | quote }}
 {{- end }}
 {{- end -}}
+
+{{/* The factory (#4397): factory.* is read through `get`, so a release
+     without the block renders. */}}
+{{- define "curie.factory.mount" -}}/etc/curie/forges{{- end -}}
+
+{{/* A number as a plain string, never in exponent form. */}}
+{{- define "curie.factory.str" -}}
+{{- if kindIs "float64" . }}{{ . | int64 | toString }}{{ else }}{{ . | toString }}{{ end -}}
+{{- end -}}
+
+{{- define "curie.factory.secretField" -}}
+{{- $type := get . "type" | default "github_app" -}}
+{{- if eq $type "oauth_client_credentials" }}client_secret{{ else if eq $type "static_token" }}token{{ else }}private_key{{ end -}}
+{{- end -}}
+
+{{- define "curie.factory.credentials" -}}
+{{- $factory := .Values.factory | default dict -}}
+{{- $found := list -}}
+{{- range $key := list "codeHosts" "trackers" -}}
+{{- range $index, $entry := (get $factory $key | default list) -}}
+{{- $credential := get $entry "credential" | default dict -}}
+{{- $field := include "curie.factory.secretField" $credential -}}
+{{- $path := printf "%s-%s/%s" (snakecase $key) (get $entry "name" | default "" | toString) $field -}}
+{{- $found = append $found (dict "key" $key "index" $index "name" (get $entry "name" | default "") "entry" (omit $entry "credential") "credential" $credential "field" $field "path" $path) -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $found -}}
+{{- end -}}
+
+{{/* .v in snake_case as {"v": ...}; an *Id is a string. */}}
+{{- define "curie.factory.snake" -}}
+{{- $v := .v -}}
+{{- if kindIs "map" $v -}}
+{{- $out := dict -}}
+{{- range $k, $c := $v -}}
+{{- $n := snakecase $k | replace "interval_seconds" "interval_s" -}}
+{{- if has $k (list "components" "reviewFeedbackAllowlist") }}{{ $_ := set $out $n $c }}
+{{- else if hasSuffix "Id" $k }}{{ $_ := set $out $n (include "curie.factory.str" $c) }}
+{{- else }}{{ $_ := set $out $n (include "curie.factory.snake" (dict "v" $c) | fromJson).v }}{{ end -}}
+{{- end -}}
+{{- $v = $out -}}
+{{- else if kindIs "slice" $v -}}
+{{- $out := list -}}
+{{- range $v }}{{ $out = append $out (include "curie.factory.snake" (dict "v" .) | fromJson).v }}{{ end -}}
+{{- $v = $out -}}
+{{- end -}}
+{{- toJson (dict "v" $v) -}}
+{{- end -}}
+
+{{- define "curie.factory.forgesJson" -}}
+{{- $factory := .Values.factory | default dict -}}
+{{- $doc := dict "code_hosts" list "trackers" list "card_base_url" (get $factory "cardBaseUrl" | default "" | toString) -}}
+{{- $_ := set $doc "bindings" (include "curie.factory.snake" (dict "v" (get $factory "bindings" | default list)) | fromJson).v -}}
+{{- range (include "curie.factory.credentials" . | fromJsonArray) -}}
+{{- $out := (include "curie.factory.snake" (dict "v" .entry) | fromJson).v -}}
+{{- $credential := (include "curie.factory.snake" (dict "v" (omit .credential "existingSecret" "existingSecretKey" "privateKey" "clientSecret" "token")) | fromJson).v -}}
+{{- $_ := set $credential "type" (get .credential "type" | default "github_app") -}}
+{{- $_ := set $credential (printf "%s_file" .field) (printf "%s/%s" (include "curie.factory.mount" .) .path) -}}
+{{- $_ := set $out "credential" $credential -}}
+{{- $section := snakecase .key -}}
+{{- $_ := set $doc $section (append (get $doc $section) $out) -}}
+{{- end -}}
+{{- toJson $doc -}}
+{{- end -}}
+
+{{- define "curie.factory.hasCredentials" -}}
+{{- if include "curie.factory.credentials" . | fromJsonArray }}true{{ end -}}
+{{- end -}}
+{{- define "curie.factory.credentialVolume" -}}
+{{- $credentials := include "curie.factory.credentials" . | fromJsonArray -}}
+{{- if $credentials }}
+- name: forge-credentials
+  projected:
+    defaultMode: 0440
+    sources:
+      {{- range $credentials }}
+      {{- $credential := .credential }}
+      - secret:
+          name: {{ get $credential "existingSecret" | quote }}
+          items:
+            - key: {{ get $credential "existingSecretKey" | quote }}
+              path: {{ .path | quote }}
+      {{- end }}
+{{- end }}
+{{- end -}}
+{{- define "curie.factory.credentialMount" -}}
+{{- if include "curie.factory.hasCredentials" . }}
+- name: forge-credentials
+  mountPath: {{ include "curie.factory.mount" . }}
+  readOnly: true
+{{- end }}
+{{- end -}}
+
+{{/* Refuse a removed key set to other than null or its old default, and a removed env name in extraEnv. */}}
+{{- define "curie.factory.legacyKeyGuard" -}}
+{{- range $name := (.Files.Get "files/legacy-factory-env.yaml" | fromYamlArray) -}}
+{{- range $workload := list "api" "worker" -}}
+{{- range (get (get $.Values $workload | default dict) "extraEnv" | default list) -}}
+{{- if eq (get . "name") $name -}}
+{{- fail (printf "%s.extraEnv %s is no longer read; configure the factory under factory.* (repository CI and bases under factory.bindings[].repos[]) and remove the entry" $workload $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- range $key := (.Files.Get "files/legacy-factory-keys.yaml" | fromYamlArray) -}}
+{{- $node := $.Values -}}
+{{- range splitList "." $key }}{{ $node = and (kindIs "map" $node) (get $node .) }}{{ end -}}
+{{- if and $node (not (has (include "curie.factory.str" $node) (list "poll" "45" "1200"))) -}}
+{{- fail (printf "%s is no longer read; configure the factory under factory.* (run `curie cluster factory` to rewrite it, which also sets %s to null)" $key $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "curie.factory.validate" -}}
+{{- include "curie.factory.legacyKeyGuard" . -}}
+{{- $factory := .Values.factory | default dict -}}
+{{- $appId := "" -}}
+{{- with .Values.api.githubAppId }}{{ $appId = include "curie.factory.str" . }}{{ end -}}
+{{- range (include "curie.factory.credentials" . | fromJsonArray) -}}
+{{- $where := printf "factory.%s[%v] (%s)" .key .index .name -}}
+{{- if not (and (get .credential "existingSecret") (get .credential "existingSecretKey")) -}}
+{{- fail (printf "%s credential needs existingSecret and existingSecretKey" $where) -}}
+{{- end -}}
+{{- $own := get .credential "appId" -}}
+{{- if and $appId $own (eq (get .credential "type" | default "github_app") "github_app") (ne (include "curie.factory.str" $own) $appId) -}}
+{{- fail (printf "%s credential appId %s differs from api.githubAppId %s; the factory and git-flow must use one GitHub App" $where (include "curie.factory.str" $own) $appId) -}}
+{{- end -}}
+{{- end -}}
+{{- if get $factory "enabled" -}}
+{{- range $section, $key := dict "tracker" "trackers" "code host" "codeHosts" -}}
+{{- $github := false -}}
+{{- range (get $factory $key | default list) }}{{ if eq (get . "kind" | default "") "github" }}{{ $github = true }}{{ end }}{{ end -}}
+{{- if not $github -}}
+{{- fail (printf "factory.enabled needs a github %s in factory.%s; run `curie cluster factory` to write one" $section $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

@@ -61,9 +61,10 @@ from .forges.github.tracker import (
     read_repository,
 )
 from .forges.github.transport import PollUnavailable
-from .forges.hosts import repository_ref
+from .forges.hosts import factory_credentials, factory_tracker, repository_ref
+from .forges.registry import forges_registry
 from .forges.types import TrackerIssueRef
-from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
+from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import FactoryNotice, mentions_login
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
 from .models import ExecutionRequest, FactoryPollCursor, WorkItem
@@ -168,10 +169,12 @@ async def _poll_repository(
     repo: str,
 ) -> None:
     now = datetime.now(UTC)
+    registry = forges_registry(settings)
+    intake = factory_tracker(registry)
     installation_id, token = await run_in_threadpool(
-        credentials_for(settings).fresh_installation_token, repo, None
+        factory_credentials(registry).fresh_installation_token, repo, None
     )
-    api = settings.github_api_url.rstrip("/")
+    api = intake.config.api_url.rstrip("/")
     repo_path = f"/repos/{repo_url_path(repo)}"
     repository = await read_repository(client, api=api, repo_full_name=repo, token=token)
     repository_id = repository.get("id")
@@ -179,8 +182,7 @@ async def _poll_repository(
         raise Unavailable(repo_path)
     if not isinstance(repository.get("full_name"), str):
         raise Unavailable(repo_path)
-    tracker = GitHubTracker.from_settings(
-        settings,
+    tracker = intake.for_repository(
         client,
         repo_full_name=repo,
         repository_id=repository_id,
@@ -260,7 +262,7 @@ async def _admit_labeled(
     *,
     installation_id: int,
 ) -> None:
-    label = settings.github_factory_label
+    label = tracker.label
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
     listed, etag = await tracker.labeled_open_issues(cursor.etags.get("issues"))
     if listed is None:
@@ -327,7 +329,7 @@ async def _cancel_stale(
             )
         )
         numbers = sorted({int(item.tracker_issue_id) for item in items})
-    label = settings.github_factory_label
+    label = tracker.label
     keys = {f"issue:{number}:{label}" for number in numbers}
     for key in list(cursor.etags):
         if key.startswith("issue:") and key not in keys:
@@ -462,9 +464,7 @@ async def _admit_mentions(
                 },
             )
             continue
-        if number not in factory_issues or not mentions_login(
-            body, settings.github_factory_mention
-        ):
+        if number not in factory_issues or not mentions_login(body, tracker.mention):
             continue
         sender_id, sender_login = sender
         notice = FactoryNotice(
@@ -496,7 +496,7 @@ async def _apply_notice(
     async with sessionmaker() as session:
         try:
             await github_factory.lock_issue(
-                session, github_factory.notice_issue(notice, settings)
+                session, github_factory.notice_issue(notice, forges_registry(settings))
             )
             verified = await github_factory.verify_current(
                 notice, settings=settings, client=client

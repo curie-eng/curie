@@ -30,6 +30,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[3]
 API_PACKAGE = REPO_ROOT / "apps" / "api" / "src" / "curie_api"
 GUARD_FILE = "charts/curie/files/legacy-factory-keys.yaml"
+ENV_GUARD_FILE = "charts/curie/files/legacy-factory-env.yaml"
 
 # Every shipped surface that configured, rendered or read the factory.
 SCANNED: tuple[str, ...] = (
@@ -44,7 +45,7 @@ SCANNED: tuple[str, ...] = (
     "tools/factory-e2e",
     "cli/src",
 )
-EXEMPT: frozenset[str] = frozenset({GUARD_FILE})
+EXEMPT: frozenset[str] = frozenset({GUARD_FILE, ENV_GUARD_FILE})
 
 REMOVED_FIELDS = (
     "github_factory_ingress_enabled",
@@ -129,13 +130,13 @@ def scan_removed_names(root: Path = REPO_ROOT) -> dict[str, list[str]]:
 def test_no_shipped_surface_reads_a_removed_factory_setting() -> None:
     assert scan_removed_names() == {}, (
         "configure the factory through factory.* / CURIE_FORGES (#4397); "
-        f"only {GUARD_FILE} may name the removed keys"
+        f"only {GUARD_FILE} and {ENV_GUARD_FILE} may name the removed keys"
     )
 
 
-def test_the_exemption_is_exactly_the_guard_file() -> None:
-    assert EXEMPT == {GUARD_FILE}
-    assert (REPO_ROOT / GUARD_FILE).is_file()
+def test_the_exemption_is_exactly_the_guard_files() -> None:
+    assert EXEMPT == {GUARD_FILE, ENV_GUARD_FILE}
+    assert all((REPO_ROOT / path).is_file() for path in EXEMPT)
 
 
 def test_the_guard_file_lists_every_removed_chart_key() -> None:
@@ -144,6 +145,11 @@ def test_the_guard_file_lists_every_removed_chart_key() -> None:
     assert all(isinstance(key, str) and key.startswith("api.githubFactory") for key in listed)
     assert len(listed) == len(set(listed))
     assert BASE_CHART_KEYS <= set(listed)
+
+
+def test_the_env_guard_file_lists_every_removed_env_name() -> None:
+    listed = yaml.safe_load((REPO_ROOT / ENV_GUARD_FILE).read_text())
+    assert sorted(listed) == sorted(field.upper() for field in REMOVED_FIELDS)
 
 
 def test_every_scanned_surface_exists() -> None:

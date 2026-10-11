@@ -771,11 +771,11 @@ pub fn describe(planned: &Planned) -> Vec<String> {
             Action::Intake(opts) => {
                 let values = intake_values(opts, &[]);
                 let intake = values
-                    .pointer("/api/githubFactoryIntake")
+                    .pointer("/factory/intake")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 lines.push(format!(
-                    "configure factory intake api.githubFactoryIntake={intake} for {} with --app-id {} --private-key-file {} and no webhook secret; the same helm upgrade binds the dark factory runner image",
+                    "configure factory intake factory.intake={intake} for {} with --app-id {} --private-key-file {} and no webhook secret; the same helm upgrade binds the dark factory runner image",
                     opts.repos.join(","),
                     opts.app_id.as_deref().unwrap_or(""),
                     opts.private_key_file

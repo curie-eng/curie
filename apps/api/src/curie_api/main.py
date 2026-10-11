@@ -42,6 +42,7 @@ from .db import (
     create_source_gate_engine,
 )
 from .evalqueue import EvalQueue
+from .forges.registry import forges_registry
 from .github_app import credentials_for, log_credential_path
 from .github_checks import GitHubStatusReporter
 from .github_review_store import GitHubReviewReconciler
@@ -125,6 +126,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = create_engine()
     app.state.engine = engine
     app.state.sessionmaker = create_sessionmaker(engine)
+    # The factory's forge registry, built once from CURIE_FORGES (#4397), so a
+    # config the registry refuses fails boot rather than the first factory pass.
+    app.state.forges = forges_registry(settings)
     # The shared client reaches the code host, so it trusts the operator's
     # code host CA bundle as well as the public roots (#3831).
     http_client = httpx.AsyncClient(timeout=10.0, verify=code_host_verify(settings))

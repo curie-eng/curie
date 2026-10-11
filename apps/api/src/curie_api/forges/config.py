@@ -30,7 +30,7 @@ from pydantic import (
     model_validator,
 )
 
-from curie_api.config import valid_base_branch
+from curie_api.branches import valid_base_branch
 from curie_api.forges import types
 from curie_api.forges.capabilities import NATIVE_FORGES, mandatory_capabilities
 from curie_api.forges.errors import InvalidPairing

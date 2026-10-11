@@ -36,6 +36,7 @@ from curie_api.workitems import lifecycle
 from . import factory_ci, factory_label_reconcile, factory_notices, factory_poll_intake
 from .code_host_trust import code_host_verify
 from .config import Settings
+from .forges.registry import forges_registry
 from .models import ExecutionRequest, WorkItem
 from .workitem_dispatch import (
     claim_due,
@@ -521,11 +522,14 @@ class WorkItemReconciler:
         """Admit labeled issues whose delivery GitHub never retried (#3081)."""
 
         settings = self._settings
-        if settings.github_factory_intake == "poll":
-            interval = settings.github_factory_poll_interval_s
+        if not settings.factory_enabled:
+            return
+        if settings.factory_intake == "poll":
+            tracker = forges_registry(settings).github_tracker()
+            interval = tracker.config.poll_interval_s if tracker is not None else 0.0
         else:
-            interval = settings.github_factory_reconcile_interval_s
-        if not settings.github_factory_ingress_enabled or interval <= 0:
+            interval = settings.factory_reconcile_interval_s
+        if interval <= 0:
             return
         clock = asyncio.get_running_loop().time()
         if clock < self._labels_due:
@@ -534,7 +538,7 @@ class WorkItemReconciler:
         async with httpx.AsyncClient(
             timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
         ) as client:
-            if settings.github_factory_intake == "poll":
+            if settings.factory_intake == "poll":
                 await factory_poll_intake.poll_once(self._sessionmaker, settings, client)
             else:
                 await factory_label_reconcile.reconcile_missed_labels(

@@ -267,8 +267,12 @@ def test_tls_values_point_github_at_the_stub_service_over_https() -> None:
     assert api["githubCloneBase"] == f"https://{STUB_HOST}:8443"
     assert api["githubRepoAllowlist"] == ["acme-corp/acme-bot"]
     assert api["githubAppId"] == "51"
-    assert api["githubFactoryIntake"] == "poll"
-    assert api["githubFactoryIngressEnabled"] is True
+    factory = _tls()["factory"]
+    assert factory["enabled"] is True
+    assert factory["intake"] == "poll"
+    assert {entry["apiUrl"] for entry in factory["codeHosts"] + factory["trackers"]} == {
+        f"https://{STUB_HOST}:8443/api/v3"
+    }
 
 
 def test_tls_values_port_flows_to_urls_and_egress() -> None:

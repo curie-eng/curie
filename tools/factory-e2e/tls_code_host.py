@@ -255,12 +255,14 @@ def tls_values(
             "githubCloneBase": origin,
             "githubRepoAllowlist": [STUB_REPO],
             "githubAppId": STUB_APP_ID,
-            "githubFactoryIntake": "poll",
-            "githubFactoryIngressEnabled": True,
             # Trust comes only through codeHostTrust, never the legacy stub path.
             "githubStubCaConfigMap": "",
         }
     )
+    # The factory reaches the stub through its own code host and tracker entries.
+    factory = values.setdefault("factory", {})
+    for entry in (*factory.get("codeHosts", []), *factory.get("trackers", [])):
+        entry["apiUrl"] = f"{origin}/api/v3"
     values["codeHostTrust"] = {"caBundle": {"configMapRef": {"name": ca_config_map, "key": CA_KEY}}}
     egress = [{"cidr": stub_cidr, "ports": [{"protocol": "TCP", "port": port}]}]
     egress += [{"cidr": cidr, "ports": [{"protocol": "TCP", "port": 443}]} for cidr in model_cidrs]

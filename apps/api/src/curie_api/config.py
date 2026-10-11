@@ -42,7 +42,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from .e2e_connector import E2EInstall
 from .forges import types as forge_types
-from .forges.paths import valid_repository_path
+from .forges.config import ForgesConfig
 from .workspace_policy import valid_allowlist_entry
 
 # Dev-only default secrets. The production boot gate refuses to start when any of
@@ -51,18 +51,6 @@ _DEV_DEFAULT_API_KEY = PUBLISHED_DEFAULT_API_KEY
 _DEV_DEFAULT_WEBHOOK_SECRET = "dev-webhook-secret"
 _DEV_DEFAULT_INTERNAL_WORKER_TOKEN = PUBLISHED_DEFAULT_INTERNAL_WORKER_TOKEN
 _DEV_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET = PUBLISHED_DEFAULT_APPROVAL_CHAT_ATTESTER_SECRET
-
-
-def valid_base_branch(name: Any) -> bool:
-    """A branch name a factory base may use: no whitespace, leading ``-`` or ``..``."""
-
-    return (
-        isinstance(name, str)
-        and bool(name)
-        and not any(char.isspace() for char in name)
-        and not name.startswith("-")
-        and ".." not in name
-    )
 
 
 class Settings(BaseSettings):
@@ -292,65 +280,40 @@ class Settings(BaseSettings):
     # identity (#2962). Such feedback is held and replayed for this long after
     # the lineage was created, then rejected as lineage_absent_or_ambiguous.
     github_review_identity_hold_s: float = 900.0
-    # Factory issue intake is separately gated from push and review handling.
-    # The label is the initial admission convention. The mention is the login
-    # an authorized human must name to request another bounded execution.
-    github_factory_ingress_enabled: bool = False
-    github_factory_label: str = ""
-    github_factory_mention: str = ""
+    # The factory (ADR 0197, #4397). FACTORY_ENABLED switches intake on;
+    # CURIE_FORGES is the one typed config of its code hosts, trackers and
+    # bindings (`forges.config.ForgesConfig`), loaded through
+    # `forges.loader.load_forges_json`, which reads each credential from the
+    # mounted file it names and refuses an inline secret. A dict passed in code
+    # (tests) is validated directly.
+    factory_enabled: bool = False
+    # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
+    # the missed-label backstop. The poll interval is the GitHub tracker's.
+    factory_intake: Literal["poll", "webhook"] = "poll"
     # A failed label delivery is never redelivered by GitHub (#3081). The work
     # item reconciler lists labeled open issues this often and admits any with
     # no WorkItem once its label is older than the grace, so a delivery still
     # in flight lands first. 0 disables the listing. Both are bounded the way
-    # GITHUB_FACTORY_CI_WAIT_S is: a negative or non finite value is refused at
-    # boot rather than surfacing as a mid-reconcile timedelta error (#3709).
-    github_factory_reconcile_interval_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
-    github_factory_reconcile_grace_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
-    # Polling is the default intake (#3745). Webhook mode is opt-in and keeps
-    # the missed-label backstop. The interval is a positive finite number of
-    # seconds; 45 sits in the 30 to 60 second band.
-    github_factory_intake: Literal["poll", "webhook"] = "poll"
-    github_factory_poll_interval_s: float = Field(default=45, gt=0, allow_inf_nan=False)
+    # FACTORY_CI_WAIT_S is: a negative or non finite value is refused at boot
+    # rather than surfacing as a mid-reconcile timedelta error (#3709).
+    factory_reconcile_interval_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
+    factory_reconcile_grace_s: float = Field(default=300.0, ge=0, allow_inf_nan=False)
     # How often the API reads each factory pull request still open on its
     # lineage, to record one merged or closed outside a publication (#3831).
     # Runs with the work item reconciler and factory ingress; 0 disables it.
     factory_lineage_reconcile_interval_s: float = Field(default=60, ge=0, allow_inf_nan=False)
-    # Public origin GitHub's image proxy fetches the live status card from
-    # (#3077), e.g. https://curie.example.com. Empty omits the card image; the
-    # status comment still carries the checklist and the result.
-    github_factory_card_base_url: str = ""
     # How long a published factory run waits on its pull request's CI, from the
     # push (#3162). The execution deadline still caps it; at most 10800 s, the
     # longest execution deadline (ADR 0171).
-    github_factory_ci_wait_s: int = Field(
+    factory_ci_wait_s: int = Field(
         default=1200,
         gt=0,
         le=10800,
-        validation_alias="GITHUB_FACTORY_CI_WAIT_S",
+        validation_alias="FACTORY_CI_WAIT_S",
     )
-    # Required Python CI per repository (#3617), a JSON object keyed by
-    # ``owner/name`` (matched case-insensitively): ``{"check": str, "paths":
-    # [str, ...], "pendingCheckPrefix": str | null}``. A repository without an
-    # entry is judged on its own checks with no path refusal. Empty by default.
-    github_factory_python_ci: dict[str, dict[str, Any]] = Field(
-        default_factory=dict,
-        validation_alias="GITHUB_FACTORY_PYTHON_CI",
-    )
-    # Checks and commit statuses that rerun after a metadata edit, per
-    # repository: {"checks": [str, ...], "statuses": [str, ...]}.
-    github_factory_metadata_ci: dict[str, dict[str, Any]] = Field(
-        default_factory=dict,
-        validation_alias="GITHUB_FACTORY_METADATA_CI",
-    )
-    # Bases a factory ticket may start from and target, per repository
-    # (#3095, ADR 0186), a JSON object keyed by ``owner/name`` (matched
-    # case-insensitively): ``{"bases": [str, ...], "default_base": str | null}``.
-    # A ``base:<branch>`` label picks one; no label picks ``default_base``, or
-    # the repository default branch when that is unset. A repository without
-    # an entry may only use its default branch. Empty by default.
-    github_factory_bases: dict[str, dict[str, Any]] = Field(
-        default_factory=dict,
-        validation_alias="GITHUB_FACTORY_BASES",
+    forges: Annotated[ForgesConfig, NoDecode] = Field(
+        default_factory=ForgesConfig,
+        validation_alias=AliasChoices("CURIE_FORGES", "forges"),
     )
     # Public model price list the factory's per-run cost estimate reads
     # (#3223), OpenRouter-shaped. Fetched at most every 6 h; any failure leaves
@@ -801,7 +764,7 @@ class Settings(BaseSettings):
     # with the claim unreleased until `channel_delivery_lease_s` lapses -- and
     # a negative window makes the quota script's EXPIRE delete the counter
     # immediately, silently disabling the quota. Bounded at construction the
-    # same way as GITHUB_FACTORY_RECONCILE_INTERVAL_S (#3709): refused at boot
+    # same way as FACTORY_RECONCILE_INTERVAL_S (#3709): refused at boot
     # rather than surfacing mid-delivery (#3720).
     hook_backlog_window_s: int = Field(default=60, gt=0)
     # Protected runtime bootstrap directory (PROTECTED-HOOK-SOURCE-9). Only the
@@ -1008,113 +971,19 @@ class Settings(BaseSettings):
     def upgrade_quiesce_key(self) -> str:
         return authoritative_key(self.worker_key_prefix, self.installation_id)
 
-    @field_validator("github_factory_python_ci", mode="before")
+    @field_validator("forges", mode="before")
     @classmethod
-    def _validate_factory_python_ci(cls, value: Any) -> dict[str, dict[str, Any]]:
-        if isinstance(value, str):
-            value = json.loads(value) if value.strip() else {}
-        if not isinstance(value, dict):
-            raise ValueError("GITHUB_FACTORY_PYTHON_CI must be a JSON object")
-        policies: dict[str, dict[str, Any]] = {}
-        for repo, policy in value.items():
-            if not isinstance(repo, str) or not valid_repository_path(forge_types.GITHUB, repo):
-                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI key {repo!r} is not owner/name")
-            if not isinstance(policy, dict) or set(policy) - {
-                "check",
-                "paths",
-                "pendingCheckPrefix",
-            }:
-                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI[{repo!r}] has an invalid shape")
-            check = policy.get("check")
-            paths = policy.get("paths")
-            prefix = policy.get("pendingCheckPrefix")
-            if not isinstance(check, str) or not check.strip():
-                raise ValueError(f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].check must be non-empty")
-            if (
-                not isinstance(paths, list)
-                or not paths
-                or not all(
-                    isinstance(path, str)
-                    and path.strip()
-                    and not path.startswith("/")
-                    and not path.endswith("/")
-                    for path in paths
-                )
-            ):
-                raise ValueError(
-                    f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].paths must be non-empty relative"
-                    " prefixes without a leading or trailing slash"
-                )
-            if prefix is not None and (not isinstance(prefix, str) or not prefix):
-                raise ValueError(
-                    f"GITHUB_FACTORY_PYTHON_CI[{repo!r}].pendingCheckPrefix must be a"
-                    " non-empty string or null"
-                )
-            policies[repo] = {"check": check, "paths": list(paths), "pendingCheckPrefix": prefix}
-        return policies
+    def _load_forges(cls, value: Any) -> Any:
+        """Route the ``CURIE_FORGES`` string through the file loader; a mapping
+        passed in code is validated as ``ForgesConfig`` directly."""
 
-    @field_validator("github_factory_metadata_ci", mode="before")
-    @classmethod
-    def _validate_factory_metadata_ci(cls, value: Any) -> dict[str, dict[str, Any]]:
         if isinstance(value, str):
-            value = json.loads(value) if value.strip() else {}
-        if not isinstance(value, dict):
-            raise ValueError("GITHUB_FACTORY_METADATA_CI must be a JSON object")
-        policies: dict[str, dict[str, Any]] = {}
-        for repo, policy in value.items():
-            if not isinstance(repo, str) or not valid_repository_path(forge_types.GITHUB, repo):
-                raise ValueError(f"GITHUB_FACTORY_METADATA_CI key {repo!r} is not owner/name")
-            if not isinstance(policy, dict) or set(policy) - {"checks", "statuses"}:
-                raise ValueError(f"GITHUB_FACTORY_METADATA_CI[{repo!r}] has an invalid shape")
-            names: dict[str, list[str]] = {}
-            for surface in ("checks", "statuses"):
-                entries = policy.get(surface, [])
-                if not isinstance(entries, list) or not all(
-                    isinstance(entry, str) and entry.strip() for entry in entries
-                ):
-                    raise ValueError(
-                        f"GITHUB_FACTORY_METADATA_CI[{repo!r}].{surface} must be a list"
-                        " of nonempty names"
-                    )
-                names[surface] = list(entries)
-            if not names["checks"] and not names["statuses"]:
-                raise ValueError(
-                    f"GITHUB_FACTORY_METADATA_CI[{repo!r}] must name a check or status"
-                )
-            policies[repo] = names
-        return policies
+            # Imported here: the loader imports the forge registry, which imports
+            # the adapter packages, which import this module.
+            from .forges.loader import load_forges_json
 
-    @field_validator("github_factory_bases", mode="before")
-    @classmethod
-    def _validate_factory_bases(cls, value: Any) -> dict[str, dict[str, Any]]:
-        if isinstance(value, str):
-            value = json.loads(value) if value.strip() else {}
-        if not isinstance(value, dict):
-            raise ValueError("GITHUB_FACTORY_BASES must be a JSON object")
-        entries: dict[str, dict[str, Any]] = {}
-        for repo, entry in value.items():
-            if not isinstance(repo, str) or not valid_repository_path(forge_types.GITHUB, repo):
-                raise ValueError(f"GITHUB_FACTORY_BASES key {repo!r} is not owner/name")
-            if not isinstance(entry, dict) or set(entry) - {"bases", "default_base"}:
-                raise ValueError(f"GITHUB_FACTORY_BASES[{repo!r}] has an invalid shape")
-            bases = entry.get("bases")
-            if (
-                not isinstance(bases, list)
-                or not bases
-                or not all(valid_base_branch(base) for base in bases)
-                or len(set(bases)) != len(bases)
-            ):
-                raise ValueError(
-                    f"GITHUB_FACTORY_BASES[{repo!r}].bases must be a non-empty list of"
-                    " unique branch names"
-                )
-            default_base = entry.get("default_base")
-            if default_base is not None and default_base not in bases:
-                raise ValueError(
-                    f"GITHUB_FACTORY_BASES[{repo!r}].default_base must be one of its bases"
-                )
-            entries[repo] = {"bases": list(bases), "default_base": default_base}
-        return entries
+            return load_forges_json(value)
+        return value
 
     @model_validator(mode="after")
     def _remediation_requires_the_executor(self) -> "Settings":
@@ -1195,40 +1064,51 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
-    def _validate_github_factory_ingress(self) -> "Settings":
-        if not self.github_factory_ingress_enabled:
-            return self
-        from .github_review_events import valid_github_login
+    def _validate_factory(self) -> "Settings":
+        """The factory's boot contract: a GitHub tracker and code host in
+        CURIE_FORGES, a repository allowlist, and a webhook secret fit for the
+        intake. Label and mention validity belong to the tracker entry."""
 
+        if not self.factory_enabled:
+            return self
+        kinds: dict[str, set[str]] = {
+            "tracker": {tracker.kind for tracker in self.forges.trackers},
+            "code host": {host.kind for host in self.forges.code_hosts},
+        }
+        missing = [what for what, found in kinds.items() if forge_types.GITHUB not in found]
         offenders = []
-        if not self.github_app_id.strip():
-            offenders.append("GITHUB_APP_ID")
-        if not self.github_app_private_key.strip():
-            offenders.append("GITHUB_APP_PRIVATE_KEY")
+        if missing:
+            offenders.append(f"CURIE_FORGES (no github {' or '.join(missing)})")
         # Polling may disable signed deliveries with a blank secret, but a
         # published signing key must never authenticate factory deliveries.
         if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
-            self.github_factory_intake == "webhook"
-            and not self.github_webhook_secret.strip()
+            self.factory_intake == "webhook" and not self.github_webhook_secret.strip()
         ):
             offenders.append("GITHUB_WEBHOOK_SECRET")
-        label = self.github_factory_label
-        if (
-            not label
-            or label != label.strip()
-            or len(label) > 50
-            or any(character.isspace() for character in label)
-        ):
-            offenders.append("GITHUB_FACTORY_LABEL")
-        if not valid_github_login(self.github_factory_mention):
-            offenders.append("GITHUB_FACTORY_MENTION")
         if not self.github_repo_allowlist:
             offenders.append("GITHUB_REPO_ALLOWLIST")
         if offenders:
             raise ValueError(
-                "GitHub factory ingress (GITHUB_FACTORY_INGRESS_ENABLED) requires "
-                "complete active configuration; "
+                "the factory (FACTORY_ENABLED) requires complete active configuration; "
                 f"set valid values for: {', '.join(offenders)}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_forge_github_host(self) -> "Settings":
+        """A GitHub code host must live on the install's GitHub host, so stored
+        lineage rows and the non-factory lookups agree on one host (#4397)."""
+
+        github = urlsplit(self.github_html_base).netloc.lower() or "github.com"
+        wrong = sorted(
+            host.name
+            for host in self.forges.code_hosts
+            if host.kind == forge_types.GITHUB and host.host != github
+        )
+        if wrong:
+            raise ValueError(
+                f"CURIE_FORGES github code host {', '.join(wrong)} is not on the host of "
+                f"GITHUB_API_URL ({github}); set both to the same GitHub"
             )
         return self
 
@@ -1321,30 +1201,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _check_factory_card_base_url(self) -> "Settings":
-        """Empty, or an https origin (http localhost only in dev), no query or fragment."""
-        value = self.github_factory_card_base_url.strip()
-        if value.endswith("/"):
-            value = value[:-1]
-        if value:
-            parts = urlsplit(value)
-            local_dev = (
-                self.environment.strip().lower() == "dev"
-                and parts.scheme == "http"
-                and parts.hostname in ("localhost", "127.0.0.1")
+        """The card origin is https; http localhost is accepted only in dev."""
+
+        parts = urlsplit(self.forges.card_base_url)
+        if parts.scheme == "http" and self.environment.strip().lower() != "dev":
+            raise ValueError(
+                "CURIE_FORGES factory.cardBaseUrl must be an https:// URL outside "
+                "ENVIRONMENT=dev"
             )
-            if (
-                not (parts.scheme == "https" or local_dev)
-                or not parts.netloc
-                or parts.query
-                or parts.fragment
-                or "?" in value
-                or "#" in value
-            ):
-                raise ValueError(
-                    "GITHUB_FACTORY_CARD_BASE_URL must be empty or an https:// URL "
-                    "with no query or fragment"
-                )
-        self.github_factory_card_base_url = value
         return self
 
     @field_validator("test_installation_drivers", mode="before")
@@ -1391,8 +1255,8 @@ class Settings(BaseSettings):
             offenders.append("API_KEY")
         empty_poll_secret = (
             self.github_webhook_secret == ""
-            and self.github_factory_ingress_enabled
-            and self.github_factory_intake == "poll"
+            and self.factory_enabled
+            and self.factory_intake == "poll"
         )
         if self.github_webhook_secret == _DEV_DEFAULT_WEBHOOK_SECRET or (
             self.github_webhook_secret == "" and not empty_poll_secret

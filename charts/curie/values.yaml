@@ -1275,6 +1275,18 @@ codeHostTrust:
       name: ""
       key: ca.crt
 # ---------------------------------------------------------------------------
+# The factory (#4397) as CURIE_FORGES; `curie cluster factory` writes it.
+# A credential names its Secret: existingSecret, existingSecretKey.
+factory:
+  enabled: false
+  intake: poll  # or webhook
+  cardBaseUrl: ""
+  ciWaitSeconds: 1200
+  codeHosts: []
+  trackers: []
+  bindings: []
+  sandboxEgress: {}
+# ---------------------------------------------------------------------------
 api:
   deploy: true
   # Runner sandbox egress to an external API endpoint (#2317, #2367). Rail 1
@@ -1376,44 +1388,6 @@ api:
   # positive reconciliation interval.
   githubReviewIngressEnabled: false
   githubReviewReconcilerIntervalSeconds: 5
-  # Signed factory issue intake is opt-in and separate from review feedback.
-  # Polling is the default. A blank webhook secret disables signed deliveries.
-  # A configured secret permits signed deliveries in either mode. The published
-  # development secret is refused whenever factory intake is enabled.
-  # Sealed installs generate and retain a real secret unless one is configured.
-  # Webhook mode requires a real secret and keeps the missed label backstop.
-  # Either mode still requires the App id and private key, a label, a mention
-  # login, and a repo allowlist.
-  githubFactoryIngressEnabled: false
-  githubFactoryIntake: poll
-  githubFactoryPollIntervalSeconds: 45
-  githubFactoryLabel: ""
-  githubFactoryMention: ""
-  # Public https origin GitHub's image proxy fetches the live factory status card
-  # from (#3077). Set, the card replaces the phase checklist (#3125); empty omits
-  # the card and the comment shows the checklist instead.
-  githubFactoryCardBaseUrl: ""
-  # Seconds a published factory run waits on its pull request's CI, from the
-  # push (#3162). The run's execution deadline still caps it. 1 to 10800.
-  githubFactoryCiWaitSeconds: 1200
-  # Required Python CI per repository (#3617), keyed by owner/name (matched
-  # case-insensitively): {check, paths, pendingCheckPrefix}. A factory Python
-  # change must fall under `paths` and pass the `check` Actions check; shard
-  # jobs named with `pendingCheckPrefix` keep the run waiting for it. A
-  # repository without an entry is judged on its own checks. Rendered as JSON
-  # into GITHUB_FACTORY_PYTHON_CI; see docs/operations.md for curie-eng/curie.
-  githubFactoryPythonCi: {}
-  # Bases a factory ticket may start from and target (#3095, ADR 0186), keyed
-  # by owner/name: {bases: [branch, ...], default_base: branch}. A ticket picks
-  # one with a `base:<branch>` label; with none it uses default_base, or the
-  # repository default branch when default_base is unset. A repository without
-  # an entry may only use its default branch. Rendered as JSON into
-  # GITHUB_FACTORY_BASES.
-  githubFactoryBases: {}
-  # Checks and commit statuses that rerun after a pull request metadata edit,
-  # keyed by owner/name: {checks: [name, ...], statuses: [name, ...]}.
-  # Rendered as JSON into GITHUB_FACTORY_METADATA_CI.
-  githubFactoryMetadataCi: {}
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
