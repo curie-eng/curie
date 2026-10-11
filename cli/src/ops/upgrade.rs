@@ -125,6 +125,8 @@ impl std::fmt::Display for UpgradePhase {
 /// Flags for `curie cluster upgrade`.
 #[derive(Debug, Clone)]
 pub struct UpgradeOpts {
+    /// @spec CLUSTER-VALUES-FILES c1-c4: immutable operator values.
+    pub file_values: Option<super::PrivateHelmValues>,
     pub common: CommonOpts,
     pub to: String,
     pub chart: UpgradeChart,
@@ -2657,6 +2659,10 @@ impl LiveHost {
                 }
             }
         }
+        // #4321 with @spec CLUSTER-VALUES-FILES c3-c4: runner rebinding is
+        // part of the final effective overlay, so metadata admission and the
+        // timeout render must see the same document that Apply receives.
+        self.compute_runner_layers();
         if self.opts.chart.pending_release().is_none() {
             self.compute_schema_compat();
             if self.current.is_some()
@@ -2670,7 +2676,6 @@ impl LiveHost {
                 }
             }
         }
-        self.compute_runner_layers();
     }
 
     /// What the upgrade does to each layered agent (#3218, #4321).
@@ -2940,13 +2945,18 @@ impl LiveHost {
             args.push(plain("--version"));
             args.push(plain(&self.opts.to));
         }
-        let tmp = tempfile::NamedTempFile::new().ok();
-        if let (Some(overlay), Some(tmp)) = (&self.overlay, &tmp) {
-            if std::fs::write(tmp.path(), overlay).is_ok() {
-                args.push(plain("-f"));
-                args.push(plain(tmp.path().to_string_lossy().into_owned()));
-            }
-        }
+        // @spec CLUSTER-VALUES-FILES c3-c4: never admit defaults after losing the overlay.
+        let _tmp = if let Some(overlay) = &self.overlay {
+            let tmp = tempfile::NamedTempFile::new()
+                .map_err(|_| "could not prepare target metadata values".to_string())?;
+            std::fs::write(tmp.path(), overlay)
+                .map_err(|_| "could not write target metadata values".to_string())?;
+            args.push(plain("-f"));
+            args.push(plain(tmp.path().to_string_lossy().into_owned()));
+            Some(tmp)
+        } else {
+            None
+        };
         let cmd = OpsCommand::new("helm", args);
         let (ok, out, err) = match self.run(&cmd) {
             Ok(v) => v,
@@ -3012,13 +3022,33 @@ impl LiveHost {
             if super::verbs::failure_reason(&err) != "Error: release: not found" {
                 bail!("could not read retained helm values: {}", err.trim());
             }
-            return Ok(None);
+            return if self.opts.file_values.is_some() {
+                self.migrate_effective_overlay(serde_json::json!({}))
+            } else {
+                Ok(None)
+            };
         }
         if out.trim().is_empty() {
-            return Ok(None);
+            return if self.opts.file_values.is_some() {
+                self.migrate_effective_overlay(serde_json::json!({}))
+            } else {
+                Ok(None)
+            };
         }
         let values: serde_json::Value =
             serde_norway::from_str(&out).context("retained helm values are malformed")?;
+        self.migrate_effective_overlay(values)
+    }
+
+    /// @spec CLUSTER-VALUES-FILES c3: admit the final merged input once.
+    fn migrate_effective_overlay(
+        &self,
+        mut values: serde_json::Value,
+    ) -> Result<Option<(String, String)>> {
+        if let Some(files) = &self.opts.file_values {
+            crate::config_migrate::clear_replaced_secret_refs(&mut values, &files.0);
+            super::lint_values::merge_values(&mut values, files.0.clone());
+        }
         // Unlike `up.rs`, the installed chart version is known here, so
         // `infer_schema_version` is not guessing when the overlay predates
         // `config.schemaVersion`.
@@ -3800,6 +3830,7 @@ mod hook_tests {
 
     fn opts(namespace: &str, release: &str) -> UpgradeOpts {
         UpgradeOpts {
+            file_values: None,
             common: CommonOpts {
                 namespace: namespace.into(),
                 release: release.into(),

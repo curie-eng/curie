@@ -132,10 +132,22 @@ impl Fixture {
             r#"#!/bin/sh
 printf 'helm %s\n' "$*" >> "$CURIE_TEST_CALLS_LOG"
 if [ "$1" = "get" ] && [ "$2" = "values" ]; then
+    if [ -n "${CURIE_TEST_FIRST_INSTALL:-}" ]; then
+        printf '%s\n' 'Error: release: not found' >&2
+        exit 1
+    fi
     printf '%s\n' "$CURIE_TEST_EXISTING_VALUES"
     exit 0
 fi
 if [ "$1" = "template" ]; then
+    if [ "$2" = "curie-values-lint" ] && [ -n "${CURIE_TEST_REAL_HELM:-}" ]; then
+        "$CURIE_TEST_REAL_HELM" "$@"
+        result=$?
+        if [ "$result" = 0 ] && [ -n "${CURIE_TEST_MUTATE_VALUES:-}" ]; then
+            printf '%s\n' 'worker: {extraEnv: [{name: NUMERIC_STRING, value: MUTATED}]}' > "$CURIE_TEST_MUTATE_VALUES"
+        fi
+        exit "$result"
+    fi
     case " $* " in
         *" --show-only templates/priorityclass.yaml "*|*" --show-only=templates/priorityclass.yaml "*)
             printf '%s\n' 'Error: could not find template templates/priorityclass.yaml in chart' >&2
@@ -240,6 +252,11 @@ exit 64
     }
 
     fn cluster_up(&self, environment: &[(&str, &str)]) -> Output {
+        self.cluster_up_with_args(environment, &[])
+    }
+
+    // @spec CLUSTER-VALUES-FILES c1-c4
+    fn cluster_up_with_args(&self, environment: &[(&str, &str)], args: &[&str]) -> Output {
         let mut paths = vec![self.bin_dir.clone()];
         if let Some(current) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&current));
@@ -275,6 +292,7 @@ exit 64
             .env_remove("CURIE_GITHUB_TOKEN")
             .env_remove("CURIE_MODEL")
             .env_remove("CURIE_FAKE_MODEL");
+        command.args(args);
         for (key, value) in environment {
             command.env(key, value);
         }
@@ -846,4 +864,327 @@ fn worker_secret_refs(rendered: &[Value]) -> BTreeMap<String, Value> {
             })
         })
         .collect()
+}
+
+#[test]
+fn ordered_operator_files_reach_real_helm_typed_and_unchanged_after_source_edit() {
+    // @spec CLUSTER-VALUES-FILES c1-c4
+    let helm = real_helm().expect("real Helm required for ordered values proof");
+    let fixture = Fixture::new(&recorded_values());
+    let first = fixture.temp.path().join("first.yaml");
+    let second = fixture.temp.path().join("second.yaml");
+    fs::write(&first, "worker:\n  extraEnv:\n    - name: NUMERIC_STRING\n      value: '1000'\n  adapterCredentials: {}\nagentSandbox:\n  connectorSecrets:\n    acme-a:\n      GRAFANA_TOKEN: PLACEHOLDER-new-file-secret\n").unwrap();
+    fs::write(&second, "worker:\n  extraEnv:\n    - name: NUMERIC_STRING\n      value: '8080'\napi:\n  podLabels:\n    example.com/key: 'off'\n").unwrap();
+    let out = fixture.cluster_up_with_args(
+        &[
+            ("CURIE_TEST_REAL_HELM", &helm),
+            ("CURIE_TEST_MUTATE_VALUES", second.to_str().unwrap()),
+        ],
+        &[
+            "-f",
+            first.to_str().unwrap(),
+            "--values-file",
+            second.to_str().unwrap(),
+        ],
+    );
+    fixture.assert_succeeded(&out);
+    let captured = merged_file_values(&fixture.captured_files());
+    assert_eq!(
+        captured.pointer("/worker/extraEnv/0/value"),
+        Some(&json!("8080"))
+    );
+    assert_eq!(
+        captured.pointer("/worker/adapterCredentials"),
+        Some(&json!({}))
+    );
+    assert_eq!(
+        captured.pointer("/api/podLabels/example.com~1key"),
+        Some(&json!("off"))
+    );
+    assert_eq!(
+        captured.pointer("/agentSandbox/connectorSecrets/acme-a/GRAFANA_TOKEN"),
+        Some(&json!("PLACEHOLDER-new-file-secret"))
+    );
+    assert!(fs::read_to_string(second).unwrap().contains("MUTATED"));
+    assert!(!all_output(&out).contains("PLACEHOLDER-new-file-secret"));
+    assert!(!fixture
+        .upgrade_argv()
+        .iter()
+        .any(|arg| arg.contains("PLACEHOLDER-new-file-secret")));
+    let rendered = render(&helm, &value_arguments(&fixture.upgrade_argv()));
+    assert_eq!(
+        worker_env(&rendered, "NUMERIC_STRING").unwrap(),
+        json!("8080")
+    );
+}
+
+#[test]
+fn fresh_install_with_files_still_generates_required_store_credentials() {
+    // @spec CLUSTER-VALUES-FILES c1-c3
+    let helm = real_helm().expect("real Helm required");
+    let fixture = Fixture::new(&serde_json::json!({}));
+    let file = fixture.temp.path().join("fresh.yaml");
+    fs::write(
+        &file,
+        "security:\n  gvisor:\n    mode: 'off'\nagentSandbox:\n  controller:\n    deploy: false\n",
+    )
+    .unwrap();
+    let output = fixture.cluster_up_with_args(
+        &[
+            ("CURIE_TEST_REAL_HELM", &helm),
+            ("CURIE_TEST_FIRST_INSTALL", "1"),
+        ],
+        &["--fake-model", "-f", file.to_str().unwrap()],
+    );
+    fixture.assert_succeeded(&output);
+    let values = merged_file_values(&fixture.captured_files());
+    for path in ["/postgres/auth/password", "/valkey/password", "/api/apiKey"] {
+        assert!(
+            values
+                .pointer(path)
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.len() >= 32),
+            "missing generated credential: {path}"
+        );
+    }
+}
+
+#[test]
+fn dedicated_flags_override_file_identity_and_service_choices() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3
+    let helm = real_helm().expect("real Helm required");
+    for clear in [false, true] {
+        let fixture = Fixture::new(&serde_json::json!({}));
+        let file = fixture.temp.path().join("flag-overrides.yaml");
+        fs::write(&file, "security:\n  gvisor:\n    mode: 'off'\napi:\n  githubToken: PLACEHOLDER-file-token\n  githubTokenExistingSecret: file-github\nagentSandbox:\n  controller:\n    deploy: false\n  runner:\n    model: file-model\n    credentialsExistingSecret: file-model-secret\nui:\n  service:\n    type: NodePort\nlangfuse:\n  web:\n    service:\n      type: NodePort\n").unwrap();
+        let mut args = vec!["-f", file.to_str().unwrap(), "--model", "flag-model"];
+        if clear {
+            args.push("--clear-github-token");
+        } else {
+            args.extend(["--github-token", "PLACEHOLDER-flag-token"]);
+        }
+        let output = fixture.cluster_up_with_args(
+            &[
+                ("CURIE_TEST_REAL_HELM", &helm),
+                ("CURIE_CREDENTIALS", "sk-ant-api03-PLACEHOLDER-explicit"),
+            ],
+            &args,
+        );
+        fixture.assert_succeeded(&output);
+        let values = effective_captured_values(&helm, &fixture);
+        assert_eq!(
+            values.pointer("/api/githubToken").and_then(Value::as_str),
+            Some(if clear { "" } else { "PLACEHOLDER-flag-token" })
+        );
+        assert_eq!(
+            values
+                .pointer("/api/githubTokenExistingSecret")
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            values
+                .pointer("/agentSandbox/runner/model")
+                .and_then(Value::as_str),
+            Some("flag-model")
+        );
+        assert_eq!(
+            values
+                .pointer("/agentSandbox/runner/credentialsExistingSecret")
+                .and_then(Value::as_str),
+            Some("")
+        );
+        assert_eq!(
+            values
+                .pointer("/agentSandbox/runner/credentials")
+                .and_then(Value::as_str),
+            Some("sk-ant-api03-PLACEHOLDER-explicit")
+        );
+        assert_eq!(
+            values.pointer("/ui/service/type").and_then(Value::as_str),
+            Some("ClusterIP")
+        );
+        assert_eq!(
+            values
+                .pointer("/langfuse/web/service/type")
+                .and_then(Value::as_str),
+            Some("ClusterIP")
+        );
+        for secret in [
+            "PLACEHOLDER-flag-token",
+            "sk-ant-api03-PLACEHOLDER-explicit",
+        ] {
+            assert!(!all_output(&output).contains(secret));
+            assert!(!fixture.upgrade_argv().join(" ").contains(secret));
+        }
+    }
+}
+
+#[test]
+fn fake_model_and_inline_set_override_lower_priority_file_choices() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3
+    let helm = real_helm().expect("real Helm required");
+    for fake in [true, false] {
+        let fixture = Fixture::new(&serde_json::json!({}));
+        let file = fixture.temp.path().join("runner-flags.yaml");
+        fs::write(&file, "security:\n  gvisor:\n    mode: 'off'\nagentSandbox:\n  controller:\n    deploy: false\n  runner:\n    fakeModel: false\n    credentialsExistingSecret: file-provider\n    credentialsExistingSecretKey: token\npostgres:\n  existingSecret: file-postgres\n").unwrap();
+        let mut args = vec!["-f", file.to_str().unwrap()];
+        if fake {
+            args.push("--fake-model");
+        } else {
+            args.extend([
+                "--set",
+                "agentSandbox.runner.credentials=sk-ant-api03-PLACEHOLDER-set-credential",
+                "--set",
+                "postgres.auth.password=PLACEHOLDER-set-db-password",
+            ]);
+        }
+        let output = fixture.cluster_up_with_args(&[("CURIE_TEST_REAL_HELM", &helm)], &args);
+        fixture.assert_succeeded(&output);
+        let values = effective_captured_values(&helm, &fixture);
+        if fake {
+            assert_eq!(
+                values.pointer("/agentSandbox/runner/fakeModel"),
+                Some(&Value::Bool(true))
+            );
+        } else {
+            assert_eq!(
+                values
+                    .pointer("/postgres/auth/password")
+                    .and_then(Value::as_str),
+                Some("PLACEHOLDER-set-db-password")
+            );
+            assert!(values
+                .pointer("/postgres/existingSecret")
+                .is_none_or(|value| value.as_str() == Some("")));
+            for path in [
+                "/agentSandbox/runner/credentialsExistingSecret",
+                "/agentSandbox/runner/credentialsExistingSecretKey",
+            ] {
+                assert!(
+                    values
+                        .pointer(path)
+                        .is_none_or(|value| value.as_str() == Some("")),
+                    "lower-priority source is still active: {path}"
+                );
+            }
+        }
+    }
+}
+
+// @spec CLUSTER-VALUES-FILES c1-c3
+fn effective_captured_values(helm: &str, fixture: &Fixture) -> Value {
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("templates")).unwrap();
+    fs::write(
+        temp.path().join("Chart.yaml"),
+        "apiVersion: v2\nname: effective-values\nversion: 0.0.0\n",
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("templates/values.yaml"),
+        "{{ .Values | toJson }}",
+    )
+    .unwrap();
+    let output = Command::new(helm)
+        .args(["template", "effective-values"])
+        .arg(temp.path())
+        .args(value_arguments(&fixture.upgrade_argv()))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", all_output(&output));
+    serde_norway::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn inline_file_credential_replaces_a_retained_secret_reference() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3
+    let helm = real_helm().expect("real Helm required");
+    let fixture = Fixture::new(
+        &serde_json::json!({"agentSandbox":{"runner":{"fakeModel":false,"credentialsExistingSecret":"retained-provider","credentialsExistingSecretKey":"token"}}}),
+    );
+    let file = fixture.temp.path().join("inline-replacement.yaml");
+    fs::write(&file, "security:\n  gvisor:\n    mode: 'off'\nagentSandbox:\n  controller:\n    deploy: false\n  runner:\n    fakeModel: false\n    credentials: sk-ant-api03-PLACEHOLDER-file-replacement\n").unwrap();
+    let output = fixture.cluster_up_with_args(
+        &[("CURIE_TEST_REAL_HELM", &helm)],
+        &["-f", file.to_str().unwrap()],
+    );
+    fixture.assert_succeeded(&output);
+    let values = effective_captured_values(&helm, &fixture);
+    assert_eq!(
+        values
+            .pointer("/agentSandbox/runner/credentials")
+            .and_then(Value::as_str),
+        Some("sk-ant-api03-PLACEHOLDER-file-replacement")
+    );
+    for path in [
+        "/agentSandbox/runner/credentialsExistingSecret",
+        "/agentSandbox/runner/credentialsExistingSecretKey",
+    ] {
+        assert!(values
+            .pointer(path)
+            .is_none_or(|value| value.as_str() == Some("")));
+    }
+    assert!(!all_output(&output).contains("sk-ant-api03-PLACEHOLDER-file-replacement"));
+    assert!(!fixture
+        .upgrade_argv()
+        .join(" ")
+        .contains("sk-ant-api03-PLACEHOLDER-file-replacement"));
+}
+
+#[test]
+fn indexed_set_preserves_file_list_item_siblings() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3
+    let helm = real_helm().expect("real Helm required");
+    let fixture = Fixture::new(&serde_json::json!({}));
+    let file = fixture.temp.path().join("indexed-overlay.yaml");
+    fs::write(
+        &file,
+        "security:\n  gvisor:\n    mode: 'off'\n  networkPolicy:\n    allowedEgress:\n      - cidr: 192.0.2.0/24\n        ports:\n          - protocol: TCP\n            port: 80\nagentSandbox:\n  controller:\n    deploy: false\n",
+    )
+    .unwrap();
+    let output = fixture.cluster_up_with_args(
+        &[("CURIE_TEST_REAL_HELM", &helm)],
+        &[
+            "--fake-model",
+            "-f",
+            file.to_str().unwrap(),
+            "--set",
+            "security.networkPolicy.allowedEgress[0].ports[0].port=443",
+        ],
+    );
+    fixture.assert_succeeded(&output);
+    let values = effective_captured_values(&helm, &fixture);
+    assert_eq!(
+        values.pointer("/security/networkPolicy/allowedEgress/0"),
+        Some(&serde_json::json!({
+            "cidr": "192.0.2.0/24",
+            "ports": [{"protocol": "TCP", "port": 443}],
+        }))
+    );
+}
+
+#[test]
+fn file_without_schema_cannot_mask_an_unsupported_retained_configuration() {
+    // @spec CLUSTER-VALUES-FILES c3
+    let helm = real_helm().expect("real Helm required");
+    let fixture = Fixture::new(
+        &serde_json::json!({"config":{"schemaVersion":"0.7.0"},"security":{"gvisor":{"mode":"off"}},"agentSandbox":{"controller":{"deploy":false}}}),
+    );
+    let file = fixture.temp.path().join("unrelated-values.yaml");
+    fs::write(&file, "worker:\n  deliveryBudgetSeconds: 600\n").unwrap();
+    let output = fixture.cluster_up_with_args(
+        &[("CURIE_TEST_REAL_HELM", &helm)],
+        &["--fake-model", "-f", file.to_str().unwrap()],
+    );
+    assert!(
+        !output.status.success(),
+        "file masked unsupported retained source"
+    );
+    assert!(
+        all_output(&output).contains("not a supported"),
+        "{}",
+        all_output(&output)
+    );
+    assert!(fixture.upgrade_argv().is_empty());
 }

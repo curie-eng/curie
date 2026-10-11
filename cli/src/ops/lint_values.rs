@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde_json::Value;
 
+use super::CmdArg;
 use super::{fetch_release_values, plain, run_capture, CommonOpts, OpsCommand};
 use crate::ui::{CliOutput, Ui};
 
@@ -51,8 +52,30 @@ impl CliOutput for LintValuesOutput {
 
 /// Ask Helm to parse each pending file. Reading the copies through `fromYaml`
 /// keeps explicit nulls that Helm omits from its computed `.Values` template.
-/// The original files also go through `-f` so Helm validates the upgrade input.
-async fn pending_values(files: &[PathBuf]) -> Result<Value> {
+/// The same captured copies go through `-f` so Helm validates this input.
+pub(crate) async fn pending_values(files: &[PathBuf]) -> Result<Value> {
+    parsed_values(files, &[]).await
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c3
+pub(crate) async fn pending_set_overlay(args: &[CmdArg]) -> Result<Value> {
+    parsed_values(&[], args).await
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c3
+pub(crate) async fn pending_set_values(base: &Value, args: &[CmdArg]) -> Result<Value> {
+    let snapshot = tempfile::NamedTempFile::new()
+        .map_err(|_| crate::exit::CliError::failure("could not prepare values snapshot"))?;
+    let encoded = serde_json::to_vec(base)
+        .map_err(|_| crate::exit::CliError::failure("could not prepare values snapshot"))?;
+    std::fs::write(snapshot.path(), encoded)
+        .map_err(|_| crate::exit::CliError::failure("could not prepare values snapshot"))?;
+    parsed_values(&[snapshot.path().to_path_buf()], args).await
+}
+
+/// @spec CLUSTER-VALUES-FILES c2-c3
+async fn parsed_values(files: &[PathBuf], explicit_args: &[CmdArg]) -> Result<Value> {
+    // @spec CLUSTER-VALUES-FILES c2: Helm parses only captured copies.
     let chart = tempfile::tempdir()
         .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
     let templates = chart.path().join("templates");
@@ -81,6 +104,9 @@ async fn pending_values(files: &[PathBuf]) -> Result<Value> {
             "  file{index}: {{{{ (.Files.Get \"files/{index}.yaml\" | fromYaml | toJson) | quote }}}}\n"
         ));
     }
+    if !explicit_args.is_empty() {
+        template.push_str("  operatorValues: {{ .Values | toJson | quote }}\n");
+    }
     std::fs::write(templates.join("values.yaml"), template)
         .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
 
@@ -89,13 +115,15 @@ async fn pending_values(files: &[PathBuf]) -> Result<Value> {
         plain("curie-values-lint"),
         plain(chart.path().to_string_lossy().into_owned()),
     ];
-    for file in files {
-        let path = file
+    for index in 0..files.len() {
+        let snapshot = chart_files.join(format!("{index}.yaml"));
+        let path = snapshot
             .to_str()
             .ok_or_else(|| crate::exit::CliError::failure("values file path is not UTF-8"))?;
         args.push(plain("-f"));
         args.push(plain(path));
     }
+    args.extend_from_slice(explicit_args);
     let (ok, output, _) = run_capture(&OpsCommand::new("helm", args))
         .await
         .map_err(|_| {
@@ -123,6 +151,16 @@ async fn pending_values(files: &[PathBuf]) -> Result<Value> {
                 crate::exit::CliError::failure("values files must contain YAML maps").into(),
             );
         }
+        merge_values(&mut pending, values);
+    }
+    if !explicit_args.is_empty() {
+        let json = rendered
+            .get("data")
+            .and_then(|data| data.get("operatorValues"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| crate::exit::CliError::failure("could not read Helm parsed values"))?;
+        let values: Value = serde_json::from_str(json)
+            .map_err(|_| crate::exit::CliError::failure("could not read Helm parsed values"))?;
         merge_values(&mut pending, values);
     }
     Ok(pending)
@@ -156,7 +194,7 @@ pub async fn lint_values(common: CommonOpts, files: Vec<PathBuf>) -> Result<Lint
 }
 
 /// Helm merges maps recursively and replaces lists, scalars, and nulls.
-fn merge_values(previous: &mut Value, later: Value) {
+pub(crate) fn merge_values(previous: &mut Value, later: Value) {
     match (previous, later) {
         (Value::Object(previous), Value::Object(later)) => {
             for (key, value) in later {

@@ -4708,6 +4708,94 @@ fn upgrade_rebinds_a_stock_layer_to_the_published_target_layer_and_retires_its_c
     );
 }
 
+/// #4321 AC1-AC2 with @spec CLUSTER-VALUES-FILES c1-c4: the stock binding
+/// supplied by an operator file participates in the target rebind, while its
+/// unrelated values remain in the one overlay used by admission and Apply.
+#[test]
+fn operator_file_stock_binding_is_rebound_in_the_admitted_apply_overlay() {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success(), "real Helm required");
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let registry = stock_registry(true);
+    let retained = serde_json::json!({
+        "agentSandbox": {
+            "runnerImages": {"acme-bot": LAYER_BOT},
+            "connectorSecrets": {"dark-factory": {"GITHUB_APP_KEY": "dark-factory-app"}}
+        }
+    });
+    let fixture = Fixture::new(Some(&retained.to_string()));
+    fixture.set_chart_values(&serde_json::json!({
+        "agentSandbox": {"runner": {
+            "image": "ghcr.io/curie-eng/curie-runner",
+            "digest": index_digest(STOCK_BASE_INDEX)
+        }}
+    }));
+    let file = fixture.0.path().join("stock-values.yaml");
+    fs::write(
+        &file,
+        format!(
+            "agentSandbox:\n  runnerImages:\n    dark-factory: {STOCK_OLD}\nworker:\n  deliveryBudgetSeconds: 777\n"
+        ),
+    )
+    .unwrap();
+
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["--values-file", file.to_str().unwrap()],
+        &[
+            ("CURIE_TEST_SRE_BOT_REGISTRY_ENDPOINT", &registry.base_url),
+            ("VALUES_FILES_REAL_HELM", helm.trim()),
+        ],
+    );
+    assert!(output.status.success(), "{}", visible(&output));
+    let applied = values_doc(&fixture.values(1));
+    assert_eq!(
+        applied
+            .pointer("/agentSandbox/runnerImages/dark-factory")
+            .and_then(Value::as_str),
+        Some(stock_new().as_str()),
+        "the file-provided stock binding is rebound: {applied}"
+    );
+    assert!(
+        applied
+            .pointer("/agentSandbox/runnerImages/acme-bot")
+            .is_none(),
+        "the retained owner-built binding is still cleared: {applied}"
+    );
+    assert_eq!(
+        applied.pointer("/worker/deliveryBudgetSeconds"),
+        Some(&serde_json::json!(777)),
+        "the unrelated file value survives the rebind: {applied}"
+    );
+    let schema_values = fixture.captured_paths("schema-values");
+    assert_eq!(
+        schema_values.len(),
+        1,
+        "schema admission did not capture exactly one overlay: {schema_values:?}"
+    );
+    let render_values = fixture.captured_paths("render-values");
+    assert_eq!(
+        render_values.len(),
+        1,
+        "timeout admission did not capture exactly one overlay: {render_values:?}"
+    );
+    for path in schema_values.into_iter().chain(render_values) {
+        let admitted: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(
+            admitted, applied,
+            "admission and Apply used different overlays"
+        );
+    }
+    let rebound = plan_line(&json(&output), "runner layers rebound:");
+    assert!(rebound.contains("dark-factory"), "{rebound}");
+    assert_retired_after_apply(&fixture, &["acme-bot", "dark-factory"]);
+}
+
 /// #4321 AC3: the dry run reads the registry, lists the rebound agent with
 /// its digest-pinned image apart from the cleared owner-built agent, prints
 /// both retirements, and mutates nothing.
@@ -5566,6 +5654,207 @@ fn printed_apply_line_matches_executed_helm_argv() {
             "{scenario}: --install only for a first install: {printed:?}"
         );
     }
+}
+
+#[test]
+fn operator_files_override_retained_values_in_admission_and_apply() {
+    // @spec CLUSTER-VALUES-FILES c1-c4
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success(), "real Helm required");
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    for reverse in [false, true] {
+        let fixture = Fixture::new(Some(
+            r#"{"worker":{"deliveryBudgetSeconds":600,"extraEnv":[{"name":"OLD","value":"old"}]}}"#,
+        ));
+        let first = fixture.0.path().join("first.yaml");
+        let second = fixture.0.path().join("second.yaml");
+        fs::write(&first, "worker:\n  deliveryBudgetSeconds: 700\n  extraEnv:\n    - name: NUMERIC_STRING\n      value: '8080'\napi:\n  podLabels:\n    example.com/key: 'off'\n").unwrap();
+        fs::write(&second, "worker:\n  deliveryBudgetSeconds: 800\n  extraEnv: []\napi:\n  githubToken: PLACEHOLDER-file-secret\n").unwrap();
+        let files = if reverse {
+            [&second, &first]
+        } else {
+            [&first, &second]
+        };
+        let output = fixture.run_with_env(
+            "healthy",
+            "0.9.0",
+            "charts/curie",
+            &[
+                "-f",
+                files[0].to_str().unwrap(),
+                "--values-file",
+                files[1].to_str().unwrap(),
+            ],
+            &[("VALUES_FILES_REAL_HELM", helm.trim())],
+        );
+        assert!(output.status.success(), "{}", stderr(&output));
+        let applied: Value = serde_json::from_str(&fixture.values(1)).unwrap();
+        assert_eq!(
+            applied.pointer("/worker/deliveryBudgetSeconds"),
+            Some(&serde_json::json!(if reverse { 700 } else { 800 }))
+        );
+        assert_eq!(
+            applied.pointer("/worker/extraEnv"),
+            Some(&if reverse {
+                serde_json::json!([{"name":"NUMERIC_STRING","value":"8080"}])
+            } else {
+                serde_json::json!([])
+            })
+        );
+        assert_eq!(
+            applied.pointer("/api/podLabels/example.com~1key"),
+            Some(&serde_json::json!("off"))
+        );
+        for path in fixture.captured_paths("render-values") {
+            let admitted: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(
+                admitted, applied,
+                "admission and Apply used different overlays"
+            );
+        }
+        assert!(!stderr(&output).contains("PLACEHOLDER-file-secret"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("PLACEHOLDER-file-secret"));
+        assert!(!fixture
+            .argv()
+            .iter()
+            .flatten()
+            .any(|arg| arg.contains("PLACEHOLDER-file-secret")));
+    }
+}
+
+#[test]
+fn explicit_file_repairs_a_retained_config_conflict_before_admission() {
+    // @spec CLUSTER-VALUES-FILES c3
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success(), "real Helm required");
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let fixture = Fixture::new(Some(&conflict_values("999").to_string()));
+    let file = fixture.0.path().join("repair.yaml");
+    fs::write(&file, "worker:\n  extraEnv: []\n").unwrap();
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["-f", file.to_str().unwrap()],
+        &[("VALUES_FILES_REAL_HELM", helm.trim())],
+    );
+    assert!(
+        output.status.success(),
+        "admission used superseded retained values: {}",
+        stderr(&output)
+    );
+    let applied: Value = serde_json::from_str(&fixture.values(1)).unwrap();
+    assert_eq!(
+        applied.pointer("/worker/extraEnv"),
+        Some(&serde_json::json!([]))
+    );
+}
+
+#[test]
+fn upgrade_file_inline_credentials_replace_retained_secret_references() {
+    // @spec CLUSTER-VALUES-FILES c1, CLUSTER-VALUES-FILES c3, CLUSTER-VALUES-FILES c4
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .unwrap();
+    assert!(helm.status.success());
+    let helm = String::from_utf8(helm.stdout).unwrap();
+    let fixture = Fixture::new(Some(
+        r#"{"agentSandbox":{"runner":{"credentialsExistingSecret":"old-model","credentialsExistingSecretKey":"token"}},"api":{"githubTokenExistingSecret":"old-github","githubTokenExistingSecretKey":"token"},"postgres":{"existingSecret":"old-postgres"}}"#,
+    ));
+    let file = fixture.0.path().join("credential-replacements.yaml");
+    fs::write(&file, "agentSandbox:\n  runner:\n    credentials: PLACEHOLDER-new-model\napi:\n  githubToken: PLACEHOLDER-new-github\npostgres:\n  auth:\n    password: PLACEHOLDER-new-postgres\n").unwrap();
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &["-f", file.to_str().unwrap()],
+        &[("VALUES_FILES_REAL_HELM", helm.trim())],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let applied: Value = serde_json::from_str(&fixture.values(1)).unwrap();
+    for (path, replacement) in [
+        ("/agentSandbox/runner/credentials", "PLACEHOLDER-new-model"),
+        ("/api/githubToken", "PLACEHOLDER-new-github"),
+        ("/postgres/auth/password", "PLACEHOLDER-new-postgres"),
+    ] {
+        assert_eq!(
+            applied.pointer(path).and_then(Value::as_str),
+            Some(replacement),
+            "file replacement lost at {path}"
+        );
+        assert!(!visible(&output).contains(replacement));
+        assert!(!fixture
+            .argv()
+            .iter()
+            .flatten()
+            .any(|arg| arg.contains(replacement)));
+    }
+    for path in [
+        "/agentSandbox/runner/credentialsExistingSecret",
+        "/agentSandbox/runner/credentialsExistingSecretKey",
+        "/api/githubTokenExistingSecret",
+        "/api/githubTokenExistingSecretKey",
+        "/postgres/existingSecret",
+    ] {
+        assert!(
+            applied
+                .pointer(path)
+                .is_none_or(|value| value.as_str() == Some("")),
+            "retained reference still active: {path}"
+        );
+    }
+    for path in fixture.captured_paths("render-values") {
+        let admitted: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(admitted, applied);
+    }
+}
+
+#[test]
+fn upgrade_refuses_before_render_when_captured_overlay_cannot_be_materialized() {
+    // @spec CLUSTER-VALUES-FILES c3, CLUSTER-VALUES-FILES c4
+    let fixture = Fixture::new(Some(r#"{"worker":{"deliveryBudgetSeconds":600}}"#));
+    let tmp = fixture.0.path().join("owned-temp");
+    fs::create_dir(&tmp).unwrap();
+    let output = fixture.run_with_env(
+        "healthy",
+        "0.9.0",
+        "charts/curie",
+        &[],
+        &[
+            ("TMPDIR", tmp.to_str().unwrap()),
+            (
+                "VALUES_FILES_REMOVE_TMP_AFTER_SCHEMA_PROBE",
+                tmp.to_str().unwrap(),
+            ),
+        ],
+    );
+    assert!(!tmp.exists(), "fixture did not inject the failure");
+    assert!(!output.status.success());
+    assert!(
+        visible(&output).contains("could not prepare target metadata values"),
+        "{}",
+        visible(&output)
+    );
+    assert!(
+        !fixture
+            .argv()
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "templates/schema-compat.yaml")),
+        "metadata was admitted without its overlay"
+    );
+    // Ownership acquisition/release precedes admission by existing policy.
+    assert!(fixture.helm_upgrades().is_empty());
+    assert!(
+        fixture.records().is_empty(),
+        "lifecycle checkpoint advanced after metadata refusal"
+    );
 }
 
 /// Whether the record lists `phase` as completed.
