@@ -403,7 +403,7 @@ spec:
             - name: REQUESTS_CA_BUNDLE
               value: /etc/curie/github-stub/ca.pem
             {{- end }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) | nindent 12 }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity" "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) | nindent 12 }}
           ports:
             - name: http
               containerPort: 8000

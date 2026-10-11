@@ -3568,6 +3568,35 @@ for component in ("api", "worker"):
 print("  ok: default us-east-1 and override eu-west-1 reach API, worker and bundle fetches with either auth mode")
 
 for component in ("api", "worker"):
+    for region in ("us-east-1", "eu-west-1"):
+        result = subprocess.run(
+            [
+                "helm", "template", "acme", chart, "--namespace", "acme",
+                "--set", "rustfs.region=eu-west-1",
+                "--set", f"{component}.extraEnv[0].name=S3_REGION",
+                "--set-string", f"{component}.extraEnv[0].value={region}",
+            ],
+            text=True, capture_output=True,
+        )
+        assert result.returncode != 0, f"accepted reserved {component}.extraEnv S3_REGION={region}"
+        for expected in (f"{component}.extraEnv", "S3_REGION", "rustfs.region"):
+            assert expected in result.stderr, result.stderr
+    extension = render(
+        "--set", "rustfs.region=eu-west-1",
+        "--set", f"{component}.extraEnv[0].name=ACME_EXTENSION",
+        "--set-string", f"{component}.extraEnv[0].value=preserved",
+    )
+    assert_regions(extension, "eu-west-1")
+    entries = [
+        entry for entry in service_container(extension, component)["env"]
+        if entry["name"] == "ACME_EXTENSION"
+    ]
+    assert entries == [{"name": "ACME_EXTENSION", "value": "preserved"}], (
+        f"{component} ACME_EXTENSION must be preserved exactly once"
+    )
+    print(f"  ok: {component}.extraEnv rejects conflicting and identical S3_REGION entries and preserves an unrelated extension")
+
+for component in ("api", "worker"):
     mutant = copy.deepcopy(override)
     container = service_container(mutant, component)
     container["env"] = [entry for entry in container["env"] if entry["name"] != "S3_REGION"]
