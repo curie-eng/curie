@@ -53,7 +53,7 @@ SELECTOR = re.compile(
     r"(?:[A-Za-z_][A-Za-z0-9_]*::)*"
     r"test[A-Za-z0-9_]*(?:\[[A-Za-z0-9_.-]+\])?"
     r"|cli/tests/[A-Za-z0-9_-]+\.rs::[A-Za-z_][A-Za-z0-9_]*"
-    r"|charts/curie/ci/[A-Za-z0-9_-]+\.sh"
+    r"|charts/curie/ci/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.sh"
     r")"
 )
 BUG_LABEL = "bug"
