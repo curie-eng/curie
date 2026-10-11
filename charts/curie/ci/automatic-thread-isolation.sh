@@ -34,15 +34,18 @@
 # cluster, kills every process the script started, and then ASSERTS that the
 # release's cluster-scoped objects, the namespace, its volumes, the kind node
 # container and those processes are all gone, and that every kind cluster that
-# existed before the run is still there. A cleanup assertion failure fails the
-# run even when the regression itself passed.
+# existed before the run is still there. It also removes the run's own image
+# tags and asserts they are gone. A cleanup assertion failure fails the run
+# even when the regression itself passed.
 #
 # Usage (no arguments; run from anywhere):
 #   bash charts/curie/ci/automatic-thread-isolation.sh
 #
-# Needs docker, kind, kubectl, helm, cargo, a C compiler and python3. The
-# product images are the published ones for the chart's appVersion, pulled
-# anonymously from GHCR; the CLI is built from the checkout the script lives in.
+# Needs docker, kind, kubectl, helm, cargo, a C compiler and python3. The CLI
+# and the api, worker and runner images are built from the checkout the script
+# lives in; the images get a run-unique tag, are loaded into the owned cluster
+# and are deployed with pullPolicy Never, so nothing depends on a published
+# appVersion.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -53,6 +56,9 @@ CONTEXT="kind-${KIND_CLUSTER}"
 NAMESPACE="ati-${RUN_ID}"
 RELEASE="ati${RUN_ID}"
 FULLNAME="${RELEASE}-curie"
+# Docker cannot reserve a tag atomically, so the image tag is owned by being
+# unguessable: a random UUID (122 random bits) on top of the run id.
+IMAGE_TAG="ati-${RUN_ID}-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 AGENT="ati-bot"
 CONCURRENT=3
 MESSAGE_TIMEOUT_SECS=420
@@ -62,6 +68,8 @@ KUBECONFIG_FILE=""
 OWNED_KIND=0
 OWNED_RELEASE=0
 SPAWNED_PIDS=()
+OWNED_IMAGES=()
+declare -A OWNED_IMAGE_IDS=()
 PREEXISTING_KIND=""
 
 log() { printf '[automatic-thread-isolation] %s\n' "$*" >&2; }
@@ -97,6 +105,11 @@ kind_clusters() {
     local out
     out="$(kind get clusters 2>&1)" || { printf '%s\n' "$out" >&2; return 1; }
     grep -v '^No kind clusters found' <<<"$out" || true
+}
+
+# The image ID a tag names, empty when the tag is absent.
+image_tag_id() {
+    docker image ls --no-trunc -q "$1"
 }
 
 # Node containers (running or not) carrying a kind cluster's label.
@@ -213,6 +226,32 @@ cleanup() {
         fi
     fi
 
+    # Only tags this run created, and only while they still name the image
+    # this run built; never by image ID, never forced or pruned, so layers
+    # shared with other tags and owners stay.
+    local image id
+    for image in "${OWNED_IMAGES[@]}"; do
+        if ! id="$(image_tag_id "$image")"; then
+            log "cleanup assertion: could not query owned image $image"
+            cleanup_failed=1
+            continue
+        fi
+        [[ -n "$id" ]] || continue
+        if [[ "$id" != "${OWNED_IMAGE_IDS[$image]:-}" ]]; then
+            log "cleanup assertion: $image names an image this run did not record; left in place"
+            cleanup_failed=1
+            continue
+        fi
+        docker image rm "$image" >/dev/null 2>&1
+        if ! id="$(image_tag_id "$image")"; then
+            log "cleanup assertion: could not query owned image $image"
+            cleanup_failed=1
+        elif [[ -n "$id" ]]; then
+            log "cleanup assertion: owned image $image still exists"
+            cleanup_failed=1
+        fi
+    done
+
     for pid in "${SPAWNED_PIDS[@]}"; do
         if kill -0 "$pid" 2>/dev/null; then
             log "cleanup assertion: spawned process $pid is still running"
@@ -246,7 +285,7 @@ cleanup() {
         log "FAIL: cleanup left owned resources behind"
         exit 1
     fi
-    log "cleanup verified: release, namespace, volumes, cluster and processes are gone"
+    log "cleanup verified: release, namespace, volumes, cluster, images and processes are gone"
     exit "$status"
 }
 trap cleanup EXIT
@@ -296,6 +335,27 @@ C
 cc -shared -fPIC -O2 -o "$WORKDIR/pin-realtime.so" "$WORKDIR/pin-realtime.c" -ldl
 PINNED_REALTIME="$(date +%s).123456000"
 
+# --- the product images under test, built from this checkout ---------------
+# Refuse a tag that already exists before claiming ownership, so cleanup never
+# removes a tag this run did not create.
+for component in api worker runner; do
+    image="curie-${component}:${IMAGE_TAG}"
+    existing="$(image_tag_id "$image")" || fail "cannot query image tag $image on this Docker daemon"
+    [[ -z "$existing" ]] || fail "image tag $image already exists; refusing to claim a tag this run did not create"
+    [[ "$component" == runner ]] && dockerfile="runner/Dockerfile" || dockerfile="apps/$component/Dockerfile"
+    log "building $image from $dockerfile"
+    OWNED_IMAGES+=("$image")
+    docker build --file "$REPO_ROOT/$dockerfile" --tag "$image" \
+        --iidfile "$WORKDIR/build-$component.iid" "$REPO_ROOT" \
+        >"$WORKDIR/build-$component.log" 2>&1 || {
+            tail -40 "$WORKDIR/build-$component.log" >&2
+            fail "$component image build failed"
+        }
+    # The ID this build produced, not whatever the tag names afterwards.
+    OWNED_IMAGE_IDS[$image]="$(cat "$WORKDIR/build-$component.iid")"
+    [[ "${OWNED_IMAGE_IDS[$image]}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "docker build did not report an image ID for $image"
+done
+
 # --- an owned kind cluster ------------------------------------------------
 # Refuse a name that already exists before claiming ownership: a failed create
 # of someone else's cluster must never lead cleanup to delete it.
@@ -311,17 +371,13 @@ if ! kind create cluster --name "$KIND_CLUSTER" --kubeconfig "$KUBECONFIG_FILE" 
     kind create cluster --name "$KIND_CLUSTER" --kubeconfig "$KUBECONFIG_FILE" --wait 180s >/dev/null
 fi
 
-APP_VERSION="$(sed -n 's/^appVersion:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CHART/Chart.yaml")"
-[[ -n "$APP_VERSION" ]] || fail "could not read appVersion from $CHART/Chart.yaml"
-for component in api worker runner; do
-    image="ghcr.io/curie-eng/curie-${component}:${APP_VERSION}"
-    if ! docker image inspect "$image" >/dev/null 2>&1; then
-        log "pulling $image"
-        docker pull --quiet "$image" >/dev/null
-    fi
-    log "loading $image into $KIND_CLUSTER"
-    kind load docker-image "$image" --name "$KIND_CLUSTER" >/dev/null
+# Load only the exact images this run built.
+for image in "${OWNED_IMAGES[@]}"; do
+    [[ "$(image_tag_id "$image")" == "${OWNED_IMAGE_IDS[$image]}" ]] || \
+        fail "$image no longer names the image this run built"
 done
+log "loading ${OWNED_IMAGES[*]} into $KIND_CLUSTER"
+kind load docker-image "${OWNED_IMAGES[@]}" --name "$KIND_CLUSTER" >/dev/null
 
 # --- the release, scripted model, no Slack --------------------------------
 log "installing release $RELEASE into namespace $NAMESPACE"
@@ -342,16 +398,16 @@ OWNED_RELEASE=1
     --set mailAdapter.deploy=false \
     --set otelCollector.deploy=false \
     --set otelCollector.telemetryDisabled=true \
-    --set "api.image.repository=ghcr.io/curie-eng/curie-api" \
-    --set "api.image.tag=${APP_VERSION}" \
-    --set api.image.pullPolicy=IfNotPresent \
-    --set "worker.image.repository=ghcr.io/curie-eng/curie-worker" \
-    --set "worker.image.tag=${APP_VERSION}" \
-    --set worker.image.pullPolicy=IfNotPresent \
-    --set "agentSandbox.runner.image=ghcr.io/curie-eng/curie-runner" \
-    --set "agentSandbox.runner.tag=${APP_VERSION}" \
-    --set agentSandbox.runner.imagePullPolicy=IfNotPresent \
-    --set agentSandbox.runner.prewarm.imagePullPolicy=IfNotPresent \
+    --set api.image.repository=curie-api \
+    --set "api.image.tag=${IMAGE_TAG}" \
+    --set api.image.pullPolicy=Never \
+    --set worker.image.repository=curie-worker \
+    --set "worker.image.tag=${IMAGE_TAG}" \
+    --set worker.image.pullPolicy=Never \
+    --set agentSandbox.runner.image=curie-runner \
+    --set "agentSandbox.runner.tag=${IMAGE_TAG}" \
+    --set agentSandbox.runner.imagePullPolicy=Never \
+    --set agentSandbox.runner.prewarm.imagePullPolicy=Never \
     >"$WORKDIR/up.out" 2>"$WORKDIR/up.err" || {
         tail -40 "$WORKDIR/up.err" >&2
         fail "curie cluster up failed"
