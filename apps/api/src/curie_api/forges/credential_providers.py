@@ -12,9 +12,13 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from curie_api.forges.types import Credential, CredentialExpiry, CredentialHeader, CredentialScope
+
+if TYPE_CHECKING:
+    from curie_api.forges.config import CredentialConfig, GitHubAppCredentialConfig
+    from curie_api.github_app import GitHubCredentials
 
 # Re-mint this long before a minted token's expiry, as `github_app` does today.
 DEFAULT_REFRESH_MARGIN = timedelta(minutes=5)
@@ -172,6 +176,59 @@ class StaticTokenProvider:
 
     def expiry(self) -> ExpiryReport:
         return self._report
+
+
+def expiry_for(config: CredentialConfig) -> ExpiryReport:
+    """The expiry of a configured credential, read from its config alone.
+
+    A GitHub App's key has no expiry and Curie re-mints its tokens. OAuth client
+    credentials re-mint; their secret's expiry is known when configured. A
+    static token's expiry is known, declared absent, or unknown.
+    """
+
+    if config.type == "github_app":
+        return ExpiryReport(CredentialExpiry.NONE, remints=True)
+    if config.type == "oauth_client_credentials":
+        if config.secret_expires_at is not None:
+            return ExpiryReport(CredentialExpiry.KNOWN, config.secret_expires_at, remints=True)
+        return ExpiryReport(CredentialExpiry.UNKNOWN, remints=True)
+    if config.expires_at is not None:
+        return ExpiryReport(CredentialExpiry.KNOWN, config.expires_at)
+    if config.never_expires:
+        return ExpiryReport(CredentialExpiry.NONE)
+    return ExpiryReport(CredentialExpiry.UNKNOWN)
+
+
+class GitHubAppProvider:
+    """A configured GitHub App. Its installation tokens are per repository and
+    per installation, so it exposes the `GitHubCredentials` that mints them
+    (verified installation, per-repository locks and cache) rather than one
+    token per scope."""
+
+    def __init__(self, credentials: GitHubCredentials, config: GitHubAppCredentialConfig) -> None:
+        self.credentials = credentials
+        self._config = config
+
+    def expiry(self) -> ExpiryReport:
+        return expiry_for(self._config)
+
+
+def github_app_provider(
+    config: GitHubAppCredentialConfig, *, api_url: str, ca_bundle: str
+) -> GitHubAppProvider:
+    """The provider for a configured GitHub App on the GitHub at ``api_url``."""
+
+    from curie_api.github_app import GitHubAuth, credentials_for_auth
+
+    auth = GitHubAuth(
+        app_id=config.app_id,
+        private_key=config.private_key.get_secret_value(),
+        token="",
+        api_url=api_url,
+        timeout_s=config.timeout_s,
+        ca_bundle=ca_bundle,
+    )
+    return GitHubAppProvider(credentials_for_auth(auth), config)
 
 
 def expiry_warning(report: ExpiryReport, now: datetime, warn_before: timedelta) -> str | None:
