@@ -66,6 +66,53 @@ def test_record_without_upstream_key_refuses_before_resource_mutation(
     assert "CURIE_FACTORY_RECORD_KEY" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        '{"version": 1, "exchanges": [',
+        json.dumps(
+            {"version": 1, "exchanges": [{"lane_key": "add Kelvin tests", "ordinal": 0}]}
+        ),
+    ],
+    ids=["invalid-json", "exchange-without-message"],
+)
+def test_malformed_replay_transcript_refuses_before_resource_mutation(
+    content: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    malformed = tmp_path / "malformed-transcript.json"
+    malformed.write_text(content)
+    monkeypatch.setattr(sk, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(sk.subprocess, "run", _refuse_external_command)
+    args = fe.parse_args(["scripted", "--transcript", str(malformed)])
+
+    assert sk.main(args) == fe.EXIT_CONFIG
+    assert "transcript" in capsys.readouterr().err.lower()
+
+
+def test_well_formed_replay_transcript_passes_configuration(tmp_path: Path) -> None:
+    transcript = tmp_path / "transcript.json"
+    transcript.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "exchanges": [
+                    {
+                        "lane_key": "add Kelvin tests",
+                        "ordinal": 0,
+                        "message": {"type": "message", "content": []},
+                    }
+                ],
+            }
+        )
+    )
+    args = fe.parse_args(["scripted", "--transcript", str(transcript)])
+
+    sk.validate_configuration(args)
+
+
 def _replay_args(tmp_path: Path) -> Any:
     transcript = tmp_path / "transcript.json"
     transcript.write_text(json.dumps({"version": 1, "exchanges": []}))
@@ -562,6 +609,79 @@ def test_real_proxy_counts_provider_requests_including_provider_failures(
     finally:
         with pytest.raises(model_module.UnexpectedRequest):
             model.close()
+
+
+@pytest.mark.parametrize(
+    ("remaining", "admitted"),
+    [(30.8, False), (31.5, True)],
+    ids=["under-one-usd-left-refused", "over-one-usd-left-admitted"],
+)
+def test_real_proxy_admits_a_request_only_while_one_usd_of_budget_remains(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remaining: float,
+    admitted: bool,
+) -> None:
+    """One request can spend past the completed-drop check, so reserve 1 USD."""
+
+    model_module = sk._module(
+        "factory_reserve_model_script", REPO_ROOT / "tools/model-script/model_script.py"
+    )
+    run = _recording_run(tmp_path, monkeypatch, remaining=50)
+    assert run.record_budget_start == 50
+    model = model_module.ModelScript(Path(run.args.transcript), record=True)
+    run.model = model
+    run.count_recording_requests(model_module)
+    provider_calls: list[str] = []
+    message = {"type": "message", "content": [{"type": "text", "text": "done"}]}
+
+    class ProviderResponse:
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self) -> ProviderResponse:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(message).encode()
+
+    def provider(request: Request, **_kwargs: Any) -> ProviderResponse:
+        provider_calls.append(request.full_url)
+        return ProviderResponse()
+
+    monkeypatch.setattr(model_module, "urlopen", provider)
+    monkeypatch.setattr(run, "provider_remaining", lambda: remaining)
+    model.start()
+    request = Request(
+        model.base_url + "/v1/messages",
+        data=json.dumps({"messages": [{"role": "user", "content": "convert units"}]}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        if admitted:
+            with urlopen(request, timeout=5) as response:
+                assert json.load(response)["type"] == "message"
+            assert len(provider_calls) == 1
+            assert run.record_error is None
+            assert run.evidence["recording_model_calls"] == 1
+        else:
+            with pytest.raises(HTTPError) as refused:
+                urlopen(request, timeout=5)
+            assert refused.value.code == 422
+            refused.value.close()
+            assert provider_calls == []
+            assert run.record_error is not None
+            assert "20 USD" in run.record_error
+            assert run.evidence["recording_model_calls"] == 0
+            assert len(model.unexpected) == 1
+    finally:
+        try:
+            model.close()
+        except model_module.UnexpectedRequest:
+            assert not admitted
 
 
 @pytest.mark.parametrize("remaining", [None, -1, "nan", "inf"])

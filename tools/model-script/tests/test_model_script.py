@@ -300,6 +300,70 @@ def test_record_injects_environment_key_and_saves_only_replay_fields(
         replay.close()
 
 
+def test_record_close_waits_for_an_in_flight_exchange_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request still waiting on the provider at close must reach the transcript."""
+
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-provider-key")
+    received = threading.Event()
+    release = threading.Event()
+
+    class SlowProvider(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            received.set()
+            release.wait(timeout=10)
+            payload = json.dumps(_message("Edit", "recorded")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowProvider)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    output = tmp_path / "recorded.json"
+    recorder = ms.ModelScript(
+        output, record=True, upstream=f"http://127.0.0.1:{server.server_address[1]}"
+    )
+    recorder.start()
+    results: list[tuple[int, bytes, str]] = []
+    client = threading.Thread(
+        target=lambda: results.append(
+            _post(recorder.base_url, _request("system", "add Kelvin"))
+        ),
+        daemon=True,
+    )
+    releaser = threading.Timer(0.5, release.set)
+    try:
+        client.start()
+        assert received.wait(timeout=5)
+        releaser.start()
+        recorder.close()
+        # close() returned, so the in-flight handler finished writing its
+        # response; the client only has to read bytes already sent.
+        client.join(timeout=2)
+        assert not client.is_alive()
+        assert release.is_set()
+        assert results and results[0][0] == 200
+        saved = json.loads(output.read_text())
+        assert len(saved["exchanges"]) == 1
+        assert saved["exchanges"][0]["lane_key"] == "add Kelvin"
+        assert saved["exchanges"][0]["message"]["content"][0]["name"] == "Edit"
+    finally:
+        release.set()
+        releaser.cancel()
+        client.join(timeout=5)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
 def test_committed_transcripts_store_no_requests_or_provider_keys() -> None:
     for path in (ROOT / "transcripts").glob("*.json"):
         text = path.read_text()
