@@ -89,6 +89,14 @@ RETRY_ALLOWLIST = frozenset(
         ("ci.yaml", "e2e-released-upgrade-negative", "Install Helm"),
         ("ci.yaml", "e2e-released-upgrade-negative", "Create the disposable kind cluster"),
         ("ci.yaml", "e2e-cluster-upgrade-matrix", "Install Helm"),
+        # Issue #4111: the scripted factory job acquires Helm, kind and kubectl
+        # before the driver runs; the driver creates its own cluster.
+        ("ci.yaml", "e2e-scripted-factory", "Install Helm"),
+        (
+            "ci.yaml",
+            "e2e-scripted-factory",
+            "Install kind and kubectl without creating a cluster",
+        ),
         ("ci.yaml", "e2e-required", "Install uv for the runtime assertion gate"),
         ("helm-ci.yaml", "chart-lint-and-assertions-1", "Install Helm"),
         ("helm-ci.yaml", "chart-assertions-2", "Install Helm"),
