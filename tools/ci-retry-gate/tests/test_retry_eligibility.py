@@ -96,6 +96,7 @@ RETRY_ALLOWLIST = frozenset(
         ("helm-ci.yaml", "chart-assertions-retained-values", "Install Helm"),
         ("helm-ci.yaml", "reserved-env-upgrade", "Install Helm"),
         ("helm-ci.yaml", "reserved-env-upgrade", "Create the kind cluster"),
+        ("helm-ci.yaml", "automatic-thread-isolation", "Install Helm"),
         ("dependency-audit.yaml", "python-audit", "Install uv"),
         ("gitleaks.yaml", "gitleaks", "Pull the gitleaks image"),
         ("release.yaml", "build", "Set up Buildx"),

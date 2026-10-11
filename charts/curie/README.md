@@ -1001,8 +1001,8 @@ The bundle fetch uses path style addressing, so it appends
 `agentSandbox.runner.bundleFetch.bucket` to this endpoint. For another AWS
 region, change the region in `rustfs.host` and set `rustfs.region` to control
 the SigV4 signing region used by the bundle fetch init container and by
-Langfuse's event/media uploads. This setting does not configure the API or
-worker S3 clients.
+Langfuse's event/media uploads. This setting also sets `S3_REGION` for the API
+and worker S3 clients.
 
 **Runner egress is a separate required list.** Rail 1 default-denies the
 sandbox, and the in-chart `runner-allow-rustfs` policy is a pod selector on

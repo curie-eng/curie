@@ -543,6 +543,8 @@ spec:
             # agree. ci/worker-object-store-assertions.sh asserts they do.
             - name: S3_ENDPOINT_URL
               value: {{ include "curie.rustfs.endpoint" . }}
+            - name: S3_REGION
+              value: {{ .Values.rustfs.region | quote }}
             {{- if include "curie.rustfs.staticCredentials" . }}
             - name: S3_ACCESS_KEY
               value: {{ .Values.rustfs.auth.accessKey | quote }}
@@ -563,7 +565,7 @@ spec:
               value: /etc/curie/github-stub/ca.pem
             {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv "additionalReserved" (include "curie.slack.reservedEnv" (dict "root" . "workload" "worker") | fromJson)) | nindent 12 }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv "additionalReserved" (merge (dict "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "worker") | fromJson))) | nindent 12 }}
           # No HTTP port on the worker, so an exec probe checks a heartbeat file
           # the asyncio event loop touches each tick. A wedged loop stops
           # touching it -> the file goes stale -> the probe fails -> restart.
