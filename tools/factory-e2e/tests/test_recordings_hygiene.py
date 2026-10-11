@@ -23,6 +23,7 @@ import re
 import shutil
 import string
 import subprocess
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,8 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCANNED_ROOTS = ("tools/factory-e2e", "apps/api/tests")
 
-# A token match whose body holds one of these words is a placeholder.
+# A token body is a placeholder when one of these words is anchored in it and
+# the rest is filler; see `_token_placeholder` for the exact rule.
 PLACEHOLDER_WORDS = (
     "example",
     "fixture",
@@ -42,6 +44,11 @@ PLACEHOLDER_WORDS = (
     "redacted",
     "xxxx",
 )
+PLACEHOLDER_WORD_RE = re.compile("|".join(PLACEHOLDER_WORDS), re.IGNORECASE)
+# Characters that delimit a word inside a token body.
+SEPARATORS = frozenset("_-.=+/")
+# A remainder this short around an anchored placeholder word is filler.
+SHORT_FILLER = 16
 
 # Site, workspace and group names a reader is meant to replace.
 PLACEHOLDER_NAMES = frozenset(
@@ -149,9 +156,65 @@ def _low_entropy(body: str) -> bool:
     return False
 
 
+def _sequential(text: str) -> bool:
+    """Mostly runs like `0123` or `abcd`: at least 3 in 4 neighbours step by one."""
+    if len(text) < 2:
+        return True
+    steps = sum(1 for left, right in pairwise(text) if ord(right) - ord(left) == 1)
+    return steps * 4 >= (len(text) - 1) * 3
+
+
+def _filler(text: str) -> bool:
+    """What a person types around a placeholder word, not a random secret.
+
+    Short (at most 16 characters, like the documented AWS example key's
+    `IOSFODNN7`), low-entropy, a repeated handful of characters (no more than
+    one distinct character per four), or a sequential run.
+    """
+    return (
+        len(text) <= SHORT_FILLER
+        or _low_entropy(text)
+        or len(set(text)) <= max(5, len(text) // 4)
+        or _sequential(text)
+    )
+
+
+def _anchored_word(lowered: str, word: str) -> bool:
+    """`word` starts the body, ends it, or has a separator on both sides."""
+    start = lowered.find(word)
+    while start != -1:
+        end = start + len(word)
+        if start == 0 or end == len(lowered):
+            return True
+        if lowered[start - 1] in SEPARATORS and lowered[end] in SEPARATORS:
+            return True
+        start = lowered.find(word, start + 1)
+    return False
+
+
 def _token_placeholder(body: str) -> bool:
-    lowered = body.lower()
-    return _low_entropy(body) or any(word in lowered for word in PLACEHOLDER_WORDS)
+    """A token body that is obviously not a real credential.
+
+    Either the body is low-entropy as a whole, or both of these hold:
+
+    1. A placeholder word is anchored in it: the word starts the body, ends
+       it, or sits between separators (`_example_`, `-test-`). A word glued to
+       other characters on both sides mid-body is the kind of thing a random
+       body contains by chance, so it exempts nothing.
+    2. What is left once every placeholder word and separator is removed is
+       filler (`_filler`), not a random string.
+
+    A real high-entropy token that happens to contain `test`, `fake` or
+    `example` fails condition 1 when the word is mid-body and condition 2 when
+    it is not.
+    """
+    if _low_entropy(body):
+        return True
+    if not any(_anchored_word(body.lower(), word) for word in PLACEHOLDER_WORDS):
+        return False
+    # The remainder keeps its original case, so `A1b2` stays four symbols.
+    rest = PLACEHOLDER_WORD_RE.sub("", body)
+    return _filler("".join(char for char in rest if char not in SEPARATORS))
 
 
 def _cloud_id_placeholder(value: str) -> bool:
@@ -316,6 +379,29 @@ PLANTED: dict[str, tuple[str, str]] = {
     ),
     "cloud-id-camel": ("atlassian-cloud-id", '{"cloudId": "' + _uuid() + '"}'),
     "cloud-id-snake": ("atlassian-cloud-id", "cloud_" + "id = '" + _uuid() + "'"),
+    # A real high-entropy body that merely contains a placeholder word is
+    # still a credential: mid-body, glued to random characters, ...
+    "github-token-test-mid-body": (
+        "github-token",
+        "gh" + "p_" + _rand(_ALNUM, 14) + "test" + _rand(_ALNUM, 18),
+    ),
+    "anthropic-key-fake-mid-body": (
+        "anthropic-key",
+        "sk-" + "ant-api03-" + _rand(_ALNUM, 45) + "fake" + _rand(_ALNUM, 44) + "AA",
+    ),
+    "atlassian-token-example-mid-body": (
+        "atlassian-api-token",
+        "ATA" + "TT3xFfGF0" + _rand(_ALNUM, 90) + "Example" + _rand(_ALNUM, 90),
+    ),
+    # ... and anchored, when what surrounds the word is random, not filler.
+    "github-fine-grained-example-prefix": (
+        "github-fine-grained-token",
+        "github" + "_pat_" + "EXAMPLE" + _rand(_ALNUM, 75),
+    ),
+    "gitlab-test-delimited": (
+        "gitlab-token",
+        "gl" + "pat-" + _rand(_ALNUM, 12) + "-test-" + _rand(_ALNUM, 12),
+    ),
 }
 
 
