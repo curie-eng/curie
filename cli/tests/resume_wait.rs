@@ -24,7 +24,7 @@ use curie::chat::{await_reply, await_resume, parse_approval_id, Outcome, SlackSt
 use curie::queue::{synthetic_turn, xadd, WORKER_GROUP};
 use curie_aci_protocol::{QueuedTurn, ReplyHandle, TurnSource};
 
-mod support;
+use crate::support;
 use support::{unique_stream, valkey_or_skip};
 
 const PLACEHOLDER_TS: &str = "1720000000.000200";

@@ -1,7 +1,7 @@
 //! Integration: the platform API client's deploy flow against the OpenAPI
 //! contract shapes (apps/api openapi.json), served by a wire-level test server.
 
-mod support;
+use crate::support;
 
 use curie::api::{ApiClient, ChannelOutcome, DeployOutcome, WorkspaceIntent};
 use curie::bundle::pack_tar_gz;
@@ -26,9 +26,6 @@ const DEPLOYMENT_ID: &str = "33333333-3333-3333-3333-333333333333";
 const BOUND: &str = "C0EXAMPLE1";
 /// A second, not-yet-bound channel: what `--slack-channel` asks to ADD.
 const OTHER: &str = "C0EXAMPLE2";
-
-#[cfg(unix)]
-static PATH_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(unix)]
 struct GitEnvGuard {
@@ -253,7 +250,7 @@ exec "$CURIE_TEST_REAL_GIT" "$@"
     permissions.set_mode(0o755);
     std::fs::set_permissions(&wrapper, permissions).unwrap();
     let count_file = wrapper_dir.path().join("git-count");
-    let _path_env = PATH_ENV_LOCK.lock().await;
+    let _path_env = support::ENV_LOCK.lock().await;
     let git_env = GitEnvGuard::install(&git, &count_file, wrapper_dir.path());
 
     let git_server = serve(|req| route(&req.method, &req.path));
@@ -1869,6 +1866,7 @@ async fn a_local_deploy_narrows_the_bring_up_to_the_targets_connectors() {
          secrets: [D8_TEST_KEPT_TOKEN]\n",
     )
     .unwrap();
+    let _env = support::ENV_LOCK.lock().await;
     std::env::remove_var("D8_TEST_EXCLUDED_TOKEN");
     std::env::remove_var("D8_TEST_KEPT_TOKEN");
 

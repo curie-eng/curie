@@ -5,7 +5,7 @@
 //! the command handlers (`--yes` gate on the destructive verbs, `--dry-run`
 //! makes no request).
 
-mod support;
+use crate::support;
 
 use curie::api::{ApiClient, BudgetConfig};
 use curie::commands::{self, AgentActionOpts};

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-mod support;
+use crate::support;
 
 use curie_aci_protocol::PROTOCOL_VERSION;
 use support::{serve, Response};

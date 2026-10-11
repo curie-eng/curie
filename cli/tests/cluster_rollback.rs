@@ -14,12 +14,11 @@
 //! EVERY PATH-dependent assertion lives in ONE `#[tokio::test]`. `rollback()`
 //! resolves `helm` off the process PATH, so that test mutates process-global
 //! PATH (and env vars the fake `helm` reads); a second parallel test touching
-//! PATH in this file would race it. Each `tests/*.rs` file is its own test
-//! binary, so one such test here is race-free, and it saves and restores the
-//! original PATH. The pure tests below never touch PATH, so they cannot race it.
+//! PATH in this file would race it. It holds `support::ENV_LOCK` for its whole
+//! body against every other test in the shared integration process, and it
+//! saves and restores the original PATH. The pure tests below never touch PATH, so they cannot race it.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::ffi::OsString;
 use std::fs;
@@ -294,6 +293,7 @@ fn rollback_opts(revision: Option<u32>, allow_failed_revision: bool) -> Rollback
 
 #[tokio::test]
 async fn rollback_hands_helm_the_selected_revision() {
+    let _env = crate::support::ENV_LOCK.lock().await;
     let original_path = std::env::var_os("PATH");
     let dir = tempfile::tempdir().expect("tempdir");
 

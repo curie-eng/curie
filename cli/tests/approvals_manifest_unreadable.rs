@@ -8,7 +8,7 @@
 //! ready-made reason cannot see that, so every case here makes the HTTP call
 //! actually fail (or succeed) and asserts what the command concluded from it.
 
-mod support;
+use crate::support;
 
 use curie::commands::{approvals, AgentActionOpts, ApprovalCmd, ApprovalsOutput};
 use curie::ui::CliOutput;

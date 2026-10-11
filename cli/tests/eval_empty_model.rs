@@ -7,7 +7,7 @@
 //! in the model sweep, and the CLI must turn that into an actionable usage
 //! error instead of forwarding it as a raw API 422.
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::path::Path;

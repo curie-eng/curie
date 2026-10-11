@@ -1,5 +1,4 @@
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

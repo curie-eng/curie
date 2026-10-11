@@ -27,7 +27,7 @@
 //! cluster tier MUST still be given explicit `--api-url`/`--api-key`, since
 //! `resolve_cluster_conn` otherwise shells out to `kubectl` to discover them.
 
-mod support;
+use crate::support;
 
 use std::process::Command;
 

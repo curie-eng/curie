@@ -3,10 +3,17 @@ name = "curie"
 version = "0.12.3"
 edition = "2021"
 description = "Curie CLI: init/start/send/eval a plugin against a local runner (task I1)"
+# Every cli/tests/<name>.rs is a module of the one `integration` test crate
+# below (#4382); tests/integration.rs declares them and guards that none is missed.
+autotests = false
 
 [[bin]]
 name = "curie"
 path = "src/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
 
 [dependencies]
 curie-aci-protocol = { path = "../packages/aci-protocol/generated/rust" }
@@ -122,8 +129,9 @@ quote = "1"
 # Dev builds carried full DWARF, which dominated the target dir. A section dump
 # of one 181MB integration test binary measured .text at 3.5MB against roughly
 # 175MB of .debug_* sections, so about 97% of every artifact was debug info.
-# With 41 integration test targets in cli/tests, each statically linking the
-# whole crate graph, a single target dir reached 175G.
+# Back when cli/tests built 41 separate integration test targets, each statically
+# linking the whole crate graph, a single target dir reached 175G. Since #4382
+# there is one integration test target, but each test binary is still mostly debug info.
 #
 # line-tables-only keeps file and line numbers in panics and backtraces, which
 # is what the test suite and local debugging actually read. It drops type and

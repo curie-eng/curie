@@ -12,5 +12,5 @@
 #    cli/tests/plugin_format_field_parity.rs).
 set -euo pipefail
 
-cargo test --manifest-path cli/Cargo.toml --test api_field_parity -- --nocapture
-cargo test --manifest-path cli/Cargo.toml --test plugin_format_field_parity -- --nocapture
+cargo test --manifest-path cli/Cargo.toml --test integration api_field_parity:: -- --nocapture
+cargo test --manifest-path cli/Cargo.toml --test integration plugin_format_field_parity:: -- --nocapture

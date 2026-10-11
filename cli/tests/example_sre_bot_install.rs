@@ -5,10 +5,9 @@
 //! purpose: they prove the preflight permits or refuses mutation without
 //! replacing Helm, Kubernetes, or the platform API with internal mocks.
 
-mod support;
+use crate::support;
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::io::{Cursor, Read};

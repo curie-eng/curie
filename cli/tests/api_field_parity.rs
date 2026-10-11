@@ -5,8 +5,8 @@
 // fixtures to prove it rejects each violation class by execution (AC5).
 //
 // ─── Shared comparator contract (Stream A implements this VERBATIM) ──────────
-// The helper lives at `cli/tests/support/field_parity.rs`, reached below via a
-// `#[path = ...]` include. Its ENTIRE public surface is one pure function plus
+// The helper lives at `cli/tests/support/field_parity.rs`, reached below via
+// `crate::support::field_parity`. Its ENTIRE public surface is one pure function plus
 // one enum. Copy both exactly; tests assert on `Violation` variants + payload,
 // never on message strings.
 //
@@ -56,8 +56,7 @@
 //    `serde::Deserialize`) and recurses into items nested in fn/impl bodies.
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[path = "support/field_parity.rs"]
-mod field_parity;
+use crate::support::field_parity;
 
 use field_parity::{violations, Violation};
 use serde_json::Value;
