@@ -7233,7 +7233,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "3600"
+                "10800"
               ],
               "global": false,
               "help": "Per run execution deadline in seconds for the deployed agent",
