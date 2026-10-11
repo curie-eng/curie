@@ -214,3 +214,60 @@ fn explicit_set_repairs_file_configuration_before_final_admission() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn captured_copies_of_credential_files_are_private_while_helm_parses_them() {
+    // @spec CLUSTER-VALUES-FILES c4
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("credentials.yaml");
+    fs::write(&file, "api:\n  githubToken: PLACEHOLDER-private-copy\n").unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let modes = dir.path().join("modes");
+    let helm = bin.join("helm");
+    fs::write(
+        &helm,
+        format!(
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = -f ]; then\n    \
+             stat -c 'dir=%a' \"$(dirname \"$(dirname \"$2\")\")\" >> '{0}'\n    \
+             stat -c 'file=%a' \"$2\" >> '{0}'\n    shift\n  fi\n  shift\ndone\nexit 1\n",
+            modes.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&helm, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    for verb in ["up", "upgrade"] {
+        let mut args = vec![
+            "--json",
+            "cluster",
+            verb,
+            "--dry-run",
+            "-f",
+            file.to_str().unwrap(),
+        ];
+        if verb == "upgrade" {
+            args.extend(["--to", "0.12.0"]);
+        }
+        let home = tempfile::tempdir().unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_curie"))
+            .args(&args)
+            .env("HOME", home.path())
+            .env("PATH", &path)
+            .env("KUBECONFIG", home.path().join("absent-kubeconfig"))
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "stub Helm refuses every parse");
+    }
+    let recorded = fs::read_to_string(&modes).expect("Helm saw the captured copy");
+    let lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(lines.len(), 4, "one copy per command: {recorded}");
+    for line in lines {
+        assert!(
+            line == "dir=700" || line == "file=600",
+            "captured credential copy is readable by other users: {recorded}"
+        );
+    }
+}
