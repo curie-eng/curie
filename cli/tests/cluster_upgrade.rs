@@ -19,6 +19,7 @@ use curie::ui::CliOutput;
 
 fn opts(to: &str) -> UpgradeOpts {
     UpgradeOpts {
+        file_values: None,
         common: CommonOpts {
             namespace: "curie".into(),
             release: "curie".into(),
