@@ -357,10 +357,21 @@ class ModelScript:
             self._server.shutdown()
             self._thread.join(timeout=5)
         with self._idle:
-            self._idle.wait_for(lambda: self._in_flight == 0, timeout=CLOSE_DRAIN_TIMEOUT_S)
+            drained = self._idle.wait_for(
+                lambda: self._in_flight == 0, timeout=CLOSE_DRAIN_TIMEOUT_S
+            )
+            in_flight = self._in_flight
         self._server.server_close()
         if self.record:
-            dump_transcript(self.transcript, self._exchanges)
+            with self._lock:
+                dump_transcript(self.transcript, list(self._exchanges))
+        if not drained:
+            # A request still in flight may be charged upstream yet never
+            # reach the transcript, so the close must not pass.
+            raise RuntimeError(
+                f"model endpoint drain timed out with {in_flight} request(s) still in flight"
+                + (f"; {len(self.unexpected)} unexpected request(s)" if self.unexpected else "")
+            )
         if self.unexpected:
             raise UnexpectedRequest(
                 f"unexpected model request: {len(self.unexpected)} request(s) "

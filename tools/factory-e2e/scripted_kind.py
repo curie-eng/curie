@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import importlib.util
 import ipaddress
@@ -193,6 +194,9 @@ class ScriptedRun:
         # Only the in-process recording proxy receives the upstream credential.
         self.env.pop("CURIE_FACTORY_RECORD_KEY", None)
         self.env["BUILDX_BUILDER"] = "default"
+        # An inherited remote context would split kind, docker and buildx
+        # across engines. The default context honours an inherited DOCKER_HOST.
+        self.env["DOCKER_CONTEXT"] = "default"
         self.curie = os.environ.get("CURIE_BIN", "curie")
         self.record_start_remaining: float | None = None
         self.record_budget_start: float | None = None
@@ -200,8 +204,8 @@ class ScriptedRun:
         self.record_namespace = os.environ.get("FACTORY_RUN_ID", self.run_id)
         self.record_error: str | None = None
         self.admission_lock = threading.Lock()
-        # Serializes admission plus the upstream forward so each admission
-        # sees the credit left after the previous call completed.
+        # Serializes this run's admission plus upstream forward; the ledger
+        # file lock extends that to every run sharing the ledger.
         self.forward_lock = threading.Lock()
 
     def check_disk(self, stage: str) -> None:
@@ -345,15 +349,25 @@ class ScriptedRun:
         forward = self.model._record
 
         def record_request(handler: Any, path: str, body: bytes) -> None:
-            with self.forward_lock:
-                if model_module.request_key(model_module._safe_json(body)) is not None:
-                    try:
-                        self.record_model_call()
-                    except fe.ConfigError as exc:
-                        self.record_error = str(exc)
-                        self.model._reject(handler, "POST", path, body)
-                        return
-                forward(handler, path, body)
+            assert self.record_ledger is not None
+            # Each admission must see the credit left after the previous call
+            # completed in any run sharing the ledger, so hold an exclusive
+            # file lock across admission and the upstream forward. Opening it
+            # per request makes two runs in one process conflict as well.
+            lock_path = self.record_ledger.with_name("recording.lock")
+            with self.forward_lock, open(lock_path, "a") as lock_file:
+                fcntl.flock(lock_file, fcntl.LOCK_EX)
+                try:
+                    if model_module.request_key(model_module._safe_json(body)) is not None:
+                        try:
+                            self.record_model_call()
+                        except fe.ConfigError as exc:
+                            self.record_error = str(exc)
+                            self.model._reject(handler, "POST", path, body)
+                            return
+                    forward(handler, path, body)
+                finally:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
 
         self.model._record = record_request
 
