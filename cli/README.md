@@ -838,7 +838,8 @@ these forms:
    or `runner/tests/test_x.py::test_y` for a Python test.
 2. `cli/tests/local/test_x.py::test_y` for a local Python test.
 3. `cli/tests/name.rs::test_name` for a Rust integration test.
-4. `charts/curie/ci/name.sh` for a chart check script.
+4. `charts/curie/ci/name.sh` or `charts/curie/ci/runtime/name.sh` for a chart
+   check script.
 
 The command runs the selector at the current `HEAD`, reverses only the change's
 non test files in a disposable worktree, then runs the selector again. It prints
