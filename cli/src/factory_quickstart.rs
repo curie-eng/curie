@@ -2229,7 +2229,7 @@ mod tests {
         input.credential_in_env = true;
         let lines = describe(&quickstart_plan(&input).unwrap());
         let dir = bundle_dir("curie", "curie");
-        // The complete ordered plan the pre-#4346 code printed for this input.
+        // The complete ordered single-repository plan, retaining the stable deadline fix.
         let expected: Vec<String> = vec![
             crate::factory_toolchain::PLAN_NOTE.to_string(),
             "Kubernetes context: kind-curie-factory because --context was passed".to_string(),
@@ -2240,7 +2240,7 @@ mod tests {
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
             format!("curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
             "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),
-            "curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 3600".to_string(),
+            "curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800".to_string(),
             "curie cluster publication-policy dark-factory --context kind-curie-factory --namespace curie --release curie --policy auto".to_string(),
             "curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5".to_string(),
         ];
