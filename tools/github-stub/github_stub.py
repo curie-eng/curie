@@ -360,6 +360,23 @@ class GithubStub:
             .strip()
         )
 
+    def _find_ref(self, branch: str) -> str | None:
+        result = subprocess.run(
+            (
+                "git",
+                "--git-dir",
+                str(self._repository),
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch}",
+            ),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        return result.stdout.decode().strip() if result.returncode == 0 else None
+
     def _repository_row(self) -> dict[str, Any]:
         return {
             "id": 4401,
@@ -498,12 +515,18 @@ class GithubStub:
             return 200, {"permission": "write", "user": HUMAN}
         if method == "GET" and tail.startswith("branches/"):
             branch = tail.removeprefix("branches/")
-            return 200, {"name": branch, "commit": {"sha": self._ref(branch)}}
+            sha = self._find_ref(branch)
+            if sha is None:
+                return 404, {"message": "Branch not found"}
+            return 200, {"name": branch, "commit": {"sha": sha}}
         if method == "GET" and tail.startswith("git/ref/heads/"):
             branch = tail.removeprefix("git/ref/heads/")
+            sha = self._find_ref(branch)
+            if sha is None:
+                return 404, {"message": "Not Found"}
             return 200, {
                 "ref": f"refs/heads/{branch}",
-                "object": {"sha": self._ref(branch), "type": "commit"},
+                "object": {"sha": sha, "type": "commit"},
             }
         if method == "GET" and tail.startswith("commits/"):
             if tail.endswith("/check-runs"):
