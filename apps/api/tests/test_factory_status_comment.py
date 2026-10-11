@@ -37,7 +37,14 @@ from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, sync_status_comments
 from curie_api.github_app import GitHubAppError
 from curie_api.workitem_dispatch import DispatchConflict, acquire, defer
-from forge_fakes.github import LABEL, _issue_event, _post
+from forge_fakes.github import (
+    LABEL,
+    _issue_event,
+    _post,
+    fake_installation_tokens,
+    forges_document,
+    forges_env_json,
+)
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     _LABELS,
     HEAD_A,
@@ -591,9 +598,7 @@ def test_credential_mint_failure_releases_status_claim_and_next_pass_retries(
             raise GitHubAppError("fixture installation token mint refused")
 
     async def go() -> None:
-        monkeypatch.setattr(
-            "curie_api.factory_notices.credentials_for", lambda _settings: RefusedCredentials()
-        )
+        fake_installation_tokens(monkeypatch, RefusedCredentials())
         assert (
             await sync_status_comments(
                 client.app.state.sessionmaker, get_settings(), owner="retry-owner", limit=1
@@ -621,9 +626,7 @@ def test_credential_mint_failure_releases_status_claim_and_next_pass_retries(
             "refused_at": None,
         }
         assert sink.requests == []
-        monkeypatch.setattr(
-            "curie_api.factory_notices.credentials_for", lambda _settings: _Credentials()
-        )
+        fake_installation_tokens(monkeypatch, _Credentials())
         assert (
             await sync_status_comments(
                 client.app.state.sessionmaker, get_settings(), owner="retry-owner", limit=1
@@ -741,13 +744,21 @@ def test_admission_creates_one_queued_status_comment(admitted: Any) -> None:  # 
     assert row["finalized_at"] is None
 
 
+def _set_card_base_url(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> None:
+    """Give the running factory's forge config a public card origin."""
+
+    document = forges_document(api_url=get_settings().github_api_url, card_base_url=CARD_BASE)
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, key_dir))
+    get_settings.cache_clear()
+
+
 def test_the_card_image_is_linked_when_a_base_url_is_set(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+    tmp_path: Path,
 ) -> None:
     client, github, sink = admitted
-    monkeypatch.setenv("GITHUB_FACTORY_CARD_BASE_URL", CARD_BASE)
-    get_settings.cache_clear()
+    _set_card_base_url(monkeypatch, tmp_path)
     number = 9902
     request_id = _admit(client, github, sink, number)
     _reconcile()
@@ -764,10 +775,10 @@ def test_the_card_image_is_linked_when_a_base_url_is_set(
 def test_a_card_url_replaces_the_checklist_as_phases_advance(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,  # noqa: F811
+    tmp_path: Path,
 ) -> None:
     client, github, sink = admitted
-    monkeypatch.setenv("GITHUB_FACTORY_CARD_BASE_URL", CARD_BASE)
-    get_settings.cache_clear()
+    _set_card_base_url(monkeypatch, tmp_path)
     number = 9912
     request_id = _admit(client, github, sink, number)
     _reconcile()

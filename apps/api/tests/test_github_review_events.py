@@ -25,6 +25,7 @@ from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
+import jwt
 import pytest
 from aci_protocol import parse_queued_turn
 from channel_protocol import scoped_conversation_id
@@ -32,7 +33,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from curie_api import approval_principal
 from curie_api.config import Settings, get_settings
-from curie_api.github_app import _RESOLVERS
+from curie_api.github_app import _RESOLVERS, GitHubAuth, GitHubCredentials, credentials_for
 from curie_api.github_review_events import FeedbackIgnored, parse_feedback
 from curie_api.github_review_truth import BoundReviewLineage, verify_feedback_truth
 from curie_api.main import create_app
@@ -412,6 +413,8 @@ async def verify_truth(truth: GitHubTruth, monkeypatch: pytest.MonkeyPatch) -> s
                 truth.lineage,
                 settings=truth.settings,
                 client=client,
+                credentials=credentials_for(truth.settings),
+                api_url=truth.settings.github_api_url,
             )
     finally:
         _RESOLVERS.clear()
@@ -633,8 +636,6 @@ def test_verified_reinstallation_retires_old_cached_token_before_any_repo_read(
     review_app_key: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from curie_api.github_app import GitHubCredentials
-
     truth = GitHubTruth("issue_comment", review_app_key)
     requests: list[httpx.Request] = []
 
@@ -656,7 +657,7 @@ def test_verified_reinstallation_retires_old_cached_token_before_any_repo_read(
         "curie_api.github_app.httpx.Client",
         lambda *a, **kw: real_client(transport=httpx.MockTransport(github)),
     )
-    credentials = GitHubCredentials(truth.settings)
+    credentials = GitHubCredentials(auth=GitHubAuth.from_settings(truth.settings))
     assert credentials.token_for_verified_installation(REPO, 11) == "fixture-installation-11"
     # An unchanged installation may reuse its cache; a different installation
     # must mint a new token even when the previous token has not yet expired.
@@ -874,6 +875,7 @@ def _review_stack(
     publish: bool,
     agent_channel: str = "C0EXAMPLE1",
     cluster_message: bool = False,
+    env: dict[str, str] | None = None,
 ) -> Iterator[tuple[TestClient, GitHubTruth, object, str]]:
     """Real migrated Postgres/Valkey/API, with only GitHub HTTP replaced.
 
@@ -927,6 +929,7 @@ def _review_stack(
         "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
         "RESUME_RECONCILER_ENABLED": "false",
         "DEAD_LETTER_WATCH_INTERVAL_S": "0",
+        **(env or {}),
     }.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
@@ -1104,6 +1107,62 @@ def post_review(
             "Content-Type": "application/json",
         },
     )
+
+
+def _pem_key() -> str:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+
+
+def test_review_ingress_truth_mints_with_the_settings_credential(
+    clean_db: None,
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    """Review ingress is not factory: it mints under the install's own App.
+
+    Twin of the factory review-truth test (#4397 R2 finding 2). The settings
+    carry App "1111" while the forge config's code host carries App "2222";
+    every App JWT the real webhook path signs must name "1111".
+    """
+    from forge_fakes.github import forges_document, forges_env_json
+
+    settings_key, code_host_key = _pem_key(), _pem_key()
+    forges = forges_env_json(forges_document(app_id="2222", private_key=code_host_key), tmp_path)
+    with _review_stack(
+        request,
+        monkeypatch,
+        settings_key,
+        publish=True,
+        env={"GITHUB_APP_ID": "1111", "CURIE_FORGES": forges},
+    ) as (client, truth, _valkey, _stream):
+        issuers: list[str] = []
+
+        def recording(github_request: httpx.Request) -> httpx.Response:
+            path = github_request.url.path
+            if path.endswith("/installation") or path.endswith("/access_tokens"):
+                bearer = github_request.headers["Authorization"].removeprefix("Bearer ")
+                claims = jwt.decode(bearer, options={"verify_signature": False})
+                issuers.append(str(claims["iss"]))
+            return truth.handle(github_request)
+
+        real_client = httpx.Client
+        monkeypatch.setattr(
+            "curie_api.github_app.httpx.Client",
+            lambda *a, **kw: real_client(transport=httpx.MockTransport(recording)),
+        )
+        # Drop the publication's cached token so admission mints afresh.
+        _RESOLVERS.clear()
+        admitted = post_review(client, truth)
+        assert admitted.status_code == 200, admitted.text
+        assert admitted.json()["status"] == "feedback_queued"
+        assert issuers, "review ingress minted no App token"
+        assert set(issuers) == {"1111"}
 
 
 @pytest.mark.parametrize(

@@ -649,7 +649,7 @@ fn intake_documents(fixture: &Fixture) -> Vec<Value> {
         .filter_map(|line| {
             let document: String = serde_json::from_str(line).ok()?;
             let values: Value = serde_json::from_str(&document).ok()?;
-            (values.pointer("/api/githubFactoryIntake") == Some(&json!("poll"))).then_some(values)
+            (values.pointer("/factory/intake") == Some(&json!("poll"))).then_some(values)
         })
         .collect()
 }
@@ -1208,7 +1208,7 @@ fn poll_quickstart_ignores_an_exported_webhook_secret() {
         .find_map(|line| {
             let document: String = serde_json::from_str(line).unwrap();
             let values: Value = serde_norway::from_str(&document).unwrap();
-            (values.pointer("/api/githubFactoryIntake") == Some(&json!("poll"))).then_some(values)
+            (values.pointer("/factory/intake") == Some(&json!("poll"))).then_some(values)
         })
         .expect("the actual poll intake values document was passed to Helm");
     assert!(

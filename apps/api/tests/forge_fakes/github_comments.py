@@ -9,6 +9,7 @@ import re
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -18,7 +19,13 @@ from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from forge_fakes.github import INSTALLATION_ID, LABEL, REPO, GitHubAPI
+from forge_fakes.github import (
+    INSTALLATION_ID,
+    REPO,
+    GitHubAPI,
+    factory_env,
+    fake_installation_tokens,
+)
 
 # --- #3097: a scripted fake of the GitHub Checks and Statuses APIs.
 #
@@ -113,6 +120,10 @@ class _Credentials:
             raise RuntimeError("unexpected installation")
         return "ghs_factory_terminus_fixture"
 
+    def token_for(self, repo: str) -> str:
+        if repo != REPO:
+            raise RuntimeError("unexpected repository")
+        return "ghs_factory_terminus_fixture"
 
     def fresh_installation_token(
         self, repo: str, installation_id: int | None = None
@@ -450,51 +461,30 @@ class _CommentServer(ThreadingHTTPServer):
 
 
 @pytest.fixture
-def comments(monkeypatch: pytest.MonkeyPatch, clean_db: None) -> Any:
+def comments(monkeypatch: pytest.MonkeyPatch, clean_db: None, tmp_path: Path) -> Any:
     """@spec apps/api/README.md#factory-test-isolation"""
     server = _CommentServer()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         host, port = server.server_address
-        monkeypatch.setenv("GITHUB_API_URL", f"http://{host}:{port}")
+        # The stand-in binds 127.0.0.1, one of the loopback hosts the forge
+        # config accepts over plain http. These tests drive signed deliveries;
+        # poll mode would also read the GitHub stand in on every reconciler pass.
+        env = factory_env(tmp_path, intake="webhook", api_url=f"http://{host}:{port}")
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
         monkeypatch.setenv("CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS", "30")
-        monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
-        monkeypatch.setenv("RESUME_RECONCILER_ENABLED", "false")
-        monkeypatch.setenv("APPROVAL_SWEEP_INTERVAL_S", "0")
-        monkeypatch.setenv("DEAD_LETTER_WATCH_INTERVAL_S", "0")
-        monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "true")
-        # These tests drive signed deliveries. Poll mode would also read the
-        # GitHub stand in on every reconciler pass.
-        monkeypatch.setenv("GITHUB_FACTORY_INTAKE", "webhook")
-        monkeypatch.setenv("GITHUB_FACTORY_LABEL", LABEL)
-        monkeypatch.setenv("GITHUB_FACTORY_MENTION", "curie")
-        monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
-        monkeypatch.setenv("GITHUB_APP_ID", "51")
-        monkeypatch.setenv("GITHUB_APP_PRIVATE_KEY", "example-private-key")
-        monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
-        monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
-        monkeypatch.setenv("GITHUB_TOKEN", "")
         monkeypatch.setenv("INTERNAL_WORKER_TOKEN", "factory-terminus-worker")
         monkeypatch.setenv("RUNS_STREAM", f"test:curie:terminus:{uuid.uuid4().hex}")
         get_settings.cache_clear()
-        monkeypatch.setattr(
-            "curie_api.factory_notices.credentials_for",
-            lambda _settings: _Credentials(),
-        )
-        monkeypatch.setattr(
-            "curie_api.github_factory.credentials_for",
-            lambda _settings: _Credentials(),
-        )
+        credentials = _Credentials()
+        fake_installation_tokens(monkeypatch, credentials)
         # The code host's git credential: this stand-in serves plain HTTP, which
         # the canonical HTTPS origin check would refuse.
         monkeypatch.setattr(
             "curie_api.forges.github.code_host.resolve_repository_credential",
-            lambda repo, settings: (f"{settings.github_html_base}/{repo}.git", _GIT_HEADER),
-        )
-        monkeypatch.setattr(
-            "curie_api.forges.github.ci.credentials_for",
-            lambda _settings: _Credentials(),
+            lambda repo, *, html_base, credentials: (f"{html_base}/{repo}.git", _GIT_HEADER),
         )
         yield server
     finally:

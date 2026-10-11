@@ -25,7 +25,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from curie_api.config import get_settings
 from curie_api.factory_notices import FINAL_MARKER
-from forge_fakes.github import LABEL, REPO_ID, _issue_event, _post, _signature
+from curie_api.forges.registry import forges_registry
+from forge_fakes.github import (
+    LABEL,
+    REPO_ID,
+    _issue_event,
+    _post,
+    _signature,
+    forges_document,
+    forges_env_json,
+    github_repository_binding,
+)
 from forge_fakes.github_comments import _rows, admitted, comments  # noqa: F401  (fixtures)
 from test_factory_status_comment import _blocked_status_sync, _marked
 from test_factory_terminus import (  # noqa: F401  (fixtures)
@@ -49,9 +59,22 @@ WORKER = {"X-Curie-Worker-Token": "factory-terminus-worker"}
 TRAIN = {REPO: {"bases": ["main", "next"], "default_base": "main"}}
 
 
-def _train(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GITHUB_FACTORY_BASES", json.dumps(TRAIN))
+def _train(monkeypatch: pytest.MonkeyPatch, key_dir: Path, client: Any) -> None:
+    """Bind ``REPO`` with the release train's bases on the running fixture's
+    GitHub host (#4397); the running app gets the new registry too."""
+
+    document = forges_document(
+        api_url=get_settings().github_api_url,
+        bindings=[
+            github_repository_binding(
+                repo=repo, bases=entry["bases"], default_base=entry["default_base"]
+            )
+            for repo, entry in TRAIN.items()
+        ],
+    )
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, key_dir))
     get_settings.cache_clear()
+    client.app.state.forges = forges_registry(get_settings())
 
 
 def _labelled(client: Any, github: Any, number: int, *labels: str) -> Any:
@@ -89,7 +112,7 @@ def _redeemed_base(client: Any, number: int, monkeypatch: pytest.MonkeyPatch) ->
 
     monkeypatch.setattr(
         "curie_api.forges.github.code_host.resolve_repository_credential",
-        lambda _repo, _settings: (
+        lambda _repo, *, html_base, credentials: (
             f"https://github.com/{REPO}.git",
             "Basic eC1hY2Nlc3MtdG9rZW46Zml4dHVyZQ==",  # x-access-token:fixture
         ),
@@ -136,9 +159,10 @@ def _redeemed_base(client: Any, number: int, monkeypatch: pytest.MonkeyPatch) ->
 def test_a_relabel_during_a_running_execution_keeps_its_base_until_the_replacement_admits(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     client, github, _sink = admitted
-    _train(monkeypatch)
+    _train(monkeypatch, tmp_path, client)
     number = 30961
     assert _labelled(client, github, number, "base:next").json()["status"] == "factory_admitted"
     before = _item(number)
@@ -169,9 +193,10 @@ def test_a_relabel_during_a_running_execution_keeps_its_base_until_the_replaceme
 def test_a_readmission_refused_for_identity_mismatch_leaves_the_base_unchanged(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     client, github, _sink = admitted
-    _train(monkeypatch)
+    _train(monkeypatch, tmp_path, client)
     number = 30962
     assert _labelled(client, github, number).json()["status"] == "factory_admitted"
     before = _item(number)
@@ -218,9 +243,10 @@ def test_a_readmission_refused_for_identity_mismatch_leaves_the_base_unchanged(
 def test_an_ignored_relabel_re_renders_a_finalized_status_comment(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     client, github, sink = admitted
-    _train(monkeypatch)
+    _train(monkeypatch, tmp_path, client)
     sink.by_path = True
     number, _pr, first = _published_issue(client, github, sink)
     (comment,) = _marked(sink, first["id"])
@@ -326,11 +352,12 @@ def _assert_note_reaches_the_comment(sink: Any, request_id: uuid.UUID) -> None:
 def test_an_ignored_relabel_during_a_held_label_sync_still_reaches_the_final_comment(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """#4167: the fenced writeback must not restore the finalization the relabel cleared."""
 
     client, github, sink = admitted
-    _train(monkeypatch)
+    _train(monkeypatch, tmp_path, client)
     sink.by_path = True
     number = 30963
     request_id = _finalized_with_label_due(client, github, sink, number, pr=41963)
@@ -350,11 +377,12 @@ def test_an_ignored_relabel_during_a_held_label_sync_still_reaches_the_final_com
 def test_an_ignored_relabel_during_the_held_finalizing_sync_still_reaches_the_comment(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """#4167: a body rendered before the relabel must not be the one finalized."""
 
     client, github, sink = admitted
-    _train(monkeypatch)
+    _train(monkeypatch, tmp_path, client)
     sink.by_path = True
     number = 30964
     request_id = _completed_run(client, github, number, pr=41964)
@@ -370,10 +398,11 @@ def test_an_ignored_relabel_during_the_held_finalizing_sync_still_reaches_the_co
 def test_a_held_sync_without_a_relabel_finalizes_and_the_next_pass_is_quiet(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     held: str,
 ) -> None:
     client, github, sink = admitted
-    _train(monkeypatch)
+    _train(monkeypatch, tmp_path, client)
     sink.by_path = True
     number = 30965 if held == "label_sync" else 30966
     if held == "label_sync":

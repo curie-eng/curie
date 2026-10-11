@@ -25,7 +25,6 @@ Machine fixtures drive the events. They are not human-authored GitHub proof.
 from __future__ import annotations
 
 import asyncio
-import importlib
 import sys
 import uuid
 from collections.abc import Iterator
@@ -36,7 +35,7 @@ from typing import Any, Protocol
 
 import httpx
 import pytest
-from curie_api.config import Settings, get_settings
+from curie_api.config import get_settings
 from curie_api.factory_label_reconcile import bound_repositories, reconcile_missed_labels
 from curie_api.factory_poll_intake import poll_once
 from curie_api.github_app import GitHubInstallationRefused
@@ -48,13 +47,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from forge_fakes.github import (  # noqa: E402
-    _ENV,
     INSTALLATION_ID,
     LABEL,
     REPO,
     REPO_ID,
     _issue_event,
     _post,
+    factory_env,
+    fake_installation_tokens,
 )
 from test_factory_poll_intake import PollGitHub  # noqa: E402
 from test_github_factory_ingress import _code, _rows  # noqa: E402
@@ -82,16 +82,6 @@ _BOUND = (REPO, SECOND_REPO)
 
 _ISSUE_NUMBERS = iter(range(9900, 10900))
 _PULL_NUMBERS = iter(range(510, 1510))
-
-_CREDENTIAL_MODULES = (
-    "curie_api.factory_label_reconcile",
-    "curie_api.factory_notices",
-    "curie_api.factory_poll_intake",
-    "curie_api.github_factory",
-    "curie_api.github_factory_review",
-    "curie_api.github_review_truth",
-    "curie_api.repository_auth",
-)
 
 
 class _RepoFake(Protocol):
@@ -178,23 +168,14 @@ class _TwoRepoCredentials:
 
 def _patch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     credentials = _TwoRepoCredentials()
-
-    def credentials_for(_settings: Settings) -> _TwoRepoCredentials:
-        return credentials
-
-    for name in _CREDENTIAL_MODULES:
-        try:
-            module = importlib.import_module(name)
-        except ImportError:
-            continue
-        monkeypatch.setattr(module, "credentials_for", credentials_for, raising=False)
+    fake_installation_tokens(monkeypatch, credentials)
 
 
 @pytest.fixture
 def forge_app(
-    monkeypatch: pytest.MonkeyPatch, clean_db: None
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None
 ) -> Iterator[tuple[TestClient, _Forge]]:
-    for key, value in _ENV.items():
+    for key, value in factory_env(tmp_path).items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
     _patch_credentials(monkeypatch)

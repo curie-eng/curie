@@ -3234,8 +3234,9 @@ PYEOF
   echo "  ok: $case_name worker pods/log rule is rejected"
 done
 
-echo "=== Assertion 21: API metadata CI policy renders from its chart value (#4162) ==="
+echo "=== Assertion 21: per-repository CI policy renders from factory.bindings[].repos[].ci (#4162, #4397) ==="
 python3 - "$CHART" "$TMP/reuse-render/curie/templates/api.yaml" <<'PYEOF'
+import copy
 import json
 import pathlib
 import subprocess
@@ -3244,11 +3245,45 @@ import sys
 import yaml
 
 chart = sys.argv[1]
-env_name = "GITHUB_FACTORY_METADATA_CI"
-value_key = "api.githubFactoryMetadataCi"
+env_name = "CURIE_FORGES"
+ci_path = "factory.bindings.0.repos.0.ci"
+
+CREDENTIAL = {
+    "type": "github_app",
+    "appId": "42",
+    "existingSecret": "factory-app",
+    "existingSecretKey": "privateKey",
+}
+GOOD_CI = {
+    "required": {"key": "python", "paths": ["src/", "tests/"], "pendingKeyPrefix": "python/"},
+    "metadataRerunKeys": ["check:pr-body", "status:lint"],
+}
 
 
-def metadata_ci(documents):
+def factory(ci):
+    repo = {"alias": "repo", "codeHost": "github", "projectId": "101", "path": "acme/repo"}
+    if ci is not None:
+        repo["ci"] = ci
+    entry = {
+        "name": "github",
+        "kind": "github",
+        "host": "github.com",
+        "apiUrl": "https://api.github.com",
+        "credential": dict(CREDENTIAL),
+    }
+    tracker = dict(entry, label="curie-factory", mention="example-factory", pollIntervalSeconds=45)
+    return {
+        "enabled": True,
+        "intake": "poll",
+        "codeHosts": [entry],
+        "trackers": [tracker],
+        "bindings": [
+            {"name": "acme", "tracker": "github", "trackerScopeId": "acme/repo", "repos": [repo]}
+        ],
+    }
+
+
+def forges(documents):
     apis = [
         doc for doc in documents
         if isinstance(doc, dict)
@@ -3263,56 +3298,79 @@ def metadata_ci(documents):
     assert len(entries) == 1, f"expected exactly one {env_name}, found {entries!r}"
     assert set(entries[0]) == {"name", "value"}, entries[0]
     assert isinstance(entries[0]["value"], str), entries[0]
-    return entries[0]["value"]
+    return json.loads(entries[0]["value"] or "{}")
 
 
-def render(*args):
+def render(ci):
     return subprocess.run(
-        ["helm", "template", "acme", chart, *args],
+        ["helm", "template", "acme", chart, "--set-json", f"factory={json.dumps(factory(ci))}"],
         text=True, capture_output=True,
     )
 
 
-for policy in (
-    None,
-    {"acme/repo": {"checks": ["pr-body"], "statuses": []}},
-    {"acme/repo": {"checks": ["pr-body"]}, "acme/other": {"statuses": ["lint"]}},
-):
-    args = [] if policy is None else ["--set-json", f"{value_key}={json.dumps(policy)}"]
-    result = render(*args)
-    assert result.returncode == 0, result.stderr
-    value = metadata_ci(yaml.safe_load_all(result.stdout))
-    expected = {} if policy is None else policy
-    assert json.loads(value) == expected, f"{env_name} rendered {value!r}, expected {expected!r}"
-    if policy is None:
-        assert value == "{}", f"default {env_name} must render {{}}"
+def rendered_ci(ci):
+    result = render(ci)
+    assert result.returncode == 0, f"valid ci {ci!r} refused: {result.stderr}"
+    config = forges(yaml.safe_load_all(result.stdout))
+    repos = config["bindings"][0]["repos"]
+    assert len(repos) == 1, repos
+    return repos[0].get("ci")
 
-retained = pathlib.Path(sys.argv[2]).read_text()
-assert metadata_ci(yaml.safe_load_all(retained)) == "{}", "retained values lost the empty metadata CI default"
 
-for policy, diagnostics in (
-    ([], ("githubFactoryMetadataCi",)),
-    ({"repo": {"checks": ["pr-body"]}}, ("repo", "^[^/]+/[^/]+$")),
-    ({"acme/repo/extra": {"checks": ["pr-body"]}}, ("acme/repo/extra", "^[^/]+/[^/]+$")),
-    ({"acme/repo": []}, ("githubFactoryMetadataCi",)),
-    ({"acme/repo": {"unknown": ["pr-body"]}}, ("githubFactoryMetadataCi", "unknown")),
-    ({"acme/repo": {"checks": "pr-body"}}, ("githubFactoryMetadataCi", "checks")),
-    ({"acme/repo": {"statuses": [1]}}, ("githubFactoryMetadataCi", "statuses")),
-    ({"acme/repo": {"checks": [""]}}, ("githubFactoryMetadataCi", "checks")),
-    ({"acme/repo": {"statuses": [""]}}, ("githubFactoryMetadataCi", "statuses")),
+assert rendered_ci(GOOD_CI) == {
+    "required": {"key": "python", "paths": ["src/", "tests/"], "pending_key_prefix": "python/"},
+    "metadata_rerun_keys": ["check:pr-body", "status:lint"],
+}, "factory repo ci must render as the snake_case CiPolicyConfig"
+
+retained = forges(yaml.safe_load_all(pathlib.Path(sys.argv[2]).read_text()))
+assert not retained.get("bindings"), f"retained values without a factory block rendered bindings: {retained!r}"
+
+
+def with_required(**changes):
+    ci = copy.deepcopy(GOOD_CI)
+    for key, value in changes.items():
+        if value is None:
+            ci["required"].pop(key)
+        else:
+            ci["required"][key] = value
+    return ci
+
+
+# Each malformed ci is paired with the nearest valid ci, which must render:
+# the refusal is the mutation's, not a broken base document.
+for bad, good, diagnostics in (
+    ([], {}, ("ci",)),
+    ({"unknown": []}, {"metadataRerunKeys": []}, ("unknown",)),
+    (with_required(extra=1), GOOD_CI, ("extra",)),
+    (with_required(key=None), GOOD_CI, ("key",)),
+    (with_required(key=""), GOOD_CI, ("key",)),
+    (with_required(paths=None), GOOD_CI, ("paths",)),
+    (with_required(paths="src/"), GOOD_CI, ("paths",)),
+    (with_required(paths=[1]), GOOD_CI, ("paths",)),
+    (with_required(pendingKeyPrefix=""), GOOD_CI, ("pendingKeyPrefix",)),
+    (dict(GOOD_CI, metadataRerunKeys="check:pr-body"), GOOD_CI, ("metadataRerunKeys",)),
+    (dict(GOOD_CI, metadataRerunKeys=[1]), GOOD_CI, ("metadataRerunKeys",)),
 ):
-    result = render("--set-json", f"{value_key}={json.dumps(policy)}")
-    assert result.returncode != 0, f"accepted malformed {value_key}: {policy!r}"
+    rendered_ci(good)
+    result = render(bad)
+    assert result.returncode != 0, f"accepted malformed {ci_path}: {bad!r}"
     assert "schema(s)" in result.stderr, result.stderr
+    # Helm 3.16 prints dotted paths, newer releases JSON pointers.
+    normalized = result.stderr.replace("/", ".")
+    assert ci_path in normalized, result.stderr
     assert all(diagnostic in result.stderr for diagnostic in diagnostics), result.stderr
 
-result = render(
-    "--set", f"api.extraEnv[0].name={env_name}",
-    "--set-string", "api.extraEnv[0].value={}",
+result = subprocess.run(
+    [
+        "helm", "template", "acme", chart,
+        "--set", f"api.extraEnv[0].name={env_name}",
+        "--set-string", "api.extraEnv[0].value={}",
+    ],
+    text=True, capture_output=True,
 )
 assert result.returncode != 0, f"accepted reserved api.extraEnv {env_name}"
-assert "api.extraEnv" in result.stderr and value_key in result.stderr, result.stderr
-print("  ok: default, configured and retained metadata CI render; schema and extraEnv refuse invalid inputs")
+assert "api.extraEnv" in result.stderr and "factory.bindings" in result.stderr, result.stderr
+print("  ok: factory repo ci renders and is retained empty; schema and extraEnv refuse invalid inputs")
 PYEOF
 
 echo "=== Assertion 22: API rollouts retain availability and drain before shutdown (#4174) ==="

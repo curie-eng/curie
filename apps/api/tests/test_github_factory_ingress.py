@@ -20,6 +20,7 @@ import json
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -38,7 +39,6 @@ from curie_api.main import create_app
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from fastapi.testclient import TestClient
 from forge_fakes.github import (
-    _ENV,
     INSTALLATION_ID,
     LABEL,
     MENTION,
@@ -53,6 +53,8 @@ from forge_fakes.github import (
     _post,
     _sender,
     _signature,
+    factory_env,
+    fake_installation_tokens,
 )
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -80,12 +82,13 @@ def github_api() -> GitHubAPI:
 
 
 @pytest.fixture
-def factory_app(monkeypatch: pytest.MonkeyPatch, clean_db: None, github_api: GitHubAPI) -> Any:
-    for key, value in _ENV.items():
+def factory_app(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None, github_api: GitHubAPI
+) -> Any:
+    for key, value in factory_env(tmp_path).items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
-    for module in ("github_factory", "repository_auth"):
-        monkeypatch.setattr(f"curie_api.{module}.credentials_for", lambda _settings: _Credentials())
+    fake_installation_tokens(monkeypatch, _Credentials())
     with TestClient(create_app()) as client:
         external = httpx.AsyncClient(transport=httpx.MockTransport(github_api.handle))
         client.app.state.http_client = external
@@ -190,7 +193,7 @@ def test_empty_webhook_secret_rejects_its_own_hmac(
     monkeypatch: pytest.MonkeyPatch, clean_db: None, valkey: object
 ) -> None:
     monkeypatch.setenv("ENVIRONMENT", "dev")
-    monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("FACTORY_ENABLED", "false")
     monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "")
     monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
@@ -211,7 +214,7 @@ def test_configured_webhook_secret_accepts_a_valid_signature(
     monkeypatch: pytest.MonkeyPatch, clean_db: None, valkey: object
 ) -> None:
     monkeypatch.setenv("ENVIRONMENT", "dev")
-    monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("FACTORY_ENABLED", "false")
     monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
     monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
@@ -232,7 +235,7 @@ def test_configured_webhook_secret_accepts_a_valid_signature(
 def test_factory_disabled_issues_stay_ignored(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("FACTORY_ENABLED", "false")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
     get_settings.cache_clear()
     body = b'{"action":"labeled"}'

@@ -2051,7 +2051,7 @@ mod tests {
         )));
         let lines = describe(&planned);
         let text = lines.join("\n");
-        assert!(text.contains("api.githubFactoryIntake=poll"), "{text}");
+        assert!(text.contains("factory.intake=poll"), "{text}");
         assert!(text.contains("no webhook secret"), "{text}");
         assert!(
             text.contains("ghcr.io/curie-eng/curie-dark-factory-runner"),
@@ -2215,7 +2215,7 @@ mod tests {
         assert!(surfaces[0].ends_with("--add github=a/x"), "{}", surfaces[0]);
         assert!(surfaces[1].ends_with("--add github=b/y"), "{}", surfaces[1]);
         assert!(
-            text.contains("factory intake api.githubFactoryIntake=poll for a/x,b/y with"),
+            text.contains("factory intake factory.intake=poll for a/x,b/y with"),
             "{text}"
         );
     }
@@ -2236,7 +2236,7 @@ mod tests {
             "model credential: use CURIE_CREDENTIALS (no prompt)".to_string(),
             "kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1".to_string(),
             "curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off".to_string(),
-            "configure factory intake api.githubFactoryIntake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
+            "configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
             format!("curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
             "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),

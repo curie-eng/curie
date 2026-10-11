@@ -23,9 +23,12 @@ from channel_protocol import work_item_events
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
 from curie_api import factory_ci, factory_notices
 from curie_api.config import Settings
+from curie_api.forges.config import ForgesConfig
 from curie_api.forges.github.ci import CiDetail
+from curie_api.forges.registry import ForgeRegistry, build_registry, forges_registry
+from curie_api.forges.types import check_run_key
 from curie_api.workitems import lifecycle
-from forge_fakes.github import ci_view
+from forge_fakes.github import ci_view, forges_document, github_repository_binding
 from pydantic import ValidationError
 
 HEAD = "a1" * 20
@@ -65,6 +68,24 @@ def conversion_metadata_ci() -> factory_ci.MetadataCiPolicy:
         checks=("Publication description guard",),
         statuses=(),
     )
+
+
+def _forges(*repositories: tuple[str, dict[str, Any]]) -> ForgesConfig:
+    """A forge config binding each ``(repository, ci)`` pair as its own GitHub
+    repository, the per-repository CI policy now living on the binding (#4397)."""
+
+    return ForgesConfig.model_validate(
+        forges_document(
+            bindings=[
+                github_repository_binding(repo=repo, repo_id=9000 + index, ci=ci)
+                for index, (repo, ci) in enumerate(repositories)
+            ]
+        )
+    )
+
+
+def _registry(*repositories: tuple[str, dict[str, Any]]) -> ForgeRegistry:
+    return build_registry(_forges(*repositories))
 
 
 def _run(
@@ -248,14 +269,14 @@ def test_marker_is_the_bundle_contract() -> None:
 
 
 def test_the_ci_wait_is_an_operator_setting_defaulting_to_1200() -> None:
-    assert Settings().github_factory_ci_wait_s == 1200
-    assert Settings(GITHUB_FACTORY_CI_WAIT_S=3600).github_factory_ci_wait_s == 3600
+    assert Settings().factory_ci_wait_s == 1200
+    assert Settings(FACTORY_CI_WAIT_S=3600).factory_ci_wait_s == 3600
 
 
 @pytest.mark.parametrize("value", [0, -1, 10801])
 def test_the_ci_wait_is_validated_at_boot(value: int) -> None:
     with pytest.raises(ValidationError):
-        Settings(GITHUB_FACTORY_CI_WAIT_S=value)
+        Settings(FACTORY_CI_WAIT_S=value)
 
 
 def test_a_wait_longer_than_1200_s_ends_green() -> None:
@@ -928,88 +949,75 @@ def test_metadata_revision_requires_each_configured_check_and_status_to_refresh(
 
 def test_the_metadata_ci_policy_setting_defaults_to_empty() -> None:
     settings = Settings()
-    assert settings.github_factory_metadata_ci == {}
-    assert factory_ci.metadata_ci_policy(settings, "acme-corp/unit-converter") is None
+    assert settings.forges.bindings == ()
+    registry = forges_registry(settings)
+    assert factory_ci.metadata_ci_policy(registry, "acme-corp/unit-converter") is None
 
 
 def test_the_metadata_ci_policy_setting_parses_and_matches_case_insensitively() -> None:
-    settings = Settings(
-        GITHUB_FACTORY_METADATA_CI=json.dumps(
+    registry = _registry(
+        (
+            "Acme-Corp/Unit-Converter",
             {
-                "Acme-Corp/Unit-Converter": {
-                    "checks": ["Publication description guard"],
-                    "statuses": ["ci/publication-description"],
-                },
-                "acme-corp/another-repository": {"checks": ["Release notes guard"]},
-            }
-        )
+                "metadata_rerun_keys": [
+                    "Publication description guard",
+                    "status:ci/publication-description",
+                ]
+            },
+        ),
+        ("acme-corp/another-repository", {"metadata_rerun_keys": ["Release notes guard"]}),
     )
 
     assert factory_ci.metadata_ci_policy(
-        settings, "acme-corp/unit-converter"
+        registry, "acme-corp/unit-converter"
     ) == factory_ci.MetadataCiPolicy(
         checks=("Publication description guard",),
         statuses=("ci/publication-description",),
     )
     assert factory_ci.metadata_ci_policy(
-        settings, "ACME-CORP/ANOTHER-REPOSITORY"
+        registry, "ACME-CORP/ANOTHER-REPOSITORY"
     ) == factory_ci.MetadataCiPolicy(checks=("Release notes guard",), statuses=())
-    assert factory_ci.metadata_ci_policy(settings, "acme-corp/acme-fixture") is None
+    assert factory_ci.metadata_ci_policy(registry, "acme-corp/acme-fixture") is None
 
 
 @pytest.mark.parametrize(
-    ("entry", "checks", "statuses"),
+    ("keys", "checks", "statuses"),
     [
-        ({"checks": ["Publication description guard"]}, ("Publication description guard",), ()),
-        ({"statuses": ["ci/publication-description"]}, (), ("ci/publication-description",)),
-        (
-            {"checks": [], "statuses": ["ci/publication-description"]},
-            (),
-            ("ci/publication-description",),
-        ),
-        (
-            {"checks": ["Publication description guard"], "statuses": []},
-            ("Publication description guard",),
-            (),
-        ),
+        (["Publication description guard"], ("Publication description guard",), ()),
+        (["status:ci/publication-description"], (), ("ci/publication-description",)),
     ],
 )
 def test_a_metadata_ci_policy_may_configure_only_one_surface(
-    entry: dict[str, Any], checks: tuple[str, ...], statuses: tuple[str, ...]
+    keys: list[str], checks: tuple[str, ...], statuses: tuple[str, ...]
 ) -> None:
-    settings = Settings(
-        GITHUB_FACTORY_METADATA_CI=json.dumps({"acme-corp/unit-converter": entry})
-    )
+    registry = _registry(("acme-corp/unit-converter", {"metadata_rerun_keys": keys}))
 
     assert factory_ci.metadata_ci_policy(
-        settings, "acme-corp/unit-converter"
+        registry, "acme-corp/unit-converter"
     ) == factory_ci.MetadataCiPolicy(checks=checks, statuses=statuses)
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("repo", "ci"),
     [
-        [],
-        {"acme-corp/unit-converter": {}},
-        {"acme-corp/unit-converter": {"checks": [], "statuses": []}},
-        {"acme-corp/unit-converter": {"checks": "Publication description guard"}},
-        {"acme-corp/unit-converter": {"checks": [""]}},
-        {"acme-corp/unit-converter": {"checks": ["   "]}},
-        {"acme-corp/unit-converter": {"checks": [42]}},
-        {"acme-corp/unit-converter": {"checks": [True]}},
-        {"acme-corp/unit-converter": {"checks": None, "statuses": ["ci/publication-description"]}},
-        {"acme-corp/unit-converter": {"statuses": "ci/publication-description"}},
-        {"acme-corp/unit-converter": {"statuses": [""]}},
-        {"acme-corp/unit-converter": {"statuses": ["   "]}},
-        {"acme-corp/unit-converter": {"statuses": [42]}},
-        {"acme-corp/unit-converter": {"checks": ["guard"], "unknown": []}},
-        {"unit-converter": {"checks": ["guard"]}},
-        {"acme-corp/unit-converter/extra": {"checks": ["guard"]}},
+        ("acme-corp/unit-converter", []),
+        ("acme-corp/unit-converter", {"metadata_rerun_keys": "Publication description guard"}),
+        ("acme-corp/unit-converter", {"metadata_rerun_keys": [""]}),
+        ("acme-corp/unit-converter", {"metadata_rerun_keys": ["   "]}),
+        ("acme-corp/unit-converter", {"metadata_rerun_keys": [42]}),
+        ("acme-corp/unit-converter", {"metadata_rerun_keys": [True]}),
+        ("acme-corp/unit-converter", {"metadata_rerun_keys": None}),
+        ("acme-corp/unit-converter", {"metadata_rerun_keys": ["guard", "guard"]}),
+        ("acme-corp/unit-converter", {"metadata_rerun_keys": ["guard"], "unknown": []}),
+        ("unit-converter", {"metadata_rerun_keys": ["guard"]}),
+        ("acme-corp/unit-converter/extra", {"metadata_rerun_keys": ["guard"]}),
     ],
 )
-def test_an_invalid_metadata_ci_policy_is_rejected_at_boot(value: Any) -> None:
+def test_an_invalid_metadata_ci_policy_is_rejected_at_boot(repo: str, ci: Any) -> None:
     with pytest.raises(ValidationError):
-        Settings(GITHUB_FACTORY_METADATA_CI=json.dumps(value))
+        _forges((repo, ci))
+    with pytest.raises(ValidationError):
+        Settings(forges=forges_document(bindings=[github_repository_binding(repo=repo, ci=ci)]))
 
 
 def test_metadata_ci_policy_is_frozen() -> None:
@@ -1128,50 +1136,56 @@ def test_python_ci_policy_is_frozen() -> None:
 
 def test_the_python_ci_policy_setting_defaults_to_empty() -> None:
     settings = Settings()
-    assert settings.github_factory_python_ci == {}
-    assert factory_ci.python_ci_policy(settings, "acme-corp/unit-converter") is None
+    assert settings.forges.bindings == ()
+    registry = forges_registry(settings)
+    assert factory_ci.python_ci_policy(registry, "acme-corp/unit-converter") is None
 
 
 def test_the_python_ci_policy_setting_parses_and_matches_case_insensitively() -> None:
-    settings = Settings(
-        GITHUB_FACTORY_PYTHON_CI=json.dumps(
+    registry = _registry(
+        (
+            "acme-corp/unit-converter",
             {
-                "acme-corp/unit-converter": {
-                    "check": "Unit conversion suite",
+                "required": {
+                    "key": "Unit conversion suite",
                     "paths": list(conversion_python_ci().paths),
-                    "pendingCheckPrefix": "Conversion batch ",
-                },
-                "Acme/Widgets": {
-                    "check": "Unit tests",
-                    "paths": ["src"],
-                    "pendingCheckPrefix": None,
-                },
-            }
-        )
+                    "pending_key_prefix": "Conversion batch ",
+                }
+            },
+        ),
+        (
+            "Acme/Widgets",
+            {"required": {"key": "Unit tests", "paths": ["src"], "pending_key_prefix": None}},
+        ),
     )
     assert (
-        factory_ci.python_ci_policy(settings, "Acme-Corp/Unit-Converter")
+        factory_ci.python_ci_policy(registry, "Acme-Corp/Unit-Converter")
         == conversion_python_ci()
     )
-    assert factory_ci.python_ci_policy(settings, "acme/widgets") == custom_python_ci()
-    assert factory_ci.python_ci_policy(settings, "acme-corp/acme-fixture") is None
+    assert factory_ci.python_ci_policy(registry, "acme/widgets") == custom_python_ci()
+    assert factory_ci.python_ci_policy(registry, "acme-corp/acme-fixture") is None
 
 
 @pytest.mark.parametrize(
-    "value",
+    ("repo", "required"),
     [
-        {"acme-corp/unit-converter": {"check": "", "paths": ["unitconv"]}},
-        {"acme-corp/unit-converter": {"check": "Python", "paths": []}},
-        {"acme-corp/unit-converter": {"check": "Python", "paths": ["/unitconv"]}},
-        {"acme-corp/unit-converter": {"check": "Python", "paths": ["unitconv/"]}},
-        {"unit-converter": {"check": "Python", "paths": ["unitconv"]}},
-        {"acme-corp/unit-converter/extra": {"check": "Python", "paths": ["unitconv"]}},
+        ("acme-corp/unit-converter", {"key": "", "paths": ["unitconv"]}),
+        ("acme-corp/unit-converter", {"key": "Python", "paths": []}),
+        ("acme-corp/unit-converter", {"key": "Python", "paths": ["/unitconv"]}),
+        ("acme-corp/unit-converter", {"key": "Python", "paths": ["unitconv/"]}),
+        ("unit-converter", {"key": "Python", "paths": ["unitconv"]}),
+        ("acme-corp/unit-converter/extra", {"key": "Python", "paths": ["unitconv"]}),
     ],
     ids=["empty-check", "empty-paths", "leading-slash", "trailing-slash", "no-owner", "3-parts"],
 )
-def test_an_invalid_python_ci_policy_is_rejected_at_boot(value: dict[str, Any]) -> None:
+def test_an_invalid_python_ci_policy_is_rejected_at_boot(
+    repo: str, required: dict[str, Any]
+) -> None:
+    ci = {"required": required}
     with pytest.raises(ValidationError):
-        Settings(GITHUB_FACTORY_PYTHON_CI=json.dumps(value))
+        _forges((repo, ci))
+    with pytest.raises(ValidationError):
+        Settings(forges=forges_document(bindings=[github_repository_binding(repo=repo, ci=ci)]))
 
 
 # --- decide: the CI deadline -----------------------------------------------------------
@@ -1643,27 +1657,21 @@ def test_no_delegated_checks_keeps_todays_verdicts(detail: CiDetail, seconds: fl
 
 
 def test_policy_settings_become_check_keys_with_statuses_prefixed() -> None:
-    settings = Settings(
-        GITHUB_FACTORY_PYTHON_CI=json.dumps(
+    registry = _registry(
+        (
+            "acme-corp/unit-converter",
             {
-                "acme-corp/unit-converter": {
-                    "check": "Unit conversion suite",
+                "required": {
+                    "key": "Unit conversion suite",
                     "paths": ["unitconv"],
-                    "pendingCheckPrefix": "Conversion batch ",
-                }
-            }
-        ),
-        GITHUB_FACTORY_METADATA_CI=json.dumps(
-            {
-                "acme-corp/unit-converter": {
-                    "checks": ["Description guard", "Description guard"],
-                    "statuses": ["ci/description"],
-                }
-            }
-        ),
+                    "pending_key_prefix": "Conversion batch ",
+                },
+                "metadata_rerun_keys": ["Description guard", "status:ci/description"],
+            },
+        )
     )
 
-    config = factory_ci.ci_policy_config(settings, "Acme-Corp/Unit-Converter")
+    config = factory_ci.ci_policy_config(registry, "Acme-Corp/Unit-Converter")
 
     assert config.required is not None
     assert (config.required.key, config.required.pending_key_prefix) == (
@@ -1684,13 +1692,15 @@ def test_policy_settings_become_check_keys_with_statuses_prefixed() -> None:
 
 
 def test_a_check_run_named_like_a_status_key_is_escaped_and_never_matches_the_status() -> None:
-    settings = Settings(
-        GITHUB_FACTORY_METADATA_CI=json.dumps(
-            {"acme-corp/acme-bot": {"checks": ["status:lint"], "statuses": ["lint"]}}
+    assert check_run_key("status:lint") == "check:status:lint"
+    registry = _registry(
+        (
+            "acme-corp/acme-bot",
+            {"metadata_rerun_keys": [check_run_key("status:lint"), "status:lint"]},
         )
     )
 
-    config = factory_ci.ci_policy_config(settings, "acme-corp/acme-bot")
+    config = factory_ci.ci_policy_config(registry, "acme-corp/acme-bot")
 
     assert config.metadata_rerun_keys == ("check:status:lint", "status:lint")
     _python, metadata = factory_ci.ci_policies(config)

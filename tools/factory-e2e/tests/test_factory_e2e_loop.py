@@ -107,7 +107,7 @@ def test_install_values_point_every_component_and_the_runner_at_built_images(
     assert runner["tag"] == "cand-cccccccccccc"
     assert "prewarm" not in runner
     # Everything else the install sets is untouched.
-    assert values["api"]["githubFactoryIngressEnabled"] is True
+    assert values["factory"]["enabled"] is True
     assert values["agentSandbox"]["controller"]["deploy"] is True
 
 

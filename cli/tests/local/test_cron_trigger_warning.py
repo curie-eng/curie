@@ -156,7 +156,7 @@ networks:
             "CURIE_CONFIG_DIR": str(config_dir),
             "DB_SCHEMA": "curie",
             "ENVIRONMENT": "dev",
-            "GITHUB_FACTORY_INGRESS_ENABLED": "false",
+            "FACTORY_ENABLED": "false",
             "GITHUB_APP_ID": "",
             "GITHUB_APP_PRIVATE_KEY": "",
             "GITHUB_REVIEW_INGRESS_ENABLED": "false",

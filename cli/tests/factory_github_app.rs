@@ -471,6 +471,18 @@ fn stdout_json(output: &Output) -> serde_json::Value {
 }
 
 /// Pull the first registration URL out of human output.
+/// The `factory.trackers` entry named `github` in a helm values document.
+fn github_tracker(values: &serde_json::Value) -> &serde_json::Value {
+    values
+        .pointer("/factory/trackers")
+        .and_then(|v| v.as_array())
+        .and_then(|list| {
+            list.iter()
+                .find(|t| t.get("name") == Some(&serde_json::json!("github")))
+        })
+        .unwrap_or_else(|| panic!("no github tracker in factory.trackers: {values}"))
+}
+
 fn find_url(text: &str, prefix: &str) -> String {
     let start = text
         .find(prefix)
@@ -1170,12 +1182,10 @@ fn app_id_and_key_infer_mention_allowlist_label_and_store_the_key_in_a_secret() 
     let api = values
         .get("api")
         .unwrap_or_else(|| panic!("no api in {values}"));
+    let tracker = github_tracker(&values);
+    assert_eq!(tracker.get("mention"), Some(&serde_json::json!(SLUG)));
     assert_eq!(
-        api.get("githubFactoryMention"),
-        Some(&serde_json::json!(SLUG))
-    );
-    assert_eq!(
-        api.get("githubFactoryLabel"),
+        tracker.get("label"),
         Some(&serde_json::json!("curie-factory"))
     );
     let mut allow: Vec<String> = api
@@ -1232,7 +1242,7 @@ fn printed_poll_completion_configures_intake_without_a_webhook_secret() {
     );
     let values: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("helm values");
     assert_eq!(
-        values.pointer("/api/githubFactoryIntake"),
+        values.pointer("/factory/intake"),
         Some(&serde_json::json!("poll"))
     );
     assert!(values.pointer("/api/githubWebhookSecret").is_none());

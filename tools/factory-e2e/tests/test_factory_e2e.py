@@ -280,6 +280,14 @@ def test_namespace_is_owned_and_rfc1123() -> None:
     assert fe.validate_namespace("test-factory-x1") == "test-factory-x1"
 
 
+def _github_entry(values: dict[str, Any], section: str) -> dict[str, Any]:
+    """The one ``factory.<section>`` entry named ``github``."""
+
+    entries = [entry for entry in values["factory"][section] if entry["name"] == "github"]
+    assert len(entries) == 1, values["factory"][section]
+    return entries[0]
+
+
 def test_install_values_pin_every_image_and_enable_factory_ingress(tmp_path: Path) -> None:
     config = fe.load_config(_env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
     values = fe.install_values(
@@ -293,10 +301,26 @@ def test_install_values_pin_every_image_and_enable_factory_ingress(tmp_path: Pat
         assert values[component]["image"]["tag"] == tag
     assert values["agentSandbox"]["runner"]["tag"] == tag
     assert values["agentSandbox"]["controller"]["deploy"] is False
+    factory = values["factory"]
+    assert factory["enabled"] is True
+    assert factory["intake"] == "poll"
+    credential = {
+        "type": "github_app",
+        "appId": "42",
+        "existingSecret": "factory-app",
+        "existingSecretKey": "privateKey",
+    }
+    code_host = _github_entry(values, "codeHosts")
+    assert code_host["kind"] == "github"
+    assert code_host["host"] == "github.com"
+    assert code_host["credential"] == credential
+    tracker = _github_entry(values, "trackers")
+    assert tracker["kind"] == "github"
+    assert tracker["host"] == "github.com"
+    assert tracker["credential"] == credential
+    assert tracker["label"] == "curie-factory"
+    assert tracker["mention"] == "example-factory"
     api = values["api"]
-    assert api["githubFactoryIngressEnabled"] is True
-    assert api["githubFactoryLabel"] == "curie-factory"
-    assert api["githubFactoryMention"] == "example-factory"
     assert api["githubAppId"] == "42"
     assert api["githubAppExistingSecret"] == "factory-app"
     assert api["githubRepoAllowlist"] == ["acme/fixture"]
@@ -315,12 +339,12 @@ def test_install_values_point_the_status_card_at_the_public_webhook_base(
         consumer_controller=True,
         card_base_url=base,
     )
-    assert values["api"]["githubFactoryCardBaseUrl"] == base
+    assert values["factory"]["cardBaseUrl"] == base
     # Before the tunnel exists there is no public base, so the value stays unset.
     unset = fe.install_values(
         config, candidate="c" * 40, app_key_secret="factory-app", consumer_controller=True
     )
-    assert "githubFactoryCardBaseUrl" not in unset["api"]
+    assert "cardBaseUrl" not in unset["factory"]
 
 
 def test_namespace_undo_is_registered_before_the_create_call(
@@ -504,8 +528,8 @@ def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> N
     for component in ("api", "worker", "dispatcher", "mailAdapter", "ui"):
         assert values[component]["image"]["tag"] == tag
     assert values["agentSandbox"]["runner"]["tag"] == tag
+    assert values["factory"]["enabled"] is True
     api = values["api"]
-    assert api["githubFactoryIngressEnabled"] is True
     assert api["githubAppId"] == "42"
     assert api["githubAppExistingSecret"] == "factory-app"
     assert api["githubRepoAllowlist"] == ["acme/fixture"]

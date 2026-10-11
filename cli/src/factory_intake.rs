@@ -957,14 +957,16 @@ mod tests {
     #[test]
     fn intake_values_carry_the_factory_settings_and_egress() {
         let values = intake_values(&opts(), &cidrs());
-        let api = &values["api"];
-        assert_eq!(api["githubFactoryIngressEnabled"], serde_json::json!(true));
-        assert_eq!(api["githubFactoryLabel"], serde_json::json!("factory"));
-        assert_eq!(api["githubFactoryMention"], serde_json::json!("curie-app"));
+        let factory = &values["factory"];
+        assert_eq!(factory["enabled"], serde_json::json!(true));
+        let tracker = github_entry(&values, "trackers");
+        assert_eq!(tracker["label"], serde_json::json!("factory"));
+        assert_eq!(tracker["mention"], serde_json::json!("curie-app"));
         assert_eq!(
-            api["githubFactoryCardBaseUrl"],
+            factory["cardBaseUrl"],
             serde_json::json!("https://cards.example.trycloudflare.com")
         );
+        let api = &values["api"];
         assert_eq!(
             api["githubRepoAllowlist"],
             serde_json::json!(["acme/widgets", "acme/gadgets"])
@@ -977,6 +979,88 @@ mod tests {
                 {"cidr": "140.82.112.0/20", "ports": [{"port": 443, "protocol": "TCP"}]},
             ])
         );
+    }
+
+    /// The one `factory.<section>` entry named `github`.
+    fn github_entry<'a>(values: &'a serde_json::Value, section: &str) -> &'a serde_json::Value {
+        let list = values["factory"][section]
+            .as_array()
+            .unwrap_or_else(|| panic!("factory.{section} is not a list: {values}"));
+        let entries: Vec<&serde_json::Value> = list
+            .iter()
+            .filter(|entry| entry["name"] == serde_json::json!("github"))
+            .collect();
+        assert_eq!(entries.len(), 1, "factory.{section}: {values}");
+        entries[0]
+    }
+
+    /// The chart's removed factory keys, read from the one file that names
+    /// them so this test spells none of them.
+    fn legacy_factory_keys() -> Vec<String> {
+        serde_norway::from_str(include_str!(
+            "../../charts/curie/files/legacy-factory-keys.yaml"
+        ))
+        .expect("legacy-factory-keys.yaml is a list of dotted chart keys")
+    }
+
+    #[test]
+    fn intake_values_write_the_factory_block_and_null_the_legacy_keys() {
+        let mut o = opts();
+        o.intake = Some("poll".into());
+        o.app_id = Some("123".into());
+        let values = intake_values(&o, &cidrs());
+        let factory = &values["factory"];
+        assert_eq!(factory["enabled"], serde_json::json!(true), "{values}");
+        assert_eq!(factory["intake"], serde_json::json!("poll"), "{values}");
+
+        let api_url = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+        let host = if api_url == crate::github_app::DEFAULT_GITHUB_API_URL {
+            "github.com".to_string()
+        } else {
+            reqwest::Url::parse(&api_url)
+                .expect("GitHub API URL parses")
+                .host_str()
+                .expect("GitHub API URL has a host")
+                .to_ascii_lowercase()
+        };
+        let credential = serde_json::json!({
+            "type": "github_app",
+            "appId": "123",
+            "existingSecret": crate::factory_app::DEFAULT_SECRET_NAME,
+            "existingSecretKey": crate::github_app::DEFAULT_APP_KEY_DATA_KEY,
+        });
+        assert_eq!(
+            factory["codeHosts"].as_array().map(Vec::len),
+            Some(1),
+            "{values}"
+        );
+        assert_eq!(
+            factory["trackers"].as_array().map(Vec::len),
+            Some(1),
+            "{values}"
+        );
+        for section in ["codeHosts", "trackers"] {
+            let entry = github_entry(&values, section);
+            assert_eq!(entry["kind"], serde_json::json!("github"), "{section}");
+            assert_eq!(entry["host"], serde_json::json!(host), "{section}");
+            assert_eq!(entry["apiUrl"], serde_json::json!(api_url), "{section}");
+            assert_eq!(entry["credential"], credential, "{section}");
+        }
+        let tracker = github_entry(&values, "trackers");
+        assert_eq!(tracker["label"], serde_json::json!("factory"));
+        assert_eq!(tracker["mention"], serde_json::json!("curie-app"));
+
+        let legacy = legacy_factory_keys();
+        assert!(!legacy.is_empty(), "the guard file lists the removed keys");
+        for key in &legacy {
+            assert!(key.starts_with("api."), "{key} is not an api key");
+            let pointer = format!("/{}", key.replace('.', "/"));
+            assert_eq!(
+                values.pointer(&pointer),
+                Some(&serde_json::Value::Null),
+                "{key} must be written as null so a reused release sheds it: {values}"
+            );
+        }
     }
 
     // C3
@@ -1053,10 +1137,7 @@ mod tests {
         o.disable = true;
         o.webhook_secret = None;
         let values = intake_values(&o, &[]);
-        assert_eq!(
-            values["api"]["githubFactoryIngressEnabled"],
-            serde_json::json!(false)
-        );
+        assert_eq!(values["factory"]["enabled"], serde_json::json!(false));
         assert!(
             values["api"].get("githubWebhookSecret").is_none(),
             "disable must not write a secret: {values}"
@@ -1064,11 +1145,22 @@ mod tests {
         assert!(!values.to_string().contains(SECRET), "{values}");
     }
 
+    const LABEL_KEY: &str = "factory.trackers[github].label";
+    const MENTION_KEY: &str = "factory.trackers[github].mention";
+    const CARD_KEY: &str = "factory.cardBaseUrl";
+
+    fn tracker(label: &str, mention: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": "github", "kind": "github", "label": label, "mention": mention
+        })
+    }
+
     fn full() -> serde_json::Value {
-        serde_json::json!({"api": {
-            "githubAppId": "123", "githubAppPrivateKey": "k",
-            "githubWebhookSecret": "s3cret", "githubFactoryLabel": "curie-factory",
-            "githubFactoryMention": "my-app", "githubRepoAllowlist": ["a/b"]}})
+        serde_json::json!({
+            "api": {
+                "githubAppId": "123", "githubAppPrivateKey": "k",
+                "githubWebhookSecret": "s3cret", "githubRepoAllowlist": ["a/b"]},
+            "factory": {"trackers": [tracker("curie-factory", "my-app")]}})
     }
 
     #[test]
@@ -1079,39 +1171,96 @@ mod tests {
     #[test]
     fn gate_missing_mention_is_named() {
         let mut v = full();
-        v["api"]
+        v["factory"]["trackers"][0]
             .as_object_mut()
             .unwrap()
-            .remove("githubFactoryMention");
+            .remove("mention");
         assert_eq!(
             intake_gate_offenders(&v, &serde_json::json!({})),
-            vec!["GITHUB_FACTORY_MENTION"]
+            vec![MENTION_KEY]
         );
     }
 
     #[test]
-    fn gate_merges_recorded_label_with_planned_mention() {
+    fn gate_merges_recorded_values_with_the_planned_factory_block() {
         let mut rec = full();
-        rec["api"]
-            .as_object_mut()
-            .unwrap()
-            .remove("githubFactoryMention");
-        let planned = serde_json::json!({"api": {"githubFactoryMention": "x-y"}});
+        rec.as_object_mut().unwrap().remove("factory");
+        let planned =
+            serde_json::json!({"factory": {"trackers": [tracker("curie-factory", "x-y")]}});
         assert!(intake_gate_offenders(&rec, &planned).is_empty());
+        // `helm -f` replaces a list, so a planned tracker list without a
+        // label drops the recorded one.
+        let planned = serde_json::json!({"factory": {"trackers": [
+            {"name": "github", "kind": "github", "mention": "x-y"}
+        ]}});
+        assert_eq!(intake_gate_offenders(&full(), &planned), vec![LABEL_KEY]);
+    }
+
+    #[test]
+    fn gate_reads_the_recorded_factory_block() {
+        let mut recorded = full();
+        recorded["api"]["githubWebhookSecret"] = serde_json::json!("");
+        recorded["api"]["environment"] = serde_json::json!("prod");
+        recorded["factory"] = serde_json::json!({
+            "intake": "webhook",
+            "cardBaseUrl": "http://localhost:3000",
+            "trackers": [tracker("has space", "@my-app")],
+        });
+        assert_eq!(
+            intake_gate_offenders(&recorded, &serde_json::json!({})),
+            vec!["GITHUB_WEBHOOK_SECRET", LABEL_KEY, MENTION_KEY, CARD_KEY]
+        );
+        // The planned factory block overlays the recorded one key by key.
+        let planned = serde_json::json!({"factory": {
+            "intake": "poll",
+            "cardBaseUrl": "https://cards.example.com",
+            "trackers": [tracker("curie-factory", "my-app")],
+        }});
+        assert!(intake_gate_offenders(&recorded, &planned).is_empty());
+        // No recorded tracker at all names both tracker keys.
+        let mut bare = full();
+        bare.as_object_mut().unwrap().remove("factory");
+        assert_eq!(
+            intake_gate_offenders(&bare, &serde_json::json!({})),
+            vec![LABEL_KEY, MENTION_KEY]
+        );
+    }
+
+    #[test]
+    fn offender_flags_map_the_factory_chart_keys_to_the_same_flags() {
+        assert_eq!(
+            offender_flag(LABEL_KEY),
+            "--label (no whitespace, 50 chars max)"
+        );
+        assert_eq!(
+            offender_flag(MENTION_KEY),
+            "--mention <app-slug> (the App login, no '@')"
+        );
+        assert_eq!(
+            offender_flag(CARD_KEY),
+            "--card-base-url https://<host> (no query or fragment; http only for localhost on a dev install)"
+        );
+        assert_eq!(
+            offender_flag("GITHUB_WEBHOOK_SECRET"),
+            "--webhook-secret-file"
+        );
+        assert_eq!(offender_flag("GITHUB_REPO_ALLOWLIST"), "--repo owner/name");
     }
 
     #[test]
     fn gate_dev_default_secret_and_at_mention_are_offenders() {
         // Webhook intake refuses both blank and published signing keys.
         for secret in ["dev-webhook-secret", ""] {
-            let planned = serde_json::json!({"api": {
-                "githubFactoryIntake": "webhook",
-                "githubWebhookSecret": secret,
-                "githubFactoryMention": "@x"
-            }});
+            let planned = serde_json::json!({
+                "api": {"githubWebhookSecret": secret},
+                "factory": {
+                    "intake": "webhook",
+                    "trackers": [tracker("curie-factory", "@x")]
+                }
+            });
             assert_eq!(
                 intake_gate_offenders(&full(), &planned),
-                vec!["GITHUB_WEBHOOK_SECRET", "GITHUB_FACTORY_MENTION"],
+                vec!["GITHUB_WEBHOOK_SECRET", MENTION_KEY],
                 "{secret}"
             );
         }
@@ -1124,10 +1273,9 @@ mod tests {
         for secret in secrets {
             for intake in intakes {
                 let mut recorded = full();
-                let api = recorded["api"].as_object_mut().unwrap();
-                api.insert("githubWebhookSecret".to_string(), serde_json::json!(secret));
+                recorded["api"]["githubWebhookSecret"] = serde_json::json!(secret);
                 if let Some(value) = intake {
-                    api.insert("githubFactoryIntake".to_string(), serde_json::json!(value));
+                    recorded["factory"]["intake"] = serde_json::json!(value);
                 }
                 let offenders = intake_gate_offenders(&recorded, &serde_json::json!({}));
                 assert!(
@@ -1142,13 +1290,9 @@ mod tests {
     fn gate_published_webhook_secret_is_refused_in_every_intake_mode() {
         for intake in [Some("poll"), Some("webhook"), None] {
             let mut recorded = full();
-            let api = recorded["api"].as_object_mut().unwrap();
-            api.insert(
-                "githubWebhookSecret".to_string(),
-                serde_json::json!("dev-webhook-secret"),
-            );
+            recorded["api"]["githubWebhookSecret"] = serde_json::json!("dev-webhook-secret");
             if let Some(value) = intake {
-                api.insert("githubFactoryIntake".to_string(), serde_json::json!(value));
+                recorded["factory"]["intake"] = serde_json::json!(value);
             }
             assert_eq!(
                 intake_gate_offenders(&recorded, &serde_json::json!({})),
@@ -1170,7 +1314,7 @@ mod tests {
                         api.insert("githubWebhookSecret".to_string(), serde_json::Value::Null);
                     }
                     if let Some(value) = intake {
-                        api.insert("githubFactoryIntake".to_string(), serde_json::json!(value));
+                        recorded["factory"]["intake"] = serde_json::json!(value);
                     }
                     recorded["security"] = serde_json::json!({
                         "allowDevDefaults": allow_dev_defaults
@@ -1247,40 +1391,31 @@ mod tests {
     fn card_base_url_rejects_unparseable_bracketed_host() {
         assert!(!card_base_url_valid("https://[cards.example.com", "prod"));
         assert!(card_base_url_valid("https://[::1]", "prod"));
-        let planned =
-            serde_json::json!({"api": {"githubFactoryCardBaseUrl": "https://[cards.example.com"}});
-        assert_eq!(
-            intake_gate_offenders(&full(), &planned),
-            vec!["GITHUB_FACTORY_CARD_BASE_URL"]
-        );
+        let planned = serde_json::json!({"factory": {"cardBaseUrl": "https://[cards.example.com"}});
+        assert_eq!(intake_gate_offenders(&full(), &planned), vec![CARD_KEY]);
     }
 
     #[test]
     fn gate_refuses_http_and_query_card_urls_and_accepts_https() {
         for bad in ["http://cards.example.com", "https://cards.example.com?q=1"] {
-            let planned = serde_json::json!({"api": {"githubFactoryCardBaseUrl": bad}});
+            let planned = serde_json::json!({"factory": {"cardBaseUrl": bad}});
             assert_eq!(
                 intake_gate_offenders(&full(), &planned),
-                vec!["GITHUB_FACTORY_CARD_BASE_URL"],
+                vec![CARD_KEY],
                 "{bad}"
             );
         }
-        let ok =
-            serde_json::json!({"api": {"githubFactoryCardBaseUrl": "https://cards.example.com"}});
+        let ok = serde_json::json!({"factory": {"cardBaseUrl": "https://cards.example.com"}});
         assert!(intake_gate_offenders(&full(), &ok).is_empty());
     }
 
     #[test]
     fn gate_reads_the_recorded_environment_for_localhost_http() {
-        let planned =
-            serde_json::json!({"api": {"githubFactoryCardBaseUrl": "http://localhost:3000"}});
+        let planned = serde_json::json!({"factory": {"cardBaseUrl": "http://localhost:3000"}});
         assert!(intake_gate_offenders(&full(), &planned).is_empty());
         let mut prod = full();
         prod["api"]["environment"] = serde_json::json!("prod");
-        assert_eq!(
-            intake_gate_offenders(&prod, &planned),
-            vec!["GITHUB_FACTORY_CARD_BASE_URL"]
-        );
+        assert_eq!(intake_gate_offenders(&prod, &planned), vec![CARD_KEY]);
     }
 
     #[test]

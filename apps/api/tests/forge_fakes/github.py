@@ -13,8 +13,9 @@ import json
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import httpx
 from curie_api.config import get_settings
@@ -40,13 +41,18 @@ MENTION = "curie"
 
 BASE_SHA = "0" * 39 + "1"
 
-_ENV = {
-    "GITHUB_FACTORY_INGRESS_ENABLED": "true",
-    "GITHUB_FACTORY_LABEL": LABEL,
-    "GITHUB_FACTORY_MENTION": MENTION,
+# The factory's GitHub App. A placeholder, never a real key: tests that mint
+# for real pass their own generated PEM.
+APP_ID = "51"
+PRIVATE_KEY = "example-private-key"
+GITHUB_API = "https://api.github.com"
+
+# The settings every factory suite boots with that are not factory settings.
+# The factory itself is configured only through `factory_env` (#4397).
+_BASE_ENV = {
     "GITHUB_REVIEW_INGRESS_ENABLED": "false",
-    "GITHUB_APP_ID": "51",
-    "GITHUB_APP_PRIVATE_KEY": "example-private-key",
+    "GITHUB_APP_ID": APP_ID,
+    "GITHUB_APP_PRIVATE_KEY": PRIVATE_KEY,
     "GITHUB_WEBHOOK_SECRET": "example-factory-hmac-secret",
     "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
     "GITHUB_TOKEN": "",
@@ -55,6 +61,179 @@ _ENV = {
     "APPROVAL_SWEEP_INTERVAL_S": "0",
     "DEAD_LETTER_WATCH_INTERVAL_S": "0",
 }
+
+
+def github_host(api_url: str) -> str:
+    """The identity host of a GitHub API URL, as `forges.hosts.github_host` derives it."""
+
+    netloc = urlsplit(api_url.rstrip("/")).netloc.lower()
+    return "github.com" if netloc == "api.github.com" else netloc
+
+
+def github_app_credential(
+    *, app_id: str = APP_ID, private_key: str = PRIVATE_KEY
+) -> dict[str, Any]:
+    return {"type": "github_app", "app_id": app_id, "private_key": private_key}
+
+
+def forges_document(
+    *,
+    api_url: str = GITHUB_API,
+    label: str = LABEL,
+    mention: str = MENTION,
+    app_id: str = APP_ID,
+    private_key: str = PRIVATE_KEY,
+    poll_interval_s: float = 45.0,
+    card_base_url: str = "",
+    bindings: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The in-code `ForgesConfig` of today's factory: one GitHub code host and
+    one GitHub tracker on the same App, both named ``github``.
+
+    This is the shape a test passes as ``Settings(forges=...)``; secrets sit
+    inline because a dict passed in code goes straight to `ForgesConfig`.
+    """
+
+    host = github_host(api_url)
+    credential = github_app_credential(app_id=app_id, private_key=private_key)
+    return {
+        "code_hosts": [
+            {
+                "name": "github",
+                "kind": "github",
+                "host": host,
+                "api_url": api_url,
+                "credential": dict(credential),
+            }
+        ],
+        "trackers": [
+            {
+                "name": "github",
+                "kind": "github",
+                "host": host,
+                "api_url": api_url,
+                "credential": dict(credential),
+                "label": label,
+                "mention": mention,
+                "poll_interval_s": poll_interval_s,
+            }
+        ],
+        "bindings": list(bindings or []),
+        "card_base_url": card_base_url,
+    }
+
+
+def github_repository_binding(
+    *,
+    repo: str = REPO,
+    repo_id: int | str = REPO_ID,
+    bases: list[str] | None = None,
+    default_base: str | None = None,
+    ci: dict[str, Any] | None = None,
+    name: str | None = None,
+) -> dict[str, Any]:
+    """A `bindings` entry carrying one GitHub repository's bases and CI policy.
+
+    Replaces the old per-repository settings maps: ``bases``/``default_base``
+    for the bases map, ``ci`` (``required`` and ``metadata_rerun_keys``) for the
+    Python and metadata CI maps.
+    """
+
+    project_id = str(repo_id)
+    entry: dict[str, Any] = {
+        "alias": "repo",
+        "code_host": "github",
+        "project_id": project_id,
+        "path": repo,
+        "bases": list(bases or []),
+        "default_base": default_base,
+    }
+    if ci is not None:
+        entry["ci"] = ci
+    return {
+        "name": name or f"repo-{project_id}",
+        "tracker": "github",
+        "tracker_scope_id": project_id,
+        "repos": [entry],
+    }
+
+
+_SECRET_FIELDS = {
+    "private_key": "private_key_file",
+    "client_secret": "client_secret_file",
+    "token": "token_file",
+}
+
+
+def forges_env_json(document: dict[str, Any], key_dir: Path) -> str:
+    """The ``CURIE_FORGES`` form of ``document``: every inline credential secret
+    is written to a file under ``key_dir`` and replaced by its ``*_file`` path,
+    the only form the env loader accepts."""
+
+    rendered = json.loads(json.dumps(document))
+    for section in ("code_hosts", "trackers"):
+        for entry in rendered.get(section, []):
+            credential = entry["credential"]
+            for inline, field in _SECRET_FIELDS.items():
+                if inline in credential:
+                    directory = key_dir / f"{section}-{entry['name']}"
+                    directory.mkdir(parents=True, exist_ok=True)
+                    path = directory / field.removesuffix("_file")
+                    path.write_text(credential.pop(inline))
+                    credential[field] = str(path)
+    return json.dumps(rendered)
+
+
+def factory_env(
+    key_dir: Path,
+    *,
+    intake: str = "poll",
+    api_url: str = GITHUB_API,
+    **forges: Any,
+) -> dict[str, str]:
+    """Every env var a factory suite boots with (#4397): the non-factory GitHub
+    settings, ``FACTORY_ENABLED``, ``FACTORY_INTAKE`` and a ``CURIE_FORGES``
+    whose App key is a file under ``key_dir``. ``GITHUB_API_URL`` is set to
+    ``api_url`` so the code host's host equals the install's GitHub host."""
+
+    return {
+        **_BASE_ENV,
+        "GITHUB_API_URL": api_url,
+        "FACTORY_ENABLED": "true",
+        "FACTORY_INTAKE": intake,
+        "CURIE_FORGES": forges_env_json(forges_document(api_url=api_url, **forges), key_dir),
+    }
+
+
+def fake_installation_tokens(monkeypatch: Any, credentials: Any = None) -> None:
+    """Answer every App token request with ``credentials`` (the fixture
+    installation token by default), wherever the `GitHubCredentials` came from:
+    the factory code host entry or the non-factory settings resolver."""
+
+    from curie_api.github_app import GitHubCredentials
+
+    fake = credentials if credentials is not None else _Credentials()
+    monkeypatch.setattr(
+        GitHubCredentials,
+        "token_for_verified_installation",
+        lambda _self, repo, installation_id: fake.token_for_verified_installation(
+            repo, installation_id
+        ),
+    )
+    monkeypatch.setattr(GitHubCredentials, "token_for", lambda _self, repo: fake.token_for(repo))
+
+    def fresh_installation_token(
+        _self: Any, repo: str, expected_installation_id: int | None = None
+    ) -> tuple[int, str]:
+        own = getattr(fake, "fresh_installation_token", None)
+        if own is not None:
+            return own(repo, expected_installation_id)
+        installation = (
+            INSTALLATION_ID if expected_installation_id is None else (expected_installation_id)
+        )
+        return installation, fake.token_for_verified_installation(repo, installation)
+
+    monkeypatch.setattr(GitHubCredentials, "fresh_installation_token", fresh_installation_token)
 
 
 class GitHubAPI:
@@ -285,8 +464,10 @@ _STATUS_STATES = {"success": "success", "failure": "failure", "cancelled": "erro
 
 
 def _stamp(second: int) -> str:
-    return (datetime(2026, 9, 1, tzinfo=UTC) + timedelta(seconds=second)).isoformat().replace(
-        "+00:00", "Z"
+    return (
+        (datetime(2026, 9, 1, tzinfo=UTC) + timedelta(seconds=second))
+        .isoformat()
+        .replace("+00:00", "Z")
     )
 
 
@@ -444,9 +625,7 @@ class GitHubRepositoryFake:
             return
         runs = self.check_runs.setdefault(sha, {})
         job_id = next(self._check_ids)
-        workflow = next(
-            (run["_workflow_run"] for run in runs.values()), next(self._workflow_runs)
-        )
+        workflow = next((run["_workflow_run"] for run in runs.values()), next(self._workflow_runs))
         status, conclusion = _RUN_STATES[state]
         runs[key] = {
             "id": job_id,

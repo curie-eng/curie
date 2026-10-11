@@ -16,6 +16,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -31,6 +32,7 @@ from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
 from curie_api.forges.github.ci import CiDetail
 from curie_api.forges.github.code_host import GitHubCodeHost
 from curie_api.forges.hosts import github_issue_ref, repository_ref
+from curie_api.forges.registry import forges_registry
 from curie_api.forges.types import (
     GITHUB,
     CheckState,
@@ -43,6 +45,7 @@ from curie_api.forges.types import (
 from curie_api.github_app import (
     _RESOLVERS,
     GitHubAppError,
+    GitHubCredentials,
     GitHubInstallationRefused,
 )
 from curie_api.main import create_app
@@ -64,7 +67,12 @@ from curie_api.workitem_outcomes import derive_outcome
 from curie_api.workitems import lifecycle as workitems
 from curie_test_support.valkey import connect_or_skip
 from fastapi.testclient import TestClient
-from forge_fakes.github import ci_view
+from forge_fakes.github import (
+    ci_view,
+    forges_document,
+    forges_env_json,
+    github_repository_binding,
+)
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -1484,6 +1492,47 @@ def _ci_inputs() -> tuple[Any, Any]:
     return lineage, work_item
 
 
+def _code_host(client: httpx.AsyncClient, credentials: Any) -> GitHubCodeHost:
+    """The GitHub code host minting through ``credentials`` (#4397: the code
+    host carries its own credential instead of reading settings)."""
+
+    settings = get_settings()
+    return GitHubCodeHost(
+        client,
+        api_url=settings.github_api_url,
+        html_base=settings.github_html_base,
+        timeout_s=settings.github_app_timeout_seconds,
+        credentials=credentials,
+    )
+
+
+def _factory_forges(
+    monkeypatch: pytest.MonkeyPatch,
+    stack: TestClient,
+    key_dir: Path,
+    bindings: list[dict[str, Any]] | None = None,
+) -> None:
+    """Give the running stack a factory GitHub code host (and ``bindings``)."""
+
+    document = forges_document(api_url=get_settings().github_api_url, bindings=bindings)
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, key_dir))
+    get_settings.cache_clear()
+    stack.app.state.forges = forges_registry(get_settings())
+
+
+def _mint_with(monkeypatch: pytest.MonkeyPatch, creds: Any) -> None:
+    """Answer every App installation token mint with ``creds``, wherever the
+    `GitHubCredentials` came from."""
+
+    monkeypatch.setattr(
+        GitHubCredentials,
+        "fresh_installation_token",
+        lambda _self, repo, expected_installation_id=None: creds.fresh_installation_token(
+            repo, expected_installation_id
+        ),
+    )
+
+
 class _FakeCreds:
     def __init__(self, *, configured: bool = True, error: Exception | None = None) -> None:
         self.app_configured = configured
@@ -1507,10 +1556,7 @@ def _observe(
     *,
     creds: _FakeCreds | None = None,
 ) -> tuple[Any, list[httpx.Request]]:
-    from curie_api.forges.github import ci
-
     fake = creds or _FakeCreds()
-    monkeypatch.setattr(ci, "credentials_for", lambda _s: fake)
     seen: list[httpx.Request] = []
 
     def record(request: httpx.Request) -> httpx.Response:
@@ -1523,7 +1569,7 @@ def _observe(
         settings = get_settings()
         async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
             return await workitem_outcomes.observe_ci(
-                GitHubCodeHost(settings, client), settings, lineage, work_item
+                _code_host(client, fake), settings, lineage, work_item
             )
 
     return asyncio.run(run()), seen
@@ -1774,6 +1820,7 @@ def test_hung_credential_acquisition_still_answers_the_detail_promptly(
     stack: TestClient,
     auth_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     import threading
 
@@ -1788,7 +1835,8 @@ def test_hung_credential_acquisition_still_answers_the_detail_promptly(
 
     release = threading.Event()
     hanging = _HangingCreds(release, hang_seconds=8.0)
-    monkeypatch.setattr(ci, "credentials_for", lambda _s: hanging)
+    _factory_forges(monkeypatch, stack, tmp_path)
+    _mint_with(monkeypatch, hanging)
     # One overall deadline bounds credential acquisition and the check request.
     monkeypatch.setattr(ci, "CI_OBSERVATION_DEADLINE_SECONDS", 0.5, raising=False)
     try:
@@ -1811,6 +1859,7 @@ def test_repeated_timeouts_do_not_accumulate_credential_work(
     stack: TestClient,
     auth_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """A bound caps live credential threads; extra callers fail fast.
 
@@ -1832,7 +1881,8 @@ def test_repeated_timeouts_do_not_accumulate_credential_work(
 
     release = threading.Event()
     hanging = _HangingCreds(release, hang_seconds=20.0)
-    monkeypatch.setattr(ci, "credentials_for", lambda _s: hanging)
+    _factory_forges(monkeypatch, stack, tmp_path)
+    _mint_with(monkeypatch, hanging)
     monkeypatch.setattr(ci, "CI_OBSERVATION_DEADLINE_SECONDS", 0.5, raising=False)
     bound = ci.CI_CREDENTIAL_SLOTS
     try:
@@ -2101,10 +2151,7 @@ def _observe_detail(
     client_options: dict[str, Any] | None = None,
     base_ref: str | None = None,
 ) -> tuple[factory_ci.CiView, list[httpx.Request]]:
-    from curie_api.forges.github import ci
-
     fake = creds or _FakeCreds()
-    monkeypatch.setattr(ci, "credentials_for", lambda _s: fake)
     seen: list[httpx.Request] = []
 
     async def record(request: httpx.Request) -> httpx.Response:
@@ -2118,7 +2165,7 @@ def _observe_detail(
             transport=httpx.MockTransport(record), **(client_options or {})
         ) as client:
             return await factory_ci.observe(
-                GitHubCodeHost(settings, client),
+                _code_host(client, fake),
                 repository_ref(settings, path=REPO, project_id="101"),
                 HEAD_SHA,
                 diagnostics=True,
@@ -2261,14 +2308,16 @@ PYTHON_CI_CHECK = "Unit conversion suite"
 # The factory target is a foreign unit conversion repository with its own policy.
 CONVERSION_PYTHON_CI_PATHS = ("unitconv", "tests")
 CONVERSION_PYTHON_CI_PENDING_PREFIX = "Conversion batch "
-CONVERSION_PYTHON_CI_ENV = json.dumps(
-    {
-        REPO: {
-            "check": PYTHON_CI_CHECK,
+CONVERSION_PYTHON_CI_BINDING = github_repository_binding(
+    repo=REPO,
+    repo_id=101,
+    ci={
+        "required": {
+            "key": PYTHON_CI_CHECK,
             "paths": list(CONVERSION_PYTHON_CI_PATHS),
-            "pendingCheckPrefix": CONVERSION_PYTHON_CI_PENDING_PREFIX,
+            "pending_key_prefix": CONVERSION_PYTHON_CI_PENDING_PREFIX,
         }
-    }
+    },
 )
 
 
@@ -2442,12 +2491,12 @@ def test_ci_gate_applies_the_python_preflight_verdict_to_python_changes(
     python_check: str | None,
     expected: tuple[str, str],
     reason: str | None,
+    tmp_path: Path,
 ) -> None:
     from curie_api.factory_progress import record_verification
     from curie_api.forges.github import ci
 
-    monkeypatch.setenv("GITHUB_FACTORY_PYTHON_CI", CONVERSION_PYTHON_CI_ENV)
-    get_settings.cache_clear()
+    _factory_forges(monkeypatch, stack, tmp_path, [CONVERSION_PYTHON_CI_BINDING])
     agent = _agent(stack, auth_headers)
     seeded = _completed(stack, agent)
     for check, outcome, exit_status in preflight:

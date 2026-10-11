@@ -22,7 +22,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from curie_api.config import Settings
-from curie_api.github_app import GitHubCredentials
+from curie_api.github_app import GitHubAuth, GitHubCredentials
 
 STUB_ROOT = Path(__file__).resolve().parents[1]
 REPO = "acme-corp/acme-bot"
@@ -79,11 +79,13 @@ def stub(tmp_path: Path, recording: dict[str, Any], issue_file: Path) -> Iterato
 def github(stub: Any, monkeypatch: pytest.MonkeyPatch) -> Iterator[httpx.Client]:
     monkeypatch.setenv("SSL_CERT_FILE", str(stub.ca_file))
     credentials = GitHubCredentials(
-        Settings(
-            GITHUB_API_URL=stub.base_url,
-            GITHUB_APP_ID="51",
-            GITHUB_APP_PRIVATE_KEY=_app_key(),
-            GITHUB_TOKEN="",
+        auth=GitHubAuth.from_settings(
+            Settings(
+                GITHUB_API_URL=stub.base_url,
+                GITHUB_APP_ID="51",
+                GITHUB_APP_PRIVATE_KEY=_app_key(),
+                GITHUB_TOKEN="",
+            )
         )
     )
     token = credentials.token_for_verified_installation(REPO, 5501)
