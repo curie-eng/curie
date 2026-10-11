@@ -88,13 +88,24 @@ fn both_commands_refuse_missing_file_before_attempting_the_cluster() {
             args.extend(["--to", "0.12.0"]);
         }
         let out = invoke(&args);
-        assert!(!out.status.success());
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "a missing file is a usage error"
+        );
         let error: serde_json::Value =
             serde_json::from_slice(&out.stdout).expect("structured failure");
         assert!(
             error.to_string().contains("values file"),
             "wrong refusal: {error}"
         );
+        assert!(
+            error["error"]
+                .as_str()
+                .is_some_and(|message| message.contains(path.to_str().unwrap())),
+            "refusal must name the unreadable file: {error}"
+        );
+        assert!(error["fix"].is_string(), "refusal needs a fix: {error}");
         assert!(
             !error.to_string().contains("unexpected argument"),
             "values option missing"
@@ -157,13 +168,18 @@ fn malformed_files_are_refused_without_echoing_yaml_contents() {
             "-f",
             file.to_str().unwrap(),
         ]);
-        assert!(!out.status.success());
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "malformed input is a usage error"
+        );
         let error: serde_json::Value =
             serde_json::from_slice(&out.stdout).expect("structured refusal");
         assert!(
             !error.to_string().contains("PLACEHOLDER-secret"),
             "contents leaked: {error}"
         );
+        assert!(error["fix"].is_string(), "refusal needs a fix: {error}");
         assert!(
             !error.to_string().contains("unexpected argument"),
             "values option missing"
