@@ -377,6 +377,36 @@ class GithubStub:
         )
         return result.stdout.decode().strip() if result.returncode == 0 else None
 
+    def _commit(self, sha: str) -> dict[str, Any] | None:
+        """One commit as GitHub's Git database API returns it, or None."""
+
+        if re.fullmatch(r"[0-9a-f]{40}", sha) is None:
+            return None
+        result = subprocess.run(
+            ("git", "--git-dir", str(self._repository), "cat-file", "commit", sha),
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        header, _, message = result.stdout.decode().partition("\n\n")
+        fields = [line.split(" ", 1) for line in header.splitlines()]
+        tree = next(value for key, value in fields if key == "tree")
+        parents = [value for key, value in fields if key == "parent"]
+        return {
+            "sha": sha,
+            "message": message,
+            "tree": {"sha": tree},
+            "parents": [
+                {
+                    "sha": parent,
+                    "url": f"{self.base_url}/api/v3/repos/{REPOSITORY}/git/commits/{parent}",
+                }
+                for parent in parents
+            ],
+        }
+
     def _repository_row(self) -> dict[str, Any]:
         return {
             "id": 4401,
@@ -528,6 +558,11 @@ class GithubStub:
                 "ref": f"refs/heads/{branch}",
                 "object": {"sha": sha, "type": "commit"},
             }
+        if method == "GET" and tail.startswith("git/commits/"):
+            commit = self._commit(tail.removeprefix("git/commits/"))
+            if commit is None:
+                return 404, {"message": "Not Found"}
+            return 200, commit
         if method == "GET" and tail.startswith("commits/"):
             if tail.endswith("/check-runs"):
                 runs = self._checks()
