@@ -64,7 +64,7 @@ LOOP_DEADLINE_SECONDS = (
 TEARDOWN_CLEAN = "every teardown step in the evidence is ok (teardown_clean is true)"
 NAMESPACE_GONE = (
     "the run's namespace is gone: kubectl --context <context> get namespace <namespace> "
-    "reports NotFound"
+    "--ignore-not-found -o name exits 0 and prints nothing"
 )
 
 Runner = Callable[[list[str], float], int]
@@ -299,8 +299,14 @@ def dry_run(key: str, out: TextIO) -> int:
     return 0
 
 
-def default_runner(argv: list[str], timeout: float) -> int:
-    """Run one step; at its deadline SIGTERM it so it tears down, then kill it."""
+def default_runner(
+    argv: list[str], timeout: float, *, grace: float = TEARDOWN_GRACE_SECONDS
+) -> int:
+    """Run one step; at its deadline SIGTERM it so it tears down, then kill it.
+
+    The step overran either way, so TimeoutExpired is raised once it has exited:
+    after its own teardown within ``grace`` seconds, or after the kill.
+    """
 
     proc = subprocess.Popen(argv)
     try:
@@ -308,7 +314,7 @@ def default_runner(argv: list[str], timeout: float) -> int:
     except subprocess.TimeoutExpired:
         proc.send_signal(signal.SIGTERM)
         try:
-            proc.wait(timeout=TEARDOWN_GRACE_SECONDS)
+            proc.wait(timeout=grace)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
@@ -348,7 +354,12 @@ def _get_path(evidence: Any, dotted: str) -> Any:
 
 
 def _namespace_gone(args: Any, evidence: Mapping[str, Any], kubectl: Kubectl) -> str | None:
-    """None when the namespace is gone, else why not."""
+    """None when the namespace is gone, else why not.
+
+    ``--ignore-not-found -o name`` makes absence an exit 0 with empty output, so
+    any nonzero exit (an unknown context, an unreachable or forbidden API) is a
+    failed check, never read as gone.
+    """
 
     namespace = evidence.get("namespace") or args.namespace
     context = (
@@ -356,12 +367,24 @@ def _namespace_gone(args: Any, evidence: Mapping[str, Any], kubectl: Kubectl) ->
     )
     if not namespace or not context:
         return "cannot check the namespace: the evidence names no namespace or kube context"
-    result = kubectl(["kubectl", "--context", str(context), "get", "namespace", str(namespace)])
-    if result.returncode != 0 and "NotFound" in (result.stderr or ""):
-        return None
-    if result.returncode == 0:
+    result = kubectl(
+        [
+            "kubectl",
+            "--context",
+            str(context),
+            "get",
+            "namespace",
+            str(namespace),
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ]
+    )
+    if result.returncode != 0:
+        return f"could not read namespace {namespace}: {(result.stderr or '').strip()}"
+    if (result.stdout or "").strip():
         return f"namespace {namespace} still exists on context {context}"
-    return f"could not read namespace {namespace}: {(result.stderr or '').strip()}"
+    return None
 
 
 def _judge_step(

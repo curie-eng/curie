@@ -19,7 +19,8 @@ is deployed, so the poller cannot admit it early, then reopens it.
 The judge reads: the admitted WorkItem request reached running and ended
 completed, the sandbox claim carried CURIE_REPO_CA_BUNDLE at the code host trust
 path, the publication Job mounted the `code-host-trust` volume from
-`code-host-ca` and completed, the stub's bare repository holds a pushed branch
+`code-host-ca` and its publication record ended succeeded, the stub's bare
+repository holds a pushed branch
 and exactly one pull request, the stub recorded no unsupported request, and no
 api, worker, publication or stub log shows a TLS verification failure.
 
@@ -78,6 +79,9 @@ CA_PATH = "/etc/curie/code-host-trust/ca.crt"
 SYSTEM_ROOTS = "/etc/ssl/certs/ca-certificates.crt"
 STUB_START_TIMEOUT_SECONDS = 600
 TERMINAL_STATUSES = frozenset({"completed", "failed", "expired", "cancelled"})
+# The worker names a publication's Job after its publication id
+# (publication_k8s.publication_resource_names): the first 20 hex digits.
+_PUBLICATION_JOB_NAME = re.compile(r"^curie-publication-([0-9a-f]{20})$")
 
 DEFAULT_TLS_ISSUE = (
     "Add a greet function to example.py",
@@ -362,16 +366,6 @@ def load_tls_config(env: Mapping[str, str], *, context: str | None) -> fe.Factor
     )
 
 
-def _job_completed(job: Mapping[str, Any]) -> bool:
-    status = job.get("status") or {}
-    if int(status.get("succeeded") or 0) >= 1:
-        return True
-    return any(
-        isinstance(c, dict) and c.get("type") == "Complete" and c.get("status") == "True"
-        for c in status.get("conditions") or []
-    )
-
-
 def _job_status_summary(job: Mapping[str, Any]) -> str:
     status = job.get("status") or {}
     conditions = [
@@ -445,8 +439,20 @@ def judge_tls_code_host(obs: Mapping[str, Any]) -> list[str]:
                     f"the publication Job's {TRUST_VOLUME} volume is ConfigMap {source!r}, "
                     f"not {CA_CONFIG_MAP}"
                 )
-        if not _job_completed(job):
-            failures.append(f"the publication Job did not complete: {_job_status_summary(job)}")
+        # Completion is the durable publication record, not the Job's status:
+        # the worker deletes the Job as soon as it settles the outcome.
+        record = obs.get("publication_record") or {}
+        status = record.get("status")
+        if status != "succeeded":
+            reason = (
+                f"its publication record is {status!r}"
+                if record
+                else "no publication record matches it"
+            )
+            failures.append(
+                f"the publication Job did not complete: {reason} "
+                f"(last Job status seen: {_job_status_summary(job)})"
+            )
 
     branches = [str(branch) for branch in obs.get("stub_branches") or []]
     if not [branch for branch in branches if branch != "main"]:
@@ -509,6 +515,7 @@ class TlsCodeHostRun:
         self.request_id = ""
         self.claim_env: dict[str, str] = {}
         self.publication_job: dict[str, Any] | None = None
+        self.publication_record: dict[str, Any] | None = None
         self.statuses: list[str] = []
         self.started_at: str | None = None
         self.obs: dict[str, Any] = {"stub": {}, "timeline": []}
@@ -818,6 +825,14 @@ class TlsCodeHostRun:
                 return
 
     def _capture_publication_job(self) -> None:
+        """Keep the publication Job's volumes from the first poll that sees it.
+
+        The worker deletes the Job right after it settles the outcome
+        (publication_loop._terminalize, then cleanup_terminal), so a later poll
+        may find nothing. The spec captured here is kept; completion is proved
+        by _capture_publication_record instead of by the Job's status.
+        """
+
         raw = self.p.kubectl(
             "-n",
             self.p.publication_namespace(),
@@ -847,7 +862,49 @@ class TlsCodeHostRun:
         }
         if self.publication_job is None:
             self._timeline("publication Job observed", name=meta.get("name"))
+        elif self.publication_job["metadata"]["name"] != meta.get("name"):
+            # Only the first Job's spec is judged; a later Job is not this run's.
+            return
         self.publication_job = reduced
+
+    def _capture_publication_record(self) -> None:
+        """The publication record behind the observed Job, read from Postgres.
+
+        Chosen over the Job's own status, its pod or a watch stream because it
+        is the one completion fact that survives the Job's deletion: the worker
+        writes the record terminal (succeeded only after the Job succeeded and
+        the pull request was verified) before it deletes the Job, and never
+        deletes the record. The Job name carries the publication id, so the
+        record read is exactly the Job whose volumes were captured.
+        """
+
+        if self.publication_job is None:
+            return
+        if (self.publication_record or {}).get("status") in ("succeeded", "failed"):
+            return
+        name = str(self.publication_job["metadata"].get("name") or "")
+        match = _PUBLICATION_JOB_NAME.match(name)
+        if match is None:
+            return
+        try:
+            rows = self.p.sql(
+                "SELECT id, status, execution_request_id FROM publications "
+                f"WHERE replace(id::text, '-', '') LIKE '{match.group(1)}%'"
+            )
+        except fe.PreflightFailed:
+            # A failed read is retried on the next poll; the record persists.
+            return
+        if len(rows) != 1:
+            return
+        publication_id, status, request_id = (rows[0] + ["", "", ""])[:3]
+        record = {
+            "id": publication_id,
+            "status": status,
+            "execution_request_id": request_id or None,
+        }
+        if record != self.publication_record:
+            self._timeline("publication record", status=status)
+        self.publication_record = record
 
     def await_ending(self) -> bool:
         """Poll the admitted request to its end, capturing claim and Job as they appear."""
@@ -858,6 +915,7 @@ class TlsCodeHostRun:
             status = self._record_status(request) if request is not None else ""
             self._capture_claim_env()
             self._capture_publication_job()
+            self._capture_publication_record()
             if status in TERMINAL_STATUSES:
                 return True
             if not self.stub_running():
@@ -958,6 +1016,7 @@ class TlsCodeHostRun:
         ended = self.await_ending() if work_item_id else False
         self._capture_claim_env()
         self._capture_publication_job()
+        self._capture_publication_record()
         branches, pulls, unsupported, stub_log = self.collect_stub()
         logs = self.collect_logs(stub_log)
         self.obs.update(
@@ -968,6 +1027,7 @@ class TlsCodeHostRun:
                 "ended": ended,
                 "claim_env": dict(self.claim_env),
                 "publication_job": self.publication_job,
+                "publication_record": self.publication_record,
                 "stub_branches": branches,
                 "stub_pull_requests": pulls,
                 "stub_unsupported": unsupported,

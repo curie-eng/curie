@@ -105,8 +105,13 @@ when given. `--dry-run` lists every step and fails on an entry with an unset
 field. Only github+github is installed; the pairings that need the GitLab,
 Jira or Bitbucket drivers list their steps and report "not installed".
 
-`tls-code-host` (tls_code_host.py) never touches real GitHub. It needs only
-CURIE_FACTORY_MODEL_API_KEY and a kube context. It runs the recorded TLS
+`tls-code-host` (tls_code_host.py) never touches real GitHub. It needs
+CURIE_FACTORY_MODEL_API_KEY and a kube context, plus
+CURIE_FACTORY_LAYER_REGISTRY, a registry the cluster can pull from, because
+the default bundle declares a runner layer and carries no connectors lock.
+With `--candidate-images build` it also needs BUILDX_BUILDER, like every
+other build run. It reads no GitHub App, webhook, actor or fixture
+repository setting. It runs the recorded TLS
 GitHub stub (tools/github-stub) as one Pod in the test namespace on the
 candidate worker image, publishes only the stub's public CA as the ConfigMap
 `code-host-ca`, and installs with `codeHostTrust.caBundle.configMapRef`, the
@@ -2053,6 +2058,7 @@ class Preflight:
         self._fixture_base_sha = ""
         self._issue_token_minted = 0.0
         self._fixture_restore_pushed = False
+        self._loop_driver: ForgeDriver | None = None
 
     # --- small wrappers -------------------------------------------------
 
@@ -3580,6 +3586,20 @@ class Preflight:
         if self._fixture_base_sha and self.default_branch_head() != self._fixture_base_sha:
             self.move_default_branch(self._fixture_base_sha)
 
+    def loop_driver(self) -> ForgeDriver:
+        """The forge driver a loop scenario observes and mutates through, built once.
+
+        The forge is the one main recorded as ``evidence["forge"]``.
+        """
+
+        if self._loop_driver is None:
+            name = self.evidence.get("forge")
+            entry = FORGES.get(name) if isinstance(name, str) else None
+            if entry is None:
+                raise ConfigError(f"the loop has no forge to drive (evidence forge {name!r})")
+            self._loop_driver = entry.driver(self)
+        return self._loop_driver
+
     def run(self, scenario: ScenarioDriver | None) -> None:
         if scenario is not None and self.scenario_name == "tls-code-host":
             # The stub code host owns its whole flow (tls_code_host.py): no App,
@@ -3598,17 +3618,23 @@ class Preflight:
         self.install()
         self.port_forward()
         self.bind_agent()
+        # A loop scenario resets and reads its fixture only through its forge
+        # driver; every other scenario uses the GitHub fixture directly.
+        driver = self.loop_driver() if self.scenario_name in LOOP_SCENARIOS else None
+        reset = driver.reset_fixture if driver is not None else self.reset_fixture
         # Reset BEFORE the webhook points here, so the closures stay off the
         # install; the after-reset is pushed now so it runs once the webhook
         # is already restored.
-        self.step("fixture reset before", **self.reset_fixture())
-        self.teardown.push("reset fixture repository", self.reset_fixture)
+        self.step("fixture reset before", **reset())
+        self.teardown.push("reset fixture repository", reset)
         self.ensure_label()
         self.tunnel()
         self.point_card_at_tunnel()
         self.repoint_webhook()
         if scenario is not None:
-            self.record_baseline()
+            self.record_baseline(
+                driver.default_branch_head if driver is not None else self.default_branch_head
+            )
         if scenario_opens_seed_issue(self.scenario_name):
             since = time.time()
             self.labelled_at = since
@@ -3642,9 +3668,9 @@ class Preflight:
         usage = data.get("usage") if isinstance(data, dict) else None
         return float(usage) if isinstance(usage, (int, float)) else None
 
-    def record_baseline(self) -> None:
+    def record_baseline(self, default_branch_head: Callable[[], str]) -> None:
         self.scenario_started = dt.datetime.now(dt.UTC).replace(microsecond=0)
-        self.head_before = self.default_branch_head()
+        self.head_before = default_branch_head()
         self.usage_before = self.model_usage()
         self.step("scenario baseline recorded", default_branch_head=self.head_before)
 
@@ -5812,11 +5838,7 @@ def loop_forge(scenario: str, requested: str | None) -> str | None:
 def forge_loop(p: Preflight) -> dict[str, Any]:
     """The loop scenario: drive the forge main recorded as ``evidence["forge"]``."""
 
-    name = p.evidence.get("forge")
-    entry = FORGES.get(name) if isinstance(name, str) else None
-    if entry is None:
-        raise ConfigError(f"the loop has no forge to drive (evidence forge {name!r})")
-    return run_loop(p, entry.driver(p))
+    return run_loop(p, p.loop_driver())
 
 
 def work_item_cli_pr_status(stdout: str) -> str | None:
@@ -5964,8 +5986,8 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
         obs.update(_new_obs(p))
         obs["forge"] = driver.forge
     work_item_id = str(obs["work_item_id"])
-    # The merge moves the default branch; teardown puts it back.
-    p.pin_fixture_base()
+    # The merge moves the default branch; the driver puts it back on teardown.
+    driver.pin_fixture_base()
 
     log("loop: waiting for the labelled run to open a pull request")
     change = driver.await_change(work_item_id)

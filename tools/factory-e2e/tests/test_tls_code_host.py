@@ -37,7 +37,10 @@ must provide. Shapes chosen here, which the implementation follows:
     ``work_item_id`` (str or None), ``request_statuses`` (ordered list, the
     last one is the ending), ``claim_env`` (the sandbox claim's env as a
     dict), ``publication_job`` (the publication Job as ``kubectl get job -o
-    json`` returns it, or None), ``stub_branches`` (branch names in the stub's
+    json`` returns it, or None), ``publication_record`` (the publications row
+    behind that Job: ``id``, ``status``, ``execution_request_id``; completion
+    is its ``status == "succeeded"``, since the worker deletes the Job as soon
+    as it settles), ``stub_branches`` (branch names in the stub's
     bare repository), ``stub_pull_requests`` (the stub's pull request rows),
     ``stub_unsupported`` (the stub's recorded unsupported requests) and
     ``logs`` (the observed api, worker, publication and stub log text). Each
@@ -428,6 +431,10 @@ def _job(
     }
 
 
+PUBLICATION_ID = "0123456789abcdef0123456789abcdef"
+PUBLICATION_JOB = f"curie-publication-{PUBLICATION_ID[:20]}"
+
+
 def _passing() -> dict[str, Any]:
     return {
         "work_item_id": "6f1c3a52-0000-4000-8000-000000000001",
@@ -438,6 +445,11 @@ def _passing() -> dict[str, Any]:
             "CURIE_REPO_CA_BUNDLE": CA_PATH,
         },
         "publication_job": _job(),
+        "publication_record": {
+            "id": PUBLICATION_ID,
+            "status": "succeeded",
+            "execution_request_id": "6f1c3a52-0000-4000-8000-000000000002",
+        },
         "stub_branches": ["main", "curie/factory-3815"],
         "stub_pull_requests": [{"number": 1, "head": "curie/factory-3815", "base": "main"}],
         "stub_unsupported": [],
@@ -515,10 +527,25 @@ def test_judge_fails_when_the_trust_volume_is_not_the_code_host_ca_config_map() 
     _failures_with(obs, "code-host-ca")
 
 
-def test_judge_fails_when_the_publication_job_did_not_complete() -> None:
+@pytest.mark.parametrize("status", ["failed", "running", "expired"])
+def test_judge_fails_when_the_publication_record_did_not_succeed(status: str) -> None:
     obs = _passing()
-    obs["publication_job"] = _job(succeeded=0, failed=1)
-    _failures_with(obs, "publication Job did not complete")
+    obs["publication_record"] = {**obs["publication_record"], "status": status}
+    matching = _failures_with(obs, "publication Job did not complete")
+    assert any(repr(status) in f for f in matching), matching
+
+
+def test_judge_fails_without_a_publication_record() -> None:
+    obs = _passing()
+    obs["publication_record"] = None
+    _failures_with(obs, "no publication record")
+
+
+def test_judge_reads_completion_from_the_record_not_the_last_job_status() -> None:
+    # The last poll saw the Job still running; the record says it succeeded.
+    obs = _passing()
+    obs["publication_job"] = _job(succeeded=0)
+    assert tls_code_host.judge_tls_code_host(obs) == []
 
 
 def test_judge_fails_when_the_stub_repo_has_no_pushed_branch() -> None:
@@ -657,3 +684,99 @@ def test_main_runs_tls_code_host_without_any_github_app_or_fixture_env(
     assert "missing required factory credential" not in err
     assert "CURIE_FACTORY_APP" not in err
     assert "CURIE_FACTORY_ACTOR" not in err
+
+
+# --------------------------------------------------------------------------
+# The live collector: the Job is deleted between polls
+# --------------------------------------------------------------------------
+
+
+class _FakePreflight:
+    """The Preflight surface TlsCodeHostRun.await_ending reads, scripted per poll."""
+
+    def __init__(self, record_status: str) -> None:
+        self.namespace = NAMESPACE
+        self.labelled_at = 0.0
+        self.record_status = record_status
+        self.polls = 0
+        self.sql_queries: list[str] = []
+        # Started just now, so the wait bound is far off.
+        self.started_at = fe._now_iso()
+        job = _job(succeeded=0)
+        job["metadata"]["name"] = PUBLICATION_JOB
+        job["metadata"]["creationTimestamp"] = "2026-10-11T00:00:00Z"
+        self.running_job = job
+
+    def publication_namespace(self) -> str:
+        return f"{NAMESPACE}-curie-publication"
+
+    def execution_request(self, _request_id: str) -> dict[str, Any]:
+        self.polls += 1
+        status = "running" if self.polls < 3 else "completed"
+        return {"status": status, "started_at": self.started_at}
+
+    def kubectl(self, *args: str, check: bool = True) -> str:
+        if "jobs" in args:
+            # Poll 1 sees the running Job with its trust volume; by poll 2 the
+            # worker has settled the outcome and deleted it.
+            items = [self.running_job] if self.polls == 1 else []
+            return json.dumps({"items": items})
+        if "sandboxclaims.extensions.agents.x-k8s.io" in args:
+            return json.dumps({"items": []})
+        if "jsonpath={.status.phase}" in args:
+            return "Running"
+        raise AssertionError(f"unexpected kubectl {args}")
+
+    def sql(self, query: str) -> list[list[str]]:
+        self.sql_queries.append(query)
+        return [[PUBLICATION_ID, self.record_status, "6f1c3a52-0000-4000-8000-000000000002"]]
+
+
+def _collect(monkeypatch: pytest.MonkeyPatch, record_status: str) -> tls_code_host.TlsCodeHostRun:
+    monkeypatch.setattr(tls_code_host.time, "sleep", lambda _s: None)
+    fake = _FakePreflight(record_status)
+    run = tls_code_host.TlsCodeHostRun(fake)  # type: ignore[arg-type]
+    run.request_id = "6f1c3a52-0000-4000-8000-000000000002"
+    assert run.await_ending() is True
+    # drive() captures once more after the loop; the Job is gone by then.
+    run._capture_publication_job()
+    run._capture_publication_record()
+    assert fake.polls == 3
+    assert fake.sql_queries, "the durable publication record was never read"
+    assert all(PUBLICATION_ID[:20] in query for query in fake.sql_queries)
+    return run
+
+
+def _collected_obs(run: tls_code_host.TlsCodeHostRun) -> dict[str, Any]:
+    return {
+        **_passing(),
+        "request_statuses": list(run.statuses),
+        "publication_job": run.publication_job,
+        "publication_record": run.publication_record,
+    }
+
+
+def test_a_job_deleted_between_polls_still_passes_on_a_succeeded_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _collect(monkeypatch, "succeeded")
+    assert run.publication_job is not None
+    assert run.publication_job["metadata"]["name"] == PUBLICATION_JOB
+    # The only Job status ever seen was running: completion is not from it.
+    assert not run.publication_job["status"].get("succeeded")
+    assert run.publication_record == {
+        "id": PUBLICATION_ID,
+        "status": "succeeded",
+        "execution_request_id": "6f1c3a52-0000-4000-8000-000000000002",
+    }
+    assert tls_code_host.judge_tls_code_host(_collected_obs(run)) == []
+
+
+def test_a_job_deleted_between_polls_fails_on_a_failed_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = _collect(monkeypatch, "failed")
+    assert run.publication_job is not None
+    failures = tls_code_host.judge_tls_code_host(_collected_obs(run))
+    assert failures and all("publication Job did not complete" in f for f in failures), failures
+    assert "'failed'" in failures[0]

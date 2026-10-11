@@ -580,8 +580,6 @@ def test_github_entry_sets_red_ci_and_merges_with_an_allowed_method(tmp_path: Pa
     ]
 
 
-
-
 def test_github_driver_opens_a_labelled_issue_and_returns_the_admitted_work_item(
     tmp_path: Path,
 ) -> None:
@@ -616,6 +614,7 @@ DRIVER_METHODS = (
     "changes_opened",
     "default_branch_head",
     "reset_fixture",
+    "pin_fixture_base",
 )
 NOT_INSTALLED_FORGES = ("gitlab", "jira_cloud", "bitbucket_cloud", "bitbucket_dc")
 
@@ -722,6 +721,200 @@ def test_forge_loop_resolves_the_github_forge() -> None:
     fe.load_forge_entries()
     args = fe.parse_args(["run", "--scenario", "forge-loop", "--forge", "github"])
     assert (args.scenario, args.forge) == ("forge-loop", "github")
+
+
+# --- the loop goes through the driver only -----------------------------------------
+
+# Every Preflight method that reads or writes GitHub directly. The loop must not
+# touch any of them: it observes and mutates the forge only through its driver.
+GITHUB_DIRECT = (
+    "github",
+    "as_actor",
+    "as_app",
+    "_paged",
+    "check_app",
+    "default_branch_head",
+    "pin_fixture_base",
+    "restore_fixture_base",
+    "move_default_branch",
+    "reset_fixture",
+    "seed_failing_test_commit",
+    "open_labelled_issue",
+    "assert_admission",
+    "label_admission_event_id",
+    "await_delivery",
+    "github_text_file",
+    "pr_head",
+    "new_branches",
+    "remove_label",
+    "post_pr_comment",
+)
+
+
+class _FakeDriver:
+    """A ForgeDriver that records each call and serves a complete loop."""
+
+    forge = "fakeforge"
+
+    def __init__(self, _p: Any = None) -> None:
+        self.calls: list[str] = []
+        self.heads = iter([("a" * 40, 1), ("b" * 40, 2), ("d" * 40, 3)])
+
+    def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
+        self.calls.append("open_and_label_ticket")
+        return "wi-1"
+
+    def await_change(self, work_item_id: str) -> fe.ChangeRef | None:
+        self.calls.append("await_change")
+        return fe.ChangeRef(7, "https://forge.example/change/7")
+
+    def change_head(self, change: fe.ChangeRef) -> tuple[str | None, int | None]:
+        self.calls.append("change_head")
+        return next(self.heads)
+
+    def set_ci_red(self, sha: str) -> dict[str, Any]:
+        self.calls.append("set_ci_red")
+        return {"sha": sha, "state": "failure"}
+
+    def ci_state(self, sha: str) -> dict[str, Any]:
+        self.calls.append("ci_state")
+        return {"sha": sha, "state": "failing" if sha == "a" * 40 else "passing"}
+
+    def post_review(self, change: fe.ChangeRef, text: str) -> dict[str, Any]:
+        self.calls.append("post_review")
+        return {"id": 5, "delivery_status_code": 200, "delivery_api_status": "factory_admitted"}
+
+    def merge(self, change: fe.ChangeRef) -> dict[str, Any]:
+        self.calls.append("merge")
+        return {"status_code": 200, "merged": True}
+
+    def change_merged(self, change: fe.ChangeRef) -> bool | None:
+        self.calls.append("change_merged")
+        return True
+
+    def changes_opened(self) -> list[int]:
+        self.calls.append("changes_opened")
+        return [7]
+
+    def default_branch_head(self) -> str:
+        self.calls.append("default_branch_head")
+        return "f" * 40
+
+    def reset_fixture(self) -> dict[str, Any]:
+        self.calls.append("reset_fixture")
+        return {"reset": "fakeforge"}
+
+    def pin_fixture_base(self) -> None:
+        self.calls.append("pin_fixture_base")
+
+
+def _forbid_github(preflight: fe.Preflight, monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in GITHUB_DIRECT:
+        assert callable(getattr(fe.Preflight, name, None)), name
+
+        def forbidden(*_a: Any, _name: str = name, **_k: Any) -> Any:
+            raise AssertionError(f"the loop touched GitHub directly through Preflight.{_name}")
+
+        monkeypatch.setattr(preflight, name, forbidden)
+
+    def no_pr_numbers(*_a: Any, **_k: Any) -> Any:
+        raise AssertionError("the loop listed pull requests on GitHub directly")
+
+    monkeypatch.setattr(fe, "_scenario_pr_numbers", no_pr_numbers)
+
+
+def _loop_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, driver: _FakeDriver
+) -> fe.Preflight:
+    monkeypatch.setitem(
+        fe.FORGES,
+        "fakeforge",
+        fe.ForgeEntry(name="fakeforge", driver=lambda _p: driver, installed=True),
+    )
+    preflight = _preflight(tmp_path, scenario_name="forge-loop")
+    preflight.evidence["forge"] = "fakeforge"
+    _forbid_github(preflight, monkeypatch)
+    return preflight
+
+
+def test_run_loop_observes_and_mutates_the_forge_only_through_the_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _FakeDriver()
+    preflight = _loop_preflight(tmp_path, monkeypatch, driver)
+    preflight.head_before = "f" * 40
+    one = {"status": "completed", "started_at": "2026-10-11T00:00:00Z"}
+    details = iter(
+        [
+            {"state": "published", "requests": [one], "pr": {"number": 7}},
+            {"state": "published", "requests": [one, one], "pr": {"number": 7}},
+        ]
+    )
+    merged = {"state": "published", "requests": [one, one], "pr": {"number": 7, "status": "merged"}}
+
+    def work_item_detail(_work_item_id: str) -> dict[str, Any]:
+        return next(details, merged)
+
+    def no_cli_judgement(*_a: Any, **_k: Any) -> None:
+        return None
+
+    preflight.work_item_detail = work_item_detail  # type: ignore[method-assign]
+    preflight.cli_check = no_cli_judgement  # type: ignore[method-assign]
+    preflight.cli_not_found_check = no_cli_judgement  # type: ignore[method-assign]
+    cli_body = json.dumps({"item": {"state": "published", "pr": {"number": 7, "status": "merged"}}})
+    preflight.cli_work_items_raw = lambda _id: (0, cli_body)  # type: ignore[method-assign]
+
+    def opened(title: str, body: str, since: float) -> str:
+        preflight.evidence["work_item_id"] = "wi-1"
+        return _FakeDriver.open_and_label_ticket(driver, title, body, since)
+
+    driver.open_and_label_ticket = opened  # type: ignore[method-assign]
+    monkeypatch.setattr(fe.time, "sleep", lambda _s: None)
+
+    obs = fe.forge_loop(preflight)
+
+    assert obs["verdict"] == "passed", obs["failures"]
+    assert obs["forge"] == "fakeforge"
+    assert driver.calls[:2] == ["open_and_label_ticket", "pin_fixture_base"]
+    for method in ("set_ci_red", "post_review", "merge", "change_merged", "changes_opened"):
+        assert method in driver.calls, method
+    assert "default_branch_head" in driver.calls
+
+
+def test_preflight_setup_resets_and_baselines_a_loop_fixture_through_the_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _FakeDriver()
+    preflight = _loop_preflight(tmp_path, monkeypatch, driver)
+    # The install and webhook steps are not the forge boundary under test.
+    for step in (
+        "check_tools",
+        "check_images",
+        "sweep_stale_namespaces",
+        "create_namespace",
+        "install",
+        "port_forward",
+        "bind_agent",
+        "ensure_label",
+        "tunnel",
+        "point_card_at_tunnel",
+        "repoint_webhook",
+    ):
+        monkeypatch.setattr(preflight, step, lambda *_a, **_k: None)
+    monkeypatch.setattr(preflight, "_lock", lambda *_a, **_k: None)
+    # check_app reads the App; it is GitHub App setup, not the fixture.
+    monkeypatch.setattr(preflight, "check_app", lambda *_a, **_k: None)
+    seen: list[Any] = []
+
+    preflight.run(lambda p: seen.append(p.loop_driver()) or {"ok": True})
+
+    assert seen == [driver]
+    assert driver.calls == ["reset_fixture", "default_branch_head"]
+    assert preflight.head_before == "f" * 40
+    names = [name for name, _step in preflight.teardown._steps]
+    assert "reset fixture repository" in names
+    reset_step = dict(preflight.teardown._steps)["reset fixture repository"]
+    assert reset_step() == {"reset": "fakeforge"}
 
 
 # --- main: forge-loop selection happens before any install ------------------------

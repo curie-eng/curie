@@ -3,10 +3,11 @@
 The `forge-loop` scenario in factory_e2e.py drives a tracker and a code host
 only through a ForgeDriver: it opens and labels the ticket, reads the change
 request the WorkItem published, reads and sets CI on its head, posts a review
-as the test actor, merges, and resets the fixture. The WorkItem side is the
-platform's own api and CLI, so it is not here. One entry module per forge in
-this directory implements the protocol and registers itself; a forge whose
-driver is not written yet registers a driver that raises ForgeNotInstalled.
+as the test actor, merges, and resets, pins and restores the fixture. The
+WorkItem side is the platform's own api and CLI, so it is not here. One entry
+module per forge in this directory implements the protocol and registers
+itself; a forge whose driver is not written yet registers a driver that raises
+ForgeNotInstalled.
 
 This module imports nothing from the harness, so a driver can be type checked
 and loaded on its own.
@@ -78,6 +79,10 @@ class ForgeDriver(Protocol):
 
     def reset_fixture(self) -> dict[str, Any]:
         """Return the fixture to its known start state; what was reset."""
+        ...
+
+    def pin_fixture_base(self) -> None:
+        """Remember the fixture's default branch head now and put it back on teardown."""
         ...
 
 

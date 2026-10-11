@@ -19,8 +19,9 @@ The real-run contract the fakes below rely on:
 3. Each persisted assertion is a ``(dotted evidence path, expected value)``
    pair.
 4. ``kubectl(argv) -> subprocess.CompletedProcess[str]`` gets a
-   ``kubectl --context <ctx> get namespace <ns>`` style argv; a nonzero exit
-   whose stderr says ``NotFound`` means the namespace is gone.
+   ``kubectl --context <ctx> get namespace <ns> --ignore-not-found -o name``
+   argv; exit 0 with empty stdout means the namespace is gone, non-empty stdout
+   means it remains, and any nonzero exit is a failed check, never gone.
 """
 
 from __future__ import annotations
@@ -28,7 +29,11 @@ from __future__ import annotations
 import dataclasses
 import io
 import json
+import os
 import subprocess
+import sys
+import textwrap
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -262,11 +267,22 @@ class _Kubectl:
 
     def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
         self.calls.append(list(argv))
+        assert argv[-3:] == ["--ignore-not-found", "-o", "name"], argv
         if self.gone:
-            return subprocess.CompletedProcess(
-                argv, 1, "", f'Error from server (NotFound): namespaces "{NAMESPACE}" not found'
-            )
+            return subprocess.CompletedProcess(argv, 0, "", "")
         return subprocess.CompletedProcess(argv, 0, f"namespace/{NAMESPACE}\n", "")
+
+
+class _KubectlError:
+    """A kubectl that fails for a reason unrelated to the namespace."""
+
+    def __init__(self, stderr: str) -> None:
+        self.stderr = stderr
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 1, "", self.stderr)
 
 
 def _args(tmp_path: Path) -> Any:
@@ -374,6 +390,27 @@ def test_real_run_fails_on_each_shortfall(
     assert summary["result"] == "failed", label
 
 
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        'error: context "k8" does not exist',
+        "Unable to connect to the server: dial tcp: lookup k8: no such host",
+        # An unrelated NotFound must not read as the namespace being gone.
+        "Error from server (NotFound): the server could not find the requested resource",
+    ],
+    ids=["unknown-context", "unreachable", "unrelated-notfound"],
+)
+def test_a_kubectl_error_is_a_failed_namespace_check_not_gone(stderr: str, tmp_path: Path) -> None:
+    args = _args(tmp_path)
+    kubectl = _KubectlError(stderr)
+    assert acceptance.run(args, runner=_Runner(_passing_evidence()), kubectl=kubectl) != 0
+    assert kubectl.calls
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["result"] == "failed"
+    failures = summary["steps"][0]["failures"]
+    assert any("could not read namespace" in f for f in failures), failures
+
+
 def test_real_run_fails_a_step_that_overruns_its_deadline(tmp_path: Path) -> None:
     def runner(argv: list[str], timeout: float) -> int:
         raise subprocess.TimeoutExpired(argv, timeout)
@@ -394,3 +431,202 @@ def test_real_run_of_a_not_installed_pairing_runs_no_step(
     assert acceptance.run(args, runner=runner, kubectl=kubectl) == fe.EXIT_SCENARIO
     assert runner.calls == [] and kubectl.calls == []
     assert "not installed" in capsys.readouterr().err
+
+
+# --- independently built evidence ------------------------------------------------------
+
+
+def _github_loop_evidence() -> dict[str, Any]:
+    """Evidence as main(), run_loop and _finish write it for a passing github-loop.
+
+    Written out literally, not derived from the persisted assertions, so an
+    assertion whose dotted path names a field the harness never writes fails.
+    """
+
+    return {
+        "schema": "curie.factory-e2e.evidence/v1",
+        "mode": "run:github-loop",
+        "candidate_commit": "c" * 40,
+        "image_tag": "sha-" + "c" * 40,
+        "candidate_image_mode": "published",
+        "kube_context": "k8",
+        "namespace": NAMESPACE,
+        "release": "curie",
+        "run_id": "0123456789ab",
+        "started_at": "2026-10-11T00:00:00+00:00",
+        "steps": [],
+        "forge": "github",
+        "execution_request_id": "6f1c3a52-0000-4000-8000-000000000002",
+        "work_item_id": "6f1c3a52-0000-4000-8000-000000000001",
+        "scenario": {
+            "work_item_id": "6f1c3a52-0000-4000-8000-000000000001",
+            "request_id": "6f1c3a52-0000-4000-8000-000000000002",
+            "delivery_id": None,
+            "issue_number": 41,
+            "cli": [],
+            "cli_failures": [],
+            "forge": "github",
+            "change_number": 42,
+            "change_url": "https://github.com/acme/fixture/pull/42",
+            "head_initial": "a" * 40,
+            "commits_initial": 1,
+            "red_ci": {"sha": "a" * 40, "context": "factory-e2e/loop-gate", "state": "failure"},
+            "first_run_terminal": True,
+            "first_run_statuses": ["completed"],
+            "first_run_cause": None,
+            "head_after_ci": "b" * 40,
+            "commits_after_ci": 2,
+            "ci_on_initial_head": {"sha": "a" * 40, "state": "failing"},
+            "ci_after_fix": {
+                "sha": "b" * 40,
+                "state": "passing",
+                "check_runs": [{"name": "test", "status": "completed", "conclusion": "success"}],
+                "statuses": [],
+            },
+            "review_id": 9,
+            "review_url": "https://github.com/acme/fixture/pull/42#pullrequestreview-9",
+            "review_delivery_id": "delivery-guid",
+            "review_delivery_status_code": 200,
+            "review_delivery_api_status": "factory_admitted",
+            "review_terminal": True,
+            "request_statuses": ["completed", "completed"],
+            "head_after_review": "d" * 40,
+            "commits_after_review": 3,
+            "work_item_change_number": 42,
+            "default_branch_moved_before_merge": False,
+            "merge": {"status_code": 200, "merged": True, "method": "merge", "sha": "e" * 40},
+            "forge_merged": True,
+            "work_item_pr_status": "merged",
+            "cli_pr_status": "merged",
+            "change_numbers": [42],
+            "verdict": "passed",
+            "failures": [],
+        },
+        "result": "passed",
+        "teardown": [
+            {"step": name, "ok": True, "detail": {}}
+            for name in (
+                "reset fixture repository",
+                "restore App webhook",
+                "stop tunnel",
+                "stop api port-forward",
+                "restore fixture default branch",
+                "delete namespaces",
+            )
+        ],
+        "teardown_clean": True,
+        "teardown_ok": {
+            "reset fixture repository": True,
+            "restore App webhook": True,
+            "stop tunnel": True,
+            "stop api port-forward": True,
+            "restore fixture default branch": True,
+            "delete namespaces": True,
+        },
+    }
+
+
+def test_independently_built_github_loop_evidence_satisfies_the_persisted_assertions() -> None:
+    evidence = _github_loop_evidence()
+    for step in acceptance.PAIRINGS["github+github"].steps:
+        for field, expected in step.persisted_assertions:
+            got = acceptance._get_path(evidence, field)
+            assert got is not acceptance._MISSING, f"{field} is not in the harness evidence"
+            assert got == expected, (field, got, expected)
+
+
+def test_real_run_passes_on_independently_built_evidence(tmp_path: Path) -> None:
+    args = _args(tmp_path)
+    assert acceptance.run(args, runner=_Runner(_github_loop_evidence()), kubectl=_Kubectl()) == 0
+
+
+def test_the_github_loop_judge_passes_the_independent_scenario() -> None:
+    # The literal scenario block is a passing loop by the harness's own judge.
+    assert fe.judge_github_loop(_github_loop_evidence()["scenario"]) == []
+
+
+# --- the default runner against a real child process -----------------------------------
+
+_CHILD = textwrap.dedent(
+    """
+    import os, signal, sys, time
+    mode, marker, sleep = sys.argv[1], sys.argv[2], float(sys.argv[3])
+    with open(marker + ".pid", "w") as handle:
+        handle.write(str(os.getpid()))
+    def on_term(_signum, _frame):
+        with open(marker + ".term", "w") as handle:
+            handle.write("term")
+        if mode == "graceful":
+            sys.exit(7)
+    if mode in ("graceful", "stubborn"):
+        # graceful exits from the handler; stubborn records it and sleeps on.
+        signal.signal(signal.SIGTERM, on_term)
+    time.sleep(sleep)
+    sys.exit(3)
+    """
+)
+
+
+def _child(tmp_path: Path, mode: str, sleep: float) -> tuple[list[str], Path]:
+    script = tmp_path / "child.py"
+    script.write_text(_CHILD)
+    marker = tmp_path / mode
+    return [sys.executable, "-I", str(script), mode, str(marker), str(sleep)], marker
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_default_runner_returns_the_exit_code_of_a_step_that_finishes(tmp_path: Path) -> None:
+    argv, marker = _child(tmp_path, "plain", 0)
+    assert acceptance.default_runner(argv, 10, grace=5) == 3
+    assert not Path(f"{marker}.term").exists()
+
+
+def test_default_runner_terminates_an_overrun_step_and_lets_it_tear_down(
+    tmp_path: Path,
+) -> None:
+    argv, marker = _child(tmp_path, "graceful", 30)
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        acceptance.default_runner(argv, 0.5, grace=10)
+    elapsed = time.monotonic() - started
+    assert Path(f"{marker}.term").read_text() == "term"
+    # It exited on SIGTERM within the grace, so no wait for the whole grace.
+    assert elapsed < 8, elapsed
+    assert not _alive(int(Path(f"{marker}.pid").read_text()))
+
+
+def test_default_runner_kills_a_step_that_ignores_sigterm_after_the_grace(
+    tmp_path: Path,
+) -> None:
+    argv, marker = _child(tmp_path, "stubborn", 30)
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        acceptance.default_runner(argv, 0.5, grace=1)
+    elapsed = time.monotonic() - started
+    assert Path(f"{marker}.term").read_text() == "term"
+    assert 1.4 <= elapsed < 10, elapsed
+    assert not _alive(int(Path(f"{marker}.pid").read_text()))
+
+
+def test_an_overrun_step_under_the_default_runner_fails_with_its_deadline(
+    tmp_path: Path,
+) -> None:
+    child, marker = _child(tmp_path, "graceful", 30)
+
+    def runner(_argv: list[str], _timeout: float) -> int:
+        return acceptance.default_runner(child, 0.5, grace=10)
+
+    args = _args(tmp_path)
+    assert acceptance.run(args, runner=runner, kubectl=_Kubectl()) != 0
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    step = summary["steps"][0]
+    assert step["exit_code"] is None
+    assert any("overran its" in f and "deadline" in f for f in step["failures"]), step
+    assert Path(f"{marker}.term").exists()

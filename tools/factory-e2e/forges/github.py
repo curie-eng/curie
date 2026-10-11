@@ -195,5 +195,8 @@ class GitHubDriver:
     def reset_fixture(self) -> dict[str, Any]:
         return self.p.reset_fixture()
 
+    def pin_fixture_base(self) -> None:
+        self.p.pin_fixture_base()
+
 
 fe.register_forge(fe.ForgeEntry(name="github", driver=GitHubDriver, installed=True))
