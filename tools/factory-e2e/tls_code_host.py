@@ -491,8 +491,9 @@ def judge_tls_code_host(obs: Mapping[str, Any]) -> list[str]:
        codeHostTrust is the only path by which any component can trust the
        stub's CA, which the stub generated for this run alone;
     2. the publication record for the admitted request ended ``succeeded``,
-       which the worker writes only after the Job succeeded and the pull
-       request was verified against the stub over TLS;
+       which the worker writes once the Job's post-push marker reports a
+       verified push and the pull request was read back from the stub over
+       TLS;
     3. the stub's bare repository holds a pushed non-main branch;
     4. no observed api, worker, publication or stub log reports a TLS
        verification failure.
@@ -1038,8 +1039,9 @@ class TlsCodeHostRun:
 
         Chosen over the Job's own status or its pod because it is the one
         completion fact that survives the Job's deletion: the worker writes the
-        record terminal (succeeded only after the Job succeeded and the pull
-        request was verified) before it deletes the Job, and never deletes the
+        record terminal (succeeded once the Job's post-push marker reports a
+        verified push and the pull request was read back) before it deletes
+        the Job, and never deletes the
         record. It is keyed by the execution request, so it needs no Job to
         have been observed.
         """
