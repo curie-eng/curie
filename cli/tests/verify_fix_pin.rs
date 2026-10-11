@@ -311,8 +311,9 @@ fn ci_gate_rejects_rust_test_flag_injection_before_it_can_report_pinned() {
         &[
             (
                 "cli/Cargo.toml",
-                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n",
             ),
+            ("cli/tests/integration.rs", "mod verify_pin;\n"),
             ("cli/src/lib.rs", "pub fn old() -> i32 {\n    1\n}\n"),
         ],
         "Add Rust fixture",
@@ -873,12 +874,12 @@ fn rust_selector_uses_cargo_with_an_exact_safe_test_name() {
             "--manifest-path",
             "cli/Cargo.toml",
             "--test",
-            "verify_pin",
+            "integration",
             "--",
             "--exact",
-            "pin_breaks",
+            "verify_pin::pin_breaks",
         ],
-        "test pin_breaks ... FAILED",
+        "test verify_pin::pin_breaks ... FAILED",
     );
 }
 
@@ -895,12 +896,12 @@ fn one_line_rust_test_function_can_prove_a_pin() {
             "--manifest-path",
             "cli/Cargo.toml",
             "--test",
-            "verify_pin",
+            "integration",
             "--",
             "--exact",
-            "pin_breaks",
+            "verify_pin::pin_breaks",
         ],
-        "test pin_breaks ... FAILED",
+        "test verify_pin::pin_breaks ... FAILED",
     );
 }
 
@@ -1026,7 +1027,7 @@ printf 'run\n' >> "$VERIFY_RUN_LOG"
 if grep -qx 'value=fixed' runner/Dockerfile; then
     exit 0
 fi
-printf 'test selected_pin ... FAILED\n'
+printf 'test verify_pin::selected_pin ... FAILED\n'
 exit 1
 "#,
     );
@@ -1478,8 +1479,9 @@ fn other_pin() {
         &[
             (
                 "cli/Cargo.toml",
-                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n",
             ),
+            ("cli/tests/integration.rs", "mod verify_pin;\n"),
             ("cli/src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n"),
         ],
         "Add Rust fixture",
@@ -1542,8 +1544,9 @@ fn selected_pin() {
         &[
             (
                 "cli/Cargo.toml",
-                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n",
             ),
+            ("cli/tests/integration.rs", "mod verify_pin;\n"),
             ("cli/src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n"),
         ],
         "Add Rust fixture",
@@ -1608,8 +1611,9 @@ fn other_pin() {
         &[
             (
                 "cli/Cargo.toml",
-                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n",
             ),
+            ("cli/tests/integration.rs", "mod verify_pin;\n"),
             ("cli/src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n"),
         ],
         "Add Rust fixture",
@@ -1675,8 +1679,9 @@ fn selected_pin() {
         &[
             (
                 "cli/Cargo.toml",
-                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+                "[package]\nname = \"pin_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\nautotests = false\n\n[[test]]\nname = \"integration\"\npath = \"tests/integration.rs\"\n",
             ),
+            ("cli/tests/integration.rs", "mod verify_pin;\n"),
             ("cli/src/lib.rs", "pub fn value() -> i32 {\n    1\n}\n"),
         ],
         "Add Rust fixture",
