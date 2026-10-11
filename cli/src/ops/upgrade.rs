@@ -3115,7 +3115,7 @@ impl LiveHost {
     fn migrate_effective_overlay(
         &self,
         mut values: serde_json::Value,
-    ) -> Result<Option<(String, String)>> {
+    ) -> Result<Option<(String, Vec<String>)>> {
         if let Some(files) = &self.opts.file_values {
             crate::config_migrate::clear_replaced_secret_refs(&mut values, &files.0);
             super::lint_values::merge_values(&mut values, files.0.clone());
