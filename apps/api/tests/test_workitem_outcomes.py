@@ -288,6 +288,7 @@ def _finish(request_id: uuid.UUID, epoch: int, outcome: str, cause: str) -> None
             outcome=outcome,  # type: ignore[arg-type]
             cause=cause,
             detail=None,
+            ci_fix_round=None,
         )
         assert getattr(result, "code", None) is None, result
 
@@ -733,6 +734,7 @@ def test_completion_without_a_pull_request_stays_running(
             outcome="completed",
             cause="completed",
             detail=None,
+            ci_fix_round=None,
         )
         assert getattr(result, "code", None) is not None, result
 

@@ -817,6 +817,42 @@ def test_credit_exhausted_escalation_finishes_with_its_cause_and_message(
     asyncio.run(exercise())
 
 
+def test_model_unreachable_on_every_attempt_finishes_with_its_cause_and_message(
+    make_harness,
+) -> None:
+    """#4333: an outage longer than the retries names the cause, not ``unclassified``."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+            max_attempts=3,
+        ) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            message = "model error: server_error: API Error: Connection refused (ECONNREFUSED)"
+            h.runner.default_script = [
+                ErrorEvent(message=message, classification="model-unreachable"),
+                Final(text="", status=SessionStatus.CLASSIFIED_FAILURE),
+            ]
+            request_id = uuid.uuid4()
+            prompt = f"Resolve {ISSUE_URL}"
+
+            await h.kernel.process_event(_turn(f"work-item-{request_id}-execute-1", prompt))
+
+            # Retryable with no side effect: every attempt is spent first.
+            assert h.runner.opened == [prompt, prompt, prompt]
+            assert work_items.calls.count("finish") == 1
+            finish = work_items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "model_unreachable"
+            assert isinstance(finish["detail"], str)
+            assert "API Error: Connection refused (ECONNREFUSED)" in finish["detail"]
+
+    asyncio.run(exercise())
+
+
 class _PublicationPendingWorkItems(_WorkItems):
     """The publication loop, not this finish, owns the WorkItem terminus."""
 
@@ -1453,10 +1489,10 @@ def _fail_settled_release(h: object) -> None:
     route is exactly what the #3071 turn budget fence guards.
     """
 
-    def release(_thread_key: str) -> bool:
+    def release_if_claim(_thread_key: str, _claim_name: str) -> bool:
         raise RuntimeError("control plane unavailable")
 
-    h.substrate.release = release  # type: ignore[attr-defined]
+    h.substrate.release_if_claim = release_if_claim  # type: ignore[attr-defined]
 
 
 def test_consecutive_work_items_replace_the_sandbox_even_with_the_same_budget(

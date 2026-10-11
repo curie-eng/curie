@@ -41,7 +41,26 @@ PostgreSQL 16:
 - **DSN + schema** (`apps/api/src/curie_api/db.py::SCHEMA`, `apps/api/src/curie_api/db.py::create_engine`): `SCHEMA = get_settings().db_schema` (default `"curie"`, `apps/api/src/curie_api/config.py::Settings`); the engine is built from `database_url` (env `DATABASE_URL`) via `create_async_engine(..., pool_pre_ping=True)`.
 - **Schema-scoped metadata** (`apps/api/src/curie_api/db.py::Base`): `Base.metadata = MetaData(schema=SCHEMA)` — every table is qualified into the `curie` schema.
 - **Models** (`apps/api/src/curie_api/models.py`): the authoritative model set is every `apps/api/src/curie_api/db.py::Base` subclass in that module, and each one's `__tablename__` is its table. The set grows with the product, so it is deliberately not enumerated here; examples include `apps/api/src/curie_api/models.py::Agent` (table `agents`), `apps/api/src/curie_api/models.py::Approval` (table `approvals`), `apps/api/src/curie_api/models.py::WorkItem` (table `work_items`), and `apps/api/src/curie_api/models.py::ThreadTranscript` (table `thread_transcripts`). The module also defines StrEnums such as `apps/api/src/curie_api/models.py::Environment` and `apps/api/src/curie_api/models.py::ApprovalStatus`.
-- **Two engines, one DSN** (`apps/api/src/curie_api/db.py::create_engine`, `apps/worker/src/curie_worker/run.py::build`): the API and the worker each build their own `create_async_engine(...)` from their own `database_url` setting (`apps/api/src/curie_api/config.py::Settings`, `apps/worker/src/curie_worker/config.py::WorkerConfig`), both read from `DATABASE_URL`, so a swap repoints both services. The worker never imports the API's models: it reaches the schema through hand-written SQL, both reading (`apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL`, `apps/worker/src/curie_worker/binding.py::_UNDEPLOYED_BINDING_SQL`, `apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`) and writing (`apps/worker/src/curie_worker/publication_store.py::PostgresPublicationStore` updates `publications` / `approvals` under `FOR UPDATE ... SKIP LOCKED`). Table and column names are a second, ORM-independent coupling a conforming DB must honor.
+
+4. **Database pools, one DSN.** The API and worker each own database pools, all selected by their service's
+`database_url` setting (`apps/api/src/curie_api/config.py::Settings`,
+`apps/worker/src/curie_worker/config.py::WorkerConfig`), both read from `DATABASE_URL`.
+The API builds its application engine, a separate liveness pool for readiness and
+worker heartbeats, and a source-gate pool
+(`apps/api/src/curie_api/db.py::create_engine`,
+`apps/api/src/curie_api/db.py::create_liveness_engine`,
+`apps/api/src/curie_api/db.py::create_source_gate_engine`). The worker builds an
+application engine and its own source-gate pool
+(`apps/worker/src/curie_worker/run.py::build`,
+`apps/worker/src/curie_worker/run.py::create_source_gate_engine`). A swap must repoint
+both services and therefore all their pools. The worker never imports the API's
+models: it reaches the schema through hand-written SQL, both reading
+(`apps/worker/src/curie_worker/binding.py::_RESOLVE_SQL`,
+`apps/worker/src/curie_worker/binding.py::_UNDEPLOYED_BINDING_SQL`,
+`apps/worker/src/curie_worker/connector_loop.py::_TARGETS_SQL`) and writing
+(`apps/worker/src/curie_worker/publication_store.py::PostgresPublicationStore`
+updates `publications` / `approvals` under `FOR UPDATE ... SKIP LOCKED`). Table and
+column names are a second, ORM-independent coupling a conforming DB must honor.
 - **Migrations**: the target DB must apply the **whole Alembic chain in `apps/api/alembic/versions/`**, in revision order, ending at `alembic heads`. The chain grows with the product, so it is deliberately not enumerated here: `ls apps/api/alembic/versions/` is the list, and `alembic heads` is the tip a conforming DB must reach. A single head is the invariant — a fork means two branches each added a migration (rebase and merge the heads before swapping anything). Two recent expand revisions make authenticated review feedback part of this schema contract: `0042_review_lineage_authority.py` adds immutable App-observed authority to publication lineages and the `publication_review_reservations` concurrency table; `0043_github_review_feedback.py` adds the `github_review_deliveries` audit table and the `github_review_feedback` durable feedback/outbox table. The latter stores normalized feedback and a credential-free queued turn, never a raw webhook body or GitHub credential.
 
 The candidate application serving window and ordered revision ancestry live in
@@ -64,10 +83,9 @@ Configured schema selection locates version metadata; source tables remain in
 
 ## Implementations today
 
-One: the compose/dev Postgres. Two SQLAlchemy async engines reach it, the API's
-(`apps/api/src/curie_api/db.py::create_engine`) and the worker's
-(`apps/worker/src/curie_worker/run.py::build`), each built from its own settings object
-but from the same `DATABASE_URL`. Tests point the API engine at the compose Postgres by
+One: the compose/dev Postgres. The API's application, liveness, and source-gate pools
+and the worker's application and source-gate pools reach it, each selected from its
+service's settings object and `DATABASE_URL`. Tests point the API engine at the compose Postgres by
 overriding `database_url` (per the `apps/api/src/curie_api/db.py` module docstring).
 
 ## Known leakage
@@ -77,8 +95,11 @@ The list is enumerated rather than totalled in prose on purpose: what counts as 
 is a judgement call, not something derivable from the tree.
 
 1. **`postgresql.UUID` column type** — `apps/api/src/curie_api/models.py::UUID` is imported
-   from `sqlalchemy.dialects.postgresql` and used as `UUID(as_uuid=True)` on every primary
-   and foreign key (e.g. `apps/api/src/curie_api/models.py::Agent`). This is a dialect-specific type.
+   from `sqlalchemy.dialects.postgresql` and used as `UUID(as_uuid=True)` for entity
+   identity columns such as `apps/api/src/curie_api/models.py::Agent.id` and their
+   references. This does not describe every key: execution events have integer identity
+   keys, source policy and schedule identities include string hook names, and factory
+   polling cursors use repository-name strings. UUID remains a dialect-specific type.
 2. **Schema-qualified tables + a schema-scoped native enum** — foreign keys are
    written as `f"{SCHEMA}.agents.id"` (`apps/api/src/curie_api/models.py::AgentVersion`,
    `apps/api/src/curie_api/models.py::Deployment`) and the `environment`

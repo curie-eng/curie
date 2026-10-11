@@ -566,6 +566,8 @@ def _exception_reason(exc: BaseException) -> str:
 # ``sandbox-capacity`` (#3693) is a ResourceQuota refusal on an approval resume,
 # which retries rather than taking the ordinary capacity reply. It is named
 # apart from ``runner-error`` because no runner was reached: the agent was busy.
+# ``model-unreachable`` (#4333) is a transport failure before the model provider
+# answered, so it is transient; the side-effect check above still runs first.
 RETRYABLE_CLASSIFICATIONS = frozenset(
     {
         "rate-limit",
@@ -574,6 +576,7 @@ RETRYABLE_CLASSIFICATIONS = frozenset(
         "sandbox-capacity",
         "sandbox-terminated",
         "workspace-error",
+        "model-unreachable",
     }
 )
 
@@ -602,6 +605,9 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         # #3071: the SDK's turn cap ran out (``error_max_turns``). Not retryable:
         # a retry would spend the same budget and stop at the same place.
         "max-turns",
+        # #4333: the model endpoint was unreachable at the transport layer.
+        # Retryable (see RETRYABLE_CLASSIFICATIONS).
+        "model-unreachable",
         # WORKER-TOOL-ACCESS-5: the runner's refusals of a restricted turn
         # (``curie_runner.tool_access``), and the worker's own for a runner that
         # cannot enforce one. Not retryable: the same runner refuses again.
@@ -638,6 +644,7 @@ _ESCALATION_CAUSES = {
     "model-credential-rejected": "model_credential_rejected",
     "rate-limit": "model_rate_limited",
     "server-error": "model_error",
+    "model-unreachable": "model_unreachable",
     "budget-exceeded": "budget_exceeded",
     "runner-timeout": "runner_timeout",
     "runner-timeout-unconfirmed": "runner_timeout",
@@ -992,10 +999,13 @@ class _ApprovalPause:
 
     ``failure_detail`` is the API's redacted, clipped coded refusal (#3617)
     when the create was refused with one; the factory run reports it.
+    ``abandoned`` means the WorkItem run bound to the event was given up as a
+    stale owner, so nothing was created and nothing may be posted (#4331).
     """
 
     created: bool
     failure_detail: str | None = None
+    abandoned: bool = False
 
     @classmethod
     def refused(cls, detail: str | None) -> _ApprovalPause:
@@ -1513,6 +1523,7 @@ class _SettlingWorkItem:
     outcome: str
     cause: str
     detail: str | None
+    ci_fix_round: int | None
     task: asyncio.Task[None] | None = None
     cleaned: bool = False
 
@@ -2095,13 +2106,21 @@ class Kernel:
         return any(held.request_id == request_id for held in self._held_work_items.values())
 
     def _begin_settling(
-        self, run: WorkItemRun, *, outcome: str, cause: str, detail: str | None
+        self,
+        run: WorkItemRun,
+        *,
+        outcome: str,
+        cause: str,
+        detail: str | None,
+        ci_fix_round: int | None,
     ) -> None:
         """Hand off only the report, synchronously retaining ownership (#4174)."""
 
         if run.request_id in self._settling_work_items:
             return
-        pending = _SettlingWorkItem(run=run, outcome=outcome, cause=cause, detail=detail)
+        pending = _SettlingWorkItem(
+            run=run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
+        )
         self._settling_work_items[run.request_id] = pending
         if self._work_item_runs.get(run.request_id) is run:
             self._work_item_runs.pop(run.request_id)
@@ -2110,10 +2129,16 @@ class Kernel:
         )
 
     async def _finish_or_settle(
-        self, run: WorkItemRun, *, outcome: str, cause: str, detail: str | None
+        self,
+        run: WorkItemRun,
+        *,
+        outcome: str,
+        cause: str,
+        detail: str | None,
+        ci_fix_round: int | None,
     ) -> None:
         try:
-            await run.finish(outcome=outcome, cause=cause, detail=detail)
+            await run.finish(outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round)
         except WorkItemConflict as exc:
             if exc.code != "not_running":
                 raise
@@ -2121,7 +2146,9 @@ class Kernel:
             # lost. Nothing remains to own; do not redeliver the ended turn.
             run.finished = True
         except WorkItemTransportError:
-            self._begin_settling(run, outcome=outcome, cause=cause, detail=detail)
+            self._begin_settling(
+                run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
+            )
 
     async def _settle_work_item(self, pending: _SettlingWorkItem) -> None:
         run = pending.run
@@ -2134,7 +2161,10 @@ class Kernel:
                     return
                 try:
                     await run.finish(
-                        outcome=pending.outcome, cause=pending.cause, detail=pending.detail
+                        outcome=pending.outcome,
+                        cause=pending.cause,
+                        detail=pending.detail,
+                        ci_fix_round=pending.ci_fix_round,
                     )
                 except WorkItemConflict as exc:
                     if exc.code in {"not_running", "publication_pending"}:
@@ -2163,7 +2193,7 @@ class Kernel:
         if run.heartbeat_running:
             await run.close()
         if run.finished:
-            await self._release_work_item_sandbox(run.thread_key)
+            await self._release_work_item_sandbox(run)
         pending.cleaned = True
 
     @staticmethod
@@ -3796,6 +3826,14 @@ class Kernel:
                         approval_routes,
                         deployment_id=workspace_deployment_id,
                     )
+                    if pause.abandoned:
+                        # #4331: a stale owner writes no finish and posts no
+                        # escalation; the API termination chain owns the lost
+                        # request's outcome (ADR 0206 decision 1).
+                        await self._complete(
+                            qevent, route, "dropped", telemetry_outcome="stale_owner", lease=lease
+                        )
+                        return
                     approval_created = pause.created
                     if not approval_created:
                         run = self._run_for_event(qevent.event_id)
@@ -3806,6 +3844,7 @@ class Kernel:
                                     outcome="failed",
                                     cause="approval_create_failed",
                                     detail=pause.failure_detail,
+                                    ci_fix_round=None,
                                 )
                             except WorkItemConflict as exc:
                                 # work_item_cancelled means what it does in
@@ -4007,7 +4046,7 @@ class Kernel:
                         if owned_run.finished:
                             # The turn has ended and the request is settled, so
                             # nothing on this thread needs the sandbox (#3075).
-                            await self._release_work_item_sandbox(owned_run.thread_key)
+                            await self._release_work_item_sandbox(owned_run)
             _OWNED_WORK_ITEM.reset(owned_token)
             _PUBLICATION_CONTEXT.reset(publication_token)
             _TURN_PROGRESS.reset(progress_token)
@@ -4354,14 +4393,36 @@ class Kernel:
         finally:
             await self._lock.release(lock_key, token)
 
-    async def _release_work_item_sandbox(self, thread_key: str) -> None:
-        """Delete a settled WorkItem thread's claim, live or suspended (#3075).
+    async def _release_work_item_sandbox(self, run: WorkItemRun) -> None:
+        """Delete a settled WorkItem run's own claim, live or suspended (#3075).
 
         Best-effort: a failure is logged and never changes the WorkItem outcome.
         The orphan reaper skips any claim a route references, so without this a
         suspended route kept its claim until someone deleted it by hand.
+
+        Fenced to the claim the run recorded (#4331): when the thread's route
+        now names another claim, such as a successor request's after ADR 0206
+        re-admission, nothing is deleted. An abandoned stale owner releases
+        nothing, because the API termination chain owns the lost request's
+        teardown, and a run that recorded no claim leaves the route alone.
         """
 
+        thread_key = run.thread_key
+        if run.abandoned:
+            logger.info(
+                "work-item %s was abandoned as a stale owner; leaving thread %s's route",
+                run.request_id,
+                thread_key,
+            )
+            return
+        claim_name = run.claim_name
+        if claim_name is None:
+            logger.info(
+                "work-item %s recorded no claim; leaving thread %s's route",
+                run.request_id,
+                thread_key,
+            )
+            return
         try:
             token = await asyncio.wait_for(
                 self._lock.acquire(self._config.lock_key(thread_key)),
@@ -4376,7 +4437,7 @@ class Kernel:
             return
         try:
             released = await asyncio.wait_for(
-                asyncio.to_thread(self._substrate.release, thread_key),
+                asyncio.to_thread(self._substrate.release_if_claim, thread_key, claim_name),
                 _RESET_RELEASE_TIMEOUT_S,
             )
             if released and self._workspace is not None:
@@ -4488,6 +4549,7 @@ class Kernel:
     async def _abandon_stale_work_item(self, thread_key: str, run: WorkItemRun) -> None:
         """Heartbeat 409 stale_owner: drop local ownership without touching the current route."""
 
+        run.abandoned = True
         await self._cancel_settling_work_items(request_id=run.request_id)
         run.finished = True
         self._forget_held_run(thread_key, run, reason="stale owner")
@@ -4822,12 +4884,14 @@ class Kernel:
                         run.held = True
                 elif outcome == "delivered":
                     ci_fix = parsed is not None and parsed.is_ci_fix
-                    if ci_fix:
-                        cause = (
-                            "runner_escalated"
-                            if turn is not None and turn.start_failed
-                            else "ci_fix_unpublished"
-                        )
+                    # Only an unpublished fix turn names its round (#4330).
+                    ci_fix_round: int | None = None
+                    if parsed is not None and parsed.is_ci_fix:
+                        if turn is not None and turn.start_failed:
+                            cause = "runner_escalated"
+                        else:
+                            cause = "ci_fix_unpublished"
+                            ci_fix_round = parsed.ci_fix_round
                     elif turn is None or self._is_approval_resume(qevent.event_id):
                         cause = "no_pull_request"
                     else:
@@ -4842,6 +4906,7 @@ class Kernel:
                                 if ci_fix or turn is None
                                 else _finish_detail(turn.assistant_text)
                             ),
+                            ci_fix_round=ci_fix_round,
                         )
                     except WorkItemConflict as exc:
                         if exc.code != "publication_pending":
@@ -4856,10 +4921,15 @@ class Kernel:
                         outcome="failed",
                         cause=_escalation_cause(turn),
                         detail=turn.error_message if turn is not None else None,
+                        ci_fix_round=None,
                     )
                 else:
                     await self._finish_or_settle(
-                        run, outcome="failed", cause="runner_failed", detail=None
+                        run,
+                        outcome="failed",
+                        cause="runner_failed",
+                        detail=None,
+                        ci_fix_round=None,
                     )
             except WorkItemConflict as exc:
                 logger.warning(
@@ -7267,6 +7337,11 @@ class Kernel:
                 runner_resources=runner_resources,
                 remaining_s=remaining_s,
             )
+            # Only the run bound to this event records the claim its turn is
+            # on; an unrelated same-thread event must not overwrite it (#4331).
+            if run.event_id == queued_event_id:
+                run.claim_name = handle.claim_name
+                run.sandbox_name = handle.sandbox_name
         if run is not None and agent_id is not None:
             # Lets a kill find this run if it later parks for approval (#3564).
             run.agent_id = agent_id
@@ -8365,6 +8440,26 @@ class Kernel:
         if ref:
             self._adopt_ref(qevent, ReplyAck(ref=ref))
 
+    def _approval_run_abandoned(self, qevent: QueuedTurn) -> bool:
+        """True when the WorkItem run bound to this event was abandoned (#4331).
+
+        A stale owner's approval would outlive the request the API already
+        handed to a successor, so it is not created.
+        """
+
+        parsed = parse_work_item_event_id(qevent.event_id)
+        if parsed is None or parsed.kind not in {"execute", "ci"}:
+            return False
+        run = self._work_item_runs.get(parsed.request_id)
+        if run is None or run.event_id != qevent.event_id or not run.abandoned:
+            return False
+        logger.warning(
+            "work-item %s was abandoned as a stale owner; creating no approval for %s",
+            run.request_id,
+            qevent.event_id,
+        )
+        return True
+
     async def _pause_for_approval(
         self,
         qevent: QueuedTurn,
@@ -8401,8 +8496,14 @@ class Kernel:
 
         Returns whether the approval was created and, when it was not, the
         API's coded refusal (#3617) for the factory run's detail, if any.
+
+        A WorkItem run abandoned as a stale owner creates nothing (#4331). The
+        abandonment arrives asynchronously from the heartbeat, so it is checked
+        at entry, immediately before the create, and again after it returns.
         """
 
+        if self._approval_run_abandoned(qevent):
+            return _ApprovalPause(created=False, abandoned=True)
         handle = _reply_handle_for(qevent)
         # Both identities are live in this function and they are not
         # interchangeable: ``thread`` is the BARE adapter conversation id used
@@ -8533,6 +8634,8 @@ class Kernel:
             if parsed_publication is not None and parsed_publication.kind in {"execute", "ci"}
             else None
         )
+        if self._approval_run_abandoned(qevent):
+            return _ApprovalPause(created=False, abandoned=True)
         try:
             if is_publication:
                 publication_creator = self._publication_creator
@@ -8687,6 +8790,9 @@ class Kernel:
             # not constrain. The API rejected these with a 422 before the model
             # was shared, which surfaced here as ApprovalBackendError; both still
             # escalate to a human rather than stranding the turn.
+            if self._approval_run_abandoned(qevent):
+                # #4331: abandoned while the create retried; nobody to escalate for.
+                return _ApprovalPause(created=False, abandoned=True)
             refusal = exc.refusal if isinstance(exc, ApprovalBackendError) else None
             if refusal is not None and refusal.startswith("publication.work_item_cancelled:"):
                 # #4191: a cancelled run is not a failure for a person.
@@ -8706,6 +8812,18 @@ class Kernel:
                 failure_class="approval-create-failed",
             )
             return _ApprovalPause.refused(refusal)
+
+        if self._approval_run_abandoned(qevent):
+            # #4331: the thread route may now name a successor's claim, so this
+            # worker neither touches the workspace nor suspends.
+            logger.warning(
+                "%s %s for %s was created before the run's abandonment was observed; "
+                "leaving it to the API termination chain",
+                "publication" if is_publication else "approval",
+                created.id,
+                qevent.event_id,
+            )
+            return _ApprovalPause(created=False, abandoned=True)
 
         progress_plan = _TURN_PROGRESS.get()
         if progress_plan is not None and self._progress is not None:

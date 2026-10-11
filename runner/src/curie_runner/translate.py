@@ -78,6 +78,8 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         "history-persistence-error",
         # #3071: the turn budget ran out (SDK result subtype ``error_max_turns``).
         "max-turns",
+        # #4333: the model endpoint was unreachable at the transport layer.
+        "model-unreachable",
     }
 )
 UNCLASSIFIED_ERROR_CLASSIFICATION = "unclassified"
@@ -120,6 +122,16 @@ _USAGE_LIMITED_TEXT = re.compile(
     r"|You've reached your Fable limit\."
     r"|Usage limit reached)"
     r"(?: · resets [^\n·]+)?(?: · progress saved)?\s*$",
+    re.IGNORECASE,
+)
+# #4333: the SDK reports a transport failure reaching the model endpoint as
+# ``server_error`` with the socket error in the assistant text. Only that exact
+# SDK code qualifies, so an HTTP 5xx from a provider that did answer stays
+# ``server-error``.
+MODEL_UNREACHABLE_CLASSIFICATION = "model-unreachable"
+_MODEL_UNREACHABLE_TEXT = re.compile(
+    r"ECONNREFUSED|ENETUNREACH|EHOSTUNREACH|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN"
+    r"|Connection refused|Connection error",
     re.IGNORECASE,
 )
 # Longest provider message carried on the error event.
@@ -172,6 +184,10 @@ def _is_credit_exhausted(error: str, provider_text: str) -> bool:
 
 def _is_usage_limited(error: str, provider_text: str) -> bool:
     return error == "rate_limit" or bool(_USAGE_LIMITED_TEXT.search(provider_text))
+
+
+def _is_model_unreachable(error: str, provider_text: str) -> bool:
+    return error == "server_error" and bool(_MODEL_UNREACHABLE_TEXT.search(provider_text))
 
 
 def is_usage_refusal(message: AssistantMessage) -> bool:
@@ -365,6 +381,10 @@ def _translate_assistant(
         elif _is_credit_exhausted(error, provider_text):
             mapped = CREDIT_EXHAUSTED_CLASSIFICATION
             state.credit_exhausted = True
+        elif _is_model_unreachable(error, provider_text):
+            mapped = MODEL_UNREACHABLE_CLASSIFICATION
+        elif error == "server_error":
+            mapped = "server-error"
         else:
             mapped = map_error_classification(error)
         state.error_classification = mapped

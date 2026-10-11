@@ -103,6 +103,10 @@ _CAUSE_TEXT = {
         "the provider limit."
     ),
     "model_error": "the model provider returned an error the run could not recover from.",
+    "model_unreachable": (
+        "the model provider could not be reached. Check the runner's network path "
+        "to the model endpoint, then retry."
+    ),
     "budget_exceeded": "the run reached a budget limit before it finished.",
     "runner_timeout": "the run took longer than its time limit.",
     "sandbox_terminated": (
@@ -193,6 +197,7 @@ _FAILURE_CLASS_BY_CAUSE = {
     "model_credential_rejected": "model-credential-rejected",
     "model_rate_limited": "rate-limit",
     "model_error": "server-error",
+    "model_unreachable": "model-unreachable",
     "budget_exceeded": "budget-exceeded",
     "runner_timeout": "runner-timeout",
     "sandbox_terminated": "sandbox-terminated",

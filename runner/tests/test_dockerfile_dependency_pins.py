@@ -634,18 +634,19 @@ def test_actual_runner_dockerfile_rejects_unpinned_pip_requirements() -> None:
 
 
 def test_prechange_drift_reports_all_six_violations() -> None:
-    dockerfile = """\
+    lock_text = _UV_LOCK.read_text(encoding="utf-8")
+    expected = _locked_runner_dependencies(lock_text)
+    # The opentelemetry-sdk pin tracks the lock so it stays the one matching pin.
+    dockerfile = f"""\
 RUN npm install -g @anthropic-ai/claude-code
 RUN npm install -g @modelcontextprotocol/server-github
 RUN /app/.venv/bin/pip install \\
     "claude-agent-sdk==0.2.115" \\
     "aiohttp==3.14.1" \\
-    "opentelemetry-sdk==1.44.0" \\
+    "opentelemetry-sdk=={expected['opentelemetry-sdk']}" \\
     "opentelemetry-exporter-otlp-proto-http==1.44.0" \\
     "anyio==4.14.1"
 """
-    lock_text = _UV_LOCK.read_text(encoding="utf-8")
-    expected = _locked_runner_dependencies(lock_text)
     violations = _find_violations(lock_text, dockerfile)
     assert violations == [
         Violation(

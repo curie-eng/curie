@@ -2942,11 +2942,15 @@ enum ClusterAction {
     /// cluster with no `runsc` RuntimeClass that is the wrong one: `cluster up`
     /// records a FAILED revision before its successful gVisor-off retry, so the
     /// history alternates failed/superseded and the preceding revision is a
-    /// failed one -- a manifest helm never finished applying.
+    /// failed one, a manifest Helm never finished applying.
     ///
-    /// This verb skips every revision whose status is not `deployed` or
-    /// `superseded` and rolls back to the newest one below the current revision
-    /// that is, printing which revisions it passed over. See issue #1899.
+    /// When the newest revision is above the newest `deployed` serving revision
+    /// with a status other than `deployed` or `superseded`, this verb rolls back
+    /// to that serving revision. Otherwise it selects the newest prior `deployed`
+    /// or `superseded` revision, printing which ineligible revisions it passed
+    /// over. See issues #1899 and #4335.
+    /// A dry run reads Helm history and prints the resolved target without
+    /// probing the live schema or running the rollback.
     Rollback {
         /// Roll back to this exact revision instead of the newest safe one. A
         /// revision that is not `deployed` or `superseded` is refused unless
@@ -2974,7 +2978,8 @@ enum ClusterAction {
         /// Skip the interactive confirmation prompt.
         #[arg(long)]
         yes: bool,
-        /// Print the commands that would run and exit without executing.
+        /// Read Helm history and print the selected revision and commands without
+        /// probing the live schema or running the rollback.
         #[arg(long)]
         dry_run: bool,
     },
@@ -3018,6 +3023,11 @@ enum ClusterAction {
         /// rollback window stays intact (#2300).
         #[arg(long = "forward-only")]
         forward_only: bool,
+        /// Take over this exact holder after verifying its CLI and Helm action
+        /// have stopped. Refuses while a release hook Job is running; recovers
+        /// an orphaned pending upgrade by rolling back to the serving revision.
+        #[arg(long, value_name = "HOLDER")]
+        take_over: Option<String>,
     },
     /// Carry bundle objects across a chart upgrade that renames the object
     /// store (issue #1324).
@@ -6066,6 +6076,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
                 forward_only,
+                take_over,
             } => {
                 let file_values = ops::load_values_files(&values_files).await?;
                 let resolved = artifacts::resolve_chart(
@@ -6088,6 +6099,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         chart,
                         yes,
                         forward_only,
+                        take_over,
                     })
                     .await?,
                 )

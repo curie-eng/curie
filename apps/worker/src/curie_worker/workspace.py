@@ -19,6 +19,7 @@ import base64
 import gzip
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -38,9 +39,14 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, cast
 from urllib.parse import urlsplit
 
+logger = logging.getLogger(__name__)
+
 WORKSPACE_REF_ENV = "CURIE_WORKSPACE_REF"
 WORKSPACE_SHA256_ENV = "CURIE_WORKSPACE_SHA256"
 WORKSPACE_MOUNT_PATH = "/workspace"
+# Encoded argument bytes per `git update-index` call, kept well under ARG_MAX
+# so a repository with thousands of dropped links still prepares.
+_UPDATE_INDEX_ARG_BUDGET = 64 * 1024
 _GITHUB_URL = re.compile(r"https://github\.com/[^\s<>|]+", re.IGNORECASE)
 _REPO_FULL_NAME = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
@@ -140,9 +146,7 @@ WORKSPACES_DISABLED_REFUSAL = (
 # Pinned by `test_selection_refusal_codes_match_the_apis_emissions` in
 # `apps/worker/tests/test_workspace.py`.
 _SELECTION_REFUSAL_MESSAGES = {
-    "workspace.selection_conflict": (
-        "This thread is already bound to a different repository."
-    ),
+    "workspace.selection_conflict": ("This thread is already bound to a different repository."),
 }
 
 
@@ -541,9 +545,7 @@ class WorkspaceCredentialClient:
             )
         return selected
 
-    def redeem(
-        self, deployment_id: uuid.UUID, conversation_id: str
-    ) -> WorkspaceCredential:
+    def redeem(self, deployment_id: uuid.UUID, conversation_id: str) -> WorkspaceCredential:
         body = json.dumps({"conversation_id": conversation_id}).encode()
         try:
             response = self._transport(
@@ -594,7 +596,6 @@ class WorkspaceCredentialClient:
             raise WorkspacePreparationError(
                 "credential-redemption", "API returned an invalid credential response"
             ) from exc
-
 
 
 def _opt_str(payload: dict[str, Any], key: str) -> str | None:
@@ -1248,6 +1249,7 @@ class WorkspacePreparer:
                         "checkout does not match the expected lineage head",
                     )
 
+                self._drop_escaping_links(checkout)
                 checkout_bytes = self._checkout_size(checkout)
                 if checkout_bytes > self.limits.max_checkout_bytes:
                     raise WorkspacePreparationError(
@@ -1362,9 +1364,7 @@ class WorkspacePreparer:
         """Materialize a headless lineage at its proposal base without a branch."""
 
         if re.fullmatch(r"[0-9a-f]{40}", expected_base) is None:
-            raise WorkspacePreparationError(
-                "lineage-checkout", "lineage base is invalid"
-            )
+            raise WorkspacePreparationError("lineage-checkout", "lineage base is invalid")
         return self.prepare(
             deployment_id=deployment_id,
             thread_key=thread_key,
@@ -1410,6 +1410,55 @@ class WorkspacePreparer:
             raise WorkspacePreparationError(
                 "origin-sanitization", ".git/config does not contain exactly one clean origin"
             )
+
+    def _drop_escaping_links(self, checkout: Path) -> None:
+        """Remove committed links that point outside the checkout.
+
+        A repository may commit convenience links (Bazel output links, for
+        example) whose targets live outside the tree. They cannot be shipped,
+        so they are unlinked and marked skip-worktree, which keeps the
+        deletion out of `git status` and out of anything `git add -A` stages.
+        """
+
+        dropped: list[str] = []
+        for root, dirnames, filenames in os.walk(checkout, followlinks=False):
+            root_path = Path(root)
+            if root_path == checkout and ".git" in dirnames:
+                dirnames.remove(".git")
+            for name in (*dirnames, *filenames):
+                path = root_path / name
+                if not path.is_symlink():
+                    continue
+                relative = path.relative_to(checkout).as_posix()
+                if _link_escapes(relative, os.readlink(path)):
+                    dropped.append(relative)
+        if not dropped:
+            return
+        dropped.sort()
+        for relative in dropped:
+            (checkout / relative).unlink()
+        batch: list[str] = []
+        batch_bytes = 0
+        for relative in dropped:
+            cost = len(os.fsencode(relative)) + 1
+            if batch and batch_bytes + cost > _UPDATE_INDEX_ARG_BUDGET:
+                self._skip_worktree(checkout, batch)
+                batch, batch_bytes = [], 0
+            batch.append(relative)
+            batch_bytes += cost
+        self._skip_worktree(checkout, batch)
+        logger.warning(
+            "workspace checkout dropped %d escaping link(s) outside the checkout: %s",
+            len(dropped),
+            ", ".join(dropped),
+        )
+
+    def _skip_worktree(self, checkout: Path, paths: list[str]) -> None:
+        self.commands.run(
+            ["git", "update-index", "--skip-worktree", "--", *paths],
+            cwd=checkout,
+            timeout_seconds=self.limits.archive_timeout_seconds,
+        )
 
     def _checkout_size(self, checkout: Path) -> int:
         total = 0
@@ -1636,9 +1685,7 @@ class WorkspaceClaimCoordinator:
                     env=claim_env,
                     workspace_repo=repo_full_name,
                     workspace_materialized_head=prepared.materialized_head,
-                    publication_visible_outcome_revision=(
-                        publication_visible_outcome_revision
-                    ),
+                    publication_visible_outcome_revision=(publication_visible_outcome_revision),
                     agent_name=agent_name,
                     runner_resources=runner_resources,
                     caller_run=caller_run,
@@ -1653,9 +1700,7 @@ class WorkspaceClaimCoordinator:
                         runner_resources=runner_resources,
                         workspace_repo=repo_full_name,
                         workspace_materialized_head=prepared.materialized_head,
-                        publication_visible_outcome_revision=(
-                            publication_visible_outcome_revision
-                        ),
+                        publication_visible_outcome_revision=(publication_visible_outcome_revision),
                         fresh_only=fresh_only,
                         caller_run=caller_run,
                     )
@@ -1671,9 +1716,7 @@ class WorkspaceClaimCoordinator:
                         runner_resources=runner_resources,
                         workspace_repo=repo_full_name,
                         workspace_materialized_head=prepared.materialized_head,
-                        publication_visible_outcome_revision=(
-                            publication_visible_outcome_revision
-                        ),
+                        publication_visible_outcome_revision=(publication_visible_outcome_revision),
                         caller_run=caller_run,
                     )
             sandbox_exposed = True
@@ -1702,9 +1745,7 @@ class WorkspaceClaimCoordinator:
 
         return cast(
             "str | None",
-            self.preparer.credentials.select(
-                deployment_id, thread_key, author, repo_full_name
-            ),
+            self.preparer.credentials.select(deployment_id, thread_key, author, repo_full_name),
         )
 
     def _stage_ownership(

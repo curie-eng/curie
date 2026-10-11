@@ -32,7 +32,7 @@ from sqlalchemy.orm import aliased
 
 from . import factory_ci, factory_label_reconcile, factory_notices, factory_poll_intake, workitems
 from .config import Settings
-from .models import ExecutionRequest, Publication, WorkItem
+from .models import ExecutionRequest, WorkItem
 from .workitem_dispatch import (
     claim_due,
     claim_terminate_publishes,
@@ -275,11 +275,7 @@ class WorkItemReconciler:
                     .join(WorkItem, WorkItem.id == ExecutionRequest.work_item_id)
                     .where(
                         ExecutionRequest.status == "running",
-                        # A published request waits on CI; the CI gate owns it.
-                        ~exists().where(
-                            Publication.execution_request_id == ExecutionRequest.id,
-                            Publication.status == "succeeded",
-                        ),
+                        workitems._not_awaiting_publication(),
                         (
                             (
                                 ExecutionRequest.runtime_heartbeat_expires_at.is_not(

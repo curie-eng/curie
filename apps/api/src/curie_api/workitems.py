@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from curie_telemetry.redact import redact_text
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, exists, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,7 +22,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from . import transcripts
 from .config import get_settings
-from .factory_reply_target import is_follow_up, parse_reply_target
+from .factory_reply_target import is_follow_up, is_relabel_objective, parse_reply_target
 from .models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
     Agent,
@@ -68,6 +68,7 @@ ConflictCode = Literal[
 
 _ACTIVE_STATUSES = ("waiting", "running", "cancellation_requested")
 _IN_FLIGHT_PUBLICATION = ("pending", "approved", "launching", "running")
+_AWAITING_PUBLICATION = (*_IN_FLIGHT_PUBLICATION, "succeeded")
 # A failed finish that never published defers to an in-flight publication (#2577, #3128).
 _UNPUBLISHED_CAUSES = frozenset({"no_pull_request", "early_stop"})
 # Longest provider message a factory notice keeps (#3073).
@@ -83,6 +84,27 @@ _NO_READMIT: dict[str, Any] = {
     "readmit_base_source": None,
     "readmit_base_commit": None,
 }
+
+
+def _not_awaiting_publication() -> ColumnElement[bool]:
+    # A publication in flight or succeeded hands the request's terminus to the
+    # publication loop and the CI gate, not to runtime owner loss.
+    return ~exists().where(
+        Publication.execution_request_id == ExecutionRequest.id,
+        Publication.status.in_(_AWAITING_PUBLICATION),
+    )
+
+
+async def _awaits_publication(session: AsyncSession, request_id: uuid.UUID) -> bool:
+    publication_id = await session.scalar(
+        select(Publication.id)
+        .where(
+            Publication.execution_request_id == request_id,
+            Publication.status.in_(_AWAITING_PUBLICATION),
+        )
+        .limit(1)
+    )
+    return publication_id is not None
 
 
 def _base_values(base: ResolvedBase | None) -> dict[str, Any]:
@@ -763,11 +785,12 @@ async def _unchanged_follow_up(
     if detail is None or not detail.strip().startswith("No changes needed:"):
         return False
     clone_base = get_settings().github_clone_base
-    if not is_follow_up(
-        request.objective,
-        repo_full_name=work_item.repo_full_name,
-        issue_number=work_item.github_issue_number,
-        clone_base=clone_base,
+    repo, issue = work_item.repo_full_name, work_item.github_issue_number
+    follow_up = is_follow_up(
+        request.objective, repo_full_name=repo, issue_number=issue, clone_base=clone_base
+    )
+    if not follow_up and not is_relabel_objective(
+        request.objective, repo_full_name=repo, issue_number=issue, clone_base=clone_base
     ):
         return False
     lineage = (
@@ -782,6 +805,22 @@ async def _unchanged_follow_up(
         or not lineage.pr_url.strip()
     ):
         return False
+    if not follow_up:
+        # A relabel continues the PR only when an earlier request of this
+        # WorkItem published on it (ADR 0208 consequence 4).
+        adopted = await session.scalar(
+            select(Publication.id)
+            .join(ExecutionRequest, ExecutionRequest.id == Publication.execution_request_id)
+            .where(
+                Publication.lineage_id == lineage.id,
+                Publication.status == "succeeded",
+                ExecutionRequest.work_item_id == work_item.id,
+                ExecutionRequest.sequence < request.sequence,
+            )
+            .limit(1)
+        )
+        if adopted is None:
+            return False
     target = parse_reply_target(
         request.objective,
         repo_full_name=work_item.repo_full_name,
@@ -1300,6 +1339,7 @@ async def _terminalize_execution(
     status: Literal["completed", "failed"],
     cause: str,
     detail: str | None,
+    ci_fix_round: int | None,
     extra_where: Sequence[ColumnElement[bool]],
 ) -> WorkItemResult:
     work_item = await _lock_work_item(session, work_item_id)
@@ -1320,6 +1360,8 @@ async def _terminalize_execution(
         return await _conflict(session, "stale_version", work_item=work_item, request=request)
     if request.status != "running" or not cause.strip():
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
+    if cause.strip() == "ci_fix_unpublished" and ci_fix_round is None:
+        return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     now = await _database_now(session)
     # The CI gate's causes (#3097) end a request whose pull request already
     # opened, so they share the opened-PR deadline exception. Keep this literal
@@ -1338,23 +1380,14 @@ async def _terminalize_execution(
     if status == "completed" and not opened:
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     if status == "failed" and cause.strip() == "ci_fix_unpublished":
+        assert ci_fix_round is not None
         # A CI fix turn that ended without a new publication is terminal, unless
-        # its publication is still in flight, or a fix publication already
-        # succeeded and awaits the CI gate's verdict; either one settles the
-        # request. Every succeeded publication after the request's first is a fix
-        # round's. The database does not record which of them the gate already
-        # judged failing, so a later round's unpublished turn defers here and the
-        # request ends at its execution deadline instead.
-        succeeded = (
-            select(Publication.id)
-            .where(
-                Publication.execution_request_id == request.id,
-                Publication.status == "succeeded",
-            )
-            .order_by(Publication.revision_number)
-            .offset(1)
-            .limit(1)
-        )
+        # a publication of the request is still in flight, or the turn's own
+        # round already published and awaits the CI gate's verdict; either one
+        # settles the request. The gate dispatches round N when the request has
+        # N - 1 succeeded publications and admits one turn per round, so the
+        # Nth succeeded publication is round N's. Fewer than N succeeded means
+        # this round never published, and the request fails at once.
         in_flight = await session.scalar(
             select(Publication.id)
             .where(
@@ -1363,9 +1396,13 @@ async def _terminalize_execution(
             )
             .limit(1)
         )
-        if in_flight is None:
-            in_flight = await session.scalar(succeeded)
-        if in_flight is not None:
+        succeeded = await session.scalar(
+            select(func.count(Publication.id)).where(
+                Publication.execution_request_id == request.id,
+                Publication.status == "succeeded",
+            )
+        )
+        if in_flight is not None or (succeeded or 0) >= ci_fix_round:
             return await _conflict(
                 session, "publication_pending", work_item=work_item, request=request
             )
@@ -1450,6 +1487,7 @@ async def complete_execution(
         status="completed",
         cause="completed",
         detail=None,
+        ci_fix_round=None,
         extra_where=(),
     )
 
@@ -1472,6 +1510,7 @@ async def fail_execution(
         status="failed",
         cause=cause,
         detail=None,
+        ci_fix_round=None,
         extra_where=(),
     )
 
@@ -1563,6 +1602,7 @@ async def settle_ci_verdict(
         status=status,
         cause=cause,
         detail=detail,
+        ci_fix_round=None,
         extra_where=(),
     )
 
@@ -2091,16 +2131,7 @@ async def request_owner_lost_cancellation(
     )
     if not heartbeat_lapsed and not owner_absent:
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
-    published = await session.scalar(
-        select(Publication.id)
-        .where(
-            Publication.execution_request_id == request.id,
-            Publication.status == "succeeded",
-        )
-        .limit(1)
-    )
-    if published is not None:
-        # A published request waits on CI; the CI gate owns its terminus.
+    if await _awaits_publication(session, request.id):
         return await _conflict(session, "illegal_transition", work_item=work_item, request=request)
     changed_id: uuid.UUID | None = await session.scalar(
         update(ExecutionRequest)
@@ -2109,6 +2140,7 @@ async def request_owner_lost_cancellation(
             ExecutionRequest.work_item_id == work_item_id,
             ExecutionRequest.version == expected_request_version,
             ExecutionRequest.status == "running",
+            _not_awaiting_publication(),
             (
                 (
                     ExecutionRequest.runtime_heartbeat_expires_at.is_not(None)

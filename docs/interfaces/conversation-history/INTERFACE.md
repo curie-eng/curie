@@ -164,6 +164,18 @@ unplanned-restart case needs no special worker/kernel branch.
 
 ## Known leakage
 
+Claude replay hydration reduces unprovable overlapping calls to the affected turns'
+visible user and assistant text
+(`runner/src/curie_runner/history.py::reduce_unprovable_overlap_turns`). It handles
+overlap within one turn and overlap across turns: a new call while earlier calls remain
+unanswered reduces the new turn and each earlier turn still holding an unanswered call.
+Later turns containing results for a removed call are also reduced, transitively, so no
+structured result survives without its call. Any reduction clears the native checkpoint
+(`runner/src/curie_runner/adapter.py::build_structured_resume`) and uses the reduced portable
+prefix. This loses tool-call and result structure from those turns. Other malformed
+history is still refused by the final grouping validation; reduction cannot turn an
+independently unmatched result into an accepted replay.
+
 - **Scoped history token (was: shared API key).** Same as memory: earlier the
   state API's one shared platform key was forwarded as `CURIE_HISTORY_TOKEN`,
   granting that key's scope. ADR-0033 (#410) replaced it with a scoped,

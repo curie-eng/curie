@@ -31,10 +31,12 @@ routing, concurrency, sandboxing — is opinionated core and channel-agnostic. S
 longer the least-clean seam by its wire contract, and #1459 took the Slack shape off the
 binding surface too; the remaining vendor shape is on the egress semantics
 (edit-in-place streaming, plus posting and settling platform-owned cards). Three
-implementations today, Slack, Discord, and email, confirm that the seam boundary is the
+channel implementations today, Slack, Discord, and email egress, confirm that the seam boundary is the
 HTTP wire rather than only the in-process port: `adapters/discord` and
 `apps/mail-adapter` are services outside the core that neither construct a `QueuedTurn`
-nor implement `ReplySink`.
+nor implement `ReplySink`. Email's authenticated HTTP reply receiver is shipped; the
+AgentMail inbound gate currently refuses every message before fetching its body or
+handling an approval reply, so it is not an admitted email turn producer.
 
 ## Current contract
 
@@ -189,10 +191,11 @@ satisfying the egress Protocol, or out of process over the HTTP wire.
 
 ## Implementations today
 
-Three first-party production channels, plus a CLI transport stub. Slack ingress
+Slack and Discord provide production ingress and egress; email provides HTTP egress,
+with AgentMail inbound admission disabled. There is also a CLI transport stub. Slack ingress
 is `apps/dispatcher` (Bolt / Socket Mode); Slack egress is `SlackReplyAdapter`
 (`apps/worker/src/curie_worker/slack_sink.py::SlackReplyAdapter`) on the Slack
-Web API. Discord (`adapters/discord`) and email (`apps/mail-adapter`) join on
+Web API. Discord (`adapters/discord`) and email's reply receiver (`apps/mail-adapter`) join on
 the authenticated HTTP edge: they neither construct a `QueuedTurn` nor implement
 `ReplySink`; the worker delivers through `HttpReplyAdapter`
 (`apps/worker/src/curie_worker/reply_sink.py::HttpReplyAdapter`) to the
@@ -342,6 +345,16 @@ absent — it is *handled* by the dedicated approval listener, not dropped.
 
 Two ends and the binding surface were cleaned; what remains is egress semantics and
 incomplete adapter coverage and conformance.
+
+Email sender authentication remains adapter-owned. A channel token authenticates the
+adapter and binding, not the sender named in a turn. The platform trusts that adapter's
+sender assertion before applying caller authorization. The AgentMail provider exposes
+labels and arbitrary headers without a trusted aligned authentication verdict or header
+provenance guarantee, so `MailAdapter._listing_rejection`
+(`apps/mail-adapter/src/curie_mail_adapter/adapter.py::MailAdapter._listing_rejection`)
+refuses all inbound messages, including approval replies. An allowed sender list cannot
+replace that authentication evidence. Outbound reply and approval-card rendering remain
+implemented through `apps/mail-adapter/src/curie_mail_adapter/egress.py::EgressHandler`.
 
 - **Fixed (#7).** The ingress field names were Slack's (`slack_event_id`, `thread_ts`,
   `placeholder_ts`); the payload was promoted into `packages/aci-protocol` as `QueuedTurn`

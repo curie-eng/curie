@@ -184,7 +184,9 @@ def test_run_settlement_retries_transports_but_not_conflicts(
 
             async def settle() -> None:
                 if operation == "finish":
-                    await run.finish(outcome="delivered", cause="completed", detail="done")
+                    await run.finish(
+                        outcome="delivered", cause="completed", detail="done", ci_fix_round=None
+                    )
                 elif operation == "hold_for_approval":
                     await run.hold_for_approval()
                 else:
@@ -246,7 +248,9 @@ def test_run_finish_clamps_retry_budget_to_execution_deadline(monkeypatch) -> No
             run.runtime_epoch = 1
             run.execution_deadline = datetime.now(UTC) + timedelta(seconds=3)
             with pytest.raises(WorkItemTransportError):
-                await run.finish(outcome="delivered", cause="completed", detail="done")
+                await run.finish(
+                    outcome="delivered", cause="completed", detail="done", ci_fix_round=None
+                )
         assert 2.9 <= sum(sleeps) <= 3
 
     asyncio.run(go())
@@ -288,6 +292,7 @@ def test_settlement_empty_transport_message_retains_the_exception_type(
                     outcome="delivered",
                     cause="completed",
                     detail="done",
+                    ci_fix_round=None,
                     budget_s=3,
                 )
 
@@ -643,6 +648,39 @@ def test_failed_start_keeps_renewing_the_acquisition(
                 await clock.advance(40.0)
                 assert seen == [(20.0, "acquire"), (30.0, "start"), (40.0, "acquire")]
                 assert not run.started
+            finally:
+                await run.close()
+
+    asyncio.run(go())
+
+
+def test_a_refused_start_still_records_the_claim_and_sandbox_names(
+    acquire_renew_clock: _AcquireRenewClock,
+) -> None:
+    # #4331: a run whose start is refused on a terminal code (#3208) must still
+    # know the claim it made, so its sandbox release stays fenced to that claim.
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        verb = request.url.path.rsplit("/", 1)[-1]
+        seen.append(verb)
+        if verb == "start":
+            # HTTP 409 shape is defined by the API's internal start route.
+            return httpx.Response(409, json={"detail": {"code": "not_dispatchable"}})
+        return httpx.Response(200, json=BASE)
+
+    async def go() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            run = _renewing_run(_renewal_client(http))
+            try:
+                with pytest.raises(WorkItemConflict) as refused:
+                    await run.start(claim_name="acme-claim", sandbox_name="acme-sandbox")
+                assert refused.value.code == "not_dispatchable"
+                assert seen == ["start"]
+                assert run.claim_name == "acme-claim"
+                assert run.sandbox_name == "acme-sandbox"
+                assert not run.started
+                assert run.runtime_epoch is None
             finally:
                 await run.close()
 

@@ -251,7 +251,7 @@ def test_happy_turn_stream_shape() -> None:
 
 
 def test_reviewer_text_stays_out_of_reply_and_durable_parent_conversation() -> None:
-    """Forwarded reviewer prose is usage evidence, with nested tools preserved.
+    """Forwarded reviewer activity is usage evidence, never durable history (#4336).
 
     Installed claude_agent_sdk/types.py:2183 documents forward_subagent_text
     and parent_tool_use_id on forwarded text, thinking and tool blocks.
@@ -302,8 +302,13 @@ def test_reviewer_text_stays_out_of_reply_and_durable_parent_conversation() -> N
         ),
         AssistantMessage(content=[TextBlock(text="Done.")], model="primary_model"),
         ResultMessage(
-            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
-            num_turns=1, session_id="example_session", result="",
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="example_session",
+            result="",
         ),
     ]
 
@@ -328,7 +333,8 @@ def test_reviewer_text_stays_out_of_reply_and_durable_parent_conversation() -> N
             await runner.start()
             try:
                 lines = [
-                    line async for line in runner.run_turn(
+                    line
+                    async for line in runner.run_turn(
                         Event(type="message", text="go", user="U0EXAMPLE1", ts="1")
                     )
                 ]
@@ -337,9 +343,7 @@ def test_reviewer_text_stays_out_of_reply_and_durable_parent_conversation() -> N
                 await runner.close()
 
     events = anyio.run(go)
-    assert [event.text for event in events if event.type == "text_delta"] == [
-        "Working. ", "Done."
-    ]
+    assert [event.text for event in events if event.type == "text_delta"] == ["Working. ", "Done."]
     assert events[-1].status is SessionStatus.DONE
     assert events[-1].text == "Working. Done."
     assert [event.tool for event in events if event.type == "tool_note"] == ["Read"]
@@ -349,13 +353,22 @@ def test_reviewer_text_stays_out_of_reply_and_durable_parent_conversation() -> N
     assert appended[0]["assistant"] == "Working. Done."
     durable = json.dumps(appended[0]["messages"])
     for reviewer_content in (
-        "Reviewer text only", "Reviewer tool commentary", "Reviewer thinking"
+        "Reviewer text only",
+        "Reviewer tool commentary",
+        "Reviewer thinking",
+        "reviewer_signature",
+        "review_read",
+        "Review tool result",
     ):
         assert reviewer_content not in durable
-    assert "Implementer thought" in durable
-    assert "primary_signature" in durable
-    assert "Review tool result" in durable
-    assert '"tool_use"' in durable and '"Read"' in durable
+    assert '"tool_use"' not in durable and '"tool_result"' not in durable
+    for implementer_content in ("Implementer thought", "primary_signature", "Working. ", "Done."):
+        assert implementer_content in durable
+    assert [message["role"] for message in appended[0]["messages"]] == [
+        "user",
+        "assistant",
+        "assistant",
+    ]
     assistant_messages = [
         message for message in appended[0]["messages"] if message["role"] == "assistant"
     ]
@@ -437,11 +450,7 @@ def test_transcript_capacity_failure_precedes_terminal_final(
     assert roots[0].attributes["curie.terminal.cause"] == "classified_failure"
     assert roots[0].attributes["curie.terminal.status"] == "failed"
     assert roots[0].status.status_code is StatusCode.ERROR
-    completed = [
-        attributes
-        for name, attributes in metrics
-        if name == "curie.turn.completed"
-    ]
+    completed = [attributes for name, attributes in metrics if name == "curie.turn.completed"]
     assert completed == [
         {
             "service.name": "curie-runner",
@@ -504,10 +513,7 @@ def test_persistable_terminal_waits_for_append_and_closes_control_window(
             assert store.turns[0].approval is not None
             assert store.turns[0].approval.summary == "Approve the action"
         assert all(
-            not (
-                message.role == "user"
-                and message.content == "too late"
-            )
+            not (message.role == "user" and message.content == "too late")
             for message in store.turns[0].messages
         )
 
@@ -526,9 +532,7 @@ def test_closing_stream_after_success_final_cannot_skip_append() -> None:
 
     async def go() -> None:
         await runner.start()
-        stream = runner.run_turn(
-            Event(type="message", text="question", user="U", ts="1")
-        )
+        stream = runner.run_turn(Event(type="message", text="question", user="U", ts="1"))
         async for line in stream:
             event = parse_ndjson(line)[0]
             if isinstance(event, Final):
@@ -598,9 +602,7 @@ def test_capacity_loss_stays_sticky_after_a_later_successful_append() -> None:
         for text, ts in (("first", "1"), ("second", "2")):
             lines = [
                 line
-                async for line in runner.run_turn(
-                    Event(type="message", text=text, user="U", ts=ts)
-                )
+                async for line in runner.run_turn(Event(type="message", text=text, user="U", ts=ts))
             ]
             turns.append(parse_ndjson("".join(lines)))
         return turns
@@ -637,9 +639,7 @@ def _turns_then_max_turns(store) -> tuple[SessionRunner, list[list]]:
         for text, ts in (("first", "1"), ("probe until done", "2")):
             lines = [
                 line
-                async for line in runner.run_turn(
-                    Event(type="message", text=text, user="U", ts=ts)
-                )
+                async for line in runner.run_turn(Event(type="message", text=text, user="U", ts=ts))
             ]
             turns.append(parse_ndjson("".join(lines)))
         return turns
@@ -841,9 +841,7 @@ def test_first_resumed_turn_records_cache_read_metric_once(monkeypatch) -> None:
     async def go() -> None:
         await runner.start()
         for ts in ("1", "2"):
-            async for _ in runner.run_turn(
-                Event(type="message", text="continue", user="U", ts=ts)
-            ):
+            async for _ in runner.run_turn(Event(type="message", text="continue", user="U", ts=ts)):
                 pass
 
     anyio.run(go)
@@ -890,9 +888,7 @@ def test_interrupting_a_stalled_phase_preserves_phase_and_cancels_cleanly(
         lines: list[str] = []
 
         async def consume() -> None:
-            async for line in runner.run_turn(
-                Event(type="message", text="go", user="U", ts="1")
-            ):
+            async for line in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
                 lines.append(line)
 
         await runner.start()
@@ -952,9 +948,7 @@ def test_interrupt_precedes_iterator_exception_and_preserves_cancelled_terminal(
         lines: list[str] = []
 
         async def consume() -> None:
-            async for line in runner.run_turn(
-                Event(type="message", text="go", user="U", ts="1")
-            ):
+            async for line in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
                 lines.append(line)
 
         await runner.start()
@@ -983,9 +977,7 @@ def test_interrupt_precedes_iterator_exception_and_preserves_cancelled_terminal(
         assert tools[0].status.status_code is StatusCode.OK
         assert tools[0].attributes["curie.phase.end_kind"] == "terminal_inferred"
         assert tools[0].attributes["curie.tool.outcome"] == "cancelled"
-        assert "internal-interrupt-error-call-PLACEHOLDER" not in repr(
-            tools[0].attributes
-        )
+        assert "internal-interrupt-error-call-PLACEHOLDER" not in repr(tools[0].attributes)
 
 
 def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
@@ -1038,21 +1030,19 @@ def test_timeout_terminalizes_before_generator_close_and_emits_one_metric(
 
     with caplog.at_level(logging.INFO, logger="curie_runner.session"):
         anyio.run(go)
-    assert sum(
-        "turn end" in record.getMessage()
-        and "status=classified-failure" in record.getMessage()
-        for record in caplog.records
-    ) == 1
+    assert (
+        sum(
+            "turn end" in record.getMessage() and "status=classified-failure" in record.getMessage()
+            for record in caplog.records
+        )
+        == 1
+    )
     spans = list(exporter.get_finished_spans())
     root = _span_named(spans, "agent.run")[0]
     assert root.attributes["curie.terminal.cause"] == "runner_timeout"
     assert root.attributes["curie.terminal.status"] == "failed"
     assert root.status.status_code is StatusCode.ERROR
-    completed = [
-        attributes
-        for name, attributes in metrics
-        if name == "curie.turn.completed"
-    ]
+    completed = [attributes for name, attributes in metrics if name == "curie.turn.completed"]
     assert completed == [
         {
             "service.name": "curie-runner",
@@ -1128,9 +1118,7 @@ def test_timeout_during_abandonment_cleanup_cannot_own_next_turn_stop() -> None:
         async def interrupt(self) -> None:
             async with self.interrupt_lock:
                 self.interrupt_roles.append(
-                    "turn_b_cleanup"
-                    if self.turn_b_cleanup_started
-                    else "before_turn_b_cleanup"
+                    "turn_b_cleanup" if self.turn_b_cleanup_started else "before_turn_b_cleanup"
                 )
                 attempt = len(self.interrupt_roles)
                 if attempt == 1:
@@ -1528,9 +1516,7 @@ def _exercise_timeout_interrupt_failure(
         await runner.close()
 
     anyio.run(go)
-    return session, first_lines, second_lines, timeout_errors, list(
-        exporter.get_finished_spans()
-    )
+    return session, first_lines, second_lines, timeout_errors, list(exporter.get_finished_spans())
 
 
 def _assert_timeout_then_healthy(
@@ -1570,9 +1556,7 @@ def test_timeout_cancelled_after_stop_write_cleans_up_before_next_query() -> Non
 
 
 def test_timeout_ack_failure_releases_only_after_recorded_stop() -> None:
-    session, first, second, errors, spans = _exercise_timeout_interrupt_failure(
-        "ack-failure"
-    )
+    session, first, second, errors, spans = _exercise_timeout_interrupt_failure("ack-failure")
     assert [type(error) for error in errors] == [RuntimeError]
     assert session.wire == [
         ("query", "first"),
@@ -1685,9 +1669,7 @@ def test_abandoning_a_stalled_phase_is_error_not_intentional_cancellation(
             with anyio.CancelScope() as scope:
                 scope_holder.append(scope)
                 scope_ready.set()
-                async for _ in runner.run_turn(
-                    Event(type="message", text="go", user="U", ts="1")
-                ):
+                async for _ in runner.run_turn(Event(type="message", text="go", user="U", ts="1")):
                     pass
 
         await runner.start()
@@ -1818,16 +1800,24 @@ def test_interrupt_reclassifies_error_result_to_idle() -> None:
     script = [
         AssistantMessage(content=[TextBlock(text="working")], model="m"),
         ResultMessage(
-            subtype="error_during_execution", duration_ms=1, duration_api_ms=1,
-            is_error=True, num_turns=1, session_id="s", result="aborted",
+            subtype="error_during_execution",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="s",
+            result="aborted",
         ),
     ]
     fake = FakeModelSession(lambda: script, truncate_on_interrupt=False)
     runner = SessionRunner(
         max_usd_per_day=None,
         held_secrets=frozenset(),
-        session_factory=lambda: fake, ceiling=0, tracer=RunTracer(None),
-        classifier=SideEffectClassifier(), trace_name="t",
+        session_factory=lambda: fake,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
     )
 
     lines: list[str] = []
@@ -1853,17 +1843,22 @@ def test_sdk_exception_still_terminates_in_final() -> None:
         async def connect(self) -> None: ...
         async def query(self, text: str) -> None:
             raise RuntimeError("cli disconnected")
+
         async def receive_turn(self):  # pragma: no cover - never reached
             if False:
                 yield None
+
         async def interrupt(self) -> None: ...
         async def close(self) -> None: ...
 
     runner = SessionRunner(
         max_usd_per_day=None,
         held_secrets=frozenset(),
-        session_factory=RaisingSession, ceiling=0, tracer=RunTracer(None),
-        classifier=SideEffectClassifier(), trace_name="t",
+        session_factory=RaisingSession,
+        ceiling=0,
+        tracer=RunTracer(None),
+        classifier=SideEffectClassifier(),
+        trace_name="t",
     )
     events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
     assert [e.type for e in events] == ["error", "final"]
@@ -1903,8 +1898,7 @@ def test_sdk_exception_logs_turn_failure(caplog) -> None:
     assert [e.type for e in events] == ["error", "final"]
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
     assert any(
-        "turn end" in message and "status=classified-failure" in message
-        for message in messages
+        "turn end" in message and "status=classified-failure" in message for message in messages
     )
     assert any(
         record.levelno == logging.ERROR
@@ -1927,8 +1921,13 @@ def test_auth_rejection_fails_fast_not_retried(caplog) -> None:
         AssistantMessage(content=[], model="m", error="authentication_failed"),
         AssistantMessage(content=[TextBlock(text=sentinel)], model="m"),
         ResultMessage(
-            subtype="success", duration_ms=1, duration_api_ms=1,
-            is_error=False, num_turns=1, session_id="s", result=sentinel,
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result=sentinel,
         ),
     ]
     runner, fake = _runner(lambda: script)
@@ -1970,8 +1969,12 @@ def test_key_limit_403_ends_credit_exhausted_not_credential_rejected() -> None:
             error="authentication_failed",
         ),
         ResultMessage(
-            subtype="success", duration_ms=1, duration_api_ms=1,
-            is_error=True, num_turns=1, session_id="s",
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="s",
             result=_OPENROUTER_KEY_LIMIT_403,
         ),
     ]
@@ -2004,8 +2007,13 @@ def test_no_auth_credentials_401_still_fails_fast_as_credential_rejected() -> No
         ),
         AssistantMessage(content=[TextBlock(text=sentinel)], model="m"),
         ResultMessage(
-            subtype="success", duration_ms=1, duration_api_ms=1,
-            is_error=False, num_turns=1, session_id="s", result=sentinel,
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result=sentinel,
         ),
     ]
     runner, fake = _runner(lambda: script)
@@ -2060,8 +2068,13 @@ def test_transient_model_error_is_not_fast_failed() -> None:
     script = [
         AssistantMessage(content=[], model="m", error="overloaded"),
         ResultMessage(
-            subtype="success", duration_ms=1, duration_api_ms=1,
-            is_error=False, num_turns=1, session_id="s", result="recovered",
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result="recovered",
         ),
     ]
     runner, fake = _runner(lambda: script)
@@ -2076,9 +2089,7 @@ def test_transient_model_error_is_not_fast_failed() -> None:
 
 
 def test_model_error_without_result_ends_in_classified_failure() -> None:
-    runner, _ = _runner(
-        lambda: [AssistantMessage(content=[], model="m", error="unknown")]
-    )
+    runner, _ = _runner(lambda: [AssistantMessage(content=[], model="m", error="unknown")])
     events = _drain(runner, Event(type="message", text="go", user="U", ts="1"))
 
     assert [event.type for event in events] == ["error", "final"]
@@ -2174,9 +2185,7 @@ def test_sdk_usd_budget_failure_names_the_configured_limit(max_usd_per_day: floa
     assert [event.type for event in events] == ["error", "final"]
     assert isinstance(events[0], ErrorEvent)
     assert events[0].classification == "budget-exceeded"
-    assert events[0].message == (
-        f"USD budget exceeded (max_usd_per_day={max_usd_per_day})"
-    )
+    assert events[0].message == (f"USD budget exceeded (max_usd_per_day={max_usd_per_day})")
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
     assert fake.interrupts == 0
 
@@ -2213,9 +2222,7 @@ def test_output_token_limit_takes_precedence_when_the_sdk_also_reports_a_usd_lim
     errors = [event for event in events if isinstance(event, ErrorEvent)]
     assert errors
     assert errors[-1].classification == "budget-exceeded"
-    assert errors[-1].message == (
-        "output token budget exceeded (max_output_tokens_per_run=64000)"
-    )
+    assert errors[-1].message == ("output token budget exceeded (max_output_tokens_per_run=64000)")
     assert not any("USD budget exceeded" in error.message for error in errors)
     assert isinstance(events[-1], Final)
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
@@ -2289,8 +2296,7 @@ def test_budget_halt_logged(caplog) -> None:
 
     assert events[-1].status == SessionStatus.CLASSIFIED_FAILURE
     assert any(
-        "turn end" in record.getMessage()
-        and "status=classified-failure" in record.getMessage()
+        "turn end" in record.getMessage() and "status=classified-failure" in record.getMessage()
         for record in caplog.records
     )
     assert any(
@@ -2309,8 +2315,13 @@ def test_error_result_body_not_logged(caplog) -> None:
     script = [
         AssistantMessage(content=[TextBlock(text="working")], model="m"),
         ResultMessage(
-            subtype="error_during_execution", duration_ms=1, duration_api_ms=1,
-            is_error=True, num_turns=1, session_id="s", result=sentinel,
+            subtype="error_during_execution",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=True,
+            num_turns=1,
+            session_id="s",
+            result=sentinel,
         ),
     ]
     runner, _ = _runner(lambda: script)
@@ -2429,8 +2440,12 @@ def test_build_options_carries_resume_ref() -> None:
 
 def test_build_options_no_history_ref_is_none() -> None:
     options = build_options(
-        plugins=[], model=None, system_prompt=None, max_turns=20,
-        max_budget_usd=1.0, resume=None,
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=20,
+        max_budget_usd=1.0,
+        resume=None,
     )
     assert options.resume is None
     assert options.task_budget is None
@@ -2453,8 +2468,12 @@ def test_build_options_forwards_text_only_subagent_usage() -> None:
     # nested tool blocks. True also forwards text and thinking AssistantMessages.
     # https://github.com/anthropics/claude-agent-sdk-python/blob/main/src/claude_agent_sdk/types.py
     options = build_options(
-        plugins=[], model=None, system_prompt=None, max_turns=20,
-        max_budget_usd=1.0, resume=None,
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=20,
+        max_budget_usd=1.0,
+        resume=None,
     )
     assert options.forward_subagent_text is True
 
@@ -2462,8 +2481,13 @@ def test_build_options_forwards_text_only_subagent_usage() -> None:
 def test_build_options_carries_task_budget_hint() -> None:
     # The ACI task_budget_hint (soft pacing) becomes the SDK task_budget.
     options = build_options(
-        plugins=[], model=None, system_prompt=None, max_turns=20,
-        max_budget_usd=1.0, resume=None, task_budget_hint=64000,
+        plugins=[],
+        model=None,
+        system_prompt=None,
+        max_turns=20,
+        max_budget_usd=1.0,
+        resume=None,
+        task_budget_hint=64000,
     )
     assert options.task_budget == {"total": 64000}
 
@@ -2615,9 +2639,12 @@ def test_reprobe_that_raises_keeps_prior_failures_and_still_queries() -> None:
     assert not any(isinstance(e, ErrorEvent) for e in events)
     assert events[-1].status == SessionStatus.DONE
     assert events[-1].text.startswith(_connector_failure().caller_message())
-    assert _hook_decision(availability, "mcp__github__search")["hookSpecificOutput"][
-        "permissionDecision"
-    ] == "deny"
+    assert (
+        _hook_decision(availability, "mcp__github__search")["hookSpecificOutput"][
+            "permissionDecision"
+        ]
+        == "deny"
+    )
 
 
 class _ReconnectingFakeSession(FakeModelSession):
@@ -2678,9 +2705,12 @@ def test_side_probe_recovery_is_kept_when_the_session_is_not_connected() -> None
         assert events[-1].status == SessionStatus.DONE
         assert events[-1].text.startswith(notice)
     assert availability.failures == (_probe_failed(),)
-    assert _hook_decision(availability, "mcp__github__search")["hookSpecificOutput"][
-        "permissionDecision"
-    ] == "deny"
+    assert (
+        _hook_decision(availability, "mcp__github__search")["hookSpecificOutput"][
+            "permissionDecision"
+        ]
+        == "deny"
+    )
 
 
 def test_side_probe_recovery_clears_when_the_session_is_connected() -> None:
@@ -2757,9 +2787,7 @@ def _blocking_reprobe_runner(
         await release.wait()
         return failures
 
-    return _connector_runner(
-        connector_failures=(_probe_failed(),), connector_reprobe=reprobe
-    )
+    return _connector_runner(connector_failures=(_probe_failed(),), connector_reprobe=reprobe)
 
 
 async def _during_recovery(
@@ -2817,9 +2845,7 @@ def test_timeout_during_connector_recovery_is_accepted_and_never_queries() -> No
         accepted.append(await runner.timeout("epoch-1"))
 
     events = anyio.run(
-        functools.partial(
-            _during_recovery, runner, release, entered, stop, turn_epoch="epoch-1"
-        )
+        functools.partial(_during_recovery, runner, release, entered, stop, turn_epoch="epoch-1")
     )
 
     assert accepted == [True]
@@ -2963,8 +2989,7 @@ def test_failed_model_turn_with_failed_connector_is_not_prefixed() -> None:
     assert not final.text.startswith(_connector_failure().caller_message())
     assert _connector_failure().caller_message() not in final.text
     assert not any(
-        isinstance(e, ErrorEvent) and "connector" in (e.classification or "")
-        for e in events
+        isinstance(e, ErrorEvent) and "connector" in (e.classification or "") for e in events
     )
 
 
@@ -2993,8 +3018,13 @@ def test_subscription_usage_limit_interrupts_before_sdk_retry_or_later_success(
         AssistantMessage(content=[TextBlock(text=text)] if text else [], model="m", error=error),
         AssistantMessage(content=[TextBlock(text=sentinel)], model="m"),
         ResultMessage(
-            subtype="success", duration_ms=1, duration_api_ms=1,
-            is_error=False, num_turns=1, session_id="s", result=sentinel,
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="s",
+            result=sentinel,
         ),
     ]
     runner, fake = _runner(lambda: script)
@@ -3007,7 +3037,6 @@ def test_subscription_usage_limit_interrupts_before_sdk_retry_or_later_success(
     assert all(sentinel not in getattr(event, "text", "") for event in events)
 
 
-
 @pytest.mark.parametrize("tool", ["Agent", "Task"])
 def test_reviewer_subscription_limit_interrupts_before_parent_success(tool: str) -> None:
     # The recorded bundled CLI failed-reviewer shape is documented in
@@ -3015,19 +3044,33 @@ def test_reviewer_subscription_limit_interrupts_before_parent_success(tool: str)
     sentinel = "SHOULD-NOT-RUN-AFTER-REVIEWER-USAGE-LIMIT"
     script = [
         AssistantMessage(
-            content=[ToolUseBlock(
-                id="toolu_usage_reviewer", name=tool,
-                input={"description": "Diff review", "subagent_type": "reviewer"},
-            )], model="m",
+            content=[
+                ToolUseBlock(
+                    id="toolu_usage_reviewer",
+                    name=tool,
+                    input={"description": "Diff review", "subagent_type": "reviewer"},
+                )
+            ],
+            model="m",
         ),
-        UserMessage(content=[ToolResultBlock(
-            tool_use_id="toolu_usage_reviewer", is_error=True,
-            content="Agent terminated early due to an API error: "
-            "You've hit your session limit · resets 3pm (UTC)",
-        )]),
+        UserMessage(
+            content=[
+                ToolResultBlock(
+                    tool_use_id="toolu_usage_reviewer",
+                    is_error=True,
+                    content="Agent terminated early due to an API error: "
+                    "You've hit your session limit · resets 3pm (UTC)",
+                )
+            ]
+        ),
         ResultMessage(
-            subtype="success", duration_ms=1, duration_api_ms=1,
-            is_error=False, num_turns=2, session_id="s", result=sentinel,
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=2,
+            session_id="s",
+            result=sentinel,
         ),
     ]
     runner, fake = _runner(lambda: script)

@@ -8,10 +8,7 @@ from pathlib import Path
 from curie_worker.kernel import map_error_classification
 
 _VECTOR = (
-    Path(__file__).resolve().parents[4]
-    / "tests"
-    / "vectors"
-    / "error-event-classification.json"
+    Path(__file__).resolve().parents[4] / "tests" / "vectors" / "error-event-classification.json"
 )
 _TOP_LEVEL_KEYS = frozenset({"comment", "unclassified", "platform", "vectors"})
 _VECTOR_KEYS = frozenset({"name", "input", "expected"})
@@ -31,6 +28,7 @@ _PLATFORM = (
     "publication-unrecorded",
     "history-persistence-error",
     "max-turns",
+    "model-unreachable",
 )
 
 

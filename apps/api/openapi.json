@@ -4136,6 +4136,19 @@
             "title": "Cause",
             "type": "string"
           },
+          "ci_fix_round": {
+            "anyOf": [
+              {
+                "maximum": 3.0,
+                "minimum": 2.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ci Fix Round"
+          },
           "detail": {
             "anyOf": [
               {
