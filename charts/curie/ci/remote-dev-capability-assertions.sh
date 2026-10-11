@@ -30,13 +30,13 @@ for invalid_allowlist_entry in \
   fi
 done
 
-python3 - "$RENDERED" "$SEALED" "$CHART/values.yaml" <<'PY'
+python3 - "$RENDERED" "$SEALED" "$CHART/values.yaml" "$SCRIPT_DIR/fixtures/factory-github-builtin-egress.yaml" <<'PY'
 import sys
 from pathlib import Path
 
 import yaml
 
-rendered_path, sealed_path, values_path = map(Path, sys.argv[1:])
+rendered_path, sealed_path, values_path, builtin_egress_path = map(Path, sys.argv[1:])
 docs = [doc for doc in yaml.safe_load_all(rendered_path.read_text()) if doc]
 sealed_docs = [doc for doc in yaml.safe_load_all(sealed_path.read_text()) if doc]
 values = yaml.safe_load(values_path.read_text())
@@ -235,7 +235,14 @@ rendered_cidrs = {
     target.get("ipBlock", {}).get("cidr")
     for target in github_rules[0]["to"]
 }
-expected_cidrs = set(values["worker"]["publication"]["githubHttpsCidrs"])
+# No factory block: publication still targets the install's GitHub through the
+# chart's built-in set (#4397 decision 6), which no values key carries.
+builtin_egress = yaml.safe_load(builtin_egress_path.read_text())
+if builtin_egress["port"] != 443:
+    fail("the built-in GitHub egress fixture must be TCP 443")
+expected_cidrs = set(builtin_egress["cidrs"])
+if "githubHttpsCidrs" in (values.get("worker", {}).get("publication") or {}):
+    fail("worker.publication.githubHttpsCidrs must be removed; egress has one source (factory code hosts)")
 if rendered_cidrs != expected_cidrs:
     fail(f"publication GitHub CIDR egress drifted: {sorted(rendered_cidrs)!r}")
 

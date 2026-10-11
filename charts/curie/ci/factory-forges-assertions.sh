@@ -281,4 +281,210 @@ if ! render_chart "$WORK/chart" --set-json "$probe=$(nondefault "${probe##*.}")"
 fi
 echo "  ok: negative control (empty guard file) no longer refuses $probe"
 
+# Egress (#4397 AC 6, decision 6) ----------------------------------------------
+# One source: each factory.codeHosts[] / factory.trackers[] entry's `egress`
+# feeds both the publication Job policy (code hosts) and the per-agent sandbox
+# policy (code hosts plus trackers) of every factory.sandboxEgress.<agent>. A
+# github entry with no egress gets the chart's built-in GitHub set, pinned in
+# ci/fixtures/factory-github-builtin-egress.yaml. Forge entries may name RFC
+# 1918 addresses and any concrete TCP port (self-managed GitLab, Bitbucket DC).
+BUILTIN="$SCRIPT_DIR/fixtures/factory-github-builtin-egress.yaml"
+[ -f "$BUILTIN" ] || { echo "FAIL: $BUILTIN is missing" >&2; exit 1; }
+SANDBOX=(--set agentSandbox.deploy=true --set agentSandbox.controller.deploy=false)
+
+# The same factory block, with operator egress on both entries: a private
+# self-managed host on 8443 for the code host (with the hostname it was
+# resolved from), and a /8 for the tracker that strictly contains an RFC 1918
+# range, so the sandbox policy must carry the private carve-out.
+python3 - "$WORK/factory.yaml" "$WORK/egress.yaml" <<'PY'
+import sys, yaml
+src, dst = sys.argv[1:]
+doc = yaml.safe_load(open(src))
+doc["factory"]["codeHosts"][0]["egress"] = [
+    {"cidr": "10.20.0.5/32", "ports": [{"protocol": "TCP", "port": 8443}], "host": "git.internal.example"},
+]
+doc["factory"]["trackers"][0]["egress"] = [
+    {"cidr": "172.0.0.0/8", "ports": [{"protocol": "TCP", "port": 443}]},
+]
+yaml.safe_dump(doc, open(dst, "w"), sort_keys=False)
+PY
+
+EGRESS_CHECK="$WORK/egress_check.py"
+cat >"$EGRESS_CHECK" <<'PY'
+import ipaddress, json, sys, yaml
+
+label, spec_text, builtin_path = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = json.loads(spec_text)
+builtin_doc = yaml.safe_load(open(builtin_path))
+BUILTIN = {(c, builtin_doc["port"]) for c in builtin_doc["cidrs"]}
+
+
+def fail(msg):
+    sys.stderr.write(f"FAIL [{label}]: {msg}\n")
+    sys.exit(1)
+
+
+def expand(pairs):
+    if pairs == "builtin":
+        return set(BUILTIN)
+    return {(c, p) for c, p in pairs}
+
+
+raw = sys.stdin.read()
+docs = [d for d in yaml.safe_load_all(raw) if d]
+if "githubHttpsCidrs" in raw:
+    fail("the render still names githubHttpsCidrs")
+
+
+def labels(doc):
+    return (doc.get("metadata") or {}).get("labels") or {}
+
+
+def ip_rules(policy):
+    """(cidr, port) pairs and per-cidr excepts of every non-DNS egress rule."""
+    pairs, excepts = set(), {}
+    for index, rule in enumerate(policy["spec"].get("egress") or []):
+        ports = rule.get("ports") or []
+        if {p.get("port") for p in ports} == {53}:
+            continue
+        peers = rule.get("to") or fail(f"{policy['metadata']['name']} rule {index} has an empty to:")
+        if not ports:
+            fail(f"{policy['metadata']['name']} rule {index} names no port (every port allowed)")
+        for peer in peers:
+            block = peer.get("ipBlock") or fail(f"{policy['metadata']['name']} rule {index} has a non-ipBlock peer {peer}")
+            for port in ports:
+                if "endPort" in port:
+                    fail(f"{policy['metadata']['name']} renders an endPort range")
+                pairs.add((block["cidr"], port["port"]))
+            excepts[block["cidr"]] = block.get("except") or []
+    return pairs, excepts
+
+
+publications = [
+    d for d in docs
+    if d.get("kind") == "NetworkPolicy" and labels(d).get("app.kubernetes.io/component") == "publication"
+    and any((r.get("ports") or []) and {p.get("port") for p in r["ports"]} != {53} for r in d["spec"].get("egress") or [])
+]
+if "publication" in spec:
+    if len(publications) != 1:
+        fail(f"expected one publication egress NetworkPolicy, got {[p['metadata']['name'] for p in publications]}")
+    got, _ = ip_rules(publications[0])
+    want = expand(spec["publication"])
+    if got != want:
+        fail(f"publication egress: missing {sorted(want - got)}, unexpected {sorted(got - want)}")
+    print(f"  ok [{label}]: publication Job egress is exactly {len(want)} (cidr, port) pairs")
+
+forge_policies = {
+    d["metadata"]["name"]: d for d in docs
+    if d.get("kind") == "NetworkPolicy" and d["metadata"]["name"].endswith("-allow-forge-egress")
+}
+sandbox = spec.get("sandbox", {})
+expected_names = {f"rel-curie-agent-{agent}-allow-forge-egress" for agent in sandbox}
+if set(forge_policies) != expected_names:
+    fail(f"forge sandbox policies {sorted(forge_policies)} != {sorted(expected_names)}")
+pools_env = None
+for d in docs:
+    if d.get("kind") == "Deployment" and d["metadata"]["name"] == "rel-curie-worker":
+        for c in d["spec"]["template"]["spec"]["containers"]:
+            for e in c.get("env") or []:
+                if e["name"] == "CURIE_AGENT_SANDBOX_POOLS":
+                    pools_env = e.get("value", "")
+templates = {d["metadata"]["name"]: d for d in docs if d.get("kind") == "SandboxTemplate"}
+for agent, want_spec in sandbox.items():
+    policy = forge_policies[f"rel-curie-agent-{agent}-allow-forge-egress"]
+    selector = policy["spec"]["podSelector"].get("matchLabels") or {}
+    if selector.get("curietech.ai/agent") != agent or selector.get("app.kubernetes.io/component") != "runner-sandbox":
+        fail(f"{agent} forge policy selector {selector} does not select that agent's runner sandboxes")
+    if policy["spec"].get("policyTypes") != ["Egress"]:
+        fail(f"{agent} forge policy must be egress-only, got {policy['spec'].get('policyTypes')}")
+    got, excepts = ip_rules(policy)
+    want = expand(want_spec["pairs"])
+    if got != want:
+        fail(f"{agent} sandbox forge egress: missing {sorted(want - got)}, unexpected {sorted(got - want)}")
+    for cidr, needed in (want_spec.get("excepts") or {}).items():
+        if not set(needed) <= set(excepts.get(cidr, [])):
+            fail(f"{agent} {cidr} must except {needed} (curie.egress.ipBlockRules), got {excepts.get(cidr)}")
+    for cidr, carved in excepts.items():
+        net = ipaddress.ip_network(cidr)
+        for e in carved:
+            if not ipaddress.ip_network(e).subnet_of(net):
+                fail(f"{agent} {cidr} excepts {e}, which is outside it (Kubernetes rejects the policy)")
+    template = templates.get(f"rel-curie-agent-{agent}-runner") or fail(
+        f"{agent} has no per-agent SandboxTemplate, so no pod carries curietech.ai/agent: {agent}; templates {sorted(templates)}")
+    pod_labels = template["spec"]["podTemplate"]["metadata"].get("labels") or {}
+    if pod_labels.get("curietech.ai/agent") != agent:
+        fail(f"{agent} SandboxTemplate pods do not carry curietech.ai/agent: {pod_labels}")
+    if pools_env is None or agent not in pools_env.split(","):
+        fail(f"{agent} is not in the worker's CURIE_AGENT_SANDBOX_POOLS ({pools_env!r}); its claims would use the shared pool")
+    print(f"  ok [{label}]: {agent} is enrolled in the sandbox pool and its forge policy carries {len(want)} pairs")
+PY
+
+egress() {
+  # $1: label; $2: JSON expectations; remaining: render args.
+  local label="$1" spec="$2"
+  shift 2
+  render "$@" | python3 "$EGRESS_CHECK" "$label" "$spec" "$BUILTIN"
+}
+
+# Publication without the factory still targets the install's GitHub (remote-dev).
+egress "no factory block" '{"publication": "builtin"}'
+egress "factory key absent (--reuse-values)" '{"publication": "builtin"}' --set-json 'factory=null'
+# A github code host with no egress gets the built-in set; the tracker too.
+egress "github entries with no egress" '{"publication": "builtin"}' -f "$WORK/factory.yaml"
+egress "sandboxEgress, github entries with no egress" \
+  '{"publication": "builtin", "sandbox": {"dark-factory": {"pairs": "builtin"}}}' \
+  -f "$WORK/factory.yaml" "${SANDBOX[@]}" --set 'factory.sandboxEgress.dark-factory=true'
+# Operator egress replaces the built-in set; one source feeds both policies.
+egress "operator egress on code host and tracker" \
+  '{"publication": [["10.20.0.5/32", 8443]], "sandbox": {"dark-factory": {"pairs": [["10.20.0.5/32", 8443], ["172.0.0.0/8", 443]], "excepts": {"172.0.0.0/8": ["172.16.0.0/12"]}}}}' \
+  -f "$WORK/egress.yaml" "${SANDBOX[@]}" --set 'factory.sandboxEgress.dark-factory=true'
+# The egress fields are chart-only: CURIE_FORGES still carries no egress or host.
+render -f "$WORK/egress.yaml" | check factory
+# Two agents get one policy each; an agent set to false gets none.
+egress "two agents, one false" \
+  '{"publication": [["10.20.0.5/32", 8443]], "sandbox": {"dark-factory": {"pairs": [["10.20.0.5/32", 8443], ["172.0.0.0/8", 443]]}, "dark-factory-fast": {"pairs": [["10.20.0.5/32", 8443], ["172.0.0.0/8", 443]]}}}' \
+  -f "$WORK/egress.yaml" "${SANDBOX[@]}" --set 'factory.sandboxEgress.dark-factory=true' \
+  --set 'factory.sandboxEgress.dark-factory-fast=true' --set 'factory.sandboxEgress.dark-factory-off=false'
+# A platform-runner agent (no runnerImages entry, nothing else naming it) is
+# enrolled by sandboxEgress alone: the check above already requires its
+# per-agent SandboxTemplate and pool env entry.
+echo "  ok: one egress source feeds publication and per-agent sandbox policies"
+
+# Refusals (each has a rendering liveness case above) ----------------------------
+refused "a code host egress default route" "default or equivalently broad route" \
+  render -f "$WORK/egress.yaml" --set-json 'factory.codeHosts[0].egress=[{"cidr":"0.0.0.0/0","ports":[{"port":443}]}]'
+refused "a tracker egress default route" "default or equivalently broad route" \
+  render -f "$WORK/egress.yaml" --set-json 'factory.trackers[0].egress=[{"cidr":"0.0.0.0/0","ports":[{"port":443}]}]'
+refused "a code host egress covering cloud metadata" "metadata" \
+  render -f "$WORK/egress.yaml" --set-json 'factory.codeHosts[0].egress=[{"cidr":"169.254.0.0/16","ports":[{"port":443}]}]'
+refused "a code host egress IPv4 /7" "per-family floor" \
+  render -f "$WORK/egress.yaml" --set-json 'factory.codeHosts[0].egress=[{"cidr":"2.0.0.0/7","ports":[{"port":443}]}]'
+refused "an operator IPv6 egress shorter than /32" "per-family floor" \
+  render -f "$WORK/egress.yaml" --set-json 'factory.codeHosts[0].egress=[{"cidr":"2001:db8::/31","ports":[{"port":443}]}]'
+refused "a code host egress with endPort" "endPort" \
+  render -f "$WORK/egress.yaml" --set-json 'factory.codeHosts[0].egress=[{"cidr":"10.20.0.5/32","ports":[{"port":8443,"endPort":8450}]}]'
+refused "a code host egress with no port" "port" \
+  render -f "$WORK/egress.yaml" --set-json 'factory.codeHosts[0].egress=[{"cidr":"10.20.0.5/32","ports":[{"protocol":"TCP"}]}]'
+refused "an invalid sandboxEgress agent name" "sandboxEgress" \
+  render -f "$WORK/factory.yaml" "${SANDBOX[@]}" --set 'factory.sandboxEgress.Dark_Factory=true'
+refused "a sandboxEgress agent name over 40 characters" "sandboxEgress" \
+  render -f "$WORK/factory.yaml" "${SANDBOX[@]}" --set "factory.sandboxEgress.$(printf 'a%.0s' {1..41})=true"
+# A code host that is not github and names no egress leaves publication nothing
+# to reach; the empty-list fail stays (networkpolicy-empty-to-assertions.sh
+# holds its negative control).
+refused "a non-github code host with no egress" "egress" \
+  render --set-json 'factory.codeHosts=[{"name":"gl","kind":"gitlab","host":"gitlab.internal.example","apiUrl":"https://gitlab.internal.example/api/v4","credential":{"type":"static_token","existingSecret":"gl","existingSecretKey":"token","neverExpires":true}}]'
+egress "a non-github code host with its own egress" '{"publication": [["10.30.0.9/32", 443]]}' \
+  --set-json 'factory.codeHosts=[{"name":"gl","kind":"gitlab","host":"gitlab.internal.example","apiUrl":"https://gitlab.internal.example/api/v4","credential":{"type":"static_token","existingSecret":"gl","existingSecretKey":"token","neverExpires":true},"egress":[{"cidr":"10.30.0.9/32","ports":[{"port":443}]}]}]'
+echo "  ok: route-shaped, metadata, endPort and portless forge egress and bad agent names are refused"
+
+# The removed list is gone from every chart source, not only from the render.
+for source in "$CHART/values.yaml" "$CHART/values.schema.json" "$CHART"/templates/*; do
+  if grep -qF 'githubHttpsCidrs' "$source"; then
+    echo "FAIL: $source still names githubHttpsCidrs" >&2
+    exit 1
+  fi
+done
+echo "  ok: worker.publication.githubHttpsCidrs is gone from values, schema and templates"
+
 echo "factory-forges-assertions: all assertions passed"

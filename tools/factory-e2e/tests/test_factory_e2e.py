@@ -2938,3 +2938,41 @@ def test_an_install_consumes_a_sandbox_controller_only_when_one_is_running() -> 
     # them: this install must deploy its own or no claim ever binds.
     assert fe.sandbox_controller_serves(crd=crd, controller_pods="") is False
     assert fe.sandbox_controller_serves(crd="", controller_pods="") is False
+
+
+# #4397 AC 6: egress has one source. The sandbox reaches GitHub through
+# factory.sandboxEgress.<agent> (the chart's built-in GitHub set on the github
+# code host and tracker); only model egress stays in allowedEgress.
+def test_install_values_enroll_the_factory_agent_for_forge_egress(tmp_path: Path) -> None:
+    values = _values(_config(tmp_path))
+    assert values["factory"]["sandboxEgress"] == {fe.FACTORY_AGENT: True}
+    for section in ("codeHosts", "trackers"):
+        (entry,) = values["factory"][section]
+        assert entry["kind"] == "github"
+        assert "egress" not in entry, f"a github {section} entry uses the built-in set"
+    assert "connectorEgress" not in values["agentSandbox"]
+
+
+def test_egress_cidrs_reads_no_github_meta(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_http(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"egress_cidrs must not call the GitHub API: {args}")
+
+    monkeypatch.setattr(fe, "http_json", no_http)
+    preflight = _preflight(tmp_path)
+    assert preflight.egress_cidrs() == []
+
+
+def test_egress_cidrs_keeps_only_model_egress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_http(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"egress_cidrs must not call the GitHub API: {args}")
+
+    def resolve(host: str, port: int, *args: Any) -> list[Any]:
+        assert (host, port) == (fe.OPENROUTER_HOST, 443)
+        return [(None, None, None, "", ("104.18.2.9", 443)), (None, None, None, "", ("104.18.3.9", 443))]
+
+    monkeypatch.setattr(fe, "http_json", no_http)
+    monkeypatch.setattr(fe.socket, "getaddrinfo", resolve)
+    env = _env(_app_dir(tmp_path))
+    env["CURIE_FACTORY_MODEL_API_KEY"] = "model-key-value"
+    preflight = _preflight(tmp_path, env)
+    assert preflight.egress_cidrs() == ["104.18.2.9/32", "104.18.3.9/32"]

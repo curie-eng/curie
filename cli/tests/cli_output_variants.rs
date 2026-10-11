@@ -338,6 +338,7 @@ fn cluster_status() -> Box<ClusterStatus> {
         urls: Vec::new(),
         upgrade: curie::ops::UpgradeStatusView::idle(None),
         delivery: curie::completion_outbox::Report::unknown(),
+        credentials: Vec::new(),
     })
 }
 

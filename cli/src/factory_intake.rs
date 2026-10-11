@@ -1078,7 +1078,7 @@ mod tests {
             mention: Some("curie-app".into()),
             card_base_url: Some("https://cards.example.trycloudflare.com".into()),
             webhook_secret: Some(SECRET.into()),
-            github_api_egress: vec!["dark-factory".into()],
+            forge_egress: vec!["dark-factory".into()],
             disable: false,
             timeout_seconds: None,
             app_id: None,
@@ -1093,39 +1093,10 @@ mod tests {
         cmd.argv()
     }
 
-    fn cidrs() -> Vec<String> {
-        vec!["192.30.252.0/22".into(), "140.82.112.0/20".into()]
-    }
-
-    // C1
-    #[test]
-    fn github_api_cidrs_reads_the_api_list_in_order() {
-        let meta = r#"{"verifiable_password_authentication":false,"hooks":["10.0.0.0/8"],"api":["192.30.252.0/22","140.82.112.0/20","2a0a:a440::/29"]}"#;
-        assert_eq!(
-            github_api_cidrs(meta).unwrap(),
-            vec![
-                "192.30.252.0/22".to_string(),
-                "140.82.112.0/20".to_string(),
-                "2a0a:a440::/29".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn github_api_cidrs_without_an_api_list_is_an_error() {
-        let error = github_api_cidrs(r#"{"hooks":["10.0.0.0/8"]}"#)
-            .expect_err("a meta document without `api` must be refused");
-        assert!(format!("{error:#}").contains("api"), "{error:#}");
-        assert!(
-            github_api_cidrs(r#"{"api":[]}"#).is_err(),
-            "an empty api list must be refused"
-        );
-    }
-
     // C2
     #[test]
     fn intake_values_carry_the_factory_settings_and_egress() {
-        let values = intake_values(&opts(), &cidrs());
+        let values = intake_values(&opts());
         let factory = &values["factory"];
         assert_eq!(factory["enabled"], serde_json::json!(true));
         let tracker = github_entry(&values, "trackers");
@@ -1141,13 +1112,77 @@ mod tests {
             serde_json::json!(["acme/widgets", "acme/gadgets"])
         );
         assert_eq!(api["githubWebhookSecret"], serde_json::json!(SECRET));
+        // #4397 AC 6: one egress source. The agent is enrolled for forge
+        // egress; the GitHub entries carry none, so the chart's built-in set
+        // applies. No CIDR list is written anywhere.
         assert_eq!(
-            values["agentSandbox"]["connectorEgress"]["dark-factory"],
-            serde_json::json!([
-                {"cidr": "192.30.252.0/22", "ports": [{"port": 443, "protocol": "TCP"}]},
-                {"cidr": "140.82.112.0/20", "ports": [{"port": 443, "protocol": "TCP"}]},
-            ])
+            factory["sandboxEgress"],
+            serde_json::json!({"dark-factory": true}),
+            "{values}"
         );
+        for section in ["codeHosts", "trackers"] {
+            assert!(
+                github_entry(&values, section).get("egress").is_none(),
+                "a github {section} entry must carry no egress (built-in set): {values}"
+            );
+        }
+        assert!(
+            values.pointer("/agentSandbox/connectorEgress").is_none(),
+            "forge egress no longer rides connectorEgress: {values}"
+        );
+        assert!(!values.to_string().contains("\"cidr\""), "{values}");
+    }
+
+    #[test]
+    fn intake_writes_sandbox_egress_for_each_named_agent_only() {
+        let mut o = opts();
+        o.forge_egress = vec!["dark-factory".into(), "dark-factory-fast".into()];
+        let values = intake_values(&o);
+        assert_eq!(
+            values["factory"]["sandboxEgress"],
+            serde_json::json!({"dark-factory": true, "dark-factory-fast": true}),
+            "{values}"
+        );
+        o.forge_egress = Vec::new();
+        let values = intake_values(&o);
+        assert!(
+            values.pointer("/factory/sandboxEgress").is_none(),
+            "no --forge-egress writes no sandboxEgress, so a reused release keeps its own: {values}"
+        );
+    }
+
+    #[tokio::test]
+    async fn intake_writes_sandbox_egress_for_the_named_agent_and_fetches_nothing() {
+        // The dry run is the whole plan; with --forge-egress it names no
+        // GitHub /meta read, because egress is no longer fetched.
+        let meta = ["/", "meta"].concat();
+        let output = factory_intake(opts())
+            .await
+            .expect("a dry run with --forge-egress plans the upgrade");
+        let plan = output.to_json();
+        let lines: Vec<String> = plan["plan"]
+            .as_array()
+            .unwrap_or_else(|| panic!("dry run plan: {plan}"))
+            .iter()
+            .map(|line| line.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            lines.iter().any(|line| line.contains("helm upgrade")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains(&meta)),
+            "the dry run still plans a GitHub {meta} fetch: {lines:?}"
+        );
+        let production = include_str!("factory_intake.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            !production.contains(&meta),
+            "factory_intake.rs still builds a GitHub {meta} request"
+        );
+        assert!(!production.contains("connectorEgress"));
     }
 
     /// The one `factory.<section>` entry named `github`.
@@ -1177,7 +1212,7 @@ mod tests {
         let mut o = opts();
         o.intake = Some("poll".into());
         o.app_id = Some("123".into());
-        let values = intake_values(&o, &cidrs());
+        let values = intake_values(&o);
         let factory = &values["factory"];
         assert_eq!(factory["enabled"], serde_json::json!(true), "{values}");
         assert_eq!(factory["intake"], serde_json::json!("poll"), "{values}");
@@ -1274,12 +1309,17 @@ mod tests {
             agent: "dark-factory".into(),
             image: "ghcr.io/curie-eng/curie-dark-factory-runner@sha256:abcd".into(),
         });
-        let values = intake_values(&o, &cidrs());
+        let values = intake_values(&o);
         assert_eq!(
             values["agentSandbox"]["runnerImages"]["dark-factory"],
             serde_json::json!("ghcr.io/curie-eng/curie-dark-factory-runner@sha256:abcd")
         );
-        assert!(values["agentSandbox"].get("connectorEgress").is_some());
+        assert_eq!(
+            values["factory"]["sandboxEgress"]["dark-factory"],
+            serde_json::json!(true),
+            "the egress enrolment rides the same upgrade document: {values}"
+        );
+        assert!(values["agentSandbox"].get("connectorEgress").is_none());
         let commands = intake_commands(
             &o,
             Path::new("/tmp/curie-factory-values.json"),
@@ -1305,13 +1345,17 @@ mod tests {
         let mut o = opts();
         o.disable = true;
         o.webhook_secret = None;
-        let values = intake_values(&o, &[]);
+        let values = intake_values(&o);
         assert_eq!(values["factory"]["enabled"], serde_json::json!(false));
         assert!(
             values["api"].get("githubWebhookSecret").is_none(),
             "disable must not write a secret: {values}"
         );
         assert!(!values.to_string().contains(SECRET), "{values}");
+        assert!(
+            values.pointer("/factory/sandboxEgress").is_none(),
+            "--disable changes nothing else, so it writes no egress: {values}"
+        );
     }
 
     const LABEL_KEY: &str = "factory.trackers[github].label";

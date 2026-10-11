@@ -101,6 +101,7 @@ mod factory_quickstart_forges;
 mod factory_quickstart_output;
 mod factory_toolchain;
 mod fake_tier_plumbing;
+mod forge_expiry;
 mod forge_fixture;
 mod github_app_clap_wiring;
 mod github_app_identity;

@@ -1946,4 +1946,111 @@ mod tests {
         assert!(text.contains("--repo a/x,b/y --context"), "{text}");
         assert!(text.contains("a/x and b/y"), "{text}");
     }
+
+    // #4397 AC 6: the egress-write helper shared by the per-forge modules. An
+    // IP or CIDR passes through; a hostname resolves on this machine to one
+    // host route per address, with the hostname recorded beside it.
+    fn egress_json(entries: &[EgressEntry]) -> serde_json::Value {
+        serde_json::to_value(entries).expect("egress entries serialize to chart values")
+    }
+
+    #[test]
+    fn forge_egress_entries_resolves_a_hostname_to_host_routes_and_records_the_host() {
+        let resolve = |host: &str| -> Result<Vec<std::net::IpAddr>> {
+            assert_eq!(host, "git.internal.example");
+            Ok(vec![
+                "10.20.0.5".parse().unwrap(),
+                "10.20.0.6".parse().unwrap(),
+                "fd12:3456::7".parse().unwrap(),
+            ])
+        };
+        let entries = forge_egress_entries("git.internal.example", &[8443, 22], resolve)
+            .expect("a resolving hostname gives host routes");
+        let ports = serde_json::json!([
+            {"protocol": "TCP", "port": 8443},
+            {"protocol": "TCP", "port": 22}
+        ]);
+        assert_eq!(
+            egress_json(&entries),
+            serde_json::json!([
+                {"cidr": "10.20.0.5/32", "ports": ports, "host": "git.internal.example"},
+                {"cidr": "10.20.0.6/32", "ports": ports, "host": "git.internal.example"},
+                {"cidr": "fd12:3456::7/128", "ports": ports, "host": "git.internal.example"},
+            ])
+        );
+    }
+
+    #[test]
+    fn forge_egress_entries_passes_an_ip_and_a_cidr_through() {
+        let never = |host: &str| -> Result<Vec<std::net::IpAddr>> {
+            panic!("an address must not be resolved, got {host}")
+        };
+        let ports = serde_json::json!([{"protocol": "TCP", "port": 443}]);
+        for (target, cidr) in [
+            ("10.20.0.5", "10.20.0.5/32"),
+            ("192.168.40.0/24", "192.168.40.0/24"),
+            ("2001:db8::9", "2001:db8::9/128"),
+            ("2001:db8:1::/48", "2001:db8:1::/48"),
+        ] {
+            let entries = forge_egress_entries(target, &[443], never)
+                .unwrap_or_else(|error| panic!("{target}: {error:#}"));
+            assert_eq!(
+                egress_json(&entries),
+                serde_json::json!([{"cidr": cidr, "ports": ports}]),
+                "{target} passes through with no host recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn forge_egress_entries_refuses_a_name_that_resolves_to_nothing() {
+        let nothing = |_: &str| -> Result<Vec<std::net::IpAddr>> { Ok(Vec::new()) };
+        let error = forge_egress_entries("gone.internal.example", &[443], nothing)
+            .expect_err("a hostname with no address must be refused");
+        assert!(
+            format!("{error:#}").contains("gone.internal.example"),
+            "the refusal names the hostname: {error:#}"
+        );
+        let failing =
+            |_: &str| -> Result<Vec<std::net::IpAddr>> { Err(anyhow::anyhow!("NXDOMAIN")) };
+        let error = forge_egress_entries("gone.internal.example", &[443], failing)
+            .expect_err("a resolver failure must be refused");
+        assert!(
+            format!("{error:#}").contains("gone.internal.example"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn the_finishing_intake_enrolls_the_deployed_agent_for_forge_egress() {
+        // The quickstart writes factory.sandboxEgress.<agent> for the agent it
+        // deploys and no CIDR list: GitHub egress is the chart's built-in set.
+        let mut input = base();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.explicit_context = Some("kind-curie-factory".into());
+        let planned = quickstart_plan(&input).unwrap();
+        let intake = planned
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Intake(opts) => Some(opts),
+                _ => None,
+            })
+            .expect("the finishing pass has an intake action");
+        assert_eq!(intake.forge_egress, vec![AGENT_NAME.to_string()]);
+        let values = intake_values(intake);
+        assert_eq!(
+            values["factory"]["sandboxEgress"],
+            serde_json::json!({ (AGENT_NAME): true }),
+            "{values}"
+        );
+        let args = intake_args("kind-curie-factory", intake, "ghcr.io/x/runner:1");
+        let flag = args
+            .iter()
+            .position(|a| a == "--forge-egress")
+            .unwrap_or_else(|| panic!("the intake subprocess must pass --forge-egress: {args:?}"));
+        assert_eq!(args[flag + 1], AGENT_NAME, "{args:?}");
+        assert!(!args.iter().any(|a| a == "--github-api-egress"), "{args:?}");
+    }
 }
