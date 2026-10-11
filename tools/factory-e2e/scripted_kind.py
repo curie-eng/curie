@@ -889,7 +889,12 @@ class ScriptedRun:
             try:
                 service.close()
             except Exception as exc:
-                errors.append(str(exc))
+                # close() re-raises the request audit after shutting down. Those
+                # requests are already the recorded scenario failure; the probe
+                # below still proves the endpoint stopped.
+                audited = service.unexpected if service is self.model else service.unknown_requests
+                if not audited:
+                    errors.append(str(exc))
             try:
                 self.evidence[field] = (
                     service.unexpected if service is self.model else service.unknown_requests
