@@ -96,8 +96,11 @@ async fn parsed_values(files: &[PathBuf], explicit_args: &[CmdArg]) -> Result<Va
         template.push_str("  empty: \"{}\"\n");
     }
     for (index, file) in files.iter().enumerate() {
-        let contents = std::fs::read(file)
-            .map_err(|_| crate::exit::CliError::failure("could not read values file"))?;
+        // @spec CLUSTER-VALUES-FILES c2: name the path, never the contents.
+        let contents = std::fs::read(file).map_err(|_| {
+            crate::exit::CliError::usage(format!("could not read values file {}", file.display()))
+                .with_fix("pass an existing, readable YAML file to -f/--values-file")
+        })?;
         std::fs::write(chart_files.join(format!("{index}.yaml")), contents)
             .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
         template.push_str(&format!(
@@ -130,14 +133,14 @@ async fn parsed_values(files: &[PathBuf], explicit_args: &[CmdArg]) -> Result<Va
             crate::exit::CliError::failure("could not invoke Helm to parse values files")
         })?;
     if !ok {
-        return Err(
-            crate::exit::CliError::failure("could not parse values files with Helm").into(),
-        );
+        return Err(crate::exit::CliError::usage("could not parse values files with Helm")
+            .with_fix("make each -f/--values-file a valid YAML mapping and each --set expression valid Helm syntax")
+            .into());
     }
     let rendered: Value = serde_norway::from_str(&output)
         .map_err(|_| crate::exit::CliError::failure("could not read Helm parsed values"))?;
     let mut pending = Value::Object(serde_json::Map::new());
-    for index in 0..files.len() {
+    for (index, file) in files.iter().enumerate() {
         let key = format!("file{index}");
         let json = rendered
             .get("data")
@@ -147,9 +150,12 @@ async fn parsed_values(files: &[PathBuf], explicit_args: &[CmdArg]) -> Result<Va
         let values: Value = serde_json::from_str(json)
             .map_err(|_| crate::exit::CliError::failure("could not read Helm parsed values"))?;
         if !values.is_object() {
-            return Err(
-                crate::exit::CliError::failure("values files must contain YAML maps").into(),
-            );
+            return Err(crate::exit::CliError::usage(format!(
+                "values file {} must contain a YAML map",
+                file.display()
+            ))
+            .with_fix("make each -f/--values-file a YAML mapping at the top level")
+            .into());
         }
         merge_values(&mut pending, values);
     }
