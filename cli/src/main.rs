@@ -2804,6 +2804,10 @@ enum ClusterAction {
     /// override from the exact admission result and retries once. Every
     /// inferred value is printed.
     Up {
+        /// Ordered Helm values files (repeatable); explicit flags take precedence.
+        // @spec CLUSTER-VALUES-FILES c1-c4
+        #[arg(short = 'f', long = "values-file", value_name = "FILE")]
+        values_files: Vec<PathBuf>,
         /// Kubernetes namespace.
         #[arg(long, default_value = "curie", env = "CURIE_NAMESPACE")]
         namespace: String,
@@ -2990,6 +2994,10 @@ enum ClusterAction {
     /// known-good version serving or returns one fail-forward command. See
     /// issue #2301.
     Upgrade {
+        /// Ordered Helm values files (repeatable); explicit flags take precedence.
+        // @spec CLUSTER-VALUES-FILES c1-c4
+        #[arg(short = 'f', long = "values-file", value_name = "FILE")]
+        values_files: Vec<PathBuf>,
         /// Target Curie version (chart/app version) to upgrade to.
         #[arg(long = "to", value_name = "VERSION")]
         to: String,
@@ -5928,6 +5936,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await?,
             ),
             ClusterAction::Up {
+                values_files,
                 namespace,
                 release,
                 chart,
@@ -5946,6 +5955,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 forward_only,
                 e2e_connector_identity,
             } => {
+                let file_values = ops::load_values_files(&values_files).await?;
                 let mut set = set;
                 if forward_only {
                     set.push("api.migrate.forwardOnly=true".to_string());
@@ -5978,6 +5988,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 emit(
                     ops::up(
                         UpOpts {
+                            file_values,
                             retained_mail_values: None,
                             // Resolved by ops::up from the recorded release values.
                             retained_runner_values: None,
@@ -6063,6 +6074,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 .await?,
             ),
             ClusterAction::Upgrade {
+                values_files,
                 to,
                 namespace,
                 release,
@@ -6073,6 +6085,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 allow_stock_layer_clear,
                 take_over,
             } => {
+                let file_values = ops::load_values_files(&values_files).await?;
                 let resolved = artifacts::resolve_chart(
                     chart.as_deref(),
                     artifacts::Channel::current(),
@@ -6083,6 +6096,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 let chart = materialize_upgrade_chart(resolved, dry_run).await?;
                 emit(
                     ops::upgrade(UpgradeOpts {
+                        file_values,
                         common: CommonOpts {
                             namespace,
                             release,
