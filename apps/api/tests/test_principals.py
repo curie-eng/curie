@@ -239,6 +239,28 @@ async def _exec(
     return [dict(row) for row in result.mappings().all()]
 
 
+async def _failed_statement_cause(
+    conn: AsyncConnection, statement: str, params: dict[str, Any]
+) -> BaseException:
+    """Run ``statement`` inside a SAVEPOINT and return the asyncpg cause of the
+    ``IntegrityError`` it is expected to raise.
+
+    The SAVEPOINT keeps the outer per-test transaction alive across the error,
+    the way every DB-level test in this module shares one rolled-back
+    transaction (see the module docstring).
+    """
+    savepoint = await conn.begin_nested()
+    try:
+        with pytest.raises(IntegrityError) as exc_info:
+            await conn.execute(text(statement), params)
+    finally:
+        if savepoint.is_active:
+            await savepoint.rollback()
+    cause = exc_info.value.orig.__cause__
+    assert cause is not None, str(exc_info.value)
+    return cause
+
+
 async def _expect_integrity_error(
     conn: AsyncConnection,
     statement: str,
@@ -255,16 +277,24 @@ async def _expect_integrity_error(
     a test pass for the wrong reason; asyncpg reports the violated constraint's
     name on the underlying exception.
     """
-    savepoint = await conn.begin_nested()
-    try:
-        with pytest.raises(IntegrityError) as exc_info:
-            await conn.execute(text(statement), params)
-    finally:
-        if savepoint.is_active:
-            await savepoint.rollback()
-    cause = exc_info.value.orig.__cause__
+    cause = await _failed_statement_cause(conn, statement, params)
     expected = {constraint} if isinstance(constraint, str) else set(constraint)
-    assert getattr(cause, "constraint_name", None) in expected, str(exc_info.value)
+    assert getattr(cause, "constraint_name", None) in expected, cause
+
+
+async def _expect_check_violation(
+    conn: AsyncConnection,
+    statement: str,
+    params: dict[str, Any],
+) -> None:
+    """Assert the statement fails on a Postgres check violation (SQLSTATE 23514).
+
+    For a trigger-raised ``RAISE EXCEPTION`` there is no declared constraint
+    name to pin, unlike ``_expect_integrity_error`` above -- the SQLSTATE class
+    is the only stable thing to assert on.
+    """
+    cause = await _failed_statement_cause(conn, statement, params)
+    assert getattr(cause, "sqlstate", None) == "23514", cause
 
 
 _INSERT_PRINCIPAL = (
@@ -639,6 +669,154 @@ def test_bad_membership_source_rejected(migrated: None) -> None:
                 "source": "manual",
             },
             constraint="principal_teams_source_ck",
+        )
+
+    _rolled_back(body)
+
+
+# --- Membership source must match its team's source (#3002) ---------------
+#
+# principal_teams.source previously had no relationship to teams.source: a
+# curie_managed membership row could sit in an idp_group team, contradicting
+# the rule that the IdP alone is the system of record for an idp_group team's
+# membership. A trigger enforces the two agree, in both directions.
+
+
+@pytest.mark.parametrize(
+    ("team_source", "membership_source"),
+    [
+        ("idp_group", "curie_managed"),
+        ("curie_managed", "idp_group"),
+    ],
+    ids=["curie-managed-membership-on-idp-team", "idp-membership-on-curie-managed-team"],
+)
+def test_membership_source_mismatched_with_team_rejected(
+    migrated: None, team_source: str, membership_source: str
+) -> None:
+    async def body(conn: AsyncConnection) -> None:
+        principal_id = await _insert_principal(conn)
+        team_id = await _insert_team(
+            conn,
+            source=team_source,
+            external_id="grp-mismatch" if team_source == "idp_group" else None,
+        )
+        await _expect_check_violation(
+            conn,
+            _INSERT_MEMBERSHIP,
+            {
+                "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
+                "principal_id": principal_id,
+                "team_id": team_id,
+                "source": membership_source,
+            },
+        )
+
+    _rolled_back(body)
+
+
+def test_membership_source_matching_idp_group_team_accepted(migrated: None) -> None:
+    async def body(conn: AsyncConnection) -> None:
+        principal_id = await _insert_principal(conn)
+        team_id = await _insert_team(conn, source="idp_group", external_id="grp-match")
+        await _exec(
+            conn,
+            _INSERT_MEMBERSHIP,
+            {
+                "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
+                "principal_id": principal_id,
+                "team_id": team_id,
+                "source": "idp_group",
+            },
+        )
+
+    _rolled_back(body)
+
+
+def test_membership_update_onto_mismatched_team_rejected(migrated: None) -> None:
+    """The guard also covers UPDATE: re-pointing a membership at a team whose
+    source no longer matches the membership's own source is rejected the same
+    way the insert path is."""
+
+    async def body(conn: AsyncConnection) -> None:
+        principal_id = await _insert_principal(conn)
+        curie_team_id = await _insert_team(conn, source="curie_managed")
+        idp_team_id = await _insert_team(
+            conn, source="idp_group", external_id="grp-retarget"
+        )
+        await _exec(
+            conn,
+            _INSERT_MEMBERSHIP,
+            {
+                "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
+                "principal_id": principal_id,
+                "team_id": curie_team_id,
+                "source": "curie_managed",
+            },
+        )
+        await _expect_check_violation(
+            conn,
+            "UPDATE curie.principal_teams SET team_id = :idp_team_id "
+            "WHERE principal_id = :principal_id AND team_id = :curie_team_id",
+            {
+                "idp_team_id": idp_team_id,
+                "principal_id": principal_id,
+                "curie_team_id": curie_team_id,
+            },
+        )
+
+    _rolled_back(body)
+
+
+def test_membership_onto_nonexistent_team_left_to_foreign_key(migrated: None) -> None:
+    """A team_id the trigger's lookup cannot find at all (not merely a
+    wrong-tenant one) is left alone by the source-match guard; the composite
+    foreign key is what rejects it."""
+
+    async def body(conn: AsyncConnection) -> None:
+        principal_id = await _insert_principal(conn)
+        await _expect_integrity_error(
+            conn,
+            _INSERT_MEMBERSHIP,
+            {
+                "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
+                "principal_id": principal_id,
+                "team_id": uuid.uuid4(),
+                "source": "curie_managed",
+            },
+            constraint="principal_teams_team_fkey",
+        )
+
+    _rolled_back(body)
+
+
+def test_membership_update_onto_a_different_tenant_rejected(migrated: None) -> None:
+    """Re-pointing tenant_id alone, with team_id left unchanged, is still
+    caught: the team no longer resolves under the new tenant_id, so the
+    source-match trigger finds nothing and the composite foreign keys reject
+    it instead."""
+
+    async def body(conn: AsyncConnection) -> None:
+        tenant_b = await _insert_tenant(conn)
+        principal_id = await _insert_principal(conn)
+        team_id = await _insert_team(conn)
+        await _exec(
+            conn,
+            _INSERT_MEMBERSHIP,
+            {
+                "tenant_id": uuid.UUID(DEFAULT_TENANT_ID),
+                "principal_id": principal_id,
+                "team_id": team_id,
+                "source": "curie_managed",
+            },
+        )
+        await _expect_integrity_error(
+            conn,
+            "UPDATE curie.principal_teams SET tenant_id = :tenant_b "
+            "WHERE principal_id = :principal_id AND team_id = :team_id",
+            {"tenant_b": tenant_b, "principal_id": principal_id, "team_id": team_id},
+            constraint=frozenset(
+                {"principal_teams_principal_fkey", "principal_teams_team_fkey"}
+            ),
         )
 
     _rolled_back(body)

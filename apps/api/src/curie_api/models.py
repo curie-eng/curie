@@ -2810,7 +2810,10 @@ class PrincipalTeam(Base):
     A projection of the IdP's group membership, not a system of record;
     ``version`` and ``synced_at`` record which sync produced the row. Both
     foreign keys include ``tenant_id``, so a principal and a team from
-    different tenants cannot be linked.
+    different tenants cannot be linked. A DB trigger (migration 0089, #3002)
+    also keeps ``source`` in agreement with the referenced team's own
+    ``source``, since a Python-side default can't stop a row from being
+    inserted or updated straight through SQL.
     """
 
     __tablename__ = "principal_teams"
