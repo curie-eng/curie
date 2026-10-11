@@ -35,7 +35,6 @@ import time
 from collections.abc import Callable, Iterator
 
 import anyio
-from claude_agent_sdk import __version__ as SDK_VERSION
 from curie_telemetry.redact import REDACTION_RULES, redact_text
 
 logger = logging.getLogger(__name__)
@@ -164,13 +163,13 @@ class StderrTail:
         self._buffer.clear()
 
 
-def _finish(outcome: str, started: float, error_class: str | None = None) -> None:
+def _finish(outcome: str, started: float, sdk_version: str, error_class: str | None = None) -> None:
     elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
     fields: dict[str, object] = {
         "phase": PHASE,
         "outcome": outcome,
         "elapsed_ms": elapsed_ms,
-        "sdk_version": SDK_VERSION,
+        "sdk_version": sdk_version,
     }
     if error_class is None:
         logger.info(
@@ -178,7 +177,7 @@ def _finish(outcome: str, started: float, error_class: str | None = None) -> Non
             PHASE,
             outcome,
             elapsed_ms,
-            SDK_VERSION,
+            sdk_version,
             extra=fields,
         )
         return
@@ -188,15 +187,18 @@ def _finish(outcome: str, started: float, error_class: str | None = None) -> Non
         PHASE,
         outcome,
         elapsed_ms,
-        SDK_VERSION,
+        sdk_version,
         error_class,
         extra=fields,
     )
 
 
 @contextlib.contextmanager
-def sdk_initialize_diagnostics(tail: StderrTail) -> Iterator[None]:
+def sdk_initialize_diagnostics(tail: StderrTail, sdk_version: str) -> Iterator[None]:
     """Time one SDK initialization and keep its stderr tail only on failure.
+
+    ``sdk_version`` comes from the adapter, which owns the SDK import, so
+    this module stays outside the harness SDK containment set.
 
     Exceptions propagate unchanged: no wrapping, retry, or timeout. Must be
     entered inside the event loop that runs ``connect``.
@@ -206,8 +208,8 @@ def sdk_initialize_diagnostics(tail: StderrTail) -> Iterator[None]:
     logger.info(
         "sdk initialize start phase=%s sdk_version=%s",
         PHASE,
-        SDK_VERSION,
-        extra={"phase": PHASE, "sdk_version": SDK_VERSION},
+        sdk_version,
+        extra={"phase": PHASE, "sdk_version": sdk_version},
     )
     started = time.monotonic()
     tail.start()
@@ -215,11 +217,11 @@ def sdk_initialize_diagnostics(tail: StderrTail) -> Iterator[None]:
         yield
     except cancelled:
         tail.discard()
-        _finish("cancelled", started)
+        _finish("cancelled", started, sdk_version)
         raise
     except BaseException as exc:
         diagnostic = tail.finish()
-        _finish("failure", started, type(exc).__name__)
+        _finish("failure", started, sdk_version, type(exc).__name__)
         if diagnostic:
             logger.warning(
                 "sdk initialize stderr tail phase=%s bytes=%d\n%s",
@@ -231,4 +233,4 @@ def sdk_initialize_diagnostics(tail: StderrTail) -> Iterator[None]:
         raise
     else:
         tail.discard()
-        _finish("success", started)
+        _finish("success", started, sdk_version)

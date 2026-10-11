@@ -43,6 +43,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from claude_agent_sdk import __version__ as _SDK_VERSION
 from claude_agent_sdk._cli_version import __cli_version__
 from claude_agent_sdk._internal.session_store import project_key_for_directory
 from claude_agent_sdk._internal.transport.subprocess_cli import _DEFAULT_MAX_BUFFER_SIZE
@@ -693,7 +694,7 @@ class ClaudeAgentSession:
         self._options.env.update(sdk_shell_env())
         # The env restore runs inside the diagnostics window, so the finish
         # record is written only after the process env is the snapshot again.
-        with sdk_initialize_diagnostics(self._stderr_tail):
+        with sdk_initialize_diagnostics(self._stderr_tail, _SDK_VERSION):
             try:
                 os.environ.clear()
                 os.environ.update(cli_parent_env(snapshot))
