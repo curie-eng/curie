@@ -18,11 +18,13 @@ is deployed, so the poller cannot admit it early, then reopens it.
 
 The judge reads: the admitted WorkItem request reached running and ended
 completed, the sandbox claim carried CURIE_REPO_CA_BUNDLE at the code host trust
-path, the publication Job mounted the `code-host-trust` volume from
-`code-host-ca` and its publication record ended succeeded, the stub's bare
-repository holds a pushed branch
-and exactly one pull request, the stub recorded no unsupported request, and no
-api, worker, publication or stub log shows a TLS verification failure.
+path, the install trusted the stub only through codeHostTrust, the request's
+publication record ended succeeded, the stub's bare repository holds a pushed
+branch and exactly one pull request, the stub recorded no unsupported request,
+and no api, worker, publication or stub log shows a TLS verification failure.
+A publication Job observed by the best-effort watch must mount the
+`code-host-trust` volume from `code-host-ca`; one never observed does not fail
+the run (judge_tls_code_host has the reasoning).
 
 Nothing here reaches real GitHub: no App JWT, actor token, webhook, tunnel,
 fixture repository or GitHub /meta call. The App private key the chart needs is
@@ -42,6 +44,7 @@ import secrets
 import shutil
 import subprocess
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -82,7 +85,7 @@ STUB_START_TIMEOUT_SECONDS = 600
 TERMINAL_STATUSES = frozenset({"completed", "failed", "expired", "cancelled"})
 # The worker names a publication's Job after its publication id
 # (publication_k8s.publication_resource_names): the first 20 hex digits.
-_PUBLICATION_JOB_NAME = re.compile(r"^curie-publication-([0-9a-f]{20})$")
+_PUBLICATION_JOB_NAME = re.compile(r"^curie-publication-[0-9a-f]{20}$")
 
 DEFAULT_TLS_ISSUE = (
     "Add a greet function to example.py",
@@ -266,6 +269,15 @@ def tls_values(
     worker = values.setdefault("worker", {})
     worker["publication"] = {**(worker.get("publication") or {}), "githubHttpsCidrs": [stub_cidr]}
     return values
+
+
+def install_trust(values: Mapping[str, Any]) -> dict[str, Any]:
+    """The code host trust settings out of install values, for the judge. Pure."""
+
+    return {
+        "codeHostTrust": copy.deepcopy(values.get("codeHostTrust")),
+        "githubStubCaConfigMap": (values.get("api") or {}).get("githubStubCaConfigMap"),
+    }
 
 
 def parse_stub_startup(log_text: str) -> dict[str, str]:
@@ -468,7 +480,30 @@ def tls_failure_lines(text: str) -> list[str]:
 
 
 def judge_tls_code_host(obs: Mapping[str, Any]) -> list[str]:
-    """Every way the run missed the TLS code host contract; empty means passed."""
+    """Every way the run missed the TLS code host contract; empty means passed.
+
+    The proof that publication trusted the stub through codeHostTrust is
+    behavioral and durable, not the publication Job object, which the worker
+    deletes as soon as it settles the outcome. It is the conjunction of:
+
+    1. the install values set ``codeHostTrust.caBundle.configMapRef`` to
+       ``code-host-ca`` and left ``api.githubStubCaConfigMap`` empty, so
+       codeHostTrust is the only path by which any component can trust the
+       stub's CA, which the stub generated for this run alone;
+    2. the publication record for the admitted request ended ``succeeded``,
+       which the worker writes only after the Job succeeded and the pull
+       request was verified against the stub over TLS;
+    3. the stub's bare repository holds a pushed non-main branch;
+    4. no observed api, worker, publication or stub log reports a TLS
+       verification failure.
+
+    Together these mean publication spoke TLS to the stub and verified it,
+    which only the codeHostTrust CA could make succeed. The Job object is a
+    diagnostic: when a publication Job was observed it must carry the
+    code-host-trust volume from ``code-host-ca`` (a contradiction fails), and
+    not observing one is recorded as ``publication_job_observed: false``
+    without failing.
+    """
 
     failures: list[str] = []
     if not obs.get("work_item_id"):
@@ -496,39 +531,53 @@ def judge_tls_code_host(obs: Mapping[str, Any]) -> list[str]:
     elif bundle != CA_PATH:
         failures.append(f"the sandbox claim's CURIE_REPO_CA_BUNDLE is {bundle}, not {CA_PATH}")
 
+    trust = obs.get("install_trust") or {}
+    config_map_ref = ((trust.get("codeHostTrust") or {}).get("caBundle") or {}).get(
+        "configMapRef"
+    ) or {}
+    if config_map_ref.get("name") != CA_CONFIG_MAP or config_map_ref.get("key") != CA_KEY:
+        failures.append(
+            "the install values did not trust the stub through codeHostTrust "
+            f"(caBundle.configMapRef: {config_map_ref or 'none'}, "
+            f"expected {CA_CONFIG_MAP}/{CA_KEY})"
+        )
+    if trust.get("githubStubCaConfigMap") != "":
+        failures.append(
+            "the install values set api.githubStubCaConfigMap to "
+            f"{trust.get('githubStubCaConfigMap')!r}, so codeHostTrust was not the only "
+            "trust path for the stub"
+        )
+
     job = obs.get("publication_job")
-    if not job:
-        failures.append("no publication Job was observed in the publication namespace")
-    else:
+    if job:
         volumes = ((job.get("spec") or {}).get("template") or {}).get("spec", {}).get(
             "volumes"
         ) or []
-        trust = next(
+        trust_volume = next(
             (v for v in volumes if isinstance(v, dict) and v.get("name") == TRUST_VOLUME), None
         )
-        if trust is None:
-            failures.append(f"the publication Job has no {TRUST_VOLUME} volume")
+        if trust_volume is None:
+            failures.append(f"the observed publication Job has no {TRUST_VOLUME} volume")
         else:
-            source = (trust.get("configMap") or {}).get("name")
+            source = (trust_volume.get("configMap") or {}).get("name")
             if source != CA_CONFIG_MAP:
                 failures.append(
-                    f"the publication Job's {TRUST_VOLUME} volume is ConfigMap {source!r}, "
-                    f"not {CA_CONFIG_MAP}"
+                    f"the observed publication Job's {TRUST_VOLUME} volume is ConfigMap "
+                    f"{source!r}, not {CA_CONFIG_MAP}"
                 )
-        # Completion is the durable publication record, not the Job's status:
-        # the worker deletes the Job as soon as it settles the outcome.
-        record = obs.get("publication_record") or {}
-        status = record.get("status")
-        if status != "succeeded":
-            reason = (
-                f"its publication record is {status!r}"
-                if record
-                else "no publication record matches it"
-            )
-            failures.append(
-                f"the publication Job did not complete: {reason} "
-                f"(last Job status seen: {_job_status_summary(job)})"
-            )
+
+    # Completion is the durable publication record, not the Job's status:
+    # the worker deletes the Job as soon as it settles the outcome.
+    record = obs.get("publication_record") or {}
+    status = record.get("status")
+    if status != "succeeded":
+        reason = (
+            f"its publication record is {status!r}"
+            if record
+            else "no publication record exists for the request"
+        )
+        seen = f" (last Job status seen: {_job_status_summary(job)})" if job else ""
+        failures.append(f"the publication did not succeed: {reason}{seen}")
 
     branches = [str(branch) for branch in obs.get("stub_branches") or []]
     if not [branch for branch in branches if branch != "main"]:
@@ -810,7 +859,7 @@ class TlsCodeHostRun:
         self.obs["model_cidrs"] = len(model_cidrs)
 
         def layer(base: dict[str, Any]) -> dict[str, Any]:
-            return tls_values(
+            values = tls_values(
                 base,
                 namespace=self.ns,
                 ca_config_map=CA_CONFIG_MAP,
@@ -818,6 +867,9 @@ class TlsCodeHostRun:
                 port=self.port,
                 model_cidrs=model_cidrs,
             )
+            # The last layer before helm, so this is the trust the install used.
+            self.obs["install_trust"] = install_trust(values)
+            return values
 
         self.p.install(egress_cidrs=model_cidrs, extra_values=layer)
 
@@ -904,16 +956,16 @@ class TlsCodeHostRun:
                 return
 
     def start_job_watch(self) -> None:
-        """Watch the publication namespace's Jobs before the ticket opens.
+        """Watch the publication namespace's Jobs before the ticket opens: a diagnostic.
 
         The worker creates the publication Job and deletes it right after it
         settles the outcome (publication_loop._terminalize, then
         cleanup_terminal), so a fast run can create and delete it between two
-        polls. A watch reports every ADDED, MODIFIED and DELETED event, so the
-        Job's volumes are kept however briefly it lived. Events stream to a
-        private file in the run's directory and are parsed by
-        publication_job_from_watch; completion is proved by
-        _capture_publication_record, not by the Job's status.
+        polls. A watch usually still reports it (ADDED, then DELETED), and
+        events stream to a private file in the run's directory parsed by
+        publication_job_from_watch. It is best-effort: a restart can miss a
+        Job, so an unobserved Job does not fail the run. The judge's proof is
+        the durable publication record and the stub's own state.
         """
 
         path = self.p.workdir / "publication-jobs.watch.json"
@@ -982,28 +1034,25 @@ class TlsCodeHostRun:
         self.publication_job = job
 
     def _capture_publication_record(self) -> None:
-        """The publication record behind the observed Job, read from Postgres.
+        """The admitted request's publication record, read from Postgres.
 
-        Chosen over the Job's own status or its pod because it
-        is the one completion fact that survives the Job's deletion: the worker
-        writes the record terminal (succeeded only after the Job succeeded and
-        the pull request was verified) before it deletes the Job, and never
-        deletes the record. The Job name carries the publication id, so the
-        record read is exactly the Job whose volumes the watch reported.
+        Chosen over the Job's own status or its pod because it is the one
+        completion fact that survives the Job's deletion: the worker writes the
+        record terminal (succeeded only after the Job succeeded and the pull
+        request was verified) before it deletes the Job, and never deletes the
+        record. It is keyed by the execution request, so it needs no Job to
+        have been observed.
         """
 
-        if self.publication_job is None:
+        if not self.request_id:
             return
         if (self.publication_record or {}).get("status") in ("succeeded", "failed"):
-            return
-        name = str(self.publication_job["metadata"].get("name") or "")
-        match = _PUBLICATION_JOB_NAME.match(name)
-        if match is None:
             return
         try:
             rows = self.p.sql(
                 "SELECT id, status, execution_request_id FROM publications "
-                f"WHERE replace(id::text, '-', '') LIKE '{match.group(1)}%'"
+                f"WHERE execution_request_id = '{uuid.UUID(self.request_id)}' "
+                "ORDER BY created_at DESC LIMIT 1"
             )
         except fe.PreflightFailed:
             # A failed read is retried on the next poll; the record persists.
@@ -1144,6 +1193,7 @@ class TlsCodeHostRun:
                 "ended": ended,
                 "claim_env": dict(self.claim_env),
                 "publication_job": self.publication_job,
+                "publication_job_observed": self.publication_job is not None,
                 "publication_job_watch_restarts": self.job_watch_restarts,
                 "publication_record": self.publication_record,
                 "stub_branches": branches,

@@ -36,11 +36,14 @@ must provide. Shapes chosen here, which the implementation follows:
     Empty means passed. ``obs`` keys:
     ``work_item_id`` (str or None), ``request_statuses`` (ordered list, the
     last one is the ending), ``claim_env`` (the sandbox claim's env as a
-    dict), ``publication_job`` (the publication Job as ``kubectl get job -o
-    json`` returns it, or None), ``publication_record`` (the publications row
-    behind that Job: ``id``, ``status``, ``execution_request_id``; completion
-    is its ``status == "succeeded"``, since the worker deletes the Job as soon
-    as it settles), ``stub_branches`` (branch names in the stub's
+    dict), ``install_trust`` (``install_trust(values)`` of the installed
+    values: ``codeHostTrust`` and ``githubStubCaConfigMap``),
+    ``publication_job`` (the publication Job a best-effort watch observed, or
+    None; None never fails, since the worker deletes the Job as soon as it
+    settles, but an observed Job must mount ``code-host-trust`` from
+    ``code-host-ca``), ``publication_record`` (the request's publications row:
+    ``id``, ``status``, ``execution_request_id``; completion is its
+    ``status == "succeeded"``), ``stub_branches`` (branch names in the stub's
     bare repository), ``stub_pull_requests`` (the stub's pull request rows),
     ``stub_unsupported`` (the stub's recorded unsupported requests) and
     ``logs`` (the observed api, worker, publication and stub log text). Each
@@ -445,6 +448,12 @@ def _passing() -> dict[str, Any]:
             "CURIE_REPO_PATH": "acme-corp/acme-bot",
             "CURIE_REPO_CA_BUNDLE": CA_PATH,
         },
+        "install_trust": {
+            "codeHostTrust": {
+                "caBundle": {"configMapRef": {"name": "code-host-ca", "key": "ca.crt"}}
+            },
+            "githubStubCaConfigMap": "",
+        },
         "publication_job": _job(),
         "publication_record": {
             "id": PUBLICATION_ID,
@@ -508,10 +517,56 @@ def test_judge_fails_when_the_claim_ca_bundle_is_not_the_code_host_trust_path() 
     assert any(CA_PATH in f for f in matching), matching
 
 
-def test_judge_fails_when_no_publication_job_was_observed() -> None:
+def test_judge_passes_a_succeeded_run_whose_publication_job_was_never_observed() -> None:
+    # The worker deletes the Job by design; the durable record, the pushed
+    # branch, the clean logs and the trust-only install values are the proof.
     obs = _passing()
     obs["publication_job"] = None
-    _failures_with(obs, "publication Job")
+    assert tls_code_host.judge_tls_code_host(obs) == []
+
+
+@pytest.mark.parametrize(
+    "trust",
+    [
+        {},
+        {"codeHostTrust": None, "githubStubCaConfigMap": ""},
+        {
+            "codeHostTrust": {"caBundle": {"configMapRef": {"name": "other-ca", "key": "ca.crt"}}},
+            "githubStubCaConfigMap": "",
+        },
+        {
+            "codeHostTrust": {"caBundle": {"configMapRef": {"name": "code-host-ca", "key": "x"}}},
+            "githubStubCaConfigMap": "",
+        },
+    ],
+    ids=["absent", "no-code-host-trust", "wrong-config-map", "wrong-key"],
+)
+def test_judge_fails_unless_the_install_trusted_the_stub_through_code_host_trust(
+    trust: dict[str, Any],
+) -> None:
+    obs = {**_passing(), "install_trust": trust, "publication_job": None}
+    _failures_with(obs, "did not trust the stub through codeHostTrust")
+
+
+@pytest.mark.parametrize("legacy", ["github-stub-ca", None])
+def test_judge_fails_unless_the_legacy_stub_ca_path_was_empty(legacy: str | None) -> None:
+    obs = _passing()
+    obs["install_trust"] = {**obs["install_trust"], "githubStubCaConfigMap": legacy}
+    _failures_with(obs, "githubStubCaConfigMap")
+
+
+def test_install_trust_reads_what_tls_values_installs() -> None:
+    values = tls_code_host.tls_values(
+        {"api": {"githubStubCaConfigMap": "github-stub-ca"}},
+        namespace=NAMESPACE,
+        ca_config_map="code-host-ca",
+        stub_cluster_ip=STUB_IP,
+        port=443,
+        model_cidrs=MODEL_CIDRS,
+    )
+    obs = {**_passing(), "install_trust": tls_code_host.install_trust(values)}
+    assert obs["install_trust"] == _passing()["install_trust"]
+    assert tls_code_host.judge_tls_code_host(obs) == []
 
 
 def test_judge_fails_when_the_publication_job_lacks_the_trust_volume() -> None:
@@ -532,13 +587,15 @@ def test_judge_fails_when_the_trust_volume_is_not_the_code_host_ca_config_map() 
 def test_judge_fails_when_the_publication_record_did_not_succeed(status: str) -> None:
     obs = _passing()
     obs["publication_record"] = {**obs["publication_record"], "status": status}
-    matching = _failures_with(obs, "publication Job did not complete")
+    obs["publication_job"] = None
+    matching = _failures_with(obs, "publication did not succeed")
     assert any(repr(status) in f for f in matching), matching
 
 
 def test_judge_fails_without_a_publication_record() -> None:
     obs = _passing()
     obs["publication_record"] = None
+    obs["publication_job"] = None
     _failures_with(obs, "no publication record")
 
 
@@ -551,6 +608,7 @@ def test_judge_reads_completion_from_the_record_not_the_last_job_status() -> Non
 
 def test_judge_fails_when_the_stub_repo_has_no_pushed_branch() -> None:
     obs = _passing()
+    obs["publication_job"] = None
     obs["stub_branches"] = ["main"]
     _failures_with(obs, "no pushed branch")
 
@@ -781,10 +839,8 @@ def test_watch_skips_malformed_lines_and_a_torn_final_event() -> None:
         json.dumps(_watched_job(PUBLICATION_JOB)) + "\n",
     ],
 )
-def test_watch_without_a_publication_job_is_none_and_the_judge_says_so(stream: str) -> None:
+def test_watch_without_a_publication_job_is_none(stream: str) -> None:
     assert tls_code_host.publication_job_from_watch(stream) is None
-    obs = {**_passing(), "publication_job": None}
-    _failures_with(obs, "no publication Job was observed")
 
 
 # --------------------------------------------------------------------------
@@ -792,18 +848,21 @@ def test_watch_without_a_publication_job_is_none_and_the_judge_says_so(stream: s
 # --------------------------------------------------------------------------
 
 
-class _FakeWatch:
-    """kubectl get jobs --watch: reports ADDED then DELETED, then blocks until stopped."""
+_ADDED_THEN_DELETED = _event("ADDED", _watched_job(PUBLICATION_JOB)) + _event(
+    "DELETED", _watched_job(PUBLICATION_JOB)
+)
 
-    def __init__(self, argv: list[str], *, stdout: Any, stderr: Any) -> None:
+
+class _FakeWatch:
+    """kubectl get jobs --watch: reports ``stream`` (by default ADDED then
+    DELETED), then blocks until stopped."""
+
+    def __init__(
+        self, argv: list[str], *, stdout: Any, stderr: Any, stream: str = _ADDED_THEN_DELETED
+    ) -> None:
         self.argv = argv
         self.terminated = False
-        stdout.write(
-            (
-                _event("ADDED", _watched_job(PUBLICATION_JOB))
-                + _event("DELETED", _watched_job(PUBLICATION_JOB))
-            ).encode()
-        )
+        stdout.write(stream.encode())
         stdout.flush()
 
     def poll(self) -> int | None:
@@ -868,13 +927,16 @@ class _FakePreflight:
 
 
 def _collect(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, record_status: str
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    record_status: str,
+    stream: str = _ADDED_THEN_DELETED,
 ) -> tuple[tls_code_host.TlsCodeHostRun, _FakePreflight]:
     monkeypatch.setattr(tls_code_host.time, "sleep", lambda _s: None)
     watches: list[_FakeWatch] = []
 
     def popen(argv: list[str], **kwargs: Any) -> _FakeWatch:
-        watch = _FakeWatch(argv, **kwargs)
+        watch = _FakeWatch(argv, stream=stream, **kwargs)
         watches.append(watch)
         return watch
 
@@ -902,7 +964,7 @@ def _collect(
     assert len(watches) == 1, "a live watch was restarted"
     assert fake.polls == 3
     assert fake.sql_queries, "the durable publication record was never read"
-    assert all(PUBLICATION_ID[:20] in query for query in fake.sql_queries)
+    assert all(f"execution_request_id = '{run.request_id}'" in query for query in fake.sql_queries)
     return run, fake
 
 
@@ -931,13 +993,23 @@ def test_a_job_never_polled_still_passes_on_a_succeeded_record(
     assert tls_code_host.judge_tls_code_host(_collected_obs(run)) == []
 
 
+def test_a_job_the_watch_never_saw_passes_on_the_durable_proof(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run, _ = _collect(monkeypatch, tmp_path, "succeeded", stream="")
+    assert run.publication_job is None
+    assert run.publication_record is not None
+    assert run.publication_record["status"] == "succeeded"
+    assert tls_code_host.judge_tls_code_host(_collected_obs(run)) == []
+
+
 def test_a_job_never_polled_fails_on_a_failed_record(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     run, _ = _collect(monkeypatch, tmp_path, "failed")
     assert run.publication_job is not None
     failures = tls_code_host.judge_tls_code_host(_collected_obs(run))
-    assert failures and all("publication Job did not complete" in f for f in failures), failures
+    assert failures and all("publication did not succeed" in f for f in failures), failures
     assert "'failed'" in failures[0]
 
 
