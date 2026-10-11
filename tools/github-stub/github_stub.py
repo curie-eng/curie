@@ -680,6 +680,7 @@ class GithubStub:
                 repository = self._repository_row()
                 pull = {
                     "id": number,
+                    "node_id": f"PR_stub{number}",
                     "number": number,
                     "state": "open",
                     "merged": False,
