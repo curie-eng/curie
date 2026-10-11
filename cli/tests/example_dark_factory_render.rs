@@ -6,7 +6,7 @@
 //! build with no published layer still renders, and says which `curie build`
 //! replaces it, instead of leaving the refusal to the deploy.
 
-mod support;
+use crate::support;
 
 use std::path::Path;
 use std::process::{Command, Output};

@@ -5,14 +5,29 @@
 //! NDJSON streaming, and the real frozen-contract serde against canned wire
 //! responses. Nothing internal to the CLI is mocked.
 
-// Each integration test binary compiles this module independently and uses a
-// different subset of it; unused-in-this-binary items are not dead code.
+// Every test module in the one integration crate shares this module, and each
+// uses a different subset of it; a helper only some modules call is not dead code.
 #![allow(dead_code)]
+
+pub mod emit_parity;
+pub mod enum_variants;
+pub mod executable;
+pub mod field_parity;
+pub mod oci_registry_stub;
+pub mod schema_inventory;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+/// Every test in the one integration binary shares a process under `cargo test`,
+/// so any test that mutates process-global state (`std::env::set_var`,
+/// `remove_var`, `set_current_dir`) holds this for the whole mutation and the
+/// restore. Async tests take it with `.lock().await`, sync tests with
+/// `.blocking_lock()` (never `blocking_lock` inside a tokio runtime). tokio's
+/// mutex does not poison, so one failing test does not cascade into the rest.
+pub static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// The compose dev Valkey (host port 26379, password `valkeypass`), used as
 /// the default target for the Valkey-backed integration tests.

@@ -87,6 +87,7 @@ GATED_JOBS = (
     "chart-assertions-2",
     "chart-assertions-retained-values",
     "reserved-env-upgrade",
+    "automatic-thread-isolation",
 )
 GATED_IF = "${{ needs.chart-changes.outputs.chart == 'true' }}"
 HELM_IF = "${{ !cancelled() }}"

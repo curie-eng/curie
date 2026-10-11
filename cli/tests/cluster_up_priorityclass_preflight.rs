@@ -2,8 +2,7 @@
 //! issue #1568. Every case drives the real `curie cluster up` entrypoint with
 //! recording Helm and kubectl executables on PATH.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::{Path, PathBuf};

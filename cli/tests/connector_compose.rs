@@ -1140,9 +1140,15 @@ fn the_up_command_uses_the_configured_connector_start_timeout() {
 #[test]
 fn the_serialized_overlay_carries_the_reference_and_never_the_resolved_value() {
     let dir = TempDir::new().expect("a scratch bundle");
+    let _env = crate::support::ENV_LOCK.blocking_lock();
+    let previous = std::env::var_os("K8S_WRITE_TOKEN");
     std::env::set_var("K8S_WRITE_TOKEN", "s3cr3t-value");
     let overlay = overlay_fixture("sre-bot", dir.path());
     let written = serde_norway::to_string(&overlay).expect("serialize the overlay");
+    match previous {
+        Some(value) => std::env::set_var("K8S_WRITE_TOKEN", value),
+        None => std::env::remove_var("K8S_WRITE_TOKEN"),
+    }
 
     assert!(
         written.contains("${K8S_WRITE_TOKEN}"),
@@ -1206,6 +1212,8 @@ async fn bring_up_local_refuses_a_declared_secret_with_no_value() {
     // from the declaration having no value HERE, not from whatever this box's
     // operator happens to have stored (and the redirect keeps the test off the
     // OS credential store entirely).
+    let _env = crate::support::ENV_LOCK.lock().await;
+    let previous_config_dir = std::env::var_os("CURIE_CONFIG_DIR");
     std::env::set_var("CURIE_CONFIG_DIR", dir.path().join("config"));
     std::env::remove_var("CURIE_TEST_UNSET_CONNECTOR_TOKEN");
     std::fs::write(
@@ -1232,6 +1240,10 @@ async fn bring_up_local_refuses_a_declared_secret_with_no_value() {
     )
     .await
     .expect_err("a declared secret with no value must refuse the bring-up");
+    match previous_config_dir {
+        Some(value) => std::env::set_var("CURIE_CONFIG_DIR", value),
+        None => std::env::remove_var("CURIE_CONFIG_DIR"),
+    }
 
     let message = format!("{error:#}");
     assert!(

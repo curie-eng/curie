@@ -3505,6 +3505,15 @@ export const commandManifest = {
           "about": "Install or upgrade the Curie release via Helm (helm upgrade --install). By default it puts the UI and Langfuse on node ports for tailnet/LAN access; pass --no-expose to keep them ClusterIP-only. Set CURIE_CREDENTIALS to a supported model provider credential (CURIE_MODEL_CREDENTIALS is a deprecated alias) to install with the real model. A fresh install without it uses fake mode. A rerun preserves the recorded model configuration. Use --fake-model to explicitly downgrade to fake mode. An sk-ant- or sk-or- credential infers its provider egress when --allow-egress-host is absent. Other credential shapes remain sealed until their provider or a raw range is explicit. A controller owned by another Helm release is reused. A healthy unowned controller whose image matches the chart is reused. An unhealthy or different unowned controller stops the install and names the kubectl repair. A direct GET that returns NotFound applies security.gvisor.mode=off before the first install and prints the inference. A forbidden lookup still applies that override from the exact admission result and retries once. Every inferred value is printed",
           "args": [
             {
+              "global": false,
+              "help": "Ordered Helm values files (repeatable); explicit flags take precedence",
+              "id": "values_files",
+              "long": "values-file",
+              "positional": false,
+              "required": false,
+              "short": "f"
+            },
+            {
               "default_values": [
                 "curie"
               ],
@@ -3830,6 +3839,15 @@ export const commandManifest = {
           "args": [
             {
               "global": false,
+              "help": "Ordered Helm values files (repeatable); explicit flags take precedence",
+              "id": "values_files",
+              "long": "values-file",
+              "positional": false,
+              "required": false,
+              "short": "f"
+            },
+            {
+              "global": false,
               "help": "Target Curie version (chart/app version) to upgrade to",
               "id": "to",
               "long": "to",
@@ -3896,6 +3914,18 @@ export const commandManifest = {
               "help": "Apply contract or irreversible schema migrations. Without this flag the upgrade Job refuses those migrations before mutation so a patch rollback window stays intact (#2300)",
               "id": "forward_only",
               "long": "forward-only",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Proceed when a stock dark factory runner layer cannot be rebound for --to: clear its binding so the agent runs the platform runner without its layer until it is rebound. Refused by default",
+              "id": "allow_stock_layer_clear",
+              "long": "allow-stock-layer-clear",
               "positional": false,
               "possible_values": [
                 "true",
@@ -7221,7 +7251,7 @@ export const commandManifest = {
             },
             {
               "default_values": [
-                "3600"
+                "10800"
               ],
               "global": false,
               "help": "Per run execution deadline in seconds for the deployed agent",

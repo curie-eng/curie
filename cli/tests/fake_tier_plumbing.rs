@@ -24,7 +24,7 @@
 //! whole defect lives in the collision between those two real artifacts: the
 //! seeded grader requires the bundle name and "all done" does not contain it.
 
-mod support;
+use crate::support;
 
 use std::path::Path;
 use std::process::Command;

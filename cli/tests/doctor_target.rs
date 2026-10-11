@@ -11,8 +11,7 @@
 //! The targeting cases empty `PATH` so they need no cluster. The model remedy
 //! case uses temporary command stubs to expose a floating release model.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::Path;

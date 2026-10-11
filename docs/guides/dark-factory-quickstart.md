@@ -7,9 +7,9 @@ quickstart commands, registering and installing the App, and labelling an
 issue. Curie polls the repository and publishes a pull request under the App's
 identity. The command never opens a browser or runs `gh`.
 
-For planning, reserve **about 70 minutes for configured waiting windows**,
+For planning, reserve **about 190 minutes for configured waiting windows**,
 plus variable time for Helm, image downloads, cluster creation, and App setup.
-That rounded allowance comprises [60 minutes of factory execution](../../cli/src/factory_quickstart.rs),
+That rounded allowance comprises [180 minutes of factory execution](../../cli/src/factory_quickstart.rs),
 [5 minutes of initial post-Helm convergence](../../cli/src/ops/convergence.rs),
 [3 minutes of API rollout after factory configuration](../../cli/src/github_app.rs),
 and [45 seconds for an intake polling interval](../../charts/curie/values.yaml).
@@ -292,7 +292,7 @@ The second run configures these values:
 | Intake | Polling (`api.githubFactoryIntake=poll`). No webhook secret. |
 | Agent | `dark-factory`, from the published runner image, environment `prod`. |
 | GitHub surface | `github=<owner>/<name>` |
-| Execution deadline | 3600 seconds |
+| Execution deadline | 10800 seconds |
 | Publication | `auto` |
 | Budget | 5 USD per day |
 

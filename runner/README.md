@@ -96,6 +96,17 @@ workspace and preserves the shell arguments, exit status and signals. Missing or
 nonexecutable launchers reject session startup instead of selecting another shell.
 Declared connector secrets remain available to bundle tools.
 
+SDK initialization writes a start record and a finish record to the runner log
+under the fixed phase `sdk_initialize`. The finish record carries the outcome
+(`success`, `failure` or `cancelled`), monotonic elapsed milliseconds, the SDK
+version and, on failure only, the exception class. It never carries options,
+environment, prompts or exception text. Every Claude CLI stderr line still reaches
+the runner's stderr for the whole session. While connect runs, the runner also
+keeps a copy of those lines, redacted before it is kept and bounded to the newest
+8192 UTF-8 bytes. A failed initialization emits that tail as one WARNING; success
+and cancellation discard it, and nothing is kept after connect ends. The original
+exception propagates unchanged, with no retry or timeout change.
+
 Each `text_delta` the runner emits is one whole assistant text block, and a
 consumer joins deltas as they come. The same boundary therefore starts a later
 block of the turn on its own paragraph (a blank line), unless the model already

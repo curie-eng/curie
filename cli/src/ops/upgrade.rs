@@ -125,11 +125,14 @@ impl std::fmt::Display for UpgradePhase {
 /// Flags for `curie cluster upgrade`.
 #[derive(Debug, Clone)]
 pub struct UpgradeOpts {
+    /// @spec CLUSTER-VALUES-FILES c1-c4: immutable operator values.
+    pub file_values: Option<super::PrivateHelmValues>,
     pub common: CommonOpts,
     pub to: String,
     pub chart: UpgradeChart,
     pub yes: bool,
     pub forward_only: bool,
+    pub allow_stock_layer_clear: bool,
     pub take_over: Option<String>,
 }
 
@@ -704,7 +707,7 @@ fn plan_lines(
     opts: &UpgradeOpts,
     from: Option<&str>,
     secret: Option<&str>,
-    schema_plan: Option<&str>,
+    schema_plan: &[String],
     retained_values: bool,
     runner_layers: &RunnerLayerPlan,
     helm_timeout_seconds: u64,
@@ -739,10 +742,9 @@ fn plan_lines(
         "phase canary: target-version smoke".into(),
         "phase commit: record known-good version".into(),
     ]);
-    // #2299: the configuration schema version the upgrade moves from and to.
-    if let Some(schema_plan) = schema_plan {
-        lines.push(schema_plan.to_string());
-    }
+    // #2299: the configuration schema version the upgrade moves from and to,
+    // then every redacted migration change line (#4322).
+    lines.extend(schema_plan.iter().cloned());
     if let Some(secret) = secret {
         lines.push(format!(
             "preserved credential api.credentials={}",
@@ -986,7 +988,8 @@ pub(crate) fn needs_stock_lookup(
 /// stop matching when the runner changes, and an unknown side counts as a
 /// change. An affected stock binding is rebound only to the registry's answer
 /// for `--to`, never to its own digest, and only when that layer's base is the
-/// target runner (ADR 0173 decision 5). Every other affected binding clears.
+/// target runner (ADR 0173 decision 5). Every other affected binding is planned
+/// for clearing; unbindable stock layers refuse Validate unless opted in.
 pub(crate) fn plan_runner_layers(
     bindings: &BTreeMap<String, String>,
     current: Option<&str>,
@@ -1056,6 +1059,63 @@ pub(crate) fn runner_layer_rebind_line(plan: &RunnerLayerPlan, to: &str) -> Opti
     ))
 }
 
+/// The Validate refusal for stock layers that cannot be rebound (#4344).
+/// Owner-built clears remain the owner's responsibility. `None` when every
+/// stock binding can be rebound or kept.
+pub(crate) fn stock_runner_layer_refusal(plan: &RunnerLayerPlan, to: &str) -> Option<String> {
+    let mut stock: Vec<_> = plan
+        .clears
+        .iter()
+        .filter_map(|(agent, reason)| {
+            let (why, remediation): (String, &str) = match reason {
+                LayerClearReason::OwnerBuilt => return None,
+                LayerClearReason::StockLayerUnpublished => (
+                    format!(
+                        "the dark factory runner layer for {to} is not published at {}:{to}",
+                        crate::examples::DARK_FACTORY_RUNNER_REPOSITORY
+                    ),
+                    "rerun once that tag is published, or choose a --to whose layer is published",
+                ),
+                LayerClearReason::StockBaseMismatch {
+                    published_base,
+                    target,
+                } => (
+                    format!(
+                        "the layer published for {to} is built on {published_base}, not the \
+                         target runner {target}"
+                    ),
+                    "remove the agentSandbox.runner image or digest override from the \
+                     installation's values so the target renders the published runner, then rerun",
+                ),
+                LayerClearReason::StockRegistryUnreachable(detail) => (
+                    format!(
+                        "the registry could not say which layer is published for {to}: {detail}"
+                    ),
+                    "restore read access to ghcr.io from this host, then rerun",
+                ),
+                LayerClearReason::TargetRunnerUnknown => (
+                    "the target runner is unknown, so no published layer can be proven to match it"
+                        .into(),
+                    "set the chart value agentSandbox.runner.digest so the target runner is \
+                     known, then rerun",
+                ),
+            };
+            Some((agent, format!("{agent} ({why}; {remediation})")))
+        })
+        .collect();
+    if stock.is_empty() {
+        return None;
+    }
+    stock.sort_by(|a, b| a.0.cmp(b.0));
+    let entries: Vec<String> = stock.into_iter().map(|(_, entry)| entry).collect();
+    Some(format!(
+        "stock runner layer cannot be rebound for {to}: {}. To clear these bindings anyway, \
+         so the agents run the platform runner without their layer until rebound, rerun with \
+         --allow-stock-layer-clear.",
+        entries.join("; ")
+    ))
+}
+
 /// The operator-facing line naming every stock agent the upgrade clears, why,
 /// and the stock remedy (#4321). Owner-built clears stay in
 /// [`runner_layer_notice`]. `None` when there are none.
@@ -1117,16 +1177,16 @@ pub(crate) fn stock_runner_layer_notice(
     ))
 }
 
-/// The owner-built notice, then the stock notice, for every cleared agent.
+/// The owner-built notice, then the opted-in stock notice, for cleared agents.
 fn runner_layer_warnings(plan: &RunnerLayerPlan, opts: &UpgradeOpts) -> Vec<String> {
+    let stock_notice = if opts.allow_stock_layer_clear {
+        stock_runner_layer_notice(plan, &opts.common.namespace, &opts.common.release, &opts.to)
+    } else {
+        None
+    };
     runner_layer_notice(&plan.owner_built_clears())
         .into_iter()
-        .chain(stock_runner_layer_notice(
-            plan,
-            &opts.common.namespace,
-            &opts.common.release,
-            &opts.to,
-        ))
+        .chain(stock_notice)
         .collect()
 }
 
@@ -1337,10 +1397,11 @@ trait UpgradeDriver {
     fn secret(&self) -> Option<&str> {
         None
     }
-    /// The redacted `config schema: <from> -> <to>` plan line (#2299), when a
-    /// retained configuration was read and migrated.
-    fn schema_plan(&self) -> Option<String> {
-        None
+    /// The redacted `config schema: <from> -> <to>` plan line (#2299) and the
+    /// migration change lines after it (#4322), when a retained configuration
+    /// was read and migrated.
+    fn schema_plan(&self) -> Vec<String> {
+        Vec::new()
     }
     fn recovery_plan(&self) -> Vec<String> {
         Vec::new()
@@ -1431,7 +1492,7 @@ async fn run_lifecycle_inner<H: UpgradeDriver>(
         &opts,
         from.as_deref(),
         host.secret(),
-        host.schema_plan().as_deref(),
+        &host.schema_plan(),
         host.retained_values(),
         &host.runner_layer_plan(),
         host.helm_timeout_seconds(),
@@ -1895,10 +1956,12 @@ struct LiveHost {
     overlay: Option<String>,
     /// Why the configuration migration refused, if it did (#2299, R7).
     config_refusal: Option<String>,
+    /// Why a stock runner layer cannot be rebound without consent to clear it.
+    runner_layer_refusal: Option<String>,
     /// Why the chart cannot install `--to`, if it cannot (Ruling 2, R1).
     chart_refusal: Option<String>,
-    /// The redacted configuration schema plan line (#2299).
-    schema_plan: Option<String>,
+    /// The redacted configuration schema plan lines (#2299, #4322).
+    schema_plan: Vec<String>,
     /// Redacted schema compatibility decision (#2588).
     schema_decision: Option<serde_json::Value>,
     /// Why the target schema was refused, if it was.
@@ -2103,8 +2166,9 @@ impl LiveHost {
             secret: None,
             overlay: None,
             config_refusal: None,
+            runner_layer_refusal: None,
             chart_refusal: None,
-            schema_plan: None,
+            schema_plan: Vec::new(),
             schema_decision: None,
             schema_refusal: None,
             runner_layers: RunnerLayerPlan::default(),
@@ -2594,7 +2658,7 @@ impl LiveHost {
         match self.retained_overlay() {
             Ok(Some((overlay, schema_plan))) => {
                 self.overlay = Some(overlay);
-                self.schema_plan = Some(schema_plan);
+                self.schema_plan = schema_plan;
             }
             Ok(None) => {}
             Err(error) => self.config_refusal = Some(format!("{error:#}")),
@@ -2657,6 +2721,10 @@ impl LiveHost {
                 }
             }
         }
+        // #4321 with @spec CLUSTER-VALUES-FILES c3-c4: runner rebinding is
+        // part of the final effective overlay, so metadata admission and the
+        // timeout render must see the same document that Apply receives.
+        self.compute_runner_layers();
         if self.opts.chart.pending_release().is_none() {
             self.compute_schema_compat();
             if self.current.is_some()
@@ -2670,7 +2738,6 @@ impl LiveHost {
                 }
             }
         }
-        self.compute_runner_layers();
     }
 
     /// What the upgrade does to each layered agent (#3218, #4321).
@@ -2683,6 +2750,7 @@ impl LiveHost {
     /// exists to prevent, and running the platform runner is always servable.
     /// A stock dark factory binding asks the registry for the layer published
     /// for `--to` and is rebound to it when its base is the target runner.
+    /// Otherwise Validate refuses unless the operator consents to clearing it.
     fn compute_runner_layers(&mut self) {
         let Some(overlay) = self
             .overlay
@@ -2743,6 +2811,14 @@ impl LiveHost {
         };
         self.runner_layers =
             plan_runner_layers(&bindings, current.as_deref(), target.as_deref(), &stock);
+        self.runner_layer_refusal = if self.opts.allow_stock_layer_clear {
+            None
+        } else {
+            stock_runner_layer_refusal(&self.runner_layers, &self.opts.to)
+        };
+        if self.runner_layer_refusal.is_some() {
+            return;
+        }
         if self.runner_layers.is_empty() {
             return;
         }
@@ -2940,13 +3016,18 @@ impl LiveHost {
             args.push(plain("--version"));
             args.push(plain(&self.opts.to));
         }
-        let tmp = tempfile::NamedTempFile::new().ok();
-        if let (Some(overlay), Some(tmp)) = (&self.overlay, &tmp) {
-            if std::fs::write(tmp.path(), overlay).is_ok() {
-                args.push(plain("-f"));
-                args.push(plain(tmp.path().to_string_lossy().into_owned()));
-            }
-        }
+        // @spec CLUSTER-VALUES-FILES c3-c4: never admit defaults after losing the overlay.
+        let _tmp = if let Some(overlay) = &self.overlay {
+            let tmp = tempfile::NamedTempFile::new()
+                .map_err(|_| "could not prepare target metadata values".to_string())?;
+            std::fs::write(tmp.path(), overlay)
+                .map_err(|_| "could not write target metadata values".to_string())?;
+            args.push(plain("-f"));
+            args.push(plain(tmp.path().to_string_lossy().into_owned()));
+            Some(tmp)
+        } else {
+            None
+        };
         let cmd = OpsCommand::new("helm", args);
         let (ok, out, err) = match self.run(&cmd) {
             Ok(v) => v,
@@ -2992,7 +3073,7 @@ impl LiveHost {
     /// values the real run retains after recovery (#4334).
     /// `Ok(None)` means no values were returned; the installed version still
     /// distinguishes an empty release from a first install.
-    fn retained_overlay(&self) -> Result<Option<(String, String)>> {
+    fn retained_overlay(&self) -> Result<Option<(String, Vec<String>)>> {
         let Some(history) = self.release_history()? else {
             return Ok(None);
         };
@@ -3012,22 +3093,41 @@ impl LiveHost {
             if super::verbs::failure_reason(&err) != "Error: release: not found" {
                 bail!("could not read retained helm values: {}", err.trim());
             }
-            return Ok(None);
+            return if self.opts.file_values.is_some() {
+                self.migrate_effective_overlay(serde_json::json!({}))
+            } else {
+                Ok(None)
+            };
         }
         if out.trim().is_empty() {
-            return Ok(None);
+            return if self.opts.file_values.is_some() {
+                self.migrate_effective_overlay(serde_json::json!({}))
+            } else {
+                Ok(None)
+            };
         }
         let values: serde_json::Value =
             serde_norway::from_str(&out).context("retained helm values are malformed")?;
+        self.migrate_effective_overlay(values)
+    }
+
+    /// @spec CLUSTER-VALUES-FILES c3: admit the final merged input once.
+    fn migrate_effective_overlay(
+        &self,
+        mut values: serde_json::Value,
+    ) -> Result<Option<(String, Vec<String>)>> {
+        if let Some(files) = &self.opts.file_values {
+            crate::config_migrate::clear_replaced_secret_refs(&mut values, &files.0);
+            super::lint_values::merge_values(&mut values, files.0.clone());
+        }
         // Unlike `up.rs`, the installed chart version is known here, so
         // `infer_schema_version` is not guessing when the overlay predates
         // `config.schemaVersion`.
         let outcome =
             crate::config_migrate::migrate_installed_config(values, self.current.as_deref())?;
-        let schema_plan = crate::config_migrate::redacted_upgrade_plan(&outcome)
-            .into_iter()
-            .next()
-            .unwrap_or_default();
+        // Every line, not just the schema line: the change lines carry names
+        // only, and redaction is `redacted_upgrade_plan`'s contract (#4322).
+        let schema_plan = crate::config_migrate::redacted_upgrade_plan(&outcome);
         Ok(Some((helm_values_document(&outcome.values)?, schema_plan)))
     }
 
@@ -3483,7 +3583,7 @@ impl UpgradeDriver for LiveHost {
         self.record = Some(record);
         Ok(())
     }
-    fn schema_plan(&self) -> Option<String> {
+    fn schema_plan(&self) -> Vec<String> {
         self.schema_plan.clone()
     }
     fn recovery_plan(&self) -> Vec<String> {
@@ -3503,6 +3603,7 @@ impl UpgradeDriver for LiveHost {
         self.chart_refusal
             .clone()
             .or_else(|| self.config_refusal.clone())
+            .or_else(|| self.runner_layer_refusal.clone())
             .or_else(|| self.timeout_refusal.clone())
             .or_else(|| self.schema_refusal.clone())
     }
@@ -3800,6 +3901,7 @@ mod hook_tests {
 
     fn opts(namespace: &str, release: &str) -> UpgradeOpts {
         UpgradeOpts {
+            file_values: None,
             common: CommonOpts {
                 namespace: namespace.into(),
                 release: release.into(),
@@ -3809,6 +3911,7 @@ mod hook_tests {
             chart: UpgradeChart::AvailableLocal("charts/curie".into()),
             yes: true,
             forward_only: false,
+            allow_stock_layer_clear: false,
             take_over: None,
         }
     }
@@ -4626,6 +4729,109 @@ mod runner_layer_guard_tests {
 
     /// #4321 AC4: a stock agent that cannot be rebound is told its reason and
     /// the stock remedy, never the owner-built `curie build` one.
+    #[test]
+    fn stock_refusal_ignores_rebinds_kept_bindings_and_owner_built_clears() {
+        for plan in [
+            RunnerLayerPlan::default(),
+            RunnerLayerPlan {
+                rebinds: vec![("dark-factory".into(), STOCK_NEW.into())],
+                ..RunnerLayerPlan::default()
+            },
+            RunnerLayerPlan {
+                kept: vec![("dark-factory".into(), STOCK_OLD.into())],
+                ..RunnerLayerPlan::default()
+            },
+            RunnerLayerPlan {
+                clears: owner_clears(&["acme-bot"]),
+                ..RunnerLayerPlan::default()
+            },
+        ] {
+            assert_eq!(stock_runner_layer_refusal(&plan, "0.12.3"), None);
+        }
+    }
+
+    #[test]
+    fn stock_refusal_has_each_exact_reason_and_remediation() {
+        for (reason, detail) in [
+            (
+                LayerClearReason::StockLayerUnpublished,
+                "the dark factory runner layer for 0.12.3 is not published at \
+                 ghcr.io/curie-eng/curie-dark-factory-runner:0.12.3; rerun once that tag is \
+                 published, or choose a --to whose layer is published"
+                    .to_string(),
+            ),
+            (
+                LayerClearReason::StockBaseMismatch {
+                    published_base: RUNNER_OTHER.into(),
+                    target: RUNNER_NEW.into(),
+                },
+                format!(
+                    "the layer published for 0.12.3 is built on {RUNNER_OTHER}, not the target \
+                     runner {RUNNER_NEW}; remove the agentSandbox.runner image or digest override \
+                     from the installation's values so the target renders the published runner, \
+                     then rerun"
+                ),
+            ),
+            (
+                LayerClearReason::StockRegistryUnreachable("connection refused".into()),
+                "the registry could not say which layer is published for 0.12.3: connection \
+                 refused; restore read access to ghcr.io from this host, then rerun"
+                    .to_string(),
+            ),
+            (
+                LayerClearReason::TargetRunnerUnknown,
+                "the target runner is unknown, so no published layer can be proven to match it; \
+                 set the chart value agentSandbox.runner.digest so the target runner is known, \
+                 then rerun"
+                    .to_string(),
+            ),
+        ] {
+            let plan = RunnerLayerPlan {
+                clears: vec![("dark-factory".into(), reason)],
+                ..RunnerLayerPlan::default()
+            };
+            assert_eq!(
+                stock_runner_layer_refusal(&plan, "0.12.3"),
+                Some(format!(
+                    "stock runner layer cannot be rebound for 0.12.3: dark-factory ({detail}). \
+                     To clear these bindings anyway, so the agents run the platform runner \
+                     without their layer until rebound, rerun with --allow-stock-layer-clear."
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn stock_refusal_orders_agents_and_omits_owner_built_agents() {
+        let plan = RunnerLayerPlan {
+            clears: vec![
+                (
+                    "night-factory".into(),
+                    LayerClearReason::TargetRunnerUnknown,
+                ),
+                ("acme-bot".into(), LayerClearReason::OwnerBuilt),
+                (
+                    "dark-factory".into(),
+                    LayerClearReason::StockLayerUnpublished,
+                ),
+            ],
+            ..RunnerLayerPlan::default()
+        };
+        let refusal = stock_runner_layer_refusal(&plan, "0.12.3").expect("stock refusal");
+        assert_eq!(
+            refusal,
+            "stock runner layer cannot be rebound for 0.12.3: dark-factory (the dark factory \
+             runner layer for 0.12.3 is not published at \
+             ghcr.io/curie-eng/curie-dark-factory-runner:0.12.3; rerun once that tag is \
+             published, or choose a --to whose layer is published); night-factory (the target \
+             runner is unknown, so no published layer can be proven to match it; set the chart \
+             value agentSandbox.runner.digest so the target runner is known, then rerun). \
+             To clear these bindings anyway, so the agents run the platform runner without \
+             their layer until rebound, rerun with --allow-stock-layer-clear."
+        );
+        assert!(!refusal.contains("acme-bot"), "{refusal}");
+    }
+
     #[test]
     fn stock_notice_names_reason_and_stock_remedy_not_curie_build() {
         let plan = RunnerLayerPlan {

@@ -253,6 +253,10 @@ def test_valid_read_returns_the_issue_and_comments_verbatim_and_stores_nothing(
     assert (context["repo_full_name"], context["issue_number"]) == (REPO, ISSUE_NUMBER)
     assert context["capability"].startswith("wir.")
     before = _durable_snapshot()
+    execution = _rows(
+        "SELECT started_at, execution_deadline FROM curie.execution_requests WHERE id = :id",
+        {"id": case["request_id"]},
+    )[0]
 
     response = _read(case, context["capability"], repo=REPO.upper())
     assert response.status_code == 200, response.text
@@ -269,6 +273,10 @@ def test_valid_read_returns_the_issue_and_comments_verbatim_and_stores_nothing(
             {"author": "octocat", "created_at": "2026-10-01T01:00:00Z", "body": ""},
         ],
         "comments_truncated": False,
+        "execution_deadline": execution["execution_deadline"].isoformat().replace("+00:00", "Z"),
+        "execution_seconds": int(
+            (execution["execution_deadline"] - execution["started_at"]).total_seconds()
+        ),
     }
     # Addressed by repository id, with the App installation token.
     assert [r.url.path for r in _github_reads(case)] == [
@@ -277,6 +285,56 @@ def test_valid_read_returns_the_issue_and_comments_verbatim_and_stores_nothing(
         f"/repositories/{REPOSITORY_ID}/issues/{ISSUE_NUMBER}/comments",
     ]
     assert _durable_snapshot() == before
+
+
+@pytest.mark.parametrize("execution_seconds", [3600, 10800])
+def test_issue_read_reports_the_stored_execution_deadline_and_configured_duration(
+    issue_case: dict[str, Any], execution_seconds: int
+) -> None:
+    case = issue_case
+    _execute(
+        "UPDATE curie.agents SET execution_deadline_seconds = :seconds WHERE id = :id",
+        {"id": case["agent_id"], "seconds": execution_seconds},
+    )
+    _replace_execution(case, status="waiting")
+    generation = _rows(
+        "SELECT dispatch_generation FROM curie.execution_requests WHERE id = :id",
+        {"id": case["request_id"]},
+    )[0]["dispatch_generation"]
+    request_url = f"/v1/internal/work-items/requests/{case['request_id']}"
+    acquire = case["client"].post(
+        f"{request_url}/acquire",
+        headers=WORKER_HEADERS,
+        json={"owner": "fixture-runner", "generation": generation},
+    )
+    assert acquire.status_code == 200, acquire.text
+    started = case["client"].post(
+        f"{request_url}/start",
+        headers=WORKER_HEADERS,
+        json={
+            "owner": "fixture-runner",
+            "generation": generation,
+            "claim_name": "fixture-claim",
+            "sandbox_name": "fixture-sandbox",
+        },
+    )
+    assert started.status_code == 200, started.text
+    execution = _rows(
+        "SELECT started_at, execution_deadline FROM curie.execution_requests WHERE id = :id",
+        {"id": case["request_id"]},
+    )[0]
+    response = _read(case, _mint(case)["capability"])
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert datetime.fromisoformat(result["execution_deadline"]) == execution["execution_deadline"]
+    assert (
+        datetime.fromisoformat(started.json()["execution_deadline"])
+        == execution["execution_deadline"]
+    )
+    assert result["execution_seconds"] == execution_seconds
+    assert (execution["execution_deadline"] - execution["started_at"]).total_seconds() == (
+        execution_seconds
+    )
 
 
 @pytest.mark.parametrize(
@@ -468,6 +526,47 @@ def test_cancellation_during_the_github_read_returns_no_issue_content(
     response = _read(case, capability)
     assert response.status_code == 409, response.text
     assert TITLE not in response.text
+    assert _github_reads(case) != []
+
+
+def test_a_budget_change_during_the_github_read_keeps_the_granted_timing(
+    issue_case: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    case = issue_case
+    _execute(
+        "UPDATE curie.agents SET execution_deadline_seconds = 7200 WHERE id = :id",
+        {"id": case["agent_id"]},
+    )
+    _replace_execution(case, deadline_in=timedelta(minutes=59))
+    capability = _mint(case)["capability"]
+    execution = _rows(
+        "SELECT started_at, execution_deadline FROM curie.execution_requests WHERE id = :id",
+        {"id": case["request_id"]},
+    )[0]
+    original = work_item_issue.read_issue
+
+    async def read_then_reconfigure(*args: Any, **kwargs: Any) -> Any:
+        content = await original(*args, **kwargs)
+        await asyncio.to_thread(
+            _execute,
+            "UPDATE curie.agents SET execution_deadline_seconds = 10800 WHERE id = :id",
+            {"id": case["agent_id"]},
+        )
+        return content
+
+    monkeypatch.setattr(work_item_issue, "read_issue", read_then_reconfigure)
+    response = _read(case, capability)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert datetime.fromisoformat(result["execution_deadline"]) == execution["execution_deadline"]
+    assert result["execution_seconds"] == 3600
+    assert (
+        _rows(
+            "SELECT execution_deadline_seconds FROM curie.agents WHERE id = :id",
+            {"id": case["agent_id"]},
+        )[0]["execution_deadline_seconds"]
+        == 10800
+    )
     assert _github_reads(case) != []
 
 

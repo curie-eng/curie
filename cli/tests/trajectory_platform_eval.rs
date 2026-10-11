@@ -4,7 +4,7 @@
 //! structured matrix cells. Neither tier may infer a trajectory verdict from a
 //! Slack reply string.
 
-mod support;
+use crate::support;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;

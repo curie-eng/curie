@@ -838,7 +838,8 @@ these forms:
    or `runner/tests/test_x.py::test_y` for a Python test.
 2. `cli/tests/local/test_x.py::test_y` for a local Python test.
 3. `cli/tests/name.rs::test_name` for a Rust integration test.
-4. `charts/curie/ci/name.sh` for a chart check script.
+4. `charts/curie/ci/name.sh` or `charts/curie/ci/runtime/name.sh` for a chart
+   check script.
 
 The command runs the selector at the current `HEAD`, reverses only the change's
 non test files in a disposable worktree, then runs the selector again. It prints
@@ -981,3 +982,32 @@ Receipt and CLI progress metadata use the same reference-boundary vector as
 approval displays. Closing code quotes end a sentence reference just as closing
 parentheses, brackets and ordinary quotes do; requested filenames and paths stay
 literal. This wording changes neither answers nor stored actions.
+
+### Ordered cluster values files
+
+`CLUSTER-VALUES-FILES c1`: `cluster up` and `cluster upgrade` accept repeatable
+`-f FILE` / `--values-file FILE`. Files merge in caller order: maps merge
+recursively, while lists, scalars and explicit nulls replace earlier values.
+Existing explicit command flags keep their precedence. Without files, retained
+configuration and command behavior remain unchanged.
+
+`CLUSTER-VALUES-FILES c2`: read and parse the complete file set before cluster
+mutation. Missing, unreadable, malformed or non-map input fails closed without
+printing file contents. Snapshot parsed values so edits to an original file
+cannot change a later Helm application. Values remain typed, including numeric
+strings, dotted mapping keys and empty lists/maps.
+
+`CLUSTER-VALUES-FILES c3`: file values override retained operator configuration;
+existing credential, provider, namespace, controller, gVisor, configuration and
+schema admission checks validate the final effective overlay. On upgrade, any
+derived stock runner layer rebind or stale binding removal becomes part of that
+final snapshot before schema compatibility and timeout metadata are rendered.
+All preflight renders and the actual Helm application use that same overlay and
+the same existing generated/inferred overrides. A file may not bypass a guard.
+
+`CLUSTER-VALUES-FILES c4`: file credentials use the existing private values-file
+lifecycle and stay out of previews, JSON plans, diagnostic contents and argument
+values. Regenerate the command manifests for the new flags. This feature does
+not change release versions or authorize contract migrations.
+
+Tracked by [#4319](https://github.com/curie-eng/curie/issues/4319).

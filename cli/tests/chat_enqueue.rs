@@ -19,15 +19,8 @@ use curie::slack::{post_placeholder, SlackTransport};
 use curie::state::{load_turn, TurnContext, TurnVerb};
 use curie_aci_protocol::QueuedTurn;
 
-mod support;
+use crate::support;
 use support::{unique_stream, valkey_or_skip, Response};
-
-/// `SLACK_API_BASE_URL` is process-global, so every test in this binary that
-/// redirects it holds this lock for the whole redirect. Without it two such tests
-/// running concurrently would each post at the other's stub (or, after the
-/// other's `remove_var`, at real Slack). A tokio mutex, not a std one, because
-/// the redirect is held across `await` points.
-static SLACK_BASE_URL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
 async fn xadd_lands_the_exact_seam_shape_on_real_valkey() {
@@ -397,7 +390,10 @@ async fn stub_captures_json_body_and_never_404s_other_methods() {
 /// coverage.
 #[tokio::test]
 async fn post_placeholder_threads_the_outbound_post_only_when_a_thread_is_named() {
-    let _slack_base = SLACK_BASE_URL_LOCK.lock().await;
+    // SLACK_API_BASE_URL is process-global: without the shared lock a concurrent
+    // redirect would post at this test's stub (or, after this test's
+    // `remove_var`, at real Slack).
+    let _slack_base = support::ENV_LOCK.lock().await;
     const NAMED_THREAD: &str = "1717171717.000100";
     let slack =
         support::serve(|_req| Response::json(200, r#"{"ok": true, "ts": "1717171717.000900"}"#));
@@ -510,9 +506,9 @@ async fn enqueue_connected(
     // must never clobber the developer's own saved turn and break their next
     // `message --continue`. Declared before the guard so the guard (dropped
     // first) restores the cwd before the temp dir is removed. The caller holds
-    // SLACK_BASE_URL_LOCK across this whole call, which serializes the cwd
-    // change against the only other test in this binary that touches
-    // process-global state.
+    // support::ENV_LOCK across this whole call, which serializes both the
+    // SLACK_API_BASE_URL redirect and the cwd change against every other test
+    // in the integration binary that touches process-global state.
     let state_home = tempfile::tempdir().expect("temp dir for the persisted turn state");
     let _cwd = CwdGuard(std::env::current_dir().expect("resolving the current working directory"));
     std::env::set_current_dir(state_home.path()).expect("pointing the cwd at the temp dir");
@@ -562,7 +558,7 @@ async fn enqueue_connected(
 /// `SLACK_API_BASE_URL` redirect.
 #[tokio::test]
 async fn connected_transport_enqueues_the_real_placeholder_as_the_conversation_id() {
-    let _slack_base = SLACK_BASE_URL_LOCK.lock().await;
+    let _slack_base = support::ENV_LOCK.lock().await;
     let Some(mut conn) =
         valkey_or_skip("connected_transport_enqueues_the_real_placeholder_as_the_conversation_id")
             .await

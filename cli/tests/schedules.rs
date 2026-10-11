@@ -5,7 +5,7 @@
 //! emitters against a wire-level HTTP peer, and asserts on stdout and the
 //! process exit code (0 ok, 1 failure, 3 transient, 4 unsupported at this tier).
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::process::{Command, Output, Stdio};

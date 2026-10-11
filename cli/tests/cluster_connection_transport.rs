@@ -7,7 +7,7 @@
 //! network boundary: every governance verb must reach the tunnel, and the
 //! cleartext decoy must receive nothing.
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
