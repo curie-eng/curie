@@ -1129,3 +1129,41 @@ jobs:
       - name: Remove owned cluster
         if: always()
         run: kind delete cluster --name curie-reserved-env
+
+  # #4311: three overlapping `curie cluster message` processes without --thread
+  # must land in three conversations. The script owns its whole lifecycle: it
+  # builds the CLI from this checkout, creates and deletes its own kind
+  # cluster, pulls the chart's published images, and verifies its teardown.
+  # Fix pin verification runs the same script red-on-revert; this job keeps
+  # the regression running on chart changes, and gives chart-check's root
+  # inventory the helm-ci step every root script needs.
+  automatic-thread-isolation:
+    name: Automatic thread isolation (kind)
+    runs-on: ubuntu-latest
+    needs: [chart-changes]
+    if: ${{ needs.chart-changes.outputs.chart == 'true' }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Pull Docker Hub images through the mirror
+        run: bash cli/scripts/configure-docker-hub-mirror.sh
+      - name: Install Helm
+        id: install_helm
+        continue-on-error: true
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.17.3
+      - name: Back off before retrying Install Helm
+        if: steps.install_helm.outcome == 'failure'
+        run: |
+          echo "Install Helm failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install Helm (retry)
+        if: steps.install_helm.outcome == 'failure'
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v3.17.3
+      - name: Concurrent automatic threads stay isolated
+        run: bash charts/curie/ci/automatic-thread-isolation.sh
