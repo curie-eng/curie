@@ -1816,7 +1816,7 @@ pub fn prepare(
     })
 }
 
-const SANDBOX_TEMPLATE_KIND: &str = "sandboxtemplates.extensions.agents.x-k8s.io";
+pub(crate) const SANDBOX_TEMPLATE_KIND: &str = "sandboxtemplates.extensions.agents.x-k8s.io";
 const SANDBOX_POOL_KIND: &str = "sandboxwarmpools.extensions.agents.x-k8s.io";
 
 fn kubectl_get_args(namespace: &str, kind: &str, name: Option<&str>) -> Vec<String> {

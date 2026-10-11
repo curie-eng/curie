@@ -108,13 +108,13 @@ def test_the_bundle_image_pins_the_slack_server():
     assert "bless another authed third-party MCP server" not in platform
 
 
-def test_the_manifest_declares_the_three_secrets_and_no_approval_route():
+def test_the_manifest_requires_slack_and_keeps_github_optional_without_approval_route():
     manifest = _manifest()
     assert manifest["secrets"] == [
         "MEAN_TESTER_SLACK_BOT_TOKEN",
         "MEAN_TESTER_SLACK_TEAM_ID",
-        "GITHUB_PERSONAL_ACCESS_TOKEN",
     ]
+    assert manifest["optionalSecrets"] == ["GITHUB_PERSONAL_ACCESS_TOKEN"]
     assert "approvalPolicy" not in manifest
     assert manifest["toolPolicy"]["approvalRequired"] == []
 
@@ -232,7 +232,9 @@ def test_every_platform_text_the_skill_judges_by_still_exists_in_the_platform():
         )
     )
     kernel_dir = REPO / "apps/worker/src/curie_worker/kernel"
-    sources += "\n" + "\n".join(path.read_text() for path in sorted(kernel_dir.glob("*.py")))
+    kernel_sources = sorted(kernel_dir.glob("*.py"))
+    assert kernel_sources, "worker kernel sources must exist"
+    sources += "\n" + "\n".join(path.read_text() for path in kernel_sources)
     joined = re.sub(r'"\s*\n\s*"', "", sources)  # join implicitly concatenated literals
     texts = _platform_texts()
     assert len(texts) >= 6

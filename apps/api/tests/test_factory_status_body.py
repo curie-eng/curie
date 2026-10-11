@@ -11,6 +11,7 @@ import pytest
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
 from curie_api.factory_progress import PhaseSlot, PhaseView, StageSlot
+from curie_api.factory_reply_target import is_relabel_objective
 from curie_api.forges.github.comments import GitHubMarkedComments, static_token
 from curie_api.forges.github.marked_comments import (
     GitHubCommentClient,
@@ -470,3 +471,44 @@ def test_marked_notice_create_update_and_unchanged_use_the_redacted_body(existin
         _assert_redacted(writes[0][1])
 
     asyncio.run(exercise())
+
+
+_RELABEL_BASE = "https://github.com"
+_RELABEL_URL = "https://github.com/acme-corp/acme-bot/issues/7"
+
+
+@pytest.mark.parametrize("clone_base", [_RELABEL_BASE, f"{_RELABEL_BASE}/"])
+@pytest.mark.parametrize(
+    "objective", [_RELABEL_URL, f"{_RELABEL_URL}\n\nRelabelled by a maintainer."]
+)
+def test_a_relabel_objective_is_the_bare_issue_url(objective: str, clone_base: str) -> None:
+    """#4345 AC6: the first line is exactly the issue URL under the clone base."""
+
+    assert is_relabel_objective(
+        objective, repo_full_name="acme-corp/acme-bot", issue_number=7, clone_base=clone_base
+    )
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        f"{_RELABEL_URL}#issuecomment-1",
+        "https://github.com/acme-corp/acme-bot/pull/7",
+        "https://github.com/acme-corp/acme-bot/issues/8",
+        "https://github.com/acme-corp/other-bot/issues/7",
+        f"{_RELABEL_URL}/x",
+        f"{_RELABEL_URL}/",
+        f"{_RELABEL_URL}0",
+        f"Relabelled.\n{_RELABEL_URL}",
+        None,
+        "",
+    ],
+)
+def test_anything_but_the_bare_issue_url_is_not_a_relabel_objective(
+    objective: str | None,
+) -> None:
+    """#4345 AC6: fragments, PR URLs, other issues or repos, and trailing paths refuse."""
+
+    assert not is_relabel_objective(
+        objective, repo_full_name="acme-corp/acme-bot", issue_number=7, clone_base=_RELABEL_BASE
+    )

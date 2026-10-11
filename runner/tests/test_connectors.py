@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -1156,6 +1157,48 @@ def test_build_runner_expands_the_bearer_and_drops_it_from_spawn_env(
     assert spawn["STDIO_TOKEN"] == "keep-me"
     github = session.options.mcp_servers["github"]
     assert github["headers"]["Authorization"] == "Bearer ghp_sentinel"
+
+
+def test_optional_binding_is_projected_before_hosted_secret_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CURIE_STATE_URL", raising=False)
+    monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "example-shared-token")
+    root = _bundle(
+        tmp_path,
+        GITHUB,
+        mcp={
+            "mcpServers": {
+                "stdio": {"command": "node", "env": {"TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"}}
+            }
+        },
+    )
+    manifest_path = root / ".claude-plugin/plugin.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["optionalSecrets"] = ["GITHUB_PERSONAL_ACCESS_TOKEN"]
+    manifest_path.write_text(json.dumps(manifest))
+    before = (root / ".mcp.json").read_bytes()
+    config = _config_for(root, release="curie", agent="acme-dev", namespace="curie")
+    spawn = {"GITHUB_PERSONAL_ACCESS_TOKEN": "example-shared-token"}
+
+    async def probe(*_args: Any, **_kwargs: Any) -> McpToolCapabilityProbe:
+        return McpToolCapabilityProbe(complete=True, has_potential_write_tool=False, tool_count=0)
+
+    monkeypatch.setattr(boot, "probe_mcp_tool_capability", probe)
+    monkeypatch.setattr(boot, "ClaudeAgentSession", _CapturedSession)
+    runner = build_runner(config, fake_model=False, sdk_env=spawn)
+    session = runner._factory()
+    assert isinstance(session, _CapturedSession)
+    # Bound is judged at boot, before hosted credential custody removes the
+    # process variable. Preserve existing stdio placeholder semantics; this is
+    # not a claim that sharing hosted/stdio credentials authenticates stdio.
+    servers = session.options.mcp_servers
+    assert servers["plugin:b:stdio"]["env"]["TOKEN"] == "${GITHUB_PERSONAL_ACCESS_TOKEN}"
+    assert servers["github"]["headers"]["Authorization"] == "Bearer example-shared-token"
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in spawn
+    assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in os.environ
+    assert "example-shared-token" in runner._held_secrets
+    assert (root / ".mcp.json").read_bytes() == before
 
 
 # --------------------------------------------------------------------------- #

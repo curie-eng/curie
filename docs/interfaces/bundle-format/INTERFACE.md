@@ -49,6 +49,8 @@ plugin shape verbatim plus a strict Curie-only overlay, not a Claude Code plugin
 
 ## Current contract
 
+The optional-secret contract follows the [accepted decision on the source release train](https://github.com/curie-eng/curie/blob/757ac40ff53af39622e0dc0fe09db4ea66dcf868/docs/adr/0209-a-bundle-may-declare-a-secret-optional.md) and #4129. This backport preserves that decision without assigning its number to a different decision on this release train.
+
 `validate_bundle(path) -> ValidationResult` is the single entry point every deploy path calls
 (`packages/plugin-format/src/plugin_format/validate.py::validate_bundle`). It returns path-qualified
 issues (codes like `manifest.missing`, `manifest.name_invalid`, `mcp.server_incomplete`) instead of
@@ -71,7 +73,7 @@ which also adds the second, non-default `agent-skills-strict` validation profile
 Those are the Claude-Code-shaped surfaces. `validate_bundle` also validates three **Curie-only root
 files**, each absent from a bundle that needs none, all three invisible to Claude Code:
 
-- `connectors.yaml` (ADR-0086, `packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`)
+1. `connectors.yaml` (ADR-0086, `packages/plugin-format/src/plugin_format/connectors.py::ConnectorsFile`)
   declares the MCP servers Curie should run or reach on the bundle's behalf, keyed by connector name.
   Each entry is a `packages/plugin-format/src/plugin_format/connectors.py::ConnectorSpec` in exactly
   one of three mutually exclusive forms: hosted by reference (`image`, plus `args`/`env`/`port`
@@ -121,7 +123,7 @@ files**, each absent from a bundle that needs none, all three invisible to Claud
   `connectors.build_no_platforms`, `connectors.ambiguous_name` (a connector name that contains
   `-mcp-` or STARTS with `mcp-`, forging the `-mcp-` join used to render the connector's object
   name, so two different (agent, connector) pairs would render byte-identical objects — checked
-  only for a hosted connector, one declaring `image:`; a remote connector, declaring `url:`,
+  only for a hosted connector, one declaring `image:` or `build:`; a remote connector, declaring `url:`,
   derives no Kubernetes object name, since `render()` emits no objects for it and its `.mcp.json`
   entry is the authored URL, so its name is not checked), `connectors.direct_service_collision` (a
   hosted connector named `x-direct` beside a hosted `x`, whose direct Service behind a caller proxy
@@ -236,7 +238,7 @@ script from `.github/workflows/plugin-compat.yaml` on two triggers, because drif
 directions: a path-filtered `pull_request` trigger catches our own drift when we touch the bundles
 or the format models, and a nightly `schedule` catches Claude Code changing the format under us,
 which no PR of ours would ever surface. The check is deliberately not `--strict`: strict mode
-promotes unknown-field warnings to errors, and the six Curie authoring extensions are
+promotes unknown-field warnings to errors, and the seven Curie authoring extensions are
 unknown-to-Claude-Code by design, so warnings are the expected steady state and only a non-zero
 exit is a failure.
 
@@ -296,8 +298,8 @@ Code keys still validate.
 
 By intent, the manifest, skill, and MCP surfaces are Claude-Code-shaped — that is the wedge, not a
 leak. What the wedge
-costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**. All six
-Curie authoring extensions — `systemPrompt`, `starterPrompts`, `secrets`, `triggers`,
+costs is asymmetric fidelity: a bundle loaded by Claude Code **validates but degrades**. All seven
+Curie authoring extensions — `systemPrompt`, `starterPrompts`, `secrets`, `optionalSecrets`, `triggers`,
 `approvalPolicy`, `toolPolicy` — are unknown fields to Claude Code, which warns about each and then
 silently ignores it at load time. The manifest is accepted and the commands, agents, hooks, and MCP
 servers work; the agent's persona, its suggested openers, its secret declarations, its wake-up
@@ -321,7 +323,7 @@ model the key at all, and the lenient models accept and silently ignore it.
 
 The three Curie-only root files degrade **more quietly still**, and they belong on the same list. A
 manifest extension at least draws a warning: `claude plugin validate examples/compat-fixture` (the
-fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which exists to carry all six)
+fixture at `examples/compat-fixture/.claude-plugin/plugin.json`, which carries the original six)
 reports one `Unknown field ... Claude Code ignores it at load time` warning per extension.
 `connectors.yaml`, `connectors.lock.yaml`, and `deploy.yaml` are not manifest fields at all, so
 Claude Code neither loads them nor mentions them: validating `examples/weather` (which carries `examples/weather/connectors.yaml`)

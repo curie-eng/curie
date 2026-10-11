@@ -116,8 +116,8 @@ Fix pin waiver: <reason>
      or routers/publications changes; runner verification preflight or factory
      progress; examples/dark-factory; and worker work item execution. Run the
      production factory scenario through the changed components. A canned
-     fixture or fake scenario does not close this tier. Until #3814 ships its
-     scenario, use `curie dev factory-e2e run --scenario issue-to-pr`.
+     fixture or fake scenario does not close this tier. Run
+     `curie dev factory-e2e scripted`, the scenario the factory row names.
 
      The guard derives minimum required tiers from changed files. Body prose
      cannot omit a required row or make it n/a. Skill and local may use fake

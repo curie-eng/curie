@@ -43,8 +43,10 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from claude_agent_sdk import __version__ as _SDK_VERSION
 from claude_agent_sdk._cli_version import __cli_version__
 from claude_agent_sdk._internal.session_store import project_key_for_directory
+from claude_agent_sdk._internal.transport.subprocess_cli import _DEFAULT_MAX_BUFFER_SIZE
 from claude_agent_sdk.types import (
     CanUseTool,
     McpSdkServerConfig,
@@ -64,6 +66,7 @@ from .history import (
     validate_assistant_groups,
 )
 from .mcp_argv import install as install_mcp_argv_offload
+from .startup_diagnostics import StderrTail, sdk_initialize_diagnostics
 
 install_mcp_argv_offload()
 
@@ -123,8 +126,10 @@ def _recover_assistant_groups(
         ):
             return messages, False
         group = _assistant_group(payload.get("id")) if message.role == "assistant" else None
-        if message.role == "assistant" and group is None and (
-            message.assistant_group is not None or payload.get("id") is not None
+        if (
+            message.role == "assistant"
+            and group is None
+            and (message.assistant_group is not None or payload.get("id") is not None)
         ):
             # Exact content is insufficient when the native envelope cannot
             # represent the portable grouping. Rebuild its IDs from portable.
@@ -143,13 +148,13 @@ def _recover_assistant_groups(
     recovered = tuple(
         replace(
             message,
-            assistant_group=message.assistant_group or (
-                native_to_portable.get(group, group) if group is not None else None
-            ),
+            assistant_group=message.assistant_group
+            or (native_to_portable.get(group, group) if group is not None else None),
         )
         for message, group in pairs
     )
     return recovered, native_eligible
+
 
 # The CLI's built-in instructions tell the model to end commits with a
 # "Co-Authored-By: Claude" trailer and PR bodies with the "Generated with
@@ -341,9 +346,9 @@ def build_structured_resume(
         entry_uuid = str(uuid.uuid5(uuid.UUID(session_id), f"{index}:{canonical}"))
         provider_message = {"role": message.role, "content": message.to_dict()["content"]}
         if message.assistant_group is not None:
-            provider_message["id"] = "msg_curie_" + uuid.uuid5(
-                uuid.UUID(session_id), message.assistant_group
-            ).hex
+            provider_message["id"] = (
+                "msg_curie_" + uuid.uuid5(uuid.UUID(session_id), message.assistant_group).hex
+            )
         entry = cast(
             "SessionStoreEntry",
             {
@@ -406,8 +411,17 @@ def _content_block_to_dict(block: object) -> dict[str, Any] | None:
 
 
 def model_message_to_conversation(message: object) -> ConversationMessage | None:
-    """Project one SDK message into Curie's portable role/content shape."""
+    """Project one SDK message into Curie's portable role/content shape.
 
+    A subagent's messages (those with a parent tool call) are not portable
+    history: the parent's ``Agent`` call and its result already carry what the
+    parent saw (RUNNER-HISTORY-GROUP-4).
+    """
+
+    if isinstance(message, UserMessage | AssistantMessage) and (
+        message.parent_tool_use_id is not None
+    ):
+        return None
     if isinstance(message, UserMessage):
         if isinstance(message.content, str):
             content: str | list[dict[str, Any]] = message.content
@@ -419,15 +433,11 @@ def model_message_to_conversation(message: object) -> ConversationMessage | None
             ]
         return ConversationMessage(role="user", content=content)
     if isinstance(message, AssistantMessage):
-        nested = message.parent_tool_use_id is not None
         content = [
             projected
             for block in message.content
-            if not (nested and isinstance(block, TextBlock | ThinkingBlock))
-            and (projected := _content_block_to_dict(block)) is not None
+            if (projected := _content_block_to_dict(block)) is not None
         ]
-        if nested and not content:
-            return None
         return ConversationMessage(
             role="assistant",
             content=content,
@@ -613,11 +623,7 @@ def build_options(
     sdk_env[_SDK_REVIEWER_MODEL_ENV] = (
         reviewer_model
         if reviewer_model is not None
-        else (
-            "claude-opus-5-5"
-            if credential.startswith("sk-ant-")
-            else "openai/gpt-6.1-sol"
-        )
+        else ("claude-opus-5-5" if credential.startswith("sk-ant-") else "openai/gpt-6.1-sol")
     )
     title_model = sdk_env.get(_SDK_TITLE_MODEL_ENV, os.environ.get(_SDK_TITLE_MODEL_ENV, ""))
     if not title_model.strip():
@@ -687,8 +693,19 @@ class ClaudeAgentSession:
     """ModelSession backed by a real claude-agent-sdk streaming-input session."""
 
     def __init__(self, options: ClaudeAgentOptions) -> None:
-        self._options = options
-        self._client = ClaudeSDKClient(options)
+        # Install the stderr tail before the client exists: the SDK copies
+        # options at connect and its transport keeps that copy, so the tail
+        # must already be on every copy to keep forwarding after connect.
+        self._stderr_tail = StderrTail(
+            options.stderr,
+            partial_line_chars=(
+                options.max_buffer_size
+                if options.max_buffer_size is not None
+                else _DEFAULT_MAX_BUFFER_SIZE
+            ),
+        )
+        self._options = replace(options, stderr=self._stderr_tail)
+        self._client = ClaudeSDKClient(self._options)
 
     async def connect(self) -> None:
         # The SDK copies os.environ into the CLI at spawn. Install the parent
@@ -711,13 +728,16 @@ class ClaudeAgentSession:
         # SDK options override inherited env at spawn. Pin authority last in
         # both maps so options cannot select an unsanitized shell/interpreter.
         self._options.env.update(sdk_shell_env())
-        try:
-            os.environ.clear()
-            os.environ.update(cli_parent_env(snapshot))
-            await self._client.connect()
-        finally:
-            os.environ.clear()
-            os.environ.update(snapshot)
+        # The env restore runs inside the diagnostics window, so the finish
+        # record is written only after the process env is the snapshot again.
+        with sdk_initialize_diagnostics(self._stderr_tail, _SDK_VERSION):
+            try:
+                os.environ.clear()
+                os.environ.update(cli_parent_env(snapshot))
+                await self._client.connect()
+            finally:
+                os.environ.clear()
+                os.environ.update(snapshot)
 
     async def query(self, text: str) -> None:
         await self._client.query(text)

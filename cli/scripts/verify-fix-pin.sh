@@ -112,7 +112,7 @@ fi
 
 selector_file=
 selector_kind=
-rust_target=
+rust_module=
 rust_test=
 case "$selector" in
   cli/tests/local/test_*.py::*)
@@ -135,8 +135,8 @@ case "$selector" in
     if [[ -z "$rust_test" || "$rust_test" == *::* || ! "$rust_test" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
       fail "unsupported selector: $selector"
     fi
-    rust_target=${selector_file##*/}
-    rust_target=${rust_target%.rs}
+    rust_module=${selector_file##*/}
+    rust_module=${rust_module%.rs}
     selector_kind=rust
     ;;
   charts/curie/ci/*.sh)
@@ -181,7 +181,7 @@ run_selector() {
     rust)
       (
         cd "$scratch"
-        cargo test --manifest-path cli/Cargo.toml --test "$rust_target" -- --exact "$rust_test"
+        cargo test --manifest-path cli/Cargo.toml --test integration -- --exact "$rust_module::$rust_test"
       )
       ;;
     chart)
@@ -653,7 +653,7 @@ PY
     fi
     ;;
   rust)
-    if grep -Fq "test $rust_test ... FAILED" "$reversed_stdout" "$reversed_stderr"; then
+    if grep -Fq "test $rust_module::$rust_test ... FAILED" "$reversed_stdout" "$reversed_stderr"; then
       :
     else
       if [[ ! "$rust_range" =~ ^([0-9]+):([0-9]+)$ ]]; then

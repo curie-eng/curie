@@ -6,7 +6,7 @@
 //! process exit code (ADR 0021/0041: 0 ok, 1 failure, 2 usage, 3 transient,
 //! 4 unsupported at this tier).
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::process::{Command, Output, Stdio};

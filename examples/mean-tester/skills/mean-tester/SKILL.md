@@ -23,6 +23,11 @@ The default channel is where you probe when a request names none, as a
 `C…` id. You read target bundles from Git only in the repositories listed
 here, as `owner/repo@branch`.
 
+`GITHUB_PERSONAL_ACCESS_TOKEN` is optional. Without it, use the request spec,
+attachments or a recorded exchange. Skip authenticated GitHub tools and ask
+for the spec in the request when a repository cannot be read. Never claim
+repository access or a commit you did not observe.
+
 New threads per 15 minutes is the share of the target installation's sandboxes
 a campaign may take: each thread you open holds one for as long as it lives,
 and the target's real users need the rest. Follow-ups per thread is how many

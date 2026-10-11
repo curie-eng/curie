@@ -14,9 +14,8 @@
 //! - a registry that cannot answer is refused with the chart value
 //!   `agentSandbox.runner.digest` named as the way to supply the digest.
 
-#[path = "support/oci_registry_stub.rs"]
-mod oci_registry_stub;
-mod support;
+use crate::support;
+use crate::support::oci_registry_stub;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

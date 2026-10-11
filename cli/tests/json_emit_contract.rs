@@ -12,7 +12,7 @@
 //! (comms/eval legitimately exit non-zero with a JSON *error* object); the bug
 //! under test is empty stdout, not a nonzero code.
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

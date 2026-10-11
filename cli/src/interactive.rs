@@ -960,8 +960,10 @@ fn deploy_to_slack(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &
         done.push(line);
     }
     done.push("");
-    done.push(format!(
-        "Disconnect Slack:  curie {verb} comms --slack --disconnect"
+    done.push(disconnect_slack_hint(
+        tier,
+        namespace.as_deref(),
+        release.as_deref(),
     ));
     if tier == Tier::Local {
         done.push("Stop the stack:    curie local down".to_string());
@@ -1206,6 +1208,23 @@ pub(crate) fn planned_prompts(
     asks.push("the Slack channel id");
     asks.push("the bundle directory");
     asks
+}
+
+pub(crate) fn disconnect_slack_hint(
+    tier: Tier,
+    namespace: Option<&str>,
+    release: Option<&str>,
+) -> String {
+    match tier {
+        Tier::Cluster => {
+            let ns = namespace.unwrap_or("<namespace>");
+            let rel = release.unwrap_or("<release>");
+            format!(
+                "Disconnect Slack:  curie cluster comms --slack --disconnect --namespace {ns} --release {rel}"
+            )
+        }
+        Tier::Local => "Disconnect Slack:  curie local comms --slack --disconnect".to_string(),
+    }
 }
 
 /// What to do when the bot does not answer.
@@ -2724,6 +2743,38 @@ mod tests {
             "{lines}"
         );
         assert!(lines.contains("curie doctor"), "{lines}");
+    }
+
+    #[test]
+    fn the_cluster_disconnect_hint_targets_the_chosen_release() {
+        assert_eq!(
+            disconnect_slack_hint(Tier::Cluster, Some("acme-system"), Some("acme-production")),
+            "Disconnect Slack:  curie cluster comms --slack --disconnect --namespace acme-system --release acme-production"
+        );
+        assert_eq!(
+            disconnect_slack_hint(Tier::Cluster, None, None),
+            "Disconnect Slack:  curie cluster comms --slack --disconnect --namespace <namespace> --release <release>"
+        );
+        assert_eq!(
+            disconnect_slack_hint(Tier::Cluster, Some("acme-system"), None),
+            "Disconnect Slack:  curie cluster comms --slack --disconnect --namespace acme-system --release <release>"
+        );
+        assert_eq!(
+            disconnect_slack_hint(Tier::Cluster, None, Some("acme-production")),
+            "Disconnect Slack:  curie cluster comms --slack --disconnect --namespace <namespace> --release acme-production"
+        );
+    }
+
+    #[test]
+    fn the_local_disconnect_hint_carries_no_release_flags() {
+        assert_eq!(
+            disconnect_slack_hint(Tier::Local, None, None),
+            "Disconnect Slack:  curie local comms --slack --disconnect"
+        );
+        assert_eq!(
+            disconnect_slack_hint(Tier::Local, Some("acme-system"), Some("acme-production")),
+            "Disconnect Slack:  curie local comms --slack --disconnect"
+        );
     }
 
     /// And it must not overclaim. The commands succeeding is not a round trip.

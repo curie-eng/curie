@@ -5,8 +5,7 @@
 //! overridable. This file talks to the clap binary only so the selected pin
 //! still compiles against the parent `RollbackOpts` (no new struct field).
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::Path;

@@ -28,6 +28,7 @@ _PLATFORM = (
     "publication-unrecorded",
     "history-persistence-error",
     "max-turns",
+    "model-unreachable",
 )
 
 

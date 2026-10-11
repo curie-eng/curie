@@ -5,8 +5,7 @@
 //! 0.8.4's migrate init container does not know. This file pins the additional
 //! pre-mutation gate. Status filtering stays in `cluster_rollback.rs`.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::Path;
@@ -608,11 +607,12 @@ fn a_failed_helm_revision_is_still_not_a_schema_question() {
     assert_eq!(choice.skipped, vec![2]);
 }
 
-/// THE REGRESSION TEST for #2296 plus the negative control. One PATH-mutating
-/// test in this binary so it cannot race itself (same discipline as
-/// `cluster_rollback.rs`).
+/// THE REGRESSION TEST for #2296 plus the negative control. It holds
+/// `support::ENV_LOCK` while it mutates PATH and the fake-tool env (same
+/// discipline as `cluster_rollback.rs`).
 #[tokio::test]
 async fn v085_revision_0039_to_v084_is_refused_before_helm_mutates() {
+    let _env = crate::support::ENV_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let history_json = dir.path().join("history.json");
     fs::write(&history_json, issue_2296_history_json()).expect("write history");

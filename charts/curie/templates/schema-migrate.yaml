@@ -68,6 +68,9 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
+              if python -c 'import curie_api.schema_compat' >/dev/null 2>&1; then
+                exec python -m curie_api.schema_compat upgrade
+              fi
               attempt=1
               max_attempts=60
               probe_error_class=""
@@ -109,9 +112,6 @@ spec:
                   print(type(error).__name__)
                   raise SystemExit(1)
               ' 2>/dev/null); then
-                  if python -c 'import curie_api.schema_compat' >/dev/null 2>&1; then
-                    exec python -m curie_api.schema_compat upgrade
-                  fi
                   # Retained pre-#2300 API image (helm --reset-then-reuse-values
                   # keeps the old digest). That image still ships Alembic and
                   # is already at its own head; upgrade head is a no-op.
@@ -134,6 +134,17 @@ spec:
               exit 1
           env:
             {{- include "curie.env.postgres" . | nindent 12 }}
+            {{- if and .Release.IsUpgrade .Values.worker.deploy .Values.worker.upgradeDrain.enabled }}
+            {{- include "curie.env.valkey" . | nindent 12 }}
+            - name: CURIE_INSTALLATION_ID
+              value: {{ include "curie.installationId" . | quote }}
+            - name: CURIE_UPGRADE_REVISION
+              value: {{ .Release.Revision | toString | quote }}
+            - name: CURIE_UPGRADE_LEGACY_QUIESCE
+              value: {{ include "curie.upgradeLegacyQuiesce" . | quote }}
+            - name: KEY_PREFIX
+              value: "curie:worker"
+            {{- end }}
             - name: CURIE_SCHEMA_FORWARD_ONLY
               value: {{ .Values.api.migrate.forwardOnly | default false | quote }}
             {{- /*

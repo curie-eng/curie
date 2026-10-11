@@ -6,7 +6,7 @@
 //! so the token never leaves this process; assertions are that stdout/stderr
 //! never contain it and that kubectl is given `--patch-file`, not the value.
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

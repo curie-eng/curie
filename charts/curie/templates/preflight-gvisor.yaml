@@ -37,7 +37,7 @@ metadata:
     # still fails the release closed. Otherwise it runs pre-install to block a
     # broken install up front. Both branches also run on `helm test`.
     "helm.sh/hook": {{ if .Values.security.gvisor.installRuntimeClass }}post-install,post-upgrade,test{{ else }}pre-install,pre-upgrade,test{{ end }}
-    "helm.sh/hook-weight": "-9"
+    "helm.sh/hook-weight": {{ if .Values.security.gvisor.installRuntimeClass }}"-9"{{ else }}"-11"{{ end }}
     "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   backoffLimit: 0

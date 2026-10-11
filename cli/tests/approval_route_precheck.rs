@@ -9,7 +9,7 @@
 //! assertions target the recorded requests and the returned error's class,
 //! message and fix, never an internal struct and never stderr warnings.
 
-mod support;
+use crate::support;
 
 use curie::commands::{
     approvals, deploy, AgentActionOpts, ApprovalCmd, ApprovalsOutput, DeployOpts, DeployTier,
@@ -316,6 +316,7 @@ async fn existing_agent_with_other_bound_route_is_refused_and_names_both() {
 #[tokio::test]
 async fn refusal_sends_no_secrets_patch() {
     const SECRET: &str = "CURIE_TEST_PRECHECK_2448_SECRET";
+    let _env = support::ENV_LOCK.lock().await;
     std::env::set_var(SECRET, "precheck-2448-value");
     let dir = gated_bundle(&[("Bash", "ops")]);
     let mut stub = DeployStub::existing(agent_json("deal-desk", None));

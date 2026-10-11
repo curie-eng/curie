@@ -16,7 +16,8 @@
     "false-completion",
     "publication-unrecorded",
     "history-persistence-error",
-    "max-turns"
+    "max-turns",
+    "model-unreachable"
   ],
   "vectors": [
     {
@@ -123,6 +124,11 @@
       "name": "platform_max_turns",
       "input": "max-turns",
       "expected": "max-turns"
+    },
+    {
+      "name": "platform_model_unreachable",
+      "input": "model-unreachable",
+      "expected": "model-unreachable"
     },
     {
       "name": "sdk_error_max_turns_subtype_is_not_vocabulary",

@@ -181,6 +181,9 @@ async def read_work_item_issue(
         raise issue_read_error(
             503, "issue_unavailable", "GitHub could not answer the issue read; retry shortly"
         ) from None
+    # The database requires both timestamps for a running execution.
+    assert current.started_at is not None
+    assert current.execution_deadline is not None
     return IssueReadResult(
         repo_full_name=authority.repo_full_name,
         issue_number=authority.issue_number,
@@ -193,4 +196,6 @@ async def read_work_item_issue(
             for c in content.comments
         ],
         comments_truncated=content.comments_truncated,
+        execution_deadline=current.execution_deadline,
+        execution_seconds=int((current.execution_deadline - current.started_at).total_seconds()),
     )

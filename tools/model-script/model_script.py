@@ -1,10 +1,9 @@
 """Scripted Anthropic Messages endpoint for factory runs (#3814).
 
-``serve`` replays a transcript. Requests are matched by normalized content,
-including subagent calls whose system text differs from the implementer.
-An unexpected request is retained, answered as an error, and fails the
-process. ``record`` proxies each request to an Anthropic-compatible provider
-and appends the exchange.
+``serve`` replays a transcript. Requests are matched by the scrubbed first
+user message and the number of assistant messages in that lane. An unexpected
+request is answered as an error and fails the process. ``record`` proxies each
+request to an Anthropic-compatible provider and appends its replay fields.
 
 The Claude Agent SDK posts ``/v1/messages`` on ``CURIE_MODEL_BASE_URL`` and
 usually sets ``stream: true``. Streaming frames follow the Messages streaming
@@ -16,25 +15,31 @@ OpenRouter's Anthropic-compatible base is ``https://openrouter.ai/api``
 from __future__ import annotations
 
 import argparse
-import base64
 import json
+import os
 import re
 import signal
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-_DROP_KEYS = frozenset({"stream", "metadata", "cache_control"})
+# Above the 600 s upstream urlopen timeout, so close() outlasts any
+# in-flight recorded exchange without waiting on idle keep-alive sockets.
+CLOSE_DRAIN_TIMEOUT_S = 660.0
+
 _VOLATILE = re.compile(
     r"https?://[^\s\"'\\<>]+"
     r"|toolu_[A-Za-z0-9]+"
     r"|msg_[A-Za-z0-9]+"
     r"|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
     r"|\b[0-9a-f]{40}\b"
-    r"|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?"
+    r"|\b\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?)?"
+    r"|\b\d+\.\d+\s*(?:seconds?|s)\b"
 )
 
 
@@ -48,26 +53,40 @@ def scrub(text: str) -> str:
     return _VOLATILE.sub("<v>", text)
 
 
-def normalize(value: Any) -> Any:
-    """Canonical content used to match a request to a transcript entry."""
+def request_key(request: dict[str, Any]) -> tuple[str, int] | None:
+    """Identify a conversation lane and its next assistant response."""
 
-    if isinstance(value, dict):
-        if "input_schema" in value and "name" in value:
-            kept = {"name": value.get("name")}
-            if "description" in value:
-                kept["description"] = value.get("description")
-            return normalize(kept)
-        kept_items = {
-            key: normalize(item)
-            for key, item in value.items()
-            if key not in _DROP_KEYS
-        }
-        return {key: kept_items[key] for key in sorted(kept_items)}
-    if isinstance(value, list):
-        return [normalize(item) for item in value]
-    if isinstance(value, str):
-        return scrub(value)
-    return value
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return None
+    first_user = next(
+        (
+            message
+            for message in messages
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        None,
+    )
+    if first_user is None:
+        return None
+    content = first_user.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "\n".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        )
+    else:
+        return None
+    ordinal = sum(
+        isinstance(message, dict) and message.get("role") == "assistant"
+        for message in messages
+    )
+    return scrub(text), ordinal
 
 
 def message_to_sse(message: dict[str, Any]) -> bytes:
@@ -78,8 +97,10 @@ def message_to_sse(message: dict[str, Any]) -> bytes:
     def emit(event: str, data: dict[str, Any]) -> None:
         frames.append(f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n")
 
-    usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
-    start = {
+    usage = message.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    start: dict[str, Any] = {
         "id": message.get("id") or "msg_scripted",
         "type": "message",
         "role": "assistant",
@@ -228,6 +249,16 @@ def load_transcript(path: Path) -> list[dict[str, Any]]:
     exchanges = raw.get("exchanges") if isinstance(raw, dict) else None
     if not isinstance(exchanges, list):
         raise ValueError("transcript exchanges must be a list")
+    for exchange in exchanges:
+        if (
+            not isinstance(exchange, dict)
+            or set(exchange) != {"lane_key", "ordinal", "message"}
+            or not isinstance(exchange["lane_key"], str)
+            or type(exchange["ordinal"]) is not int
+            or exchange["ordinal"] < 0
+            or not isinstance(exchange["message"], dict)
+        ):
+            raise ValueError("transcript exchange requires lane_key, ordinal, and message")
     return exchanges
 
 
@@ -254,10 +285,15 @@ class ModelScript:
         self.record = record
         self.upstream = upstream.rstrip("/")
         self.host = host
+        self._record_key = os.environ.get("CURIE_FACTORY_RECORD_KEY", "") if record else ""
+        if record and not self._record_key:
+            raise ValueError("recording requires CURIE_FACTORY_RECORD_KEY")
         self._exchanges = [] if record else load_transcript(transcript)
         self._used: set[int] = set()
         self.unexpected: list[dict[str, Any]] = []
         self._lock = threading.Lock()
+        self._in_flight = 0
+        self._idle = threading.Condition()
         script = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -267,6 +303,14 @@ class ModelScript:
                 return
 
             def do_GET(self) -> None:  # noqa: N802
+                with script._serving():
+                    self._get()
+
+            def do_POST(self) -> None:  # noqa: N802
+                with script._serving():
+                    self._post()
+
+            def _get(self) -> None:
                 if self.path.split("?", 1)[0] in {"/", "/health"}:
                     body = b'{"ok":true}'
                     self.send_response(200)
@@ -277,10 +321,13 @@ class ModelScript:
                     return
                 script._reject(self, "GET", self.path, b"")
 
-            def do_POST(self) -> None:  # noqa: N802
+            def _post(self) -> None:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length)
                 path = self.path.split("?", 1)[0]
+                if path != "/v1/messages":
+                    script._reject(self, "POST", path, body)
+                    return
                 if script.record:
                     script._record(self, path, body)
                     return
@@ -288,6 +335,7 @@ class ModelScript:
 
         self._server = ThreadingHTTPServer((host, port), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._closed = False
 
     @property
     def port(self) -> int:
@@ -302,25 +350,56 @@ class ModelScript:
         self._thread.start()
 
     def close(self) -> None:
-        self._server.shutdown()
+        if self._closed:
+            return
+        self._closed = True
+        if self._thread.is_alive():
+            self._server.shutdown()
+            self._thread.join(timeout=5)
+        with self._idle:
+            drained = self._idle.wait_for(
+                lambda: self._in_flight == 0, timeout=CLOSE_DRAIN_TIMEOUT_S
+            )
+            in_flight = self._in_flight
         self._server.server_close()
         if self.record:
-            dump_transcript(self.transcript, self._exchanges)
+            with self._lock:
+                dump_transcript(self.transcript, list(self._exchanges))
+        if not drained:
+            # A request still in flight may be charged upstream yet never
+            # reach the transcript, so the close must not pass.
+            raise RuntimeError(
+                f"model endpoint drain timed out with {in_flight} request(s) still in flight"
+                + (f"; {len(self.unexpected)} unexpected request(s)" if self.unexpected else "")
+            )
         if self.unexpected:
             raise UnexpectedRequest(
-                f"{len(self.unexpected)} request(s) were not in the transcript"
+                f"unexpected model request: {len(self.unexpected)} request(s) "
+                "were not in the transcript"
             )
 
-    def _match(self, method: str, path: str, body: bytes) -> dict[str, Any] | None:
+    @contextmanager
+    def _serving(self) -> Iterator[None]:
+        with self._idle:
+            self._in_flight += 1
         try:
-            parsed = json.loads(body) if body else {}
-        except json.JSONDecodeError:
-            parsed = {"_raw": body.decode("utf-8", errors="replace")}
-        wanted = normalize({"method": method, "path": path, "body": parsed})
+            yield
+        finally:
+            with self._idle:
+                self._in_flight -= 1
+                self._idle.notify_all()
+
+    def _match(self, method: str, path: str, body: bytes) -> dict[str, Any] | None:
+        if method != "POST" or path != "/v1/messages":
+            return None
+        parsed = _safe_json(body)
+        wanted = request_key(parsed)
+        if wanted is None:
+            return None
         for index, exchange in enumerate(self._exchanges):
             if index in self._used:
                 continue
-            if exchange.get("match") == wanted:
+            if (exchange["lane_key"], exchange["ordinal"]) == wanted:
                 self._used.add(index)
                 return exchange
         return None
@@ -333,13 +412,7 @@ class ModelScript:
                     {
                         "method": "POST",
                         "path": path,
-                        "match": normalize(
-                            {
-                                "method": "POST",
-                                "path": path,
-                                "body": _safe_json(body),
-                            }
-                        ),
+                        "key": request_key(_safe_json(body)),
                     }
                 )
         if exchange is None:
@@ -348,7 +421,8 @@ class ModelScript:
                     "type": "error",
                     "error": {
                         "type": "unexpected_request",
-                        "message": "the transcript has no unused request with this content",
+                        "message": "unexpected model request: the transcript has no unused "
+                        "exchange for this lane and ordinal",
                     },
                 }
             ).encode()
@@ -359,21 +433,13 @@ class ModelScript:
             handler.wfile.write(payload)
             return
         request = _safe_json(body)
-        wants_stream = isinstance(request, dict) and bool(request.get("stream"))
-        raw = exchange.get("raw_body_b64")
-        content_type = str(exchange.get("content_type") or "application/json")
-        if wants_stream and isinstance(exchange.get("message"), dict):
+        wants_stream = bool(request.get("stream"))
+        if wants_stream:
             payload = message_to_sse(exchange["message"])
             content_type = "text/event-stream"
-        elif isinstance(raw, str) and content_type.startswith("text/event-stream") and wants_stream:
-            payload = base64.b64decode(raw)
-        elif isinstance(exchange.get("message"), dict):
+        else:
             payload = json.dumps(exchange["message"]).encode()
             content_type = "application/json"
-        elif isinstance(raw, str):
-            payload = base64.b64decode(raw)
-        else:
-            payload = b"{}"
         handler.send_response(200)
         handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(payload)))
@@ -381,8 +447,15 @@ class ModelScript:
         handler.wfile.write(payload)
 
     def _record(self, handler: BaseHTTPRequestHandler, path: str, body: bytes) -> None:
-        headers = {"Content-Type": handler.headers.get("Content-Type", "application/json")}
-        for name in ("x-api-key", "anthropic-version", "anthropic-beta"):
+        key = request_key(_safe_json(body))
+        if key is None:
+            self._reject(handler, "POST", path, body)
+            return
+        headers = {
+            "Content-Type": handler.headers.get("Content-Type", "application/json"),
+            "x-api-key": self._record_key,
+        }
+        for name in ("anthropic-version", "anthropic-beta"):
             value = handler.headers.get(name)
             if value:
                 headers[name] = value
@@ -417,17 +490,18 @@ class ModelScript:
                     parsed = None
                 if isinstance(parsed, dict) and parsed.get("type") == "message":
                     message = parsed
-            with self._lock:
-                self._exchanges.append(
-                    {
-                        "match": normalize(
-                            {"method": "POST", "path": path, "body": _safe_json(body)}
-                        ),
-                        "content_type": content_type.split(";")[0],
-                        "raw_body_b64": base64.b64encode(payload).decode(),
-                        "message": message,
-                    }
+            if message is None:
+                status = 502
+                content_type = "application/json"
+                payload = (
+                    b'{"type":"error","error":{"message":'
+                    b'"provider returned no Messages response"}}'
                 )
+            else:
+                with self._lock:
+                    self._exchanges.append(
+                        {"lane_key": key[0], "ordinal": key[1], "message": message}
+                    )
         handler.send_response(status)
         handler.send_header("Content-Type", content_type)
         handler.send_header("Content-Length", str(len(payload)))
@@ -445,11 +519,12 @@ class ModelScript:
         handler.wfile.write(payload)
 
 
-def _safe_json(body: bytes) -> Any:
+def _safe_json(body: bytes) -> dict[str, Any]:
     try:
-        return json.loads(body) if body else {}
-    except json.JSONDecodeError:
-        return {"_raw": body.decode("utf-8", errors="replace")}
+        parsed = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -466,13 +541,16 @@ def main(argv: list[str] | None = None) -> int:
     record.add_argument("--port", type=int, default=0)
     args = parser.parse_args(argv)
     recording = args.command == "record"
-    script = ModelScript(
-        args.output if recording else args.transcript,
-        record=recording,
-        upstream=getattr(args, "upstream", "https://openrouter.ai/api"),
-        host=args.host,
-        port=args.port,
-    )
+    try:
+        script = ModelScript(
+            args.output if recording else args.transcript,
+            record=recording,
+            upstream=getattr(args, "upstream", "https://openrouter.ai/api"),
+            host=args.host,
+            port=args.port,
+        )
+    except (OSError, ValueError) as exc:
+        parser.exit(1, f"model-script: {exc}\n")
     stop = threading.Event()
 
     def _stop(_signum: int, _frame: Any) -> None:

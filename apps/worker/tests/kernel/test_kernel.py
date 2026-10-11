@@ -59,7 +59,10 @@ from curie_worker.sandbox import (
     RouteRecord,
     SandboxHandle,
 )
+from curie_worker.sandbox.types import SandboxTermination
 from curie_worker.workspace import (
+    WorkspaceClaimCoordinator,
+    WorkspaceCredentialClient,
     WorkspacePreparationError,
     WorkspaceSelectionRefused,
 )
@@ -2000,8 +2003,8 @@ def test_a_selection_refusal_is_logged_so_an_operator_can_find_it(make_harness, 
 # The refusal half of this ticket is already covered above, by the INFO line the
 # refusal branch emits. These pin the other half: clone and upload failures used
 # to be swallowed by the broad start-failure clause, which names an event id and
-# an anonymous repr. They assert the log line, not the reply; the reply was never
-# the missing half.
+# an anonymous repr. The original #2004 tests pin those log lines. The #4367
+# tests below also pin the stage and reason carried into the terminal reply.
 
 
 def _workspace_binding(
@@ -2118,6 +2121,184 @@ def test_workspace_preparation_failure_escalates_by_its_own_name(make_harness, c
             assert "acme-corp/acme-bot" in message, message
             assert "stage=clone" in message, message
             assert "repository not found" in message, message
+
+    asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_detail", "expected_attempts"),
+    [
+        pytest.param(
+            500,
+            "workspace repository-selection failed: API returned HTTP 500",
+            3,
+            id="fault-exhausts-retry-budget",
+        ),
+        pytest.param(
+            403,
+            "That repository is not in api.githubRepoAllowlist for this installation; "
+            "allow `owner/repo` or `owner/*` in the chart values.",
+            1,
+            id="allowlist-refusal-is-terminal",
+        ),
+        pytest.param(
+            409,
+            "This thread is already bound to a different repository.",
+            1,
+            id="selection-conflict-is-terminal",
+        ),
+    ],
+)
+def test_workspace_selection_http_failure_preserves_diagnostic_and_retry_policy(
+    make_harness, status: int, expected_detail: str, expected_attempts: int
+) -> None:
+    """#4367: selection faults retain the reason while policy refusals stay terminal."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        requests: list[dict[str, object]] = []
+
+        async def select(request: web.Request) -> web.Response:
+            requests.append(await request.json())
+            return web.json_response(
+                {
+                    "detail": {
+                        "code": "workspace.selection_conflict",
+                        "message": "opaque API response must not become the public reason",
+                    }
+                },
+                status=status,
+            )
+
+        app = web.Application()
+        app.router.add_post(f"/v1/internal/workspaces/{deployment_id}/selection", select)
+        async with TestServer(app) as server:
+            credentials = WorkspaceCredentialClient(
+                api_url=str(server.make_url("")),
+                github_api_url="https://api.github.com",
+                worker_token="workspace-test-token",
+            )
+            async with make_harness(
+                binding=_workspace_binding(deployment_id), max_attempts=3
+            ) as h:
+                h.kernel._workspace = WorkspaceClaimCoordinator(
+                    preparer=SimpleNamespace(credentials=credentials),
+                    substrate=h.substrate,
+                )
+                event = qevent(
+                    "Fix https://github.com/acme-corp/acme-bot",
+                    thread=f"tWorkspaceSelection{status}",
+                )
+                await h.kernel.process_event(event)
+
+                assert len(requests) == expected_attempts
+                assert all(
+                    body["repo_full_name"] == "acme-corp/acme-bot" for body in requests
+                )
+                assert h.fake_k8s.claim_envs == []
+                assert h.runner.opened == []
+                assert h.runner.steers == []
+                assert len(h.sink.completions) == 1
+                assert h.sink.completions[0].event_id == event.event_id
+                reply = h.sink.last_text
+                assert reply is not None
+                if status == 500:
+                    assert kernel_failures.failure_class_from_reply(reply) == "workspace-error"
+                    assert expected_detail in reply
+                    assert "after 3 attempt(s)" in reply
+                    assert h.sink.completions[0].outcome == "escalated"
+                else:
+                    assert reply == expected_detail
+                    assert kernel_failures.failure_class_from_reply(reply) is None
+                    assert h.sink.completions[0].outcome == "delivered"
+                assert "opaque API response" not in reply
+                assert await h.kernel._markers.is_terminal(event.event_id)
+
+    asyncio.run(go())
+
+
+def test_workspace_failure_reason_is_redacted_before_clipping(make_harness) -> None:
+    """A credential spanning the bound must be consumed before a prefix is kept."""
+
+    deployment_id = uuid.uuid4()
+    reason = (
+        "git clone exited 128: -----BEGIN PRIVATE KEY-----\n"
+        f"{'SYNTHETIC-PRIVATE-MATERIAL' * 30}\n-----END PRIVATE KEY----- "
+        f"remaining diagnosis {'x' * 1000}"
+    )
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=1) as h:
+
+            class WorkspaceProbe:
+                def select_repository(self, **_kwargs: object) -> str:
+                    return "acme-corp/acme-bot"
+
+                def claim_or_resume_with_handle(self, **_kwargs: object) -> object:
+                    raise WorkspacePreparationError("clone", reason)
+
+            h.kernel._workspace = WorkspaceProbe()  # type: ignore[assignment]
+            event = qevent(
+                "Fix https://github.com/acme-corp/acme-bot", thread="tWorkspaceSecret"
+            )
+            await h.kernel.process_event(event)
+
+            reply = h.sink.last_text
+            assert reply is not None
+            assert kernel_failures.failure_class_from_reply(reply) == "workspace-error"
+            detail = reply.split("after 1 attempt(s). ", 1)[1].split(" event_id=", 1)[0]
+            assert detail.startswith(
+                "workspace clone failed: git clone exited 128: [REDACTED:pem_private_key]"
+            )
+            assert len(detail) <= 300
+            assert "remaining diagnosis" in detail
+            assert "SYNTHETIC-PRIVATE-MATERIAL" not in reply
+            assert "-----BEGIN PRIVATE KEY-----" not in reply
+            assert "-----END PRIVATE KEY-----" not in reply
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+            assert len(h.sink.completions) == 1
+            assert h.sink.completions[0].outcome == "escalated"
+
+    asyncio.run(go())
+
+
+def test_prior_side_effect_does_not_retry_a_workspace_selection_failure(make_harness) -> None:
+    """The durable no-retry marker wins before another workspace request is sent."""
+
+    deployment_id = uuid.uuid4()
+
+    async def go() -> None:
+        async with make_harness(binding=_workspace_binding(deployment_id), max_attempts=3) as h:
+
+            class WorkspaceProbe:
+                selection_calls = 0
+
+                def select_repository(self, **_kwargs: object) -> str:
+                    self.selection_calls += 1
+                    raise WorkspacePreparationError(
+                        "repository-selection", "API returned HTTP 500"
+                    )
+
+            probe = WorkspaceProbe()
+            h.kernel._workspace = probe  # type: ignore[assignment]
+            event = qevent(
+                "Fix https://github.com/acme-corp/acme-bot", thread="tWorkspacePriorAction"
+            )
+            await h.kernel._markers.mark_side_effect(event.event_id)
+            await h.kernel.process_event(event)
+
+            assert probe.selection_calls == 0
+            assert h.fake_k8s.claim_envs == []
+            assert h.runner.opened == []
+            reply = h.sink.last_text
+            assert reply is not None
+            assert kernel_failures.failure_class_from_reply(reply) == "prior-side-effect"
+            assert "not retrying automatically" in reply
+            assert len(h.sink.completions) == 1
+            assert h.sink.completions[0].outcome == "escalated"
+            assert await h.kernel._markers.is_terminal(event.event_id)
 
     asyncio.run(go())
 
@@ -2761,6 +2942,20 @@ def test_finish_race_falls_back_to_a_fresh_turn(make_harness) -> None:
             id="empty-alone-is-retryable-runner-error",
         ),
         pytest.param(
+            [
+                ErrorEvent(
+                    message="model error: server_error: API Error: Connection refused "
+                    "(ECONNREFUSED)",
+                    classification="model-unreachable",
+                )
+            ],
+            [Final(text="recovered", status=DONE)],
+            "recovered",
+            # #4333: a model endpoint that could not be reached before any
+            # side effect is a transport failure a later attempt can pass.
+            id="model-unreachable-retries",
+        ),
+        pytest.param(
             # Mid-run drop: a delta streams, then the stream ends with no final.
             [TextDelta(text="partial")],
             [TextDelta(text="full"), Final(text="full done", status=DONE)],
@@ -2867,6 +3062,84 @@ def test_pod_termination_cause_reaches_factory_finish_detail(make_harness) -> No
             assert "The node was low on memory." in finish["detail"]
             assert "Kubernetes pod terminated" in finish["detail"]
             assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+class _DropAfterSideEffectPersisted:
+    """A runner ``hold`` that drops the stream once the worker persisted the flag.
+
+    ``abort_after_frames`` can close the socket before the client reads the
+    buffered flag frame, and aiohttp then raises before yielding it. Raising
+    from the handler after the headers were sent aborts the chunked stream.
+    """
+
+    def __init__(self, redis: Any, key: str) -> None:
+        self._redis = redis
+        self._key = key
+
+    async def wait(self) -> None:
+        for _ in range(500):
+            if await self._redis.exists(self._key):
+                break
+            await asyncio.sleep(0.01)
+        raise ConnectionResetError("runner pod deleted")
+
+
+def test_deleted_pod_after_side_effect_escalates_as_sandbox_terminated(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SandboxTermination("Deleted")
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+            h.runner.default_script = [SideEffectFlag(tool="deploy"), TextDelta(text="partial")]
+            h.runner.hold = _DropAfterSideEffectPersisted(
+                h.async_redis, h.config.side_effect_key(event.event_id)
+            )
+
+            await h.kernel.process_event(event)
+
+            assert await h.async_redis.exists(h.config.side_effect_key(event.event_id))
+
+            # ADR 0013: no automatic retry after a side effect, even though
+            # sandbox-terminated is otherwise retryable.
+            assert h.runner.opened == [ISSUE_PROMPT]
+            assert len(items.finishes) == 1
+            finish = items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "sandbox_terminated"
+            assert isinstance(finish["detail"], str)
+            assert "Kubernetes pod terminated: Deleted" in finish["detail"]
+            assert h.fake_k8s.termination_queries
+
+    asyncio.run(go())
+
+
+def test_deleted_pod_without_side_effect_retries(make_harness) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_PublicationApi(),
+            max_attempts=2,
+        ) as h:
+            items = _WorkItems()
+            h.kernel._work_items = items
+            h.fake_k8s.termination = SandboxTermination("Deleted")
+            h.runner.default_script = [TextDelta(text="partial")]
+            h.runner.abort_after_frames = True
+            event = _turn(f"work-item-{uuid.uuid4()}-execute-1", ISSUE_PROMPT)
+
+            await h.kernel.process_event(event)
+
+            assert h.runner.opened == [ISSUE_PROMPT, ISSUE_PROMPT]
+            assert len(h.fake_k8s.termination_queries) == 2
 
     asyncio.run(go())
 
@@ -3040,6 +3313,69 @@ def test_side_effect_failure_escalates_without_retry(make_harness) -> None:
 
             assert h.runner.opened == ["do it"]  # exactly one attempt, no retry
             assert h.sink.last_text is not None and "human" in h.sink.last_text.lower()
+            assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
+            assert await h.async_redis.exists(h.config.done_key(ev.event_id))
+
+    asyncio.run(go())
+
+
+def test_server_error_model_unreachable_split_server_error_not_retried(make_harness) -> None:
+    """#4333: only model-unreachable joined the retryable set, not server-error."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    ErrorEvent(
+                        message="model error: server_error: API Error: 500 Internal server error",
+                        classification="server-error",
+                    ),
+                    Final(text="failed", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            await h.kernel.process_event(qevent("go", event_id="evt-server-error-4333"))
+
+            assert h.runner.opened == ["go"]  # exactly one attempt, no retry
+            reply = h.sink.last_text
+            assert reply is not None
+            assert "(server-error) after 1 attempt(s)" in reply
+            assert "recovered" not in reply
+
+    asyncio.run(go())
+
+
+def test_model_unreachable_after_side_effect_escalates_without_retry(make_harness) -> None:
+    """ADR 0013: a retryable model-unreachable must not retry after a side effect."""
+
+    async def go() -> None:
+        async with make_harness() as h:
+            h.runner.turn_scripts = [
+                [
+                    SideEffectFlag(tool="deploy"),
+                    ErrorEvent(
+                        message="model error: server_error: API Error: Connection refused "
+                        "(ECONNREFUSED)",
+                        classification="model-unreachable",
+                    ),
+                    Final(text="failed", status=FAIL),
+                ],
+                [Final(text="recovered", status=DONE)],
+            ]
+            ev = qevent("do it", event_id="evt-unreachable-side-effect")
+            await h.kernel.process_event(ev)
+
+            assert h.runner.opened == ["do it"]  # exactly one attempt, no retry
+            reply = h.sink.last_text
+            assert reply is not None
+            assert reply.startswith("curie-turn-failure: model-unreachable\n")
+            assert (
+                "The run hit an error (model-unreachable) after starting an action; "
+                "not retrying automatically."
+            ) in reply
+            assert "ECONNREFUSED" in reply
+            assert "human" in reply.lower()
+            assert "recovered" not in reply
             assert await h.async_redis.exists(h.config.side_effect_key(ev.event_id))
             assert await h.async_redis.exists(h.config.done_key(ev.event_id))
 

@@ -4,7 +4,7 @@
 // truth: the frozen package's own schema export, not `apps/api/openapi.json`).
 //
 // Reuses the EXACT SAME comparator #691 built
-// (`cli/tests/support/field_parity.rs`, included below via `#[path = ...]`,
+// (`cli/tests/support/field_parity.rs`, imported below from `crate::support`,
 // same as `cli/tests/api_field_parity.rs`). That comparator is generic over
 // "a Rust source, a components.schemas-shaped Value, a mirrors/non_mirrors
 // manifest" -- so the only new work here is (a) wrapping
@@ -22,8 +22,7 @@
 // stay fully covered, and the gate's own wiring (schema wrapping + per-file
 // manifest filtering) actually rejects a deliberately introduced drift.
 
-#[path = "support/field_parity.rs"]
-mod field_parity;
+use crate::support::field_parity;
 
 use field_parity::{violations, Violation};
 use quote::ToTokens;

@@ -13,6 +13,7 @@ import asyncio
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 from curie_worker.capacity_wait import CapacityWaitRequested
@@ -167,9 +168,9 @@ def test_a_terminal_unstarted_defer_releases_the_thread_sandbox(
             releases: list[str] = []
             release = h.kernel._release_work_item_sandbox
 
-            async def observed_release(thread: str) -> None:
-                releases.append(thread)
-                await release(thread)
+            async def observed_release(run: Any) -> None:
+                releases.append(run.thread_key)
+                await release(run)
 
             monkeypatch.setattr(h.kernel, "_release_work_item_sandbox", observed_release)
             request_id = uuid.uuid4()

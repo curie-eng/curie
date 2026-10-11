@@ -8,6 +8,7 @@ the reconciler decides from the marker itself (fail-open on a read error).
 from __future__ import annotations
 
 import contextlib
+import importlib
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -58,6 +59,32 @@ def test_upgrade_quiesce_key_mirrors_the_worker(fresh_settings: Any) -> None:
     assert (
         Settings().upgrade_quiesce_key() == "curie:worker:upgrade:quiesce:install-a"
     )
+
+
+@pytest.mark.parametrize("installation", ("", "acme-test"))
+@pytest.mark.parametrize("prefix", ("curie:worker", "test:private:worker"))
+@pytest.mark.parametrize("bridge", (False, True))
+def test_api_worker_and_drain_share_the_key_authority(
+    fresh_settings: Any, installation: str, prefix: str, bridge: bool
+) -> None:
+    from curie_worker.config import WorkerConfig
+    from curie_worker.upgrade_drain import UpgradeDrainGate
+
+    pause = importlib.import_module("curie_upgrade_pause")
+    fresh_settings.setenv("CURIE_INSTALLATION_ID", installation)
+    fresh_settings.setenv("KEY_PREFIX", prefix)
+    api = Settings()
+    worker = WorkerConfig(
+        installation_id=installation,
+        key_prefix=prefix,
+        upgrade_legacy_quiesce=bridge,
+    )
+    expected = pause.authoritative_key(prefix, installation)
+    assert api.upgrade_quiesce_key() == worker.upgrade_quiesce_key() == expected
+    assert worker.upgrade_legacy_quiesce_key() == pause.legacy_key(prefix)
+    # Key selection never contacts Valkey; this is the actual drain reader.
+    gate = UpgradeDrainGate(None, worker)  # type: ignore[arg-type]
+    assert gate._marker_keys() == pause.marker_keys(prefix, installation, bridge)
 
 
 class _Valkey:

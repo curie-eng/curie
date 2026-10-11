@@ -78,7 +78,7 @@ use quote::ToTokens;
 use serde_json::Value;
 use syn::visit::Visit;
 
-use crate::field_parity::{self, CollectedStruct};
+use super::field_parity::{self, CollectedStruct};
 
 /// A single way a declared `emits` projection has drifted. Mirrors the shape of
 /// `field_parity::Violation`: the gate test matches on these variants and their

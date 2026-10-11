@@ -476,6 +476,7 @@ and runs every target check before mutation.
 | `--yes` | Skip the confirmation prompt. |
 | `--dry-run` | Print the redacted plan and exit without changing the installed release or downloading the default release chart archive. It still reads the installed release from the cluster, and retained-configuration checks always run. Available local charts and Helm refs also run target chart and schema checks; Helm may fetch an explicit repository or OCI ref for those metadata checks. A cold default release archive records those checks as pending until download. A plan that ends in a validate refusal exits nonzero, like the real run. The printed `helm upgrade` line is the command Apply runs, including `--install` and `-f <retained-values>` when it passes them. |
 | `--forward-only` | Apply pending contract or irreversible schema migrations. Without this flag, Validate refuses those migrations before mutation so a patch rollback window stays intact. |
+| `--allow-stock-layer-clear` | Proceed when a stock dark factory runner layer cannot be rebound for `--to`: clear its binding so the agent runs the platform runner without its layer until it is rebound. Refused by default. |
 
 One resumable lifecycle: inspect and plan, validate configuration and
 schema compatibility and refuse on an ambiguous migration conflict, drain
@@ -526,6 +527,29 @@ not the drain gate itself; the gate (issue 2010) is the chart's own
 pre-upgrade Helm hook Job, which runs during Apply and whose outcome the
 convergence check above reports as the drained-queue gate.
 
+The independent mail persistence checks and pre-upgrade gVisor preflight run
+before the drain, so their failures do not pause worker claims. A clean drain
+leaves a 300-second handoff lease on the installation's pause marker. Attest
+requires both this revision's recorded drain success and its existing marker,
+then renews the lease for 300 seconds. The schema-migrate process uses the same
+shared renewal, starting before Postgres readiness and repeating every 100
+seconds while it is alive. Renewal never creates a missing marker or takes
+authority from another revision; lost authority refuses the upgrade.
+
+The last pre-upgrade hook, `upgrade-drain-hold` at weight `10`, runs
+`--mode hold` after migration. It extends the existing same-revision marker to
+the configured roll hold, `worker.upgradeDrain.quiesceTtlSeconds`, without
+shortening a longer lease. It refuses if the marker is absent, belongs to
+another revision, or Valkey is unreachable. The post-upgrade release clears
+the marker after the roll.
+
+Before hold succeeds, a failed step leaves claims paused for at most 300
+seconds after its last renewal. A gap between steps longer than the handoff
+lease refuses the upgrade, so retry once the hook images are cached. A failure
+after hold succeeds, including manifest apply or a rollout wait timeout, can
+still leave claims paused until the remaining lease expires, potentially for
+the full configured roll hold. Helm has no upgrade-failed hook to release it.
+
 After confirmation, the command claims the namespaced
 `<release>-upgrade-checkpoint` ConfigMap before it reads release snapshots or
 runs Helm. The claim records an opaque holder identifier and a redacted action
@@ -551,8 +575,9 @@ of the Namespace object.
 Any interruption after ownership acquisition, including Ctrl C, SIGINT, and
 SIGTERM, leaves the holder in place. A normal exit that reports an ownership
 release CAS failure can also leave the holder. Do not rerun the upgrade in
-either case until the checked recovery below is complete. There is no expiry,
-heartbeat, or automatic takeover. First read the live checkpoint:
+either case until the checked recovery below is complete.
+There is no expiry, heartbeat, or automatic takeover. First read the live
+checkpoint:
 
 ```bash
 kubectl --context <context> -n <namespace> get configmap <release>-upgrade-checkpoint -o json
@@ -565,8 +590,43 @@ its Helm action is no longer running. Clearing a live holder can let another
 upgrade overlap the original operation. Never delete the checkpoint as a
 recovery step because it also contains the resumable lifecycle record.
 
-Only after those checks, replace both values in this conditional patch with the
-exact values just observed:
+After those checks, use the exact observed holder to plan and run recovery:
+
+```bash
+curie cluster upgrade --to <version> --namespace <namespace> --release <release> \
+  --take-over <observed-holder> --dry-run
+curie cluster upgrade --to <version> --namespace <namespace> --release <release> \
+  --take-over <observed-holder> --yes
+```
+
+Both runs refuse if the holder differs, there is nothing to take over, or a
+release Helm hook Job still has active pods. An unreadable hook Job list also
+refuses. The CLI cannot verify that the local CLI or Helm process has stopped;
+that remains the operator's check. The real run tests the observed checkpoint
+resource version and named holder in one conditional patch, replaces the holder
+with its own, and preserves the durable lifecycle record for resumption. A
+failed comparison reports the currently observed holder and action.
+
+The installed and known-good versions in a dry run come from the serving
+`deployed` revision, including when a newer revision is `pending-upgrade`.
+A dry run reads ownership without creating or patching it. A held checkpoint
+requires a matching `--take-over` even for a dry run, whose plan names the
+takeover and any rollback before the upgrade command.
+
+If the newest Helm revision is pending, a plain upgrade refuses after releasing
+its claim. The message names the pending revision and status, the serving
+revision and version, and the rollback command. With `--take-over`, an orphaned
+`pending-upgrade` revision is rolled back to the serving revision using
+`helm rollback <release> <serving-revision> -n <namespace> --wait --timeout 15m`
+before the CLI reads retained snapshots or resumes the lifecycle. A failed
+rollback fails the command and releases ownership without changing the durable
+record. `pending-install`, `pending-rollback`, and a pending history with no
+deployed revision refuse without automated recovery.
+
+The conditional manual patch remains a fallback. After verifying that the
+holder and Helm action have stopped and no release hook Job is running, recover
+any orphaned pending upgrade with the rollback command above. Then replace both
+values in this patch with the exact checkpoint values just observed:
 
 ```bash
 kubectl --context <context> -n <namespace> patch configmap <release>-upgrade-checkpoint \
@@ -635,10 +695,17 @@ curie cluster rollback
 | `--allow-failed-revision` | Permit a `--revision` that Helm never finished applying. |
 | `--live-schema-revision <rev>` | Assert the live Alembic revision instead of reading it from the API pod. The schema-window check still runs against this value. |
 | `--yes` | Skip the confirmation prompt. |
-| `--dry-run` | Print the commands that would run and exit. |
+| `--dry-run` | Read Helm history and print the selected revision and commands. The live-schema probe and rollback do not run. |
 
-`curie cluster rollback` puts the release back on the newest revision that
-Helm actually finished applying.
+`curie cluster rollback` selects the newest `deployed` revision as the serving
+revision. When the newest history row is above it and is not `deployed` or
+`superseded`, the rollback targets the serving revision. For example, deployed
+revision 4 followed by pending revision 5 rolls back to revision 4, clearing
+the unfinished upgrade while retaining known good state.
+
+Otherwise, it selects the newest `deployed` or `superseded` revision below
+the serving revision. If no revision is deployed, it selects below the highest
+revision in the history.
 
 A bare `helm rollback` can select a failed revision from history left by
 older releases or by the `Forbidden` RuntimeClass GET admission fallback.
@@ -651,10 +718,17 @@ history, `helm rollback` with no revision targets the immediately preceding
 revision, which may be a manifest Helm never finished putting on the cluster.
 Rolling back to it re-applies that broken manifest.
 
-So this verb reads the history first, skips every revision whose status is not
-`deployed` or `superseded`, and rolls back to the newest one that is. It prints
-which revisions it passed over, so you can see exactly what a bare
+This verb reads the history first and only selects a revision whose status is
+`deployed` or `superseded`. It prints which ineligible revisions it passed over,
+so you can see exactly what a bare
 `helm rollback` would have landed on instead.
+
+`--dry-run` also reads Helm history and applies the same target selection and
+status refusals. It prints the resolved revision number, status and chart,
+the revision it rolls back from, and any skipped revisions. `--json` carries
+these same lines in the plan. A failed history read or refused selection exits
+nonzero. The plan lists the live-schema probe, but neither that probe nor
+`helm rollback` runs during a dry run.
 
 Status is not the whole story. Every API pod still runs `alembic upgrade head`
 at startup, so an older image refuses a live database revision it does not
@@ -1102,10 +1176,13 @@ Checks on the unchanged commit retain their passing, pending or failing evidence
 Without a repository policy, a metadata revision ends as `ci_unverified` with
 reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
 
-Set the chart value with a values file or `--set-json`. Installs that previously
-set `GITHUB_FACTORY_METADATA_CI` through `api.extraEnv` must move the JSON object
-to `api.githubFactoryMetadataCi` and remove that extraEnv entry; the chart now
-reserves the environment variable. Compose installs set it in the environment.
+Set the chart value with a values file or `--set-json`. The chart reserves the
+environment variable, so it cannot be set through `api.extraEnv`. On an install
+that set it there, `curie cluster upgrade` and `curie cluster up` move the JSON
+object to `api.githubFactoryMetadataCi`, drop the extraEnv entry, and list the
+move in the plan. A value that is not a JSON object, a `valueFrom` entry, or a
+different value already in `api.githubFactoryMetadataCi` stops the upgrade
+before any change. Compose installs set it in the environment.
 For Curie's own repository, the value is:
 
 ```json
@@ -1196,15 +1273,30 @@ cannot be determined, it names every agent in `agentSandbox.runnerImages` before
 upgrading, in the plan and `--dry-run` output too, and clears those entries in
 the same `helm upgrade` by deleting the keys from the retained values document.
 It does not pass a null override. A null map entry is not a deletion, and the
-chart refuses it as a digest before Helm creates a revision. After that upgrade it deletes those agents'
-SandboxClaims, as `curie cluster deploy` does, so a live thread's next turn
-starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
-layer until their owners rebuild with `curie build` and redeploy. Both checks
+chart refuses it as a digest before Helm creates a revision. After that upgrade it retires those agents'
+SandboxClaims whose runner is not the planned layer, or cannot be resolved, and
+keeps sandboxes already on the target layer. If a claim, pod or template read
+fails, it falls back to retiring all of the agent's claims. A retired thread's
+next turn starts a fresh sandbox instead of keeping the old layer. Those agents run the new platform runner without their
+layer until their owners rebuild with `curie build` and redeploy. An agent bound
+to the project's published dark factory layer
+(`ghcr.io/curie-eng/curie-dark-factory-runner@...`) is instead rebound to the
+layer published for the target version when that layer's base is the target
+runner. The plan lists it separately, and its sandboxes are retired the same
+way. When it cannot be rebound (no published layer, another base, an
+unreachable registry, or an unknown target runner), the upgrade refuses at
+Validate with the reason and remediation. It is cleared only with
+`--allow-stock-layer-clear`; then the notice names `curie cluster factory
+--runner-image <agent>=<repository>@sha256:<digest>`, or `curie example
+dark-factory render` then `curie cluster deploy`, instead of `curie build`. The
+canary then reads every layered agent's SandboxTemplate and fails the upgrade
+when its image is not the planned one. Both checks
 resolve runner digests by reading the registry directly, so the operator host
 needs no docker. A registry that refuses anonymous reads falls back to `docker
 buildx imagetools` and its registry login when docker is on PATH. When no digest
 can be resolved, `curie cluster deploy` refuses and `curie cluster upgrade`
-clears every layer; setting the chart value `agentSandbox.runner.digest` pins
+refuses for stock layers unless `--allow-stock-layer-clear` is set, while
+owner-built layers are cleared; setting the chart value `agentSandbox.runner.digest` pins
 the runner so no lookup is needed.
 
 For a run that can last three hours, set an illustrative $100 USD cap after
@@ -1302,7 +1394,10 @@ not edited again. A comment a person deletes is re-created once on the next
 pass; unlabel the issue to stop the run instead.
 
 When publication succeeds, the result names the exact pull request
-URL. When the run cannot complete, the result starts with `Could not complete:`
+URL. A follow-up that needs no change, including a relabel that continues the
+open pull request, ends with `Status: SUCCEEDED` and a result starting
+`No changes needed:` that names the open pull request.
+When the run cannot complete, the result starts with `Could not complete:`
 and a plain sentence for the cause. A request lost with its worker and retried
 as a new run shows `Status: RETRYING` and its result starts with `Retrying:`.
 When the model provider refused the run,
@@ -1318,7 +1413,7 @@ A last `Cause:` line names the platform cause code
 `no_pull_request`,
 `early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
 classified run failure: `model_credit_exhausted`, `model_usage_limited`,
-`model_credential_rejected`, `model_rate_limited`, `model_error`, `budget_exceeded`, `runner_timeout`,
+`model_credential_rejected`, `model_rate_limited`, `model_error`, `model_unreachable`, `budget_exceeded`, `runner_timeout`,
 `sandbox_terminated`, `workspace_error`, or `history_capacity`). A sandbox
 termination includes the Kubernetes reason and, for an EmptyDir eviction, the
 volume limit in a `Details:` line. When the cause has a runner failure

@@ -46,6 +46,8 @@ impl std::fmt::Debug for PrivateHelmValues {
 }
 
 pub struct UpOpts {
+    /// @spec CLUSTER-VALUES-FILES c1-c4: captured operator values.
+    pub file_values: Option<PrivateHelmValues>,
     /// Existing mail lifecycle and paired worker credentials, with explicit
     /// operator overrides removed. Populated by the one release-values read.
     pub retained_mail_values: Option<PrivateHelmValues>,
@@ -66,6 +68,10 @@ pub struct UpOpts {
     pub no_expose: bool,
     pub set: Vec<String>,
     pub set_string: Vec<String>,
+    /// `path=<compact json>` object or array values a configuration migration
+    /// promoted from the release (#4322). Not operator input: they never
+    /// override an operator key and are passed to Helm whole via `--set-json`.
+    pub set_json: Vec<String>,
     /// Named model providers (validated against [`parse_egress_provider`]) whose
     /// API host(s) runner egress is opened to. Resolved to narrow host-route
     /// CIDRs at install time into [`resolved_egress_cidrs`]; empty means no
@@ -122,7 +128,18 @@ pub struct UpOpts {
 
 impl UpOpts {
     pub(super) fn operator_sets(&self) -> Vec<String> {
-        self.set.iter().chain(&self.set_string).cloned().collect()
+        // @spec CLUSTER-VALUES-FILES c3: file keys are explicit overrides.
+        self.file_values
+            .iter()
+            .flat_map(|values| {
+                values
+                    .1
+                    .iter()
+                    .map(|(key, value)| format!("{key}={}", escape_helm_set_string_value(value)))
+            })
+            .chain(self.set.iter().cloned())
+            .chain(self.set_string.iter().cloned())
+            .collect()
     }
 }
 
@@ -2492,6 +2509,14 @@ fn overlay_overridden_keys(
     {
         overridden.insert((*key).to_string());
     }
+    // A promoted object travels whole as `--set-json`; its leaves must not
+    // also be re-supplied per path by the live overlay (#4322).
+    overridden.extend(
+        opts.set_json
+            .iter()
+            .filter_map(|expression| expression.split_once('='))
+            .map(|(key, _)| key.to_string()),
+    );
     overridden
 }
 
@@ -2505,10 +2530,20 @@ fn overlay_migration_results(
 ) {
     let overridden = overlay_overridden_keys(opts, operator_sets);
     for (_, helm_key) in crate::config_migrate::extra_env_successors() {
-        if overridden.contains(*helm_key)
-            || overridden
-                .iter()
-                .any(|key| key_is_or_descends_from(key, helm_key))
+        let typed = values
+            .pointer(&format!("/{}", helm_key.replace('.', "/")))
+            .is_some_and(|value| value.is_object() || value.is_array());
+        // An operator override of the key or an ancestor replaces it outright.
+        // A descendant override replaces a scalar too, but only refines an
+        // object: Helm applies `--set` over `--set-json`, so the typed object
+        // still travels and the operator leaf wins (#4322).
+        if overridden
+            .iter()
+            .any(|key| key_is_or_descends_from(helm_key, key))
+            || (!typed
+                && overridden
+                    .iter()
+                    .any(|key| key_is_or_descends_from(key, helm_key)))
         {
             continue;
         }
@@ -2611,7 +2646,12 @@ fn overlay_leaf(
             .push(format!("{path}={}", escape_helm_set_string_value(raw))),
         serde_json::Value::Bool(flag) => opts.set.push(format!("{path}={flag}")),
         serde_json::Value::Number(number) => opts.set.push(format!("{path}={number}")),
-        _ => {}
+        // An object or list has no faithful per-leaf `--set` form, so it
+        // reaches Helm whole as compact JSON (#4322).
+        value @ (serde_json::Value::Object(_) | serde_json::Value::Array(_)) => {
+            opts.set_json.push(format!("{path}={value}"));
+        }
+        serde_json::Value::Null => {}
     }
 }
 
@@ -2893,6 +2933,9 @@ enum PlannedHelmValues {
         values: Vec<(String, String)>,
         diff: DiffParticipation,
     },
+    /// A migrated object or list (#4322): executed as `--set-json key=<json>`,
+    /// masked in every rendered form, and compared leaf by leaf.
+    Json { key: String, json: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2968,6 +3011,15 @@ impl UpValuePlan {
         });
     }
 
+    fn set_json_expression(&mut self, expression: &str) {
+        if let Some((key, json)) = expression.split_once('=') {
+            self.entries.push(PlannedHelmValues::Json {
+                key: key.to_string(),
+                json: json.to_string(),
+            });
+        }
+    }
+
     fn secret_file(&mut self, values: Vec<(String, String)>, diff: DiffParticipation) {
         if !values.is_empty() {
             self.entries
@@ -2993,6 +3045,13 @@ impl UpValuePlan {
                 }
                 PlannedHelmValues::SecretFile { values, .. } => {
                     args.push(CmdArg::SecretValuesFile(values.clone()));
+                }
+                PlannedHelmValues::Json { key, json } => {
+                    args.push(plain("--set-json"));
+                    args.push(CmdArg::MaskedJsonSet {
+                        key: key.clone(),
+                        json: MaskedJson(json.clone()),
+                    });
                 }
             }
         }
@@ -3023,6 +3082,13 @@ impl UpValuePlan {
                     diff: DiffParticipation::Preserve,
                     ..
                 } => {}
+                // The same leaf keys `installation::flatten_values` reads off
+                // the live release, so an unchanged object compares equal.
+                PlannedHelmValues::Json { key, json } => {
+                    if let Ok(parsed) = serde_json::from_str(json) {
+                        crate::installation::flatten_values(&parsed, key, &mut values);
+                    }
+                }
             }
         }
         values
@@ -3034,12 +3100,24 @@ impl UpValuePlan {
 /// update one path without updating the other.
 pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     let mut plan = UpValuePlan::default();
+    // @spec CLUSTER-VALUES-FILES c3-c4: explicit flags follow file inputs.
+    if let Some(values) = &o.file_values {
+        plan.entries
+            .push(PlannedHelmValues::Retained(values.clone()));
+    }
     if o.dev {
         plan.set(ALLOW_DEV_DEFAULTS_KEY, "true");
     }
     if !o.no_expose {
-        plan.set("ui.service.type", "NodePort");
-        plan.set("langfuse.web.service.type", "NodePort");
+        // @spec CLUSTER-VALUES-FILES c1: defaults do not override file choices.
+        for key in ["ui.service.type", "langfuse.web.service.type"] {
+            if o.file_values
+                .as_ref()
+                .is_none_or(|values| !values.1.contains_key(key))
+            {
+                plan.set(key, "NodePort");
+            }
+        }
     }
     if let Some(model) = &o.local_model {
         plan.set(INFERENCE_DEPLOY_KEY, "true");
@@ -3091,6 +3169,12 @@ pub(crate) fn up_value_plan(o: &UpOpts) -> UpValuePlan {
     {
         plan.entries
             .push(PlannedHelmValues::Retained(values.clone()));
+    }
+    // Helm merges `--set-json` before `--set` and `--set-string` whatever the
+    // argv order, so the migrated objects come first and an operator leaf
+    // override wins in `effective_values` exactly as it does in Helm.
+    for expression in &o.set_json {
+        plan.set_json_expression(expression);
     }
     if let Some(model) = &o.model {
         if explicit_runner_model(&o.operator_sets()).is_none() {
@@ -3238,6 +3322,14 @@ const GVISOR_MODE_KEY: &str = "security.gvisor.mode";
 /// desynchronises the guard from what helm actually renders.
 const ALLOW_DEV_DEFAULTS_KEY: &str = "security.allowDevDefaults";
 
+fn controller_deploy_enabled(plan: &UpValuePlan) -> bool {
+    // Missing overrides keep the shipped chart's enabled default.
+    plan.effective_values()
+        .get(CONTROLLER_DEPLOY_KEY)
+        .map(String::as_str)
+        != Some("false")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClusterUpInference {
     Provider {
@@ -3365,7 +3457,13 @@ fn final_operator_value<'a>(opts: &'a UpOpts, key: &str) -> Option<&'a str> {
             .rev()
             .find_map(|(candidate, value)| (candidate.trim() == key).then_some(value.trim()))
     };
-    in_lane(&opts.set_string).or_else(|| in_lane(&opts.set))
+    in_lane(&opts.set_string)
+        .or_else(|| in_lane(&opts.set))
+        .or_else(|| {
+            opts.file_values
+                .as_ref()
+                .and_then(|values| values.1.get(key).map(String::as_str))
+        })
 }
 
 fn detected_provider_from_plan(opts: &UpOpts, plan: &UpValuePlan) -> Option<&'static str> {
@@ -5148,9 +5246,28 @@ pub async fn up(
     github_token: Option<String>,
     clear_github_token: bool,
 ) -> Result<ClusterUpOutput> {
+    // @spec CLUSTER-VALUES-FILES c1-c3
+    apply_flags_to_file_values(&mut opts, github_token.as_deref(), clear_github_token);
+    if opts.file_values.is_some() {
+        // @spec CLUSTER-VALUES-FILES c1-c3: Helm supplies actual typed set semantics.
+        let args = file_set_args(&opts);
+        if let Some(values) = &mut opts.file_values {
+            if !args.is_empty() {
+                let explicit = super::lint_values::pending_set_overlay(&args).await?;
+                let mut combined = super::lint_values::pending_set_values(&values.0, &args).await?;
+                crate::config_migrate::clear_replaced_secret_refs(&mut combined, &explicit);
+                values.0 = combined;
+            }
+            values.1.clear();
+            flatten_file_values(&values.0, "", &mut values.1);
+        }
+    }
+    // @spec CLUSTER-VALUES-FILES c3: validation sees the captured files.
     validate_up_inputs(&opts, github_token.as_deref(), clear_github_token)?;
     validate_credential_egress_consistency(&opts)?;
-    provider_contradiction(&opts, &up_value_plan(&opts))?;
+    if opts.file_values.is_none() {
+        provider_contradiction(&opts, &up_value_plan(&opts))?;
+    }
     let resolve_provider_egress = !opts.common.dry_run;
     let existing = if should_read_existing(opts.dev, opts.common.dry_run) {
         require_on_path("helm")?;
@@ -5158,13 +5275,36 @@ pub async fn up(
     } else {
         None
     };
+    // @spec CLUSTER-VALUES-FILES c3: preserve completion, with explicit files winning.
+    let mut effective_existing = existing.clone();
+    if let Some(values) = &opts.file_values {
+        let supplied_keys: BTreeSet<String> = values.1.keys().cloned().collect();
+        let merged = effective_existing.get_or_insert_with(|| serde_json::json!({}));
+        crate::config_migrate::clear_replaced_secret_refs(merged, &values.0);
+        super::lint_values::merge_values(merged, values.0.clone());
+        // @spec CLUSTER-VALUES-FILES c3: normalize the admitted full snapshot,
+        // but keep input provenance separate from retained value ownership.
+        opts.file_values = Some(PrivateHelmValues(merged.clone(), BTreeMap::new()));
+        apply_flags_to_file_values(&mut opts, github_token.as_deref(), clear_github_token);
+        let mut values = opts.file_values.take().expect("captured file snapshot");
+        values.0 = crate::config_migrate::migrate_installed_config(values.0, None)?.values;
+        flatten_file_values(&values.0, "", &mut values.1);
+        values.1.retain(|key, _| supplied_keys.contains(key));
+        *merged = values.0.clone();
+        opts.file_values = Some(values);
+    }
     opts = complete_up_opts_without_runner_egress(
         opts,
-        existing.as_ref(),
+        effective_existing.as_ref(),
         github_token.as_deref(),
         clear_github_token,
         true,
     )?;
+    // @spec CLUSTER-VALUES-FILES c3: an overlay is not an installed release.
+    if existing.is_none() && opts.file_values.is_some() && !opts.dev {
+        opts.secrets
+            .extend(resolve_generated_secrets(None, &opts.operator_sets())?);
+    }
     validate_credential_egress_consistency(&opts)?;
     let completed_identity_plan = up_value_plan(&opts);
     let mut inferences = Vec::new();
@@ -5177,7 +5317,7 @@ pub async fn up(
     let (next_preserved_egress_index, recorded_egress_cidrs) =
         resolve_preserved_runner_egress_values(
             &mut opts,
-            existing.as_ref(),
+            effective_existing.as_ref(),
             &operator_sets,
             provider_was_inferred,
         );
@@ -5409,7 +5549,9 @@ async fn run_prepared_up(
             }
         }
     }
-    if set_passthrough_leaks_github_token(&opts.operator_sets()) {
+    // @spec CLUSTER-VALUES-FILES c4: files are not argv credential inputs.
+    let argv_sets: Vec<String> = opts.set.iter().chain(&opts.set_string).cloned().collect();
+    if set_passthrough_leaks_github_token(&argv_sets) {
         match invocation {
             UpInvocation::ClusterUp => ui.warn("a GitHub credential passed with --set lands in the process table and shell history; use --github-token, or CURIE_GITHUB_TOKEN to keep it out of shell history too"),
             UpInvocation::Apply => ui.warn("a GitHub credential placed under `set:` in `curie.yaml` reaches the Helm process table; use `credentials.github_token` to name a credential source instead"),
@@ -5451,9 +5593,10 @@ async fn run_prepared_up(
     // label namespace <missing>`. Mirror the resolve_generated_secrets
     // existing/fresh split: both runtime probes live here in the executor, the
     // argv stays in the pure `ownership_label_commands` builder. `--dry-run`
-    // stays offline and previews the fresh-install stamp for every candidate
-    // (existed == false), never touching the cluster and never running the
-    // post-install probe.
+    // stays offline and previews the fresh-install stamp for the primary
+    // namespace and, when controller deployment is enabled, the shared namespace
+    // (existed == false), never touching the cluster or running the post-install
+    // probe.
     let mut owned_namespaces = vec![opts.common.namespace.clone()];
     if opts.common.namespace != "agent-sandbox-system" {
         owned_namespaces.push("agent-sandbox-system".to_string());
@@ -5469,7 +5612,9 @@ async fn run_prepared_up(
         } else {
             namespace_exists(&ns).await?
         };
-        if opts.common.dry_run {
+        if opts.common.dry_run
+            && (ns == opts.common.namespace || controller_deploy_enabled(&value_plan))
+        {
             // existed_before is provably false on this branch (set above).
             let common = ns_common(&opts.common, &ns, true);
             cmds.extend(ownership_label_commands(
@@ -5546,11 +5691,7 @@ async fn run_prepared_up(
     } else {
         preflight_priority_class_ownership(&opts, &value_plan).await?;
     }
-    let observe_controller = value_plan
-        .effective_values()
-        .get(CONTROLLER_DEPLOY_KEY)
-        .map(String::as_str)
-        != Some("false");
+    let observe_controller = controller_deploy_enabled(&value_plan);
     let admission_namespaces: Vec<_> = ownership_candidates
         .iter()
         .filter(|(namespace, _)| {
@@ -5772,8 +5913,31 @@ mod tests {
 
     use crate::ops::testsupport::*;
 
+    #[test]
+    fn file_set_capture_masks_credential_values_in_command_diagnostics() {
+        // @spec CLUSTER-VALUES-FILES c4
+        let o = UpOpts {
+            set: vec![
+                "api.githubToken=PLACEHOLDER-capture-secret".into(),
+                "worker.adapterCredentials={}".into(),
+            ],
+            set_string: vec!["agentSandbox.runner.credentials=PLACEHOLDER-model-secret".into()],
+            ..opts()
+        };
+        let cmd = OpsCommand::new("helm", file_set_args(&o));
+        let display = cmd.display();
+        assert!(!display.contains("PLACEHOLDER-capture-secret"));
+        assert!(!display.contains("PLACEHOLDER-model-secret"));
+        assert!(cmd
+            .argv()
+            .iter()
+            .any(|arg| arg.contains("PLACEHOLDER-capture-secret")));
+        assert!(cmd.argv().iter().any(|arg| arg == "--set-json"));
+    }
+
     fn opts() -> UpOpts {
         UpOpts {
+            file_values: None,
             retained_mail_values: None,
             retained_runner_values: None,
             saved_credentials: None,
@@ -5782,6 +5946,7 @@ mod tests {
             no_expose: true,
             set: vec![],
             set_string: vec![],
+            set_json: vec![],
             allow_egress_host: vec![],
             resolved_egress_cidrs: vec![],
             allow_web_egress: vec![],
@@ -6624,6 +6789,248 @@ mod tests {
         );
     }
 
+    /// Issue #4322: the metadata CI policy an earlier guide put in
+    /// `api.extraEnv`, as the operator wrote it (a JSON object in a string).
+    fn legacy_metadata_ci_policy() -> serde_json::Value {
+        serde_json::json!({
+            "acme/widgets": {
+                "checks": ["pr-body", "sentinel-4322-do-not-print"],
+                "statuses": ["ci/lint"]
+            },
+            "acme/gadgets": {"checks": ["Validate PR title"]}
+        })
+    }
+
+    fn legacy_metadata_ci_entry() -> serde_json::Value {
+        serde_json::json!({
+            "name": "GITHUB_FACTORY_METADATA_CI",
+            "value": serde_json::to_string_pretty(&legacy_metadata_ci_policy()).unwrap()
+        })
+    }
+
+    /// The materialized `cluster up` Helm argv for a release carrying
+    /// `existing`, plus every `-f` values document it hands Helm (read while
+    /// the materialization guards still hold the files).
+    fn cluster_up_helm_inputs(
+        existing: &serde_json::Value,
+    ) -> (Vec<String>, Vec<serde_json::Value>) {
+        let opts =
+            complete_up_opts_without_runner_egress(opts(), Some(existing), None, false, true)
+                .unwrap_or_else(|err| panic!("cluster up must accept the release: {err:#}"));
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv();
+        let documents = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "-f")
+            .map(|pair| {
+                let raw = std::fs::read_to_string(&pair[1]).unwrap();
+                serde_norway::from_str(&raw).unwrap()
+            })
+            .collect();
+        (argv, documents)
+    }
+
+    fn api_extra_env_names(documents: &[serde_json::Value]) -> Vec<String> {
+        documents
+            .iter()
+            .filter_map(|doc| doc.pointer("/api/extraEnv")?.as_array())
+            .flatten()
+            .filter_map(|entry| entry.get("name")?.as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Issue #4322 (AC4): `cluster up` over a release carrying the legacy
+    /// extraEnv entry hands Helm the migrated object whole, as `--set-json`,
+    /// instead of silently dropping it or exploding it into per-leaf `--set`.
+    #[test]
+    fn cluster_up_passes_migrated_metadata_ci_object_as_set_json() {
+        let existing = serde_json::json!({
+            "config": {"schemaVersion": "0.9.0"},
+            "api": {
+                "extraEnv": [
+                    {"name": "PROVIDER_BASE_URL", "value": "https://provider.example.com/v1"},
+                    legacy_metadata_ci_entry(),
+                    {"name": "LOG_FORMAT", "value": "json"}
+                ]
+            }
+        });
+        let (argv, documents) = cluster_up_helm_inputs(&existing);
+        let set_json: Vec<&String> = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--set-json")
+            .map(|pair| &pair[1])
+            .filter(|expr| expr.starts_with("api.githubFactoryMetadataCi="))
+            .collect();
+        assert_eq!(
+            set_json.len(),
+            1,
+            "the migrated object must reach Helm as exactly one --set-json: {argv:?}"
+        );
+        let rhs = set_json[0]
+            .strip_prefix("api.githubFactoryMetadataCi=")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(rhs)
+            .unwrap_or_else(|err| panic!("--set-json value must be JSON ({err}): {rhs}"));
+        assert_eq!(parsed, legacy_metadata_ci_policy());
+        assert!(
+            !rhs.contains('\n'),
+            "--set-json carries compact JSON: {rhs}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.starts_with("api.githubFactoryMetadataCi.")),
+            "the object must not also be exploded into per-leaf --set entries: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.contains("GITHUB_FACTORY_METADATA_CI")),
+            "the legacy extraEnv entry must not be re-supplied on argv: {argv:?}"
+        );
+        assert_eq!(
+            api_extra_env_names(&documents),
+            vec!["PROVIDER_BASE_URL".to_string(), "LOG_FORMAT".to_string()],
+            "the legacy entry must leave the retained extraEnv and the rest keep their order: {documents:?}"
+        );
+    }
+
+    /// Issue #4322 (AC4 edge): when the legacy entry was the ONLY extraEnv item,
+    /// migration leaves `api.extraEnv: []`. That must not refuse `cluster up`.
+    #[test]
+    fn cluster_up_accepts_metadata_ci_as_the_only_extra_env_entry() {
+        let existing = serde_json::json!({
+            "config": {"schemaVersion": "0.9.0"},
+            "api": {"extraEnv": [legacy_metadata_ci_entry()]}
+        });
+        let (argv, documents) = cluster_up_helm_inputs(&existing);
+        assert!(
+            argv.windows(2).any(|pair| pair[0] == "--set-json"
+                && pair[1].starts_with("api.githubFactoryMetadataCi=")),
+            "the migrated object must reach Helm: {argv:?}"
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg.contains("GITHUB_FACTORY_METADATA_CI")),
+            "the legacy extraEnv entry must not be re-supplied on argv: {argv:?}"
+        );
+        assert!(
+            api_extra_env_names(&documents).is_empty(),
+            "the legacy extraEnv entry must not be re-supplied in a values file: {documents:?}"
+        );
+    }
+
+    /// Issue #4322: `diff`/`apply` against an already migrated release whose
+    /// policy is unchanged compares the object leaf by leaf, the way
+    /// `installation::flatten_values` reads the live side, and reports nothing.
+    #[test]
+    fn unchanged_migrated_metadata_ci_object_diffs_as_no_change() {
+        let live = serde_json::json!({
+            "config": {"schemaVersion": "0.9.0"},
+            "api": {"githubFactoryMetadataCi": legacy_metadata_ci_policy()}
+        });
+        let opts = complete_up_opts_without_runner_egress(opts(), Some(&live), None, false, false)
+            .unwrap_or_else(|err| panic!("apply must accept the release: {err:#}"));
+        assert_eq!(opts.set_json.len(), 1, "the object travels typed");
+        let desired = up_value_plan(&opts).effective_values();
+        let entries = crate::installation::diff_plan(&desired, Some(&live));
+        let policy: Vec<_> = entries
+            .iter()
+            .filter(|entry| key_is_or_descends_from(&entry.key, "api.githubFactoryMetadataCi"))
+            .collect();
+        assert!(
+            !policy.is_empty()
+                && policy
+                    .iter()
+                    .all(|entry| entry.key != "api.githubFactoryMetadataCi"
+                        && entry.kind == crate::installation::DiffKind::Same),
+            "every policy leaf must compare unchanged: {policy:?}"
+        );
+        let changed: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.kind.is_change())
+            .collect();
+        assert!(
+            changed.is_empty(),
+            "an unchanged release must diff clean: {changed:?}"
+        );
+    }
+
+    /// Issue #4322: the migrated object used to travel in a private values
+    /// document. Helm still gets the exact JSON, but no rendered form of the
+    /// command (display, dry-run plan, `--debug`, `Debug`) carries it.
+    #[test]
+    fn migrated_metadata_ci_object_is_masked_in_rendered_commands() {
+        let existing = serde_json::json!({
+            "config": {"schemaVersion": "0.9.0"},
+            "api": {"extraEnv": [legacy_metadata_ci_entry()]}
+        });
+        let opts =
+            complete_up_opts_without_runner_egress(opts(), Some(&existing), None, false, true)
+                .unwrap_or_else(|err| panic!("cluster up must accept the release: {err:#}"));
+        let command = &up_commands(&opts)[0];
+        let sentinel = "sentinel-4322-do-not-print";
+        let display = command.display();
+        assert!(
+            display.contains("--set-json")
+                && display.contains("api.githubFactoryMetadataCi=<masked json>"),
+            "the rendered command must still show the key: {display}"
+        );
+        assert!(
+            !display.contains(sentinel),
+            "display leaked the value: {display}"
+        );
+        assert!(
+            !format!("{command:?}").contains(sentinel),
+            "Debug leaked the value"
+        );
+        let (materialized, _guards) = command.materialize_secret_files().unwrap();
+        assert!(
+            materialized.argv().iter().any(
+                |arg| arg.starts_with("api.githubFactoryMetadataCi=") && arg.contains(sentinel)
+            ),
+            "Helm must still receive the exact JSON"
+        );
+    }
+
+    /// Issue #4322: an operator override of one leaf inside the migrated object
+    /// refines it rather than abandoning the typed transport. Helm merges
+    /// `--set-json` before `--set`, so the operator leaf wins there and in
+    /// `effective_values`, and the schema-valid empty list is not refused.
+    #[test]
+    fn operator_leaf_override_keeps_the_migrated_object_typed() {
+        let policy = serde_json::json!({"acme/widgets": {"checks": ["pr-body"], "statuses": []}});
+        let existing = serde_json::json!({
+            "config": {"schemaVersion": "0.9.0"},
+            "api": {"extraEnv": [{
+                "name": "GITHUB_FACTORY_METADATA_CI",
+                "value": policy.to_string()
+            }]}
+        });
+        let leaf = "api.githubFactoryMetadataCi.acme/widgets.checks[0]";
+        let mut base = opts();
+        base.set = vec![format!("{leaf}=replacement")];
+        let opts = complete_up_opts_without_runner_egress(base, Some(&existing), None, false, true)
+            .unwrap_or_else(|err| panic!("a leaf override must not refuse: {err:#}"));
+        assert_eq!(
+            opts.set_json,
+            vec![format!("api.githubFactoryMetadataCi={policy}")],
+            "the migrated object must still travel whole"
+        );
+        let effective = up_value_plan(&opts).effective_values();
+        assert_eq!(effective.get(leaf).map(String::as_str), Some("replacement"));
+        let (materialized, _guards) = up_commands(&opts)[0].materialize_secret_files().unwrap();
+        let argv = materialized.argv();
+        let position = |flag: &str, prefix: &str| {
+            argv.windows(2)
+                .position(|pair| pair[0] == flag && pair[1].starts_with(prefix))
+                .unwrap_or_else(|| panic!("{flag} {prefix} missing: {argv:?}"))
+        };
+        position("--set-json", "api.githubFactoryMetadataCi=");
+        position("--set", leaf);
+    }
+
     /// `dispatcher.slack.identities` (ADR-0168 decision 1) sits beside the
     /// `default` block `comms` records. `up` is a full upgrade, so a list it
     /// did not re-pass would silently undeclare every named identity, and the
@@ -6653,6 +7060,7 @@ mod tests {
         });
         let opts = complete_up_opts_without_runner_egress(
             UpOpts {
+                file_values: None,
                 retained_mail_values: None,
                 retained_runner_values: None,
                 saved_credentials: None,
@@ -6667,6 +7075,7 @@ mod tests {
                 no_expose: true,
                 set: vec![],
                 set_string: vec![],
+                set_json: vec![],
                 allow_web_egress: vec![],
                 fake_model: false,
                 credentials: None,
@@ -10310,4 +10719,131 @@ fn effective_existing_secret(
         return !value.is_empty();
     }
     preserved_value(existing, &reference).is_some()
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c4
+fn file_set_args(opts: &UpOpts) -> Vec<CmdArg> {
+    opts.set
+        .iter()
+        .map(|expression| {
+            if let Some(typed) = typed_empty_worker_map_override(expression) {
+                [plain("--set-json"), CmdArg::HelmSetExpression(typed)]
+            } else {
+                [
+                    plain("--set"),
+                    CmdArg::HelmSetExpression(expression.clone()),
+                ]
+            }
+        })
+        .chain(opts.set_string.iter().map(|expression| {
+            [
+                plain("--set-string"),
+                CmdArg::HelmSetExpression(expression.clone()),
+            ]
+        }))
+        .flatten()
+        .collect()
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c3
+fn apply_flags_to_file_values(opts: &mut UpOpts, github_token: Option<&str>, clear: bool) {
+    let Some(values) = &mut opts.file_values else {
+        return;
+    };
+    let mut changes = Vec::new();
+    if opts.model.is_some() {
+        changes.push((RUNNER_MODEL_KEY.to_string(), None));
+    }
+    if clear || github_token.is_some_and(|value| !value.is_empty()) {
+        changes.push((GITHUB_TOKEN_KEY.to_string(), None));
+        changes.extend(
+            GITHUB_TOKEN_REFERENCE_KEYS
+                .iter()
+                .map(|key| ((*key).to_string(), Some(serde_json::json!("")))),
+        );
+    }
+    if opts.credentials.is_some() || opts.local_model.is_some() {
+        changes.push((MODEL_CREDENTIAL_KEY.to_string(), None));
+        changes.extend(
+            MODEL_CREDENTIAL_REFERENCE_KEYS
+                .iter()
+                .map(|key| ((*key).to_string(), Some(serde_json::json!("")))),
+        );
+    }
+    if opts.fake_model {
+        changes.push((FAKE_MODEL_KEY.to_string(), Some(serde_json::json!(true))));
+    }
+    if opts.no_expose {
+        for key in ["ui.service.type", "langfuse.web.service.type"] {
+            changes.push((key.to_string(), Some(serde_json::json!("ClusterIP"))));
+        }
+    }
+    for (key, replacement) in changes {
+        // These managed key paths are fixed chart paths, never file-authored
+        // dotted map keys. Leave absent file keys to existing completion.
+        let Some((parent, leaf)) = key.rsplit_once('.') else {
+            continue;
+        };
+        let pointer = format!("/{}", parent.replace('.', "/"));
+        let Some(object) = values
+            .0
+            .pointer_mut(&pointer)
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if !object.contains_key(leaf) {
+            continue;
+        }
+        if let Some(replacement) = replacement {
+            object.insert(leaf.to_string(), replacement);
+        } else {
+            object.remove(leaf);
+        }
+    }
+    values.1.clear();
+    flatten_file_values(&values.0, "", &mut values.1);
+}
+
+/// @spec CLUSTER-VALUES-FILES c1-c4
+pub async fn load_values_files(files: &[std::path::PathBuf]) -> Result<Option<PrivateHelmValues>> {
+    if files.is_empty() {
+        return Ok(None);
+    }
+    let parsed = super::lint_values::pending_values(files).await?;
+    // Admission belongs after dedicated flags and typed --set overlays.
+    let document = parsed;
+    let mut flattened = BTreeMap::new();
+    flatten_file_values(&document, "", &mut flattened);
+    Ok(Some(PrivateHelmValues(document, flattened)))
+}
+
+/// @spec CLUSTER-VALUES-FILES c2-c3
+fn flatten_file_values(
+    value: &serde_json::Value,
+    prefix: &str,
+    out: &mut BTreeMap<String, String>,
+) {
+    match value {
+        serde_json::Value::Object(map) if !map.is_empty() => {
+            for (key, child) in map {
+                flatten_file_values(child, &join_escaped_helm_set_path(prefix, key), out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            out.insert(prefix.into(), value.to_string());
+            for (index, child) in items.iter().enumerate() {
+                flatten_file_values(child, &format!("{prefix}[{index}]"), out);
+            }
+        }
+        scalar => {
+            out.insert(
+                prefix.into(),
+                scalar
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| scalar.to_string()),
+            );
+        }
+    }
 }

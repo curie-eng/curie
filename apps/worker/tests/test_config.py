@@ -608,10 +608,7 @@ def test_defaults_parity_with_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.slack_api_base_url == ""
     assert config.slack_identities == ()
     # Postgres
-    assert (
-        config.database_url
-        == "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
-    )
+    assert config.database_url == "postgresql+asyncpg://postgres:postgres@localhost:25432/postgres"
     assert config.db_schema == "curie"
     # Deployment-to-runtime binding
     assert config.default_max_usd_per_day == 10.0

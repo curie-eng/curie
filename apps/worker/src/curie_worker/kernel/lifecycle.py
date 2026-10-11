@@ -1246,6 +1246,14 @@ async def _process_event(
                     approval_routes,
                     deployment_id=workspace_deployment_id,
                 )
+                if pause.abandoned:
+                    # #4331: a stale owner writes no finish and posts no
+                    # escalation; the API termination chain owns the lost
+                    # request's outcome (ADR 0206 decision 1).
+                    await self._complete(
+                        qevent, route, "dropped", telemetry_outcome="stale_owner", lease=lease
+                    )
+                    return
                 approval_created = pause.created
                 if not approval_created:
                     run = self._run_for_event(qevent.event_id)
@@ -1256,6 +1264,7 @@ async def _process_event(
                                 outcome="failed",
                                 cause="approval_create_failed",
                                 detail=pause.failure_detail,
+                                ci_fix_round=None,
                             )
                         except WorkItemConflict as exc:
                             # work_item_cancelled means what it does in
@@ -1478,7 +1487,7 @@ async def _process_event(
                     if owned_run.finished:
                         # The turn has ended and the request is settled, so
                         # nothing on this thread needs the sandbox (#3075).
-                        await self._release_work_item_sandbox(owned_run.thread_key)
+                        await self._release_work_item_sandbox(owned_run)
         constants._OWNED_WORK_ITEM.reset(owned_token)
         constants._PUBLICATION_CONTEXT.reset(publication_token)
         constants._TURN_PROGRESS.reset(progress_token)

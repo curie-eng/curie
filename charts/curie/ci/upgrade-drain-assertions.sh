@@ -15,8 +15,8 @@
 #     deliveries held the upgrade back;
 #   * a roll-hold quiesce TTL longer than the drain wait strands a paused
 #     fleet for longer than the upgrade could ever have waited (#3127): the
-#     marker is a renewed lease while waiting, and the hold written after a
-#     clean drain is capped at the effective wait;
+#     marker is a renewed lease while waiting, and the final hold hook's roll
+#     hold is capped at the effective wait;
 #   * a wait shorter than the delivery budget refuses upgrades over turns that
 #     are still inside the budget ADR-0131 already promised them, which is a
 #     gate that gets switched off in its first week.
@@ -45,6 +45,18 @@ helm template t "$CHART" \
   --set-string worker.upgradeDrain.resources.requests.memory=512Mi \
   --set-string worker.upgradeDrain.resources.limits.memory=768Mi \
   > "$TMP/custom-memory.yaml"
+
+# Render both gVisor hook phases with the external mail persistence preflight.
+# Their order must keep unrelated preflight failures ahead of the drain.
+for install_runtime_class in false true; do
+  helm template t "$CHART" --is-upgrade \
+    --set security.gvisor.mode=require \
+    --set "security.gvisor.installRuntimeClass=$install_runtime_class" \
+    --set mailAdapter.deploy=true \
+    --set 'mailAdapter.agentmail.httpsCidrs[0]=203.0.113.0/24' \
+    --set mailAdapter.persistence.existingClaim=acme-mail-state \
+    > "$TMP/hook-order-$install_runtime_class.yaml"
+done
 
 # --- the two render-time refusals -------------------------------------------
 #
@@ -106,6 +118,7 @@ custom_memory_path = sys.argv[8]
 DRAIN = "upgrade-drain"
 RELEASE = "upgrade-drain-release"
 ATTEST = "upgrade-drain-attest"
+HOLD = "upgrade-drain-hold"
 
 
 def load(path):
@@ -121,7 +134,7 @@ def jobs_by_component(docs):
         component = (doc.get("metadata") or {}).get("labels", {}).get(
             "app.kubernetes.io/component"
         )
-        if component in (DRAIN, RELEASE, ATTEST):
+        if component in (DRAIN, RELEASE, ATTEST, HOLD):
             out.setdefault(component, []).append(doc)
     return out
 
@@ -141,7 +154,7 @@ for path, label in ((disabled_path, "upgradeDrain.enabled=false"), (no_worker_pa
 
 # --- the default render ------------------------------------------------------
 jobs = jobs_by_component(load(default_path))
-for component in (DRAIN, RELEASE, ATTEST):
+for component in (DRAIN, RELEASE, ATTEST, HOLD):
     check(
         len(jobs.get(component, [])) == 1,
         f"expected exactly one {component} Job, found {len(jobs.get(component, []))}",
@@ -154,7 +167,7 @@ for path, label, request_memory, limit_memory in (
     (custom_memory_path, "custom-memory", "512Mi", "768Mi"),
 ):
     rendered_jobs = jobs_by_component(load(path))
-    for component in (DRAIN, RELEASE, ATTEST):
+    for component in (DRAIN, RELEASE, ATTEST, HOLD):
         matching = rendered_jobs.get(component, [])
         if len(matching) != 1:
             check(False, f"the {label} render lacks exactly one {component} Job")
@@ -185,10 +198,12 @@ if not failures:
     drain = jobs[DRAIN][0]
     release = jobs[RELEASE][0]
     attest = jobs[ATTEST][0]
+    hold = jobs[HOLD][0]
 
     drain_ann = (drain.get("metadata") or {}).get("annotations", {})
     release_ann = (release.get("metadata") or {}).get("annotations", {})
     attest_ann = (attest.get("metadata") or {}).get("annotations") or {}
+    hold_ann = (hold.get("metadata") or {}).get("annotations") or {}
 
     # The hook phases. `pre-upgrade` ONLY: a fresh install has nothing in flight
     # and no Valkey to ask, so `pre-install` would fail every first install.
@@ -247,6 +262,43 @@ if not failures:
         "expected 300 so a slow image pull cannot fail attest after a clean drain",
     )
 
+    # The last pre-upgrade step renews the existing lease into the roll hold.
+    check(
+        hold_ann.get("helm.sh/hook") == "pre-upgrade",
+        f"hold hook is {hold_ann.get('helm.sh/hook')!r}, expected exactly 'pre-upgrade'",
+    )
+    check(
+        hold_ann.get("helm.sh/hook-weight") == "10",
+        f"hold hook weight is {hold_ann.get('helm.sh/hook-weight')!r}, expected '10'",
+    )
+    check(
+        hold_ann.get("helm.sh/hook-delete-policy") == "before-hook-creation,hook-succeeded",
+        "the hold hook must retain failed evidence and clear only before the next attempt or on success",
+    )
+    check(
+        "curie.ai/minimum-helm-timeout-seconds" not in hold_ann,
+        "the hold hook carries the timeout annotation that belongs to the drain Job only",
+    )
+    hold_spec = hold.get("spec") or {}
+    check(
+        hold_spec.get("backoffLimit") == 0,
+        f"hold backoffLimit is {hold_spec.get('backoffLimit')!r}, expected 0",
+    )
+    check(
+        hold_spec.get("activeDeadlineSeconds") == 300,
+        f"hold activeDeadlineSeconds is {hold_spec.get('activeDeadlineSeconds')!r}, expected 300",
+    )
+    attest_container = attest["spec"]["template"]["spec"]["containers"][0]
+    hold_container = hold["spec"]["template"]["spec"]["containers"][0]
+    check(
+        hold_container.get("env") == attest_container.get("env"),
+        "the hold hook does not carry the attest hook's complete environment",
+    )
+    check(
+        hold_container.get("image") == attest_container.get("image"),
+        "the hold hook does not use the same worker image as attest",
+    )
+
     drain_spec = drain.get("spec") or {}
     release_spec = release.get("spec") or {}
     # A refusal is a decision, not a transient error.
@@ -274,6 +326,7 @@ if not failures:
         (DRAIN, drain, "drain"),
         (RELEASE, release, "release"),
         (ATTEST, attest, "attest"),
+        (HOLD, hold, "hold"),
     ):
         pod = (doc.get("spec") or {}).get("template", {}).get("spec", {})
         check(
@@ -307,7 +360,7 @@ if not failures:
         env = {e["name"]: e for e in container.get("env", []) if isinstance(e, dict)}
         for required in ("VALKEY_HOST", "VALKEY_PORT", "VALKEY_PASSWORD"):
             check(required in env, f"{component} is missing {required}")
-        # Both Jobs build the same WorkerConfig. The roll hold is capped at the
+        # All Jobs build the same WorkerConfig. The roll hold is capped at the
         # effective wait (#3127): min(quiesceTtlSeconds 1800, wait 10860) = 1800.
         check(
             env.get("CURIE_UPGRADE_DRAIN_TIMEOUT_S", {}).get("value") == "10860",
@@ -470,8 +523,69 @@ if failures:
 print("OK: upgrade drain gate render assertions passed")
 PY
 
+python3 - "$TMP/hook-order-false.yaml" "$TMP/hook-order-true.yaml" <<'PY'
+import sys
+
+import yaml
+
+
+def hooks(path):
+    with open(path) as stream:
+        documents = [doc for doc in yaml.safe_load_all(stream) if doc]
+    return {
+        (doc["kind"], doc["metadata"]["name"]): doc["metadata"]["annotations"]
+        for doc in documents
+        if "helm.sh/hook" in (doc.get("metadata", {}).get("annotations") or {})
+    }
+
+
+expected_pre_upgrade = {
+    ("ServiceAccount", "t-curie-mail-persistence-preflight"): -12,
+    ("Role", "t-curie-mail-persistence-preflight"): -12,
+    ("RoleBinding", "t-curie-mail-persistence-preflight"): -12,
+    ("Job", "t-curie-mail-persistence-preflight"): -11,
+    ("Job", "t-curie-preflight-avx"): -10,
+    ("Job", "t-curie-upgrade-drain"): -10,
+    ("Job", "t-curie-upgrade-drain-attest"): -9,
+    ("Job", "t-curie-schema-migrate"): -5,
+    ("Job", "t-curie-upgrade-drain-hold"): 10,
+}
+for path, install_runtime_class in zip(sys.argv[1:], (False, True), strict=True):
+    rendered = hooks(path)
+    expected = dict(expected_pre_upgrade)
+    gvisor_key = ("Job", "t-curie-preflight-gvisor")
+    if not install_runtime_class:
+        expected[gvisor_key] = -11
+    for key, weight in expected.items():
+        assert key in rendered, f"missing hook {key} in {path}"
+        annotations = rendered[key]
+        phases = set(annotations["helm.sh/hook"].split(","))
+        assert "pre-upgrade" in phases, f"{key} is not a pre-upgrade hook"
+        assert annotations.get("helm.sh/hook-weight") == str(weight), (
+            f"{key} has weight {annotations.get('helm.sh/hook-weight')!r}, expected {weight}"
+        )
+
+    gvisor = rendered[gvisor_key]
+    expected_gvisor_phases = (
+        {"post-install", "post-upgrade", "test"}
+        if install_runtime_class
+        else {"pre-install", "pre-upgrade", "test"}
+    )
+    assert set(gvisor["helm.sh/hook"].split(",")) == expected_gvisor_phases, (
+        "gVisor hook phases do not match RuntimeClass ownership"
+    )
+    assert gvisor.get("helm.sh/hook-weight") == ("-9" if install_runtime_class else "-11"), (
+        "gVisor must run before drain in pre-upgrade and after release in post-upgrade"
+    )
+    release = rendered[("Job", "t-curie-upgrade-drain-release")]
+    assert release["helm.sh/hook"] == "post-upgrade", "release hook phase changed"
+    assert release.get("helm.sh/hook-weight") == "-10", "release hook weight changed"
+
+print("OK: pre-upgrade mail, gVisor, drain, attest, migration and hold hook order is preserved")
+PY
+
 # The installation identity is one render-scoped value shared by the managed
-# Secret, the long-running worker and both lifecycle hooks. Keep these checks in
+# Secret, the long-running worker and all lifecycle hooks. Keep these checks in
 # the real Helm consumer: independently calling a random helper from each
 # template would look plausible in source and still split the release across
 # three different Valkey keys.
@@ -492,6 +606,7 @@ default_path, fresh_second_path, client_upgrade_path, byo_path = map(
 DRAIN = "upgrade-drain"
 RELEASE = "upgrade-drain-release"
 ATTEST = "upgrade-drain-attest"
+HOLD = "upgrade-drain-hold"
 
 
 def load(path):
@@ -574,7 +689,12 @@ def assert_identity_render(docs, *, observed, legacy):
     revisions = []
     identities = []
     legacy_values = []
-    for component, mode in ((DRAIN, "drain"), (RELEASE, "release"), (ATTEST, "attest")):
+    for component, mode in (
+        (DRAIN, "drain"),
+        (RELEASE, "release"),
+        (ATTEST, "attest"),
+        (HOLD, "hold"),
+    ):
         hook = one(docs, kind="Job", component=component)
         container, env = container_env(hook)
         assert container.get("command") == [
@@ -606,14 +726,14 @@ def assert_identity_render(docs, *, observed, legacy):
         revisions.append(revision["value"])
         legacy_values.append(legacy_entry["value"])
 
-    assert identities == [installation_id, installation_id, installation_id], (
+    assert identities == [installation_id] * 4, (
         "managed Secret and hook installation identities do not match within one render"
     )
     assert len(set(revisions)) == 1, (
-        "drain, release, and attest hooks carry different revisions"
+        "drain, release, attest and hold hooks carry different revisions"
     )
-    assert legacy_values == [legacy, legacy, legacy], (
-        "drain, release, and attest hooks disagree on legacy compatibility"
+    assert legacy_values == [legacy] * 4, (
+        "drain, release, attest and hold hooks disagree on legacy compatibility"
     )
     return installation_id, managed_name, worker_env
 
@@ -662,7 +782,7 @@ assert installation_ref.get("name") == managed_name, (
 
 print(
     "OK: one memoized installation identity reaches the managed Secret, worker and "
-    "the drain, release, and attest hooks; fresh installs rotate it; client-only "
+    "the drain, release, attest and hold hooks; fresh installs rotate it; client-only "
     "upgrades are marked unobserved; BYO credential Secrets cannot replace it"
 )
 PY

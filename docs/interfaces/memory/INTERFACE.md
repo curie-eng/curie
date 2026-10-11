@@ -48,9 +48,12 @@ frozen ACI field is unchanged; the state-API bearer is a runner-local knob
   At boot the runner loads memory and composes it into the effective system
   prompt as a preamble — this is how memory is *delivered into the sandbox*. A
   transient load failure degrades to "no memory" and does not block boot.
-- **Append side.** `append(record)` durably writes one record; provenance is
-  stamped by `SessionRunner.remember(content, source_trace_ids=...)`. The record
-  survives suspend/resume and is reloaded at the next boot.
+3. **Append side.** `append(record)` POSTs one record to the legacy log; provenance is
+  stamped by `SessionRunner.remember(content, source_trace_ids=...)`. A platform-authorized
+  caller can persist it for the next boot. The worker's sandbox credential cannot:
+  the state API refuses memory appends even with a per-turn write token. The supported
+  per-turn `remember` fact tool writes a fact key with PUT through `MemoryFactsStore`,
+  beside this port.
 
 ## Implementations today
 
@@ -61,7 +64,11 @@ facts store (`MemoryFactsStore`, below) sits beside the port, not behind it.
 over the durable KV/document store landed for #23/#248
 (`apps/api` `/agents/{agent_id}/state/{namespace}/{key}`, Postgres JSONB).
 `load` GETs the single log-shaped key; `append` POSTs to that key's `/append`
-endpoint (#248), inheriting durability and the per-value/per-namespace size caps.
+endpoint (#248), inheriting durability and the per-value/per-namespace size caps when
+authorized. These methods use the store's supplied token, so the worker's read-only
+boot token permits loading but cannot fulfill legacy `SessionRunner.remember` or
+log consolidation's PUT. Per-turn fact credentials never authorize a log append or
+replacement (`apps/api/src/curie_api/routers/state.py::_check_memory_reach`).
 The worker (`binding.boot_env`) delivers the ref as
 `http(s)://api/agents/<id>/state/memory` and forwards a scoped, agent-bound
 `state` token (ADR-0033, #410) as the memory token rather than the raw platform
@@ -196,7 +203,7 @@ change.
   reads; writes need the per-turn credential above. The
   platform key still authenticates the state router for operators, the CLI, and
   the worker's own control-plane calls.
-- **Consolidation is an opt-in capability, not part of the port.** The core
+2. **Consolidation is an opt-in capability, not part of the port.** The core
   `MemoryStore` port stays `load`/`append` only. Consolidation (#265) adds a
   separate `SupportsReplace` capability (`replace(records)`) and the
   `consolidate_memory(store)` entry point (also `SessionRunner.consolidate_memory`):
@@ -204,8 +211,10 @@ change.
   `consolidate_records` while **unioning their provenance** (`merge_provenance` —
   no source trace is lost), and writes the compacted set back only when the store
   advertises `replace` and the pass actually reduced the record count.
-  `StateApiMemoryStore.replace` is a blind PUT of the log key; `NullMemoryStore`
-  and any read-only backing make consolidation a reporting-only no-op. Automatic
+  `StateApiMemoryStore.replace` is a blind PUT of the log key and succeeds only with
+  platform authorization. With the worker's boot-read token a reducing pass attempts
+  that PUT and is refused; it is not a reporting-only no-op. `NullMemoryStore` and
+  stores without the replace capability remain reporting-only. Automatic
   learned-record *extraction* remains later work.
 - **An operator read/write plane sits below the port, not on it.** The
   inspect, seed, trace-back, edit, and delete surface (#266, #267, #1904) is

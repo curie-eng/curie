@@ -31,6 +31,7 @@ from aci_protocol import (
 )
 from channel_protocol.reply import ReplyAck, ReplyEvent
 from curie_worker.approvals import (
+    ApprovalBackendError,
     ApprovalClient,
     ApprovalRequest,
     CreatedApproval,
@@ -49,6 +50,7 @@ from curie_worker.workitem_dispatch import (
     WorkItemStartGrant,
     WorkItemStartRefused,
 )
+from curie_worker.workspace import WorkspacePreparationError
 from redis.exceptions import ResponseError
 
 AGENT_ID = uuid.UUID("11111111-1111-4111-8111-111111111111")
@@ -183,6 +185,99 @@ class _NoExistingPublication:
 
     async def get_publication_precheck_context(self, **_kwargs: object) -> None:
         return None
+
+
+class _HttpPrecheckApi(_NoExistingPublication):
+    """Serve the API refusal shape from #4299 to the real worker client."""
+
+    def __init__(self, responses: list[tuple[int, dict[str, object] | None]]) -> None:
+        self.mints: list[httpx.Request] = []
+
+        def answer(request: httpx.Request) -> httpx.Response:
+            assert request.url.path == "/v1/internal/publications/precheck/context"
+            assert request.headers["X-Curie-Worker-Token"] == "example-worker-token"
+            self.mints.append(request)
+            status, body = responses[min(len(self.mints) - 1, len(responses) - 1)]
+            return httpx.Response(status, json=body) if body is not None else httpx.Response(status)
+
+        self.http = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+        self.client = ApprovalClient(
+            api_base_url="http://api.example.test",
+            api_key="",
+            client=self.http,
+            read_timeout_s=5.0,
+            worker_token="example-worker-token",
+        )
+
+    async def get_publication_precheck_context(self, **kwargs: object) -> PublicationContext | None:
+        return await self.client.get_publication_precheck_context(**kwargs)  # type: ignore[arg-type]
+
+    async def aclose(self) -> None:
+        await self.http.aclose()
+
+
+_PR_NOT_ADOPTED_RESPONSE: tuple[int, dict[str, object]] = (
+    409,
+    {
+        "detail": {
+            "code": "pull_request_not_adopted",
+            "message": "an earlier pull request could not be continued",
+        }
+    },
+)
+
+
+def test_real_precheck_client_raises_the_dedicated_existing_pr_refusal() -> None:
+    from curie_worker.approvals import PullRequestNotAdopted
+
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([_PR_NOT_ADOPTED_RESPONSE])
+        try:
+            with pytest.raises(PullRequestNotAdopted) as caught:
+                await publications.get_publication_precheck_context(
+                    deployment_id=DEPLOYMENT_ID,
+                    work_item_id=uuid.uuid4(),
+                    execution_request_id=uuid.uuid4(),
+                    runtime_epoch=1,
+                    queued_event_id="work-item-context-example",
+                )
+            assert type(caught.value) is PullRequestNotAdopted
+            assert len(publications.mints) == 1
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (409, {"detail": {"code": "invalid_context"}}),
+        (503, {"detail": {"code": "precheck_unavailable"}}),
+        (503, {"detail": {"code": "pull_request_not_adopted"}}),
+        (409, {"detail": "pull_request_not_adopted"}),
+    ],
+)
+def test_real_precheck_client_keeps_other_refusals_as_backend_errors(
+    status: int, body: dict[str, object]
+) -> None:
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([(status, body)])
+        try:
+            with pytest.raises(ApprovalBackendError) as caught:
+                await publications.get_publication_precheck_context(
+                    deployment_id=DEPLOYMENT_ID,
+                    work_item_id=uuid.uuid4(),
+                    execution_request_id=uuid.uuid4(),
+                    runtime_epoch=1,
+                    queued_event_id="work-item-context-example",
+                )
+            assert type(caught.value) is ApprovalBackendError
+            assert len(publications.mints) == 1
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
 
 
 class _RecordingSink:
@@ -362,6 +457,162 @@ def test_factory_turn_receives_only_authoritative_publication_context(
                         else None
                     )
                     assert expected.capability not in turn.text
+
+    asyncio.run(exercise())
+
+
+def test_existing_pr_refusal_finishes_execute_once_without_starting_the_runner(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([_PR_NOT_ADOPTED_RESPONSE])
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=publications,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+                event = _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+
+                await h.kernel.process_event(event)
+
+                assert len(publications.mints) == 1
+                assert h.runner.opened == []
+                assert items.calls.count("start") == 1
+                assert items.calls.count("finish") == 1
+                assert items.finishes[0]["outcome"] == "failed"
+                assert items.finishes[0]["cause"] == "pull_request_not_adopted"
+                assert await h.kernel._markers.is_terminal(event.event_id)
+                assert all("runner_escalated" not in text for text in _escalations(caplog))
+                assert any("pull-request-not-adopted" in text for text in _escalations(caplog))
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("status", "code"), [(409, "invalid_context"), (503, "precheck_unavailable")]
+)
+def test_other_precheck_backend_errors_exhaust_the_existing_execute_retry_budget(
+    make_harness, status: int, code: str
+) -> None:
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([(status, {"detail": {"code": code}})])
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                publication_creator=publications,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+
+                await h.kernel.process_event(
+                    _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+
+                assert len(publications.mints) == h.config.max_attempts
+                assert h.runner.opened == []
+                assert items.calls.count("finish") == 1
+                assert items.finishes[0]["outcome"] == "failed"
+                assert items.finishes[0]["cause"] == "runner_escalated"
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_a_transient_generic_precheck_refusal_still_allows_a_factory_turn(
+    make_harness,
+) -> None:
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi(
+            [(409, {"detail": {"code": "invalid_context"}}), (204, None)]
+        )
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                approvals=_Approvals(),
+                publication_creator=publications,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+                h.runner.default_script = [
+                    Final(
+                        text="Requesting approval.",
+                        status=SessionStatus.AWAITING_APPROVAL,
+                        approval_summary="Run the requested command",
+                        approval_gate_kind="permission",
+                        approval_granted_tool="Bash",
+                    )
+                ]
+
+                await h.kernel.process_event(
+                    _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+
+                assert len(publications.mints) == 2
+                assert len(h.runner.opened) == 1
+                assert items.finishes == []
+                assert items.calls.count("hold_for_approval") == 1
+        finally:
+            await publications.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_existing_pr_refusal_finishes_approval_resume_without_a_new_runner_turn(
+    make_harness, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def exercise() -> None:
+        publications = _HttpPrecheckApi([(204, None), _PR_NOT_ADOPTED_RESPONSE])
+        try:
+            async with make_harness(
+                binding=_Binding(),
+                workspace_factory=_Workspace,
+                approvals=_Approvals(),
+                publication_creator=publications,
+            ) as h:
+                items = _WorkItems()
+                h.kernel._work_items = items
+                h.runner.default_script = [
+                    Final(
+                        text="Requesting approval.",
+                        status=SessionStatus.AWAITING_APPROVAL,
+                        approval_summary="Run the requested command",
+                        approval_gate_kind="permission",
+                        approval_granted_tool="Bash",
+                    )
+                ]
+                await h.kernel.process_event(
+                    _turn(f"work-item-{uuid.uuid4()}-execute-1", f"Resolve {ISSUE_URL}")
+                )
+                assert len(publications.mints) == 1
+                assert len(h.runner.opened) == 1
+                assert items.finishes == []
+                before = len(publications.mints)
+                resumed = _turn(
+                    f"approval-{uuid.uuid4()}-resolved",
+                    "[approval resolved] approved",
+                    placeholder="approval-placeholder",
+                )
+
+                await h.kernel.process_event(resumed)
+
+                assert len(publications.mints) - before == 1
+                assert len(h.runner.opened) == 1
+                assert items.calls.count("finish") == 1
+                assert items.finishes[0]["outcome"] == "failed"
+                assert items.finishes[0]["cause"] == "pull_request_not_adopted"
+                assert await h.kernel._markers.is_terminal(resumed.event_id)
+                assert all("runner_escalated" not in text for text in _escalations(caplog))
+                assert any("pull-request-not-adopted" in text for text in _escalations(caplog))
+        finally:
+            await publications.aclose()
 
     asyncio.run(exercise())
 
@@ -563,6 +814,102 @@ def test_credit_exhausted_escalation_finishes_with_its_cause_and_message(
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "model_credit_exhausted"
             assert finish["detail"] == message
+
+    asyncio.run(exercise())
+
+
+def test_model_unreachable_on_every_attempt_finishes_with_its_cause_and_message(
+    make_harness,
+) -> None:
+    """#4333: an outage longer than the retries names the cause, not ``unclassified``."""
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=_Workspace,
+            publication_creator=_NoExistingPublication(),
+            max_attempts=3,
+        ) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            message = "model error: server_error: API Error: Connection refused (ECONNREFUSED)"
+            h.runner.default_script = [
+                ErrorEvent(message=message, classification="model-unreachable"),
+                Final(text="", status=SessionStatus.CLASSIFIED_FAILURE),
+            ]
+            request_id = uuid.uuid4()
+            prompt = f"Resolve {ISSUE_URL}"
+
+            await h.kernel.process_event(_turn(f"work-item-{request_id}-execute-1", prompt))
+
+            # Retryable with no side effect: every attempt is spent first.
+            assert h.runner.opened == [prompt, prompt, prompt]
+            assert work_items.calls.count("finish") == 1
+            finish = work_items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "model_unreachable"
+            assert isinstance(finish["detail"], str)
+            assert "API Error: Connection refused (ECONNREFUSED)" in finish["detail"]
+
+    asyncio.run(exercise())
+
+
+def test_workspace_retry_fault_finishes_with_redacted_bounded_stage_and_reason(
+    make_harness,
+) -> None:
+    """#4367: work-item finish consumes safe detail before reply formatting."""
+
+    reason = (
+        "API returned HTTP 500: -----BEGIN PRIVATE KEY-----\n"
+        f"{'SYNTHETIC-PRIVATE-MATERIAL' * 30}\n-----END PRIVATE KEY----- "
+        f"remaining diagnosis {'x' * 1000}"
+    )
+
+    class WorkspaceFaultOnRetry(_Workspace):
+        def select_repository(self, **kwargs: object) -> object:
+            selected = super().select_repository(**kwargs)
+            if len(self.selections) > 1:
+                raise WorkspacePreparationError("repository-selection", reason)
+            return selected
+
+    async def exercise() -> None:
+        async with make_harness(
+            binding=_Binding(),
+            workspace_factory=WorkspaceFaultOnRetry,
+            publication_creator=_NoExistingPublication(),
+            max_attempts=3,
+        ) as h:
+            work_items = _WorkItems()
+            h.kernel._work_items = work_items
+            # Start the real execution before the workspace retry fails. A
+            # fault before start defers the request and has no finish reader.
+            h.runner.default_script = [
+                ErrorEvent(message="retry this clean attempt", classification="runner-error"),
+                Final(text="", status=SessionStatus.CLASSIFIED_FAILURE),
+            ]
+            request_id = uuid.uuid4()
+            prompt = f"Resolve {ISSUE_URL}"
+
+            await h.kernel.process_event(_turn(f"work-item-{request_id}-execute-1", prompt))
+
+            assert h.runner.opened == [prompt]
+            assert h.kernel._workspace.selections == [WORK_ITEM_REPO] * 3
+            assert work_items.calls.count("start") == 1
+            assert work_items.calls.count("finish") == 1
+            finish = work_items.finishes[0]
+            assert finish["outcome"] == "failed"
+            assert finish["cause"] == "workspace_error"
+            detail = finish["detail"]
+            assert isinstance(detail, str)
+            assert detail.startswith(
+                "workspace repository-selection failed: API returned HTTP 500: "
+                "[REDACTED:pem_private_key]"
+            )
+            assert len(detail) <= 300
+            assert "remaining diagnosis" in detail
+            assert "SYNTHETIC-PRIVATE-MATERIAL" not in detail
+            assert "-----BEGIN PRIVATE KEY-----" not in detail
+            assert "-----END PRIVATE KEY-----" not in detail
 
     asyncio.run(exercise())
 
@@ -1203,10 +1550,10 @@ def _fail_settled_release(h: object) -> None:
     route is exactly what the #3071 turn budget fence guards.
     """
 
-    def release(_thread_key: str) -> bool:
+    def release_if_claim(_thread_key: str, _claim_name: str) -> bool:
         raise RuntimeError("control plane unavailable")
 
-    h.substrate.release = release  # type: ignore[attr-defined]
+    h.substrate.release_if_claim = release_if_claim  # type: ignore[attr-defined]
 
 
 def test_consecutive_work_items_replace_the_sandbox_even_with_the_same_budget(

@@ -55,16 +55,21 @@ acceptable normal-path answer rather than an outage.
 gate holds the marker as a short LEASE (:func:`quiesce_lease_s`) that it renews
 every poll, so a gate that dies without running any cleanup (SIGKILL, node
 loss) stops renewing and the fleet resumes within one lease. Only after a clean
-drain is the marker extended to the roll hold (``upgrade_quiesce_ttl_s``), which
-the chart caps at the effective drain wait; the post-upgrade release clears it
-long before that in the normal path.
+drain is the marker handed off with the shared 300 s lease. Attest renews that
+lease once and schema-migrate renews it while running. The final pre-upgrade
+``hold`` hook extends existing authority to the roll hold
+(``upgrade_quiesce_ttl_s``), which the chart caps at the effective drain wait.
+The post-upgrade release clears it in the normal path; a failure after hold can
+still pause claims until the roll hold expires.
 
 **A deleted drain Job is not a successful drain (#3360).** Helm treats deletion
 of that Job as the hook finishing, so a later pre-upgrade attest hook reads a
 success record written only after a clean drain and refuses the upgrade when
 the record is missing, unreadable, or for another revision. The record is this
 revision's key. Attest does not write it and does not touch the quiesce
-marker. The post-upgrade release deletes it.
+marker's bytes: after the record matches, it renews only an existing marker
+owned by this revision and refuses absent or foreign authority. The
+post-upgrade release deletes the record.
 """
 
 from __future__ import annotations
@@ -82,7 +87,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal, NotRequired, TypedDict
 
+from curie_upgrade_pause import PAUSE_LEASE_S, marker_keys, renew_pause
 from redis.asyncio import Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from redis.exceptions import ResponseError
 
 from .config import WorkerConfig
@@ -254,12 +262,11 @@ class UpgradeDrainGate:
         return self._config.upgrade_revision or 0
 
     def _marker_keys(self) -> tuple[str, ...]:
-        authoritative = self._config.upgrade_quiesce_key()
-        if self._config.installation_id and self._config.upgrade_legacy_quiesce:
-            # Scoped first so a same revision retry repairs a legacy key that an
-            # old hook rewrote while retaining the authoritative marker's time.
-            return (authoritative, self._config.upgrade_legacy_quiesce_key())
-        return (authoritative,)
+        return marker_keys(
+            self._config.key_prefix,
+            self._config.installation_id,
+            self._config.upgrade_legacy_quiesce,
+        )
 
     async def request_quiesce(self, *, ttl_s: float | None = None) -> None:
         """Ask every replica to stop taking new work.
@@ -452,14 +459,16 @@ class UpgradeDrainGate:
         cleanup releases the fleet within one lease (#3127). A renewal fenced
         by a newer revision cancels the wait and raises
         :class:`QuiesceWriteRefused`: this gate no longer holds pause
-        authority. The heartbeat is always stopped before the roll hold is
-        written or the call returns. On a clean drain the flag is extended
-        once to the roll hold (``upgrade_quiesce_ttl_s``): that is what keeps
-        the replacement pods from reclaiming while the roll is in progress, and
-        the post-upgrade release clears it. On refusal the lease is left set
-        and clearing it is the caller's decision (see :func:`run_gate`),
-        because a caller that wants to retry the gate immediately should not
-        have to re-quiesce a fleet that just resumed.
+        authority. The heartbeat is always stopped before the handoff lease
+        is written or the call returns. On a clean drain the flag is handed
+        off with the shared 300 s lease. Attest and schema-migrate renew that
+        existing authority; only the final pre-upgrade hold hook extends it
+        to ``upgrade_quiesce_ttl_s`` for the roll. The post-upgrade release
+        clears it, while a failure after hold can still last for the roll hold.
+        On refusal the lease is left set and clearing it is the caller's
+        decision (see :func:`run_gate`), because a caller that wants to retry
+        the gate immediately should not have to re-quiesce a fleet that just
+        resumed.
         """
         timeout = self._config.upgrade_drain_timeout_s if timeout_s is None else timeout_s
         interval = (
@@ -491,9 +500,9 @@ class UpgradeDrainGate:
                 with contextlib.suppress(BaseException):
                     await task
         if not remaining:
-            # The roll hold: the replacement pods must not claim until the
-            # post-upgrade release clears the marker.
-            await self.request_quiesce(ttl_s=self._config.upgrade_quiesce_ttl_s)
+            # Hand off a short lease. Only the final pre-upgrade hold hook
+            # extends existing authority for the roll.
+            await self.request_quiesce(ttl_s=PAUSE_LEASE_S)
             return DrainOutcome(
                 drained=True, remaining=(), waited_s=time.monotonic() - started
             )
@@ -576,11 +585,12 @@ async def _record_drain_success(redis: Redis, config: WorkerConfig) -> None:
 
 
 async def _attest_recorded_drain(redis: Redis, config: WorkerConfig) -> int:
-    """Read the success record and nothing else.
+    """Require this revision's success record, then renew its handoff lease once.
 
-    Exit 0 only when it names this hook revision. Missing, non-JSON, the wrong
-    type, a different revision, or a Valkey error is a refusal (exit 1). This
-    path does not SET the key and does not write or clear the quiesce marker.
+    Exit 0 only when the record matches and existing pause authority is owned
+    by this revision. Missing or malformed records, absent or foreign authority,
+    and Valkey errors refuse (exit 1). Renewal preserves marker bytes and never
+    shortens its TTL. This path never creates or clears a marker or record.
     """
     try:
         raw = await redis.get(config.upgrade_drain_success_key())
@@ -590,17 +600,42 @@ async def _attest_recorded_drain(redis: Redis, config: WorkerConfig) -> int:
             "revision and nothing was rolled. The success record could not be read."
         )
         return 1
-    if _success_record_matches(raw, _hook_revision(config)):
-        logger.info(
-            "upgrade drain success is recorded for revision %d",
-            _hook_revision(config),
+    if not _success_record_matches(raw, _hook_revision(config)):
+        logger.error(
+            "refusing the upgrade: no successful drain is recorded for this "
+            "revision and nothing was rolled."
         )
-        return 0
-    logger.error(
-        "refusing the upgrade: no successful drain is recorded for this "
-        "revision and nothing was rolled."
+        return 1
+    try:
+        renewed = await renew_pause(
+            redis,
+            marker_keys(
+                config.key_prefix,
+                config.installation_id,
+                config.upgrade_legacy_quiesce,
+            ),
+            _hook_revision(config),
+            PAUSE_LEASE_S * 1000,
+        )
+    except Exception:  # noqa: BLE001 - failure boundary
+        logger.error(
+            "refusing the upgrade: the recorded drain's pause authority could "
+            "not be renewed and nothing was rolled."
+        )
+        return 1
+    if renewed != "renewed":
+        logger.error(
+            "refusing the upgrade: the recorded drain's pause authority is %s "
+            "and nothing was rolled.",
+            renewed,
+        )
+        return 1
+    logger.info(
+        "upgrade drain success is recorded and its handoff lease renewed for "
+        "revision %d",
+        _hook_revision(config),
     )
-    return 1
+    return 0
 
 
 async def run_gate(config: WorkerConfig, *, mode: str) -> int:
@@ -608,12 +643,22 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
 
     ``drain`` is the pre-upgrade hook: quiesce, wait, and answer with the exit
     code Helm reads as "proceed" (0) or "do not roll" (1). A clean drain also
-    records success for this revision. ``attest`` only reads that record and
-    refuses when it is absent. ``release`` is the post-upgrade hook: clear the
-    flag and delete this revision's success record so the new pods start claiming.
+    records success for this revision and hands off a 300 s pause lease.
+    ``attest`` requires that record and renews matching existing authority once.
+    ``hold`` is the final pre-upgrade hook: renew existing authority to the
+    configured roll hold without creating keys, reading the success record or
+    shortening a longer TTL. Either renewal refuses absent or foreign authority
+    and Valkey errors. A failure after hold can still pause claims for the roll
+    hold. ``release`` is the post-upgrade hook: clear the flag and delete this
+    revision's success record so the new pods start claiming.
     """
     redis = _client(config)
     try:
+        if mode in {"attest", "hold"}:
+            # These hooks are one-shot steps. Redis.set_retry also applies to
+            # future pooled connections, so a connection failure cannot spend
+            # the hook budget on the client's default backoff and retries.
+            redis.set_retry(Retry(NoBackoff(), 0))
         if mode == "release":
             await UpgradeDrainGate(redis, config).clear_quiesce()
             await redis.delete(config.upgrade_drain_success_key())
@@ -624,6 +669,35 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
             return 0
         if mode == "attest":
             return await _attest_recorded_drain(redis, config)
+        if mode == "hold":
+            try:
+                renewed = await renew_pause(
+                    redis,
+                    marker_keys(
+                        config.key_prefix,
+                        config.installation_id,
+                        config.upgrade_legacy_quiesce,
+                    ),
+                    _hook_revision(config),
+                    max(1, int(config.upgrade_quiesce_ttl_s * 1000)),
+                )
+            except Exception:  # noqa: BLE001 - failure boundary
+                logger.error(
+                    "refusing the upgrade: pause authority could not be renewed "
+                    "for the roll hold and nothing was rolled."
+                )
+                return 1
+            if renewed != "renewed":
+                logger.error(
+                    "refusing the upgrade: pause authority is %s and the roll "
+                    "hold was not applied. Nothing was rolled.",
+                    renewed,
+                )
+                return 1
+            logger.info(
+                "upgrade roll hold renewed for revision %d", _hook_revision(config)
+            )
+            return 0
         gate = UpgradeDrainGate(redis, config)
         # Job deletion and activeDeadlineSeconds deliver SIGTERM. Cancel the
         # wait and clear the marker at once rather than leaving the fleet paused
@@ -658,7 +732,7 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
                 "Nothing was rolled."
             )
             return 1
-        except Exception:
+        except Exception:  # noqa: BLE001 - failure boundary
             # An unreadable lane (or any other failure) refuses the upgrade;
             # release the fleet before propagating the non-zero exit.
             await gate.clear_quiesce()
@@ -667,11 +741,11 @@ async def run_gate(config: WorkerConfig, *, mode: str) -> int:
             for sig in installed:
                 loop.remove_signal_handler(sig)
         if outcome.drained:
-            # The roll hold is already written inside await_drained. Record
+            # The handoff lease is already written inside await_drained. Record
             # success only now: SIGTERM, a refused drain, and an exception
             # return above without this write. Handlers are already removed,
             # so SIGTERM during this write kills the process instead of
-            # taking the cleanup path. A failed SET drops the roll hold so a
+            # taking the cleanup path. A failed SET drops the handoff lease so a
             # refused upgrade does not leave the fleet paused.
             try:
                 await _record_drain_success(redis, config)
@@ -729,12 +803,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--mode",
-        choices=("drain", "release", "status", "attest"),
+        choices=("drain", "release", "status", "attest", "hold"),
         default="drain",
         help=(
-            "drain: pre-upgrade gate. attest: pre-upgrade check that this "
-            "revision's drain recorded success. release: post-upgrade quiesce "
-            "clear. status: read worker claim state."
+            "drain: pre-upgrade gate with a 300 s handoff lease. attest: check "
+            "this revision's recorded success and renew its existing pause "
+            "once. hold: final pre-upgrade renewal to the configured roll hold. "
+            "release: post-upgrade quiesce clear. status: read worker claim state."
         ),
     )
     parser.add_argument(

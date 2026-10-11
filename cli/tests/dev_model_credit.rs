@@ -5,7 +5,7 @@
 //! 200 `{"data":{"total_credits":800,"total_usage":599.85}}`, and an unknown
 //! key's 401 `{"error":{"message":"User not found.","code":401}}`.
 
-mod support;
+use crate::support;
 
 use std::process::{Command, Output};
 

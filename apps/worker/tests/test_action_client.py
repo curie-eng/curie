@@ -434,7 +434,9 @@ async def test_a_server_error_on_an_attributed_completion_is_not_a_refusal() -> 
 
 @pytest.fixture
 def retry_clock(monkeypatch):
-    from curie_worker import api_retry
+    from types import SimpleNamespace
+
+    from curie_worker import actions, api_retry
 
     class Clock:
         now = 0.0
@@ -451,6 +453,7 @@ def retry_clock(monkeypatch):
             self.now += delay
 
     clock = Clock()
+    monkeypatch.setattr(actions, "time", SimpleNamespace(monotonic=clock))
     monkeypatch.setattr(api_retry, "_clock", clock)
     monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
     return clock
@@ -567,3 +570,32 @@ async def test_transient_attributed_completion_replays_sealed_state_and_worker_a
     assert seen[0]["body"]["connector_digest"] == _DIGEST
     assert seen[0]["api_key"] == "k" and seen[0]["worker_token"] == "wt"
     assert retry_clock.sleeps == [0.5, 1.0]
+
+
+@pytest.mark.parametrize("operation", ["record", "complete"])
+async def test_ledger_empty_timeout_message_retains_the_exception_type(
+    operation, retry_clock
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("", request=request)
+
+    client, seen = _client(handler)
+    async with client:
+        actions = ActionClient(api_base_url="http://api", api_key="k", client=client)
+        frame = SideEffectFlag(tool="deploy", call_id="call-1")
+        with pytest.raises(ActionBackendError, match="ReadTimeout") as caught:
+            if operation == "record":
+                await actions.record(
+                    frame,
+                    event_id="event",
+                    conversation_id="thread",
+                    agent_id=None,
+                    budget_s=3,
+                )
+            else:
+                await actions.complete("a1", frame, budget_s=3)
+
+    assert isinstance(caught.value.__cause__, httpx.ReadTimeout)
+    assert str(caught.value.__cause__) == ""
+    assert retry_clock.sleeps == [0.5, 1.0, 1.5]
+    assert len(seen) == 4

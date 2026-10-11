@@ -14,8 +14,8 @@ pub struct DownOpts {
 pub struct RollbackOpts {
     pub common: CommonOpts,
     /// An operator-named revision. `None` lets [`select_rollback_revision`] pick
-    /// the newest `deployed`/`superseded` revision below the current one, which
-    /// is the whole point of the verb (#1899).
+    /// the serving revision beneath an unfinished latest revision, or the
+    /// newest prior `deployed`/`superseded` revision (#1899, #4335).
     pub revision: Option<u32>,
     /// Admit a `--revision` whose status is not `deployed`/`superseded`. Refused
     /// without this flag, since helm never finished applying such a revision.
@@ -1696,10 +1696,11 @@ impl RollbackTarget {
     }
 }
 
-/// Pick the rollback target: the NEWEST revision strictly below the current one
-/// whose status is `deployed` or `superseded`.
+/// Pick the serving revision when the newest revision above it is ineligible.
+/// Otherwise pick the newest eligible revision strictly below the current one.
 ///
-/// This is the whole fix for #1899. A `cluster up` against a cluster with no
+/// This preserves known good state after an interrupted or failed upgrade
+/// (#4335). The status filter fixes #1899: a `cluster up` against a cluster with no
 /// `runsc` RuntimeClass records a FAILED revision before its successful retry,
 /// so the history alternates failed/superseded and the immediately preceding
 /// revision -- the one bare `helm rollback` targets -- is a failed one. Skipping
@@ -1708,6 +1709,19 @@ impl RollbackTarget {
 /// Pure by construction so the decision is unit-testable with no cluster.
 pub fn select_rollback_revision(history: &[HelmRevision]) -> Result<RollbackTarget> {
     let current = require_current_revision(history)?;
+
+    if let Some(newest) = history
+        .iter()
+        .max_by_key(|row| row.revision)
+        .filter(|row| row.revision > current && !is_eligible_rollback_status(&row.status))
+    {
+        return Ok(RollbackTarget::Eligible(RollbackChoice {
+            from_revision: newest.revision,
+            to_revision: current,
+            skipped: skipped_between(history, current, newest.revision),
+            forced: false,
+        }));
+    }
 
     match history
         .iter()
@@ -2142,16 +2156,6 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     let ui = crate::ui::ui();
     let history_cmd = helm_history_cmd(&opts.common);
 
-    if opts.common.dry_run {
-        // The target revision is a function of the live history, so a dry run
-        // that has not read it can only name the revision when the operator did.
-        return Ok(ClusterRollbackOutput::DryRun(crate::ui::DryRunPlan {
-            lines: rollback_commands(&opts.common, opts.revision)
-                .iter()
-                .map(plan_line)
-                .collect(),
-        }));
-    }
     require_on_path("helm")?;
 
     ui.plumbing(&format!("+ {}", history_cmd.display()));
@@ -2182,6 +2186,34 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
         }
         None => select_rollback_revision(&history)?.require_eligible()?,
     };
+
+    if opts.common.dry_run {
+        let target = history
+            .iter()
+            .find(|row| row.revision == choice.to_revision)
+            .context("selected rollback revision is missing from Helm history")?;
+        let skipped = if choice.skipped.is_empty() {
+            "none".to_string()
+        } else {
+            choice
+                .skipped
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut lines: Vec<String> = rollback_commands(&opts.common, Some(choice.to_revision))
+            .iter()
+            .map(plan_line)
+            .collect();
+        lines.push(format!(
+            "selected revision {} ({}, {}) from revision {}; skipped {}",
+            choice.to_revision, target.status, target.chart, choice.from_revision, skipped
+        ));
+        return Ok(ClusterRollbackOutput::DryRun(crate::ui::DryRunPlan {
+            lines,
+        }));
+    }
 
     if !opts.disable_schema_gate {
         let target_row = history
@@ -3491,12 +3523,36 @@ impl ReleaseFullname {
 /// `cli/tests/chart_fullname_parity.rs` pins both the rule and its limit
 /// against the chart's own render.
 pub fn chart_fullname(release: &str) -> ReleaseFullname {
+    ReleaseFullname(release_fullname_from_values(
+        release,
+        &serde_json::Value::Null,
+    ))
+}
+
+/// The chart's `curie.fullname` (charts/curie/templates/_helpers.tpl) for
+/// `release` under `values`, the document Apply hands Helm (#4321). A nonempty
+/// `fullnameOverride` wins; otherwise the name is `nameOverride` or `curie`,
+/// and a release already containing it is used as is. Both branches then
+/// `trunc 63 | trimSuffix "-"`, which removes exactly one trailing dash.
+pub(crate) fn release_fullname_from_values(release: &str, values: &serde_json::Value) -> String {
     const CHART_NAME: &str = "curie";
 
-    let fullname = if release.contains(CHART_NAME) {
-        release.to_string()
-    } else {
-        format!("{release}-{CHART_NAME}")
+    let nonempty = |key: &str| {
+        values
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+    let fullname = match nonempty("fullnameOverride") {
+        Some(over) => over.to_string(),
+        None => {
+            let name = nonempty("nameOverride").unwrap_or(CHART_NAME);
+            if release.contains(name) {
+                release.to_string()
+            } else {
+                format!("{release}-{name}")
+            }
+        }
     };
     // `trunc 63` first, then `trimSuffix "-"`, with sprig's exact semantics:
     // `trimSuffix` removes EXACTLY ONE trailing dash where
@@ -3505,8 +3561,10 @@ pub fn chart_fullname(release: &str) -> ReleaseFullname {
     // fullnameOverride=<61 a's>--<10 z's>` renders the api Service as
     // `<61 a's>--api`, so one dash survives for the component suffix to join to.
     let truncated: String = fullname.chars().take(63).collect();
-    let trimmed = truncated.strip_suffix('-').unwrap_or(truncated.as_str());
-    ReleaseFullname(trimmed.to_string())
+    truncated
+        .strip_suffix('-')
+        .unwrap_or(truncated.as_str())
+        .to_string()
 }
 
 /// The fullname a `--dry-run` plan prints, plus the caveat that goes with it.

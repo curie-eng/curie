@@ -26,7 +26,7 @@
 //! `charts/curie` relative to the test process's cwd, which is the `cli`
 //! package root.
 
-mod support;
+use crate::support;
 
 use std::process::Command;
 

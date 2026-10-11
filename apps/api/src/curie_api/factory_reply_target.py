@@ -8,6 +8,8 @@ revision's objective still opens with the feedback URL, for the agent only.
 
 from __future__ import annotations
 
+import re
+
 from .forges.types import PullRequestRef, ReplyTarget
 from .models import ExecutionRequest, WorkItem
 
@@ -51,3 +53,29 @@ def stored_reply_target(request: ExecutionRequest, work_item: WorkItem) -> Reply
         assert request.reply_target_comment_id is not None
         return ReplyTarget.on_thread(pull_request, request.reply_target_comment_id)
     return ReplyTarget.on_pull_request(pull_request)
+
+
+def is_issue_follow_up(
+    objective: str | None, *, repo_full_name: str, issue_number: int, clone_base: str
+) -> bool:
+    if not isinstance(objective, str) or not objective:
+        return False
+    match = re.fullmatch(
+        rf"{re.escape(clone_base.rstrip('/'))}/{re.escape(repo_full_name)}/issues/{issue_number}#issuecomment-([1-9][0-9]{{0,18}})",
+        objective.split("\n", 1)[0],
+    )
+    return match is not None and int(match.group(1)) <= 2**63 - 1
+
+
+def is_relabel_objective(
+    objective: str | None, *, repo_full_name: str, issue_number: int, clone_base: str
+) -> bool:
+    if not isinstance(objective, str) or not objective:
+        return False
+    return (
+        re.fullmatch(
+            rf"{re.escape(clone_base.rstrip('/'))}/{re.escape(repo_full_name)}/issues/{issue_number}",
+            objective.split("\n", 1)[0],
+        )
+        is not None
+    )

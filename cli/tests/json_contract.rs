@@ -278,10 +278,9 @@ fn error_json_validates_against_error_schema() {
 // new inlined `to_json` arm would slip past the gate the way `Enqueued` did.
 
 // The `syn` walk that reads the enum's variants straight out of the source, in
-// the same `#[path = ...]` shape the sibling AST gates use
+// the same shared `support` module shape the sibling AST gates use
 // (`cli/tests/schema_inventory.rs`, `cli/tests/api_emit_parity.rs`).
-#[path = "support/enum_variants.rs"]
-mod enum_variants;
+use crate::support::enum_variants;
 
 /// The compiled `message.schema.json` validator. Every message-schema test
 /// below takes it from here rather than re-inlining the load + compile pair.
@@ -400,7 +399,7 @@ fn message_outcome_samples_cover_every_declared_variant() {
 // EXECUTION -- the same "guard rejects a violating input" convention the sibling
 // AST gates follow (`cli/tests/schema_inventory.rs`, `cli/tests/api_emit_parity.rs`),
 // over small inline source fixtures, since `variant_names` takes source text and
-// needs no file on disk. They live here, beside the `#[path]` include and the
+// needs no file on disk. They live here, beside the `support` import and the
 // real-tree assertion that consumes it, because that is where each sibling gate
 // keeps its own rejection cases.
 

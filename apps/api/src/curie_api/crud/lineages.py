@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from curie_api.schemas.publications import PublicationLineageAdvance, ReviewRevisionReserve
@@ -50,21 +51,24 @@ async def _bind_running_work_item_lineage(
     *,
     publication: Publication,
     lineage: ThreadPublicationLineage,
-    identity: VerifiedPublicationIdentity | None,
 ) -> None:
-    """Bind only the running request that created the successful publication."""
+    """Record the publishing request's open PR even after execution ends."""
 
-    if publication.execution_request_id is None:
+    if (
+        publication.execution_request_id is None
+        or lineage.status != "open"
+        or lineage.pr_number is None
+    ):
         return
     request_owns_item = (
         select(ExecutionRequest.id)
         .where(
             ExecutionRequest.id == publication.execution_request_id,
             ExecutionRequest.work_item_id == WorkItem.id,
-            ExecutionRequest.status == "running",
         )
         .exists()
     )
+    other_owner = aliased(WorkItem)
     predicates: list[ColumnElement[bool]] = [
         WorkItem.agent_id == lineage.agent_id,
         WorkItem.conversation_id.in_(
@@ -74,33 +78,16 @@ async def _bind_running_work_item_lineage(
         WorkItem.cancelled_at.is_(None),
         WorkItem.publication_lineage_id.is_(None),
         request_owns_item,
+        ~select(other_owner.id).where(other_owner.publication_lineage_id == lineage.id).exists(),
     ]
-    values = identity.lineage_values() if identity is not None else None
-    kind, host, project_id, installation_id = (
+    predicates.extend(
         (
-            values["code_host_kind"],
-            values["code_host_host"],
-            values["repository_project_id"],
-            values["code_host_installation_id"],
-        )
-        if values is not None
-        else (
-            lineage.code_host_kind,
-            lineage.code_host_host,
-            lineage.repository_project_id,
-            lineage.code_host_installation_id,
+            WorkItem.code_host_kind == lineage.code_host_kind,
+            WorkItem.code_host_host == lineage.code_host_host,
+            WorkItem.repository_project_id == lineage.repository_project_id,
+            WorkItem.code_host_installation_id == lineage.code_host_installation_id,
         )
     )
-    if project_id is not None:
-        predicates.extend(
-            (
-                WorkItem.code_host_kind == kind,
-                WorkItem.code_host_host == host,
-                WorkItem.repository_project_id == project_id,
-            )
-        )
-    if installation_id is not None:
-        predicates.append(WorkItem.code_host_installation_id == installation_id)
     await session.execute(
         update(WorkItem)
         .where(*predicates)
@@ -577,7 +564,6 @@ async def advance_publication_lineage(
             session,
             publication=publication,
             lineage=lineage,
-            identity=identity,
         )
     await session.commit()
     refreshed = await session.get(ThreadPublicationLineage, lineage.id)

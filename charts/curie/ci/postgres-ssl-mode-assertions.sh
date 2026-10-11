@@ -49,13 +49,12 @@
 #   5. NEGATIVE CONTROL -- invalid values: prefer, disable, verify-full, a
 #      quoted "false", and 0 each fail the render and name postgres.sslMode.
 #      Sprig `default` swallows false and 0, so these are read raw.
-#   6. The migrate probe extracted from the byo-require render lifts ssl= out
-#      of the DSN into the asyncpg.connect kwarg as the string "require" (not
-#      True, which asyncpg maps to verify-full), then a fake driver fails
-#      against a closed port with a connection error class.
-#   7. The same extracted probe runs against a closed port with the installed
-#      asyncpg driver (no fake), so a scheme or ssl-kwarg rejection cannot hide
-#      behind the argument stub.
+#   6. The retained legacy migrate probe lifts ssl= out of the DSN into the
+#      real asyncpg.connect kwarg as the string "require" (not True), then
+#      reports the actual closed-port connection error class.
+#   7. Current migrate dispatch enters schema_compat before legacy readiness.
+#      Its exact moved wait function uses the same real driver boundary and
+#      preserves safe diagnostics. Removing its TLS argument must fail.
 #   8. Prisma sslmode set: every rendered Langfuse DATABASE_URL's sslmode, if
 #      present, is one of disable|prefer|require. A synthetic no-verify (the
 #      #2476 spelling) and verify-full each fail that check, so a later
@@ -336,119 +335,7 @@ refuse_invalid "--set postgres.sslMode=0" "sslMode=0"
 echo "  [5] negative control: prefer/disable/verify-full/false/0 each refuse and name postgres.sslMode: OK"
 
 echo
-echo "=== Extracted migrate probe against a closed port (byo-require) ==="
-BYO_REQUIRE_DIR="$BYO_REQUIRE_DIR" TMP="$TMP" python3 <<'PY'
-import os
-import pathlib
-import socket
-import subprocess
-import sys
-import textwrap
-
-import yaml
-
-templates_dir = os.environ["BYO_REQUIRE_DIR"]
-tmp = pathlib.Path(os.environ["TMP"])
-
-
-def die(message):
-    print(f"FAIL: [6] {message}", file=sys.stderr)
-    raise SystemExit(1)
-
-
-docs = [
-    doc
-    for doc in yaml.safe_load_all(pathlib.Path(templates_dir, "schema-migrate.yaml").read_text())
-    if doc
-]
-migrate = []
-for doc in docs:
-    spec = (
-        (doc.get("spec") or {})
-        .get("template", {})
-        .get("spec", {})
-    )
-    for container in spec.get("containers") or []:
-        if container.get("name") == "schema-migrate":
-            migrate.append(container)
-if len(migrate) != 1:
-    die(f"expected exactly one schema-migrate container, found {len(migrate)}")
-
-process = list(migrate[0].get("command") or []) + list(migrate[0].get("args") or [])
-if len(process) < 3 or process[1] != "-c":
-    die(f"migrate init is not a shell -c script: {process[:3]!r}")
-script = process[2]
-marker = "python -c '"
-start = script.find(marker)
-if start < 0:
-    die("migrate init script has no python -c probe")
-start += len(marker)
-end = script.find("'", start)
-if end < 0:
-    die("migrate init python -c probe is not single-quote terminated")
-probe_src = textwrap.dedent(script[start:end])
-if "DATABASE_URL" not in probe_src or "asyncpg.connect" not in probe_src:
-    die("extracted probe does not connect through DATABASE_URL with asyncpg")
-
-closed = socket.socket()
-closed.bind(("127.0.0.1", 0))
-host, port = closed.getsockname()
-closed.close()
-
-fake = tmp / "fake-asyncpg"
-fake.mkdir()
-(fake / "asyncpg.py").write_text(
-    """\
-import socket
-from urllib.parse import urlparse
-
-
-class Connection:
-    async def close(self):
-        return None
-
-
-async def connect(database_url, timeout=None, **kwargs):
-    parsed = urlparse(database_url.replace("postgresql+asyncpg://", "postgresql://", 1))
-    socket.create_connection(
-        (parsed.hostname, parsed.port or 5432),
-        timeout=timeout if timeout is not None else 2,
-    )
-    return Connection()
-"""
-)
-
-database_url = (
-    f"postgresql+asyncpg://curie:not-a-secret@{host}:{port}/curie?ssl=require"
-)
-result = subprocess.run(
-    [sys.executable, "-c", probe_src],
-    env={
-        **os.environ,
-        "DATABASE_URL": database_url,
-        "PYTHONPATH": str(fake),
-    },
-    capture_output=True,
-    text=True,
-    timeout=15,
-    check=False,
-)
-output = (result.stdout or "") + (result.stderr or "")
-if result.returncode == 0:
-    die(f"probe succeeded against a closed port: {output!r}")
-if "ConnectionRefusedError" not in output and "OSError" not in output:
-    die(
-        "probe against a closed port must fail with a connection error class, "
-        f"got {output!r}"
-    )
-print(
-    "  [6] extracted schema-migrate probe uses DATABASE_URL and fails "
-    "against a closed port with a connection error class: OK"
-)
-PY
-
-echo
-echo "=== Extracted migrate probe with real asyncpg against a closed port ==="
+echo "=== Current and legacy migrate readiness with real asyncpg against a closed port ==="
 REAL_PYTHON=""
 if python3 -c 'import asyncpg' >/dev/null 2>&1; then
   REAL_PYTHON="$(command -v python3)"
@@ -456,14 +343,16 @@ elif command -v uv >/dev/null 2>&1 && (cd "$REPO_ROOT" && uv run python -c 'impo
   REAL_PYTHON="$(cd "$REPO_ROOT" && uv run python -c 'import sys; print(sys.executable)')"
 else
   python3 -m venv "$TMP/asyncpg-venv" \
-    || fail "[7] could not create a venv to install asyncpg"
+    || fail "[6/7] could not create a venv to install asyncpg"
   "$TMP/asyncpg-venv/bin/pip" install --quiet asyncpg \
-    || fail "[7] could not install asyncpg into a throwaway venv"
+    || fail "[6/7] could not install asyncpg into a throwaway venv"
   REAL_PYTHON="$TMP/asyncpg-venv/bin/python"
 fi
-BYO_REQUIRE_DIR="$BYO_REQUIRE_DIR" REAL_PYTHON="$REAL_PYTHON" python3 <<'PY'
+BYO_REQUIRE_DIR="$BYO_REQUIRE_DIR" REAL_PYTHON="$REAL_PYTHON" \
+REPO_ROOT="$REPO_ROOT" python3 <<'PY'
 import os
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -471,72 +360,167 @@ import textwrap
 
 import yaml
 
-templates_dir = os.environ["BYO_REQUIRE_DIR"]
+templates_dir = pathlib.Path(os.environ["BYO_REQUIRE_DIR"])
 
 
 def die(message):
-    print(f"FAIL: [7] {message}", file=sys.stderr)
+    print(f"FAIL: [6/7] {message}", file=sys.stderr)
     raise SystemExit(1)
 
 
-docs = [
-    doc
-    for doc in yaml.safe_load_all(pathlib.Path(templates_dir, "schema-migrate.yaml").read_text())
-    if doc
-]
+docs = [doc for doc in yaml.safe_load_all((templates_dir / "schema-migrate.yaml").read_text()) if doc]
 migrate = []
 for doc in docs:
     spec = (doc.get("spec") or {}).get("template", {}).get("spec", {})
-    for container in spec.get("containers") or []:
-        if container.get("name") == "schema-migrate":
-            migrate.append(container)
+    migrate.extend(item for item in spec.get("containers", []) if item.get("name") == "schema-migrate")
 if len(migrate) != 1:
     die(f"expected exactly one schema-migrate container, found {len(migrate)}")
-
 process = list(migrate[0].get("command") or []) + list(migrate[0].get("args") or [])
+if len(process) != 3 or process[1] != "-c":
+    die("schema-migrate must render a shell -c dispatch")
 script = process[2]
-marker = "python -c '"
-start = script.find(marker) + len(marker)
-end = script.find("'", start)
-probe_src = textwrap.dedent(script[start:end])
+dispatch = "exec python -m curie_api.schema_compat upgrade"
+if dispatch not in script or "attempt=1" not in script:
+    die("schema-migrate must dispatch current-image readiness and retain legacy readiness")
+if script.index(dispatch) > script.index("attempt=1"):
+    die("current-image readiness must enter schema_compat before the legacy shell probe")
+probes = [
+    textwrap.dedent(candidate)
+    for candidate in re.findall(r"python -c '([^']*)'", script, re.DOTALL)
+    if "DATABASE_URL" in candidate and "asyncpg.connect" in candidate
+]
+if len(probes) != 1:
+    die(f"expected one retained legacy asyncpg readiness probe, found {len(probes)}")
 
-closed = socket.socket()
-closed.bind(("127.0.0.1", 0))
-host, port = closed.getsockname()
-closed.close()
+# Observe the real driver boundary, then delegate unchanged. Wrong schemes,
+# misplaced ssl settings, boolean TLS modes and changed timeouts must fail.
+observer = r'''
+import asyncio
+import os
+from urllib.parse import parse_qs, urlparse
 
-database_url = (
-    f"postgresql+asyncpg://curie:not-a-secret@{host}:{port}/curie?ssl=require"
-)
-env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-env["DATABASE_URL"] = database_url
-real_python = os.environ["REAL_PYTHON"]
-result = subprocess.run(
-    [real_python, "-c", probe_src],
-    env=env,
-    capture_output=True,
-    text=True,
-    timeout=15,
-    check=False,
-)
-output = (result.stdout or "") + (result.stderr or "")
-if result.returncode == 0:
-    die(f"real asyncpg probe succeeded against a closed port: {output!r}")
-if "IndentationError" in output or "SyntaxError" in output:
-    die(f"extracted probe is not valid Python: {output!r}")
-if "ClientConfigurationError" in output:
-    die(f"real asyncpg rejected the lifted ssl kwarg: {output!r}")
-if "postgresql+asyncpg" in output and "scheme" in output.lower():
-    die(f"probe did not convert the SQLAlchemy scheme before asyncpg.connect: {output!r}")
-if "ConnectionRefusedError" not in output and "OSError" not in output:
-    die(
-        "real asyncpg against a closed port must fail with a connection error class, "
-        f"got {output!r}"
-    )
-print(
-    "  [7] extracted schema-migrate probe with real asyncpg fails against a closed "
-    "port with a connection error class: OK"
-)
+import asyncpg
+
+original_connect = asyncpg.connect
+
+async def observe_connect(database_url, *args, **kwargs):
+    print("REAL_CONNECT_BOUNDARY_ENTERED", flush=True)
+    parsed = urlparse(database_url)
+    assert parsed.scheme == "postgresql", "SQLAlchemy scheme reached asyncpg"
+    assert "ssl" not in parse_qs(parsed.query), "ssl reached the server settings"
+    if "ssl" not in kwargs:
+        print("REAL_CONNECT_REJECTED_REASON=missing_ssl_kwarg", flush=True)
+        raise ValueError("readiness_missing_ssl_kwarg")
+    assert kwargs.get("ssl") == "require", "TLS must remain the require string"
+    assert kwargs.get("timeout") == 2, "readiness connect timeout changed"
+    print("REAL_CONNECT_ARGS_OK", flush=True)
+    return await original_connect(database_url, *args, **kwargs)
+
+asyncpg.connect = observe_connect
+'''
+current = r'''
+import ast
+import pathlib
+import sys
+from types import SimpleNamespace
+from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlunparse
+
+# Execute the exact moved readiness function and its actual source constants.
+# DATABASE_URL is a configuration input; the driver and stores are never faked.
+source = pathlib.Path(os.environ["CURRENT_SCHEMA_SOURCE"])
+tree = ast.parse(source.read_text())
+functions = [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "wait_for_postgres"]
+assert len(functions) == 1, "current readiness function is missing or ambiguous"
+constants = {}
+for node in tree.body:
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in {
+                "POSTGRES_ATTEMPTS", "POSTGRES_RETRY_S", "POSTGRES_CONNECT_TIMEOUT_S",
+            }:
+                constants[target.id] = ast.literal_eval(node.value)
+assert constants == {
+    "POSTGRES_ATTEMPTS": 60, "POSTGRES_RETRY_S": 2.0, "POSTGRES_CONNECT_TIMEOUT_S": 2.0,
+}, "current readiness defaults changed"
+
+if os.environ.get("SSL_NEGATIVE_CONTROL") == "1":
+    class RemoveSslArgument(ast.NodeTransformer):
+        removed = 0
+
+        def visit_Assign(self, node):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Subscript)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "connect_kwargs"
+                    and isinstance(target.slice, ast.Constant)
+                    and target.slice.value == "ssl"
+                ):
+                    self.removed += 1
+                    return ast.copy_location(ast.Pass(), node)
+            return self.generic_visit(node)
+
+    mutant = RemoveSslArgument()
+    functions[0] = mutant.visit(functions[0])
+    assert mutant.removed == 1, "negative control could not remove the TLS argument"
+    print("SSL_MUTATION_APPLIED=1", flush=True)
+
+namespace = {
+    "asyncio": asyncio, "asyncpg": asyncpg, "sys": sys, "Any": Any,
+    "urlparse": urlparse, "parse_qsl": parse_qsl, "urlencode": urlencode,
+    "urlunparse": urlunparse,
+    "get_settings": lambda: SimpleNamespace(database_url=os.environ["DATABASE_URL"]),
+    **constants,
+}
+module = ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[]))
+exec(compile(module, str(source), "exec"), namespace)
+# One real failure proves TLS/connect arguments; separate diagnostic ladder
+# tests retain the complete 60-attempt wait contract checked above.
+namespace["POSTGRES_ATTEMPTS"] = 1
+raise SystemExit(asyncio.run(namespace["wait_for_postgres"]()))
+'''
+
+with socket.socket() as closed:
+    # Keep this bound, unlistening endpoint owned until every child exits.
+    closed.bind(("127.0.0.1", 0))
+    host, port = closed.getsockname()
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+    env["DATABASE_URL"] = f"postgresql+asyncpg://curie:not-a-secret@{host}:{port}/curie?ssl=require"
+    env["CURRENT_SCHEMA_SOURCE"] = str(pathlib.Path(os.environ["REPO_ROOT"], "apps/api/src/curie_api/schema_compat.py"))
+
+    def run(boundary, *, negative=False):
+        result = subprocess.run(
+            [os.environ["REAL_PYTHON"], "-c", observer + boundary],
+            env={**env, "SSL_NEGATIVE_CONTROL": "1" if negative else "0"},
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.returncode == 0:
+            die("readiness unexpectedly succeeded against the owned closed port")
+        return output
+
+    for aid, label, boundary in ((6, "legacy shell", probes[0]), (7, "current Python", current)):
+        output = run(boundary)
+        if output.count("REAL_CONNECT_BOUNDARY_ENTERED") != 1 or output.count("REAL_CONNECT_ARGS_OK") != 1:
+            die(f"{label} readiness did not preserve the real asyncpg TLS/connect arguments")
+        if "ConnectionRefusedError" not in output and "OSError" not in output:
+            die(f"{label} readiness did not report a real closed-port connection error class")
+        for forbidden in ("IndentationError", "SyntaxError", "ClientConfigurationError", "not-a-secret"):
+            if forbidden in output:
+                die(f"{label} readiness emitted an invalid or credential-bearing diagnostic")
+        print(f"  [{aid}] {label} readiness preserves ssl=require and real closed-port diagnostics: OK")
+
+    negative = run(current, negative=True)
+    if negative.count("SSL_MUTATION_APPLIED=1") != 1:
+        die("negative control setup did not confirm exactly one TLS-argument mutation")
+    if negative.count("REAL_CONNECT_BOUNDARY_ENTERED") != 1:
+        die("negative control did not invoke the current readiness driver boundary exactly once")
+    if negative.count("REAL_CONNECT_REJECTED_REASON=missing_ssl_kwarg") != 1:
+        die("negative control did not fail for the precise missing TLS argument")
+    if "REAL_CONNECT_ARGS_OK" in negative or "probe error class: ValueError" not in negative:
+        die("missing TLS argument did not produce the current readiness failure diagnostic")
+    print("  [7] negative control: missing current TLS argument is rejected: OK")
 PY
 
 echo

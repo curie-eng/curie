@@ -62,16 +62,8 @@ use curie::ops::{
 };
 use curie::ui::{CliOutput, DryRunPlan};
 
-#[path = "support/enum_variants.rs"]
-mod enum_variants;
-// Only `cli_output_impls` is used here; the rest of the module serves
-// `schema_inventory.rs`'s own test. Each `#[path] mod` include is a separate
-// compilation unit, so the unused remainder is dead code in THIS one and would
-// fail `clippy -D warnings`. Scoped to this include rather than annotating the
-// shared file, so the other includers keep their real dead-code coverage.
-#[allow(dead_code)]
-#[path = "support/schema_inventory.rs"]
-mod schema_inventory;
+use crate::support::enum_variants;
+use crate::support::schema_inventory;
 
 // ---------------------------------------------------------------------------
 // Discovery: the expectation side, derived from the source AST.

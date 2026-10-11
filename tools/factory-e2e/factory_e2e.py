@@ -6088,8 +6088,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "scripted",
         help="kind-rung factory scenario with the GitHub stub and a scripted model",
     )
-    scripted.add_argument("--context", required=True)
-    scripted.add_argument("--namespace", default="test-factory-scripted")
     scripted.add_argument(
         "--transcript",
         type=Path,
@@ -6111,6 +6109,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     accept.add_argument("--issue-file", type=Path, help="the loop ticket (default: a small task)")
     accept.add_argument("--revision-file", type=Path, help="the review text")
+    scripted.add_argument("--build-images", action="store_true")
+    scripted.add_argument("--record", action="store_true")
     return parser.parse_args(argv)
 
 

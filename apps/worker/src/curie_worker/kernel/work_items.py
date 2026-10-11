@@ -38,6 +38,7 @@ class _SettlingWorkItem:
     outcome: str
     cause: str
     detail: str | None
+    ci_fix_round: int | None
     task: asyncio.Task[None] | None = None
     cleaned: bool = False
 
@@ -62,13 +63,21 @@ def owns_work_item(self: Kernel, request_id: uuid.UUID) -> bool:
 
 
 def _begin_settling(
-    self: Kernel, run: WorkItemRun, *, outcome: str, cause: str, detail: str | None
+    self: Kernel,
+    run: WorkItemRun,
+    *,
+    outcome: str,
+    cause: str,
+    detail: str | None,
+    ci_fix_round: int | None,
 ) -> None:
     """Hand off only the report, synchronously retaining ownership (#4174)."""
 
     if run.request_id in self._settling_work_items:
         return
-    pending = _SettlingWorkItem(run=run, outcome=outcome, cause=cause, detail=detail)
+    pending = _SettlingWorkItem(
+        run=run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
+    )
     self._settling_work_items[run.request_id] = pending
     if self._work_item_runs.get(run.request_id) is run:
         self._work_item_runs.pop(run.request_id)
@@ -78,10 +87,16 @@ def _begin_settling(
 
 
 async def _finish_or_settle(
-    self: Kernel, run: WorkItemRun, *, outcome: str, cause: str, detail: str | None
+    self: Kernel,
+    run: WorkItemRun,
+    *,
+    outcome: str,
+    cause: str,
+    detail: str | None,
+    ci_fix_round: int | None,
 ) -> None:
     try:
-        await run.finish(outcome=outcome, cause=cause, detail=detail)
+        await run.finish(outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round)
     except WorkItemConflict as exc:
         if exc.code != "not_running":
             raise
@@ -89,7 +104,9 @@ async def _finish_or_settle(
         # lost. Nothing remains to own; do not redeliver the ended turn.
         run.finished = True
     except WorkItemTransportError:
-        self._begin_settling(run, outcome=outcome, cause=cause, detail=detail)
+        self._begin_settling(
+            run, outcome=outcome, cause=cause, detail=detail, ci_fix_round=ci_fix_round
+        )
 
 
 async def _settle_work_item(self: Kernel, pending: _SettlingWorkItem) -> None:
@@ -103,14 +120,22 @@ async def _settle_work_item(self: Kernel, pending: _SettlingWorkItem) -> None:
                 return
             try:
                 await run.finish(
-                    outcome=pending.outcome, cause=pending.cause, detail=pending.detail
+                    outcome=pending.outcome,
+                    cause=pending.cause,
+                    detail=pending.detail,
+                    ci_fix_round=pending.ci_fix_round,
                 )
             except WorkItemConflict as exc:
                 if exc.code in {"not_running", "publication_pending"}:
                     run.finished = True
                 return
-            except WorkItemTransportError:
-                logger.warning("work-item finish still unavailable for %s", run.request_id)
+            except WorkItemTransportError as exc:
+                logger.warning(
+                    "work-item finish still unavailable for %s: %s: %s",
+                    run.request_id,
+                    type(exc).__name__,
+                    exc,
+                )
             else:
                 return
     finally:
@@ -128,7 +153,7 @@ async def _clean_settling_work_item(self: Kernel, pending: _SettlingWorkItem) ->
     if run.heartbeat_running:
         await run.close()
     if run.finished:
-        await self._release_work_item_sandbox(run.thread_key)
+        await self._release_work_item_sandbox(run)
     pending.cleaned = True
 
 
@@ -482,14 +507,35 @@ async def _quiesce_capacity_epoch(self: Kernel, thread_key: str, epoch: str) -> 
     )
 
 
-async def _release_work_item_sandbox(self: Kernel, thread_key: str) -> None:
+async def _release_work_item_sandbox(self: Kernel, run: WorkItemRun) -> None:
     """Delete a settled WorkItem thread's claim, live or suspended (#3075).
 
     Best-effort: a failure is logged and never changes the WorkItem outcome.
     The orphan reaper skips any claim a route references, so without this a
     suspended route kept its claim until someone deleted it by hand.
+    Fenced to the claim the run recorded (#4331): when the thread's route
+    now names another claim, such as a successor request's after ADR 0206
+    re-admission, nothing is deleted. An abandoned stale owner releases
+    nothing, because the API termination chain owns the lost request's
+    teardown, and a run that recorded no claim leaves the route alone.
     """
 
+    thread_key = run.thread_key
+    if run.abandoned:
+        logger.info(
+            "work-item %s was abandoned as a stale owner; leaving thread %s's route",
+            run.request_id,
+            thread_key,
+        )
+        return
+    claim_name = run.claim_name
+    if claim_name is None:
+        logger.info(
+            "work-item %s recorded no claim; leaving thread %s's route",
+            run.request_id,
+            thread_key,
+        )
+        return
     try:
         token = await asyncio.wait_for(
             self._lock.acquire(self._config.lock_key(thread_key)),
@@ -504,7 +550,7 @@ async def _release_work_item_sandbox(self: Kernel, thread_key: str) -> None:
         return
     try:
         released = await asyncio.wait_for(
-            asyncio.to_thread(self._substrate.release, thread_key),
+            asyncio.to_thread(self._substrate.release_if_claim, thread_key, claim_name),
             constants._RESET_RELEASE_TIMEOUT_S,
         )
         if released and self._workspace is not None:
@@ -619,6 +665,7 @@ async def _stop_owned_work_item(self: Kernel, thread_key: str, run: WorkItemRun)
 async def _abandon_stale_work_item(self: Kernel, thread_key: str, run: WorkItemRun) -> None:
     """Heartbeat 409 stale_owner: drop local ownership without touching the current route."""
 
+    run.abandoned = True
     await self._cancel_settling_work_items(request_id=run.request_id)
     run.finished = True
     self._forget_held_run(thread_key, run, reason="stale owner")
