@@ -215,6 +215,9 @@ DEFAULT_LABEL = "curie-factory"
 NAMESPACE_PREFIX = "test-factory-"
 APP_KEY_REF = "factory-e2e-github-app"
 SANDBOX_CRD = "sandboxes.agents.x-k8s.io"
+# The pod label of the vendored agent-sandbox controller Deployment the chart
+# renders (charts/curie/templates/agent-sandbox.yaml).
+SANDBOX_CONTROLLER_SELECTOR = "app=agent-sandbox-controller"
 OWNER_LABEL = "app.kubernetes.io/managed-by=curie-factory-e2e"
 RUN_ANNOTATION = "curie.dev/factory-e2e-run"
 # "<hostname>:<pid>" of the process that created the namespace, so a later run
@@ -1226,6 +1229,18 @@ def model_proxy_egress(url: str) -> dict[str, Any]:
     else:
         port = 80
     return {"cidr": f"{host}/32", "ports": [{"protocol": "TCP", "port": port}]}
+
+
+def sandbox_controller_serves(*, crd: str, controller_pods: str) -> bool:
+    """True when the install should consume an existing sandbox controller. Pure.
+
+    The sandbox CRDs outlive the release that created them (helm never deletes
+    `crds/`), so a CRD alone does not mean a controller serves it. Only a
+    running controller pod does; without one this install deploys its own,
+    or every sandbox claim waits unbound.
+    """
+
+    return bool(crd.strip()) and bool(controller_pods.strip())
 
 
 def install_values(
@@ -2621,8 +2636,18 @@ class Preflight:
         """
 
         chart = self.extract_chart()
-        consumer = bool(
-            self.kubectl("get", "crd", SANDBOX_CRD, "--ignore-not-found", "-o", "name").strip()
+        consumer = sandbox_controller_serves(
+            crd=self.kubectl("get", "crd", SANDBOX_CRD, "--ignore-not-found", "-o", "name"),
+            controller_pods=self.kubectl(
+                "get",
+                "pods",
+                "--all-namespaces",
+                "-l",
+                SANDBOX_CONTROLLER_SELECTOR,
+                "--field-selector=status.phase=Running",
+                "-o",
+                "name",
+            ),
         )
         for manifest in sorted((chart / "crds").glob("*.yaml")):
             match = re.search(r"^  name:\s*(\S+)", manifest.read_text(), re.MULTILINE)
