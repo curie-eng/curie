@@ -70,6 +70,8 @@ OWNED_RELEASE=0
 SPAWNED_PIDS=()
 OWNED_IMAGES=()
 declare -A OWNED_IMAGE_IDS=()
+# Each owned tag's --iidfile, registered before its build starts.
+declare -A OWNED_IMAGE_IIDFILES=()
 PREEXISTING_KIND=""
 
 log() { printf '[automatic-thread-isolation] %s\n' "$*" >&2; }
@@ -229,7 +231,7 @@ cleanup() {
     # Only tags this run created, and only while they still name the image
     # this run built; never by image ID, never forced or pruned, so layers
     # shared with other tags and owners stay.
-    local image id
+    local image id recorded iidfile
     for image in "${OWNED_IMAGES[@]}"; do
         if ! id="$(image_tag_id "$image")"; then
             log "cleanup assertion: could not query owned image $image"
@@ -237,7 +239,23 @@ cleanup() {
             continue
         fi
         [[ -n "$id" ]] || continue
-        if [[ "$id" != "${OWNED_IMAGE_IDS[$image]:-}" ]]; then
+        # A TERM that arrives during the foreground build runs this cleanup
+        # after the build returns but before its ID is recorded; the ID that
+        # exact build wrote to its iidfile is then the only proof of ownership.
+        recorded="${OWNED_IMAGE_IDS[$image]:-}"
+        if [[ -z "$recorded" ]]; then
+            iidfile="${OWNED_IMAGE_IIDFILES[$image]:-}"
+            if [[ -n "$iidfile" && -f "$iidfile" ]]; then
+                recorded="$(cat "$iidfile")"
+            fi
+            if [[ ! "$recorded" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                log "cleanup assertion: $image exists but its build reported no valid image ID; left in place"
+                cleanup_failed=1
+                continue
+            fi
+            log "cleanup: recovered the build ID for $image from its iidfile"
+        fi
+        if [[ "$id" != "$recorded" ]]; then
             log "cleanup assertion: $image names an image this run did not record; left in place"
             cleanup_failed=1
             continue
@@ -344,15 +362,16 @@ for component in api worker runner; do
     [[ -z "$existing" ]] || fail "image tag $image already exists; refusing to claim a tag this run did not create"
     [[ "$component" == runner ]] && dockerfile="runner/Dockerfile" || dockerfile="apps/$component/Dockerfile"
     log "building $image from $dockerfile"
+    OWNED_IMAGE_IIDFILES[$image]="$WORKDIR/build-$component.iid"
     OWNED_IMAGES+=("$image")
     docker build --file "$REPO_ROOT/$dockerfile" --tag "$image" \
-        --iidfile "$WORKDIR/build-$component.iid" "$REPO_ROOT" \
+        --iidfile "${OWNED_IMAGE_IIDFILES[$image]}" "$REPO_ROOT" \
         >"$WORKDIR/build-$component.log" 2>&1 || {
             tail -40 "$WORKDIR/build-$component.log" >&2
             fail "$component image build failed"
         }
     # The ID this build produced, not whatever the tag names afterwards.
-    OWNED_IMAGE_IDS[$image]="$(cat "$WORKDIR/build-$component.iid")"
+    OWNED_IMAGE_IDS[$image]="$(cat "${OWNED_IMAGE_IIDFILES[$image]}")"
     [[ "${OWNED_IMAGE_IDS[$image]}" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "docker build did not report an image ID for $image"
 done
 

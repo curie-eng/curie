@@ -1132,8 +1132,9 @@ jobs:
 
   # #4311: three overlapping `curie cluster message` processes without --thread
   # must land in three conversations. The script owns its whole lifecycle: it
-  # builds the CLI from this checkout, creates and deletes its own kind
-  # cluster, pulls the chart's published images, and verifies its teardown.
+  # builds the CLI and the api, worker and runner images from this checkout,
+  # creates and deletes its own kind cluster, deploys those candidate images,
+  # and verifies its teardown.
   # Fix pin verification runs the same script red-on-revert; this job keeps
   # the regression running on chart changes, and gives chart-check's root
   # inventory the helm-ci step every root script needs.
