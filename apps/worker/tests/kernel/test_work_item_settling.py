@@ -234,7 +234,7 @@ def test_settling_empty_transport_error_is_named_in_the_log(
     make_harness, monkeypatch, caplog
 ) -> None:
     from curie_worker import api_retry
-    from curie_worker import kernel as kernel_module
+    from curie_worker.kernel import work_items as kernel_work_items
 
     async def go() -> None:
         clock = ApiClock()
@@ -263,7 +263,7 @@ def test_settling_empty_transport_error_is_named_in_the_log(
 
         monkeypatch.setattr(api_retry, "_clock", clock)
         monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
-        monkeypatch.setattr(kernel_module, "_settle_sleep", settle_sleep)
+        monkeypatch.setattr(kernel_work_items, "_settle_sleep", settle_sleep)
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example", client=http
@@ -879,7 +879,7 @@ def test_settlement_cleanup_never_deletes_the_successor_claim(make_harness, monk
     after a successor took the thread releases nothing of the successor's."""
 
     from curie_worker import api_retry
-    from curie_worker import kernel as kernel_module
+    from curie_worker.kernel import work_items as kernel_work_items
 
     async def go() -> None:
         clock = ApiClock()
@@ -896,7 +896,7 @@ def test_settlement_cleanup_never_deletes_the_successor_claim(make_harness, monk
 
         monkeypatch.setattr(api_retry, "_clock", clock)
         monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
-        monkeypatch.setattr(kernel_module, "_settle_sleep", settle_sleep)
+        monkeypatch.setattr(kernel_work_items, "_settle_sleep", settle_sleep)
         async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example", client=http
@@ -954,7 +954,7 @@ def test_a_normal_finish_releases_exactly_its_own_claim_and_route(
     deletes that claim, its route, and its workspace, at both release sites."""
 
     from curie_worker import api_retry
-    from curie_worker import kernel as kernel_module
+    from curie_worker.kernel import work_items as kernel_work_items
 
     async def go() -> None:
         clock = ApiClock()
@@ -968,7 +968,7 @@ def test_a_normal_finish_releases_exactly_its_own_claim_and_route(
 
         monkeypatch.setattr(api_retry, "_clock", clock)
         monkeypatch.setattr(api_retry, "_sleep", clock.sleep)
-        monkeypatch.setattr(kernel_module, "_settle_sleep", recover_on_settle)
+        monkeypatch.setattr(kernel_work_items, "_settle_sleep", recover_on_settle)
         async with httpx.AsyncClient(transport=httpx.MockTransport(api)) as http:
             client = WorkItemDispatchClient(
                 api_base_url="http://api.example", worker_token="example", client=http

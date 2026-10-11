@@ -1399,6 +1399,14 @@ def _revision_reply(pr: int, fragment: str) -> dict[str, str | None]:
     }
 
 
+ISSUE_REPLY: dict[str, str | None] = {
+    "reply_target_kind": "issue",
+    "reply_target_pr_number": None,
+    "reply_target_comment_id": None,
+    "reply_target_url": None,
+}
+
+
 REVISION_REPLY_COLUMNS = (
     "reply_target_kind, reply_target_pr_number, reply_target_comment_id, reply_target_url"
 )
@@ -1407,7 +1415,9 @@ REVISION_REPLY_VALUES = (
 )
 
 
-def _insert_revision(work_item_id: uuid.UUID, number: int, pr: int, fragment: str) -> uuid.UUID:
+def _insert_revision(
+    work_item_id: uuid.UUID, number: int, objective: str, reply: dict[str, str | None]
+) -> uuid.UUID:
     request_id = uuid.uuid4()
 
     async def go() -> None:
@@ -1428,10 +1438,10 @@ def _insert_revision(work_item_id: uuid.UUID, number: int, pr: int, fragment: st
                     {
                         "id": request_id,
                         "work_item": work_item_id,
-                        "objective": _revision_objective(pr, fragment),
+                        "objective": objective,
                         "repo": REPO,
                         "conversation": f"issue-{number}",
-                        **_revision_reply(pr, fragment),
+                        **reply,
                     },
                 )
                 await conn.execute(
@@ -1551,7 +1561,12 @@ def _complete_revision(
 ) -> tuple[int, int, uuid.UUID]:
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
-    revision = _insert_revision(first["work_item_id"], number, pr, fragment)
+    revision = _insert_revision(
+        first["work_item_id"],
+        number,
+        _revision_objective(pr, fragment),
+        _revision_reply(pr, fragment),
+    )
     _start_running(revision)
     _attach_revision_publication(first["work_item_id"], revision)
     _reconcile()
@@ -1599,7 +1614,7 @@ def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
     sink.requests.clear()
     sink.ci_observations.clear()
     objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88120"
-    revision = _insert_revision(first["work_item_id"], number, objective)
+    revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
     _start_running(revision)
     detail = f"{padding}No changes needed: the existing tests already cover this request."
 
@@ -1655,7 +1670,9 @@ def test_a_review_revision_with_no_changes_completes_in_its_thread(
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
     objective = _revision_objective(pr, "discussion_r88121")
-    revision = _insert_revision(first["work_item_id"], number, objective)
+    revision = _insert_revision(
+        first["work_item_id"], number, objective, _revision_reply(pr, "discussion_r88121")
+    )
     _start_running(revision)
     detail = "No changes needed: this helper already has the requested name."
 
@@ -1717,7 +1734,14 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
         objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88122"
         if case == "mismatched_pr":
             objective = _revision_objective(pr + 1, "discussion_r88122")
-        request_id = _insert_revision(first["work_item_id"], number, objective)
+        request_id = _insert_revision(
+            first["work_item_id"],
+            number,
+            objective,
+            _revision_reply(pr + 1, "discussion_r88122")
+            if case == "mismatched_pr"
+            else ISSUE_REPLY,
+        )
     _start_running(request_id)
     sink.requests.clear()
     if case == "could_not_complete":
@@ -1890,7 +1914,7 @@ def test_a_relabel_revision_on_an_adopted_pull_request_settles_through_the_ci_ga
 ) -> None:
     """#4345 AC4: a relabel that publishes a revision still waits on the CI gate."""
 
-    import curie_api.workitems as workitems
+    import curie_api.workitems.lifecycle as workitems
 
     client, github, sink = admitted
     number = 9413
@@ -1931,7 +1955,7 @@ def test_a_no_change_follow_up_defers_to_its_in_flight_publication(
     sink.by_path = True
     number, _pr, first = _published_issue(client, github, sink)
     objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88123"
-    revision = _insert_revision(first["work_item_id"], number, objective)
+    revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
     _start_running(revision)
     _attach_revision_publication(first["work_item_id"], revision, status="pending")
 
@@ -1956,7 +1980,7 @@ def test_a_no_change_follow_up_cannot_complete_after_its_execution_deadline(
     sink.by_path = True
     number, _pr, first = _published_issue(client, github, sink)
     objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88124"
-    revision = _insert_revision(first["work_item_id"], number, objective)
+    revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
 
     async def expired_runtime() -> None:
         engine = create_async_engine(get_settings().database_url)
@@ -1996,13 +2020,13 @@ def test_a_no_change_follow_up_cannot_complete_after_its_execution_deadline(
 def test_a_no_change_follow_up_preserves_stale_version_fencing(admitted: Any, stale: str) -> None:
     """Both optimistic versions fence the unchanged completion at the state boundary."""
 
-    from curie_api.workitems import WorkItemConflict, _terminalize_execution
+    from curie_api.workitems.lifecycle import WorkItemConflict, terminalize_execution
 
     client, github, sink = admitted
     sink.by_path = True
     number, _pr, first = _published_issue(client, github, sink)
     objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88125"
-    revision = _insert_revision(first["work_item_id"], number, objective)
+    revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
     _start_running(revision)
     versions = _rows(
         "SELECT w.version AS work_version, r.version AS request_version "
@@ -2015,7 +2039,7 @@ def test_a_no_change_follow_up_preserves_stale_version_fencing(admitted: Any, st
         engine = create_async_engine(get_settings().database_url)
         try:
             async with AsyncSession(engine) as session:
-                result = await _terminalize_execution(
+                result = await terminalize_execution(
                     session,
                     work_item_id=first["work_item_id"],
                     request_id=revision,
@@ -2131,7 +2155,12 @@ def test_a_marker_already_on_the_pull_request_is_not_posted_again(
     sink.by_path = True
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
-    revision = _insert_revision(first["work_item_id"], number, pr, fragment)
+    revision = _insert_revision(
+        first["work_item_id"],
+        number,
+        _revision_objective(pr, fragment),
+        _revision_reply(pr, fragment),
+    )
     sink.lists[f"/repos/{REPO}/{listed.format(pr=pr)}"] = [
         {
             "id": 7555,
@@ -2174,7 +2203,12 @@ def test_a_lost_thread_reply_response_rescans_every_list(admitted: Any) -> None:
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
     fragment = "discussion_r88109"
-    revision = _insert_revision(first["work_item_id"], number, pr, fragment)
+    revision = _insert_revision(
+        first["work_item_id"],
+        number,
+        _revision_objective(pr, fragment),
+        _revision_reply(pr, fragment),
+    )
     sink.lists[f"/repos/{REPO}/issues/{pr}/comments"] = [
         {"id": 9000 + i, "body": f"unrelated comment {i}"} for i in range(550)
     ]
