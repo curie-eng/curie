@@ -2143,6 +2143,12 @@ class Preflight:
                 "--candidate-images build on a cluster that is not kind pushes every image to "
                 "CURIE_FACTORY_LAYER_REGISTRY; set it to a registry the cluster can pull from"
             )
+        if not self.config.layer_registry and bundle_declares_runner_layer(self.config.bundle_dir):
+            raise ConfigError(
+                "--candidate-images build rebuilds the bundle's runner layer on the candidate "
+                "runner; set CURIE_FACTORY_LAYER_REGISTRY, since a committed lock names a layer "
+                "built on another runner"
+            )
         self.step(
             "candidate build tools present",
             builder=os.environ["BUILDX_BUILDER"],
