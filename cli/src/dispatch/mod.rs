@@ -736,7 +736,23 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                 budget,
                 chart,
                 dry_run,
+                code_host,
+                tracker,
+                forge_url,
+                token_file,
+                ca_file,
+                review_accounts,
             } => {
+                let forge = curie::factory_quickstart::ForgeFlags {
+                    code_host,
+                    tracker,
+                    forge_url,
+                    token_file,
+                    ca_file,
+                    review_accounts,
+                };
+                // Refuse an unusable forge selection before the chart fetch.
+                curie::factory_quickstart::select_forge(&forge)?;
                 let resolved = artifacts::resolve_chart(
                     chart.as_deref(),
                     artifacts::Channel::current(),
@@ -761,6 +777,7 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                             budget_usd: budget,
                             chart,
                             dry_run,
+                            forge,
                         },
                     )
                     .await?,

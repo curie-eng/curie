@@ -1422,6 +1422,29 @@ pub(crate) enum FactoryAction {
         /// Print the steps and exit without creating a cluster or applying anything.
         #[arg(long)]
         dry_run: bool,
+        /// Code host the factory publishes to. Only github is installed in
+        /// this build.
+        #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
+        code_host: curie::factory_quickstart::CodeHostKind,
+        /// Tracker the factory takes issues from. Only github is installed in
+        /// this build.
+        #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
+        tracker: curie::factory_quickstart::TrackerKind,
+        /// Base URL of a non-GitHub forge. Refused for github.
+        #[arg(long, value_name = "URL")]
+        forge_url: Option<String>,
+        /// File holding a non-GitHub forge's access token. The path is passed
+        /// through; the token never enters argv. Refused for github.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+        /// CA bundle for a non-GitHub forge with a private certificate.
+        /// Refused for github.
+        #[arg(long, value_name = "PATH")]
+        ca_file: Option<PathBuf>,
+        /// Account whose reviews a non-GitHub forge counts (repeatable).
+        /// Refused for github.
+        #[arg(long = "review-account", value_name = "ACCOUNT")]
+        review_accounts: Vec<String>,
     },
 }
 

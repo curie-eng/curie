@@ -105,8 +105,14 @@ fn assert_golden(name: &str, input: &PlanInput) {
         .split_once(&format!("{HEADER_END}\n"))
         .expect("golden header ends with `# ---`");
     assert!(header.contains("20fccad31"), "{header}");
-    assert!(header.contains(OLD_KEY) && header.contains(NEW_KEY), "{header}");
-    assert!(body.contains(OLD_KEY), "golden must hold the captured old key");
+    assert!(
+        header.contains(OLD_KEY) && header.contains(NEW_KEY),
+        "{header}"
+    );
+    assert!(
+        body.contains(OLD_KEY),
+        "golden must hold the captured old key"
+    );
     let expected = body.replace(OLD_KEY, NEW_KEY);
     assert_eq!(actual, expected, "describe output for {name} drifted");
 }
@@ -258,10 +264,10 @@ fn factory_quickstart_default_github_invocation_still_plans() {
     let body: serde_json::Value = serde_json::from_str(&run.stdout).expect("one plan object");
     let lines = body["plan"].as_array().expect("plan lines");
     assert!(
-        lines
-            .iter()
-            .any(|line| line.as_str().unwrap().contains("curie cluster deploy")
-                || line.as_str().unwrap().contains("curie cluster up")),
+        lines.iter().any(
+            |line| line.as_str().unwrap().contains("curie cluster deploy")
+                || line.as_str().unwrap().contains("curie cluster up")
+        ),
         "{body}"
     );
 

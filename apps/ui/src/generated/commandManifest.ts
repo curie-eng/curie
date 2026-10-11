@@ -9340,6 +9340,71 @@ export const commandManifest = {
                 "false"
               ],
               "required": false
+            },
+            {
+              "default_values": [
+                "github"
+              ],
+              "global": false,
+              "help": "Code host the factory publishes to. Only github is installed in this build",
+              "id": "code_host",
+              "long": "code-host",
+              "positional": false,
+              "possible_values": [
+                "github",
+                "gitlab",
+                "bitbucket-cloud",
+                "bitbucket-dc"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "github"
+              ],
+              "global": false,
+              "help": "Tracker the factory takes issues from. Only github is installed in this build",
+              "id": "tracker",
+              "long": "tracker",
+              "positional": false,
+              "possible_values": [
+                "github",
+                "gitlab",
+                "jira-cloud"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Base URL of a non-GitHub forge. Refused for github",
+              "id": "forge_url",
+              "long": "forge-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File holding a non-GitHub forge's access token. The path is passed through; the token never enters argv. Refused for github",
+              "id": "token_file",
+              "long": "token-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "CA bundle for a non-GitHub forge with a private certificate. Refused for github",
+              "id": "ca_file",
+              "long": "ca-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Account whose reviews a non-GitHub forge counts (repeatable). Refused for github",
+              "id": "review_accounts",
+              "long": "review-account",
+              "positional": false,
+              "required": false
             }
           ],
           "hidden": false,
