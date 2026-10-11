@@ -180,7 +180,7 @@ and no grant check (`cli/src/docker.rs`, `cli/src/connector_build.rs`).
    the same name and keys changes no checksum and needs a manual rollout.
 5. **The Docker dev path checks a key it never uses.** Both Docker emitters
    refuse a hosted connector without a caller public key, and the CLI satisfies
-   that by generating a throwaway pair on each start (`cli/src/commands/connectors.rs`). No
+   that by generating a throwaway pair on each start (`cli/src/commands/connector_images.rs`). No
    proxy holds it, so the refusal guards nothing on that path.
 6. **Docs and comments still describe the keyless install.** The chart values
    comment and the connector-host file say an install with no key renders no

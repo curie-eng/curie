@@ -474,6 +474,7 @@ def _open_pr(client: TestClient, publication_id: str) -> None:
                     metadata_updated_at=None,
                 ),
                 identity=VerifiedPublicationIdentity(
+                    host="github.com",
                     repository_id=101,
                     installation_id=202,
                     pr_node_id="PR_example_123",
