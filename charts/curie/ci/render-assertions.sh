@@ -88,6 +88,10 @@
 # Issue #4294, Assertion 23. Dependency additions require an explicit install
 # opt-in, with a typed chart value and a reserved worker environment name.
 #
+# Issue #4378, Assertion 24. API and worker S3 clients use the same signing
+# region as bundle fetches, with static credentials or web identity. Removing
+# either service's region must fail the same rendered-manifest assertion.
+#
 # Runnable locally (from anywhere) and from CI. Fails loudly, naming the key.
 set -euo pipefail
 
@@ -3477,6 +3481,103 @@ for publication_enabled in (True, False):
     assert result.returncode != 0, f"accepted reserved worker.extraEnv {env_name}"
     assert "worker.extraEnv" in result.stderr and value_key in result.stderr, result.stderr
 print("  ok: dependency additions default false, explicit true renders, schema and extraEnv refuse bypasses")
+PYEOF
+
+echo "=== Assertion 24: API and worker S3 regions match bundle fetches (#4378) ==="
+python3 - "$CHART" <<'PYEOF'
+import copy
+import json
+import subprocess
+import sys
+
+import yaml
+
+chart = sys.argv[1]
+
+
+def service_container(documents, component):
+    deployments = [
+        doc for doc in documents
+        if isinstance(doc, dict)
+        and doc.get("kind") == "Deployment"
+        and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == component
+    ]
+    assert len(deployments) == 1, f"expected one {component} Deployment, found {len(deployments)}"
+    containers = [
+        container for container in deployments[0]["spec"]["template"]["spec"]["containers"]
+        if container["name"] == component
+    ]
+    assert len(containers) == 1, f"expected one {component} container, found {len(containers)}"
+    return containers[0]
+
+
+def assert_regions(documents, expected):
+    for component in ("api", "worker"):
+        entries = [
+            entry for entry in service_container(documents, component)["env"]
+            if entry["name"] == "S3_REGION"
+        ]
+        assert entries == [{"name": "S3_REGION", "value": expected}], (
+            f"{component} S3_REGION must equal {expected!r} exactly once"
+        )
+    fetches = [
+        container for doc in documents
+        if isinstance(doc, dict) and doc.get("kind") == "SandboxTemplate"
+        for container in doc["spec"]["podTemplate"]["spec"].get("initContainers", [])
+        if container["name"] == "bundle-fetch"
+    ]
+    assert fetches, "expected at least one bundle-fetch init container"
+    for container in fetches:
+        entries = [entry for entry in container["env"] if entry["name"] == "AWS_DEFAULT_REGION"]
+        assert entries == [{"name": "AWS_DEFAULT_REGION", "value": expected}], (
+            f"bundle-fetch AWS_DEFAULT_REGION must equal {expected!r} exactly once"
+        )
+
+
+def render(*args):
+    result = subprocess.run(
+        ["helm", "template", "acme", chart, "--namespace", "acme", *args],
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    return list(yaml.safe_load_all(result.stdout))
+
+
+assert_regions(render(), "us-east-1")
+override = render("--set", "rustfs.region=eu-west-1")
+assert_regions(override, "eu-west-1")
+web_identity = render(
+    "--set", "rustfs.region=eu-west-1",
+    "--set", "rustfs.deploy=false",
+    "--set", "rustfs.host=s3.example.com",
+    "--set", "rustfs.port=443",
+    "--set", "rustfs.auth.accessKey=",
+    "--set-json", "rustfs.egress=" + json.dumps([
+        {"cidr": "192.0.2.10/32", "ports": [{"protocol": "TCP", "port": 443}]},
+    ]),
+    "--set-json", "rustfs.stsEgress=" + json.dumps([
+        {"cidr": "192.0.2.11/32", "ports": [{"protocol": "TCP", "port": 443}]},
+    ]),
+)
+assert_regions(web_identity, "eu-west-1")
+for component in ("api", "worker"):
+    names = {entry["name"] for entry in service_container(web_identity, component)["env"]}
+    assert not names & {"S3_ACCESS_KEY", "S3_SECRET_KEY"}, (
+        f"{component} web identity render must omit static S3 credentials"
+    )
+print("  ok: default us-east-1 and override eu-west-1 reach API, worker and bundle fetches with either auth mode")
+
+for component in ("api", "worker"):
+    mutant = copy.deepcopy(override)
+    container = service_container(mutant, component)
+    container["env"] = [entry for entry in container["env"] if entry["name"] != "S3_REGION"]
+    try:
+        assert_regions(mutant, "eu-west-1")
+    except AssertionError as error:
+        assert str(error) == f"{component} S3_REGION must equal 'eu-west-1' exactly once", str(error)
+    else:
+        raise AssertionError(f"missing {component} S3_REGION passed the region assertion")
+    print(f"  ok: missing {component} S3_REGION is rejected")
 PYEOF
 
 echo
