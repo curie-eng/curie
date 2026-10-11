@@ -3905,6 +3905,18 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "Proceed when a stock dark factory runner layer cannot be rebound for --to: clear its binding so the agent runs the platform runner without its layer until it is rebound. Refused by default",
+              "id": "allow_stock_layer_clear",
+              "long": "allow-stock-layer-clear",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Take over this exact holder after verifying its CLI and Helm action have stopped. Refuses while a release hook Job is running; recovers an orphaned pending upgrade by rolling back to the serving revision",
               "id": "take_over",
               "long": "take-over",
