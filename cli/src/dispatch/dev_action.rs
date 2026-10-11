@@ -41,6 +41,29 @@ pub(super) async fn run(action: DevAction) -> Result<()> {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             commands::dev_script("cli/scripts/factory-e2e.sh", &args).await
         }
+        DevAction::ForgeFixture {
+            kind,
+            action,
+            state_dir,
+            advertise_host,
+            port,
+        } => {
+            let state_dir = state_dir.to_string_lossy().into_owned();
+            let port = port.map(|p| p.to_string());
+            let mut args: Vec<&str> = vec![
+                kind.as_str(),
+                action.as_str(),
+                "--state-dir",
+                state_dir.as_str(),
+            ];
+            if let Some(host) = advertise_host.as_deref() {
+                args.extend(["--advertise-host", host]);
+            }
+            if let Some(port) = port.as_deref() {
+                args.extend(["--port", port]);
+            }
+            commands::dev_script("cli/scripts/forge-fixture.sh", &args).await
+        }
         DevAction::OidcE2e { args } => {
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             commands::dev_script("cli/scripts/oidc-e2e.sh", &args).await
