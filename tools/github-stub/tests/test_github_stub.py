@@ -345,6 +345,17 @@ def test_git_smart_http_clones_pushes_and_exposes_the_pushed_ref(
     assert git("ls-remote", stub.clone_url, "refs/heads/factory/example").split()[0] == pushed_sha
     branch = _ok(github.get(f"/repos/{REPO}/branches/factory%2Fexample"))
     assert branch["commit"]["sha"] == pushed_sha
+    # The worker's publication reconcile reads sha, message and parents from
+    # GitHub's Git database commit
+    # (https://docs.github.com/en/rest/git/commits#get-a-commit-object).
+    commit = _ok(github.get(f"/repos/{REPO}/git/commits/{pushed_sha}"))
+    assert commit["sha"] == pushed_sha
+    assert commit["message"].splitlines()[0] == "Add example"
+    assert [parent["sha"] for parent in commit["parents"]] == [
+        git("rev-parse", "HEAD~1", cwd=checkout)
+    ]
+    missing = github.get(f"/repos/{REPO}/git/commits/{'0' * 40}")
+    assert missing.status_code == 404, missing.text
     pull = _ok(
         github.post(
             f"/repos/{REPO}/pulls",
