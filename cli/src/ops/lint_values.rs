@@ -76,7 +76,16 @@ pub(crate) async fn pending_set_values(base: &Value, args: &[CmdArg]) -> Result<
 /// @spec CLUSTER-VALUES-FILES c2-c3
 async fn parsed_values(files: &[PathBuf], explicit_args: &[CmdArg]) -> Result<Value> {
     // @spec CLUSTER-VALUES-FILES c2: Helm parses only captured copies.
-    let chart = tempfile::tempdir()
+    // @spec CLUSTER-VALUES-FILES c4: the copies can carry credentials, so the
+    // directory is owner-only from creation and each copy is written 0600.
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let chart = builder
+        .tempdir()
         .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
     let templates = chart.path().join("templates");
     std::fs::create_dir(&templates)
@@ -101,7 +110,7 @@ async fn parsed_values(files: &[PathBuf], explicit_args: &[CmdArg]) -> Result<Va
             crate::exit::CliError::usage(format!("could not read values file {}", file.display()))
                 .with_fix("pass an existing, readable YAML file to -f/--values-file")
         })?;
-        std::fs::write(chart_files.join(format!("{index}.yaml")), contents)
+        crate::secrets::write_private(&chart_files.join(format!("{index}.yaml")), &contents)
             .map_err(|_| crate::exit::CliError::failure("could not prepare values lint chart"))?;
         template.push_str(&format!(
             "  file{index}: {{{{ (.Files.Get \"files/{index}.yaml\" | fromYaml | toJson) | quote }}}}\n"
