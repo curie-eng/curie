@@ -40,15 +40,17 @@ pub(super) enum Facet {
     Rollout,
 }
 
-/// The Drain facet is the worker drain Job, its post-upgrade release, and the
-/// attest Job (`charts/curie/templates/worker-upgrade-drain.yaml`). A refusal
-/// there means accepted work had not settled, or no successful drain is
-/// recorded for this revision, which `cluster upgrade` reports separately from
-/// every other hook. Schema-migrate stays [`Facet::Hook`].
+/// The Drain facet covers the worker drain, attest, hold, and post-upgrade
+/// release Jobs (`charts/curie/templates/worker-upgrade-drain.yaml`). A refusal
+/// means accepted work had not settled, no successful drain is recorded, or
+/// this revision's pause authority could not be renewed. `cluster upgrade`
+/// reports these failures separately from every other hook. Schema-migrate
+/// stays [`Facet::Hook`].
 fn hook_facet(name: &str) -> Facet {
     if name.ends_with("-upgrade-drain")
         || name.ends_with("-upgrade-drain-release")
         || name.ends_with("-upgrade-drain-attest")
+        || name.ends_with("-upgrade-drain-hold")
     {
         Facet::Drain
     } else {
@@ -1021,6 +1023,29 @@ pub(super) async fn wait_for_observation(opts: &CommonOpts) -> Observation {
 mod timestamp_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn hook_facet_reports_a_failed_hold_as_a_drain_failure() {
+        let name = "acme-curie-upgrade-drain-hold";
+        let mut observation = Observation::default();
+        observation.issue(hook_facet(name), name, "Helm hook failed");
+        assert!(!observation.holds(Facet::Drain));
+        assert!(observation.holds(Facet::Hook));
+        assert_eq!(observation.issues, [format!("{name}: Helm hook failed")]);
+
+        for suffix in [
+            "upgrade-drain",
+            "upgrade-drain-attest",
+            "upgrade-drain-release",
+        ] {
+            assert_eq!(hook_facet(&format!("acme-curie-{suffix}")), Facet::Drain);
+        }
+        assert_eq!(hook_facet("acme-curie-schema-migrate"), Facet::Hook);
+        assert_eq!(
+            hook_facet("acme-curie-upgrade-drain-hold-other"),
+            Facet::Hook
+        );
+    }
 
     #[test]
     fn rfc3339_parses_helm_and_kubernetes_stamps() {

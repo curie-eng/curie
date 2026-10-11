@@ -523,6 +523,29 @@ not the drain gate itself; the gate (issue 2010) is the chart's own
 pre-upgrade Helm hook Job, which runs during Apply and whose outcome the
 convergence check above reports as the drained-queue gate.
 
+The independent mail persistence checks and pre-upgrade gVisor preflight run
+before the drain, so their failures do not pause worker claims. A clean drain
+leaves a 300-second handoff lease on the installation's pause marker. Attest
+requires both this revision's recorded drain success and its existing marker,
+then renews the lease for 300 seconds. The schema-migrate process uses the same
+shared renewal, starting before Postgres readiness and repeating every 100
+seconds while it is alive. Renewal never creates a missing marker or takes
+authority from another revision; lost authority refuses the upgrade.
+
+The last pre-upgrade hook, `upgrade-drain-hold` at weight `10`, runs
+`--mode hold` after migration. It extends the existing same-revision marker to
+the configured roll hold, `worker.upgradeDrain.quiesceTtlSeconds`, without
+shortening a longer lease. It refuses if the marker is absent, belongs to
+another revision, or Valkey is unreachable. The post-upgrade release clears
+the marker after the roll.
+
+Before hold succeeds, a failed step leaves claims paused for at most 300
+seconds after its last renewal. A gap between steps longer than the handoff
+lease refuses the upgrade, so retry once the hook images are cached. A failure
+after hold succeeds, including manifest apply or a rollout wait timeout, can
+still leave claims paused until the remaining lease expires, potentially for
+the full configured roll hold. Helm has no upgrade-failed hook to release it.
+
 After confirmation, the command claims the namespaced
 `<release>-upgrade-checkpoint` ConfigMap before it reads release snapshots or
 runs Helm. The claim records an opaque holder identifier and a redacted action

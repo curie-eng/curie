@@ -101,17 +101,26 @@ adding one.
    installation-scoped quiesce marker fenced by Helm revision (a higher-revision
    marker refuses the write), holds it as a short lease renewed by a heartbeat
    (`apps/worker/src/curie_worker/upgrade_drain.py::quiesce_lease_s`), and waits
-   for every leased delivery to settle. A clean drain extends the marker to the
-   roll hold; a refusal fails the hook, so Helm applies nothing. An attest hook
-   fails closed if the drain Job was deleted rather than succeeding, and a
-   `post-upgrade` hook releases the marker.
+   for every leased delivery to settle. Independent mail persistence checks
+   and the pre-upgrade gVisor preflight run before this gate. A clean drain
+   leaves a 300-second handoff lease; a refusal fails the hook, so Helm applies
+   nothing. Attest requires this revision's recorded drain success and renews
+   its existing same-revision marker for 300 seconds. It fails closed if the
+   drain Job was deleted without succeeding or pause authority was lost. After
+   migration, the last `pre-upgrade` hook, `upgrade-drain-hold` at weight `10`,
+   runs `--mode hold` to extend that authority to the configured roll hold
+   without shortening a longer lease. Attest and hold never create a marker;
+   absent or foreign authority or a Valkey failure refuses the upgrade. A
+   `post-upgrade` hook releases the marker after the roll.
 7. **Migrate once.** The migrate phase is a checkpoint boundary only. The one
    migrator is the `post-install,pre-upgrade` Job in
    `charts/curie/templates/schema-migrate.yaml`, ordered after the drain hook,
    which runs `apps/api/src/curie_api/schema_compat.py::upgrade_with_pause`. On an
    upgrade it renews the drain's pause marker through the renew-only
    `packages/upgrade-pause/src/curie_upgrade_pause/__init__.py::renew_pause` for
-   its whole life and refuses to start Alembic once that authority is lost.
+   its whole life, starting before Postgres readiness and repeating every 100
+   seconds with the shared 300-second lease. It refuses to start Alembic once
+   that authority is lost.
 8. **Converge, canary, commit.** Helm success is not convergence. Converge checks
    target images, observed generations, ready replicas, zero unavailable
    replicas, hook health, the drain verdict from Helm's retained hook history,
@@ -171,11 +180,15 @@ One, in three processes:
 4. **Worker drain state is a Valkey key the API also writes.** The migrate Job
    renews a worker-owned marker, so both images depend on `packages/upgrade-pause`
    staying in step.
-5. **ADR-0209 is only partly built.** The shared renew-only module and
-   schema-migrate renewal shipped. A clean drain still writes the full roll hold
-   instead of a short hand-off lease, attest does not renew, and the planned
-   `upgrade-drain-hold` hook does not exist, so a failure after a clean drain can
-   still pause the fleet for up to the roll hold.
+5. **Failure after hold retains the remaining lease.** The clean drain,
+   attest and schema-migrate hand off and renew a 300-second lease, bounding a
+   failure before hold succeeds to 300 seconds after the last renewal. Once
+   `upgrade-drain-hold` extends the marker, a manifest apply failure or rollout
+   wait timeout can still leave claims paused until that lease expires,
+   potentially for the full configured roll hold. Helm has no upgrade-failed
+   hook, and no chart-owned process renews through the roll. Renewal is
+   extend-only, so a configured roll hold below 300 seconds does not shorten
+   the handoff lease.
 6. **Approval identity migrations are fenced inside the migrate Job.**
    `apps/api/src/curie_api/migration_fence.py::fence_identity_tables` bounds its
    lock wait on the assumption the worker is already drained. Approvals an

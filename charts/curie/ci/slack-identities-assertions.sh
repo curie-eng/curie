@@ -33,6 +33,7 @@ RANDOM_DOCS = {
     ("Secret", "acme-curie-runner-token"),
     ("Job", "acme-curie-upgrade-drain"),
     ("Job", "acme-curie-upgrade-drain-attest"),
+    ("Job", "acme-curie-upgrade-drain-hold"),
     ("Job", "acme-curie-upgrade-drain-release"),
 }
 PLAIN = {"dispatcher": {"slack": {"appToken": "xapp-example", "botToken": "xoxb-example"}}}
