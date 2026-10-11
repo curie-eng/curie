@@ -14,6 +14,7 @@ import math
 import os
 import signal
 import socket
+import ssl
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -961,6 +962,36 @@ def _build_connector_loop(
     )
 
 
+_PUBLICATION_GITHUB_CA_SETTING = "CURIE_PUBLICATION_GITHUB_CA_FILE"
+
+
+def _publication_github_ca_pem(config: WorkerConfig) -> str | None:
+    """Read the configured GitHub CA once; a set but unusable path stops startup."""
+
+    path = config.publication_github_ca_file
+    if not path:
+        return None
+    try:
+        pem = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            f"{_PUBLICATION_GITHUB_CA_SETTING} points at {path!r}, which cannot be read: {exc}"
+        ) from exc
+    if "-----BEGIN CERTIFICATE-----" not in pem:
+        raise RuntimeError(
+            f"{_PUBLICATION_GITHUB_CA_SETTING} points at {path!r}, "
+            "which contains no PEM certificate"
+        )
+    try:
+        ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=pem)
+    except (ssl.SSLError, ValueError) as exc:
+        raise RuntimeError(
+            f"{_PUBLICATION_GITHUB_CA_SETTING} points at {path!r}, "
+            f"which contains no usable PEM certificate: {exc}"
+        ) from exc
+    return pem
+
+
 def _build_publication_loop(
     config: WorkerConfig,
     env: Mapping[str, str],
@@ -975,6 +1006,7 @@ def _build_publication_loop(
         "CURIE_SANDBOX_SUBSTRATE", "kubernetes"
     ).lower() != "kubernetes":
         return None
+    github_ca_pem = _publication_github_ca_pem(config)
     namespace = config.publication_namespace
     cluster = KubernetesPublicationCluster(namespace)
     store = PostgresPublicationStore(
@@ -1036,6 +1068,7 @@ def _build_publication_loop(
             memory_limit=config.publication_memory_limit,
             ephemeral_request=config.publication_ephemeral_request,
             ephemeral_limit=config.publication_ephemeral_limit,
+            github_ca_pem=github_ca_pem,
         ),
     )
     return PublicationReconcileLoop(

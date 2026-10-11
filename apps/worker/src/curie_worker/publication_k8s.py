@@ -35,6 +35,11 @@ _URL_USERINFO = re.compile(r"(https?://)[^/\s@]+@", re.IGNORECASE)
 _MARKER_LOG_LINE = re.compile(r"^CURIE_[A-Z_]+=")
 # Failed Job text leaves the cluster into thread history; keep it bounded.
 _MAX_JOB_ERROR = 1500
+# A configured GitHub CA rides in the per-publication ConfigMap, which the Job
+# already mounts at /publication, so no extra volume or namespace object exists.
+_GITHUB_CA_KEY = "github-ca.pem"
+_GITHUB_CA_PATH = f"/publication/{_GITHUB_CA_KEY}"
+_GITHUB_CA_ENV_NAMES = ("SSL_CERT_FILE", "GIT_SSL_CAINFO", "REQUESTS_CA_BUNDLE")
 
 
 def _redact(text: str) -> str:
@@ -69,6 +74,8 @@ class PublicationJobSettings:
     memory_limit: str
     ephemeral_request: str
     ephemeral_limit: str
+    # PEM text of a private CA for a GitHub stub; None keeps the image's trust.
+    github_ca_pem: str | None
     owner_uid: str | None = None
     active_deadline_seconds: int = 300
     git_timeout_seconds: int = 60
@@ -720,6 +727,9 @@ def build_publication_resources(
         "github_timeout_seconds": settings.github_timeout_seconds,
         "github_api_url": settings.github_api_url,
     }
+    if settings.github_ca_pem is not None:
+        # Only when set, so a contract without a CA hashes exactly as before.
+        contract["github_ca_sha256"] = hashlib.sha256(settings.github_ca_pem.encode()).hexdigest()
     annotations = {
         "curietech.ai/publication-contract-sha256": hashlib.sha256(
             json.dumps(contract, sort_keys=True, separators=(",", ":")).encode()
@@ -731,7 +741,7 @@ def build_publication_resources(
         "annotations": annotations,
         "ownerReferences": _owner_reference(settings, owner_uid),
     }
-    config_map = {
+    config_map: dict[str, Any] = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {**metadata, "name": names.config_map},
@@ -741,6 +751,8 @@ def build_publication_resources(
         },
         "data": {"publish.sh": _PUBLISH_SCRIPT},
     }
+    if settings.github_ca_pem is not None:
+        config_map["data"][_GITHUB_CA_KEY] = settings.github_ca_pem
     secret = {
         "apiVersion": "v1",
         "kind": "Secret",
@@ -782,6 +794,8 @@ def build_publication_resources(
         {"name": "GITHUB_API_URL", "value": settings.github_api_url},
         {"name": "GITHUB_HTML_BASE", "value": settings.github_html_base},
     ]
+    if settings.github_ca_pem is not None:
+        env.extend({"name": name, "value": _GITHUB_CA_PATH} for name in _GITHUB_CA_ENV_NAMES)
     pod_spec: dict[str, Any] = {
         "serviceAccountName": settings.service_account_name,
         "automountServiceAccountToken": False,

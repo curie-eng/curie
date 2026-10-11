@@ -1001,6 +1001,7 @@ def _loop(
             owner_name="curie-publication-owner",
             git_user_name="Curie Publisher",
             git_user_email="publisher@example.com",
+            github_ca_pem=None,
             cpu_request="100m",
             cpu_limit="1",
             memory_request="256Mi",

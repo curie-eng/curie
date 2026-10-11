@@ -1824,3 +1824,20 @@ def test_publication_html_base_is_derived_from_the_configured_api_url(
     monkeypatch.setenv("CURIE_PUBLICATION_GITHUB_API_URL", api_url)
 
     assert WorkerConfig().publication_github_html_base == html_base
+
+
+def test_publication_github_ca_file_defaults_to_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+
+    assert WorkerConfig().publication_github_ca_file == ""
+
+
+def test_publication_github_ca_file_reads_its_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_all_config_env(monkeypatch)
+    monkeypatch.setenv("CURIE_PUBLICATION_GITHUB_CA_FILE", "/etc/curie/github-stub/ca.pem")
+
+    assert WorkerConfig().publication_github_ca_file == "/etc/curie/github-stub/ca.pem"

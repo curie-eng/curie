@@ -37,8 +37,9 @@ def publication_k8s() -> Any:
     return importlib.import_module("curie_worker.publication_k8s")
 
 
-def _settings(module: Any) -> Any:
+def _settings(module: Any, *, github_ca_pem: str | None = None) -> Any:
     return module.PublicationJobSettings(
+        github_ca_pem=github_ca_pem,
         namespace="curie",
         runner_image="ghcr.io/curie-eng/curie-runner:v0.7.0",
         image_pull_policy="IfNotPresent",
@@ -2188,6 +2189,71 @@ def test_omitempty_tolerance_refuses_differing_or_emptied_non_empty_values(
     del backoff_absent["spec"]["backoffLimit"]
     with pytest.raises(publication_k8s.PublicationResourceError, match="spec mismatch"):
         publication_k8s.validate_adopted_resource("Job", resources.job, backoff_absent)
+
+
+_GITHUB_CA_PEM = (
+    "-----BEGIN CERTIFICATE-----\n"
+    "MIIBszCCAVmgAwIBAgIUcurieTestStubCaPlaceholderAAAAAAAAAAAwCgYIKoZI\n"
+    "zj0EAwIwLzEtMCsGA1UEAwwkY3VyaWUtZ2l0aHViLXN0dWItdGVzdC1jYS1wbGFj\n"
+    "-----END CERTIFICATE-----\n"
+)
+_CA_ENV_NAMES = ("SSL_CERT_FILE", "GIT_SSL_CAINFO", "REQUESTS_CA_BUNDLE")
+_CA_MOUNT_PATH = "/publication/github-ca.pem"
+
+
+def _ca_resources(module: Any, github_ca_pem: str | None) -> Any:
+    return module.build_publication_resources(
+        _payload(module),
+        credential=WRITE_CREDENTIAL,
+        settings=_settings(module, github_ca_pem=github_ca_pem),
+    )
+
+
+def test_publication_job_trusts_configured_github_ca(
+    publication_k8s: Any,
+) -> None:
+    trusted = _ca_resources(publication_k8s, _GITHUB_CA_PEM)
+    untrusted = _ca_resources(publication_k8s, None)
+
+    assert trusted.config_map["data"]["github-ca.pem"] == _GITHUB_CA_PEM
+    assert trusted.config_map["data"]["publish.sh"] == (
+        untrusted.config_map["data"]["publish.sh"]
+    )
+    trusted_container = trusted.job["spec"]["template"]["spec"]["containers"][0]
+    for name in _CA_ENV_NAMES:
+        entries = [item for item in trusted_container["env"] if item["name"] == name]
+        assert entries == [{"name": name, "value": _CA_MOUNT_PATH}], name
+
+    trusted_pod = trusted.job["spec"]["template"]["spec"]
+    untrusted_pod = untrusted.job["spec"]["template"]["spec"]
+    assert trusted_pod["volumes"] == untrusted_pod["volumes"]
+    assert trusted_container["volumeMounts"] == (
+        untrusted_pod["containers"][0]["volumeMounts"]
+    )
+
+    assert set(untrusted.config_map["data"]) == {"publish.sh"}
+    untrusted_names = {
+        item["name"] for item in untrusted_pod["containers"][0]["env"]
+    }
+    assert untrusted_names.isdisjoint(_CA_ENV_NAMES)
+
+    publication_k8s.validate_adopted_resource(
+        "ConfigMap", trusted.config_map, deepcopy(trusted.config_map)
+    )
+
+    differing = deepcopy(trusted.config_map)
+    differing["data"]["github-ca.pem"] = _GITHUB_CA_PEM.replace("MIIB", "MIIC")
+    with pytest.raises(publication_k8s.PublicationResourceError):
+        publication_k8s.validate_adopted_resource(
+            "ConfigMap", trusted.config_map, differing
+        )
+
+    missing = deepcopy(trusted.config_map)
+    del missing["data"]["github-ca.pem"]
+    with pytest.raises(publication_k8s.PublicationResourceError):
+        publication_k8s.validate_adopted_resource(
+            "ConfigMap", trusted.config_map, missing
+        )
 
 
 def test_omitempty_tolerance_refuses_valueFrom_secretKeyRef_on_omitted_env(

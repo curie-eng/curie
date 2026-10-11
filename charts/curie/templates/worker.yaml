@@ -292,6 +292,10 @@ spec:
               value: {{ .Values.worker.publication.gitCommandTimeoutSeconds | quote }}
             - name: CURIE_PUBLICATION_GITHUB_API_URL
               value: {{ .Values.api.githubApiUrl | quote }}
+            {{- if .Values.api.githubStubCaConfigMap }}
+            - name: CURIE_PUBLICATION_GITHUB_CA_FILE
+              value: /etc/curie/github-stub/ca.pem
+            {{- end }}
             - name: CURIE_PUBLICATION_RECONCILE_INTERVAL_SECONDS
               value: {{ .Values.worker.publication.reconcileIntervalSeconds | quote }}
             - name: CURIE_PUBLICATION_LEASE_SECONDS

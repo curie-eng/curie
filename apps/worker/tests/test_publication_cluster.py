@@ -94,6 +94,7 @@ def _settings() -> PublicationJobSettings:
         owner_name=OWNER_NAME,
         git_user_name="Curie Publisher",
         git_user_email="publisher@example.com",
+        github_ca_pem=None,
         cpu_request="25m",
         cpu_limit="500m",
         memory_request="64Mi",

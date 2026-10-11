@@ -6486,6 +6486,7 @@ async def _reconcile_through_lineage_patch(
         owner_name="curie-publication",
         git_user_name="Curie Publisher",
         git_user_email="publisher@example.test",
+        github_ca_pem=None,
         cpu_request="100m",
         cpu_limit="1",
         memory_request="256Mi",
