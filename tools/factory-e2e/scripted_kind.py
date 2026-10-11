@@ -207,6 +207,9 @@ class ScriptedRun:
         # Serializes this run's admission plus upstream forward; the ledger
         # file lock extends that to every run sharing the ledger.
         self.forward_lock = threading.Lock()
+        # Set when teardown begins; a request still waiting on either lock is
+        # then refused, since cleanup would never measure the credit it spends.
+        self.recording_closed = False
 
     def check_disk(self, stage: str) -> None:
         if shutil.disk_usage("/").free < 30 * 1024**3:
@@ -355,8 +358,25 @@ class ScriptedRun:
             # file lock across admission and the upstream forward. Opening it
             # per request makes two runs in one process conflict as well.
             lock_path = self.record_ledger.with_name("recording.lock")
-            with self.forward_lock, open(lock_path, "a") as lock_file:
-                fcntl.flock(lock_file, fcntl.LOCK_EX)
+            with open(lock_path, "a") as lock_file:
+                # Poll both locks so a request queued behind another run is
+                # refused once teardown begins instead of stalling it.
+                while True:
+                    if self.recording_closed:
+                        self.model._reject(handler, "POST", path, body)
+                        return
+                    if self.forward_lock.acquire(blocking=False):
+                        try:
+                            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            self.forward_lock.release()
+                        else:
+                            if not self.recording_closed:
+                                break
+                            fcntl.flock(lock_file, fcntl.LOCK_UN)
+                            self.forward_lock.release()
+                            continue
+                    time.sleep(0.1)
                 try:
                     if model_module.request_key(model_module._safe_json(body)) is not None:
                         try:
@@ -368,8 +388,14 @@ class ScriptedRun:
                     forward(handler, path, body)
                 finally:
                     fcntl.flock(lock_file, fcntl.LOCK_UN)
+                    self.forward_lock.release()
 
         self.model._record = record_request
+
+    def begin_model_teardown(self) -> None:
+        """Refuse every recording request not yet forwarded upstream."""
+
+        self.recording_closed = True
 
     def prerequisites(self) -> None:
         for binary in ("docker", "kind", "helm", "kubectl", "openssl", "git", self.curie):
@@ -400,7 +426,12 @@ class ScriptedRun:
             self.command(self.curie, "build", "--tag", "curie-runner:latest", timeout=1800)
             self.check_disk("built runner")
         for image in IMAGES:
-            self.command("docker", "image", "inspect", image, timeout=30)
+            try:
+                self.command("docker", "image", "inspect", image, timeout=30)
+            except ScriptedScenarioError:
+                raise fe.ConfigError(
+                    f"local image {image} is missing; pass --build-images to build it"
+                ) from None
 
     def execute(self) -> None:
         self.prerequisites()
@@ -836,6 +867,7 @@ class ScriptedRun:
         errors: list[str] = []
         # Cleanup must retain its own timeout after the scenario deadline.
         self.deadline = None
+        self.begin_model_teardown()
         if self.forward is not None:
             try:
                 self.forward.terminate()
