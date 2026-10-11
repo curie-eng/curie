@@ -25,6 +25,8 @@ enum Coerce {
     Number,
     Integer,
     Bool,
+    /// A JSON document in a string that must parse to an object.
+    JsonObject,
 }
 
 /// Exact extraEnv name -> first-class Helm key successors.
@@ -65,6 +67,13 @@ const EXTRA_ENV_SUCCESSORS: &[(&str, &str, Coerce)] = &[
         "CURIE_SLACK_TRUSTED_ORIGINS",
         "worker.slackTrustedOrigins",
         Coerce::String,
+    ),
+    // #4322: the v0.12.1/v0.12.2 guide set the factory metadata CI policy
+    // through api.extraEnv; v0.12.3 made the name chart owned.
+    (
+        "GITHUB_FACTORY_METADATA_CI",
+        "api.githubFactoryMetadataCi",
+        Coerce::JsonObject,
     ),
 ];
 
@@ -114,6 +123,7 @@ pub fn extra_env_successors() -> &'static [(&'static str, &'static str)] {
         ),
         ("CURIE_DELIVERY_BUDGET_S", "worker.deliveryBudgetSeconds"),
         ("CURIE_SLACK_TRUSTED_ORIGINS", "worker.slackTrustedOrigins"),
+        ("GITHUB_FACTORY_METADATA_CI", "api.githubFactoryMetadataCi"),
     ];
     PAIRS
 }
@@ -303,6 +313,12 @@ fn coerce_extra_env(value: Option<&Value>, coerce: Coerce) -> Result<Value> {
             "true" | "1" => Ok(Value::Bool(true)),
             "false" | "0" => Ok(Value::Bool(false)),
             _ => bail!("value is not a boolean"),
+        },
+        // serde's parse error can quote the input, so it is discarded: the
+        // refusal names the variable and key, never the value.
+        Coerce::JsonObject => match serde_json::from_str::<Value>(&raw) {
+            Ok(object @ Value::Object(_)) => Ok(object),
+            _ => bail!("value is not a JSON object"),
         },
     }
 }

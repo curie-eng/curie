@@ -3023,6 +3023,11 @@ enum ClusterAction {
         /// rollback window stays intact (#2300).
         #[arg(long = "forward-only")]
         forward_only: bool,
+        /// Proceed when a stock dark factory runner layer cannot be rebound for
+        /// --to: clear its binding so the agent runs the platform runner without
+        /// its layer until it is rebound. Refused by default.
+        #[arg(long)]
+        allow_stock_layer_clear: bool,
         /// Take over this exact holder after verifying its CLI and Helm action
         /// have stopped. Refuses while a release hook Job is running; recovers
         /// an orphaned pending upgrade by rolling back to the serving revision.
@@ -5997,6 +6002,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                             no_expose,
                             set,
                             set_string: vec![],
+                            set_json: vec![],
                             allow_egress_host,
                             // Populated by ops::up (resolve named providers to host
                             // routes on a live run); empty here so the pure builder and
@@ -6076,6 +6082,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                 yes,
                 dry_run,
                 forward_only,
+                allow_stock_layer_clear,
                 take_over,
             } => {
                 let file_values = ops::load_values_files(&values_files).await?;
@@ -6099,6 +6106,7 @@ async fn run(command: Option<Command>) -> Result<()> {
                         chart,
                         yes,
                         forward_only,
+                        allow_stock_layer_clear,
                         take_over,
                     })
                     .await?,
@@ -8099,6 +8107,7 @@ mod tests {
                         to,
                         namespace,
                         dry_run,
+                        allow_stock_layer_clear,
                         ..
                     },
                 ..
@@ -8106,11 +8115,36 @@ mod tests {
                 assert_eq!(to, "0.9.0");
                 assert_eq!(namespace, "curie");
                 assert!(dry_run);
+                assert!(!allow_stock_layer_clear);
             }
             _ => panic!("expected cluster upgrade"),
         }
         let missing = try_parse_from(["curie", "cluster", "upgrade"]);
         assert!(missing.is_err(), "--to is required");
+    }
+
+    #[test]
+    fn cluster_upgrade_parses_allow_stock_layer_clear() {
+        let parsed = try_parse_from([
+            "curie",
+            "cluster",
+            "upgrade",
+            "--to",
+            "0.9.0",
+            "--allow-stock-layer-clear",
+        ])
+        .expect("cluster upgrade should accept the explicit stock clear flag");
+        match parsed.command {
+            Some(Command::Cluster {
+                action:
+                    ClusterAction::Upgrade {
+                        allow_stock_layer_clear,
+                        ..
+                    },
+                ..
+            }) => assert!(allow_stock_layer_clear),
+            _ => panic!("expected cluster upgrade"),
+        }
     }
 
     #[test]
