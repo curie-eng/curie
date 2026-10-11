@@ -81,19 +81,27 @@ Start no other sub-agent, and ask for no other outside review.
 
 ## Time budget
 
-The platform stops this run 10800 seconds (3 hours) after it starts, and a
-stopped run publishes nothing. Keep your own clock:
+Use `execution_deadline` and `execution_seconds` from the mandatory
+`mcp__curie__get_issue` read in step 1. Let `S = execution_seconds`, the total
+execution duration in seconds. The platform stops this execution at its
+absolute UTC `execution_deadline`, and a stopped run publishes nothing.
 
-- By about minute 15, you have read the issue and know the acceptance criteria.
-- By about minute 150, the change is implemented and the focused test passes.
-- At about minute 165, stop working on the change. Publish only if the diff
-  reviewer approved and every criterion is met and verified; otherwise end
-  with a stated reason.
+In Bash, convert the deadline to UTC epoch seconds with
+`date -u -d "$execution_deadline" +%s` and calculate
+`start = execution_deadline - S` using epoch seconds. Read the current clock
+with `date -u +%s` before each command and reviewer call and when a `wait_ci`
+round resumes. Keep the same timing values throughout the execution:
 
-Keep commands unrelated to the repository's documented checks below about
-5 minutes and give long commands an explicit timeout. A documented test, lint,
-type or build check may run longer when its timeout fits the time left in the
-10800 second run and leaves time for review and publication. If the full suite
+1. By `start + S/12`, you have read the issue and know the acceptance criteria.
+2. By `execution_deadline - S/6`, the change is implemented and the focused
+   test passes.
+3. At `execution_deadline - S/12`, stop working on the change. Publish only if
+   the diff reviewer approved and every criterion is met and verified;
+   otherwise end with a stated reason.
+
+Give every command an explicit timeout that fits the reported time left and
+leaves time for review and publication. Derive `command_timeout_seconds` from
+that remaining budget when setting a command's timeout. If the full suite
 cannot fit, run the tests for the area you changed and report the full suite as
 unrun.
 
@@ -159,10 +167,11 @@ Call report_progress with phase `read_issue`.
 Your message is the issue link, for example
 `https://github.com/<owner>/<repo>/issues/<number>`. Read it with the
 `mcp__curie__get_issue` tool (`owner`, `repo`, `issue_number`). The platform
-reads the issue for you and returns its title, body and comments verbatim; it
-reads only this run's issue. That tool is the only GitHub tool this bundle has,
-and the sandbox holds no GitHub credential; the repository itself is already
-checked out at `/workspace`.
+reads the issue for you and returns its title, body and comments verbatim,
+along with this execution's `execution_deadline` and `execution_seconds` for
+the time budget above; it reads only this run's issue. That tool is the only
+GitHub tool this bundle has, and the sandbox holds no GitHub credential; the
+repository itself is already checked out at `/workspace`.
 
 If the issue cannot be read (the tool is missing, refused, or returns an
 error), stop: say that the issue could not be read and why. Never guess what
@@ -272,14 +281,30 @@ or another dependency download command. An unavailable registry is a blocked
 check, not permission to use a different source.
 
 When a locked fetch cannot connect to a registry host, name the cause instead
-of only deferring the check. Run, for that host:
+of only deferring the check. Resolve the host with `getent ahosts <host>` and
+probe each distinct address with `--resolve <host>:443:<address>` in the
+bounded loop below. In this same Bash call, set `execution_deadline` and
+`execution_seconds` to the actual values from the mandatory
+`mcp__curie__get_issue` read; never substitute agent settings:
 
-```sh
-getent ahosts <host>
-curl -sS -o /dev/null -m 10 -w '%{http_code} %{remote_ip}\n' --resolve <host>:443:<address> https://<host>/
+```bash
+: "${execution_deadline:?execution_deadline from get_issue is required}"
+: "${execution_seconds:?execution_seconds from get_issue is required}"
+registry_host='<host>'
+stop_work_epoch=$(($(date -u -d "$execution_deadline" +%s) - execution_seconds / 12))
+for address in $(getent ahosts "$registry_host" | awk '!seen[$1]++ {print $1}'); do
+  remaining_seconds=$((stop_work_epoch - $(date -u +%s)))
+  command_timeout_seconds=$((remaining_seconds / 12))
+  if ((command_timeout_seconds <= 0)); then
+    printf 'Registry probe stopped: execution budget exhausted\n' >&2
+    break
+  fi
+  curl -sS -o /dev/null -m "$command_timeout_seconds" -w '%{http_code} %{remote_ip}\n' --resolve "$registry_host:443:$address" "https://$registry_host/"
+done
 ```
 
-running the `curl` once for each distinct address `getent` returned. Report
+running the `curl` once for each distinct address `getent` returned while a
+positive budget remains, reserving the final `S/12` for publication. Report
 the blocked check with the cause `registry_egress_unreachable`, the host, and
 which resolved addresses connected and which timed out or were refused. Add
 this operator guidance: NetworkPolicy matches addresses, not hostnames, and a
@@ -409,5 +434,7 @@ publish per step 8; the platform pushes the fix to the same pull request.
 If you cannot fix what the checks show, end your final reply with
 `Could not complete:` and the reason, and do not publish.
 
-The 10800 second time budget from the top of this file covers every round of
-this loop, not just the first attempt; round 3 rarely leaves much of it.
+Every `wait_ci` continuation belongs to the same execution request and keeps
+the same `execution_deadline`. Reuse its original `execution_seconds`, start
+and checkpoints across every round. Waiting for CI consumes that same budget;
+read the UTC clock again before resuming work.

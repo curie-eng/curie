@@ -113,7 +113,10 @@ DISCIPLINE = {
         r"|reason.{0,80}instead of (a "
         r"|opening a )?pull request"
     ),
-    "time-budget-10800": r"10800",
+    "time-budget-from-issue-read": (
+        r"`execution_deadline`.{0,80}`execution_seconds`"
+        r".{0,80}`mcp__curie__get_issue`"
+    ),
     "untrusted-input": r"untrusted",
     "stop-on-ambiguity": (
         r"ambigu\w*.{0,160}(stop"
@@ -371,7 +374,10 @@ def test_wait_ci_section_loops_a_failed_check_back_to_implement() -> None:
     assert "untrusted" in section.lower()
     assert ".github/" in section
     assert "Could not complete:" in section
-    assert "10800" in section
+    assert "same execution request" in section
+    assert "same `execution_deadline`" in section
+    assert "original `execution_seconds`" in section
+    assert re.search(r"start\s+and checkpoints across every round", section)
     assert "does not act on them yet" not in section
 
 

@@ -899,7 +899,7 @@ fn both_default_passes_stay_within_the_line_budget_against_a_fake_cluster() {
             "PATCH",
             "/agents/agent-fixture",
             "execution_deadline_seconds",
-            json!(3600),
+            json!(10800),
         ),
         (
             "PATCH",

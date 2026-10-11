@@ -34,8 +34,10 @@ reviewer subagents check it on a stronger model. The skill walks nine phases:
    successfully; an unreadable checks result or one that never settles ends
    it unverified or timed out instead.
 
-The skill budgets its own time against the platform's 10800 second (3 hour)
-execution bound and treats the issue text and repository files as untrusted data.
+The skill paces its work from `execution_deadline` and `execution_seconds`
+returned by the mandatory `mcp__curie__get_issue` read, and treats the issue
+text and repository files as untrusted data. The maximum execution duration is
+10800 seconds; an unconfigured execution deadline remains 1800 seconds.
 Running the repository's tests is an instruction in this skill. The platform
 does not enforce it, and a different bundle can choose differently.
 
@@ -123,7 +125,9 @@ out-of-credits cause and the review is not retried.
   WorkItem's issue, reads the issue and its comments with the GitHub App
   installation token (minted fresh per read, so runs longer than one hour
   keep reading), and returns the title, body, state, author and comments
-  verbatim. It stores nothing. The sandbox holds no GitHub credential at all.
+  verbatim, along with the execution's absolute UTC `execution_deadline` and
+  total duration in seconds as `execution_seconds`. It stores nothing. The
+  sandbox holds no GitHub credential at all.
   A failed or capped review ends the reply with `Could not complete:` and the
   unresolved findings, and the platform's factory status comment on the issue
   carries that result.
@@ -149,9 +153,11 @@ toolchains, for linux/amd64 and linux/arm64) in `connectors.lock.yaml`, so the
 deploy below builds nothing. A CLI built from source has no published layer,
 says so, and names the `curie build` that builds one instead.
 
-Then enable the model and intake. The skill plans for a 3 hour run. The chart
-worker budget and runner ceiling already default to 10800. The execution
-deadline still defaults to 1800, so it needs an override.
+Then enable the model and intake. This recipe selects the maximum execution
+duration of 10800 seconds. The chart worker budget and runner ceiling already
+default to 10800. The execution deadline remains 1800 seconds when unconfigured,
+so this recipe needs an override. The skill paces itself from the configured
+deadline returned by `get_issue`.
 
 ```bash
 # The factory's default model: GLM 5.3 Flash through OpenRouter. The

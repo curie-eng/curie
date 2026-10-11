@@ -22,7 +22,7 @@ use crate::ui::DryRunPlan;
 pub const DEFAULT_KIND_NAME: &str = "curie-factory";
 pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
 pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-5-5";
-pub const DEFAULT_DEADLINE_SECONDS: u32 = 3600;
+pub const DEFAULT_DEADLINE_SECONDS: u32 = 10800;
 pub const DEFAULT_BUDGET_USD: f64 = 5.0;
 pub const AGENT_NAME: &str = "dark-factory";
 pub const GVISOR_OFF_SET: &str = "security.gvisor.mode=off";
@@ -1995,7 +1995,7 @@ mod tests {
         assert!(text.contains("--env prod"), "{text}");
         assert!(text.contains("--repo acme/widgets"), "{text}");
         assert!(text.contains("--add github=acme/widgets"), "{text}");
-        assert!(text.contains("--execution-deadline 3600"), "{text}");
+        assert!(text.contains("--execution-deadline 10800"), "{text}");
         assert!(text.contains("--policy auto"), "{text}");
         assert!(text.contains("--limit 5"), "{text}");
         assert!(text.contains("use CURIE_CREDENTIALS (no prompt)"), "{text}");
