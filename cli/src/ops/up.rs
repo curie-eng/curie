@@ -3322,6 +3322,14 @@ const GVISOR_MODE_KEY: &str = "security.gvisor.mode";
 /// desynchronises the guard from what helm actually renders.
 const ALLOW_DEV_DEFAULTS_KEY: &str = "security.allowDevDefaults";
 
+fn controller_deploy_enabled(plan: &UpValuePlan) -> bool {
+    // Missing overrides keep the shipped chart's enabled default.
+    plan.effective_values()
+        .get(CONTROLLER_DEPLOY_KEY)
+        .map(String::as_str)
+        != Some("false")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClusterUpInference {
     Provider {
@@ -5585,9 +5593,10 @@ async fn run_prepared_up(
     // label namespace <missing>`. Mirror the resolve_generated_secrets
     // existing/fresh split: both runtime probes live here in the executor, the
     // argv stays in the pure `ownership_label_commands` builder. `--dry-run`
-    // stays offline and previews the fresh-install stamp for every candidate
-    // (existed == false), never touching the cluster and never running the
-    // post-install probe.
+    // stays offline and previews the fresh-install stamp for the primary
+    // namespace and, when controller deployment is enabled, the shared namespace
+    // (existed == false), never touching the cluster or running the post-install
+    // probe.
     let mut owned_namespaces = vec![opts.common.namespace.clone()];
     if opts.common.namespace != "agent-sandbox-system" {
         owned_namespaces.push("agent-sandbox-system".to_string());
@@ -5603,7 +5612,9 @@ async fn run_prepared_up(
         } else {
             namespace_exists(&ns).await?
         };
-        if opts.common.dry_run {
+        if opts.common.dry_run
+            && (ns == opts.common.namespace || controller_deploy_enabled(&value_plan))
+        {
             // existed_before is provably false on this branch (set above).
             let common = ns_common(&opts.common, &ns, true);
             cmds.extend(ownership_label_commands(
@@ -5680,11 +5691,7 @@ async fn run_prepared_up(
     } else {
         preflight_priority_class_ownership(&opts, &value_plan).await?;
     }
-    let observe_controller = value_plan
-        .effective_values()
-        .get(CONTROLLER_DEPLOY_KEY)
-        .map(String::as_str)
-        != Some("false");
+    let observe_controller = controller_deploy_enabled(&value_plan);
     let admission_namespaces: Vec<_> = ownership_candidates
         .iter()
         .filter(|(namespace, _)| {

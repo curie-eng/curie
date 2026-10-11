@@ -437,6 +437,174 @@ fn assert_inference_once(shown: &str, applied_override: &str) {
 }
 
 #[test]
+fn cluster_up_dry_run_ownership_respects_effective_controller_deploy() {
+    let helm = Command::new("sh")
+        .args(["-c", "command -v helm"])
+        .output()
+        .expect("locate real Helm");
+    assert!(
+        helm.status.success(),
+        "real Helm is required for dry-run values-file parsing"
+    );
+    let real_helm = String::from_utf8(helm.stdout).expect("Helm path is UTF 8");
+    let defaults: Value = serde_norway::from_str(
+        &fs::read_to_string(Path::new(chart()).join("values.yaml"))
+            .expect("read shipped chart defaults"),
+    )
+    .expect("parse shipped chart defaults");
+    assert_eq!(
+        defaults.pointer("/agentSandbox/controller/deploy"),
+        Some(&Value::Bool(true)),
+        "the absent override case requires the shipped controller default"
+    );
+
+    type Scenario<'a> = (&'a str, &'a [bool], &'a [&'a str], bool, &'a str);
+    let scenarios: &[Scenario<'_>] = &[
+        ("shipped default", &[], &[], true, TARGET_NAMESPACE),
+        (
+            "typed false",
+            &[],
+            &["--set", "agentSandbox.controller.deploy=false"],
+            false,
+            TARGET_NAMESPACE,
+        ),
+        ("file false", &[false], &[], false, TARGET_NAMESPACE),
+        (
+            "file false overridden true",
+            &[false],
+            &["--set", "agentSandbox.controller.deploy=true"],
+            true,
+            TARGET_NAMESPACE,
+        ),
+        (
+            "file true overridden false",
+            &[true],
+            &["--set", "agentSandbox.controller.deploy=false"],
+            false,
+            TARGET_NAMESPACE,
+        ),
+        (
+            "later file enables",
+            &[false, true],
+            &[],
+            true,
+            TARGET_NAMESPACE,
+        ),
+        (
+            "later file disables",
+            &[true, false],
+            &[],
+            false,
+            TARGET_NAMESPACE,
+        ),
+    ];
+
+    for (name, file_values, flags, controller_enabled, primary) in scenarios {
+        let fixture = Fixture::new("");
+        // Values files use real Helm's offline parser. Refuse every cluster
+        // operation, including read-only release or Kubernetes probes.
+        test_executable::install_in(
+            &fixture.bin_dir,
+            "helm",
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CURIE_TEST_HELM_LOG"
+if [ "$1" = "template" ] && [ "${2:-}" = "curie-values-lint" ]; then
+    exec "$CURIE_TEST_REAL_HELM" "$@"
+fi
+printf 'dry run attempted a Helm cluster operation\n' >&2
+exit 64
+"#,
+        );
+        test_executable::install_in(
+            &fixture.bin_dir,
+            "kubectl",
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "$CURIE_TEST_KUBECTL_LOG"
+printf 'dry run invoked kubectl\n' >&2
+exit 64
+"#,
+        );
+        let mut extra = vec!["--dry-run".to_owned(), "--json".to_owned()];
+        for (index, enabled) in file_values.iter().enumerate() {
+            let path = fixture
+                ._temp
+                .path()
+                .join(format!("controller-{index}.yaml"));
+            fs::write(
+                &path,
+                format!("agentSandbox:\n  controller:\n    deploy: {enabled}\n"),
+            )
+            .expect("write controller values file");
+            extra.push("--values-file".to_owned());
+            extra.push(path.to_str().expect("values path is UTF 8").to_owned());
+        }
+        extra.extend(flags.iter().map(|flag| (*flag).to_owned()));
+        let extra: Vec<_> = extra.iter().map(String::as_str).collect();
+        let kubeconfig = fixture._temp.path().join("absent-kubeconfig");
+        let output = fixture.run(
+            &[
+                ("CURIE_TEST_REAL_HELM", real_helm.trim()),
+                (
+                    "KUBECONFIG",
+                    kubeconfig.to_str().expect("kubeconfig is UTF 8"),
+                ),
+            ],
+            VALID_RESOLVER,
+            &extra,
+        );
+        let shown = all_output(&output);
+        assert!(output.status.success(), "{name}: {shown}");
+        let helm_calls = fixture.helm_log();
+        assert!(
+            helm_calls
+                .lines()
+                .all(|line| line.starts_with("template curie-values-lint ")),
+            "{name}: Helm attempted a cluster operation: {helm_calls}"
+        );
+        if !file_values.is_empty() {
+            assert!(
+                !helm_calls.is_empty(),
+                "{name}: values files must be parsed by real Helm"
+            );
+        }
+        assert!(
+            fixture.kubectl_log().is_empty(),
+            "{name}: kubectl was invoked"
+        );
+        let json: Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{name}: invalid dry-run JSON ({error}): {shown}"));
+        assert_eq!(json["dry_run"], true, "{name}: {json}");
+        let plan: Vec<_> = json["plan"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}: no dry-run plan: {json}"))
+            .iter()
+            .map(|line| line.as_str().expect("plan line is a string"))
+            .collect();
+        let primary_stamp = format!(
+            "kubectl label namespace {primary} curietech.ai/created-by={TARGET_RELEASE} curietech.ai/created-in={primary} --overwrite"
+        );
+        assert_eq!(
+            plan.iter().filter(|line| **line == primary_stamp).count(),
+            1,
+            "{name}: primary ownership must be planned exactly once: {plan:?}"
+        );
+        let shared_writes: Vec<_> = plan
+            .iter()
+            .filter(|line| {
+                line.contains("label namespace agent-sandbox-system ")
+                    || line.contains("annotate namespace agent-sandbox-system ")
+            })
+            .collect();
+        let shared_expected = *controller_enabled || *primary == "agent-sandbox-system";
+        assert_eq!(
+            shared_writes.len(),
+            usize::from(shared_expected),
+            "{name}: shared ownership must follow the effective controller decision and primary namespace: {plan:?}"
+        );
+    }
+}
+
+#[test]
 fn recognized_credential_prefixes_infer_provider_egress() {
     for (credential, provider, cidr) in [
         (ANTHROPIC_CREDENTIAL, "anthropic", "8.8.8.8/32"),
