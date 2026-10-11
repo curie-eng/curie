@@ -45,6 +45,7 @@ from claude_agent_sdk import (
 )
 from claude_agent_sdk._cli_version import __cli_version__
 from claude_agent_sdk._internal.session_store import project_key_for_directory
+from claude_agent_sdk._internal.transport.subprocess_cli import _DEFAULT_MAX_BUFFER_SIZE
 from claude_agent_sdk.types import (
     CanUseTool,
     McpSdkServerConfig,
@@ -63,6 +64,7 @@ from .history import (
     validate_assistant_groups,
 )
 from .mcp_argv import install as install_mcp_argv_offload
+from .startup_diagnostics import StderrTail, sdk_initialize_diagnostics
 
 install_mcp_argv_offload()
 
@@ -654,8 +656,19 @@ class ClaudeAgentSession:
     """ModelSession backed by a real claude-agent-sdk streaming-input session."""
 
     def __init__(self, options: ClaudeAgentOptions) -> None:
-        self._options = options
-        self._client = ClaudeSDKClient(options)
+        # Install the stderr tail before the client exists: the SDK copies
+        # options at connect and its transport keeps that copy, so the tail
+        # must already be on every copy to keep forwarding after connect.
+        self._stderr_tail = StderrTail(
+            options.stderr,
+            partial_line_chars=(
+                options.max_buffer_size
+                if options.max_buffer_size is not None
+                else _DEFAULT_MAX_BUFFER_SIZE
+            ),
+        )
+        self._options = replace(options, stderr=self._stderr_tail)
+        self._client = ClaudeSDKClient(self._options)
 
     async def connect(self) -> None:
         # The SDK copies os.environ into the CLI at spawn. Install the parent
@@ -678,13 +691,16 @@ class ClaudeAgentSession:
         # SDK options override inherited env at spawn. Pin authority last in
         # both maps so options cannot select an unsanitized shell/interpreter.
         self._options.env.update(sdk_shell_env())
-        try:
-            os.environ.clear()
-            os.environ.update(cli_parent_env(snapshot))
-            await self._client.connect()
-        finally:
-            os.environ.clear()
-            os.environ.update(snapshot)
+        # The env restore runs inside the diagnostics window, so the finish
+        # record is written only after the process env is the snapshot again.
+        with sdk_initialize_diagnostics(self._stderr_tail):
+            try:
+                os.environ.clear()
+                os.environ.update(cli_parent_env(snapshot))
+                await self._client.connect()
+            finally:
+                os.environ.clear()
+                os.environ.update(snapshot)
 
     async def query(self, text: str) -> None:
         await self._client.query(text)
