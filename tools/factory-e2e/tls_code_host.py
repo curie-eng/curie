@@ -574,6 +574,7 @@ def judge_tls_code_host(obs: Mapping[str, Any]) -> list[str]:
     if status != "succeeded":
         reason = (
             f"its publication record is {status!r}"
+            + (f" ({record['error']})" if record.get("error") else "")
             if record
             else "no publication record exists for the request"
         )
@@ -1049,7 +1050,9 @@ class TlsCodeHostRun:
             return
         try:
             rows = self.p.sql(
-                "SELECT id, status, execution_request_id FROM publications "
+                "SELECT id, status, execution_request_id, "
+                "left(translate(coalesce(error, ''), E'\\t\\n\\r', '   '), 500) "
+                "FROM publications "
                 f"WHERE execution_request_id = '{uuid.UUID(self.request_id)}' "
                 "ORDER BY created_at DESC LIMIT 1"
             )
@@ -1058,11 +1061,12 @@ class TlsCodeHostRun:
             return
         if len(rows) != 1:
             return
-        publication_id, status, request_id = (rows[0] + ["", "", ""])[:3]
+        publication_id, status, request_id, error = (rows[0] + ["", "", "", ""])[:4]
         record = {
             "id": publication_id,
             "status": status,
             "execution_request_id": request_id or None,
+            "error": error or None,
         }
         if record != self.publication_record:
             self._timeline("publication record", status=status)

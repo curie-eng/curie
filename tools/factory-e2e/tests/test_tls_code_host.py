@@ -989,6 +989,7 @@ def test_a_job_never_polled_still_passes_on_a_succeeded_record(
         "id": PUBLICATION_ID,
         "status": "succeeded",
         "execution_request_id": "6f1c3a52-0000-4000-8000-000000000002",
+        "error": None,
     }
     assert tls_code_host.judge_tls_code_host(_collected_obs(run)) == []
 
@@ -1047,3 +1048,14 @@ def test_a_closed_job_watch_is_restarted_and_appends(
     assert text.count('"ADDED"') == 2, "the restart truncated the earlier events"
     run._capture_publication_job()
     assert run.publication_job is not None
+
+
+def test_judge_names_the_publication_error_when_it_failed() -> None:
+    obs = _passing()
+    obs["publication_record"] = {
+        **obs["publication_record"],
+        "status": "failed",
+        "error": "push refused: example reason",
+    }
+    failures = tls_code_host.judge_tls_code_host(obs)
+    assert any("'failed' (push refused: example reason)" in f for f in failures), failures
