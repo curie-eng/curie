@@ -23,7 +23,7 @@ use curie::factory_quickstart::{
 
 fn plan_input() -> PlanInput {
     PlanInput {
-        repo: "acme/widgets".into(),
+        repos: vec!["acme/widgets".into()],
         app_id: None,
         private_key_file: None,
         explicit_context: None,

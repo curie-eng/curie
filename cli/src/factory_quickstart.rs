@@ -35,7 +35,7 @@ pub const RUN_CREDIT_USD: f64 = 5.0;
 
 #[derive(Debug, Clone)]
 pub struct QuickstartOpts {
-    pub repo: String,
+    pub repos: Vec<String>,
     pub app_id: Option<String>,
     pub private_key_file: Option<PathBuf>,
     pub context: Option<String>,
@@ -52,7 +52,7 @@ pub struct QuickstartOpts {
 
 #[derive(Debug, Clone)]
 pub struct PlanInput {
-    pub repo: String,
+    pub repos: Vec<String>,
     pub app_id: Option<String>,
     pub private_key_file: Option<String>,
     pub explicit_context: Option<String>,
@@ -97,7 +97,7 @@ pub enum Action {
     },
     Register {
         org: Option<String>,
-        repo: String,
+        repos: Vec<String>,
         context: String,
         namespace: String,
         release: String,
@@ -108,7 +108,7 @@ pub enum Action {
         context: String,
         namespace: String,
         release: String,
-        repo: String,
+        repos: Vec<String>,
         deadline_seconds: u32,
         budget_usd: f64,
     },
@@ -297,6 +297,40 @@ pub fn validate_repo(repo: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validates the quickstart repository list: at least one entry, each
+/// owner/name, and no repository named twice (GitHub names are case
+/// insensitive).
+pub fn validate_repos(repos: &[String]) -> Result<()> {
+    if repos.is_empty() {
+        return Err(CliError::usage("--repo names no repository")
+            .with_fix("pass the GitHub repositories as owner/name, for example --repo acme/widgets")
+            .into());
+    }
+    let mut seen: Vec<String> = Vec::with_capacity(repos.len());
+    for repo in repos {
+        validate_repo(repo)?;
+        let key = repo.to_ascii_lowercase();
+        if seen.contains(&key) {
+            return Err(
+                CliError::usage(format!("--repo names {repo:?} more than once"))
+                    .with_fix("list each GitHub repository once in --repo")
+                    .into(),
+            );
+        }
+        seen.push(key);
+    }
+    Ok(())
+}
+
+/// "a/x", "a/x and b/y", "a/x, b/y and c/z".
+fn repos_prose(repos: &[String]) -> String {
+    match repos {
+        [] => String::new(),
+        [only] => only.clone(),
+        [head @ .., last] => format!("{} and {last}", head.join(", ")),
+    }
+}
+
 pub fn validate_model_credential(key: &str) -> Result<()> {
     if ["sk-or-", "sk-ant-"]
         .iter()
@@ -341,7 +375,7 @@ pub fn credential_decision(
 }
 
 pub struct RerunTarget<'a> {
-    pub repo: &'a str,
+    pub repos: &'a [String],
     pub context: &'a str,
     pub namespace: &'a str,
     pub release: &'a str,
@@ -352,7 +386,8 @@ pub struct RerunTarget<'a> {
 pub fn registration_steps(target: &RerunTarget<'_>) -> Vec<String> {
     let mut rerun = format!(
         "Rerun: curie factory quickstart --repo {} --context {}",
-        target.repo, target.context
+        target.repos.join(","),
+        target.context
     );
     for (flag, value, default) in [
         ("--namespace", target.namespace, "curie"),
@@ -370,7 +405,10 @@ pub fn registration_steps(target: &RerunTarget<'_>) -> Vec<String> {
     vec![
         "Open the link and click Create GitHub App. The name, permissions, and the disabled webhook are already filled in.".to_string(),
         "On the App settings page, note the App ID and click Generate a private key to download the .pem file.".to_string(),
-        format!("Click Install App and install it on {}.", target.repo),
+        format!(
+            "Click Install App and install it on {}.",
+            repos_prose(target.repos)
+        ),
         rerun,
     ]
 }
@@ -468,7 +506,7 @@ pub fn release_has_real_model(values: &serde_json::Value) -> bool {
 }
 
 pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
-    validate_repo(&input.repo)?;
+    validate_repos(&input.repos)?;
     let finishing = match (&input.app_id, &input.private_key_file) {
         (None, None) => false,
         (Some(id), Some(path)) => {
@@ -598,14 +636,14 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
             context: context.clone(),
             namespace: input.namespace.clone(),
             release: input.release.clone(),
-            repo: input.repo.clone(),
+            repos: input.repos.clone(),
             deadline_seconds: input.execution_deadline_seconds,
             budget_usd: input.budget_usd,
         });
     } else {
         actions.push(Action::Register {
             org: input.org.clone(),
-            repo: input.repo.clone(),
+            repos: input.repos.clone(),
             context: context.clone(),
             namespace: input.namespace.clone(),
             release: input.release.clone(),
@@ -642,7 +680,7 @@ fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIntakeOpts {
             dry_run: false,
         },
         chart: input.chart.clone(),
-        repos: vec![input.repo.clone()],
+        repos: input.repos.clone(),
         label: None,
         mention: None,
         card_base_url: None,
@@ -707,7 +745,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
             }
             Action::Register {
                 org,
-                repo,
+                repos,
                 context,
                 namespace,
                 release,
@@ -718,10 +756,11 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     .map(|org| format!(" for organization {org}"))
                     .unwrap_or_default();
                 lines.push(format!(
-                    "print the GitHub App registration link{org_note} and the rerun steps for {repo}; apply no intake"
+                    "print the GitHub App registration link{org_note} and the rerun steps for {}; apply no intake",
+                    repos_prose(repos)
                 ));
                 lines.extend(registration_steps(&RerunTarget {
-                    repo,
+                    repos,
                     context,
                     namespace,
                     release,
@@ -749,22 +788,17 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 context,
                 namespace,
                 release,
-                repo,
+                repos,
                 deadline_seconds,
                 budget_usd,
             } => {
-                let dir = bundle_dir(namespace, release);
                 lines.push(format!(
                     "render the dark factory and deploy the published {} image",
                     crate::examples::DARK_FACTORY_RUNNER_REPOSITORY
                 ));
-                lines.push(format!(
-                    "curie cluster deploy --context {context} --namespace {namespace} --release {release} --plugin-dir {} --agent {AGENT_NAME} --env prod --repo {repo}",
-                    dir.display()
-                ));
-                lines.push(format!(
-                    "curie cluster surfaces {AGENT_NAME} --context {context} --namespace {namespace} --release {release} --add github={repo}"
-                ));
+                for args in deploy_args(context, namespace, release, repos) {
+                    lines.push(format!("curie {}", args.join(" ")));
+                }
                 lines.push(format!(
                     "curie cluster overrides {AGENT_NAME} --context {context} --namespace {namespace} --release {release} --execution-deadline {deadline_seconds}"
                 ));
@@ -933,6 +967,9 @@ async fn release_matches_quickstart_target(
 }
 
 pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
+    // Reject a bad repository list before any prerequisite check, network
+    // preflight, or kube context pin.
+    validate_repos(&opts.repos)?;
     let current = if opts.context.is_some() {
         None
     } else {
@@ -949,8 +986,7 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     if !opts.dry_run {
         match (&opts.app_id, &opts.private_key_file) {
             (Some(id), Some(file)) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => {
-                crate::factory_toolchain::preflight(id, file, std::slice::from_ref(&opts.repo))
-                    .await?;
+                crate::factory_toolchain::preflight(id, file, &opts.repos).await?;
             }
             (None, None) => {}
             _ => {
@@ -1015,7 +1051,7 @@ pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
         _ => (false, model),
     };
     let planned = quickstart_plan(&PlanInput {
-        repo: opts.repo.clone(),
+        repos: opts.repos.clone(),
         app_id: opts.app_id.clone(),
         private_key_file: opts
             .private_key_file
@@ -1134,7 +1170,7 @@ async fn execute(
             }
             Action::Register {
                 org,
-                repo,
+                repos,
                 context,
                 namespace,
                 release,
@@ -1144,7 +1180,7 @@ async fn execute(
                 let name = crate::factory_app::random_app_name();
                 let url = crate::factory_app::registration_url(org.as_deref(), &name);
                 let steps = registration_steps(&RerunTarget {
-                    repo,
+                    repos,
                     context,
                     namespace,
                     release,
@@ -1196,35 +1232,7 @@ async fn execute(
                         fix.as_deref(),
                     ));
                 }
-                let mut args = vec![
-                    "cluster".into(),
-                    "factory".into(),
-                    "--context".into(),
-                    planned.context.clone(),
-                    "--namespace".into(),
-                    intake.common.namespace.clone(),
-                    "--release".into(),
-                    intake.common.release.clone(),
-                    "--chart".into(),
-                    intake.chart.clone(),
-                    "--repo".into(),
-                    intake.repos.join(","),
-                    "--intake".into(),
-                    POLL_INTAKE.into(),
-                    "--app-id".into(),
-                    intake.app_id.clone().unwrap_or_default(),
-                    "--private-key-file".into(),
-                    intake
-                        .private_key_file
-                        .as_ref()
-                        .map(|path| path.display().to_string())
-                        .unwrap_or_default(),
-                ];
-                if let Some(org) = &intake.org {
-                    args.extend(["--org".into(), org.clone()]);
-                }
-                args.push("--runner-image".into());
-                args.push(format!("{AGENT_NAME}={image}"));
+                let args = intake_args(&planned.context, intake, &image);
                 intake_json = run_self(&args, "Configuring factory intake").await?;
                 if intake_json.get("github_app").is_none() {
                     return Err(step_error(
@@ -1243,7 +1251,7 @@ async fn execute(
                 context,
                 namespace,
                 release,
-                repo,
+                repos,
                 deadline_seconds,
                 budget_usd,
             } => {
@@ -1266,39 +1274,18 @@ async fn execute(
                             })?
                     }
                 };
-                run_self(
-                    &[
-                        "cluster".into(),
-                        "deploy".into(),
-                        "--context".into(),
-                        context.clone(),
-                        "--namespace".into(),
-                        namespace.clone(),
-                        "--release".into(),
-                        release.clone(),
-                        "--plugin-dir".into(),
-                        dir.display().to_string(),
-                        "--agent".into(),
-                        AGENT_NAME.into(),
-                        "--env".into(),
-                        "prod".into(),
-                        "--repo".into(),
-                        repo.clone(),
-                    ],
-                    "Deploying dark factory",
-                )
-                .await?;
-                run_self(
-                    &cluster_agent(
-                        "surfaces",
-                        context,
-                        namespace,
-                        release,
-                        &["--add".into(), format!("github={repo}")],
-                    ),
-                    "Binding GitHub repository",
-                )
-                .await?;
+                // `deploy_args` puts the deploy first, then one binding per repository.
+                for (index, args) in deploy_args(context, namespace, release, repos)
+                    .into_iter()
+                    .enumerate()
+                {
+                    let step = if index == 0 {
+                        "Deploying dark factory"
+                    } else {
+                        "Binding GitHub repository"
+                    };
+                    run_self(&args, step).await?;
+                }
                 run_self(
                     &cluster_agent(
                         "overrides",
@@ -1338,7 +1325,7 @@ async fn execute(
                     .unwrap_or(serde_json::Value::Null);
                 return Ok(QuickstartOutput::Ready {
                     context: context.clone(),
-                    repo: repo.clone(),
+                    repo: repos.join(","),
                     intake: POLL_INTAKE.into(),
                     app_id: app
                         .get("app_id")
@@ -1387,6 +1374,85 @@ async fn execute(
         }
     }
     Err(CliError::failure("quickstart plan produced no result").into())
+}
+
+/// The `cluster factory` argv quickstart runs for intake. That command's
+/// `--repo` is repeatable and not comma split, so each repository gets its own
+/// flag.
+pub fn intake_args(context: &str, intake: &FactoryIntakeOpts, image: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "cluster".into(),
+        "factory".into(),
+        "--context".into(),
+        context.into(),
+        "--namespace".into(),
+        intake.common.namespace.clone(),
+        "--release".into(),
+        intake.common.release.clone(),
+        "--chart".into(),
+        intake.chart.clone(),
+    ];
+    for repo in &intake.repos {
+        args.extend(["--repo".into(), repo.clone()]);
+    }
+    args.extend([
+        "--intake".into(),
+        POLL_INTAKE.into(),
+        "--app-id".into(),
+        intake.app_id.clone().unwrap_or_default(),
+        "--private-key-file".into(),
+        intake
+            .private_key_file
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    ]);
+    if let Some(org) = &intake.org {
+        args.extend(["--org".into(), org.clone()]);
+    }
+    args.push("--runner-image".into());
+    args.push(format!("{AGENT_NAME}={image}"));
+    args
+}
+
+/// The deploy argvs, in order: `cluster deploy` with the first repository as
+/// the agent's git-flow repository, then one GitHub surface binding per
+/// repository so the one agent serves each.
+pub fn deploy_args(
+    context: &str,
+    namespace: &str,
+    release: &str,
+    repos: &[String],
+) -> Vec<Vec<String>> {
+    let first = repos.first().cloned().unwrap_or_default();
+    let mut argvs = vec![vec![
+        "cluster".into(),
+        "deploy".into(),
+        "--context".into(),
+        context.into(),
+        "--namespace".into(),
+        namespace.into(),
+        "--release".into(),
+        release.into(),
+        "--plugin-dir".into(),
+        bundle_dir(namespace, release).display().to_string(),
+        "--agent".into(),
+        AGENT_NAME.into(),
+        "--env".into(),
+        "prod".into(),
+        "--repo".into(),
+        first,
+    ]];
+    for repo in repos {
+        argvs.push(cluster_agent(
+            "surfaces",
+            context,
+            namespace,
+            release,
+            &["--add".into(), format!("github={repo}")],
+        ));
+    }
+    argvs
 }
 
 /// The key whose OpenRouter credit to check. An explicit key wins because
@@ -1739,7 +1805,7 @@ mod tests {
 
     fn base() -> PlanInput {
         PlanInput {
-            repo: "acme/widgets".into(),
+            repos: vec!["acme/widgets".to_string()],
             app_id: None,
             private_key_file: None,
             explicit_context: None,
@@ -2006,7 +2072,7 @@ mod tests {
     #[test]
     fn registration_steps_name_the_rerun_and_no_browser_tool() {
         let steps = registration_steps(&RerunTarget {
-            repo: "acme/widgets",
+            repos: &["acme/widgets".to_string()],
             context: "kind-curie-factory",
             namespace: "factory-ns",
             release: "factory",
@@ -2085,9 +2151,9 @@ mod tests {
     #[test]
     fn a_malformed_repo_or_half_an_app_pair_is_refused() {
         let mut input = base();
-        input.repo = "acme".into();
+        input.repos = vec!["acme".to_string()];
         assert!(quickstart_plan(&input).is_err());
-        input.repo = "acme/widgets".into();
+        input.repos = vec!["acme/widgets".to_string()];
         input.app_id = Some("12".into());
         assert!(quickstart_plan(&input).is_err());
         input.private_key_file = Some("/tmp/app.pem".into());
@@ -2104,5 +2170,262 @@ mod tests {
             &serde_json::json!({"agentSandbox": {"runner": {"fakeModel": true}}})
         ));
         assert!(!release_has_real_model(&serde_json::json!({})));
+    }
+
+    fn multi_repo_input() -> PlanInput {
+        let mut input = base();
+        input.repos = vec!["a/x".to_string(), "b/y".to_string()];
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.explicit_context = Some("kind-curie-factory".into());
+        input.credential_in_env = true;
+        input
+    }
+
+    #[test]
+    fn quickstart_multi_repo_plan_intakes_both_deploys_first_and_binds_each() {
+        let planned = quickstart_plan(&multi_repo_input()).unwrap();
+        let both = vec!["a/x".to_string(), "b/y".to_string()];
+        assert!(planned
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Intake(opts) if opts.repos == both)));
+        assert!(planned
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Deploy { repos, .. } if *repos == both)));
+        let lines = describe(&planned);
+        let text = lines.join("\n");
+        let deploy: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with("curie cluster deploy "))
+            .collect();
+        assert_eq!(deploy.len(), 1, "{text}");
+        assert!(
+            deploy[0].ends_with("--env prod --repo a/x"),
+            "{}",
+            deploy[0]
+        );
+        assert!(!deploy[0].contains("b/y"), "{}", deploy[0]);
+        let surfaces: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with("curie cluster surfaces "))
+            .collect();
+        assert_eq!(surfaces.len(), 2, "{text}");
+        assert!(surfaces[0].ends_with("--add github=a/x"), "{}", surfaces[0]);
+        assert!(surfaces[1].ends_with("--add github=b/y"), "{}", surfaces[1]);
+        assert!(
+            text.contains("factory intake api.githubFactoryIntake=poll for a/x,b/y with"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn quickstart_multi_repo_single_repo_plan_is_unchanged() {
+        let mut input = base();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.explicit_context = Some("kind-curie-factory".into());
+        input.credential_in_env = true;
+        let lines = describe(&quickstart_plan(&input).unwrap());
+        let dir = bundle_dir("curie", "curie");
+        // The complete ordered plan the pre-#4346 code printed for this input.
+        let expected: Vec<String> = vec![
+            crate::factory_toolchain::PLAN_NOTE.to_string(),
+            "Kubernetes context: kind-curie-factory because --context was passed".to_string(),
+            "model credential: use CURIE_CREDENTIALS (no prompt)".to_string(),
+            "kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1".to_string(),
+            "curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off".to_string(),
+            "configure factory intake api.githubFactoryIntake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
+            "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
+            format!("curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
+            "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),
+            "curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 3600".to_string(),
+            "curie cluster publication-policy dark-factory --context kind-curie-factory --namespace curie --release curie --policy auto".to_string(),
+            "curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5".to_string(),
+        ];
+        assert_eq!(lines, expected);
+        let ready = QuickstartOutput::Ready {
+            context: "kind-curie-factory".into(),
+            repo: "acme/widgets".into(),
+            intake: POLL_INTAKE.into(),
+            app_id: "12345".into(),
+            slug: "acme-factory".into(),
+            mention: "@acme-factory".into(),
+            mention_inferred: true,
+            repos: vec!["acme/widgets".to_string()],
+            label: "factory".into(),
+            label_inferred: true,
+            runner_image: "runner:dev".into(),
+            agent: AGENT_NAME.into(),
+            deadline_seconds: DEFAULT_DEADLINE_SECONDS,
+            budget_usd: DEFAULT_BUDGET_USD,
+            credit_remaining_usd: None,
+        };
+        let json = crate::ui::CliOutput::to_json(&ready);
+        assert_eq!(json["repo"], "acme/widgets");
+        assert_eq!(
+            json["github_app"]["repos"],
+            serde_json::json!(["acme/widgets"])
+        );
+        let steps = registration_steps(&RerunTarget {
+            repos: &["acme/widgets".to_string()],
+            context: "kind-curie-factory",
+            namespace: "curie",
+            release: "curie",
+            model: DEFAULT_MODEL,
+            org: None,
+        });
+        assert_eq!(
+            steps[2],
+            "Click Install App and install it on acme/widgets."
+        );
+        assert_eq!(
+            steps[3],
+            "Rerun: curie factory quickstart --repo acme/widgets --context kind-curie-factory --app-id <APP_ID> --private-key-file <PATH.pem>"
+        );
+    }
+
+    #[test]
+    fn quickstart_multi_repo_rejects_a_duplicate_and_an_invalid_entry() {
+        let mut input = base();
+        input.repos = vec!["a/x".to_string(), "A/X".to_string()];
+        let err = quickstart_plan(&input).unwrap_err();
+        let shown = format!("{err:#}");
+        assert!(shown.contains("A/X"), "{shown}");
+        input.repos = vec!["a/x".to_string(), "b/y".to_string(), "a/x".to_string()];
+        let shown = format!("{:#}", quickstart_plan(&input).unwrap_err());
+        assert!(shown.contains("a/x"), "{shown}");
+        for bad in [
+            vec!["a/x".to_string(), "bogus".to_string()],
+            vec!["a/x".to_string(), String::new()],
+            vec!["a/x".to_string(), "b/y/z".to_string()],
+            Vec::new(),
+        ] {
+            input.repos = bad.clone();
+            assert!(quickstart_plan(&input).is_err(), "{bad:?}");
+        }
+        // A trailing comma in `--repo a/x,` reaches the plan as an empty entry.
+        input.repos = "a/x,".split(',').map(str::to_string).collect();
+        assert!(quickstart_plan(&input).is_err());
+        // Two distinct repositories still plan.
+        input.repos = vec!["a/x".to_string(), "b/y".to_string()];
+        assert!(quickstart_plan(&input).is_ok());
+    }
+
+    #[test]
+    fn quickstart_multi_repo_intake_passes_one_repo_flag_per_entry() {
+        let planned = quickstart_plan(&multi_repo_input()).unwrap();
+        let intake = planned
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Intake(opts) => Some(opts),
+                _ => None,
+            })
+            .expect("intake action");
+        let args = intake_args("kind-curie-factory", intake, "ghcr.io/x/runner:1");
+        let repo_values: Vec<&str> = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "--repo")
+            .map(|(i, _)| args[i + 1].as_str())
+            .collect();
+        assert_eq!(repo_values, ["a/x", "b/y"], "{args:?}");
+        assert!(!args.iter().any(|a| a.contains(',')), "{args:?}");
+        assert_eq!(&args[..2], ["cluster", "factory"]);
+        let pos = |flag: &str| args.iter().position(|a| a == flag).unwrap();
+        assert_eq!(args[pos("--context") + 1], "kind-curie-factory");
+        assert_eq!(args[pos("--intake") + 1], "poll");
+        assert_eq!(args[pos("--app-id") + 1], "12345");
+        assert_eq!(args[pos("--private-key-file") + 1], "/keys/app.pem");
+        assert_eq!(
+            args[pos("--runner-image") + 1],
+            "dark-factory=ghcr.io/x/runner:1"
+        );
+    }
+
+    #[test]
+    fn quickstart_multi_repo_deploy_binds_every_repository_and_deploys_the_first() {
+        let repos = vec!["a/x".to_string(), "b/y".to_string()];
+        let argvs = deploy_args("ctx", "ns", "rel", &repos);
+        assert_eq!(argvs.len(), 3, "{argvs:?}");
+        assert_eq!(&argvs[0][..2], ["cluster", "deploy"]);
+        let repo_flags: Vec<&str> = argvs[0]
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.as_str() == "--repo")
+            .map(|(i, _)| argvs[0][i + 1].as_str())
+            .collect();
+        assert_eq!(repo_flags, ["a/x"], "{:?}", argvs[0]);
+        assert_eq!(argvs[0].last().unwrap(), "a/x");
+        assert!(argvs[0]
+            .windows(2)
+            .any(|w| w == ["--agent", "dark-factory"]));
+        assert!(argvs[0].windows(2).any(|w| w == ["--env", "prod"]));
+        let expected = |repo: &str| {
+            cluster_agent(
+                "surfaces",
+                "ctx",
+                "ns",
+                "rel",
+                &["--add".to_string(), format!("github={repo}")],
+            )
+        };
+        assert_eq!(argvs[1], expected("a/x"));
+        assert_eq!(argvs[2], expected("b/y"));
+        assert_eq!(
+            argvs[1],
+            [
+                "cluster",
+                "surfaces",
+                "dark-factory",
+                "--context",
+                "ctx",
+                "--namespace",
+                "ns",
+                "--release",
+                "rel",
+                "--add",
+                "github=a/x"
+            ]
+        );
+        // One repository keeps one deploy and one surfaces argv.
+        assert_eq!(deploy_args("ctx", "ns", "rel", &repos[..1]).len(), 2);
+    }
+
+    #[test]
+    fn quickstart_multi_repo_registration_names_every_repository() {
+        let repos = vec!["a/x".to_string(), "b/y".to_string()];
+        let steps = registration_steps(&RerunTarget {
+            repos: &repos,
+            context: "kind-curie-factory",
+            namespace: "curie",
+            release: "curie",
+            model: DEFAULT_MODEL,
+            org: None,
+        });
+        let install = steps
+            .iter()
+            .find(|s| s.starts_with("Click Install App"))
+            .unwrap();
+        assert!(
+            install.contains("a/x") && install.contains("b/y"),
+            "{install}"
+        );
+        assert!(install.contains("a/x and b/y"), "{install}");
+        let rerun = steps.iter().find(|s| s.starts_with("Rerun:")).unwrap();
+        assert!(
+            rerun.starts_with(
+                "Rerun: curie factory quickstart --repo a/x,b/y --context kind-curie-factory"
+            ),
+            "{rerun}"
+        );
+        // The first pass (no App id) prints the same through describe().
+        let mut input = base();
+        input.repos = repos;
+        let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
+        assert!(text.contains("--repo a/x,b/y --context"), "{text}");
+        assert!(text.contains("a/x and b/y"), "{text}");
     }
 }
