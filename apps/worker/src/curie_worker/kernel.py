@@ -5807,7 +5807,8 @@ class Kernel:
             # fall into the clause below and answer to the name "runner-error",
             # pointing an operator at a runner that never saw the fault. Retry
             # behavior is deliberately identical (`workspace-error` is
-            # retryable); only the name and the log line change.
+            # retryable); the classification and log identify the fault, and the
+            # terminal diagnostic carries a redacted, bounded reason naming the stage.
             record_reclaimed_retry()
             release_order()
             self._log_workspace_start_failure(
@@ -5818,7 +5819,11 @@ class Kernel:
                 agent_name=agent_name,
                 workspace_deployment_id=workspace_deployment_id,
             )
-            return TurnOutcome(terminal_ok=False, classification="workspace-error")
+            return TurnOutcome(
+                terminal_ok=False,
+                classification="workspace-error",
+                error_message=" ".join(redact_text(str(exc)).split())[:_ESCALATION_DETAIL_MAX],
+            )
         except AttachmentResolutionError as exc:
             record_reclaimed_retry()
             release_order()
