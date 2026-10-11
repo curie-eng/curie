@@ -2112,10 +2112,8 @@ def test_publication_turn_is_done_before_card_delivery_and_never_replays_model(
             sessionmaker = async_sessionmaker(self.engine, expire_on_commit=False)
             async with sessionmaker() as session:
                 data = PublicationCreate.model_validate(request.to_json())
-
                 async def metadata_check() -> None:
                     return
-
                 publication, _ = await crud_publications.create_publication(
                     session, data, patch=data.decoded_patch(), metadata_check=metadata_check
                 )
