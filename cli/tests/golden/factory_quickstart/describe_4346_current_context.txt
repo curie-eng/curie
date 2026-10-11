@@ -1,0 +1,16 @@
+# Captured verbatim from commit 20fccad31 (the #4346 merge on next), case current_context.
+# Never hand-edited. The test applies exactly one substitution before comparing:
+# api.githubFactoryIntake -> factory.intake (#4397 decision 5 removes the old key).
+# ---
+infer repository toolchains before Helm from App-authenticated workflows and manifests; warn about tools or versions absent from the fixed runner
+Kubernetes context: kind-curie-factory because the current context is a kind context
+model credential: use CURIE_CREDENTIALS (no prompt)
+kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1
+curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off
+configure factory intake api.githubFactoryIntake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image
+render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image
+curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir /tmp/factory-quickstart-golden/curie-factory-quickstart-curie-curie/dark-factory --agent dark-factory --env prod --repo acme/widgets
+curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets
+curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800
+curie cluster publication-policy dark-factory --context kind-curie-factory --namespace curie --release curie --policy auto
+curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5
