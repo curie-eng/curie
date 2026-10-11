@@ -1366,9 +1366,17 @@ pub(crate) enum FactoryAction {
     /// GitHub App, and on the second run deploy the published dark factory.
     /// Never opens a browser and never runs gh.
     Quickstart {
-        /// GitHub repository the factory may work in, as owner/name.
-        #[arg(long = "repo", value_name = "OWNER/NAME")]
-        repo: String,
+        /// GitHub repositories the factory serves, as a comma separated
+        /// owner/name list (repeatable). The first is the agent's git-flow
+        /// repository, and each is bound to the one agent.
+        #[arg(
+            id = "repo",
+            long = "repo",
+            value_name = "OWNER/NAME",
+            required = true,
+            value_delimiter = ','
+        )]
+        repos: Vec<String>,
         /// Numeric GitHub App ID. Pair with --private-key-file. Without both,
         /// the command prints the registration link and exits after cluster up.
         #[arg(long, value_name = "ID", requires = "private_key_file")]

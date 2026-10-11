@@ -38,7 +38,7 @@ from .forges.identity import reconcile_delivery_id
 from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
 from .github_factory_events import FactoryNotice
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable, human_sender
-from .models import Agent, AgentChannel
+from .models import AgentChannel
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name
 from .workspace_policy import repository_is_allowed
 
@@ -56,14 +56,10 @@ def parse_time(value: Any) -> datetime | None:
 
 
 async def bound_repositories(session: AsyncSession) -> list[str]:
+    """The polled set is the distinct addresses of GitHub bindings (ADR 0214
+    decision 5); callers filter it by the allowlist."""
     rows = await session.scalars(
-        select(AgentChannel.address)
-        .join(Agent, Agent.id == AgentChannel.agent_id)
-        .where(
-            AgentChannel.kind == GITHUB_CHANNEL_KIND,
-            Agent.repo_full_name == AgentChannel.address,
-        )
-        .distinct()
+        select(AgentChannel.address).where(AgentChannel.kind == GITHUB_CHANNEL_KIND).distinct()
     )
     return list(rows)
 

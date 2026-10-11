@@ -189,6 +189,11 @@ curie factory quickstart --repo "$CURIE_REPO" "${QUICKSTART_CONTEXT_ARGS[@]}" \
   --app-id "$CURIE_APP_ID" --private-key-file "$CURIE_APP_KEY_FILE"
 ```
 
+To serve more than one repository from the same agent, pass a comma separated
+list such as `--repo acme/widgets,acme/gadgets` on both runs and install the App
+on each. The first repository is the agent's git-flow repository, and each one
+gets its own GitHub surface binding.
+
 Each step is safe to repeat. A rerun after a failure resumes: kind is not
 created again, `cluster up` keeps the recorded model credential, and the App
 setup, deploy, surface, deadline, publication policy, and budget are applied
@@ -257,11 +262,11 @@ The second run configures these values:
 | Value | Source |
 |---|---|
 | Mention | The App slug, so a revision comment can mention `@<slug>`. |
-| Allowlist | The repository you passed, checked against the App installation. |
-| Label | `curie-factory`, created on that repository when it is missing. |
+| Allowlist | The repositories you passed, checked against the App installation. |
+| Label | `curie-factory`, created on each repository when it is missing. |
 | Intake | Polling (`api.githubFactoryIntake=poll`). No webhook secret. |
 | Agent | `dark-factory`, from the published runner image, environment `prod`. |
-| GitHub surface | `github=<owner>/<name>` |
+| GitHub surface | `github=<owner>/<name>`, one per repository |
 | Execution deadline | 3600 seconds |
 | Publication | `auto` |
 | Budget | 5 USD per day |

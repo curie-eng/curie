@@ -723,7 +723,7 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Local { action }) => local_action::run(action).await,
         Some(Command::Factory { action }) => match action {
             FactoryAction::Quickstart {
-                repo,
+                repos,
                 app_id,
                 private_key_file,
                 context,
@@ -748,7 +748,7 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                 emit(
                     curie::factory_quickstart::quickstart(
                         curie::factory_quickstart::QuickstartOpts {
-                            repo,
+                            repos,
                             app_id,
                             private_key_file,
                             context,

@@ -233,4 +233,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0208 | [A factory PR opened after its request was cancelled is adopted by the next run](0208-a-factory-pr-opened-after-its-request-was-cancelled-is-adopted-by-the-next-run.md) | Accepted |
 | 0209 | [Pause authority after a drain is a lease held by a live upgrade step](0209-pause-authority-after-a-drain-is-a-lease-held-by-a-live-upgrade-step.md) | Accepted |
 | 0210 | [A bundle may declare a secret optional](0210-a-bundle-may-declare-a-secret-optional.md) | Accepted |
+| 0214 | [One factory agent serves every GitHub repository bound to it](0214-one-factory-agent-serves-every-github-repository-bound-to-it.md) | Accepted |
 <!-- END GENERATED: adr-index -->

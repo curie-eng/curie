@@ -16,6 +16,12 @@ tracker. Everything else in this ADR stands.
 classifies the ticket once at admission and stores only a verdict and a
 digest, never ticket content. The sandbox read stays verbatim and unparsed.
 
+**Partially amended by [ADR 0214](0214-one-factory-agent-serves-every-github-repository-bound-to-it.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+"Polling is the default intake", item 1. The API polls the distinct addresses
+of GitHub channel bindings that the allowlist admits, not every repository the
+App is installed on.
+
 Accepted with explicit maintainer approval on 2026-10-01 (Brian Conn),
 alongside implementation under ADR 0102.
 

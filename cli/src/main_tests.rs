@@ -2221,3 +2221,38 @@ fn developer_model_script_passes_provider_flags_through() {
     }
     assert!(try_parse_from(["curie", "dev", "model-script"]).is_err());
 }
+
+#[test]
+fn quickstart_multi_repo_clap_splits_a_comma_list() {
+    fn repos(argv: &[&str]) -> Vec<String> {
+        let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        match try_parse_from(argv).expect("parses").command {
+            Some(Command::Factory {
+                action: FactoryAction::Quickstart { repos, .. },
+            }) => repos,
+            _ => panic!("not factory quickstart"),
+        }
+    }
+    let both = vec!["a/x".to_string(), "b/y".to_string()];
+    assert_eq!(
+        repos(&["curie", "factory", "quickstart", "--repo", "a/x,b/y"]),
+        both
+    );
+    assert_eq!(
+        repos(&[
+            "curie",
+            "factory",
+            "quickstart",
+            "--repo",
+            "a/x",
+            "--repo",
+            "b/y"
+        ]),
+        both
+    );
+    assert_eq!(
+        repos(&["curie", "factory", "quickstart", "--repo", "a/x"]),
+        vec!["a/x".to_string()]
+    );
+    assert!(try_parse_from(["curie", "factory", "quickstart"]).is_err());
+}

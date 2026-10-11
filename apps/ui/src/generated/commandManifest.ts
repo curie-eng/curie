@@ -9181,7 +9181,7 @@ export const commandManifest = {
           "args": [
             {
               "global": false,
-              "help": "GitHub repository the factory may work in, as owner/name",
+              "help": "GitHub repositories the factory serves, as a comma separated owner/name list (repeatable). The first is the agent's git-flow repository, and each is bound to the one agent",
               "id": "repo",
               "long": "repo",
               "positional": false,
