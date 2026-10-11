@@ -54,6 +54,7 @@ import copy
 import json
 import os
 import subprocess
+import types
 from pathlib import Path
 from typing import Any
 
@@ -687,28 +688,165 @@ def test_main_runs_tls_code_host_without_any_github_app_or_fixture_env(
 
 
 # --------------------------------------------------------------------------
-# The live collector: the Job is deleted between polls
+# publication_job_from_watch
 # --------------------------------------------------------------------------
 
 
-class _FakePreflight:
-    """The Preflight surface TlsCodeHostRun.await_ending reads, scripted per poll."""
+def _watched_job(name: str, *, succeeded: int = 0) -> dict[str, Any]:
+    job = _job(succeeded=succeeded)
+    job["metadata"] = {
+        "name": name,
+        "namespace": f"{NAMESPACE}-curie-publication",
+        "creationTimestamp": "2026-10-11T00:00:00Z",
+    }
+    job["apiVersion"] = "batch/v1"
+    return job
 
-    def __init__(self, record_status: str) -> None:
+
+def _event(kind: str, job: dict[str, Any], *, indent: int | None = 4) -> str:
+    # kubectl writes each watch event as an indented JSON object.
+    return json.dumps({"type": kind, "object": job}, indent=indent) + "\n"
+
+
+def _trust_volume(job: dict[str, Any] | None) -> dict[str, Any] | None:
+    assert job is not None
+    volumes = job["spec"]["template"]["spec"]["volumes"]
+    return next((v for v in volumes if v.get("name") == "code-host-trust"), None)
+
+
+def test_watch_keeps_a_job_seen_only_as_added_then_deleted() -> None:
+    stream = _event("ADDED", _watched_job(PUBLICATION_JOB)) + _event(
+        "DELETED", _watched_job(PUBLICATION_JOB, succeeded=1)
+    )
+    job = tls_code_host.publication_job_from_watch(stream)
+    assert job is not None
+    assert job["metadata"]["name"] == PUBLICATION_JOB
+    assert _trust_volume(job) == {
+        "name": "code-host-trust",
+        "configMap": {"name": "code-host-ca", "items": [{"key": "ca.crt", "path": "ca.crt"}]},
+    }
+    # The final status reported is the DELETED event's.
+    assert job["status"].get("succeeded") == 1
+    obs = {**_passing(), "publication_job": job}
+    assert tls_code_host.judge_tls_code_host(obs) == []
+
+
+def test_watch_takes_volumes_from_any_event_for_the_job() -> None:
+    bare = _watched_job(PUBLICATION_JOB)
+    bare["spec"] = {}
+    stream = _event("ADDED", _watched_job(PUBLICATION_JOB)) + _event("DELETED", bare)
+    assert _trust_volume(tls_code_host.publication_job_from_watch(stream)) is not None
+
+
+def test_watch_ignores_unrelated_jobs_and_keeps_the_first_publication_job() -> None:
+    other_publication = "curie-publication-" + "f" * 20
+    unrelated = _watched_job("curie-cleanup-28817700")
+    unrelated["spec"]["template"]["spec"]["volumes"] = []
+    second = _watched_job(other_publication)
+    second["spec"]["template"]["spec"]["volumes"] = []
+    stream = (
+        _event("ADDED", unrelated, indent=None)
+        + _event("ADDED", _watched_job(PUBLICATION_JOB), indent=None)
+        + _event("ADDED", second, indent=None)
+        + _event("MODIFIED", unrelated, indent=None)
+        + _event("DELETED", _watched_job(PUBLICATION_JOB), indent=None)
+    )
+    job = tls_code_host.publication_job_from_watch(stream)
+    assert job is not None
+    assert job["metadata"]["name"] == PUBLICATION_JOB
+    assert _trust_volume(job) is not None
+
+
+def test_watch_skips_malformed_lines_and_a_torn_final_event() -> None:
+    torn = _event("MODIFIED", _watched_job(PUBLICATION_JOB))[:-40]
+    stream = (
+        'error: the server doesn\'t have a resource type "jobz"\n'
+        "{not json\n"
+        '"a bare string"\n'
+        '{"type": "ADDED"}\n' + _event("ADDED", _watched_job(PUBLICATION_JOB)) + "}}}\n" + torn
+    )
+    job = tls_code_host.publication_job_from_watch(stream)
+    assert job is not None
+    assert job["metadata"]["name"] == PUBLICATION_JOB
+    assert _trust_volume(job) is not None
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        "",
+        "garbage\n",
+        _event("ADDED", _watched_job("curie-cleanup-28817700")),
+        # The bare Job object, not a watch event.
+        json.dumps(_watched_job(PUBLICATION_JOB)) + "\n",
+    ],
+)
+def test_watch_without_a_publication_job_is_none_and_the_judge_says_so(stream: str) -> None:
+    assert tls_code_host.publication_job_from_watch(stream) is None
+    obs = {**_passing(), "publication_job": None}
+    _failures_with(obs, "no publication Job was observed")
+
+
+# --------------------------------------------------------------------------
+# The live collector: the Job is created and deleted between polls
+# --------------------------------------------------------------------------
+
+
+class _FakeWatch:
+    """kubectl get jobs --watch: reports ADDED then DELETED, then blocks until stopped."""
+
+    def __init__(self, argv: list[str], *, stdout: Any, stderr: Any) -> None:
+        self.argv = argv
+        self.terminated = False
+        stdout.write(
+            (
+                _event("ADDED", _watched_job(PUBLICATION_JOB))
+                + _event("DELETED", _watched_job(PUBLICATION_JOB))
+            ).encode()
+        )
+        stdout.flush()
+
+    def poll(self) -> int | None:
+        return 0 if self.terminated else None
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.terminated = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+
+class _FakeTeardown:
+    def __init__(self) -> None:
+        self.steps: list[tuple[str, Any]] = []
+
+    def push(self, name: str, step: Any) -> None:
+        self.steps.append((name, step))
+
+
+class _FakePreflight:
+    """The Preflight surface the watch and TlsCodeHostRun.await_ending read."""
+
+    def __init__(self, record_status: str, workdir: Path) -> None:
         self.namespace = NAMESPACE
+        self.workdir = workdir
+        self.config = types.SimpleNamespace(kube_context="k8")
+        self.teardown = _FakeTeardown()
         self.labelled_at = 0.0
         self.record_status = record_status
         self.polls = 0
         self.sql_queries: list[str] = []
         # Started just now, so the wait bound is far off.
         self.started_at = fe._now_iso()
-        job = _job(succeeded=0)
-        job["metadata"]["name"] = PUBLICATION_JOB
-        job["metadata"]["creationTimestamp"] = "2026-10-11T00:00:00Z"
-        self.running_job = job
 
     def publication_namespace(self) -> str:
         return f"{NAMESPACE}-curie-publication"
+
+    def step(self, _what: str, **_facts: Any) -> None:
+        return None
 
     def execution_request(self, _request_id: str) -> dict[str, Any]:
         self.polls += 1
@@ -717,10 +855,7 @@ class _FakePreflight:
 
     def kubectl(self, *args: str, check: bool = True) -> str:
         if "jobs" in args:
-            # Poll 1 sees the running Job with its trust volume; by poll 2 the
-            # worker has settled the outcome and deleted it.
-            items = [self.running_job] if self.polls == 1 else []
-            return json.dumps({"items": items})
+            raise AssertionError("the publication Job is read from the watch, not polled")
         if "sandboxclaims.extensions.agents.x-k8s.io" in args:
             return json.dumps({"items": []})
         if "jsonpath={.status.phase}" in args:
@@ -732,19 +867,43 @@ class _FakePreflight:
         return [[PUBLICATION_ID, self.record_status, "6f1c3a52-0000-4000-8000-000000000002"]]
 
 
-def _collect(monkeypatch: pytest.MonkeyPatch, record_status: str) -> tls_code_host.TlsCodeHostRun:
+def _collect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, record_status: str
+) -> tuple[tls_code_host.TlsCodeHostRun, _FakePreflight]:
     monkeypatch.setattr(tls_code_host.time, "sleep", lambda _s: None)
-    fake = _FakePreflight(record_status)
+    watches: list[_FakeWatch] = []
+
+    def popen(argv: list[str], **kwargs: Any) -> _FakeWatch:
+        watch = _FakeWatch(argv, **kwargs)
+        watches.append(watch)
+        return watch
+
+    monkeypatch.setattr(tls_code_host.subprocess, "Popen", popen)
+    fake = _FakePreflight(record_status, tmp_path)
     run = tls_code_host.TlsCodeHostRun(fake)  # type: ignore[arg-type]
     run.request_id = "6f1c3a52-0000-4000-8000-000000000002"
+    run.start_job_watch()
+    assert len(watches) == 1
+    argv = watches[0].argv
+    assert argv[:3] == ["kubectl", "--context", "k8"]
+    assert argv[argv.index("-n") + 1] == fake.publication_namespace()
+    for flag in ("--watch", "--output-watch-events"):
+        assert flag in argv
+    assert argv[argv.index("-o") + 1] == "json"
+    assert run.job_watch_file is not None
+    assert (run.job_watch_file.stat().st_mode & 0o777) == 0o600
+    assert [name for name, _ in fake.teardown.steps] == ["stop publication Job watch"]
     assert run.await_ending() is True
-    # drive() captures once more after the loop; the Job is gone by then.
+    # drive() stops the watch and captures once more after the loop.
+    assert run.stop_job_watch() is True
     run._capture_publication_job()
     run._capture_publication_record()
+    assert watches[0].terminated
+    assert len(watches) == 1, "a live watch was restarted"
     assert fake.polls == 3
     assert fake.sql_queries, "the durable publication record was never read"
     assert all(PUBLICATION_ID[:20] in query for query in fake.sql_queries)
-    return run
+    return run, fake
 
 
 def _collected_obs(run: tls_code_host.TlsCodeHostRun) -> dict[str, Any]:
@@ -756,13 +915,13 @@ def _collected_obs(run: tls_code_host.TlsCodeHostRun) -> dict[str, Any]:
     }
 
 
-def test_a_job_deleted_between_polls_still_passes_on_a_succeeded_record(
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_job_never_polled_still_passes_on_a_succeeded_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    run = _collect(monkeypatch, "succeeded")
+    run, _ = _collect(monkeypatch, tmp_path, "succeeded")
     assert run.publication_job is not None
     assert run.publication_job["metadata"]["name"] == PUBLICATION_JOB
-    # The only Job status ever seen was running: completion is not from it.
+    # The watch never reported success: completion is not from the Job.
     assert not run.publication_job["status"].get("succeeded")
     assert run.publication_record == {
         "id": PUBLICATION_ID,
@@ -772,11 +931,47 @@ def test_a_job_deleted_between_polls_still_passes_on_a_succeeded_record(
     assert tls_code_host.judge_tls_code_host(_collected_obs(run)) == []
 
 
-def test_a_job_deleted_between_polls_fails_on_a_failed_record(
-    monkeypatch: pytest.MonkeyPatch,
+def test_a_job_never_polled_fails_on_a_failed_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    run = _collect(monkeypatch, "failed")
+    run, _ = _collect(monkeypatch, tmp_path, "failed")
     assert run.publication_job is not None
     failures = tls_code_host.judge_tls_code_host(_collected_obs(run))
     assert failures and all("publication Job did not complete" in f for f in failures), failures
     assert "'failed'" in failures[0]
+
+
+def test_the_job_watch_stops_on_teardown(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        tls_code_host.subprocess, "Popen", lambda argv, **kw: _FakeWatch(argv, **kw)
+    )
+    fake = _FakePreflight("succeeded", tmp_path)
+    run = tls_code_host.TlsCodeHostRun(fake)  # type: ignore[arg-type]
+    run.start_job_watch()
+    ((_, stop),) = fake.teardown.steps
+    assert stop() == {"stopped": True}
+    assert run.job_watch is not None and run.job_watch.poll() is not None
+
+
+def test_a_closed_job_watch_is_restarted_and_appends(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    watches: list[_FakeWatch] = []
+
+    def popen(argv: list[str], **kwargs: Any) -> _FakeWatch:
+        watches.append(_FakeWatch(argv, **kwargs))
+        return watches[-1]
+
+    monkeypatch.setattr(tls_code_host.subprocess, "Popen", popen)
+    fake = _FakePreflight("succeeded", tmp_path)
+    run = tls_code_host.TlsCodeHostRun(fake)  # type: ignore[arg-type]
+    run.start_job_watch()
+    watches[0].terminated = True  # the API server closed the watch
+    run._keep_job_watch()
+    assert len(watches) == 2 and run.job_watch is watches[1]
+    assert run.job_watch_restarts == 1
+    assert run.job_watch_file is not None
+    text = run.job_watch_file.read_text()
+    assert text.count('"ADDED"') == 2, "the restart truncated the earlier events"
+    run._capture_publication_job()
+    assert run.publication_job is not None

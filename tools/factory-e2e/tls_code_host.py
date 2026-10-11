@@ -40,6 +40,7 @@ import os
 import re
 import secrets
 import shutil
+import subprocess
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -379,6 +380,81 @@ def _job_status_summary(job: Mapping[str, Any]) -> str:
     )
 
 
+def _watch_events(text: str) -> list[dict[str, Any]]:
+    """The watch events in a `kubectl get --watch --output-watch-events -o json` stream.
+
+    kubectl writes one indented JSON object per event, back to back. Anything
+    that does not decode (a torn final object, a stray stderr line) is skipped
+    a line at a time, so one bad event never hides the ones after it.
+    """
+
+    decoder = json.JSONDecoder()
+    events: list[dict[str, Any]] = []
+    index = 0
+    while index < len(text):
+        if text[index].isspace():
+            index += 1
+            continue
+        try:
+            value, index = decoder.raw_decode(text, index)
+        except ValueError:
+            newline = text.find("\n", index)
+            index = len(text) if newline < 0 else newline + 1
+            continue
+        if (
+            isinstance(value, dict)
+            and isinstance(value.get("type"), str)
+            and isinstance(value.get("object"), dict)
+        ):
+            events.append(value)
+    return events
+
+
+def publication_job_from_watch(text: str) -> dict[str, Any] | None:
+    """The first publication Job a Job watch reported, reduced to what the judge reads.
+
+    The worker creates the Job and deletes it as soon as it settles the
+    outcome, so the Job may exist only between two polls. A watch still
+    reports it (ADDED, then DELETED with the final object), and any of those
+    events carries the immutable pod template, so its volumes come from
+    whichever event has them. Status is the last one reported, for the
+    failure message only; completion is judged from the publication record.
+    Jobs not named like a publication Job are ignored, and only the first
+    publication Job reported is this run's.
+    """
+
+    name: str | None = None
+    volumes: list[Any] = []
+    status: dict[str, Any] = {}
+    namespace: Any = None
+    for event in _watch_events(text):
+        job = event["object"]
+        if job.get("kind") not in (None, "Job"):
+            continue
+        meta = job.get("metadata") or {}
+        job_name = str(meta.get("name") or "")
+        if not _PUBLICATION_JOB_NAME.match(job_name):
+            continue
+        if name is None:
+            name = job_name
+        elif job_name != name:
+            continue
+        namespace = meta.get("namespace") or namespace
+        template = ((job.get("spec") or {}).get("template") or {}).get("spec") or {}
+        if template.get("volumes"):
+            volumes = list(template["volumes"])
+        if job.get("status"):
+            status = dict(job["status"])
+    if name is None:
+        return None
+    return {
+        "kind": "Job",
+        "metadata": {"name": name, "namespace": namespace},
+        "spec": {"template": {"spec": {"volumes": volumes}}},
+        "status": status,
+    }
+
+
 def tls_failure_lines(text: str) -> list[str]:
     """Distinct log lines that report a failed TLS verification."""
 
@@ -515,6 +591,9 @@ class TlsCodeHostRun:
         self.request_id = ""
         self.claim_env: dict[str, str] = {}
         self.publication_job: dict[str, Any] | None = None
+        self.job_watch: subprocess.Popen[bytes] | None = None
+        self.job_watch_file: Path | None = None
+        self.job_watch_restarts = 0
         self.publication_record: dict[str, Any] | None = None
         self.statuses: list[str] = []
         self.started_at: str | None = None
@@ -824,58 +903,93 @@ class TlsCodeHostRun:
                 self._timeline("sandbox claim observed", keys=sorted(self.claim_env))
                 return
 
-    def _capture_publication_job(self) -> None:
-        """Keep the publication Job's volumes from the first poll that sees it.
+    def start_job_watch(self) -> None:
+        """Watch the publication namespace's Jobs before the ticket opens.
 
-        The worker deletes the Job right after it settles the outcome
-        (publication_loop._terminalize, then cleanup_terminal), so a later poll
-        may find nothing. The spec captured here is kept; completion is proved
-        by _capture_publication_record instead of by the Job's status.
+        The worker creates the publication Job and deletes it right after it
+        settles the outcome (publication_loop._terminalize, then
+        cleanup_terminal), so a fast run can create and delete it between two
+        polls. A watch reports every ADDED, MODIFIED and DELETED event, so the
+        Job's volumes are kept however briefly it lived. Events stream to a
+        private file in the run's directory and are parsed by
+        publication_job_from_watch; completion is proved by
+        _capture_publication_record, not by the Job's status.
         """
 
-        raw = self.p.kubectl(
-            "-n",
-            self.p.publication_namespace(),
-            "get",
-            "jobs",
-            "-l",
-            "curietech.ai/component=publication",
-            "-o",
-            "json",
-            check=False,
-        )
+        path = self.p.workdir / "publication-jobs.watch.json"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.close(fd)
+        self.job_watch_file = path
+        self._spawn_job_watch()
+
+        def stop() -> dict[str, Any]:
+            return {"stopped": self.stop_job_watch()}
+
+        self.p.teardown.push("stop publication Job watch", stop)
+        self.p.step("publication Job watch started", namespace=self.p.publication_namespace())
+
+    def _spawn_job_watch(self) -> None:
+        assert self.job_watch_file is not None
+        with open(self.job_watch_file, "ab") as sink:
+            # The child holds its own descriptor; the file stays 0600.
+            self.job_watch = subprocess.Popen(
+                [
+                    "kubectl",
+                    "--context",
+                    self.p.config.kube_context,
+                    "-n",
+                    self.p.publication_namespace(),
+                    "get",
+                    "jobs",
+                    "-l",
+                    "curietech.ai/component=publication",
+                    "--watch",
+                    "--output-watch-events",
+                    "-o",
+                    "json",
+                ],
+                stdout=sink,
+                stderr=subprocess.DEVNULL,
+            )
+
+    def _keep_job_watch(self) -> None:
+        """Restart the watch if the API server closed it; a restart relists as ADDED."""
+
+        if self.job_watch is not None and self.job_watch.poll() is not None:
+            self.job_watch_restarts += 1
+            self._timeline("publication Job watch restarted", restarts=self.job_watch_restarts)
+            self._spawn_job_watch()
+
+    def stop_job_watch(self) -> bool:
+        if self.job_watch is None:
+            return True
+        return fe._stop(self.job_watch)
+
+    def _capture_publication_job(self) -> None:
+        """Read the publication Job, if any, from everything the watch has reported."""
+
+        if self.job_watch_file is None:
+            return
         try:
-            items = json.loads(raw).get("items") or []
-        except ValueError:
+            text = self.job_watch_file.read_text(errors="replace")
+        except OSError:
             return
-        if not items:
+        job = publication_job_from_watch(text)
+        if job is None:
             return
-        items.sort(key=lambda j: str((j.get("metadata") or {}).get("creationTimestamp") or ""))
-        job = items[-1]
-        meta = job.get("metadata") or {}
-        template = ((job.get("spec") or {}).get("template") or {}).get("spec") or {}
-        reduced = {
-            "kind": "Job",
-            "metadata": {"name": meta.get("name"), "namespace": meta.get("namespace")},
-            "spec": {"template": {"spec": {"volumes": template.get("volumes") or []}}},
-            "status": job.get("status") or {},
-        }
         if self.publication_job is None:
-            self._timeline("publication Job observed", name=meta.get("name"))
-        elif self.publication_job["metadata"]["name"] != meta.get("name"):
-            # Only the first Job's spec is judged; a later Job is not this run's.
-            return
-        self.publication_job = reduced
+            self._timeline("publication Job observed", name=job["metadata"]["name"])
+        self.publication_job = job
 
     def _capture_publication_record(self) -> None:
         """The publication record behind the observed Job, read from Postgres.
 
-        Chosen over the Job's own status, its pod or a watch stream because it
+        Chosen over the Job's own status or its pod because it
         is the one completion fact that survives the Job's deletion: the worker
         writes the record terminal (succeeded only after the Job succeeded and
         the pull request was verified) before it deletes the Job, and never
         deletes the record. The Job name carries the publication id, so the
-        record read is exactly the Job whose volumes were captured.
+        record read is exactly the Job whose volumes the watch reported.
         """
 
         if self.publication_job is None:
@@ -914,6 +1028,7 @@ class TlsCodeHostRun:
             request = self.p.execution_request(self.request_id)
             status = self._record_status(request) if request is not None else ""
             self._capture_claim_env()
+            self._keep_job_watch()
             self._capture_publication_job()
             self._capture_publication_record()
             if status in TERMINAL_STATUSES:
@@ -1011,9 +1126,11 @@ class TlsCodeHostRun:
         self.publish_ca_to_publication_namespace()
         p.port_forward()
         p.bind_agent(github_token=False)
+        self.start_job_watch()
         self.open_ticket()
         work_item_id = self.await_admission()
         ended = self.await_ending() if work_item_id else False
+        self.stop_job_watch()
         self._capture_claim_env()
         self._capture_publication_job()
         self._capture_publication_record()
@@ -1027,6 +1144,7 @@ class TlsCodeHostRun:
                 "ended": ended,
                 "claim_env": dict(self.claim_env),
                 "publication_job": self.publication_job,
+                "publication_job_watch_restarts": self.job_watch_restarts,
                 "publication_record": self.publication_record,
                 "stub_branches": branches,
                 "stub_pull_requests": pulls,

@@ -47,8 +47,21 @@ PLACEHOLDER_WORDS = (
 PLACEHOLDER_WORD_RE = re.compile("|".join(PLACEHOLDER_WORDS), re.IGNORECASE)
 # Characters that delimit a word inside a token body.
 SEPARATORS = frozenset("_-.=+/")
-# A remainder this short around an anchored placeholder word is filler.
-SHORT_FILLER = 16
+# A sequential filler run (`0123`, `abcd`) is at least this long.
+SEQUENTIAL_RUN = 4
+
+# Publicly documented vendor example values, matched exactly. Nothing else is
+# exempted by name: a value that differs by one character is scanned as usual.
+DOCUMENTED_EXAMPLES = frozenset(
+    {
+        # AWS documentation publishes this access key id as its example
+        # (IAM User Guide, "Managing access keys for IAM users").
+        "AK" + "IA" + "IOSFODNN7" + "EXAMPLE",
+        # Its temporary-credential form: the same documented example body with
+        # the STS key id prefix.
+        "AS" + "IA" + "IOSFODNN7" + "EXAMPLE",
+    }
+)
 
 # Site, workspace and group names a reader is meant to replace.
 PLACEHOLDER_NAMES = frozenset(
@@ -157,26 +170,32 @@ def _low_entropy(body: str) -> bool:
 
 
 def _sequential(text: str) -> bool:
-    """Mostly runs like `0123` or `abcd`: at least 3 in 4 neighbours step by one."""
-    if len(text) < 2:
-        return True
-    steps = sum(1 for left, right in pairwise(text) if ord(right) - ord(left) == 1)
-    return steps * 4 >= (len(text) - 1) * 3
+    """Strictly sequential runs like `0123456789` or `abcdABCD`.
+
+    Every character steps up by one from the previous, except at the start
+    of a new run, and every run is at least SEQUENTIAL_RUN long.
+    """
+    if not text:
+        return False
+    run = 1
+    for left, right in pairwise(text):
+        if ord(right) - ord(left) == 1:
+            run += 1
+        elif run < SEQUENTIAL_RUN:
+            return False
+        else:
+            run = 1
+    return run >= SEQUENTIAL_RUN
 
 
 def _filler(text: str) -> bool:
     """What a person types around a placeholder word, not a random secret.
 
-    Short (at most 16 characters, like the documented AWS example key's
-    `IOSFODNN7`), low-entropy, a repeated handful of characters (no more than
-    one distinct character per four), or a sequential run.
+    Nothing, a low-entropy string (at most five distinct characters, or one
+    short unit repeated), or strictly sequential runs. Length alone never
+    makes a remainder filler.
     """
-    return (
-        len(text) <= SHORT_FILLER
-        or _low_entropy(text)
-        or len(set(text)) <= max(5, len(text) // 4)
-        or _sequential(text)
-    )
+    return not text or _low_entropy(text) or _sequential(text)
 
 
 def _anchored_word(lowered: str, word: str) -> bool:
@@ -238,6 +257,8 @@ def findings(text: str) -> list[str]:
 
     for rule, pattern, prefix in TOKEN_RULES:
         for match in pattern.finditer(text):
+            if match.group(0) in DOCUMENTED_EXAMPLES:
+                continue
             if not _token_placeholder(match.group(0)[prefix:]):
                 report(match.start(), rule, match.group(0))
 
@@ -402,6 +423,22 @@ PLANTED: dict[str, tuple[str, str]] = {
         "gitlab-token",
         "gl" + "pat-" + _rand(_ALNUM, 12) + "-test-" + _rand(_ALNUM, 12),
     ),
+    # A short random remainder after an anchored word is still random.
+    "gitlab-test-plus-16-random": (
+        "gitlab-token",
+        "gl" + "pat-" + "test" + _rand(_ALNUM, 16),
+    ),
+    "aws-test-prefix": ("aws-access-key-id", "AK" + "IA" + "TEST" + _rand(_UPPER, 12)),
+    # A long random remainder over a small alphabet (hex) is still random.
+    "anthropic-test-anchored-hex-remainder": (
+        "anthropic-key",
+        "sk-" + "ant-api03-" + "test-" + _rand("0123456789abcdef", 90),
+    ),
+    # A documented example value is exempt only exactly; one character off is not.
+    "aws-documented-example-altered": (
+        "aws-access-key-id",
+        "AK" + "IA" + "IOSFODNN8" + "EXAMPLE",
+    ),
 }
 
 
@@ -424,14 +461,14 @@ PLACEHOLDERS: dict[str, str] = {
     "github-token-repeated": "gh" + "p_" + "x" * 36,
     "github-token-unit": "gh" + "p_" + "abc123" * 6,
     "github-token-word": "gh" + "o_" + "EXAMPLE" + "0123456789abcdefghijABCDEFGHI",
-    "github-fine-grained-word": "github" + "_pat_" + "placeholder" + "A1b2C3d4E5" * 7 + "q",
-    "gitlab-token-word": "gl" + "pat-" + "fixture" + "Ab1Cd2Ef3Gh4K",
+    "github-fine-grained-word": "github" + "_pat_" + "placeholder" + "A1b2C3d4E5" * 7 + "A",
+    "gitlab-token-word": "gl" + "pat-" + "fixture" + "ABCDEFGHIJKLM",
     "atlassian-token-word": "ATA" + "TT" + "redacted" + _ALNUM + _ALNUM[:10],
     "bitbucket-token-low": "ATB" + "B" + "0" * 32,
     "slack-token-word": "xo" + "xb-" + "1" * 12 + "-" + "2" * 13 + "-" + "fakefakefakefakefakefake",
     "anthropic-key-word": "sk-" + "ant-api03-" + "dummy" + _ALNUM + _ALNUM[:20],
     "openrouter-key-low": "sk-" + "or-v1-" + "0" * 64,
-    "aws-access-key-id-word": "AK" + "IA" + "IOSFODNN7" + "EXAMPLE",
+    "aws-access-key-id-documented-example": "AK" + "IA" + "IOSFODNN7" + "EXAMPLE",
     "aws-access-key-id-low": "AK" + "IA" + "A" * 16,
     "private-key-header-only": '"' + _PEM_HEAD + '"',
     "private-key-low-body": _PEM_HEAD + "\n" + "A" * 64 + "\n" + _PEM_TAIL,
