@@ -383,3 +383,71 @@ def test_repository_id_paths_serve_the_same_repository(github: httpx.Client, stu
     assert by_id == _ok(github.get(f"/repos/{REPO}/issues/{issue['number']}"))
     assert _ok(github.get("/repositories/4401"))["full_name"] == REPO
     assert stub.unknown_requests == []
+
+
+def test_missing_branch_lookups_answer_404_like_github(github: httpx.Client, stub: Any) -> None:
+    """The factory publication probes its new head branch before pushing it.
+
+    GitHub answers 404 for both lookups when the branch does not exist:
+    "Get a branch" (https://docs.github.com/en/rest/branches/branches#get-a-branch)
+    returns {"message": "Branch not found"}, and "Get a reference"
+    (https://docs.github.com/en/rest/git/refs#get-a-reference) returns
+    {"message": "Not Found"}.
+    """
+
+    branch = github.get(f"/repos/{REPO}/branches/factory%2Fnot-pushed-yet")
+    assert branch.status_code == 404, branch.text
+    assert branch.json()["message"] == "Branch not found"
+    ref = github.get(f"/repos/{REPO}/git/ref/heads/factory%2Fnot-pushed-yet")
+    assert ref.status_code == 404, ref.text
+    assert ref.json()["message"] == "Not Found"
+    assert stub.unknown_requests == []
+
+
+def test_existing_branch_lookups_still_resolve_main_and_pushed_branches(
+    github: httpx.Client, stub: Any, tmp_path: Path
+) -> None:
+    env = dict(os.environ)
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_SSL_CAINFO": str(stub.ca_file)})
+    authorization = github.headers["Authorization"]
+
+    def git(*args: str, cwd: Path = tmp_path) -> str:
+        result = subprocess.run(
+            ["git", "-c", f"http.extraHeader=Authorization: {authorization}", *args],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    main_sha = git("ls-remote", stub.clone_url, "refs/heads/main").split()[0]
+    assert _ok(github.get(f"/repos/{REPO}/branches/main"))["commit"]["sha"] == main_sha
+    main_ref = _ok(github.get(f"/repos/{REPO}/git/ref/heads/main"))
+    assert main_ref["ref"] == "refs/heads/main"
+    assert main_ref["object"]["sha"] == main_sha
+
+    checkout = tmp_path / "checkout"
+    git("clone", stub.clone_url, str(checkout))
+    (checkout / "probe.txt").write_text("Pushed after a 404 lookup.\n")
+    git("add", "probe.txt", cwd=checkout)
+    git(
+        "-c",
+        "user.name=Example Author",
+        "-c",
+        "user.email=author@example.com",
+        "commit",
+        "-m",
+        "Add probe",
+        cwd=checkout,
+    )
+    pushed_sha = git("rev-parse", "HEAD", cwd=checkout)
+    assert github.get(f"/repos/{REPO}/branches/factory%2Fprobe").status_code == 404
+    git("push", "origin", "HEAD:refs/heads/factory/probe", cwd=checkout)
+    assert _ok(github.get(f"/repos/{REPO}/branches/factory%2Fprobe"))["commit"]["sha"] == pushed_sha
+    pushed_ref = _ok(github.get(f"/repos/{REPO}/git/ref/heads/factory%2Fprobe"))
+    assert pushed_ref["object"]["sha"] == pushed_sha
+    assert stub.unknown_requests == []
