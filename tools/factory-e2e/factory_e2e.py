@@ -6905,19 +6905,7 @@ TLS_CODE_HOST_MODULE = Path(__file__).resolve().parent / "tls_code_host.py"
 def load_tls_code_host() -> Any:
     """The tls-code-host scenario module, loaded once under its own name."""
 
-    module = sys.modules.get("tls_code_host")
-    if module is None:
-        spec = importlib.util.spec_from_file_location("tls_code_host", TLS_CODE_HOST_MODULE)
-        if spec is None or spec.loader is None:
-            raise ConfigError(f"cannot load {TLS_CODE_HOST_MODULE}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["tls_code_host"] = module
-        try:
-            spec.loader.exec_module(module)
-        except BaseException:
-            del sys.modules["tls_code_host"]
-            raise
-    return module
+    return _load_by_path("tls_code_host", TLS_CODE_HOST_MODULE)
 
 
 SCENARIOS["tls-code-host"] = load_tls_code_host().drive

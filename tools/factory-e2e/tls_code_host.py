@@ -969,10 +969,7 @@ class TlsCodeHostRun:
         the durable publication record and the stub's own state.
         """
 
-        path = self.p.workdir / "publication-jobs.watch.json"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.close(fd)
-        self.job_watch_file = path
+        self.job_watch_file = self._private_file("publication-jobs.watch.json", "")
         self._spawn_job_watch()
 
         def stop() -> dict[str, Any]:

@@ -53,15 +53,6 @@ EXPECTED_PAIRINGS = {
 }
 INSTALLED = {"github+github"}
 NOT_INSTALLED = sorted(EXPECTED_PAIRINGS - INSTALLED)
-STEP_FIELDS = (
-    "name",
-    "inputs",
-    "command",
-    "deadline_seconds",
-    "remote_assertions",
-    "persisted_assertions",
-    "teardown_checks",
-)
 NAMESPACE = "test-factory-acceptance"
 
 
