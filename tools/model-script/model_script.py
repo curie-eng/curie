@@ -20,11 +20,17 @@ import os
 import re
 import signal
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+# Above the 600 s upstream urlopen timeout, so close() outlasts any
+# in-flight recorded exchange without waiting on idle keep-alive sockets.
+CLOSE_DRAIN_TIMEOUT_S = 660.0
 
 _VOLATILE = re.compile(
     r"https?://[^\s\"'\\<>]+"
@@ -263,13 +269,6 @@ def dump_transcript(path: Path, exchanges: list[dict[str, Any]]) -> None:
     )
 
 
-class _JoiningHTTPServer(ThreadingHTTPServer):
-    """Keeps handler threads joinable so close waits for in-flight exchanges."""
-
-    daemon_threads = False
-    block_on_close = True
-
-
 class ModelScript:
     """One loopback or pod-facing Messages server."""
 
@@ -293,6 +292,8 @@ class ModelScript:
         self._used: set[int] = set()
         self.unexpected: list[dict[str, Any]] = []
         self._lock = threading.Lock()
+        self._in_flight = 0
+        self._idle = threading.Condition()
         script = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -302,6 +303,14 @@ class ModelScript:
                 return
 
             def do_GET(self) -> None:  # noqa: N802
+                with script._serving():
+                    self._get()
+
+            def do_POST(self) -> None:  # noqa: N802
+                with script._serving():
+                    self._post()
+
+            def _get(self) -> None:
                 if self.path.split("?", 1)[0] in {"/", "/health"}:
                     body = b'{"ok":true}'
                     self.send_response(200)
@@ -312,7 +321,7 @@ class ModelScript:
                     return
                 script._reject(self, "GET", self.path, b"")
 
-            def do_POST(self) -> None:  # noqa: N802
+            def _post(self) -> None:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length)
                 path = self.path.split("?", 1)[0]
@@ -324,7 +333,7 @@ class ModelScript:
                     return
                 script._serve(self, path, body)
 
-        self._server = _JoiningHTTPServer((host, port), Handler)
+        self._server = ThreadingHTTPServer((host, port), Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._closed = False
 
@@ -347,6 +356,8 @@ class ModelScript:
         if self._thread.is_alive():
             self._server.shutdown()
             self._thread.join(timeout=5)
+        with self._idle:
+            self._idle.wait_for(lambda: self._in_flight == 0, timeout=CLOSE_DRAIN_TIMEOUT_S)
         self._server.server_close()
         if self.record:
             dump_transcript(self.transcript, self._exchanges)
@@ -355,6 +366,17 @@ class ModelScript:
                 f"unexpected model request: {len(self.unexpected)} request(s) "
                 "were not in the transcript"
             )
+
+    @contextmanager
+    def _serving(self) -> Iterator[None]:
+        with self._idle:
+            self._in_flight += 1
+        try:
+            yield
+        finally:
+            with self._idle:
+                self._in_flight -= 1
+                self._idle.notify_all()
 
     def _match(self, method: str, path: str, body: bytes) -> dict[str, Any] | None:
         if method != "POST" or path != "/v1/messages":

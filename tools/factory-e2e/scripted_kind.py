@@ -36,7 +36,7 @@ TRANSCRIPT = REPO_ROOT / "tools/model-script/transcripts/unitconv-issue.json"
 IMAGES = ("curie-api:local", "curie-worker:local", "curie-ui:local", "curie-runner:latest")
 BOUND_SECONDS = 2400
 RECORD_BUDGET_USD = 20
-RECORD_REQUEST_RESERVE_USD = 1.0
+RECORD_REQUEST_RESERVE_USD = 2.0
 RECORD_ATTEMPTS = 3
 
 
@@ -200,6 +200,9 @@ class ScriptedRun:
         self.record_namespace = os.environ.get("FACTORY_RUN_ID", self.run_id)
         self.record_error: str | None = None
         self.admission_lock = threading.Lock()
+        # Serializes admission plus the upstream forward so each admission
+        # sees the credit left after the previous call completed.
+        self.forward_lock = threading.Lock()
 
     def check_disk(self, stage: str) -> None:
         if shutil.disk_usage("/").free < 30 * 1024**3:
@@ -342,14 +345,15 @@ class ScriptedRun:
         forward = self.model._record
 
         def record_request(handler: Any, path: str, body: bytes) -> None:
-            if model_module.request_key(model_module._safe_json(body)) is not None:
-                try:
-                    self.record_model_call()
-                except fe.ConfigError as exc:
-                    self.record_error = str(exc)
-                    self.model._reject(handler, "POST", path, body)
-                    return
-            forward(handler, path, body)
+            with self.forward_lock:
+                if model_module.request_key(model_module._safe_json(body)) is not None:
+                    try:
+                        self.record_model_call()
+                    except fe.ConfigError as exc:
+                        self.record_error = str(exc)
+                        self.model._reject(handler, "POST", path, body)
+                        return
+                forward(handler, path, body)
 
         self.model._record = record_request
 
