@@ -534,7 +534,7 @@ def test_a_budget_change_during_the_github_read_keeps_the_granted_timing(
 ) -> None:
     case = issue_case
     _execute(
-        "UPDATE curie.agents SET execution_deadline_seconds = 3600 WHERE id = :id",
+        "UPDATE curie.agents SET execution_deadline_seconds = 7200 WHERE id = :id",
         {"id": case["agent_id"]},
     )
     _replace_execution(case, deadline_in=timedelta(minutes=59))

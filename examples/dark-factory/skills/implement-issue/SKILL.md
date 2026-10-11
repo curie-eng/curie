@@ -281,14 +281,30 @@ or another dependency download command. An unavailable registry is a blocked
 check, not permission to use a different source.
 
 When a locked fetch cannot connect to a registry host, name the cause instead
-of only deferring the check. Run, for that host:
+of only deferring the check. Resolve the host with `getent ahosts <host>` and
+probe each distinct address with `--resolve <host>:443:<address>` in the
+bounded loop below. In this same Bash call, set `execution_deadline` and
+`execution_seconds` to the actual values from the mandatory
+`mcp__curie__get_issue` read; never substitute agent settings:
 
-```sh
-getent ahosts <host>
-curl -sS -o /dev/null -m "$command_timeout_seconds" -w '%{http_code} %{remote_ip}\n' --resolve <host>:443:<address> https://<host>/
+```bash
+: "${execution_deadline:?execution_deadline from get_issue is required}"
+: "${execution_seconds:?execution_seconds from get_issue is required}"
+registry_host='<host>'
+stop_work_epoch=$(($(date -u -d "$execution_deadline" +%s) - execution_seconds / 12))
+for address in $(getent ahosts "$registry_host" | awk '!seen[$1]++ {print $1}'); do
+  remaining_seconds=$((stop_work_epoch - $(date -u +%s)))
+  command_timeout_seconds=$((remaining_seconds / 12))
+  if ((command_timeout_seconds <= 0)); then
+    printf 'Registry probe stopped: execution budget exhausted\n' >&2
+    break
+  fi
+  curl -sS -o /dev/null -m "$command_timeout_seconds" -w '%{http_code} %{remote_ip}\n' --resolve "$registry_host:443:$address" "https://$registry_host/"
+done
 ```
 
-running the `curl` once for each distinct address `getent` returned. Report
+running the `curl` once for each distinct address `getent` returned while a
+positive budget remains, reserving the final `S/12` for publication. Report
 the blocked check with the cause `registry_egress_unreachable`, the host, and
 which resolved addresses connected and which timed out or were refused. Add
 this operator guidance: NetworkPolicy matches addresses, not hostnames, and a
