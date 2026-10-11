@@ -492,6 +492,9 @@ def test_invalid_or_duplicate_declarations_fail_closed_without_calling_curie(
         "cli/tests/local/../test_pin.py::test_pin",
         "cli/tests/local/pin.py::test_pin",
         "cli/tests/local/test_pin.py::helper",
+        "charts/curie/ci/../render-assertions.sh",
+        "charts/curie/ci/runtime/",
+        "charts/curie/ci/runtime/name.py",
     ],
 )
 def test_unsupported_selectors_fail_closed_without_calling_curie(
@@ -1764,6 +1767,24 @@ def test_helm_render_pin_for_a_found_cluster_issue_passes_without_a_waiver(
         "verify-fix-pin",
         "HEAD",
         CHART_SELECTOR,
+    ]
+
+
+def test_nested_chart_runtime_selector_meets_the_cluster_floor(tmp_path: Path) -> None:
+    """charts/curie/ci/runtime/ scripts are cluster pins like top-level ones (#4367)."""
+    selector = "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh"
+    completed, call_log = _run_checker(
+        tmp_path,
+        f"Closes #12\n\nFix pin: {selector}\n",
+        gh_labels=FOUND_CLUSTER_LABELS,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(call_log.read_text(encoding="utf-8")) == [
+        "dev",
+        "verify-fix-pin",
+        "HEAD",
+        selector,
     ]
 
 

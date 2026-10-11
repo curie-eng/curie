@@ -1926,7 +1926,7 @@ class TestHelmCiJobsCarryNoJobLevelIf:
     After #1470 the gate refuses a skipped required check, so that skip blocks
     every release. helm's if must be exactly `${{ !cancelled() }}` so a
     completed run cannot record the required check as skipped. chart-changes
-    has no if. The four gated jobs use exactly
+    has no if. The five gated jobs use exactly
     `${{ needs.chart-changes.outputs.chart == 'true' }}`. Any other job-level
     if fails the test.
     """
@@ -1936,6 +1936,7 @@ class TestHelmCiJobsCarryNoJobLevelIf:
         "chart-assertions-2",
         "chart-assertions-retained-values",
         "reserved-env-upgrade",
+        "automatic-thread-isolation",
     )
     GATED_IF = "${{ needs.chart-changes.outputs.chart == 'true' }}"
 

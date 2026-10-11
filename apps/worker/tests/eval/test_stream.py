@@ -411,9 +411,7 @@ class _FakeK8s:
             pool=pool,
         )
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         assert request_timeout_seconds > 0
         claim = self.claims.get(name)
         if claim is None:
@@ -444,9 +442,7 @@ class _FakeK8s:
                 out.append(view)
         return out
 
-    def get_sandbox(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> SandboxView | None:
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
         assert request_timeout_seconds > 0
         if not any(c.sandbox_name == name for c in self.claims.values()):
             return None
@@ -1320,14 +1316,10 @@ def test_provisioned_runner_reviewer_model_end_to_end(
 
                     summary = await client.xpending(cfg.eval_stream, cfg.eval_consumer_group)
                     assert summary["pending"] == 0
-                    traces = await _assert_langfuse_traces(
-                        lf_client, cfg, sha, expected=1
-                    )
+                    traces = await _assert_langfuse_traces(lf_client, cfg, sha, expected=1)
                     trace_row = traces[0]
                     assert trace_row["metadata"]["model"] == expected_model
-                    model_tags = [
-                        tag for tag in trace_row["tags"] if tag.startswith("model:")
-                    ]
+                    model_tags = [tag for tag in trace_row["tags"] if tag.startswith("model:")]
                     assert model_tags == (
                         [] if expected_model is None else [f"model:{expected_model}"]
                     )
@@ -1630,9 +1622,7 @@ class _TokenSubstrate:
         self._token = token
         self.released: list[str] = []
 
-    def claim(
-        self, _key: str, *, env: dict[str, str] | None = None, **_: object
-    ) -> _FakeHandle:
+    def claim(self, _key: str, *, env: dict[str, str] | None = None, **_: object) -> _FakeHandle:
         return _FakeHandle(base_url="http://sandbox.local:8080", token=self._token)
 
     def release(self, key: str, **_: object) -> None:
@@ -1733,9 +1723,9 @@ def test_eval_requested_model_boots_and_tags_that_model() -> None:
     # No requested model: the worker default is booted and tagged, as before.
     default_item = _item(suite="s", sha="deadbeef", bundle_ref="bundles/x.zip", target_url=None)
     assert (
-        consumer._boot_env(
-            default_item, None, None, model="worker-default", reviewer_model=None
-        )[MODEL_ENV]
+        consumer._boot_env(default_item, None, None, model="worker-default", reviewer_model=None)[
+            MODEL_ENV
+        ]
         == "worker-default"
     )
     assert consumer._eval_model(default_item, "worker-default") == "worker-default"
@@ -1829,9 +1819,7 @@ class _ConcurrencyProbeSubstrate:
         self.peak = 0
         self.claims = 0
 
-    def claim(
-        self, _key: str, *, env: dict[str, str] | None = None, **_: object
-    ) -> _FakeHandle:
+    def claim(self, _key: str, *, env: dict[str, str] | None = None, **_: object) -> _FakeHandle:
         with self._lock:
             self._live += 1
             self.claims += 1
@@ -1932,9 +1920,7 @@ def _canned_run(monkeypatch, outcomes: list[EvalOutcome]) -> None:
             suite=suite.name,
             model=None,
             results=[
-                EvalCaseResult(
-                    case_id=f"c{i}", outcome=outcome, output="all done", latency_ms=1.0
-                )
+                EvalCaseResult(case_id=f"c{i}", outcome=outcome, output="all done", latency_ms=1.0)
                 for i, outcome in enumerate(outcomes)
             ],
         )
@@ -1964,9 +1950,7 @@ class _EvalMetric:
 
 
 class _EvalSpan:
-    def add_event(
-        self, _name: str, _attributes: Mapping[str, str] | None = None
-    ) -> None:
+    def add_event(self, _name: str, _attributes: Mapping[str, str] | None = None) -> None:
         pass
 
 
@@ -2050,8 +2034,7 @@ def test_eval_consumer_uses_a_safe_root_and_records_bounded_completion(
     assert completed
     assert {point.attributes["outcome"] for point in completed} == {"success"}
     assert all(
-        set(point.attributes)
-        <= {"service.name", "operation", "role", "source", "outcome"}
+        set(point.attributes) <= {"service.name", "operation", "role", "source", "outcome"}
         for point in completed
     )
 
@@ -2190,9 +2173,7 @@ def test_eval_claim_with_connector_secrets_targets_the_per_agent_pool(monkeypatc
     monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
     fake_k8s = _FakeK8s()
     sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
-    sync_client = redis.Redis(
-        host=_VH, port=_VP, password=_VPW or None, decode_responses=False
-    )
+    sync_client = redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False)
     pressure_client = AsyncRedis(
         host=_VH,
         port=_VP,
@@ -2275,9 +2256,7 @@ class _DelayedDeleteK8s(_FakeK8s):
         self.lingering_sandboxes[claim.sandbox_name] = name
         self.deleted.append(name)
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None:
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None:
         if name in self.claim_gets:
             self.claim_gets[name] += 1
             if self.claim_gets[name] >= self.claim_gone_after_gets:
@@ -2285,9 +2264,7 @@ class _DelayedDeleteK8s(_FakeK8s):
                 return None
         return super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
 
-    def get_sandbox(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> SandboxView | None:
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None:
         if name in self.sandbox_gets:
             self.sandbox_gets[name] += 1
             if self.sandbox_gets[name] >= self.sandbox_gone_after_gets:
@@ -2314,9 +2291,7 @@ def test_eval_suite_waits_until_the_released_claim_is_gone(monkeypatch) -> None:
     monkeypatch.setattr(stream_module, "run_eval_suite", _skip_suite)
     fake_k8s = _DelayedDeleteK8s(claim_gone_after_gets=2, sandbox_gone_after_gets=4)
     sandbox_prefix = f"test:curie:sandbox:{uuid.uuid4().hex}"
-    sync_client = redis.Redis(
-        host=_VH, port=_VP, password=_VPW or None, decode_responses=False
-    )
+    sync_client = redis.Redis(host=_VH, port=_VP, password=_VPW or None, decode_responses=False)
     pressure_client = AsyncRedis(
         host=_VH,
         port=_VP,
@@ -2479,9 +2454,7 @@ def test_eval_threads_sample_config_from_env_into_run_eval_suite(
 
     asyncio.run(go())
 
-    assert captured["samples"] == SampleConfig(
-        n=3, policy=AggregationPolicy.MAJORITY, k=1
-    )
+    assert captured["samples"] == SampleConfig(n=3, policy=AggregationPolicy.MAJORITY, k=1)
 
 
 @pytest.mark.parametrize("fake_model", [True, False])
@@ -2704,8 +2677,7 @@ def test_bundle_trajectory_sidecar_scores_observed_calls_instead_of_text(
                 "wrong": ["fetch", "search"],
             }
             cases_payload = (
-                json.dumps(suite.model_dump(mode="json"), indent=2, sort_keys=True)
-                + "\n"
+                json.dumps(suite.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
             ).encode("utf-8")
             sidecar = _trajectory_sidecar(
                 [
@@ -2748,8 +2720,7 @@ def test_bundle_trajectory_sidecar_scores_observed_calls_instead_of_text(
             assert by_id["right_order"].detail is None
             assert by_id["wrong_order"].outcome is EvalOutcome.FAIL
             assert by_id["wrong_order"].detail == (
-                "mode=exact expected=['search', 'fetch'] "
-                "observed=['fetch', 'search']"
+                "mode=exact expected=['search', 'fetch'] observed=['fetch', 'search']"
             )
             assert by_id["wrong_order"].error is None
             assert reporter.reports[0].passed_count == 1
@@ -3180,11 +3151,7 @@ def test_stream_records_the_trigger_identity_and_selected_trajectory_scorer(
                         params={"tags": f"version:{sha}"},
                         auth=(cfg.langfuse_public_key, cfg.langfuse_secret_key),
                     )
-                    traces = (
-                        response.json().get("data", [])
-                        if response.status_code == 200
-                        else []
-                    )
+                    traces = response.json().get("data", []) if response.status_code == 200 else []
                     if traces:
                         trace = traces[0]
                         break
@@ -3250,9 +3217,7 @@ def _lease_result(entry_id: str) -> EvalRunResult:
         suite="lease",
         stream_id=entry_id,
         results=[
-            EvalCaseResult(
-                case_id="1", outcome=EvalOutcome.PASS, output="ok", latency_ms=1.0
-            )
+            EvalCaseResult(case_id="1", outcome=EvalOutcome.PASS, output="ok", latency_ms=1.0)
         ],
     )
 
@@ -3345,9 +3310,7 @@ def test_eval_a_second_replica_is_refused_while_the_first_holds_a_live_lease() -
         client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
         store = DeliveryLeaseStore(client, cfg)
         held = _HeldSuiteRun()
-        consumer_a = _lease_consumer(
-            redis_client=client, cfg=cfg_a, leases=store, suite_run=held
-        )
+        consumer_a = _lease_consumer(redis_client=client, cfg=cfg_a, leases=store, suite_run=held)
         consumer_b = _lease_consumer(
             redis_client=client, cfg=cfg_b, leases=store, suite_run=_instant_suite_run
         )
@@ -3400,9 +3363,7 @@ def test_eval_a_running_suite_holds_its_lease_without_burning_a_delivery() -> No
         client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
         store = DeliveryLeaseStore(client, cfg)
         held = _HeldSuiteRun()
-        consumer = _lease_consumer(
-            redis_client=client, cfg=cfg, leases=store, suite_run=held
-        )
+        consumer = _lease_consumer(redis_client=client, cfg=cfg, leases=store, suite_run=held)
         await consumer.ensure_group()
 
         await _eval_payload(client, cfg, sha=f"sha-{token}")
@@ -3422,9 +3383,9 @@ def test_eval_a_running_suite_holds_its_lease_without_burning_a_delivery() -> No
 
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline:
-            assert await store.is_live(
-                cfg.eval_stream, cfg.eval_consumer_group, renewed_id
-            ), "a running eval lost its lease: the heartbeat is not renewing"
+            assert await store.is_live(cfg.eval_stream, cfg.eval_consumer_group, renewed_id), (
+                "a running eval lost its lease: the heartbeat is not renewing"
+            )
             await asyncio.sleep(0.1)
 
         assert (
@@ -3464,9 +3425,7 @@ def test_eval_a_dead_owners_entry_transfers_only_after_expiry() -> None:
         client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
         store = DeliveryLeaseStore(client, cfg)
         held = _HeldSuiteRun()
-        consumer = _lease_consumer(
-            redis_client=client, cfg=cfg, leases=store, suite_run=held
-        )
+        consumer = _lease_consumer(redis_client=client, cfg=cfg, leases=store, suite_run=held)
         await consumer.ensure_group()
 
         await _eval_payload(client, cfg, sha=f"sha-{token}")
@@ -3529,9 +3488,7 @@ def test_eval_a_live_lease_holds_off_the_delivery_cap() -> None:
 
         await _eval_payload(client, cfg, sha=f"sha-{token}")
         entry_id, _fields = await _eval_read_one(client, cfg, "peer-eval")
-        await client.xclaim(
-            cfg.eval_stream, cfg.eval_consumer_group, "peer-eval", 0, [entry_id]
-        )
+        await client.xclaim(cfg.eval_stream, cfg.eval_consumer_group, "peer-eval", 0, [entry_id])
         assert (await _eval_pending(client, cfg))[entry_id] >= cfg.max_delivery
 
         lease = await store.acquire(
@@ -3551,7 +3508,10 @@ def test_eval_a_live_lease_holds_off_the_delivery_cap() -> None:
         # dead-lettered on the next pass.
         assert (
             await store.release(
-                cfg.eval_stream, cfg.eval_consumer_group, entry_id, owner=lease.owner,
+                cfg.eval_stream,
+                cfg.eval_consumer_group,
+                entry_id,
+                owner=lease.owner,
                 resume_event_id=None,
             )
             is True
@@ -3579,20 +3539,20 @@ def test_eval_request_stop_stops_the_read_loop_but_never_the_heartbeat() -> None
     ``_inflight`` wait (its handler is awaited INLINE inside ``_consume``), which
     is exactly why this twin exists instead of a shared body with the runs lane.
 
-    The negative control is the sibling lease that is never renewed: it expires
-    across the same post-stop window.
+    Six advances of the held lease's absolute server expiry prove post-stop
+    renewal under a 300s TTL that tolerates runner stalls. The negative control
+    is the sibling lease that is never renewed: its expiry never moves later
+    across the same post-stop window, even if the sibling has already expired.
     """
     from curie_worker.delivery_lease import DeliveryLeaseStore
 
     async def go() -> None:
         token = uuid.uuid4().hex[:8]
-        cfg = _lease_cfg(token)
+        cfg = _lease_cfg(token, delivery_lease_ttl_s=300.0)
         client = AsyncRedis(host=_VH, port=_VP, password=_VPW, decode_responses=True)
         store = DeliveryLeaseStore(client, cfg)
         held = _HeldSuiteRun()
-        consumer = _lease_consumer(
-            redis_client=client, cfg=cfg, leases=store, suite_run=held
-        )
+        consumer = _lease_consumer(redis_client=client, cfg=cfg, leases=store, suite_run=held)
         await consumer.ensure_group()
 
         await _eval_payload(client, cfg, sha=f"sha-{token}")
@@ -3608,28 +3568,39 @@ def test_eval_request_stop_stops_the_read_loop_but_never_the_heartbeat() -> None
             sibling_id,
             consumer=cfg.eval_consumer_name,
         )
+        held_key = cfg.delivery_lease_key(cfg.eval_stream, cfg.eval_consumer_group, entry_id)
+        sibling_key = cfg.delivery_lease_key(cfg.eval_stream, cfg.eval_consumer_group, sibling_id)
+        sibling_expiry = await client.pexpiretime(sibling_key)
+        assert sibling_expiry > 0
 
         consumer.request_stop()
         late_id = await _eval_payload(client, cfg, sha=f"late-{token}")
+        expiry = await client.pexpiretime(held_key)
+        assert expiry > 0
 
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            assert await store.is_live(
-                cfg.eval_stream, cfg.eval_consumer_group, entry_id
-            ), "request_stop() dropped the in-flight lease: the drain cannot finish"
-            await asyncio.sleep(0.1)
-
-        assert (
-            await store.is_live(cfg.eval_stream, cfg.eval_consumer_group, sibling_id) is False
-        ), "the un-renewed sibling never expired, so the survival above is vacuous"
+        for _ in range(6):
+            deadline = time.monotonic() + 10.0
+            while True:
+                renewed_expiry = await client.pexpiretime(held_key)
+                assert renewed_expiry > 0, (
+                    "request_stop() dropped the in-flight lease: the drain cannot finish"
+                )
+                if renewed_expiry > expiry:
+                    expiry = renewed_expiry
+                    break
+                assert time.monotonic() < deadline, (
+                    "request_stop() stopped renewing the in-flight lease"
+                )
+                await asyncio.sleep(0.05)
+            assert await client.pexpiretime(sibling_key) <= sibling_expiry, (
+                "the un-renewed sibling's expiry moved later"
+            )
         assert held.runs == [entry_id], "the read loop took a new entry after request_stop()"
         assert late_id not in await _eval_pending(client, cfg)
 
         held.hold.set()
         await asyncio.wait_for(task, timeout=10.0)
-        assert entry_id not in await _eval_pending(client, cfg), (
-            "the drained eval never acked"
-        )
+        assert entry_id not in await _eval_pending(client, cfg), "the drained eval never acked"
         await _eval_cleanup(client, cfg)
 
     asyncio.run(go())
@@ -4016,9 +3987,7 @@ def test_eval_a_suite_is_cut_short_at_the_deliverys_remaining_budget(
         assert slow.started.is_set(), (
             "the suite never started, so 'it did not complete' proves nothing"
         )
-        assert not slow.completed.is_set(), (
-            "the suite ran to completion past its delivery deadline"
-        )
+        assert not slow.completed.is_set(), "the suite ran to completion past its delivery deadline"
         assert elapsed < 4.0, (
             f"the suite ran {elapsed:.1f}s on 0.5s of remaining budget; it was not "
             "bounded at roughly the budget"

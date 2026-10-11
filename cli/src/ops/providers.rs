@@ -3,6 +3,7 @@
 //! is opened to.
 
 use anyhow::{bail, Context, Result};
+#[cfg(debug_assertions)]
 use std::collections::BTreeMap;
 
 #[allow(unused_imports)]

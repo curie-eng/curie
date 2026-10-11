@@ -22,7 +22,8 @@
 //! channel, or real Slack HTTP on the CLI side.
 
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path, State};
@@ -870,21 +871,147 @@ pub fn continue_hint_long_line(verb: &str, channel: &str, thread_ts: &str) -> St
 
 /// Resolve the channel and timestamps for a turn: an explicit `--channel` is
 /// carried verbatim (so the worker's exact-equality binding can route to a
-/// deployed agent) and an explicit `--thread` continues that thread; each falls
+/// deployed agent) and an explicit `--thread` is continued verbatim; each falls
 /// back to a fresh synthetic value when absent. The placeholder ts is always
-/// synthetic (the CLI owns the placeholder message). Returns
+/// synthetic (the CLI owns the placeholder message). Automatic allocation mixes
+/// a per-process identity into the clock read, so independent processes reading
+/// the same clock value get distinct conversations (#4311). The ts keeps
+/// Slack's `<secs>.<6 digit>` shape, and successive calls in one process stay
+/// distinct because the micros advance. Returns
 /// `(channel, thread_ts, placeholder_ts)`.
 pub fn resolve_targets(channel: Option<&str>, thread: Option<&str>) -> (String, String, String) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after the epoch");
+    resolve_targets_at(channel, thread, now, process_thread_identity())
+}
+
+/// The pure core of [`resolve_targets`], with the clock read and the process
+/// identity passed in so a test can pin both. The thread ts is
+/// `<secs>.<frac>` where `frac` is the clock's micros plus `identity`, modulo a
+/// million and zero padded to six digits; the placeholder ts is the next
+/// micro after it. Returns `(channel, thread_ts, placeholder_ts)`.
+fn resolve_targets_at(
+    channel: Option<&str>,
+    thread: Option<&str>,
+    now: Duration,
+    identity: u32,
+) -> (String, String, String) {
     let channel = channel.map_or_else(synthetic_channel, str::to_string);
-    let (synthetic_thread_ts, placeholder_ts) = synthetic_thread_and_placeholder();
-    let thread_ts = thread.map_or(synthetic_thread_ts, str::to_string);
+    let secs = now.as_secs();
+    let frac = (u64::from(now.subsec_micros()) + u64::from(identity)) % 1_000_000;
+    let thread_ts = thread.map_or_else(|| format!("{secs}.{frac:06}"), str::to_string);
+    let placeholder_ts = format!("{secs}.{:06}", (frac + 1) % 1_000_000);
     (channel, thread_ts, placeholder_ts)
+}
+
+/// A value drawn once per process and mixed into automatic thread allocation,
+/// so two processes that read the same clock value still land on different
+/// thread timestamps (#4311). It is below one million so it fits the six digit
+/// fraction of a Slack ts.
+fn process_thread_identity() -> u32 {
+    static IDENTITY: OnceLock<u32> = OnceLock::new();
+    *IDENTITY.get_or_init(|| (uuid::Uuid::new_v4().as_u128() % 1_000_000) as u32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    /// Split a Slack-shaped `<secs>.<micros>` ts into its two fields.
+    fn ts_fields(ts: &str) -> (u64, &str) {
+        let (secs, micros) = ts.split_once('.').expect("dot separator");
+        assert_eq!(micros.len(), 6, "micros width: {ts}");
+        assert!(
+            micros.bytes().all(|b| b.is_ascii_digit()),
+            "micros digits: {ts}"
+        );
+        (secs.parse().expect("integer seconds"), micros)
+    }
+
+    /// #4311: three processes that omit `--thread` and read the SAME wall-clock
+    /// value must still land in three conversations. Before the fix the thread
+    /// ts was a pure function of the clock, so identical reads shared one
+    /// conversation. The clock is injected so the collision is reproduced
+    /// exactly instead of hoped for; only the process identity differs.
+    #[test]
+    fn automatic_thread_identity_is_distinct_per_process_at_one_clock_value() {
+        let now = Duration::new(1_760_000_000, 123_456_000);
+        let identities = [7_u32, 424_242, 999_999];
+        let allocated: Vec<(String, String, String)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = identities
+                .iter()
+                .map(|&identity| {
+                    scope.spawn(move || resolve_targets_at(Some("C0EXAMPLE1"), None, now, identity))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("allocation thread"))
+                .collect()
+        });
+
+        let threads: std::collections::BTreeSet<&str> = allocated
+            .iter()
+            .map(|(_, thread, _)| thread.as_str())
+            .collect();
+        assert_eq!(
+            threads.len(),
+            identities.len(),
+            "one clock value must still yield one conversation per process: {allocated:?}"
+        );
+        for (channel, thread, placeholder) in &allocated {
+            assert_eq!(
+                channel, "C0EXAMPLE1",
+                "an explicit channel is carried verbatim"
+            );
+            assert_ne!(
+                thread, placeholder,
+                "the placeholder never names the thread"
+            );
+            let (secs, _) = ts_fields(thread);
+            assert_eq!(
+                secs,
+                now.as_secs(),
+                "the thread keeps the clock's seconds: {thread}"
+            );
+            ts_fields(placeholder);
+        }
+    }
+
+    /// The neighbouring behaviour the fix must keep: an explicit `--thread`
+    /// continues exactly that conversation whatever the clock or process
+    /// identity, and one process allocating twice at two clock reads still
+    /// gets two conversations (the `skill eval` per-sample threads, #550).
+    #[test]
+    fn automatic_thread_identity_keeps_explicit_threads_and_in_process_order() {
+        let now = Duration::new(1_760_000_000, 123_456_000);
+        for identity in [0_u32, 7, 999_999] {
+            let (_, thread, placeholder) =
+                resolve_targets_at(Some("C0EXAMPLE1"), Some("1720000000.000100"), now, identity);
+            assert_eq!(
+                thread, "1720000000.000100",
+                "explicit --thread is continued verbatim"
+            );
+            assert_ne!(placeholder, thread);
+        }
+
+        let later = now + Duration::from_micros(1);
+        let (_, first, _) = resolve_targets_at(Some("C0EXAMPLE1"), None, now, 7);
+        let (_, second, _) = resolve_targets_at(Some("C0EXAMPLE1"), None, later, 7);
+        assert_ne!(
+            first, second,
+            "successive reads in one process stay distinct"
+        );
+
+        // With no channel the synthetic channel is still minted.
+        let (channel, _, _) = resolve_targets_at(None, None, now, 7);
+        assert!(
+            channel.starts_with("C-SIM-"),
+            "synthetic channel: {channel}"
+        );
+    }
 
     /// The frozen action-id vector, parsed strictly. `deny_unknown_fields` is
     /// the whole point: a key this lane cannot see would pass vacuously, which
