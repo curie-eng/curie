@@ -77,6 +77,12 @@ def test_complete_runner_and_docker_load_through_settings(
     assert config == load_forges_json(json.dumps(doc))
 
 
+def test_chart_runner_tools_match_the_catalog_contract() -> None:
+    schema = json.loads((ROOT / "charts/curie/values.schema.json").read_text())
+    tools = schema["definitions"]["repositoryRunner"]["properties"]["tools"]["items"]["enum"]
+    assert set(tools) == set(CATALOG_TOOLS)
+
+
 @pytest.mark.parametrize(
     "changes",
     [

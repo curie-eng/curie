@@ -105,3 +105,9 @@ def test_model_refuses_invalid_cidr() -> None:
     entry = _entry(egress=[{"cidr": "invalid", "ports": [{"protocol": "TCP", "port": 443}]}])
     with pytest.raises(ValidationError):
         RepoRunnerPools.model_validate({"acme-corp/api": entry})
+
+
+def test_model_refuses_malformed_json() -> None:
+    with pytest.raises(ValidationError) as error:
+        RepoRunnerPools.model_validate_json('{"acme-corp/api":')
+    assert error.value.errors(include_input=False)[0]["type"] == "json_invalid"
