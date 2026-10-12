@@ -1048,8 +1048,15 @@ The inventory scans at most eight pages with a SCAN `COUNT` hint of 8192,
 roughly 65,000 keys in the whole logical database. `COUNT` is approximate. A
 separate limit counts at most 256 matching route keys before filtering, so
 suspended routes count toward it, and at most four candidates are probed.
-Candidates are probed idle eval routes first (conversation ids with the `eval:`
-isolate prefix), then every other route, each group in expiry order. A
+Each worker selects a bounded window of routes not yet selected in its current
+inventory cycle. Idle eval routes come first (conversation ids with the `eval:`
+isolate prefix), then every other route, each group in expiry order. Selected
+thread identities survive expiry changes and are forgotten when absent from a
+complete inventory. After every remaining route has been selected, the next
+pass starts a new cycle. Selection advances before candidate I/O, so concurrent
+passes and unreadable old routes do not repeatedly occupy the same four slots.
+This scheduling state grants no deletion authority; locked runner status and
+fenced route checks still decide whether a route can be reclaimed. A
 database outside either finite window fails closed. Alert on
 `curie.sandbox.lifecycle` with `operation=reclaim` and
 `outcome=scan-incomplete`. Redis or Valkey before 7.0 does not support
