@@ -87,15 +87,17 @@ class JiraSite:
 def load_site(environ: Mapping[str, str]) -> JiraSite:
     """The site facts from the env file CURIE_FACTORY_JIRA_ENV_FILE names.
 
-    A missing variable, file or key is a ConfigError naming the variable or
-    the key, never a value.
+    A token file path is read relative to the env file's own directory (an
+    absolute path stays as written). A missing variable, file or key is a
+    ConfigError naming the variable or the key, never a value.
     """
 
     named = environ.get(ENV_FILE_VAR)
     if not named:
         raise fe.ConfigError(f"{ENV_FILE_VAR} must name the Jira test site env file")
+    env_file = Path(named)
     try:
-        text = Path(named).read_text()
+        text = env_file.read_text()
     except OSError as exc:
         raise fe.ConfigError(f"{ENV_FILE_VAR} names an unreadable file: {exc.strerror}") from None
     facts: dict[str, str] = {}
@@ -115,10 +117,10 @@ def load_site(environ: Mapping[str, str]) -> JiraSite:
         cloud_id=facts["cloud_id"],
         project_key=facts["project_key"],
         labeler_email=facts["labeler_email"],
-        labeler_token_file=Path(facts["labeler_token_file"]),
+        labeler_token_file=env_file.parent / facts["labeler_token_file"],
         bot_email=facts["bot_email"],
         bot_account_id=facts["bot_account_id"],
-        bot_token_file=Path(facts["bot_token_file"]),
+        bot_token_file=env_file.parent / facts["bot_token_file"],
     )
 
 

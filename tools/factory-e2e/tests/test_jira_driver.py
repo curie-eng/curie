@@ -647,6 +647,24 @@ def test_site_facts_come_only_from_the_named_env_file(tmp_path: Path) -> None:
     _no_secret(repr(site), "the site facts repr")
 
 
+def test_site_token_files_named_relatively_are_read_beside_the_env_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The operator's env file names its token files relative to itself; the
+    # harness runs from the repository root, not from that directory.
+    path = _env_file(tmp_path / "site")
+    text = path.read_text()
+    text = text.replace(str(tmp_path / "site" / "labeler-token"), "labeler-token")
+    text = text.replace(str(tmp_path / "site" / "bot-token"), "bot-token")
+    path.write_text(text)
+    monkeypatch.chdir(tmp_path)
+
+    site = _jira_module().load_site({"CURIE_FACTORY_JIRA_ENV_FILE": str(path)})
+
+    assert site.labeler_token_file == tmp_path / "site" / "labeler-token"
+    assert site.bot_token_file == tmp_path / "site" / "bot-token"
+
+
 def test_site_facts_without_the_env_var_are_a_config_error() -> None:
     with pytest.raises(fe.ConfigError, match="CURIE_FACTORY_JIRA_ENV_FILE"):
         _jira_module().load_site({})
