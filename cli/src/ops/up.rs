@@ -5744,6 +5744,23 @@ async fn run_prepared_up(
     let gvisor_preflight_job = gvisor_preflight
         .as_ref()
         .map(|preflight| preflight.job_name.clone());
+    {
+        let mut args = vec![
+            plain("template"),
+            plain(&opts.common.release),
+            plain(&opts.chart),
+            plain("-n"),
+            plain(&opts.common.namespace),
+        ];
+        value_plan.append_command_args(&mut args);
+        super::capacity::preflight(
+            OpsCommand::new("helm", args),
+            &opts.common,
+            existing.is_some(),
+            ui,
+        )
+        .await;
+    }
     let cl = ui.checklist();
     let label = format!("installing release {}", opts.common.release);
     // A failed-only history is not an upgrade target: `helm upgrade --install`
