@@ -174,17 +174,62 @@ def verdict(preflight_outcome: str, publication_paths: list[str]) -> int:
     return 0
 
 
-def free_registry_port() -> int:
-    """Return a free loopback port below the kernel's ephemeral range."""
+def docker_engine_is_local(docker_host: str | None) -> bool:
+    """A unix socket or an unset host is this machine. ssh and tcp are not."""
 
-    for port in random.sample(range(20000, 32000), 50):
-        with socket.socket() as sock:
-            try:
-                sock.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            return port
-    raise ScriptedScenarioError("no free loopback port for the run registry")
+    if not docker_host:
+        return True
+    return docker_host.startswith("unix://")
+
+
+def in_process_callback_host(
+    *, docker_host: str | None, stub_host: str | None, gateway: str
+) -> str:
+    """Address kind pods use to reach servers running in this process.
+
+    On a local engine that address is the kind-network gateway. On a remote
+    engine the gateway is an address on the engine host, so the servers bind
+    CURIE_LOCAL_STUB_HOST instead and the chart egress rules name that IP.
+    """
+
+    if docker_engine_is_local(docker_host):
+        return gateway
+    if not stub_host:
+        raise ScriptedScenarioError(
+            "a remote Docker engine requires CURIE_LOCAL_STUB_HOST so kind pods "
+            "can reach the in-process fixture servers"
+        )
+    try:
+        address = ipaddress.ip_address(stub_host)
+    except ValueError:
+        raise ScriptedScenarioError(
+            "CURIE_LOCAL_STUB_HOST must be an IP address"
+        ) from None
+    if address.version != 4:
+        raise ScriptedScenarioError("CURIE_LOCAL_STUB_HOST must be an IPv4 address")
+    return str(address)
+
+
+def registry_port_candidates() -> list[int]:
+    """Ports below the kernel ephemeral range, in a random order."""
+
+    return random.sample(range(20000, 32000), 50)
+
+
+def client_loopback_port_is_free(port: int) -> bool:
+    """The CLI and the port forwarder reach the registry through this machine."""
+
+    with socket.socket() as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def registry_bind_rejected(detail: str) -> bool:
+    text = detail.casefold()
+    return "address already in use" in text or "port is already allocated" in text
 
 
 class ScriptedRun:
@@ -471,23 +516,11 @@ class ScriptedRun:
         # Docker can reassign an ephemeral published port when the registry
         # later joins the kind network, which strands the mirror key and the
         # push address. An explicit port below the ephemeral range stays put.
-        registry_port = free_registry_port()
-        self.registry_attempted = True
-        self.command(
-            "docker",
-            "run",
-            "-d",
-            "--name",
-            self.registry,
-            "--label",
-            f"curie.factory-scripted={self.run_id}",
-            "-p",
-            f"127.0.0.1:{registry_port}:5000",
-            "mirror.gcr.io/library/registry:2",
-            timeout=300,
-        )
-        registry_ref = f"localhost:{registry_port}"
-        self.registry_ref = registry_ref
+        # The publish address stays the engine loopback: the daemon pushes to
+        # it, and containerd pulls through the mirror of that same name. The
+        # port also has to be free here so imagetools and the port forwarder
+        # can open localhost:<port> when the engine is another machine.
+        registry_port, registry_ref = self.start_registry()
         config = self.workdir / "kind.yaml"
         config.write_text(
             "kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\n"
@@ -522,6 +555,11 @@ class ScriptedRun:
                 for item in network["IPAM"]["Config"]
                 if item.get("Gateway") and ipaddress.ip_address(item["Gateway"]).version == 4
             )
+        callback = in_process_callback_host(
+            docker_host=self.env.get("DOCKER_HOST"),
+            stub_host=self.env.get("CURIE_LOCAL_STUB_HOST"),
+            gateway=gateway,
+        )
         # Loading separately bounds kind's temporary Docker export to one
         # image rather than a tar archive of all four candidate images.
         for image in IMAGES:
@@ -542,7 +580,7 @@ class ScriptedRun:
         self.stub = github.GithubStub(
             self.workdir / "github",
             recording,
-            host=gateway,
+            host=callback,
             seed_tree=FIXTURE,
             issue_file=ISSUE,
         )
@@ -553,7 +591,7 @@ class ScriptedRun:
         issue["labels"] = []
         self.stub._put("issue", 3815, issue)
         self.model = model.ModelScript(
-            Path(self.args.transcript), record=self.args.record, host=gateway
+            Path(self.args.transcript), record=self.args.record, host=callback
         )
         if self.args.record:
             self.count_recording_requests(model)
@@ -679,6 +717,36 @@ class ScriptedRun:
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
         self.wait_for_final()
         self.observe()
+
+    def start_registry(self) -> tuple[int, str]:
+        """Publish the run registry on the engine loopback and name it localhost."""
+
+        self.registry_attempted = True
+        for port in registry_port_candidates():
+            if not client_loopback_port_is_free(port):
+                continue
+            try:
+                self.command(
+                    "docker",
+                    "run",
+                    "-d",
+                    "--name",
+                    self.registry,
+                    "--label",
+                    f"curie.factory-scripted={self.run_id}",
+                    "-p",
+                    f"127.0.0.1:{port}:5000",
+                    "mirror.gcr.io/library/registry:2",
+                    timeout=300,
+                )
+            except ScriptedScenarioError as exc:
+                if registry_bind_rejected(str(exc)):
+                    continue
+                raise
+            registry_ref = f"localhost:{port}"
+            self.registry_ref = registry_ref
+            return port, registry_ref
+        raise ScriptedScenarioError("no free loopback port for the run registry")
 
     def deploy(self, registry_ref: str) -> None:
         assert self.workdir is not None

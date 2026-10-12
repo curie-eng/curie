@@ -1,6 +1,14 @@
 //! Binary integration contract for the gVisor preflight diagnosis in issue
-//! #1653. Every case drives the real `curie cluster up` entrypoint with fake
-//! Helm and kubectl executables on PATH.
+//! #1653 and the scheduling lookup in #4411. Every case drives the real
+//! `curie cluster up` or `curie apply` entrypoint with fake Helm and kubectl
+//! executables on PATH.
+//!
+//! RuntimeClass scheduling.nodeSelector is defined by Kubernetes:
+//! https://kubernetes.io/docs/concepts/containers/runtime-class/#scheduling
+//! Events use reason and involvedObject from the v1 Event API:
+//! https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/event-v1/
+//! The empty `kubectl get nodes -l <selector> -o name` response and the
+//! RuntimeClass JSON shape were also observed on disposable kind in #4411.
 
 use crate::support::executable as test_executable;
 
@@ -15,6 +23,8 @@ const TARGET_NAMESPACE: &str = "target-namespace";
 const RENDERED_JOB: &str = "acme-runtime-preflight-gvisor";
 const RUNTIME_CLASS_REJECTION: &str = "Error creating: pods \"acme-runtime-preflight-gvisor-example\" is forbidden: pod rejected: RuntimeClass \"gvisor\" not found";
 const OPENROUTER_CREDENTIAL: &str = "sk-or-v1-PLACEHOLDER";
+const GVISOR_NODE_SELECTOR: &str = "sandbox.gke.io/runtime=gvisor";
+const SCHEDULING_EVENT_MESSAGE: &str = "SENSITIVE_EVENT_MESSAGE_MUST_NOT_APPEAR";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_curie")
@@ -27,7 +37,19 @@ fn chart() -> &'static str {
 fn install_converged_stub(dir: &Path, name: &str, body: &str) {
     let body = if matches!(name, "helm" | "kubectl") {
         format!(
-            "#!/bin/sh\n{}\n{}",
+            "#!/bin/sh\n{}\n{}\n{}",
+            r#"case "$CURIE_TEST_EVENT_MODE" in
+    failed-scheduling*|deadline-no-events|scheduling-events-*)
+        if [ ! -e "$CURIE_TEST_HELM_SUCCESS" ] && [ "${0##*/}" = "helm" ] && [ "$1" = "status" ]; then
+            printf '%s\n' '{"version":1,"info":{"status":"failed"},"hooks":[{"name":"acme-runtime-preflight-gvisor","kind":"Job","events":["pre-install","pre-upgrade"],"manifest":"apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: acme-runtime-preflight-gvisor\n  namespace: target-namespace\nspec:\n  template:\n    spec:\n      containers:\n        - name: probe\n          image: busybox:1\n"}]}'
+            exit 0
+        fi
+        if [ ! -e "$CURIE_TEST_HELM_SUCCESS" ] && [ "${0##*/}" = "kubectl" ] && [ "$1" = "get" ] && [ "$2" = "deployments,statefulsets,daemonsets,pods,jobs" ]; then
+            printf '%s\n' '{"items":[{"apiVersion":"batch/v1","kind":"Job","metadata":{"name":"acme-runtime-preflight-gvisor","namespace":"target-namespace"},"status":{"conditions":[{"type":"Failed","status":"True","reason":"DeadlineExceeded"}]}}]}'
+            exit 0
+        fi
+        ;;
+esac"#,
             include_str!("data/converged-installation-read.sh"),
             body.strip_prefix("#!/bin/sh\n").unwrap_or(body)
         )
@@ -46,6 +68,7 @@ struct Fixture {
     helm_sequence: PathBuf,
     event_log: PathBuf,
     helm_pid: PathBuf,
+    helm_success: PathBuf,
     helm_termination_log: PathBuf,
     helm_pending: PathBuf,
     namespace_ready: PathBuf,
@@ -53,6 +76,7 @@ struct Fixture {
     watch_pid: PathBuf,
     event_emitted: PathBuf,
     runtimeclass_log: PathBuf,
+    nodes_log: PathBuf,
     event_mode: String,
     singleton_mode: String,
     credential: String,
@@ -76,6 +100,7 @@ impl Fixture {
         let helm_sequence = temp.path().join("helm-sequence.log");
         let event_log = temp.path().join("event-queries.log");
         let helm_pid = temp.path().join("helm.pid");
+        let helm_success = temp.path().join("helm-success");
         let helm_termination_log = temp.path().join("helm-termination.log");
         let helm_pending = temp.path().join("helm-pending");
         let namespace_ready = temp.path().join("namespace-ready");
@@ -83,6 +108,7 @@ impl Fixture {
         let watch_pid = temp.path().join("watch.pid");
         let event_emitted = temp.path().join("event-emitted");
         let runtimeclass_log = temp.path().join("runtimeclass.log");
+        let nodes_log = temp.path().join("nodes.log");
 
         install_converged_stub(
             &bin_dir,
@@ -213,6 +239,7 @@ if [ "$1" = "template" ]; then
 fi
 
 if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
+    rm -f "$CURIE_TEST_HELM_SUCCESS"
     printf '%s\n' "$*" >> "$CURIE_TEST_UPGRADE_LOG"
     printf '%s\n' "$*" >> "$CURIE_TEST_HELM_SEQUENCE"
     printf '%s\n' "$$" > "$CURIE_TEST_HELM_PID"
@@ -261,7 +288,17 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
         printf '%s\n' 'Error: UPGRADE FAILED: pre-upgrade hooks failed: job target-release-upgrade-drain failed: secret not found' >&2
         exit 1
     fi
+    case "$CURIE_TEST_EVENT_MODE" in
+        failed-scheduling*|deadline-no-events|scheduling-events-*)
+            if [ "$gvisor_mode" != "off" ]; then
+                sleep 1
+                printf '%s\n' 'Error: UPGRADE FAILED: pre-install hooks failed: job acme-runtime-preflight-gvisor failed: DeadlineExceeded' >&2
+                exit 1
+            fi
+            ;;
+    esac
     sleep 1
+    : > "$CURIE_TEST_HELM_SUCCESS"
     printf '%s\n' 'Release installed'
     exit 0
 fi
@@ -404,6 +441,35 @@ if [ "$1" = "get" ] && { [ "$2" = "event" ] || [ "$2" = "events" ]; }; then
         *)
             printf 'event query was not namespaced to the release or controller namespace: %s\n' "$*" >&2
             exit 64
+            ;;
+    esac
+    case " $* " in
+        *reason=FailedScheduling*)
+            case " $* " in
+                *" -n target-namespace "*) ;;
+                *) exit 64 ;;
+            esac
+            case " $* " in
+                *" -o json "*) ;;
+                *) exit 64 ;;
+            esac
+            case "$CURIE_TEST_EVENT_MODE" in
+                failed-scheduling)
+                    printf '%s\n' '{"apiVersion":"v1","kind":"EventList","items":[{"involvedObject":{"kind":"Pod","namespace":"target-namespace","name":"acme-runtime-preflight-gvisor-example"},"reason":"FailedScheduling","message":"SENSITIVE_EVENT_MESSAGE_MUST_NOT_APPEAR"}]}'
+                    ;;
+                failed-scheduling-unrelated)
+                    printf '%s\n' '{"apiVersion":"v1","kind":"EventList","items":[{"involvedObject":{"kind":"ReplicaSet","name":"acme-runtime-preflight-gvisor-example"},"reason":"FailedScheduling"},{"involvedObject":{"kind":"Pod","name":"acme-runtime-preflight-gvisorother-example"},"reason":"FailedScheduling"},{"involvedObject":{"kind":"Pod","name":"other-preflight-example"},"reason":"FailedScheduling"},{"involvedObject":{"kind":"Pod","name":"acme-runtime-preflight-gvisor-example"},"reason":"FailedCreate"}]}'
+                    ;;
+                scheduling-events-forbidden)
+                    printf '%s\n' 'Error from server (Forbidden): events is forbidden in target-namespace' >&2
+                    exit 1
+                    ;;
+                scheduling-events-malformed)
+                    printf '%s\n' 'invalid event JSON'
+                    ;;
+                *) printf '%s\n' '{"apiVersion":"v1","kind":"EventList","items":[]}' ;;
+            esac
+            exit 0
             ;;
     esac
     case " $* " in
@@ -594,11 +660,52 @@ if [ "$1" = "get" ] && [ "$2" = "runtimeclass" ]; then
             printf '{"apiVersion":"node.k8s.io/v1","kind":"RuntimeClass","metadata":{"name":"%s"},"handler":"runsc"}\n' "$name"
             exit 0
             ;;
+        unschedulable|schedulable|node-list-forbidden|node-list-failed)
+            printf '{"apiVersion":"node.k8s.io/v1","kind":"RuntimeClass","metadata":{"name":"%s"},"handler":"runsc","scheduling":{"nodeSelector":{"sandbox.gke.io/runtime":"gvisor"},"tolerations":[{"key":"sandbox.gke.io/runtime","operator":"Equal","value":"gvisor","effect":"NoSchedule"}]}}\n' "$name"
+            exit 0
+            ;;
+        multiple-selectors)
+            printf '{"apiVersion":"node.k8s.io/v1","kind":"RuntimeClass","metadata":{"name":"%s"},"handler":"runsc","scheduling":{"nodeSelector":{"zone.example.com/name":"sandbox","sandbox.gke.io/runtime":"gvisor"}}}\n' "$name"
+            exit 0
+            ;;
+        empty-selector)
+            printf '{"apiVersion":"node.k8s.io/v1","kind":"RuntimeClass","metadata":{"name":"%s"},"handler":"runsc","scheduling":{"nodeSelector":{}}}\n' "$name"
+            exit 0
+            ;;
         *)
             printf 'unexpected runtimeclass lookup mode: %s\n' "$lookup" >&2
             exit 64
             ;;
     esac
+fi
+
+if [ "$1" = "get" ] && [ "$2" = "nodes" ]; then
+    printf '%s\n' "$*" >> "$CURIE_TEST_NODES_LOG"
+    selector="sandbox.gke.io/runtime=gvisor"
+    if [ "$CURIE_TEST_RUNTIMECLASS_LOOKUP" = "multiple-selectors" ]; then
+        selector="sandbox.gke.io/runtime=gvisor,zone.example.com/name=sandbox"
+    fi
+    if [ "$#" -ne 6 ] || [ "$3" != "-l" ] || [ "$4" != "$selector" ] || [ "$5" != "-o" ] || [ "$6" != "name" ]; then
+        printf 'unexpected selected nodes lookup: %s\n' "$*" >&2
+        exit 64
+    fi
+    case "$CURIE_TEST_RUNTIMECLASS_LOOKUP" in
+        schedulable) printf '%s\n' 'node/acme-sandbox' ;;
+        node-list-forbidden)
+            printf '%s\n' 'Error from server (Forbidden): nodes is forbidden at the cluster scope' >&2
+            exit 1
+            ;;
+        node-list-failed)
+            printf '%s\n' 'Unable to connect to the server: connection refused' >&2
+            exit 1
+            ;;
+        unschedulable|multiple-selectors) ;;
+        *)
+            printf 'unexpected node list lookup mode: %s\n' "$CURIE_TEST_RUNTIMECLASS_LOOKUP" >&2
+            exit 64
+            ;;
+    esac
+    exit 0
 fi
 
 printf 'unexpected kubectl invocation: %s\n' "$*" >&2
@@ -615,6 +722,7 @@ exit 64
             helm_sequence,
             event_log,
             helm_pid,
+            helm_success,
             helm_termination_log,
             helm_pending,
             namespace_ready,
@@ -622,6 +730,7 @@ exit 64
             watch_pid,
             event_emitted,
             runtimeclass_log,
+            nodes_log,
             event_mode: event_mode.to_string(),
             singleton_mode: singleton_mode.to_string(),
             credential: credential.to_string(),
@@ -694,6 +803,7 @@ exit 64
             .env("CURIE_TEST_HISTORY_STATUS", &self.history_status)
             .env("CURIE_TEST_EVENT_LOG", &self.event_log)
             .env("CURIE_TEST_HELM_PID", &self.helm_pid)
+            .env("CURIE_TEST_HELM_SUCCESS", &self.helm_success)
             .env(
                 "CURIE_TEST_HELM_TERMINATION_LOG",
                 &self.helm_termination_log,
@@ -707,6 +817,7 @@ exit 64
             .env("CURIE_TEST_SINGLETON_MODE", &self.singleton_mode)
             .env("CURIE_TEST_RUNTIMECLASS_LOG", &self.runtimeclass_log)
             .env("CURIE_TEST_RUNTIMECLASS_LOOKUP", &self.runtimeclass_lookup)
+            .env("CURIE_TEST_NODES_LOG", &self.nodes_log)
             .env(
                 "CURIE_TEST_PROVIDER_EGRESS_JSON",
                 r#"{"openrouter.ai":["1.1.1.1"],"api.anthropic.com":["8.8.8.8"]}"#,
@@ -732,6 +843,10 @@ exit 64
 
     fn runtimeclass_gets(&self) -> String {
         fs::read_to_string(&self.runtimeclass_log).unwrap_or_default()
+    }
+
+    fn nodes_gets(&self) -> String {
+        fs::read_to_string(&self.nodes_log).unwrap_or_default()
     }
 
     fn uninstall_count(&self) -> usize {
@@ -1704,6 +1819,9 @@ const GVISOR_INFERENCE: &str =
     "inferred that the cluster has no `gvisor` RuntimeClass from admission";
 const GVISOR_LOOKUP_INFERENCE: &str =
     "inferred that the cluster has no `gvisor` RuntimeClass from the RuntimeClass lookup (NotFound)";
+const GVISOR_SCHEDULING_INFERENCE: &str = "inferred that RuntimeClass `gvisor` cannot schedule: no node matches its nodeSelector `sandbox.gke.io/runtime=gvisor` (on GKE, add a GKE Sandbox node pool to keep gVisor); applying `--set security.gvisor.mode=off`";
+const GVISOR_SCHEDULING_DIAGNOSIS: &str = "gVisor preflight Job `acme-runtime-preflight-gvisor` was never scheduled (FailedScheduling): RuntimeClass `gvisor` requires nodes labelled `sandbox.gke.io/runtime=gvisor` and no node has that label; on GKE this means the cluster has no GKE Sandbox node pool";
+const GVISOR_DEADLINE_ERROR: &str = "Helm installation failed; observed rollout reasons: Helm release: latest revision is not deployed; acme-probe: target workload is absent; acme-runtime-preflight-gvisor: DeadlineExceeded";
 
 fn assert_neither_gvisor_inference(shown: &str) {
     assert!(
@@ -1799,6 +1917,276 @@ fn present_runtimeclass_does_not_infer_gvisor_off() {
     );
     assert_neither_gvisor_inference(&shown);
     fixture.assert_children_stopped();
+}
+
+#[test]
+fn unschedulable_runtimeclass_applies_gvisor_off_before_install() {
+    let fixture = Fixture::new("failed-scheduling", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("unschedulable");
+    let (output, _) = fixture.run(&[]);
+    let shown = stderr(&output);
+
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
+    assert!(upgrades.contains("security.gvisor.mode=off"), "{upgrades}");
+    assert!(shown.contains(GVISOR_SCHEDULING_INFERENCE), "{shown}");
+    assert_inference_once(&shown, "--set security.gvisor.mode=off");
+    assert_neither_gvisor_inference(&shown);
+    assert!(!shown.contains("retrying"), "{shown}");
+    assert_eq!(
+        fixture.nodes_gets().trim(),
+        format!("get nodes -l {GVISOR_NODE_SELECTOR} -o name")
+    );
+    fixture.assert_no_event_watch();
+    fixture.assert_no_failed_revision_discard();
+}
+
+#[test]
+fn unschedulable_runtimeclass_inference_uses_sorted_selector_and_rendered_name() {
+    let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("multiple-selectors");
+    let (output, _) = fixture.run(&["--set", "security.gvisor.runtimeClassName=example-class"]);
+    let shown = stderr(&output);
+
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    assert!(
+        shown.contains("inferred that RuntimeClass `example-class` cannot schedule: no node matches its nodeSelector `sandbox.gke.io/runtime=gvisor,zone.example.com/name=sandbox`"),
+        "{shown}"
+    );
+    assert!(
+        fixture
+            .runtimeclass_gets()
+            .contains("get runtimeclass example-class"),
+        "{}",
+        fixture.runtimeclass_gets()
+    );
+    assert_eq!(
+        fixture.nodes_gets().trim(),
+        "get nodes -l sandbox.gke.io/runtime=gvisor,zone.example.com/name=sandbox -o name"
+    );
+}
+
+#[test]
+fn schedulable_runtimeclass_with_node_selector_does_not_infer_gvisor_off() {
+    let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("schedulable");
+    let (output, _) = fixture.run(&[]);
+    let shown = stderr(&output);
+
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
+    assert!(!upgrades.contains("security.gvisor.mode=off"), "{upgrades}");
+    assert!(!shown.contains("cannot schedule"), "{shown}");
+    assert_neither_gvisor_inference(&shown);
+    assert!(!fixture.nodes_gets().is_empty());
+    fixture.assert_children_stopped();
+}
+
+#[test]
+fn unreadable_node_list_does_not_infer_gvisor_off() {
+    for lookup in ["node-list-forbidden", "node-list-failed"] {
+        let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
+            .with_runtimeclass_lookup(lookup);
+        let (output, _) = fixture.run(&[]);
+        let shown = stderr(&output);
+
+        assert!(output.status.success(), "{lookup}: {shown}");
+        assert_eq!(fixture.upgrade_count(), 1);
+        let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
+        assert!(!upgrades.contains("security.gvisor.mode=off"), "{upgrades}");
+        assert!(!shown.contains("cannot schedule"), "{shown}");
+        assert_neither_gvisor_inference(&shown);
+        assert!(
+            !fixture.nodes_gets().is_empty(),
+            "the node read must be attempted"
+        );
+        fixture.assert_children_stopped();
+    }
+}
+
+#[test]
+fn empty_runtimeclass_selector_does_not_query_nodes_or_infer_gvisor_off() {
+    let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("empty-selector");
+    let (output, _) = fixture.run(&[]);
+    let shown = stderr(&output);
+
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    assert!(fixture.nodes_gets().is_empty());
+    assert!(!shown.contains("cannot schedule"), "{shown}");
+    assert_neither_gvisor_inference(&shown);
+    fixture.assert_children_stopped();
+}
+
+#[test]
+fn explicit_auto_with_unschedulable_runtimeclass_is_a_usage_error_before_install() {
+    let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("unschedulable");
+    let (output, _) = fixture.run(&["--set", "security.gvisor.mode=auto"]);
+    let shown = stderr(&output);
+
+    assert_eq!(output.status.code(), Some(2), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 0);
+    assert!(
+        shown.contains("explicit `security.gvisor.mode=auto` contradicts the detected RuntimeClass scheduling: no node matches `gvisor` nodeSelector `sandbox.gke.io/runtime=gvisor`; remove the explicit `security.gvisor.mode=auto` setting and rerun to accept the inferred gVisor posture"),
+        "{shown}"
+    );
+    assert!(!shown.contains("inferred that"), "{shown}");
+    assert!(!shown.contains("retrying"), "{shown}");
+}
+
+#[test]
+fn explicit_require_with_unschedulable_runtimeclass_installs_without_inference() {
+    let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("unschedulable");
+    let (output, _) = fixture.run(&["--set", "security.gvisor.mode=require"]);
+    let shown = stderr(&output);
+
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
+    assert!(
+        upgrades.contains("security.gvisor.mode=require"),
+        "{upgrades}"
+    );
+    assert!(!upgrades.contains("security.gvisor.mode=off"), "{upgrades}");
+    assert!(
+        !shown.contains("inferred that") && !shown.contains("contradicts"),
+        "{shown}"
+    );
+    fixture.assert_children_stopped();
+}
+
+#[test]
+fn rendered_runtimeclass_creation_does_not_infer_off_from_an_empty_node_list() {
+    let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("unschedulable");
+    let (output, _) = fixture.run(&["--set", "security.gvisor.installRuntimeClass=true"]);
+    let shown = stderr(&output);
+
+    assert!(output.status.success(), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    let upgrades = fs::read_to_string(&fixture.upgrade_log).expect("read Helm upgrade log");
+    assert!(!upgrades.contains("security.gvisor.mode=off"), "{upgrades}");
+    assert!(!shown.contains("cannot schedule"), "{shown}");
+    fixture.assert_children_stopped();
+}
+
+#[test]
+fn unschedulable_runtimeclass_does_not_infer_without_a_rendered_preflight() {
+    for extra in [
+        vec!["--fake-model"],
+        vec!["--set", "security.gvisorPreflight.enabled=false"],
+        vec!["--dry-run"],
+    ] {
+        let fixture = Fixture::new("nonmatching", "absent", OPENROUTER_CREDENTIAL)
+            .with_runtimeclass_lookup("unschedulable");
+        let (output, _) = fixture.run(&extra);
+        let shown = stderr(&output);
+
+        assert!(output.status.success(), "{extra:?}: {shown}");
+        assert!(fixture.runtimeclass_gets().is_empty(), "{extra:?}");
+        assert!(fixture.nodes_gets().is_empty(), "{extra:?}");
+        assert!(!shown.contains("cannot schedule"), "{shown}");
+        assert_neither_gvisor_inference(&shown);
+    }
+}
+
+#[test]
+fn gvisor_preflight_failed_scheduling_names_the_cause() {
+    let fixture = Fixture::new("failed-scheduling", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("unschedulable");
+    let (output, _) = fixture.run(&["--set", "security.gvisor.mode=require"]);
+    let shown = stderr(&output);
+
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    assert!(
+        shown.contains(&format!("{GVISOR_SCHEDULING_DIAGNOSIS}. To install without gVisor isolation, run `curie cluster up --set security.gvisor.mode=off`.")),
+        "{shown}"
+    );
+    assert!(!shown.contains("observed rollout reasons"), "{shown}");
+    assert!(!shown.contains(SCHEDULING_EVENT_MESSAGE), "{shown}");
+    assert_eq!(fixture.runtimeclass_gets().lines().count(), 2);
+    assert_eq!(fixture.nodes_gets().lines().count(), 2);
+    assert!(
+        fs::read_to_string(&fixture.event_log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.contains("reason=FailedScheduling")
+                && line.contains("-n target-namespace")),
+        "diagnosis must query scheduling Events in the release namespace"
+    );
+    fixture.assert_children_stopped();
+}
+
+#[test]
+fn apply_gvisor_preflight_failed_scheduling_names_the_cause() {
+    let fixture = Fixture::new("failed-scheduling", "absent", OPENROUTER_CREDENTIAL)
+        .with_runtimeclass_lookup("unschedulable");
+    let (output, _) = fixture.run_apply();
+    let shown = stderr(&output);
+
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert_eq!(fixture.upgrade_count(), 1);
+    assert!(
+        shown.contains(&format!("{GVISOR_SCHEDULING_DIAGNOSIS}. To install without gVisor isolation, set `platform.gvisor: off` in `curie.yaml` and rerun `curie apply`.")),
+        "{shown}"
+    );
+    assert!(!shown.contains("curie cluster up --set"), "{shown}");
+    assert!(!shown.contains("inferred that"), "{shown}");
+    assert!(!shown.contains("observed rollout reasons"), "{shown}");
+    assert!(!shown.contains(SCHEDULING_EVENT_MESSAGE), "{shown}");
+    assert_eq!(fixture.runtimeclass_gets().lines().count(), 1);
+    fixture.assert_children_stopped();
+}
+
+#[test]
+fn gvisor_preflight_failed_scheduling_without_readable_selector_keeps_the_reason() {
+    for lookup in ["present", "schedulable", "node-list-forbidden", "forbidden"] {
+        let fixture = Fixture::new("failed-scheduling", "absent", OPENROUTER_CREDENTIAL)
+            .with_runtimeclass_lookup(lookup);
+        let (output, _) = fixture.run(&["--set", "security.gvisor.mode=require"]);
+        let shown = stderr(&output);
+
+        assert_eq!(output.status.code(), Some(1), "{lookup}: {shown}");
+        assert!(
+            shown.contains("gVisor preflight Job `acme-runtime-preflight-gvisor` was never scheduled (FailedScheduling). To install without gVisor isolation, run `curie cluster up --set security.gvisor.mode=off`."),
+            "{lookup}: {shown}"
+        );
+        assert!(!shown.contains("GKE Sandbox"), "{shown}");
+        assert!(!shown.contains(SCHEDULING_EVENT_MESSAGE), "{shown}");
+        fixture.assert_children_stopped();
+    }
+}
+
+#[test]
+fn gvisor_preflight_deadline_without_scheduling_events_keeps_existing_error() {
+    for event_mode in [
+        "deadline-no-events",
+        "failed-scheduling-unrelated",
+        "scheduling-events-forbidden",
+        "scheduling-events-malformed",
+    ] {
+        let fixture = Fixture::new(event_mode, "absent", OPENROUTER_CREDENTIAL)
+            .with_runtimeclass_lookup("unschedulable");
+        let (output, _) = fixture.run(&["--json", "--set", "security.gvisor.mode=require"]);
+        let payload: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("{event_mode}: {error}: {}", stderr(&output)));
+
+        assert_eq!(output.status.code(), Some(1), "{event_mode}: {payload}");
+        assert_eq!(
+            payload["error"], GVISOR_DEADLINE_ERROR,
+            "{event_mode}: {payload}"
+        );
+        assert_eq!(fixture.upgrade_count(), 1);
+        assert!(!payload.to_string().contains("was never scheduled"));
+        fixture.assert_children_stopped();
+    }
 }
 
 #[test]
