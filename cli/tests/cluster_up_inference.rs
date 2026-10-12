@@ -89,6 +89,12 @@ if [ "$1" = "template" ]; then
             exit 1
             ;;
     esac
+    case " $* " in
+        *" --show-only "*|*" --show-only="*)
+            printf 'unexpected helm template invocation: %s\n' "$*" >&2
+            exit 64
+            ;;
+    esac
     printf '%s\n' 'apiVersion: apps/v1' 'kind: Deployment' 'metadata:' '  name: acme-platform' 'spec:' '  template:' '    spec:' '      containers:' '        - name: platform' '          resources:' '            requests:' '              cpu: 100m' '              memory: 128Mi'
     exit 0
 fi
