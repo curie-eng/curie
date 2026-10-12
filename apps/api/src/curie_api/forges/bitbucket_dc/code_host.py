@@ -1,0 +1,631 @@
+"""The Bitbucket Data Center CodeHost adapter (ADR 0197, #4401).
+
+It speaks Bitbucket Data Center REST under ``<api_url>/rest/api/latest`` with
+one project or repository HTTP access token, sent as a Bearer header on every
+API call and on git (decision 4.2). Its first call reads the server version;
+below 9.4.0 every port call raises `ServerTooOld` (decision 7).
+
+A repository is addressed by its stored ``PROJECT/slug`` path; only
+`resolve_repository` and `credential` go by the numeric id, which Data Center
+cannot read directly, so they page through ``GET /repos`` (decision 6.2).
+Review feedback is pull request comments only, read from the activity stream
+(decision 10). ``ci_diagnostics``, ``rerun_failed`` and ``user_can_write`` are
+unsupported (decision 3); review authority falls back to the binding's
+allowlist (decision 11).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from urllib.parse import quote
+
+import httpx
+
+from curie_api.forges import types
+from curie_api.forges.bitbucket_dc.comments import BitbucketDcMarkedComments
+from curie_api.forges.bitbucket_dc.transport import DcTransport, object_of
+from curie_api.forges.bitbucket_dc.version import MINIMUM, ServerTooOld, parse_version
+from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
+from curie_api.forges.credential_providers import StaticTokenProvider
+from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
+from curie_api.forges.types import (
+    Actor,
+    CheckSource,
+    CheckState,
+    CiReport,
+    CiRollup,
+    Commit,
+    Credential,
+    CredentialScope,
+    FeedbackKind,
+    FeedbackPage,
+    NormalizedCheck,
+    PullRequest,
+    PullRequestRef,
+    PullRequestState,
+    RepositoryRef,
+    RerunJob,
+    RerunObserver,
+    RerunRecord,
+    ReviewFeedback,
+    status_key,
+)
+
+logger = logging.getLogger(__name__)
+
+CAPABILITIES: Mapping[Operation, Support] = {
+    **dict.fromkeys(CODE_HOST_OPERATIONS, Support.SUPPORTED),
+    Operation.CI_DIAGNOSTICS: Support.UNSUPPORTED,
+    Operation.RERUN_FAILED: Support.UNSUPPORTED,
+    Operation.USER_CAN_WRITE: Support.UNSUPPORTED,
+}
+# A feedback listing re-reads this far behind its cursor and drops what it
+# already returned, so a comment stamped late is still listed once (decision 10.5).
+OVERLAP = timedelta(seconds=120)
+_OVERLAP_MS = round(OVERLAP.total_seconds() * 1000)
+
+_PULL_STATES = {
+    "OPEN": PullRequestState.OPEN,
+    "MERGED": PullRequestState.MERGED,
+    "DECLINED": PullRequestState.CLOSED,
+    "SUPERSEDED": PullRequestState.CLOSED,
+}
+_BUILD_STATES = {
+    "SUCCESSFUL": CheckState.SUCCESS,
+    "FAILED": CheckState.FAILURE,
+    "INPROGRESS": CheckState.PENDING,
+    "UNKNOWN": CheckState.PENDING,
+    "CANCELLED": CheckState.CANCELLED,
+    "STOPPED": CheckState.CANCELLED,
+}
+
+
+def _ms_time(value: Any) -> datetime | None:
+    if type(value) is not int:
+        return None
+    return datetime.fromtimestamp(value / 1000, UTC)
+
+
+def _ms(stamp: datetime) -> int:
+    return round(stamp.timestamp() * 1000)
+
+
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _int(value: Any) -> int:
+    return value if type(value) is int else 0
+
+
+def _user_id(user: Any) -> str | None:
+    if isinstance(user, dict) and type(user.get("id")) is int:
+        return str(user["id"])
+    return None
+
+
+@dataclass(frozen=True)
+class _Cursor:
+    """Where a feedback listing stopped: the newest creation time listed and
+    the ids created within `OVERLAP` of it."""
+
+    since: datetime
+    seen: frozenset[str]
+
+    @classmethod
+    def parse(cls, cursor: str | None) -> _Cursor | None:
+        if not cursor:
+            return None
+        loaded = json.loads(cursor)
+        since = loaded.get("since") if isinstance(loaded, dict) else None
+        seen = loaded.get("seen", []) if isinstance(loaded, dict) else None
+        if not isinstance(since, str) or not isinstance(seen, list):
+            raise ValueError("a Bitbucket feedback cursor carries an ISO-8601 'since' and 'seen'")
+        stamp = datetime.fromisoformat(since)
+        if stamp.tzinfo is None or not all(isinstance(item, str) for item in seen):
+            raise ValueError("a Bitbucket feedback cursor carries an aware 'since' and string ids")
+        return cls(stamp, frozenset(seen))
+
+    def dump(self) -> str:
+        return json.dumps({"since": self.since.isoformat(), "seen": sorted(self.seen)})
+
+
+@dataclass(frozen=True)
+class ThreadComment:
+    """One live comment on a pull request as the activity stream shows it."""
+
+    id: str
+    author: Actor
+    text: str
+    created: int
+    version: int
+    parent: str | None
+    anchored: bool
+
+
+@dataclass(frozen=True)
+class CommentTree:
+    """Every live comment on one pull request, with its thread structure."""
+
+    comments: Mapping[str, ThreadComment]
+
+    def root_of(self, comment: ThreadComment) -> ThreadComment:
+        seen = {comment.id}
+        while comment.parent is not None and comment.parent in self.comments:
+            comment = self.comments[comment.parent]
+            if comment.id in seen:
+                break
+            seen.add(comment.id)
+        return comment
+
+
+@dataclass(frozen=True)
+class _PullRead:
+    payload: dict[str, Any]
+
+    @property
+    def author_id(self) -> str | None:
+        author = self.payload.get("author")
+        return _user_id(author.get("user")) if isinstance(author, dict) else None
+
+    @property
+    def state(self) -> PullRequestState:
+        return _PULL_STATES.get(_text(self.payload.get("state")), PullRequestState.CLOSED)
+
+    @property
+    def head_sha(self) -> str:
+        ref = self.payload.get("fromRef")
+        return _text(ref.get("latestCommit")) if isinstance(ref, dict) else ""
+
+
+class BitbucketDcCodeHost:
+    """One Bitbucket Data Center as one access token."""
+
+    kind = types.BITBUCKET_DC
+    capabilities: Mapping[Operation, Support] = CAPABILITIES
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        api_url: str,
+        host: str,
+        token: str,
+        credentials: StaticTokenProvider,
+        page_size: int = 100,
+    ) -> None:
+        self.host = host
+        self._api_url = api_url.rstrip("/")
+        self._http = DcTransport(client, api_url=api_url, token=token)
+        self._credentials = credentials
+        self._page_size = page_size
+        self._version: str | None = None
+        self._comments = BitbucketDcMarkedComments(self)
+
+    def __repr__(self) -> str:
+        return f"BitbucketDcCodeHost(host={self.host!r}, api_url={self._api_url!r})"
+
+    @property
+    def marked_comments(self) -> BitbucketDcMarkedComments:
+        return self._comments
+
+    # Version floor and addressing ---------------------------------------------
+
+    async def ensure_version(self, operation: Operation) -> None:
+        """Read the server version once; refuse every call on a server older
+        than 9.4.0. A failed read is not cached."""
+
+        if self._version is None:
+            payload = await self._http.json("GET", "/application-properties", what="version")
+            version = payload.get("version")
+            if not isinstance(version, str) or parse_version(version) is None:
+                raise Unavailable("version")
+            self._version = version
+        parsed = parse_version(self._version)
+        if parsed is None or parsed < MINIMUM:
+            raise ServerTooOld(operation, self._version)
+
+    def repo_path(self, repository: RepositoryRef) -> str:
+        """``/projects/{KEY}/repos/{slug}`` of a repository on this server."""
+
+        if repository.kind != self.kind or repository.host != self.host:
+            raise NotFound("repository")
+        parts = repository.path.split("/")
+        if len(parts) != 2 or not all(parts):
+            raise NotFound("repository")
+        key, slug = parts
+        return f"/projects/{quote(key, safe='')}/repos/{quote(slug, safe='')}"
+
+    def pull_path(self, pull_request: PullRequestRef) -> str:
+        if not pull_request.number.isdigit():
+            raise NotFound("pull_request")
+        return f"{self.repo_path(pull_request.repository)}/pull-requests/{pull_request.number}"
+
+    @property
+    def transport(self) -> DcTransport:
+        return self._http
+
+    @property
+    def page_size(self) -> int:
+        return self._page_size
+
+    # Repositories ------------------------------------------------------------
+
+    async def resolve_repository(self, project_id: str) -> RepositoryRef:
+        await self.ensure_version(Operation.RESOLVE_REPOSITORY)
+        return await self._resolve(project_id)
+
+    async def _resolve(self, project_id: str) -> RepositoryRef:
+        found: dict[str, Any] | None = None
+        async for page in self._http.iter_pages("/repos", what="repository", limit=self._page_size):
+            found = next((r for r in page if str(r.get("id")) == project_id), None)
+            if found is not None:
+                break
+        if found is None:
+            raise NotFound("repository")
+        project = found.get("project")
+        key = project.get("key") if isinstance(project, dict) else None
+        slug = found.get("slug")
+        if not isinstance(key, str) or not isinstance(slug, str):
+            raise Unavailable("repository")
+        path = f"{key}/{slug}"
+        ref = types.RepositoryRef(self.kind, self.host, project_id, path)
+        default = await self._default_branch(self.repo_path(ref))
+        return types.RepositoryRef(self.kind, self.host, project_id, path, default_branch=default)
+
+    async def _default_branch(self, repo: str) -> str | None:
+        try:
+            branch = await self._http.json("GET", f"{repo}/default-branch", what="default_branch")
+        except NotFound:
+            # An empty repository has no default branch yet.
+            return None
+        return _text(branch.get("displayId")) or None
+
+    async def credential(self, repository: RepositoryRef, scope: CredentialScope) -> Credential:
+        """The Bearer credential for git on ``<api_url>/scm/<KEY>/<slug>.git``,
+        refused when the repository was renamed since it was stored."""
+
+        await self.ensure_version(Operation.CREDENTIAL)
+        self.repo_path(repository)
+        current = await self._resolve(repository.project_id)
+        if current.path != repository.path:
+            raise NotFound("repository_renamed")
+        return await self._credentials.get(scope)
+
+    async def branch_head(self, repository: RepositoryRef, branch: str) -> str | None:
+        await self.ensure_version(Operation.BRANCH_HEAD)
+        repo = self.repo_path(repository)
+        listed = await self._http.pages(
+            f"{repo}/branches",
+            what="branch",
+            limit=self._page_size,
+            params={"filterText": branch},
+        )
+        for item in listed:
+            if item.get("displayId") == branch:
+                return _text(item.get("latestCommit")) or None
+        return None
+
+    async def read_commit(self, repository: RepositoryRef, sha: str) -> Commit:
+        await self.ensure_version(Operation.READ_COMMIT)
+        repo = self.repo_path(repository)
+        payload = await self._http.json(
+            "GET", f"{repo}/commits/{quote(sha, safe='')}", what="commit"
+        )
+        parents = payload.get("parents")
+        return Commit(
+            sha=_text(payload.get("id")),
+            parents=tuple(
+                _text(parent.get("id"))
+                for parent in (parents if isinstance(parents, list) else [])
+                if isinstance(parent, dict)
+            ),
+            message=_text(payload.get("message")),
+        )
+
+    # Pull requests -----------------------------------------------------------
+
+    async def read_pull(self, pull_request: PullRequestRef) -> _PullRead:
+        """The pull request as Data Center answers it, without the merge read."""
+
+        return _PullRead(
+            await self._http.json("GET", self.pull_path(pull_request), what="pull_request")
+        )
+
+    async def _conflicted(self, pull_request: PullRequestRef) -> bool | None:
+        response = await self._http.request(
+            "GET", f"{self.pull_path(pull_request)}/merge", what="merge_status", allow=(409,)
+        )
+        if response.status_code == 409:
+            # Data Center cannot compute the merge right now (or the pull
+            # request is closed): unknown, not clean.
+            return None
+        conflicted = object_of(response, "merge_status").get("conflicted")
+        return conflicted if isinstance(conflicted, bool) else None
+
+    async def _pull(self, repository: RepositoryRef, payload: dict[str, Any]) -> PullRequest:
+        number = payload.get("id")
+        if type(number) is not int:
+            raise Unavailable("pull_request")
+        ref = PullRequestRef(repository, str(number))
+        read = _PullRead(payload)
+        source, target = payload.get("fromRef"), payload.get("toRef")
+        links = payload.get("links")
+        own = links.get("self") if isinstance(links, dict) else None
+        first = own[0] if isinstance(own, list) and own else None
+        url = first.get("href") if isinstance(first, dict) else ""
+        return PullRequest(
+            ref=ref,
+            head_sha=read.head_sha,
+            head_ref=_text(source.get("displayId")) if isinstance(source, dict) else "",
+            base_ref=_text(target.get("displayId")) if isinstance(target, dict) else "",
+            state=read.state,
+            url=_text(url),
+            title=_text(payload.get("title")),
+            body=_text(payload.get("description")),
+            draft=payload.get("draft") is True,
+            conflicted=await self._conflicted(ref),
+            updated_at=_ms_time(payload.get("updatedDate")),
+        )
+
+    async def find_pull_request(
+        self, repository: RepositoryRef, *, head_ref: str
+    ) -> PullRequest | None:
+        await self.ensure_version(Operation.FIND_PULL_REQUEST)
+        repo = self.repo_path(repository)
+        ref_id = f"refs/heads/{head_ref}"
+        listed = await self._http.pages(
+            f"{repo}/pull-requests",
+            what="pull_request",
+            limit=self._page_size,
+            params={"at": ref_id, "direction": "OUTGOING", "state": "ALL"},
+        )
+        matches = [
+            item
+            for item in listed
+            if isinstance(item.get("fromRef"), dict) and item["fromRef"].get("id") == ref_id
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            raise Ambiguous("pull_request")
+        return await self._pull(repository, matches[0])
+
+    async def open_pull_request(
+        self,
+        repository: RepositoryRef,
+        *,
+        head_ref: str,
+        base_ref: str,
+        title: str,
+        body: str,
+        draft: bool = False,
+    ) -> PullRequest:
+        await self.ensure_version(Operation.OPEN_PULL_REQUEST)
+        repo = self.repo_path(repository)
+        key, slug = repository.path.split("/")
+        located = {"slug": slug, "project": {"key": key}}
+        payload = await self._http.json(
+            "POST",
+            f"{repo}/pull-requests",
+            what="pull_request",
+            json={
+                "title": title,
+                "description": body,
+                "draft": draft,
+                "fromRef": {"id": f"refs/heads/{head_ref}", "repository": located},
+                "toRef": {"id": f"refs/heads/{base_ref}", "repository": located},
+            },
+        )
+        return await self._pull(repository, payload)
+
+    async def update_pull_request(
+        self, pull_request: PullRequestRef, *, title: str | None, body: str | None
+    ) -> PullRequest:
+        """Edit the title and or description, sending the version just read
+        (decision 8.5). A version someone else moved on answers 409, raised as
+        `Unavailable` so the caller retries with a fresh read."""
+
+        await self.ensure_version(Operation.UPDATE_PULL_REQUEST)
+        read = await self.read_pull(pull_request)
+        if title is None and body is None:
+            return await self._pull(pull_request.repository, read.payload)
+        change: dict[str, Any] = {"version": read.payload.get("version")}
+        if title is not None:
+            change["title"] = title
+        if body is not None:
+            change["description"] = body
+        response = await self._http.request(
+            "PUT", self.pull_path(pull_request), what="pull_request", json=change, allow=(409,)
+        )
+        if response.status_code == 409:
+            raise Unavailable("stale_version")
+        return await self._pull(pull_request.repository, object_of(response, "pull_request"))
+
+    async def read_pull_request(self, pull_request: PullRequestRef) -> PullRequest:
+        await self.ensure_version(Operation.READ_PULL_REQUEST)
+        read = await self.read_pull(pull_request)
+        return await self._pull(pull_request.repository, read.payload)
+
+    # CI ----------------------------------------------------------------------
+
+    async def observe_ci(self, repository: RepositoryRef, head_sha: str) -> CiRollup:
+        """The build statuses posted on exactly ``head_sha``, read from the
+        repository-scoped builds API Required Builds reads (decision 9)."""
+
+        await self.ensure_version(Operation.OBSERVE_CI)
+        repo = self.repo_path(repository)
+        listed = await self._http.pages(
+            f"{repo}/commits/{quote(head_sha, safe='')}/builds",
+            what="builds",
+            limit=self._page_size,
+        )
+        checks: dict[str, NormalizedCheck] = {}
+        for build in listed:
+            key = build.get("key")
+            if not isinstance(key, str) or not key:
+                continue
+            reported = _text(build.get("state"))
+            state = _BUILD_STATES.get(reported)
+            if state is None:
+                logger.warning("Bitbucket Data Center build state %r read as pending", reported)
+                state = CheckState.PENDING
+            checks[key] = NormalizedCheck(
+                key=status_key(key),
+                state=state,
+                head_sha=head_sha,
+                name=_text(build.get("name")) or key,
+                url=_text(build.get("url")) or None,
+                source=CheckSource.STATUS,
+                reported_state=reported,
+                started_at=_ms_time(build.get("dateAdded")),
+            )
+        return CiRollup.on_head(head_sha, tuple(checks.values()))
+
+    async def ci_diagnostics(
+        self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None
+    ) -> CiReport:
+        raise Unsupported(Operation.CI_DIAGNOSTICS)
+
+    async def rerun_failed(
+        self,
+        repository: RepositoryRef,
+        jobs: Sequence[RerunJob],
+        *,
+        settled: Collection[str] = (),
+        on_attempt: RerunObserver | None = None,
+    ) -> RerunRecord:
+        raise Unsupported(Operation.RERUN_FAILED)
+
+    async def user_can_write(self, repository: RepositoryRef, actor: Actor) -> bool:
+        # Data Center reports a user's effective permission only to an admin,
+        # and omits inherited grants even then (decision 11).
+        raise Unsupported(Operation.USER_CAN_WRITE)
+
+    # Review feedback ---------------------------------------------------------
+
+    async def comment_tree(self, pull_request: PullRequestRef) -> CommentTree:
+        """Every live comment on the pull request, read from every page of its
+        activities. A comment appears in each activity that touched it (added,
+        replied, edited), with its replies nested; a deleted one is gone from
+        all but its ``DELETED`` activity."""
+
+        activities = await self._http.pages(
+            f"{self.pull_path(pull_request)}/activities",
+            what="activities",
+            limit=self._page_size,
+        )
+        deleted = {
+            str(activity["comment"].get("id"))
+            for activity in activities
+            if activity.get("commentAction") == "DELETED"
+            and isinstance(activity.get("comment"), dict)
+        }
+        found: dict[str, ThreadComment] = {}
+        parents: dict[str, str] = {}
+
+        def walk(comment: Any, parent: str | None) -> None:
+            if not isinstance(comment, dict) or type(comment.get("id")) is not int:
+                return
+            cid = str(comment["id"])
+            author = comment.get("author")
+            author_id = _user_id(author)
+            if parent is not None:
+                parents[cid] = parent
+            if cid not in found and cid not in deleted and author_id is not None:
+                assert isinstance(author, dict)
+                found[cid] = ThreadComment(
+                    id=cid,
+                    author=Actor(author_id, _text(author.get("slug"))),
+                    text=_text(comment.get("text")),
+                    created=_int(comment.get("createdDate")),
+                    version=_int(comment.get("version")),
+                    parent=None,
+                    anchored=isinstance(comment.get("anchor"), dict),
+                )
+            for reply in comment.get("comments") or []:
+                walk(reply, cid)
+
+        for activity in activities:
+            if activity.get("action") == "COMMENTED" and activity.get("commentAction") != "DELETED":
+                walk(activity.get("comment"), None)
+        return CommentTree(
+            {cid: replace(comment, parent=parents.get(cid)) for cid, comment in found.items()}
+        )
+
+    async def list_review_feedback(
+        self, pull_request: PullRequestRef, cursor: str | None
+    ) -> FeedbackPage:
+        """Comments by anyone but the pull request's author, newer than
+        ``cursor`` less `OVERLAP`, minus the ids the cursor already returned.
+
+        An unanchored top-level comment and its replies are ``COMMENT``; an
+        inline comment and every reply under it are ``REVIEW_COMMENT`` with
+        the inline root as ``thread_id``. Approvals and needs-work verdicts
+        carry no text and are not feedback (decision 10).
+        """
+
+        await self.ensure_version(Operation.LIST_REVIEW_FEEDBACK)
+        previous = _Cursor.parse(cursor)
+        read = await self.read_pull(pull_request)
+        tree = await self.comment_tree(pull_request)
+        start = _ms(previous.since) - _OVERLAP_MS if previous is not None else None
+        candidates = [
+            comment
+            for comment in tree.comments.values()
+            if comment.author.id != read.author_id and (start is None or comment.created >= start)
+        ]
+        candidates.sort(key=lambda c: (c.created, int(c.id)))
+        seen = previous.seen if previous is not None else frozenset()
+        items: list[ReviewFeedback] = []
+        for comment in candidates:
+            if comment.id in seen:
+                continue
+            root = tree.root_of(comment)
+            inline = root.anchored
+            items.append(
+                ReviewFeedback(
+                    id=comment.id,
+                    author=comment.author,
+                    body=comment.text,
+                    pull_request=pull_request,
+                    head_sha=read.head_sha,
+                    kind=FeedbackKind.REVIEW_COMMENT if inline else FeedbackKind.COMMENT,
+                    thread_id=root.id if inline else None,
+                )
+            )
+        stamps = [c.created for c in candidates]
+        if previous is not None:
+            stamps.append(_ms(previous.since))
+        if not stamps:
+            return FeedbackPage(tuple(items), "")
+        newest = max(stamps)
+        window = newest - _OVERLAP_MS
+        following = _Cursor(
+            datetime.fromtimestamp(newest / 1000, UTC),
+            frozenset(c.id for c in candidates if c.created >= window),
+        )
+        return FeedbackPage(tuple(items), following.dump())
+
+    async def verify_feedback(self, feedback: ReviewFeedback) -> bool:
+        await self.ensure_version(Operation.VERIFY_FEEDBACK)
+        pull_request = feedback.pull_request
+        if not feedback.id.isdigit():
+            return False
+        try:
+            read = await self.read_pull(pull_request)
+            if read.state is not PullRequestState.OPEN:
+                return False
+            current = await self._http.json(
+                "GET", f"{self.pull_path(pull_request)}/comments/{feedback.id}", what="comment"
+            )
+        except NotFound:
+            return False
+        if _user_id(current.get("author")) != feedback.author.id:
+            return False
+        return _text(current.get("text")) == feedback.body
