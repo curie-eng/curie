@@ -432,17 +432,32 @@ ATTESTER_MUTANT="$TMP/mutant-managed-secret-nil"
 cp -a "$CHART" "$ATTESTER_MUTANT"
 python3 - "$ATTESTER_MUTANT/templates/_helpers.tpl" <<'PYEOF'
 import pathlib
+import re
 import sys
 
 path = pathlib.Path(sys.argv[1])
 text = path.read_text()
 start_marker = '{{- define "curie.managedSecret" -}}'
-end_marker = '{{/* ---- Shared first-party-app environment fragments ---- */}}'
-start = text.find(start_marker)
-end = text.find(end_marker, start)
-if start == -1 or end == -1:
-    sys.stderr.write("negative control could not find curie.managedSecret to mutate\n")
-    sys.exit(1)
+if text.count(start_marker) != 1:
+    sys.exit("negative control requires exactly one curie.managedSecret definition")
+start = text.index(start_marker)
+# Stop at this definition's matching end. The adjacent Secret memo and checksum
+# helpers must survive so the mutant still exercises the normal Secret render.
+depth = 0
+end = None
+for action in re.finditer(r'{{-?\s*(.*?)\s*-?}}', text[start:], re.DOTALL):
+    command = action.group(1).strip().split(None, 1)[0]
+    if command in {"define", "if", "range", "with", "block"}:
+        depth += 1
+    elif command == "end":
+        depth -= 1
+        if depth == 0:
+            end = start + action.end()
+            break
+if end is None:
+    sys.exit("negative control could not find curie.managedSecret's matching end")
+if text[start:end].count('{{- if kindIs "invalid" $value -}}') != 1:
+    sys.exit("negative control requires the nil-safe managedSecret guard")
 old_body = r'''{{- define "curie.managedSecret" -}}
 {{- if eq (toString .root.Values.security.allowDevDefaults) "true" -}}{{/* string-coercion safety -- a quoted "false" must not read as truthy and silently ship a published default (fail closed to generation). */}}
 {{- .value -}}
@@ -456,7 +471,7 @@ old_body = r'''{{- define "curie.managedSecret" -}}
 {{- randAlphaNum 32 -}}
 {{- end -}}
 {{- end -}}'''
-path.write_text(text[:start] + old_body + "\n\n" + text[end:])
+path.write_text(text[:start] + old_body + text[end:])
 PYEOF
 ATTESTER_MUTANT_OUT="$TMP/mutant-managed-secret-nil.yaml"
 helm template legacy-attester "$ATTESTER_MUTANT" \
@@ -1328,16 +1343,17 @@ echo "=== Assertion 12b negative control: routing githubToken through curie.mana
 # regression and require the check to reject it, naming the key.
 GHT_MUTANT="$TMP/mutant-githubtoken"
 cp -a "$CHART" "$GHT_MUTANT"
-python3 - "$GHT_MUTANT/templates/secrets.yaml" <<'PYEOF'
+python3 - "$GHT_MUTANT/templates/_helpers.tpl" <<'PYEOF'
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])
 text = p.read_text()
-old = '  githubToken: {{ .Values.api.githubToken | default "" | quote }}'
-new = ('  githubToken: {{ include "curie.managedSecret" (dict "root" . "key" "githubToken" '
-       '"value" .Values.api.githubToken "default" "" "hex" false "existingData" $existingSecret) | quote }}')
-if old not in text:
-    sys.stderr.write(f"negative control could not find {old!r} to mutate\n")
-    sys.exit(1)
+# Mutate effective resolution in the memo; Secret emission reads this dict.
+old = '{{- $_ := set $content "githubToken" ((.Values.api.githubToken | default "") | toString) -}}'
+new = ('{{- $_ := set $content "githubToken" ((include "curie.managedSecret" '
+       '(dict "root" . "key" "githubToken" "value" .Values.api.githubToken '
+       '"default" "" "hex" false "existingData" $existingSecretData)) | toString) -}}')
+if text.count(old) != 1:
+    sys.exit("negative control requires exactly one githubToken memo resolution")
 p.write_text(text.replace(old, new, 1))
 PYEOF
 GHT_MUTANT_RENDER="$TMP/mutant-githubtoken.yaml"
