@@ -30,6 +30,7 @@ import json
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from pathlib import Path
@@ -598,9 +599,16 @@ def test_dc_ci_state_maps_the_head_builds(
     _dc_state(tmp_path, monkeypatch)
     values = [{"key": f"k{i}", "state": state} for i, state in enumerate(states)]
 
+    # Bitbucket DC 9.4.24, observed on the fixture: the repository-scoped builds
+    # GET answers 400 without ?key= and one build with it, so keys come from the
+    # build-status listing and each state from the repository-scoped read.
     def answer(method: str, url: str) -> tuple[int, Any]:
-        if method == "GET" and url.startswith(f"{DC_REST}/commits/{SHA}/builds"):
+        path, _, query = url.partition("?")
+        if method == "GET" and path == f"{DC_BASE}/rest/build-status/latest/commits/{SHA}":
             return 200, {"values": values, "isLastPage": True, "start": 0, "size": len(values)}
+        if method == "GET" and path == f"{DC_REST}/commits/{SHA}/builds":
+            key = urllib.parse.parse_qs(query)["key"][0]
+            return 200, next(v for v in values if v["key"] == key)
         return _ok(method, url)
 
     http = _install(monkeypatch, answer)

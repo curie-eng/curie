@@ -228,7 +228,24 @@ class BitbucketDcDriver:
         return {"sha": sha, "context": LOOP_GATE_KEY, "state": "FAILED"}
 
     def _builds(self, sha: str) -> list[dict[str, Any]] | None:
-        return self._paged(f"/commits/{sha}/builds")
+        """Each build on ``sha``, read one key at a time; None when any read fails.
+
+        On 9.4 the repository-scoped builds read answers 400 without ``key``,
+        so the keys come from the build-status listing, and each is then read
+        from the repository-scoped API the adapter and Required Builds use.
+        """
+
+        listing = self._paged(f"{self.base_url}/rest/build-status/latest/commits/{sha}")
+        if listing is None:
+            return None
+        builds: list[dict[str, Any]] = []
+        for key in dict.fromkeys(str(item["key"]) for item in listing if item.get("key")):
+            query = urllib.parse.quote(key, safe="")
+            status, build = self._call("GET", f"/commits/{sha}/builds?key={query}")
+            if status != 200 or not isinstance(build, dict):
+                return None
+            builds.append(build)
+        return builds
 
     def ci_state(self, sha: str) -> dict[str, Any]:
         builds = self._builds(sha)
