@@ -175,7 +175,7 @@ class InMemoryMarkedComments(_Declared):
     def seed_comment(self, target: ReplyTarget, author: Actor, body: str) -> str:
         """A comment someone else (or a past run) left; returns its id."""
 
-        comment = _Comment(f"c{next(self._ids)}", author, body)
+        comment = _Comment(str(next(self._ids)), author, body)
         self._accept(target).append(comment)
         return comment.id
 
@@ -467,7 +467,11 @@ class InMemoryTracker(_Declared):
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         if not self._gate(Operation.LINK_PULL_REQUEST):
             return
-        self._issue(issue).linked.append(pull_request.ref)
+        # Idempotent, as a tracker's link is (Jira keys it by its global id).
+        linked = self._issue(issue).linked
+        if pull_request.ref in linked:
+            return
+        linked.append(pull_request.ref)
         self.ledger.record()
 
     async def dependencies(self, issue: TrackerIssueRef) -> tuple[TrackerIssueRef, ...]:

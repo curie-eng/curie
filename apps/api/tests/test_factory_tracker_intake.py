@@ -301,6 +301,20 @@ def _marker(comment: jira_fake.JiraComment) -> str:
     return str(comment.properties["curie.factory"]["marker"])
 
 
+def _code_spans(node: Any) -> list[str]:
+    """The text of every ADF text node carrying a ``code`` mark: a markdown code
+    span in the core's body becomes one (decision 15)."""
+
+    if isinstance(node, list):
+        return [text for child in node for text in _code_spans(child)]
+    if not isinstance(node, dict):
+        return []
+    if node.get("type") == "text":
+        marks = {mark.get("type") for mark in node.get("marks") or []}
+        return [str(node.get("text", ""))] if "code" in marks else []
+    return _code_spans(node.get("content", []))
+
+
 def _admit_id(intake: Intake, issue: jira_fake.JiraIssue, event_id: str) -> uuid.UUID:
     """The request id the label event ``event_id`` admits under (ADR 0187)."""
 
@@ -435,10 +449,12 @@ def test_label_conflict_and_other_agent_refusals_comment_once_with_the_github_te
     assert _work_items(conflicted) == []
     [comment] = _bot_comments(intake, conflicted)
     assert _marker(comment) == LABEL_REFUSAL_MARKER
+    text = jira_fake.flatten(comment.body)
     assert (
-        "Curie did not start this issue: it carries `factory`, `factory-fast`, which start "
-        "different agents" in jira_fake.flatten(comment.body)
+        "Curie did not start this issue: it carries factory, factory-fast, which start "
+        "different agents" in text
     )
+    assert _code_spans(comment.body) == ["factory", "factory-fast"]
     writes = intake.jira.writes
     intake.sweep()
     assert intake.jira.writes == writes, "a refusal repeated by the sweep writes nothing"
@@ -460,9 +476,10 @@ def test_label_conflict_and_other_agent_refusals_comment_once_with_the_github_te
     refusals = [c for c in _bot_comments(intake, owned) if _marker(c) == LABEL_REFUSAL_MARKER]
     assert len(refusals) == 1
     assert (
-        "Curie did not start this issue under `factory-fast`: it belongs to the run the "
-        "`factory` label started, which is another agent's."
+        "Curie did not start this issue under factory-fast: it belongs to the run the "
+        "factory label started, which is another agent's."
     ) in jira_fake.flatten(refusals[0].body)
+    assert _code_spans(refusals[0].body)[:2] == ["factory-fast", "factory"]
 
 
 def test_a_repository_refusal_comments_the_refusal_body(

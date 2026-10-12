@@ -118,16 +118,16 @@ out-of-credits cause and the review is not retried.
   gives every session the built-in file tools. The sandbox has no general
   network access. The operator may allow package registry routes for locked
   dependency fetches, and the sandbox holds no push or publication credential.
-- **The issue.** The platform tool `mcp__curie__get_issue` (arguments
-  `owner`, `repo`, `issue_number`), mounted for executions that have a
-  WorkItem. The tool presents an execution scoped capability the API minted
-  for that execution. The API checks that it names this execution and the
-  WorkItem's issue, reads the issue and its comments with the GitHub App
-  installation token (minted fresh per read, so runs longer than one hour
-  keep reading), and returns the title, body, state, author and comments
-  verbatim, along with the execution's absolute UTC `execution_deadline` and
-  total duration in seconds as `execution_seconds`. It stores nothing. The
-  sandbox holds no GitHub credential at all.
+- **The issue.** The platform tool `mcp__curie__get_issue` (no arguments),
+  mounted for executions that have a WorkItem. The tool presents an
+  execution scoped capability the API minted for that execution. The API
+  checks that it names this execution and the WorkItem's issue, reads the
+  ticket through its tracker (a GitHub issue with the App installation token
+  minted fresh per read, so runs longer than one hour keep reading; a Jira
+  issue with the tracker's own credential), and returns it as markdown with
+  its comments, its link, the execution's absolute UTC `execution_deadline`
+  and total duration in seconds as `execution_seconds`. It stores nothing.
+  The sandbox holds no tracker credential at all.
   A failed or capped review ends the reply with `Could not complete:` and the
   unresolved findings, and the platform's factory status comment on the issue
   carries that result.

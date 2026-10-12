@@ -30,9 +30,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.forges.errors import ForgeError
 from curie_api.forges.hosts import issue_url as tracker_issue_url
-from curie_api.forges.hosts import repository_ref
 from curie_api.forges.ports import CodeHost
-from curie_api.forges.types import RollupState
+from curie_api.forges.types import RepositoryRef, RollupState
 from curie_api.schemas.workitems import (
     WorkItemCiOut,
     WorkItemCiState,
@@ -643,12 +642,15 @@ async def observe_ci(
     settings: Settings,
     lineage: ThreadPublicationLineage | None,
     work_item: WorkItem,
+    *,
+    repository: RepositoryRef,
 ) -> WorkItemCiOut:
     """CI on the lineage's published head, live and never persisted.
 
     Every failure is ``unavailable`` with the code host's fixed reason code,
     which never carries a response body, header, URL or token. ``code_host``
-    is None when the install configures no factory code host.
+    is None when the install configures no code host entry for the stored
+    ``repository``, the one the caller chose ``code_host`` by.
     """
 
     if lineage is None or lineage.pr_number is None:
@@ -663,11 +665,6 @@ async def observe_ci(
             head_sha=head_sha,
             observed_at=_now(),
         )
-    repository = repository_ref(
-        settings,
-        path=lineage.repo_full_name,
-        project_id=lineage.repository_project_id or work_item.repository_project_id,
-    )
     try:
         rollup = await code_host.observe_ci(repository, head_sha)
     except ForgeError as exc:

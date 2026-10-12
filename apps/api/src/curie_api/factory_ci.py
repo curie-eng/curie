@@ -67,9 +67,10 @@ from .config import Settings
 from .forges.capabilities import Operation, Support, supports
 from .forges.config import CiPolicyConfig
 from .forges.errors import ForgeError
-from .forges.hosts import factory_code_host, issue_url, repository_ref
+from .forges.hosts import issue_url
 from .forges.ports import CodeHost
 from .forges.registry import ForgeRegistry, forges_registry
+from .forges.trackers import code_host_for_repository, stored_repository
 from .forges.types import (
     STATUS_KEY_PREFIX,
     CheckSource,
@@ -1048,9 +1049,32 @@ async def gate(
         return "waiting"
     request, work_item, lineage = facts.request, facts.work_item, facts.lineage
     registry = forges_registry(settings)
-    code_host = factory_code_host(
-        registry, client, installations=stored_installation(lineage, work_item)
-    )
+    # The code host entry the lineage recorded, or its WorkItem's when the
+    # lineage carries no code host identity (it is all set or all unset),
+    # never the install's GitHub accessor (#4358 plan D14).
+    if lineage.code_host_kind is not None:
+        repository = stored_repository(
+            settings,
+            kind=lineage.code_host_kind,
+            host=lineage.code_host_host,
+            path=lineage.repo_full_name or work_item.repository_path,
+            project_id=lineage.repository_project_id,
+        )
+    else:
+        repository = stored_repository(
+            settings,
+            kind=work_item.code_host_kind,
+            host=work_item.code_host_host,
+            path=work_item.repository_path,
+            project_id=work_item.repository_project_id,
+        )
+    try:
+        code_host = code_host_for_repository(
+            registry, client, repository, installations=stored_installation(lineage, work_item)
+        )
+    except ForgeError:
+        # An entry this install no longer configures is never read elsewhere.
+        return "waiting"
     capabilities = ci_capabilities(code_host.capabilities)
     assert request.execution_deadline is not None
     round_ = len(facts.publications)
@@ -1115,11 +1139,6 @@ async def gate(
 
     view: CiView | None = None
     fresh_after: datetime | None = None
-    repository = repository_ref(
-        settings,
-        path=lineage.repo_full_name or work_item.repository_path,
-        project_id=lineage.repository_project_id,
-    )
     if preflight_verdict is not None:
         verdict = preflight_verdict
         head_sha = observed_sha or ""

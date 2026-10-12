@@ -6100,18 +6100,10 @@ export interface components {
             /** Supported */
             supported: boolean;
         };
-        /** IssueReadComment */
-        IssueReadComment: {
-            /** Author */
-            author: string | null;
-            /** Body */
-            body: string;
-            /** Created At */
-            created_at: string | null;
-        };
         /**
          * IssueReadContext
-         * @description The execution scoped capability and the one issue it names.
+         * @description The execution scoped capability and the one issue it names: ``issue`` is
+         *     how a person names it (``curie-eng/curie#12`` on GitHub, ``PROJ-12`` on Jira).
          */
         IssueReadContext: {
             /** Capability */
@@ -6121,10 +6113,8 @@ export interface components {
              * Format: uuid
              */
             execution_request_id: string;
-            /** Issue Number */
-            issue_number: number;
-            /** Repo Full Name */
-            repo_full_name: string;
+            /** Issue */
+            issue: string;
             /**
              * Work Item Id
              * Format: uuid
@@ -6143,30 +6133,13 @@ export interface components {
             execution_request_id: string;
         };
         /**
-         * IssueReadRequest
-         * @description The issue the sandbox asks for. Anything but the capability's is refused.
-         */
-        IssueReadRequest: {
-            /** Issue Number */
-            issue_number: number;
-            /** Repo Full Name */
-            repo_full_name: string;
-        };
-        /**
          * IssueReadResult
-         * @description The issue verbatim with its execution deadline and total allowed seconds.
+         * @description The ticket as its tracker renders it in markdown (title, description and
+         *     comments), its link, and the execution deadline and total allowed seconds.
          *
-         *     The platform parses and stores none of the issue content.
+         *     The platform parses and stores none of the ticket content.
          */
         IssueReadResult: {
-            /** Author */
-            author: string | null;
-            /** Body */
-            body: string;
-            /** Comments */
-            comments: components["schemas"]["IssueReadComment"][];
-            /** Comments Truncated */
-            comments_truncated: boolean;
             /**
              * Execution Deadline
              * Format: date-time
@@ -6174,14 +6147,12 @@ export interface components {
             execution_deadline: string;
             /** Execution Seconds */
             execution_seconds: number;
-            /** Issue Number */
-            issue_number: number;
-            /** Repo Full Name */
-            repo_full_name: string;
-            /** State */
-            state: string | null;
-            /** Title */
-            title: string;
+            /** Issue */
+            issue: string;
+            /** Ticket */
+            ticket: string;
+            /** Url */
+            url: string;
         };
         /**
          * KillState
@@ -15905,11 +15876,7 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["IssueReadRequest"];
-            };
-        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {

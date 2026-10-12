@@ -335,6 +335,15 @@ def install(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Install
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
     fake_installation_tokens(monkeypatch)
+    # The code host's git credential: the GitHub fake serves plain HTTP, which
+    # the canonical HTTPS origin check would refuse (as `forge_fakes.github_comments`).
+    monkeypatch.setattr(
+        "curie_api.forges.github.code_host.resolve_repository_credential",
+        lambda repo, *, html_base, credentials: (
+            f"{html_base}/{repo}.git",
+            "Basic eC1hY2Nlc3MtdG9rZW46Zml4dHVyZQ==",  # x-access-token:fixture
+        ),
+    )
     starter = jira.add_user(STARTER_ID, "Ada Starter")
     outsider = jira.add_user(OUTSIDER_ID, "Oscar Outsider")
     github.permissions[SENDER] = (SENDER_ID, "write")

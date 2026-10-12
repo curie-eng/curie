@@ -1228,12 +1228,14 @@ against every criterion, and ends in one pull request or a stated reason. Any
 other bundle can take its place; the platform does not require this one.
 
 The bundle reads the issue through the platform tool `mcp__curie__get_issue`,
-mounted for executions that have a WorkItem. The tool presents an execution
-scoped capability the API minted for that execution; the API checks it names
-this execution and the WorkItem's issue, reads the issue and its comments with
-the GitHub App installation token (minted fresh per read), and returns them
-verbatim without storing anything. The sandbox holds no GitHub credential, so
-the bundle needs no token or runner egress to the GitHub API. The bundle's
+mounted for executions that have a WorkItem. The tool takes no arguments and
+presents an execution scoped capability the API minted for that execution; the
+API checks it names this execution and the WorkItem's issue, reads the ticket
+through the WorkItem's tracker (a GitHub issue with the App installation token
+minted fresh per read, a Jira issue with the tracker's own credential), and
+returns it as markdown with its comments without storing anything. The sandbox
+holds no tracker credential, so the bundle needs no token or runner egress to
+the tracker's API. The bundle's
 runner layer still carries the uv, Rust and pnpm toolchains. Each release
 publishes it as `ghcr.io/curie-eng/curie-dark-factory-runner:<version>`, and
 `curie example dark-factory render --out <dir>` from a release CLI records its

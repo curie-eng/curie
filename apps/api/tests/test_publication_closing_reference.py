@@ -223,8 +223,8 @@ def test_a_tracker_that_cannot_answer_refuses_the_publication_retryably(
     assert jira_fake.TOKEN not in refused.text
     assert (
         _rows(
-            "SELECT id FROM curie.publications WHERE dedupe_key = :key",
-            {"key": payload["dedupe_key"]},
+            "SELECT id FROM curie.publications WHERE execution_request_id = :request",
+            {"request": request_id},
         )
         == []
     )

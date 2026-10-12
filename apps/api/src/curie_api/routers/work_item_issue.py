@@ -9,16 +9,17 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from curie_api.schemas.workitems import (
-    IssueReadComment,
     IssueReadContext,
     IssueReadContextMint,
-    IssueReadRequest,
     IssueReadResult,
 )
 
 from ..auth import require_internal_worker_token
 from ..config import get_settings
 from ..deps import SessionDep
+from ..forges.errors import ForgeError
+from ..forges.registry import forges_registry
+from ..forges.trackers import display_reference, issue_link
 from ..issue_read import (
     CAPABILITY_TTL_SECONDS,
     IssueReadAuthority,
@@ -53,12 +54,14 @@ async def require_issue_read(
 
 
 def _claims_match(claims: IssueReadClaims, authority: IssueReadAuthority) -> bool:
+    issue = authority.issue
     return (
         claims.work_item_id == authority.work_item_id
         and claims.execution_request_id == authority.execution_request_id
-        and claims.github_repository_id == authority.github_repository_id
-        and claims.issue_number == authority.issue_number
-        and claims.repo_full_name.casefold() == authority.repo_full_name.casefold()
+        and claims.tracker_kind == issue.kind
+        and claims.tracker_host == issue.host
+        and claims.tracker_scope_id == issue.scope_id
+        and claims.tracker_issue_id == issue.issue_id
     )
 
 
@@ -87,23 +90,23 @@ async def mint_issue_read_context(
         scope="work_item.issue_read",
         work_item_id=authority.work_item_id,
         execution_request_id=authority.execution_request_id,
-        repo_full_name=authority.repo_full_name,
-        github_repository_id=authority.github_repository_id,
-        issue_number=authority.issue_number,
+        tracker_kind=authority.issue.kind,
+        tracker_host=authority.issue.host,
+        tracker_scope_id=authority.issue.scope_id,
+        tracker_issue_id=authority.issue.issue_id,
         iat=now,
         exp=exp,
     )
     return IssueReadContext(
         work_item_id=claims.work_item_id,
         execution_request_id=claims.execution_request_id,
-        repo_full_name=claims.repo_full_name,
-        issue_number=claims.issue_number,
+        issue=display_reference(authority.issue, authority.repository.path),
         capability=mint(get_settings().api_key, claims),
     )
 
 
 # One execution's reads share a sliding window on the shared store's clock, so
-# repeated or concurrent calls cannot drain the installation's GitHub quota.
+# repeated or concurrent calls cannot drain the tracker's quota.
 # Each read costs at most eleven provider requests. Refused attempts add nothing.
 _ISSUE_READS_PER_WINDOW = 20
 _CHARGE_ATTEMPT = """
@@ -140,23 +143,15 @@ async def charge_issue_read_attempt(client: Redis, execution_request_id: uuid.UU
 
 @router.post("/issue-read", response_model=IssueReadResult)
 async def read_work_item_issue(
-    data: IssueReadRequest,
     request: Request,
     response: Response,
     session: SessionDep,
     claims: Annotated[IssueReadClaims, Depends(require_issue_read)],
 ) -> IssueReadResult:
     response.headers["Cache-Control"] = "no-store"
-    # The capability names one issue. Refuse any other before touching state.
-    if (
-        data.repo_full_name.casefold() != claims.repo_full_name.casefold()
-        or data.issue_number != claims.issue_number
-    ):
-        raise issue_read_error(
-            403,
-            "issue_not_granted",
-            f"this execution may read only {claims.repo_full_name}#{claims.issue_number}",
-        )
+    # The capability names the one issue; a durable WorkItem holding another
+    # refuses it before any read.
+    settings = get_settings()
     try:
         authority = await read_issue_authority(
             session, execution_request_id=claims.execution_request_id, running=True
@@ -164,10 +159,10 @@ async def read_work_item_issue(
         if not _claims_match(claims, authority):
             raise IssueReadRefused
         await charge_issue_read_attempt(request.app.state.valkey, claims.execution_request_id)
-        content = await read_issue(
-            authority, settings=get_settings(), client=request.app.state.http_client
+        ticket = await read_issue(
+            authority, settings=settings, client=request.app.state.http_client
         )
-        # Cancellation or the deadline may land during the GitHub read.
+        # Cancellation or the deadline may land during the tracker read.
         current = await read_issue_authority(
             session, execution_request_id=claims.execution_request_id, running=True
         )
@@ -178,24 +173,24 @@ async def read_work_item_issue(
             409, "invalid_context", "the execution no longer grants this issue read"
         ) from None
     except IssueReadUnavailable:
-        raise issue_read_error(
-            503, "issue_unavailable", "GitHub could not answer the issue read; retry shortly"
-        ) from None
+        raise _unavailable() from None
     # The database requires both timestamps for a running execution.
     assert current.started_at is not None
     assert current.execution_deadline is not None
+    try:
+        url = issue_link(forges_registry(settings), current.issue, current.repository)
+    except ForgeError:
+        raise _unavailable() from None
     return IssueReadResult(
-        repo_full_name=authority.repo_full_name,
-        issue_number=authority.issue_number,
-        title=content.title,
-        body=content.body,
-        state=content.state,
-        author=content.author,
-        comments=[
-            IssueReadComment(author=c.author, created_at=c.created_at, body=c.body)
-            for c in content.comments
-        ],
-        comments_truncated=content.comments_truncated,
+        issue=display_reference(current.issue, current.repository.path),
+        url=url,
+        ticket=ticket,
         execution_deadline=current.execution_deadline,
         execution_seconds=int((current.execution_deadline - current.started_at).total_seconds()),
+    )
+
+
+def _unavailable() -> HTTPException:
+    return issue_read_error(
+        503, "issue_unavailable", "The tracker could not answer the issue read; retry shortly"
     )

@@ -28,7 +28,7 @@ from curie_api.forges.types import RepositoryRef
 
 if TYPE_CHECKING:
     from curie_api.forges.github.code_host import GitHubCodeHost
-    from curie_api.forges.github.comments import TokenSource
+    from curie_api.forges.github.comments import GitHubMarkedComments, TokenSource
     from curie_api.forges.github.tracker import GitHubTracker
 
 
@@ -150,6 +150,7 @@ class GitHubCodeHostConnection:
         client: httpx.AsyncClient,
         *,
         installations: Mapping[str, int] | None = None,
+        repository: RepositoryRef | None = None,
     ) -> GitHubCodeHost:
         from curie_api.forges.github.code_host import GitHubCodeHost
 
@@ -159,5 +160,43 @@ class GitHubCodeHostConnection:
             html_base=self.html_base,
             timeout_s=self._provider.credentials.auth.timeout_s,
             credentials=self._provider.credentials,
+            marked_comments=self._marked_comments(client, installations, repository),
             installations=installations,
+        )
+
+    def _marked_comments(
+        self,
+        client: httpx.AsyncClient,
+        installations: Mapping[str, int] | None,
+        repository: RepositoryRef | None,
+    ) -> GitHubMarkedComments | None:
+        """Pull request and review thread comments on ``repository``, minted
+        only for the installation ``installations`` records for it (#4358 plan
+        D6). None without a repository whose id and installation are recorded."""
+
+        if repository is None or not repository.project_id.isdigit():
+            return None
+        installation = next(
+            (
+                installation_id
+                for path, installation_id in (installations or {}).items()
+                if path.casefold() == repository.path.casefold()
+            ),
+            None,
+        )
+        if installation is None:
+            return None
+        from curie_api.forges.github.comments import GitHubMarkedComments
+
+        async def token() -> str:
+            return await self.installation_token(repository, installation)
+
+        return GitHubMarkedComments(
+            client,
+            api=self.config.api_url,
+            host=self.config.host,
+            repo_full_name=repository.path,
+            repository_id=int(repository.project_id),
+            token=token,
+            app_id=self._provider.credentials.auth.app_id,
         )

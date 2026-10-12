@@ -16,6 +16,7 @@ from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.crud import agents as crud_agents
 from curie_api.crud import approvals as crud_approvals
@@ -44,14 +45,16 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
-from ..forges.errors import ForgeError, Unauthorized, Unavailable
+from ..forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
 from ..forges.hosts import code_host_for, pull_request_ref
+from ..forges.trackers import tracker_for_work_item
 from ..forges.types import GITHUB, CredentialScope
 from ..models import (
     ExecutionRequest,
     Publication,
     PublicationReviewReservation,
     ThreadPublicationLineage,
+    WorkItem,
 )
 from ..publication_authority import (
     AuthorityRefused,
@@ -75,6 +78,48 @@ from ..workspace_policy import credential_mode, repository_is_allowed
 from .publication_precheck import precheck_error
 
 logger = logging.getLogger(__name__)
+
+
+async def _closing_reference(
+    session: AsyncSession, request: Request, execution_request_id: uuid.UUID
+) -> str | None:
+    """The WorkItem tracker's closing reference for the request's issue.
+
+    None when the request is unknown (creation refuses it), or when no
+    configured tracker serves the WorkItem's issue (a WorkItem the work-items
+    API admitted on an install with no factory trackers). A configured tracker
+    that cannot answer refuses the publication retryably, so no body is stored
+    without its reference.
+    """
+
+    execution = await session.get(ExecutionRequest, execution_request_id)
+    if execution is None:
+        return None
+    item = await session.get(WorkItem, execution.work_item_id)
+    if item is None:
+        return None
+    try:
+        tracker = tracker_for_work_item(
+            request.app.state.forges,
+            request.app.state.http_client,
+            item.tracker_issue,
+            item.repository,
+            item.code_host_installation_id,
+        )
+    except NotFound:
+        return None
+    try:
+        reference: str = await tracker.closing_reference(item.tracker_issue, item.repository)
+    except ForgeError:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            {
+                "code": "publication.closing_reference_unavailable",
+                "message": "the tracker could not name the issue; retry shortly",
+            },
+            headers={"Retry-After": "10"},
+        ) from None
+    return reference
 
 router = APIRouter(
     prefix="/publications",
@@ -370,6 +415,7 @@ async def create_publication(
     traceparent = canonicalize_traceparent(request.headers.get(TRACEPARENT_STREAM_FIELD))
 
     if data.work_item_request_id is not None:
+        work_item_request_id = data.work_item_request_id
         prior_paths = (
             await session.scalars(
                 select(Publication.changed_paths).where(
@@ -457,6 +503,12 @@ async def create_publication(
             if missing:
                 body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
                 data = data.model_copy(update={"body": body})
+        # Every factory pull request body references its ticket (#4358 plan D7),
+        # in the tracker's own form; a body that already carries it is kept.
+        reference = await _closing_reference(session, request, work_item_request_id)
+        if reference is not None and reference not in (data.body or ""):
+            body = f"{data.body}\n\n{reference}" if data.body else reference
+            data = data.model_copy(update={"body": body})
 
     async def metadata_check() -> None:
         if patch:

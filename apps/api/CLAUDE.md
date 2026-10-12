@@ -81,13 +81,16 @@ worker, Postgres, RustFS/S3, Langfuse, and GitHub.
 - **The factory issue read is a scoped credential exception (ADR 0187).**
   `POST /work-items/issue-read` accepts only the API issued `wir` capability
   in `X-Curie-Issue-Read`. Its sole scope is `work_item.issue_read`, and it
-  names one execution request and its WorkItem's repository and issue. The
-  worker mints it at sandbox boot through
-  `POST /v1/internal/work-items/issue-read/context` using its internal worker
-  credential. The read refuses any other repository or issue, re-checks that
-  the request is still running before its deadline and that its WorkItem is
-  not cancelled, then reads the issue and its comments with a freshly minted
-  App installation token and returns them verbatim. It stores nothing.
+  names one execution request, its WorkItem, and that WorkItem's tracker
+  issue (tracker kind, host, scope id and issue id). The worker mints it at
+  sandbox boot through `POST /v1/internal/work-items/issue-read/context` using
+  its internal worker credential. The read takes no body: it refuses a
+  capability whose issue is not the durable WorkItem's, re-checks that the
+  request is still running before its deadline and that its WorkItem is not
+  cancelled, then reads the ticket through the WorkItem's tracker
+  (`Tracker.read_ticket`; a GitHub issue with an App installation token
+  freshly minted only for the recorded installation) and returns it as
+  markdown with its link. It stores nothing.
   State and other scoped credentials do not authorize it, and `wir`
   authorizes no other route.
 - **Channel read is a scoped credential exception (ADR 0100, #2877).**

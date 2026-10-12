@@ -23,8 +23,9 @@ from sqlalchemy.sql.elements import ColumnElement
 from .. import transcripts
 from ..config import get_settings
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
-from ..forges.github.binding import github_reply_route
+from ..forges.errors import ForgeError
 from ..forges.registry import forges_registry
+from ..forges.trackers import comment_prefix, issue_link, reply_route
 from ..forges.types import RepositoryRef, TrackerIssueRef
 from ..models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
@@ -814,18 +815,21 @@ async def _unchanged_follow_up(
 
     if detail is None or not detail.strip().startswith("No changes needed:"):
         return False
-    # The objective links the issue under the factory code host's web base
-    # (github_factory._facts), so the comparison reads the same base.
-    code_host = forges_registry(get_settings()).github_code_host()
-    if code_host is None:
+    # The objective opens with the issue link admission wrote, so the
+    # comparison reads the same link. An issue that cannot be linked (no
+    # GitHub code host, or a binding that left config) is not a follow-up.
+    try:
+        link = issue_link(
+            forges_registry(get_settings()), work_item.tracker_issue, work_item.repository
+        )
+    except ForgeError:
         return False
-    clone_base = code_host.html_base
-    repo, issue = work_item.repository_path, int(work_item.tracker_issue_id)
+    prefix = comment_prefix(work_item.tracker_kind)
     follow_up = request.reply_target_kind != "issue" or is_issue_follow_up(
-        request.objective, repo_full_name=repo, issue_number=issue, clone_base=clone_base
+        request.objective, issue_link=link, comment_prefix=prefix
     )
     if not follow_up and not is_relabel_objective(
-        request.objective, repo_full_name=repo, issue_number=issue, clone_base=clone_base
+        request.objective, issue_link=link, comment_prefix=prefix
     ):
         return False
     lineage = (
@@ -1951,8 +1955,8 @@ async def admit_pending_readmit(
         await session.commit()
         return None
     request_id = work_item.readmit_request_id
-    reply_kind, reply_address, reply_conversation_id = github_reply_route(
-        work_item.repository_path, int(work_item.tracker_issue_id)
+    reply_kind, reply_address, reply_conversation_id = reply_route(
+        forges_registry(get_settings()), work_item.tracker_issue, work_item.repository_path
     )
     snapshot: dict[str, Any] = {
         "objective": work_item.readmit_objective,

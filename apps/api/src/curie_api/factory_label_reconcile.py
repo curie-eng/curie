@@ -32,12 +32,13 @@ from starlette.concurrency import run_in_threadpool
 from . import github_factory
 from .config import Settings
 from .forges.errors import Unavailable
-from .forges.github.binding import GITHUB_CHANNEL_KIND, bound_labels
+from .forges.github.binding import GITHUB_CHANNEL_KIND
 from .forges.github.comments import static_token
 from .forges.github.tracker import GitHubTracker, last_label_event, read_repository
 from .forges.hosts import factory_credentials, factory_tracker
 from .forges.identity import reconcile_delivery_id
 from .forges.registry import forges_registry
+from .forges.surfaces import bound_labels
 from .forges.types import GITHUB
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import FactoryNotice
@@ -85,6 +86,28 @@ async def open_work_item_repositories(session: AsyncSession) -> list[str]:
     return list(rows)
 
 
+async def tracker_work_item_repositories(session: AsyncSession) -> list[str]:
+    """The GitHub repositories of open non-GitHub tracker WorkItems with a pull
+    request (#4358 plan D10).
+
+    Their review feedback is on the GitHub code host, so the GitHub poll pass
+    walks them for feedback only; their intake is the tracker's own pass.
+    Callers filter it by the allowlist.
+    """
+
+    rows = await session.scalars(
+        select(WorkItem.repository_path)
+        .where(
+            WorkItem.tracker_kind != GITHUB,
+            WorkItem.code_host_kind == GITHUB,
+            WorkItem.cancelled_at.is_(None),
+            WorkItem.publication_lineage_id.is_not(None),
+        )
+        .distinct()
+    )
+    return list(rows)
+
+
 async def reconcile_missed_labels(
     sessionmaker: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -123,7 +146,7 @@ async def _reconcile_repository(
     registry = forges_registry(settings)
     intake = factory_tracker(registry)
     async with sessionmaker() as session:
-        labels = sorted(await bound_labels(session, registry, repo))
+        labels = sorted(await bound_labels(session, registry, GITHUB_CHANNEL_KIND, repo))
     if not labels:
         return 0
     installation_id, token = await run_in_threadpool(

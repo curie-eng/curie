@@ -28,15 +28,17 @@ from curie_api.workitems.lifecycle import (
 
 from . import factory_base, workitem_dispatch
 from .config import Settings
+from .factory_admission import (
+    LABEL_REFUSAL_MARKER,
+    cancel_work_item,
+    ignored,
+    label_refusal,
+    label_span,
+)
 from .factory_base import BaseRefusal
 from .factory_notices import mark_status_comment_stale
 from .forges.errors import ForgeError, Unavailable
-from .forges.github.binding import (
-    agent_binding,
-    bound_labels,
-    github_reply_route,
-    resolve_binding,
-)
+from .forges.github.binding import GITHUB_CHANNEL_KIND, resolve_binding
 from .forges.github.comments import static_token
 from .forges.github.identity import delivery_uuid
 from .forges.github.tracker import GitHubTracker, IssueFacts, last_label_event
@@ -50,7 +52,8 @@ from .forges.hosts import (
 from .forges.identity import issue_lock_keys
 from .forges.ports import CodeHost
 from .forges.registry import ForgeRegistry, forges_registry
-from .forges.surfaces import effective_trigger_label
+from .forges.surfaces import agent_binding, bound_labels, effective_trigger_label
+from .forges.trackers import reply_route
 from .forges.types import GITHUB, ReplyTarget, RepositoryRef, TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import (
@@ -104,10 +107,6 @@ IGNORED = {
     "label_conflict",
 }
 
-# The one label refusal comment per issue (#4361 decision 9), edited, never
-# duplicated, like the `base:` refusal.
-LABEL_REFUSAL_MARKER = "curie-factory-label-refusal"
-
 
 @dataclass(frozen=True)
 class VerifiedIssue:
@@ -123,10 +122,6 @@ class VerifiedIssue:
     tracker: GitHubTracker
     code_host: CodeHost
     repository: RepositoryRef
-
-
-def ignored(code: str) -> WebhookResult:
-    return WebhookResult(status="factory_ignored", errors=[{"code": code}])
 
 
 async def _tracker(
@@ -211,9 +206,7 @@ def notice_issue(notice: FactoryNotice, registry: ForgeRegistry) -> TrackerIssue
 def notice_repository(notice: FactoryNotice, registry: ForgeRegistry) -> RepositoryRef:
     """The repository a GitHub notice's issue lives on: its own (ADR 0197 rule 3)."""
 
-    return factory_repository(
-        registry, path=notice.repo_full_name, project_id=notice.repository_id
-    )
+    return factory_repository(registry, path=notice.repo_full_name, project_id=notice.repository_id)
 
 
 async def lock_issue(session: AsyncSession, issue: TrackerIssueRef) -> None:
@@ -243,8 +236,8 @@ def _facts(notice: FactoryNotice, binding: AgentChannel, registry: ForgeRegistry
     objective = f"{base}/{notice.repo_full_name}/issues/{notice.issue_number}"
     if notice.disposition == "mention":
         objective = f"{objective}#issuecomment-{notice.comment_id}"
-    kind, address, reply_conversation_id = github_reply_route(
-        notice.repo_full_name, notice.issue_number
+    kind, address, reply_conversation_id = reply_route(
+        registry, notice_issue(notice, registry), notice.repo_full_name
     )
     return Admission(
         agent_id=binding.agent_id,
@@ -264,9 +257,7 @@ def _facts(notice: FactoryNotice, binding: AgentChannel, registry: ForgeRegistry
 
 
 async def work_item_for(session: AsyncSession, issue: TrackerIssueRef) -> WorkItem | None:
-    found: WorkItem | None = await session.scalar(
-        select(WorkItem).where(*for_tracker_issue(issue))
-    )
+    found: WorkItem | None = await session.scalar(select(WorkItem).where(*for_tracker_issue(issue)))
     return found
 
 
@@ -309,7 +300,9 @@ async def _record_label(
         return
     ignored = factory_base.label_disagreement(
         verified.labels,
-        factory_base.bases_for(forges_registry(settings), item.repository_path),
+        factory_base.bases_for(
+            forges_registry(settings).github_repository_policy(item.repository_path)
+        ),
         verified.default_branch,
         item.base_branch,
     )
@@ -328,8 +321,7 @@ async def _fresh_base(
 
     tracker = verified.tracker
     resolved = await factory_base.resolve_base(
-        registry=forges_registry(settings),
-        repo_full_name=notice.repo_full_name,
+        policy=forges_registry(settings).github_repository_policy(notice.repo_full_name),
         labels=verified.labels,
         default_branch=verified.default_branch,
         code_host=verified.code_host,
@@ -357,10 +349,6 @@ def admitting_label(registry: ForgeRegistry, item: WorkItem) -> str | None:
         return item.trigger_label
     tracker = registry.github_tracker()
     return None if tracker is None else tracker.config.label
-
-
-def _label_span(label: str | None) -> str:
-    return f"`{label}`" if label is not None else "its original label"
 
 
 async def _comment_label_refusal(tracker: GitHubTracker, number: int, body: str) -> None:
@@ -391,28 +379,17 @@ async def _refuse_label_admission(
        repository. A run already admitted is not touched.
     """
 
-    if existing is not None and existing.agent_id != binding.agent_id:
-        owner = admitting_label(registry, existing)
-        await _comment_label_refusal(
-            verified.tracker,
-            notice.issue_number,
-            f"Curie did not start this issue under {_label_span(notice.label)}: it belongs to the "
-            f"run the {_label_span(owner)} label started, which is another agent's. Open a new "
-            f"issue to run it under {_label_span(notice.label)}.",
-        )
-        raise FactoryRefused("work_item_other_agent")
-    bound = await bound_labels(session, registry, notice.repo_full_name)
-    present = sorted(label for label in bound if label in verified.labels)
-    if len(present) > 1:
-        await _comment_label_refusal(
-            verified.tracker,
-            notice.issue_number,
-            "Curie did not start this issue: it carries "
-            f"{', '.join(_label_span(label) for label in present)}, which start different "
-            "agents on this repository. Keep exactly one of them; Curie will pick the issue "
-            "up on its next pass.",
-        )
-        raise FactoryRefused("label_conflict")
+    bound = await bound_labels(session, registry, GITHUB_CHANNEL_KIND, notice.repo_full_name)
+    refusal = label_refusal(
+        label=notice.label,
+        owner_label=None if existing is None else admitting_label(registry, existing),
+        other_agent=existing is not None and existing.agent_id != binding.agent_id,
+        present=sorted(label for label in bound if label in verified.labels),
+    )
+    if refusal is not None:
+        code, body = refusal
+        await _comment_label_refusal(verified.tracker, notice.issue_number, body)
+        raise FactoryRefused(code)
     return frozenset(bound)
 
 
@@ -446,7 +423,7 @@ async def _settle_label_refusal(
         await tracker.marked_comments.upsert_marked(
             target,
             LABEL_REFUSAL_MARKER,
-            f"Curie started this issue under {_label_span(label)}; the earlier label refusal no "
+            f"Curie started this issue under {label_span(label)}; the earlier label refusal no "
             "longer applies.",
         )
     except ForgeError:
@@ -468,7 +445,9 @@ async def admit_notice(
         if existing is None:
             raise FactoryRefused("not_admitted")
         # A mention routes to the WorkItem's agent's surface (#4361 decision 11).
-        found = await agent_binding(session, existing.agent_id, notice.repo_full_name)
+        found = await agent_binding(
+            session, existing.agent_id, GITHUB_CHANNEL_KIND, notice.repo_full_name
+        )
         if found is None:
             raise FactoryRefused("binding_missing")
         binding = found
@@ -548,25 +527,7 @@ async def cancel_notice(
     # only when it is the label that admitted it (#4361 decision 10).
     if notice.action == "unlabeled" and notice.label != admitting_label(registry, item):
         return ignored("label_not_admitting")
-    result = await workitem_dispatch.cancel(
-        session, work_item_id=item.id, expected_version=item.version
-    )
-    if isinstance(result, WorkItemConflict) and result.code == "stale_version":
-        if result.work_item_version is None:
-            return ignored("stale_version")
-        result = await workitem_dispatch.cancel(
-            session,
-            work_item_id=item.id,
-            expected_version=result.work_item_version,
-        )
-    if isinstance(result, WorkItemConflict):
-        return ignored(result.code)
-    if result.replayed:
-        return WebhookResult(status="factory_duplicate")
-    status = None if result.request is None else result.request.status
-    if status == "cancellation_requested":
-        return WebhookResult(status="factory_cancellation_requested")
-    return WebhookResult(status="factory_cancelled")
+    return await cancel_work_item(session, item)
 
 
 async def _with_label_event(
@@ -643,7 +604,7 @@ async def handle_factory_delivery(
         labels = (
             frozenset()
             if repository is None
-            else frozenset(await bound_labels(session, registry, repository))
+            else frozenset(await bound_labels(session, registry, GITHUB_CHANNEL_KIND, repository))
         )
         notice = parse_factory_event(
             event,

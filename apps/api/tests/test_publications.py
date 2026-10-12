@@ -7193,7 +7193,9 @@ def test_factory_python_publication_with_a_passed_python_check_adds_no_stamp(
     created = _post_factory_publication(client, payload)
 
     assert created.status_code == 201, created.text
-    assert created.json()["body"] == payload["body"]
+    # No stamp: the only addition is the closing reference (#4358 plan D7).
+    number = payload["reply_conversation_id"].removeprefix("issue-")
+    assert created.json()["body"] == f"{payload['body']}\n\nCloses #{number}"
 
 
 def test_factory_python_publication_uses_the_python_check_among_several(
@@ -7430,7 +7432,10 @@ def test_factory_non_python_publication_keeps_its_existing_body_without_python_c
     created = _post_factory_publication(client, payload)
 
     assert created.status_code == 201, created.text
-    assert created.json()["body"] == payload["body"]
+    # No python claim is added; only the tracker's closing reference, which the
+    # body lacked, is appended (#4358 plan D7).
+    issue_number = int(payload["reply_conversation_id"].removeprefix("issue-"))
+    assert created.json()["body"] == f"{payload['body']}\n\nCloses #{issue_number}"
 
 
 def test_later_non_python_publication_keeps_prior_python_proof_pending(

@@ -73,10 +73,16 @@ class CodeHostConnection(Protocol):
         ...
 
     def adapter(
-        self, client: httpx.AsyncClient, *, installations: Mapping[str, int] | None = None
+        self,
+        client: httpx.AsyncClient,
+        *,
+        installations: Mapping[str, int] | None = None,
+        repository: RepositoryRef | None = None,
     ) -> CodeHost:
         """The code host adapter. ``installations`` maps a repository path to
-        the App installation stored for it."""
+        the App installation stored for it. With ``repository``, its
+        ``marked_comments`` are the status comments on that repository's pull
+        requests and review threads."""
         ...
 
     async def installation_for(self, repository: RepositoryRef) -> int | None:
