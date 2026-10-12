@@ -251,6 +251,50 @@ pub fn forge_egress_entries(
         .collect())
 }
 
+/// Reads the access token from `token_file`, trimmed. The value is never
+/// put into an error.
+pub(super) fn read_token(token_file: &Path) -> Result<String> {
+    let raw = std::fs::read_to_string(token_file).map_err(|error| {
+        CliError::failure(format!(
+            "could not read the token file {}: {error}",
+            token_file.display()
+        ))
+    })?;
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(
+            CliError::usage(format!("the token file {} is empty", token_file.display())).into(),
+        );
+    }
+    Ok(token.to_string())
+}
+
+/// A client with the forge probes' 5 second connect and 15 second request
+/// timeouts, trusting `ca_file` when given.
+pub(super) fn http_client(ca_file: Option<&Path>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(15));
+    if let Some(ca_file) = ca_file {
+        let pem = std::fs::read(ca_file).map_err(|error| {
+            CliError::failure(format!(
+                "could not read --ca-file {}: {error}",
+                ca_file.display()
+            ))
+        })?;
+        let certificate = reqwest::Certificate::from_pem(&pem).map_err(|error| {
+            CliError::usage(format!(
+                "--ca-file {} is not a PEM certificate: {error}",
+                ca_file.display()
+            ))
+        })?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder.build().map_err(|error| {
+        CliError::failure(format!("could not build an HTTP client: {error}")).into()
+    })
+}
+
 /// The error for a forge kind this build has no quickstart module for.
 fn forge_not_installed(kind: &str) -> anyhow::Error {
     CliError::unsupported(format!(

@@ -47,11 +47,10 @@ EXPECTED_PAIRINGS = {
     "jira_cloud+github",
     "gitlab+gitlab",
     "jira_cloud+gitlab",
-    "bitbucket_cloud+bitbucket_cloud",
     "jira_cloud+bitbucket_cloud",
-    "bitbucket_dc+bitbucket_dc",
+    "jira_cloud+bitbucket_dc",
 }
-INSTALLED = {"github+github"}
+INSTALLED = {"github+github", "jira_cloud+bitbucket_cloud", "jira_cloud+bitbucket_dc"}
 NOT_INSTALLED = sorted(EXPECTED_PAIRINGS - INSTALLED)
 NAMESPACE = "test-factory-acceptance"
 

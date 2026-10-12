@@ -17,9 +17,10 @@ and to `--evidence` when given.
 
 `--dry-run` lists every step and launches nothing. It fails on an entry with
 an unset step field, and reports "not installed" for an entry whose forge
-drivers are not installed. Only github+github is installed today; the
-GitLab, Jira and Bitbucket entries are complete step definitions waiting on
-their drivers in tools/factory-e2e/forges/.
+drivers are not installed. github+github, jira_cloud+bitbucket_cloud and
+jira_cloud+bitbucket_dc are installed today; the other GitLab and Jira entries
+are complete step definitions waiting on their drivers in
+tools/factory-e2e/forges/. Bitbucket pairs only with a Jira Cloud tracker.
 """
 
 from __future__ import annotations
@@ -208,9 +209,8 @@ PAIRINGS: dict[str, Pairing] = {
         _pairing("jira_cloud", "github", installed=False),
         _pairing("gitlab", "gitlab", installed=False),
         _pairing("jira_cloud", "gitlab", installed=False),
-        _pairing("bitbucket_cloud", "bitbucket_cloud", installed=False),
-        _pairing("jira_cloud", "bitbucket_cloud", installed=False),
-        _pairing("bitbucket_dc", "bitbucket_dc", installed=False),
+        _pairing("jira_cloud", "bitbucket_cloud", installed=True),
+        _pairing("jira_cloud", "bitbucket_dc", installed=True),
     )
 }
 

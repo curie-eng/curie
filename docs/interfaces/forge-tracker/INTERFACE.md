@@ -199,6 +199,15 @@ Jira and both Bitbucket kinds are.
    Bitbucket binding has.
 2. **GitHub:** not yet behind the ports. Its code lives in
    `apps/api/src/curie_api/forges/github/` and is called directly.
+3. **Bitbucket Cloud:** `BitbucketCloudCodeHost` in
+   `apps/api/src/curie_api/forges/bitbucket_cloud/code_host.py`, a code host
+   only, paired with a Jira Cloud tracker. Every mandatory CodeHost and
+   MarkedComments operation is supported; `ci_diagnostics`, `rerun_failed` and
+   `user_can_write` are unsupported. Review feedback counts only from accounts
+   in the binding's review feedback allowlist.
+4. **Bitbucket Data Center:** `BitbucketDcCodeHost` in
+   `apps/api/src/curie_api/forges/bitbucket_dc/code_host.py`, with the same
+   capabilities and allowlist rule, for Data Center 9.4.0 or newer.
 
 ## Known leakage
 

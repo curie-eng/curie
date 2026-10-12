@@ -1,0 +1,14 @@
+{
+  "type": "error",
+  "error": {
+    "message": "Your credentials lack one or more required privilege scopes.",
+    "detail": {
+      "granted": [
+        "account"
+      ],
+      "required": [
+        "repository"
+      ]
+    }
+  }
+}
