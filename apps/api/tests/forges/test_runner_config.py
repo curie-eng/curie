@@ -208,8 +208,11 @@ def _shared_document(case: str) -> dict[str, Any]:
 def test_repository_identity_and_path_consistency(case: str, refused: bool) -> None:
     document = _shared_document(case)
     if refused:
-        with pytest.raises(ValidationError):
+        with pytest.raises(ValidationError) as error:
             ForgesConfig.model_validate(document)
+        terms = ("path",) if case == "cross-host-active" else ("runner", "docker")
+        messages = [e["msg"].lower() for e in error.value.errors(include_input=False)]
+        assert any(term in message for term in terms for message in messages), messages
     else:
         assert len(ForgesConfig.model_validate(document).bindings) == 2
 
