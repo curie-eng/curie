@@ -248,6 +248,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         environ=os.environ,
         level=settings.log_level.upper(),
     )
+    # Keep access and error records at INFO on the shared telemetry handlers.
+    configure_service_logging(
+        logging.getLogger("uvicorn"),
+        service_name="curie-api",
+        logger_provider=telemetry.logger_provider,
+        level=logging.INFO,
+    )
     app.state.telemetry = telemetry
     for limit in ("value", "namespace"):
         record_metric(
