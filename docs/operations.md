@@ -1582,6 +1582,7 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to the execution bound; unset, the model is fake |
 | `CURIE_FACTORY_MODEL_BASE_URL` or `--model-base-url` | Anthropic-compatible base URL. The worker receives it as `CURIE_MODEL_BASE_URL` through `worker.extraEnv`. The host must be the model proxy pod IP; sandbox egress allows that `/32` and port. `curie dev model-script record` is the proxy that writes a transcript while it forwards to `https://openrouter.ai/api`. `curie dev model-script serve` replays that transcript and fails if a request, including a plan or diff reviewer call, was not recorded |
 | `CURIE_FACTORY_MODEL` | Model name (default `z-ai/glm-5.3-flash`) |
+| `CURIE_FACTORY_JIRA_ENV_FILE` | Only for `--forge jira_cloud` (the `jira_cloud+github` acceptance entry): a file of `key=value` lines setting `site` (bare host), `cloud_id`, `project_key`, `labeler_email`, `labeler_token_file`, `bot_email`, `bot_account_id` and `bot_token_file`. The labeler is the human account allowed to start work; the bot is the factory account the run installs. Tokens stay in their files and ride only in Basic Authorization headers |
 | `CURIE_FACTORY_MODEL_CONTEXT_TOKENS` | The model's context window, passed to the sandbox as `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (default 128000 for the default model, unset for any other) |
 
 The App must already be installed on the fixture repository. Adding a

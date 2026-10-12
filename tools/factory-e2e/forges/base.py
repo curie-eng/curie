@@ -16,7 +16,7 @@ and loaded on its own.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, NoReturn, Protocol
 
 
@@ -36,6 +36,8 @@ class ForgeDriver(Protocol):
     """The forge steps the loop needs. Each forge entry implements them once."""
 
     forge: str
+    # "<tracker>+<code host>", as the acceptance table keys its entries.
+    pairing: str
 
     def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
         """Open the ticket with the factory label, prove admission; the WorkItem id."""
@@ -83,6 +85,18 @@ class ForgeDriver(Protocol):
 
     def pin_fixture_base(self) -> None:
         """Remember the fixture's default branch head now and put it back on teardown."""
+        ...
+
+    def teardowns(self) -> tuple[tuple[str, Callable[[], Any]], ...]:
+        """Named undo steps of the driver's own, pushed right after the fixture reset."""
+        ...
+
+    def tracker_evidence(self, change: ChangeRef | None, work_item_id: str) -> dict[str, Any]:
+        """What the tracker shows for the run once the merge is observed; {} when nothing."""
+        ...
+
+    def judge_tracker(self, evidence: Mapping[str, Any]) -> list[str]:
+        """Every way ``evidence`` falls short, one line each. Empty means it passed."""
         ...
 
 

@@ -17,9 +17,14 @@ and to `--evidence` when given.
 
 `--dry-run` lists every step and launches nothing. It fails on an entry with
 an unset step field, and reports "not installed" for an entry whose forge
-drivers are not installed. Only github+github is installed today; the
-GitLab, Jira and Bitbucket entries are complete step definitions waiting on
-their drivers in tools/factory-e2e/forges/.
+drivers are not installed. github+github and jira_cloud+github are installed
+today; the GitLab and Bitbucket entries, and Jira with those code hosts, are
+complete step definitions waiting on their drivers in tools/factory-e2e/forges/.
+
+A Jira tracker entry is driven by the jira_cloud driver (`--forge jira_cloud`),
+which delegates the change, CI, review and merge steps to the code host's
+driver, so it asserts the same loop plus the tracker evidence and the
+"close Jira test issues" teardown.
 """
 
 from __future__ import annotations
@@ -118,7 +123,27 @@ _CI_NAMES = {
 }
 
 
+# The step the jira_cloud driver's teardowns() pushes.
+CLOSE_JIRA_STEP = "close Jira test issues"
+# What a passing Jira tracker run records under scenario.tracker.
+_JIRA_TRACKER_ASSERTIONS = (
+    ("scenario.tracker.status_comments", 1),
+    ("scenario.tracker.remote_links", 1),
+    ("scenario.tracker.pr_body_has_key", True),
+    ("scenario.tracker.bot_label_admitted", False),
+)
+
+
 def _inputs(tracker: str, code_host: str) -> dict[str, str]:
+    credentials = (
+        "CURIE_FACTORY_* variables and files for the test App, actor and fixture, "
+        "with CURIE_FACTORY_MODEL_API_KEY for a real model"
+    )
+    if tracker == "jira_cloud":
+        credentials += (
+            ", and CURIE_FACTORY_JIRA_ENV_FILE naming the Jira test site, the labeler and "
+            "the factory account with their token files"
+        )
     return {
         "tracker": f"{_FORGE_LABELS[tracker]} ({tracker})",
         "code_host": f"{_FORGE_LABELS[code_host]} ({code_host})",
@@ -126,16 +151,21 @@ def _inputs(tracker: str, code_host: str) -> dict[str, str]:
         "review": "--revision-file, else the default review text (a round trip unit test)",
         "candidate": "--candidate and --candidate-images (build for a pull request head)",
         "kube_context": "--context, else CURIE_FACTORY_KUBE_CONTEXT",
-        "credentials": (
-            "CURIE_FACTORY_* variables and files for the test App, actor and fixture, "
-            "with CURIE_FACTORY_MODEL_API_KEY for a real model"
-        ),
+        "credentials": credentials,
     }
 
 
 def _remote(tracker: str, code_host: str) -> tuple[str, ...]:
     change = _CHANGE_NAMES[code_host]
     host = _FORGE_LABELS[code_host]
+    tracker_lines: tuple[str, ...] = ()
+    if tracker == "jira_cloud":
+        tracker_lines = (
+            "the ticket carries exactly one status comment from the factory account",
+            f"the ticket carries exactly one remote link to the {change}",
+            f"the {change} body names the ticket key and its browse URL",
+            "a second ticket labelled by the factory account admits no WorkItem",
+        )
     return (
         f"{_FORGE_LABELS[tracker]} shows one new ticket from the test actor carrying the "
         "factory label",
@@ -145,16 +175,21 @@ def _remote(tracker: str, code_host: str) -> tuple[str, ...]:
         f"a review from the test actor that mentions the factory is followed by a new "
         f"commit on the same {change}",
         f"the test actor merged the {change} and {host} reads it merged",
+        *tracker_lines,
     )
 
 
-def _persisted(scenario: str, forge: str, teardown_steps: tuple[str, ...]) -> tuple[Any, ...]:
+def _persisted(
+    scenario: str, forge: str, pairing: str, teardown_steps: tuple[str, ...]
+) -> tuple[Any, ...]:
+    tracker = _JIRA_TRACKER_ASSERTIONS if forge == "jira_cloud" else ()
     return (
         ("result", "passed"),
         ("mode", f"run:{scenario}"),
         ("forge", forge),
         ("scenario.verdict", "passed"),
         ("scenario.forge", forge),
+        ("scenario.pairing", pairing),
         ("scenario.red_ci.state", "failure"),
         ("scenario.ci_after_fix.state", "passing"),
         ("scenario.review_delivery_api_status", "factory_admitted"),
@@ -162,12 +197,17 @@ def _persisted(scenario: str, forge: str, teardown_steps: tuple[str, ...]) -> tu
         ("scenario.forge_merged", True),
         ("scenario.work_item_pr_status", "merged"),
         ("scenario.cli_pr_status", "merged"),
+        *tracker,
         ("teardown_clean", True),
         *((f"teardown_ok.{name}", True) for name in teardown_steps),
     )
 
 
 def _loop_step(tracker: str, code_host: str) -> Step:
+    # The driver the loop runs: a Jira tracker's own, which delegates the code
+    # host steps; else the code host's. --forge, evidence forge and the
+    # scenario's forge all name it.
+    driver = tracker if tracker == "jira_cloud" else code_host
     if (tracker, code_host) == ("github", "github"):
         scenario = "github-loop"
         command = ["run", "--scenario", scenario]
@@ -180,8 +220,9 @@ def _loop_step(tracker: str, code_host: str) -> Step:
         )
     else:
         scenario = "forge-loop"
-        command = ["run", "--scenario", scenario, "--forge", code_host]
+        command = ["run", "--scenario", scenario, "--forge", driver]
         teardown_steps = (
+            *((CLOSE_JIRA_STEP,) if driver == "jira_cloud" else ()),
             "reset fixture repository",
             "restore fixture default branch",
             "delete namespaces",
@@ -192,7 +233,7 @@ def _loop_step(tracker: str, code_host: str) -> Step:
         command=command,
         deadline_seconds=LOOP_DEADLINE_SECONDS,
         remote_assertions=_remote(tracker, code_host),
-        persisted_assertions=_persisted(scenario, code_host, teardown_steps),
+        persisted_assertions=_persisted(scenario, driver, f"{tracker}+{code_host}", teardown_steps),
         teardown_checks=(TEARDOWN_CLEAN, NAMESPACE_GONE),
     )
 
@@ -205,7 +246,7 @@ PAIRINGS: dict[str, Pairing] = {
     p.key: p
     for p in (
         _pairing("github", "github", installed=True),
-        _pairing("jira_cloud", "github", installed=False),
+        _pairing("jira_cloud", "github", installed=True),
         _pairing("gitlab", "gitlab", installed=False),
         _pairing("jira_cloud", "gitlab", installed=False),
         _pairing("bitbucket_cloud", "bitbucket_cloud", installed=False),
