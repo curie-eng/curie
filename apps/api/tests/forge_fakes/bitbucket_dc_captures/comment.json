@@ -1,0 +1,83 @@
+{
+  "properties": {
+    "repositoryId": 1
+  },
+  "id": 2,
+  "version": 0,
+  "text": "Please rename this.",
+  "author": {
+    "name": "reviewer",
+    "emailAddress": "reviewer@example.invalid",
+    "active": true,
+    "displayName": "placeholder-user-2",
+    "id": 2,
+    "slug": "reviewer",
+    "type": "NORMAL",
+    "links": {
+      "self": [
+        {
+          "href": "https://bbdc.example.invalid/users/reviewer"
+        }
+      ]
+    }
+  },
+  "createdDate": 1760000002000,
+  "updatedDate": 1760000002000,
+  "comments": [
+    {
+      "properties": {
+        "repositoryId": 1
+      },
+      "id": 3,
+      "version": 0,
+      "text": "Thanks, will do.\n\n[//]: # (curie-factory-status:00000000-0000-4000-8000-000000000001)",
+      "author": {
+        "name": "curie-factory-bot",
+        "emailAddress": "curie-factory-bot@example.invalid",
+        "active": true,
+        "displayName": "placeholder-user-101",
+        "id": 101,
+        "slug": "curie-factory-bot",
+        "type": "SERVICE",
+        "links": {
+          "self": [
+            {
+              "href": "https://bbdc.example.invalid/users/curie-factory-bot"
+            }
+          ]
+        }
+      },
+      "createdDate": 1760000003000,
+      "updatedDate": 1760000003000,
+      "comments": [],
+      "tasks": [],
+      "severity": "NORMAL",
+      "state": "OPEN",
+      "threadResolved": false,
+      "permittedOperations": {
+        "editable": true,
+        "transitionable": true,
+        "deletable": true
+      }
+    }
+  ],
+  "tasks": [],
+  "severity": "NORMAL",
+  "state": "OPEN",
+  "threadResolved": false,
+  "permittedOperations": {
+    "editable": false,
+    "transitionable": true,
+    "deletable": false
+  },
+  "anchor": {
+    "fromHash": "1f2e3d4c5b6a79807a3f0c9e1d2b4a5f6e7d8c9b",
+    "toHash": "7a3f0c9e1d2b4a5f6e7d8c9b0a1f2e3d4c5b6a79",
+    "line": 1,
+    "lineType": "ADDED",
+    "fileType": "TO",
+    "path": "README.md",
+    "diffType": "EFFECTIVE",
+    "orphaned": false
+  }
+}

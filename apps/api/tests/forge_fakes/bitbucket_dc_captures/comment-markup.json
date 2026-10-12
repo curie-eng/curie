@@ -1,0 +1,37 @@
+{
+  "properties": {
+    "repositoryId": 1
+  },
+  "id": 3,
+  "version": 0,
+  "text": "Thanks, will do.\n\n[//]: # (curie-factory-status:00000000-0000-4000-8000-000000000001)",
+  "author": {
+    "name": "curie-factory-bot",
+    "emailAddress": "curie-factory-bot@example.invalid",
+    "active": true,
+    "displayName": "placeholder-user-101",
+    "id": 101,
+    "slug": "curie-factory-bot",
+    "type": "SERVICE",
+    "links": {
+      "self": [
+        {
+          "href": "https://bbdc.example.invalid/users/curie-factory-bot"
+        }
+      ]
+    }
+  },
+  "createdDate": 1760000003000,
+  "updatedDate": 1760000003000,
+  "comments": [],
+  "tasks": [],
+  "severity": "NORMAL",
+  "state": "OPEN",
+  "threadResolved": false,
+  "permittedOperations": {
+    "editable": true,
+    "transitionable": true,
+    "deletable": true
+  },
+  "html": "<p>Thanks, will do.</p>"
+}
