@@ -3,6 +3,77 @@
   "type": "object",
   "definitions": {
     "forge": {"properties": {"egress": {"type": "array", "items": {"required": ["cidr", "ports"]}}}},
+    "runnerProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "command"],
+      "properties": {
+        "name": {"type": "string", "pattern": "\\S"},
+        "command": {
+          "type": "array",
+          "minItems": 1,
+          "items": [{"type": "string", "pattern": "\\S"}],
+          "additionalItems": {"type": "string"}
+        }
+      }
+    },
+    "repositoryRunner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tools", "image", "base", "platformDigests"],
+      "properties": {
+        "tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "enum": ["uv", "rust", "pnpm", "build-essential", "docker-cli"]}
+        },
+        "image": {"type": "string", "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"},
+        "base": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "platformDigests": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["linux/amd64", "linux/arm64"],
+          "properties": {
+            "linux/amd64": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "linux/arm64": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          }
+        },
+        "dockerfile": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "probes": {"type": "array", "items": {"$ref": "#/definitions/runnerProbe"}}
+      }
+    },
+    "runnerDocker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "egressAllowlist": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["cidr", "ports"],
+            "properties": {
+              "cidr": {"type": "string", "pattern": "^[^\\s/]+/[0-9]{1,3}$"},
+              "ports": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["port"],
+                  "properties": {
+                    "protocol": {"type": "string", "enum": ["TCP"], "default": "TCP"},
+                    "port": {"type": "integer", "minimum": 1, "maximum": 65535}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "computePodDisruptionBudget": {
       "type": "object",
       "description": "Optional PodDisruptionBudget for a compute-plane Deployment (issue #1574). minAvailable, when set, replaces maxUnavailable. A budget allowing zero voluntary disruptions at the configured replica count needs allowBlockingDrain: true; the template refuses it otherwise.",
@@ -142,14 +213,31 @@
         "ciWaitSeconds": {"type": "integer", "minimum": 1, "maximum": 10800},
         "codeHosts": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
         "trackers": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
-        "bindings": {"type": "array", "items": {"type": "object", "properties": {"repos": {"type": "array", "items": {"type": "object", "properties": {"ci": {
-          "type": "object", "additionalProperties": false,
+        "bindings": {"type": "array", "items": {"type": "object", "properties": {"repos": {"type": "array", "items": {
+          "type": "object",
+          "allOf": [{
+            "if": {
+              "required": ["docker"],
+              "properties": {"docker": {"required": ["enabled"], "properties": {"enabled": {"const": true}}}}
+            },
+            "then": {
+              "required": ["runner"],
+              "properties": {"runner": {"properties": {"tools": {"contains": {"const": "docker-cli"}}}}}
+            }
+          }],
           "properties": {
-            "required": {"type": "object", "additionalProperties": false, "required": ["key", "paths"], "properties": {
-              "key": {"type": "string", "minLength": 1},
-              "paths": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
-              "pendingKeyPrefix": {"type": ["string", "null"], "minLength": 1}}},
-            "metadataRerunKeys": {"type": "array", "items": {"type": "string", "minLength": 1}}}}}}}}}},
+            "runner": {"$ref": "#/definitions/repositoryRunner"},
+            "docker": {"$ref": "#/definitions/runnerDocker"},
+            "ci": {
+              "type": "object", "additionalProperties": false,
+              "properties": {
+                "required": {"type": "object", "additionalProperties": false, "required": ["key", "paths"], "properties": {
+                  "key": {"type": "string", "minLength": 1},
+                  "paths": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+                  "pendingKeyPrefix": {"type": ["string", "null"], "minLength": 1}}},
+                "metadataRerunKeys": {"type": "array", "items": {"type": "string", "minLength": 1}}}}
+          }
+        }}}}},
         "sandboxEgress": {"type": "object", "additionalProperties": {"type": "boolean"}}
       }
     },

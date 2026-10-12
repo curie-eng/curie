@@ -110,6 +110,8 @@ env = {e["name"]: e for e in container.get("env", []) or []}
 
 for doc in docs:
     for c in (doc.get("spec", {}).get("template", {}).get("spec", {}) or {}).get("containers", []) or []:
+        if c.get("name") == "worker" and any(e["name"] == "CURIE_REPO_RUNNER_POOLS" for e in c.get("env", []) or []):
+            fail("schema-only repository blocks must not render CURIE_REPO_RUNNER_POOLS")
         stale = [e["name"] for e in c.get("env", []) or [] if e["name"].startswith(OLD_ENV_PREFIX)]
         if stale:
             fail("%s/%s still renders %s" % (doc["metadata"]["name"], c["name"], stale))
@@ -179,6 +181,25 @@ if repo["ci"] != {
 }:
     fail("ci policy %s" % (repo["ci"],))
 
+if mode == "tools":
+    digest = lambda c: "sha256:" + c * 64
+    expected_runner = {
+        "tools": ["uv", "rust", "pnpm", "build-essential", "docker-cli"],
+        "image": "registry.example.com/acme/runner@" + digest("a"), "base": digest("d"),
+        "platform_digests": {"linux/amd64": digest("b"), "linux/arm64": digest("c")},
+        "dockerfile": "Dockerfile.runner",
+        "probes": [{"name": "check", "command": ["check", "", "--version"]}],
+    }
+    if repo.get("runner") != expected_runner:
+        fail("runner fields, platform keys or probe argv changed in CURIE_FORGES")
+    expected_docker = {"enabled": True, "egress_allowlist": [
+        {"cidr": "203.0.113.0/24", "ports": [{"protocol": "TCP", "port": 443}]},
+    ]}
+    if repo.get("docker") != expected_docker:
+        fail("Docker declaration changed in CURIE_FORGES")
+elif "runner" in repo or "docker" in repo:
+    fail("absent repository runner/Docker blocks must stay absent")
+
 if len(volumes) != 1:
     fail(f"expected one projected Secret volume for forge credentials, got {volumes}")
 volume = volumes[0]
@@ -223,6 +244,46 @@ refused() {
 # Liveness and shape ------------------------------------------------------------
 render | check default
 render -f "$WORK/factory.yaml" | check factory
+
+# Repository tool declarations remain data; no pool env or runtime is added.
+python3 - "$WORK/factory.yaml" "$WORK/tools.yaml" <<'PY'
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1]))
+repo = doc["factory"]["bindings"][0]["repos"][0]
+digest = lambda c: "sha256:" + c * 64
+repo["runner"] = {
+    "tools": ["uv", "rust", "pnpm", "build-essential", "docker-cli"],
+    "image": "registry.example.com/acme/runner@" + digest("a"), "base": digest("d"),
+    "platformDigests": {"linux/amd64": digest("b"), "linux/arm64": digest("c")},
+    "dockerfile": "Dockerfile.runner",
+    "probes": [{"name": "check", "command": ["check", "", "--version"]}],
+}
+repo["docker"] = {"enabled": True, "egressAllowlist": [
+    {"cidr": "203.0.113.0/24", "ports": [{"protocol": "TCP", "port": 443}]},
+]}
+yaml.safe_dump(doc, open(sys.argv[2], "w"), sort_keys=False)
+PY
+render -f "$WORK/tools.yaml" | check tools
+PREFIX='factory.bindings[0].repos[0]'
+DIGEST="$(python3 -c 'print("sha256:" + "a" * 64)')"
+for image in "registry.example.com:5000/acme/runner@$DIGEST" "registry.example.com:5000/acme/runner:v1@$DIGEST"; do
+  render -f "$WORK/tools.yaml" --set-string "$PREFIX.runner.image=$image" >/dev/null
+done
+render -f "$WORK/factory.yaml" --set-json "$PREFIX.docker={\"enabled\":false}" >/dev/null
+render -f "$WORK/factory.yaml" --set-json "$PREFIX.docker={\"enabled\":false,\"egressAllowlist\":[{\"cidr\":\"203.0.113.0/24\",\"ports\":[{\"protocol\":\"TCP\",\"port\":443}]}]}" >/dev/null
+refused "tag-only repository image" "runner" render -f "$WORK/tools.yaml" \
+  --set-string "$PREFIX.runner.image=registry.example.com/acme/runner:latest"
+refused "unknown catalog tool" "tools" render -f "$WORK/tools.yaml" \
+  --set-json "$PREFIX.runner.tools=[\"unknown-tool\"]"
+refused "empty probe argv" "command" render -f "$WORK/tools.yaml" \
+  --set-json "$PREFIX.runner.probes=[{\"name\":\"check\",\"command\":[]}]"
+refused "blank probe executable" "command" render -f "$WORK/tools.yaml" \
+  --set-json "$PREFIX.runner.probes=[{\"name\":\"check\",\"command\":[\" \t\"]}]"
+refused "Docker enabled without CLI" "runner" render -f "$WORK/tools.yaml" \
+  --set-json "$PREFIX.runner.tools=[\"uv\"]"
+refused "Docker enabled without runner" "runner" render -f "$WORK/factory.yaml" \
+  --set-json "$PREFIX.docker={\"enabled\":true}"
+echo "  ok: tool blocks preserve platform keys and argv; invalid declarations are refused"
 
 # `--reuse-values` from a release that predates the block: no `factory` key.
 render --set-json 'factory=null' >/dev/null
