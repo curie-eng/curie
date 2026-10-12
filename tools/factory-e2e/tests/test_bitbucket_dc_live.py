@@ -7,6 +7,10 @@ way the forge loop does: the red loop gate on the first head, a pushed
 revision whose head the driver turns green, a review comment as ``reviewer``,
 and the merge as the admin, read back as merged.
 
+Pass or fail, the test leaves the fixture as it found it: it declines the pull
+request if still open, deletes its branch, and, once the merge moved the
+default branch, force-updates it back to the head recorded at the start.
+
     CURIE_BITBUCKET_DC_FIXTURE=<dir>/state.json \\
         python3 -m pytest tools/factory-e2e/tests -k bitbucket_dc_live -rs
 """
@@ -21,6 +25,8 @@ import ssl
 import subprocess
 import sys
 import urllib.request
+from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -115,25 +121,95 @@ class _Fixture:
         return str(next(link["href"] for link in links if link["name"] in ("http", "https")))
 
 
-def test_bitbucket_dc_live_driver_posts_status_reviews_and_merges(tmp_path: Path) -> None:
+@dataclass
+class _Mutations:
+    """What the test changed on the fixture, so teardown can undo exactly that."""
+
+    work: Path
+    default: str
+    default_head: str
+    branch: str = ""
+    pull_request: int | None = None
+
+
+def _remote_head(fixture: _Fixture, ref: str, cwd: Path) -> str:
+    listed = fixture.git("ls-remote", "origin", ref, cwd=cwd)
+    return listed.split()[0] if listed else ""
+
+
+def _undo(fixture: _Fixture, done: _Mutations) -> list[str]:
+    """Decline, delete the branch, restore the default branch; each step's failure."""
+
+    failures: list[str] = []
+    merged = False
+    if done.pull_request is not None:
+        try:
+            pull = fixture.helpers.pull_request(fixture.state, done.pull_request)
+            merged = pull["state"] == "MERGED"
+            if pull["state"] == "OPEN":
+                fixture.helpers.decline(fixture.state, done.pull_request)
+        except Exception as error:  # noqa: BLE001 -- every step runs; all are reported
+            failures.append(f"decline pull request {done.pull_request}: {error}")
+    if done.branch and _remote_head(fixture, f"refs/heads/{done.branch}", done.work):
+        try:
+            fixture.git("push", "-q", "origin", "--delete", done.branch, cwd=done.work)
+        except subprocess.CalledProcessError as error:
+            failures.append(f"delete branch {done.branch}: {error.stderr}")
+    if merged and _remote_head(fixture, done.default, done.work) != done.default_head:
+        try:
+            fixture.git(
+                "push",
+                "-q",
+                "--force",
+                "origin",
+                f"{done.default_head}:{done.default}",
+                cwd=done.work,
+            )
+        except subprocess.CalledProcessError as error:
+            failures.append(f"restore {done.default}: {error.stderr}")
+    return failures
+
+
+@pytest.fixture
+def fixture() -> _Fixture:
     helpers = _helpers()
-    state = helpers.load_state(os.environ[STATE_VAR])
-    fixture = _Fixture(state, helpers)
+    return _Fixture(helpers.load_state(os.environ[STATE_VAR]), helpers)
+
+
+@pytest.fixture
+def mutations(fixture: _Fixture, tmp_path: Path) -> Iterator[_Mutations]:
+    """A clone of the fixture repository; on teardown, every change the test made is undone."""
+
+    work = tmp_path / "work"
+    fixture.git("clone", "--quiet", fixture.clone_url(), str(work), cwd=tmp_path)
+    default = f"refs/heads/{fixture.state['default_branch']}"
+    done = _Mutations(work, default, fixture.git("rev-parse", "HEAD", cwd=work))
+    yield done
+    failures = _undo(fixture, done)
+    assert failures == [], "the fixture was left changed: " + "; ".join(failures)
+    if done.default_head:
+        assert _remote_head(fixture, done.default, work) == done.default_head
+
+
+def test_bitbucket_dc_live_driver_posts_status_reviews_and_merges(
+    tmp_path: Path, fixture: _Fixture, mutations: _Mutations
+) -> None:
+    state = fixture.state
     fe.load_forge_entries()
     driver = sys.modules["factory_e2e_forges.bitbucket_dc"].BitbucketDcDriver(_preflight(tmp_path))
 
     # A branch with one commit, and a pull request from it, as the factory.
-    work = tmp_path / "work"
+    work = mutations.work
     branch = f"curie/live-{secrets.token_hex(4)}"
-    fixture.git("clone", "--quiet", fixture.clone_url(), str(work), cwd=tmp_path)
     for key, value in (("user.name", "Factory Live Test"), ("user.email", "bot@example.invalid")):
         fixture.git("config", key, value, cwd=work)
     fixture.git("checkout", "-q", "-b", branch, cwd=work)
     (work / "LIVE.md").write_text("first\n")
     fixture.git("add", "LIVE.md", cwd=work)
     fixture.git("commit", "-q", "-m", "Live driver test", cwd=work)
+    mutations.branch = branch
     fixture.git("push", "-q", "origin", branch, cwd=work)
-    default = f"refs/heads/{state['default_branch']}"
+    default = mutations.default
     opened = fixture.call(
         "POST",
         "/pull-requests",
@@ -144,6 +220,7 @@ def test_bitbucket_dc_live_driver_posts_status_reviews_and_merges(tmp_path: Path
             "toRef": {"id": default},
         },
     )
+    mutations.pull_request = int(opened["id"])
     change = fe.ChangeRef(int(opened["id"]), str(opened["links"]["self"][0]["href"]))
 
     first, count = driver.change_head(change)

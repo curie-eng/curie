@@ -69,7 +69,7 @@ OUTSIDER = Actor("placeholder-account-outsider", "drive-by")
 INLINE = {"path": "src/widget.txt", "from": None, "to": 12}
 
 # Bitbucket Cloud build status states (commit-statuses reference).
-STATUS_STATES = frozenset({"SUCCESSFUL", "FAILED", "INPROGRESS", "STOPPED"})
+STATUS_STATES = frozenset({"SUCCESSFUL", "FAILED", "INPROGRESS", "STOPPED", "CANCELLED"})
 PULL_STATES = frozenset({"OPEN", "MERGED", "DECLINED", "SUPERSEDED"})
 # Bitbucket's own default page length on these listings.
 DEFAULT_PAGELEN = 10

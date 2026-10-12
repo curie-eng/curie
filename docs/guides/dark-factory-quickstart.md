@@ -418,13 +418,20 @@ factory:
           codeHost: bitbucket-dc
           projectId: "1"
           path: FAC/demo
+      defaultRepo: example-repo
+      startAuthority:
+        type: allowlist
+        accounts: ["<Jira account id>"]
       reviewFeedbackAllowlist:
         bitbucket: ["<Atlassian account_id>"]
         bitbucket-dc: ["<numeric user id>"]
 ```
 
-The `jira` tracker entry under `factory.trackers` is the Jira Cloud half of
-the pairing. Each code host also needs its `egress` entries: the Bitbucket
+A Jira binding must name a `defaultRepo`, the alias a ticket runs against when
+nothing picks another, and a `startAuthority` of type `allowlist` (Jira
+account ids) or `group` (a Jira `groupId`): Jira cannot report repository
+write access, so the default write check is refused. The `jira` tracker entry
+under `factory.trackers` is the Jira Cloud half of the pairing. Each code host also needs its `egress` entries: the Bitbucket
 Cloud ranges from `https://ip-ranges.atlassian.com/` on port 443, or the
 addresses your Data Center host resolves to on its port.
 

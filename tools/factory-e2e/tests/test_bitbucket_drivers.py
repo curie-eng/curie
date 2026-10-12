@@ -476,6 +476,78 @@ def test_cloud_change_merged_reads_the_pull_request(
     assert driver.change_merged(fe.ChangeRef(7, "https://example.invalid/pr/7")) is expected
 
 
+def _paged_commits(next_url: str) -> Answer:
+    """The pull request, then a first commits page whose ``next`` is ``next_url``."""
+
+    commits = f"{CLOUD_API}/pullrequests/7/commits"
+
+    def answer(method: str, url: str) -> tuple[int, Any]:
+        if method == "GET" and url.split("?")[0] == f"{CLOUD_API}/pullrequests/7":
+            return 200, {"id": 7, "source": {"commit": {"hash": SHA}}}
+        if method == "GET" and url.startswith(commits) and "page=2" not in url:
+            return 200, {"values": [{"hash": SHA}], "next": next_url}
+        if method == "GET" and url.startswith(commits):
+            return 200, {"values": [{"hash": GREEN}]}
+        return 404, {"error": {"message": "stub"}}
+
+    return answer
+
+
+def test_cloud_paging_refuses_a_next_link_on_another_origin_before_sending_the_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cloud_env(tmp_path, monkeypatch)
+    foreign = "https://attacker.example.invalid/2.0/page?page=2"
+    http = _install(monkeypatch, _paged_commits(foreign))
+    driver = _cloud_driver(tmp_path)
+    http.calls.clear()
+
+    with pytest.raises(fe.PreflightFailed):
+        driver.change_head(fe.ChangeRef(7, "https://example.invalid/pr/7"))
+
+    # No request, so no Authorization header, ever reached the foreign host.
+    assert {urllib.parse.urlsplit(call.url).netloc for call in http.calls} == {"api.bitbucket.org"}
+    assert any(call.url.startswith(f"{CLOUD_API}/pullrequests/7/commits") for call in http.calls)
+
+
+@pytest.mark.parametrize(
+    "foreign",
+    [
+        "http://api.bitbucket.org/2.0/repositories/example-workspace/example-repo/x?page=2",
+        "https://api.bitbucket.org:8443/2.0/repositories/example-workspace/example-repo/x?page=2",
+        "https://api.bitbucket.org.example.invalid/2.0/x?page=2",
+    ],
+)
+def test_cloud_paging_refuses_a_next_link_with_another_scheme_port_or_host(
+    foreign: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cloud_env(tmp_path, monkeypatch)
+    http = _install(monkeypatch, _paged_commits(foreign))
+    driver = _cloud_driver(tmp_path)
+    http.calls.clear()
+
+    with pytest.raises(fe.PreflightFailed):
+        driver.change_head(fe.ChangeRef(7, "https://example.invalid/pr/7"))
+
+    assert foreign not in [call.url for call in http.calls]
+
+
+def test_cloud_paging_follows_a_same_origin_next_link_with_the_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cloud_env(tmp_path, monkeypatch)
+    same = f"{CLOUD_API}/pullrequests/7/commits?pagelen=50&page=2"
+    http = _install(monkeypatch, _paged_commits(same))
+    driver = _cloud_driver(tmp_path)
+    http.calls.clear()
+
+    head, count = driver.change_head(fe.ChangeRef(7, "https://example.invalid/pr/7"))
+
+    assert (head, count) == (SHA, 2)
+    (second,) = [call for call in http.calls if call.url == same]
+    assert second.headers["authorization"] == f"Bearer {FACTORY_TOKEN}"
+
+
 # --- Bitbucket Data Center: configuration and request shapes -----------------------------
 
 

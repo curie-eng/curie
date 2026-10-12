@@ -10,8 +10,9 @@ token and a build status round trip. ``down`` removes everything the project
 created and the state directory.
 
 Stdlib only; runs on the system ``python3``. Every external command goes
-through ``runner`` and every HTTP request through ``urlopen``, both handed to
-``main`` so the unit tests can fake them.
+through ``runner``, every HTTP request through ``urlopen`` and every reading
+of the time against ``up``'s deadline through ``clock``, all handed to ``main``
+so the unit tests can fake them.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -43,6 +44,8 @@ SCHEMA = "curie.forge-fixture.bitbucket-dc/v1"
 VERSION = "9.4.24"
 DEFAULT_PORT = 27443
 READY_TIMEOUT = 900.0
+# The longest one seeding request may take; less when the deadline is nearer.
+SEED_REQUEST_TIMEOUT = 30.0
 LICENSE_PAGE = (
     "https://developer.atlassian.com/platform/marketplace/"
     "timebomb-licenses-for-testing-server-apps/"
@@ -361,6 +364,7 @@ class Up:
         port: int,
         advertise_host: str,
         deadline: float,
+        clock: Callable[[], float],
     ) -> None:
         self.runner = runner
         self.urlopen = urlopen
@@ -369,6 +373,7 @@ class Up:
         self.port = port
         self.advertise_host = advertise_host
         self.deadline = deadline
+        self.clock = clock
         self.compose_file = state_dir / "compose.yaml"
         self.ca_file = state_dir / "ca.pem"
         self.base_url = f"https://localhost:{port}"
@@ -377,7 +382,7 @@ class Up:
         self.db_password = secrets.token_urlsafe(24)
 
     def remaining(self) -> float:
-        left = self.deadline - time.monotonic()
+        left = self.deadline - self.clock()
         if left <= 0:
             raise FixtureError(f"up ran past its {int(READY_TIMEOUT)} s budget")
         return left
@@ -425,14 +430,16 @@ class Up:
         seeded = self.seed()
 
         _fail_at("state")
+        # Seeding may end past the deadline; such a fixture is a failure, not up.
+        self.remaining()
         self.write_state(seeded)
 
     def wait_ready(self) -> None:
         log(f"waiting for {self.base_url}/status to report RUNNING")
         http = Http(self.urlopen, self.base_url, self.ca_file)
         last = "no answer yet"
-        next_note = time.monotonic() + 60
-        while time.monotonic() < self.deadline:
+        next_note = self.clock() + 60
+        while self.clock() < self.deadline:
             try:
                 state = http.call("GET", "/status", timeout=10).get("state")
             except FixtureError as error:
@@ -443,7 +450,7 @@ class Up:
                 last = f"state {state}"
                 if state == "ERROR":
                     self.fail_with_logs(f"Bitbucket reported state ERROR at {self.base_url}/status")
-            if time.monotonic() >= next_note:
+            if self.clock() >= next_note:
                 log(f"still waiting: {last}")
                 next_note += 60
             time.sleep(5)
@@ -461,18 +468,22 @@ class Up:
 
     def seed(self) -> dict[str, Any]:
         http = Http(self.urlopen, self.base_url, self.ca_file)
+
+        def call(method: str, path: str, **kwargs: Any) -> Any:
+            # Refuses to start once the deadline has passed.
+            timeout = min(SEED_REQUEST_TIMEOUT, self.remaining())
+            return http.call(method, path, timeout=timeout, **kwargs)
+
         admin = _basic(ADMIN, self.passwords[ADMIN])
         api = "/rest/api/latest"
         repo_api = f"{api}/projects/{PROJECT_KEY}/repos/{REPO_SLUG}"
 
-        version = http.call("GET", f"{api}/application-properties", auth=admin)["version"]
+        version = call("GET", f"{api}/application-properties", auth=admin)["version"]
         if version != VERSION:
             raise FixtureError(f"Bitbucket reports version {version}, expected {VERSION}")
         log(f"seeding project {PROJECT_KEY}, repository {REPO_SLUG}, users and a token")
-        http.call(
-            "POST", f"{api}/projects", auth=admin, body={"key": PROJECT_KEY, "name": "Factory"}
-        )
-        repo = http.call(
+        call("POST", f"{api}/projects", auth=admin, body={"key": PROJECT_KEY, "name": "Factory"})
+        repo = call(
             "POST",
             f"{api}/projects/{PROJECT_KEY}/repos",
             auth=admin,
@@ -480,11 +491,11 @@ class Up:
         )
         head = self.push_seed_commit(admin)
 
-        user_ids = {ADMIN: str(http.call("GET", f"{api}/users/{ADMIN}", auth=admin)["id"])}
+        user_ids = {ADMIN: str(call("GET", f"{api}/users/{ADMIN}", auth=admin)["id"])}
         for user in USERS:
             # Created with a throwaway password (the API takes it in the query
             # string), then given the real one in a JSON body.
-            http.call(
+            call(
                 "POST",
                 f"{api}/admin/users",
                 auth=admin,
@@ -498,27 +509,27 @@ class Up:
                 },
             )
             password = self.passwords[user]
-            http.call(
+            call(
                 "PUT",
                 f"{api}/admin/users/credentials",
                 auth=admin,
                 body={"name": user, "password": password, "passwordConfirm": password},
             )
-            http.call(
+            call(
                 "PUT",
                 f"{api}/admin/permissions/users",
                 auth=admin,
                 query={"name": user, "permission": "LICENSED_USER"},
             )
-            http.call(
+            call(
                 "PUT",
                 f"{repo_api}/permissions/users",
                 auth=admin,
                 query={"name": user, "permission": "REPO_WRITE"},
             )
-            user_ids[user] = str(http.call("GET", f"{api}/users/{user}", auth=admin)["id"])
+            user_ids[user] = str(call("GET", f"{api}/users/{user}", auth=admin)["id"])
 
-        token = http.call(
+        token = call(
             "PUT",
             f"/rest/access-tokens/latest/projects/{PROJECT_KEY}/repos/{REPO_SLUG}",
             auth=admin,
@@ -602,8 +613,10 @@ class Up:
         _write_state(sd, state)
 
 
-def up(args: argparse.Namespace, runner: Runner, urlopen: Opener) -> int:
-    started = time.monotonic()
+def up(
+    args: argparse.Namespace, runner: Runner, urlopen: Opener, clock: Callable[[], float]
+) -> int:
+    started = clock()
     fail_at = os.environ.get(FAIL_AT_ENV)
     if fail_at and fail_at not in PHASES:
         raise FixtureError(f"{FAIL_AT_ENV}={fail_at} is not one of {', '.join(PHASES)}")
@@ -630,7 +643,8 @@ def up(args: argparse.Namespace, runner: Runner, urlopen: Opener) -> int:
     project = f"curie-forge-bbdc-{secrets.token_hex(4)}"
     # Written first, so `down` can always find what to remove.
     _write_state(state_dir, {"schema": SCHEMA, "project": project})
-    fixture = Up(runner, urlopen, state_dir, project, port, advertise_host, started + READY_TIMEOUT)
+    deadline = started + READY_TIMEOUT
+    fixture = Up(runner, urlopen, state_dir, project, port, advertise_host, deadline, clock)
     try:
         fixture.run()
     except BaseException:
@@ -640,7 +654,7 @@ def up(args: argparse.Namespace, runner: Runner, urlopen: Opener) -> int:
         except FixtureError as error:
             log(f"teardown incomplete, rerun down: {error}")
         raise
-    took = int(time.monotonic() - started)
+    took = int(clock() - started)
     print(f"bitbucket-dc fixture up in {took} s: {fixture.base_url} (project {project})")
     print(f"state: {state_dir / 'state.json'}")
     return 0
@@ -793,7 +807,13 @@ def self_test(args: argparse.Namespace, runner: Runner, urlopen: Opener) -> int:
 # --------------------------------------------------------------------------
 
 
-def main(argv: list[str], *, runner: Runner, urlopen: Opener) -> int:
+def main(
+    argv: list[str],
+    *,
+    runner: Runner,
+    urlopen: Opener,
+    clock: Callable[[], float] = time.monotonic,
+) -> int:
     parser = argparse.ArgumentParser(prog="fixture.py", description=__doc__.splitlines()[0])
     parser.add_argument("action", choices=("up", "self-test", "down"))
     parser.add_argument("--state-dir", required=True)
@@ -802,7 +822,7 @@ def main(argv: list[str], *, runner: Runner, urlopen: Opener) -> int:
     args = parser.parse_args(argv)
     try:
         if args.action == "up":
-            return up(args, runner, urlopen)
+            return up(args, runner, urlopen, clock)
         if args.action == "self-test":
             return self_test(args, runner, urlopen)
         return down(args, runner)

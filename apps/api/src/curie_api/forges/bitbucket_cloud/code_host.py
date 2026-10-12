@@ -80,6 +80,7 @@ _STATUS_STATES = {
     "FAILED": CheckState.FAILURE,
     "INPROGRESS": CheckState.PENDING,
     "STOPPED": CheckState.CANCELLED,
+    "CANCELLED": CheckState.CANCELLED,
 }
 # The comment author types that are an account, a person or a token's bot user.
 # Anything else (a deleted or anonymous author) is never feedback.

@@ -607,6 +607,7 @@ async def test_bitbucket_dc_build_statuses_on_the_head(fake: BitbucketDcFake, ad
         ("e2e", "INPROGRESS"),
         ("docs", "CANCELLED"),
         ("scan", "UNKNOWN"),
+        ("deploy", "STOPPED"),
     ]:
         fake.post_status(head, key, word)
     fake.post_status(other, "elsewhere", "FAILED")
@@ -619,6 +620,7 @@ async def test_bitbucket_dc_build_statuses_on_the_head(fake: BitbucketDcFake, ad
         "status:e2e": CheckState.PENDING,
         "status:docs": CheckState.CANCELLED,
         "status:scan": CheckState.PENDING,
+        "status:deploy": CheckState.CANCELLED,
     }
     assert all(c.source is CheckSource.STATUS and c.head_sha == head for c in rollup.checks)
     assert by_key["status:lint"].reported_state == "FAILED"
@@ -785,6 +787,55 @@ async def test_bitbucket_dc_marked_comment_created_found_and_edited_in_place(
     assert "Done." in fake.comments[int(created.comment.id)].text
     found = await comments.find_marked(target, MARKER)
     assert found is not None and found.id == created.comment.id
+
+
+@pytest.mark.anyio
+async def test_bitbucket_dc_marked_comment_stale_edit_is_unavailable_then_lands_next_pass(
+    fake: BitbucketDcFake, adapter: Any
+) -> None:
+    pull = await _open(adapter, fake, "factory/marked-stale")
+    target = ReplyTarget.on_pull_request(pull.ref)
+    comments = adapter.marked_comments
+    created = await comments.upsert_marked(target, MARKER, "Working on it.")
+    cid = int(created.comment.id)
+    writes = fake.writes
+
+    # Someone edited the comment between the read and the PUT: the 409 is a
+    # transient the next poll pass resolves, never a lost or doubled write.
+    fake.bump_comment_version_on_next_write(cid)
+    with pytest.raises(Unavailable, match="stale_version"):
+        await comments.upsert_marked(target, MARKER, "Done.")
+    assert fake.writes == writes
+    assert fake.comments[cid].text == comments.embed(MARKER, "Working on it.")
+
+    with fake.recording() as sent:
+        edited = await comments.upsert_marked(target, MARKER, "Done.")
+    (put,) = [r for r in sent if r.method == "PUT"]
+    assert put.body["version"] == fake.comments[cid].version - 1
+    assert edited.written is True and edited.comment.id == created.comment.id
+    assert fake.writes == writes + 1
+    assert fake.comments[cid].text == comments.embed(MARKER, "Done.")
+    assert [c.id for c in fake.comments.values() if MARKER in c.text and not c.deleted] == [cid]
+
+
+@pytest.mark.anyio
+async def test_bitbucket_dc_marked_comment_current_edit_lands_without_a_retry(
+    fake: BitbucketDcFake, adapter: Any
+) -> None:
+    pull = await _open(adapter, fake, "factory/marked-current")
+    target = ReplyTarget.on_pull_request(pull.ref)
+    comments = adapter.marked_comments
+    created = await comments.upsert_marked(target, MARKER, "Working on it.")
+    cid = int(created.comment.id)
+    writes = fake.writes
+
+    with fake.recording() as sent:
+        edited = await comments.upsert_marked(target, MARKER, "Done.")
+
+    (put,) = [r for r in sent if r.method == "PUT"]
+    assert put.body["version"] == fake.comments[cid].version - 1
+    assert edited.written is True and fake.writes == writes + 1
+    assert fake.comments[cid].text == comments.embed(MARKER, "Done.")
 
 
 @pytest.mark.anyio

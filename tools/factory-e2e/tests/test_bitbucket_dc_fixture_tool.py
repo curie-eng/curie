@@ -6,13 +6,14 @@ every HTTP request goes through two seams the fixture takes as keyword
 arguments, and the tests hand it fakes. The seams, which the implementation
 follows:
 
-``main(argv: list[str], *, runner: Runner, urlopen: Opener) -> int``
+``main(argv: list[str], *, runner: Runner, urlopen: Opener, clock=time.monotonic) -> int``
     ``argv`` is everything after the script name, for example
     ``["up", "--state-dir", D, "--port", "27443"]``. It returns the exit code
     and does not raise for a fixture failure: the reason goes to stderr. The
     script's ``__main__`` block calls it with the real runner and
     ``urllib.request.urlopen``. ``CURIE_FORGE_FIXTURE_FAIL_AT`` is read from
-    ``os.environ``.
+    ``os.environ``. ``clock`` is every reading of the time against ``up``'s
+    900 s deadline.
 
 ``runner(argv, *, env=None, input=None, timeout=None, cwd=None)``
     Runs every external command (``docker``, ``docker compose``, ``openssl``,
@@ -516,9 +517,11 @@ class Run:
     ) -> None:
         self.fx, self.docker, self.http, self.capsys = fx, docker, http, capsys
         self.out = self.err = ""
+        # Extra keyword seams for main, such as a fake ``clock``.
+        self.seams: dict[str, Any] = {}
 
     def __call__(self, *argv: str) -> int:
-        rc = self.fx.main(list(argv), runner=self.docker, urlopen=self.http)
+        rc = self.fx.main(list(argv), runner=self.docker, urlopen=self.http, **self.seams)
         captured = self.capsys.readouterr()
         self.out, self.err = captured.out, captured.err
         assert isinstance(rc, int)
@@ -791,6 +794,60 @@ def test_fail_at_unset_runs_every_phase(
     assert "down" not in docker.compose_subcommands()
     assert docker.all_ids(load_state(state_dir)["project"])
     assert http.any("/rest/access-tokens/")
+
+
+# --------------------------------------------------------------------------
+# up: the 900 s budget covers seeding too (decision 14.8)
+
+READY_TIMEOUT = 900.0
+
+
+def _clock_jumping_at(http: FakeHttp, marker: str, to: float) -> Any:
+    """A clock at 0 until a request whose URL holds ``marker`` is sent, then at ``to``."""
+
+    def clock() -> float:
+        return to if http.any(marker) else 0.0
+
+    return clock
+
+
+def _fails_and_tears_down(run: Run, docker: FakeDocker, state_dir: Path) -> None:
+    assert "900 s budget" in run.err
+    assert docker.everything() == set()
+    assert not state_dir.exists()
+    assert "down" in docker.compose_subcommands()
+    assert run("down", "--state-dir", str(state_dir)) == 0, run.err
+
+
+def test_up_fails_and_tears_down_when_the_budget_runs_out_during_seeding(
+    run: Run, docker: FakeDocker, http: FakeHttp, state_dir: Path, free_port: int
+) -> None:
+    # The budget is spent while the first user is being created.
+    run.seams["clock"] = _clock_jumping_at(http, "/admin/users", READY_TIMEOUT + 1)
+    assert up(run, state_dir, free_port) != 0
+    # Seeding sent no request after the deadline passed: no token was minted.
+    assert not http.any("/rest/access-tokens/")
+    _fails_and_tears_down(run, docker, state_dir)
+
+
+def test_up_fails_and_tears_down_when_the_last_seeding_request_ends_past_the_budget(
+    run: Run, docker: FakeDocker, http: FakeHttp, state_dir: Path, free_port: int
+) -> None:
+    # Every request started in time; the token request returned after the deadline.
+    run.seams["clock"] = _clock_jumping_at(http, "/rest/access-tokens/", READY_TIMEOUT + 1)
+    assert up(run, state_dir, free_port) != 0
+    assert http.any("/rest/access-tokens/")
+    _fails_and_tears_down(run, docker, state_dir)
+
+
+def test_up_succeeds_when_seeding_finishes_inside_the_budget(
+    run: Run, docker: FakeDocker, http: FakeHttp, state_dir: Path, free_port: int
+) -> None:
+    run.seams["clock"] = _clock_jumping_at(http, "/rest/access-tokens/", READY_TIMEOUT - 1)
+    assert up(run, state_dir, free_port) == 0, run.err
+    assert load_state(state_dir)["token_file"]
+    assert "down" not in docker.compose_subcommands()
+    assert docker.all_ids(load_state(state_dir)["project"])
 
 
 # --------------------------------------------------------------------------

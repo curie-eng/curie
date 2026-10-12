@@ -139,8 +139,13 @@ class BitbucketCloudDriver:
             return status, None
 
     def _paged(self, path: str) -> list[dict[str, Any]] | None:
-        """Every ``values`` item across ``next`` pages; None when a page is unreadable."""
+        """Every ``values`` item across ``next`` pages; None when a page is unreadable.
 
+        A ``next`` link off the API origin is refused before it is requested,
+        so the token never leaves Bitbucket.
+        """
+
+        origin = urllib.parse.urlsplit(API_URL)
         items: list[dict[str, Any]] = []
         url: str | None = path
         while url:
@@ -149,6 +154,12 @@ class BitbucketCloudDriver:
                 return None
             items.extend(item for item in page.get("values") or [] if isinstance(item, dict))
             url = page.get("next") if isinstance(page.get("next"), str) else None
+            if url:
+                there = urllib.parse.urlsplit(url)
+                if (there.scheme, there.netloc) != (origin.scheme, origin.netloc):
+                    raise fe.PreflightFailed(
+                        f"refused a next page link off {origin.scheme}://{origin.netloc}"
+                    )
         return items
 
     # --- tickets (Jira Cloud) -------------------------------------------

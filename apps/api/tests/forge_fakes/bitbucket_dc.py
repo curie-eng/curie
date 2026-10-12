@@ -217,6 +217,7 @@ class BitbucketDcFake:
         self._transport_errors = 0
         self._answers: list[_Answer] = []
         self._bump_on_read: set[int] = set()
+        self._bump_comment_on_write: set[int] = set()
         self.add_user(FACTORY, token=FACTORY_TOKEN, service=True)
         self.add_user(REVIEWER, token=REVIEWER_TOKEN)
         self.add_user(OUTSIDER, token=OUTSIDER_TOKEN)
@@ -320,7 +321,7 @@ class BitbucketDcFake:
         description: str | None = None,
     ) -> None:
         """A build status on ``sha`` in Bitbucket's own words (SUCCESSFUL, FAILED,
-        INPROGRESS, CANCELLED, UNKNOWN). The latest status per key wins. Stored
+        INPROGRESS, CANCELLED, STOPPED, UNKNOWN). The latest status per key wins. Stored
         in the build status listing's shape."""
 
         self.builds.setdefault(sha, {})[key] = {
@@ -435,6 +436,12 @@ class BitbucketDcFake:
         """Someone else edits ``pull`` right after the next read of it."""
 
         self._bump_on_read.add(pull)
+
+    def bump_comment_version_on_next_write(self, cid: int) -> None:
+        """Someone else edits comment ``cid`` just before the next edit of it
+        lands, so that edit carries an outdated version and answers 409 once."""
+
+        self._bump_comment_on_write.add(cid)
 
     # Faults ----------------------------------------------------------------
 
@@ -1059,6 +1066,9 @@ class BitbucketDcFake:
         if found.author != uid:
             return JSONResponse(capture("error-403.json"), status_code=403)
         body = await request.json()
+        if found.id in self._bump_comment_on_write:
+            self._bump_comment_on_write.discard(found.id)
+            found.version, found.updated = found.version + 1, self.now()
         if body.get("version") != found.version:
             stale = capture("error-409-comment-out-of-date.json")
             stale["errors"][0].update(
