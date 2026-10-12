@@ -515,6 +515,7 @@ class KubernetesSandboxClient:
             secret_name=names.secret,
             token_names=sorted(tokens),
             runner_resources=runner_resources,
+            claim=claim,
             executor_secret_names=executor_secret_names,
             executor_withheld=executor_withheld,
         )

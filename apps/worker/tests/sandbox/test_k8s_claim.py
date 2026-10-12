@@ -1938,6 +1938,8 @@ def test_tokens_ride_a_secret_owned_by_the_claim_template() -> None:
 
     assert template["metadata"]["labels"][_CLAIM_LABEL] == claim
     assert template["metadata"]["labels"][_MANAGED_BY[0]] == _MANAGED_BY[1]
+    # The sandbox pod itself carries the claim label (per-run NetworkPolicy selector).
+    assert template["spec"]["podTemplate"]["metadata"]["labels"][_CLAIM_LABEL] == claim
     (template_owner,) = template["metadata"]["ownerReferences"]
     assert {k: template_owner[k] for k in ("apiVersion", "kind", "name", "uid")} == {
         "apiVersion": _EXT_API_VERSION,
@@ -1988,6 +1990,8 @@ def test_per_claim_template_copies_the_pool_source_template() -> None:
     _runner_container(without_env).pop("env")
     expected = copy.deepcopy(pristine)
     _runner_container(expected).pop("env")
+    # The one other difference is the claim label on the pod template.
+    assert without_env["podTemplate"]["metadata"]["labels"].pop(_CLAIM_LABEL) == claim
     assert without_env == expected
     assert template["kind"] == "SandboxTemplate"
     assert template["apiVersion"] == _EXT_API_VERSION
