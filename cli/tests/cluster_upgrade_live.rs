@@ -3044,6 +3044,58 @@ fn observed_version_divergence_fails_apply() {
     }
 }
 
+// #4495: every failed phase must preserve its report while the process exits 1.
+// Converge and Canary fail on observations; Commit uses the existing phase hook.
+#[test]
+fn failed_upgrade_exits_nonzero_in_every_phase() {
+    for (scenario, phase, hook, exact) in [
+        ("stale-images", "converge", None, false),
+        ("canary-version-drift", "canary", None, true),
+        ("healthy", "commit", Some("commit"), true),
+    ] {
+        let fixture = Fixture::new(None);
+        let extra_env: Vec<_> = hook
+            .into_iter()
+            .map(|phase| ("CURIE_UPGRADE_TEST_FAIL_AT", phase))
+            .collect();
+        let output = fixture.local_env(scenario, &extra_env);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a failed {phase} must exit 1: {}",
+            visible(&output)
+        );
+        let report = json(&output);
+        assert_eq!(report["status"], "failed", "{report}");
+        assert_eq!(report["phase"], phase, "{report}");
+        assert!(report["convergence"].is_object(), "{report}");
+        assert_eq!(report["convergence"]["exact"], exact, "{report}");
+        assert!(report["fail_forward"].is_object(), "{report}");
+        assert!(
+            report["fail_forward"]["command"]
+                .as_str()
+                .is_some_and(|command| command.starts_with("curie cluster ")),
+            "{report}"
+        );
+        assert!(
+            report["fail_forward"]["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "{report}"
+        );
+        observed_for_real(&fixture);
+        assert_eq!(fixture.helm_upgrades().len(), 1, "{phase}");
+    }
+
+    let fixture = Fixture::new(None);
+    let output = fixture.local("healthy");
+    assert_eq!(output.status.code(), Some(0), "{}", visible(&output));
+    let report = json(&output);
+    assert_eq!(report["status"], "succeeded", "{report}");
+    assert_eq!(report["convergence"]["exact"], true, "{report}");
+    assert_eq!(report["canary"]["passed"], true, "{report}");
+}
+
 // T3 -- #2301 "a target-version canary". Apply's own post-condition read is
 // satisfied (`helm get metadata` reports 0.9.0 after the upgrade) and
 // convergence is exact, THEN the release slips back to 0.8.6 before the canary.
@@ -5036,9 +5088,10 @@ fn canary_fails_when_a_rebound_template_drops_its_layer() {
 fn helm_upgrade_failure_is_a_terminal_checkpoint_and_releases_ownership() {
     let fixture = Fixture::new(None);
     let output = fixture.local("helm-upgrade-fails");
-    assert!(
-        !output.status.success(),
-        "a failed apply must not report process success: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a failed apply must exit 1: {}",
         visible(&output)
     );
     let body = json(&output);
@@ -5283,6 +5336,7 @@ fn fail_at_plan_on_owned_namespace_fails_before_helm() {
         &[],
         &[("CURIE_UPGRADE_TEST_FAIL_AT", "plan")],
     );
+    assert_eq!(output.status.code(), Some(1), "{}", visible(&output));
     let payload = json(&output);
     assert_eq!(
         payload["status"],

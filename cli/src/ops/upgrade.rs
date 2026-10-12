@@ -1385,6 +1385,118 @@ fn fail_forward_for(opts: &UpgradeOpts, previous_serving: bool, reason: &str) ->
     }
 }
 
+#[cfg(test)]
+mod fail_forward_tests {
+    use super::*;
+
+    fn opts(chart: UpgradeChart) -> UpgradeOpts {
+        UpgradeOpts {
+            file_values: None,
+            common: CommonOpts {
+                namespace: "acme-test".into(),
+                release: "acme-bot".into(),
+                dry_run: false,
+            },
+            to: "0.9.0".into(),
+            chart,
+            yes: true,
+            forward_only: false,
+            allow_stock_layer_clear: false,
+            take_over: None,
+        }
+    }
+
+    struct ContextGuard(Option<String>);
+
+    impl ContextGuard {
+        fn set(context: Option<&str>) -> Self {
+            let guard = Self(std::env::var("HELM_KUBECONTEXT").ok());
+            match context {
+                Some(context) => std::env::set_var("HELM_KUBECONTEXT", context),
+                None => std::env::remove_var("HELM_KUBECONTEXT"),
+            }
+            guard
+        }
+    }
+
+    impl Drop for ContextGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(context) => std::env::set_var("HELM_KUBECONTEXT", context),
+                None => std::env::remove_var("HELM_KUBECONTEXT"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_recovery_preserves_context_and_available_chart_operand() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = ContextGuard::set(Some("acme-context"));
+        for chart in [
+            UpgradeChart::AvailableLocal("charts/curie".into()),
+            UpgradeChart::HelmReference("acme/curie".into()),
+        ] {
+            let opts = opts(chart);
+            let recovery = fail_forward_for(&opts, false, "convergence failed");
+            assert_eq!(
+                recovery.command,
+                format!(
+                    "curie cluster upgrade --to 0.9.0 --release acme-bot --namespace acme-test --context acme-context --chart {}",
+                    opts.chart.operand()
+                )
+            );
+            assert_eq!(recovery.reason, "convergence failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_release_recovery_preserves_context_without_chart() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = ContextGuard::set(Some("acme-context"));
+        let opts = opts(UpgradeChart::PendingRelease {
+            source_url: "https://example.com/curie-0.9.0.tgz".into(),
+            cache_path: "/cache/curie-0.9.0.tgz".into(),
+        });
+        let recovery = fail_forward_for(&opts, false, "convergence failed");
+        assert_eq!(
+            recovery.command,
+            "curie cluster upgrade --to 0.9.0 --release acme-bot --namespace acme-test --context acme-context"
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_recovery_preserves_context_without_chart() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        let _guard = ContextGuard::set(Some("acme-context"));
+        let recovery = fail_forward_for(
+            &opts(UpgradeChart::AvailableLocal("charts/curie".into())),
+            true,
+            "migration failed",
+        );
+        assert_eq!(
+            recovery.command,
+            "curie cluster rollback --yes --release acme-bot --namespace acme-test --context acme-context"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_omits_unset_or_blank_context() {
+        let _lock = crate::PROCESS_ENV_LOCK.lock().await;
+        for context in [None, Some(""), Some("  ")] {
+            let _guard = ContextGuard::set(context);
+            let opts = opts(UpgradeChart::HelmReference("acme/curie".into()));
+            assert_eq!(
+                fail_forward_for(&opts, false, "failed").command,
+                "curie cluster upgrade --to 0.9.0 --release acme-bot --namespace acme-test --chart acme/curie"
+            );
+            assert_eq!(
+                fail_forward_for(&opts, true, "failed").command,
+                "curie cluster rollback --yes --release acme-bot --namespace acme-test"
+            );
+        }
+    }
+}
+
 trait UpgradeDriver {
     fn current(&self) -> Option<String>;
     fn set_current(&mut self, version: Option<String>);
