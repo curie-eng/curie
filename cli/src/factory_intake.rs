@@ -7,7 +7,6 @@
 //! `CURIE_GITHUB_WEBHOOK_SECRET` environment variable only.
 
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::Result;
 
@@ -30,8 +29,8 @@ pub struct FactoryIntakeOpts {
     pub card_base_url: Option<String>,
     /// The resolved webhook secret value, never a path and never from argv.
     pub webhook_secret: Option<String>,
-    /// Agents that get GitHub API egress (`agentSandbox.connectorEgress.<agent>`).
-    pub github_api_egress: Vec<String>,
+    /// Agents enrolled for forge egress (`factory.sandboxEgress.<agent>`).
+    pub forge_egress: Vec<String>,
     /// Set `factory.enabled=false` and nothing else.
     pub disable: bool,
     /// Explicit helm `--timeout` seconds; `None` derives it from the release.
@@ -76,7 +75,8 @@ pub fn minimum_helm_timeout_from_hooks(rendered: &str) -> Option<u64> {
             continue;
         };
         let seconds = value
-            .pointer("/metadata/annotations")
+            .get("metadata")
+            .and_then(|m| m.get("annotations"))
             .and_then(|a| a.get(MINIMUM_HELM_TIMEOUT_ANNOTATION))
             .and_then(serde_json::Value::as_str)
             .and_then(|raw| raw.parse::<u64>().ok())
@@ -184,34 +184,6 @@ pub fn resolve_webhook_secret(file: Option<&Path>) -> Result<Option<String>> {
     Ok(Some(value))
 }
 
-/// The `api` CIDR list of a GitHub `/meta` document, order preserved.
-/// Missing or empty is an error.
-pub fn github_api_cidrs(meta_json: &str) -> Result<Vec<String>> {
-    let meta: serde_json::Value = serde_json::from_str(meta_json)
-        .map_err(|error| CliError::failure(format!("GitHub /meta is not JSON: {error}")))?;
-    let cidrs: Vec<String> = meta
-        .get("api")
-        .and_then(serde_json::Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    if cidrs.is_empty() {
-        return Err(CliError::failure("GitHub /meta has no `api` CIDR list").into());
-    }
-    Ok(cidrs)
-}
-
-/// Keep only IPv4 prefixes. The chart's connectorEgress NetworkPolicy
-/// (charts/curie/templates/security-networkpolicy.yaml) refuses IPv6 prefixes
-/// broader than /32, and GitHub publishes IPv6 api ranges such as /29, so
-/// passing them makes the helm apply fail.
-pub fn ipv4_cidrs(cidrs: &[String]) -> Vec<String> {
-    cidrs.iter().filter(|c| !c.contains(':')).cloned().collect()
-}
-
 /// The chart's removed `api.*` factory keys (#4397), from the one file that
 /// names them. Each is written as null so a `--reuse-values` upgrade sheds it.
 fn legacy_factory_keys() -> Vec<String> {
@@ -293,7 +265,7 @@ fn set_github_entries(
 }
 
 /// The values document applied with `--reuse-values -f`.
-pub fn intake_values(opts: &FactoryIntakeOpts, cidrs: &[String]) -> serde_json::Value {
+pub fn intake_values(opts: &FactoryIntakeOpts) -> serde_json::Value {
     let mut api = serde_json::Map::new();
     for key in legacy_factory_keys() {
         if let Some(name) = key.strip_prefix("api.") {
@@ -324,17 +296,15 @@ pub fn intake_values(opts: &FactoryIntakeOpts, cidrs: &[String]) -> serde_json::
         opts.label.as_deref(),
         opts.mention.as_deref(),
     );
-    if !opts.github_api_egress.is_empty() {
-        let rules: Vec<serde_json::Value> = ipv4_cidrs(cidrs)
+    // The github entries carry no egress, so the chart's built-in GitHub set
+    // applies; each named agent's sandboxes are enrolled for it (#4397).
+    if !opts.forge_egress.is_empty() {
+        let agents: serde_json::Map<String, serde_json::Value> = opts
+            .forge_egress
             .iter()
-            .map(|cidr| serde_json::json!({"cidr": cidr, "ports": [{"port": 443, "protocol": "TCP"}]}))
+            .map(|agent| (agent.clone(), serde_json::Value::Bool(true)))
             .collect();
-        let egress: serde_json::Map<String, serde_json::Value> = opts
-            .github_api_egress
-            .iter()
-            .map(|agent| (agent.clone(), serde_json::json!(rules)))
-            .collect();
-        values["agentSandbox"] = serde_json::json!({ "connectorEgress": egress });
+        values["factory"]["sandboxEgress"] = serde_json::Value::Object(agents);
     }
     // The quickstart finish upgrade is this one document. The chart is the
     // caller's `--chart` (the chart `cluster up` already installed), not a
@@ -404,41 +374,6 @@ pub fn intake_commands(
         &crate::ops::chart_fullname(&opts.common.release),
     ));
     cmds
-}
-
-async fn fetch_github_api_cidrs() -> Result<Vec<String>> {
-    let api = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
-    let url = format!("{}/meta", api.trim_end_matches('/'));
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|err| CliError::failure(format!("could not build an HTTP client: {err}")))?;
-    let response = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", format!("curie/{}", env!("CARGO_PKG_VERSION")))
-        .send()
-        .await
-        .map_err(|err| {
-            CliError::failure(format!("fetching {url} failed: {err}; nothing was applied"))
-        })?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(CliError::failure(format!(
-            "fetching {url} returned {status}; nothing was applied"
-        ))
-        .into());
-    }
-    let cidrs = ipv4_cidrs(&github_api_cidrs(&body)?);
-    if cidrs.is_empty() {
-        return Err(CliError::failure(format!(
-            "{url} lists no IPv4 api ranges; nothing was applied"
-        ))
-        .into());
-    }
-    Ok(cidrs)
 }
 
 /// True for a bare GitHub login: alphanumeric runs joined by single hyphens
@@ -655,11 +590,10 @@ fn recorded_credential(recorded: &serde_json::Value) -> FactoryCredential {
 /// entry lists are written whole.
 fn planned_values(
     opts: &FactoryIntakeOpts,
-    cidrs: &[String],
     recorded: &serde_json::Value,
     app_plan: Option<&AppPlan>,
 ) -> serde_json::Value {
-    let mut values = intake_values(opts, cidrs);
+    let mut values = intake_values(opts);
     if opts.disable {
         return values;
     }
@@ -872,13 +806,6 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
                 ));
             }
         }
-        if !opts.disable && !opts.github_api_egress.is_empty() {
-            let api = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
-            lines.push(format!(
-                "# fetch {}/meta for the GitHub API egress CIDRs",
-                api
-            ));
-        }
         let timeout = effective_helm_timeout(opts.timeout_seconds, None);
         lines.extend(
             intake_commands(&opts, placeholder, timeout)
@@ -945,7 +872,7 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
         }) {
             publication = None;
         }
-        let planned = planned_values(&opts, &[], &recorded, app_plan.as_ref());
+        let planned = planned_values(&opts, &recorded, app_plan.as_ref());
         let offenders = intake_gate_offenders(&recorded, &planned);
         if !offenders.is_empty() {
             let fixes: Vec<String> = offenders
@@ -965,12 +892,7 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
     }
     require_on_path("helm")?;
     require_on_path("kubectl")?;
-    let cidrs = if !opts.disable && !opts.github_api_egress.is_empty() {
-        fetch_github_api_cidrs().await?
-    } else {
-        Vec::new()
-    };
-    let mut values = planned_values(&opts, &cidrs, &recorded, app_plan.as_ref());
+    let mut values = planned_values(&opts, &recorded, app_plan.as_ref());
     if let Some(identity) = &publication {
         values["worker"] = serde_json::json!({
             "publication": {

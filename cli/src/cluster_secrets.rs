@@ -584,6 +584,55 @@ fn runner_image_update(runner_image: Option<&str>, changed: bool) -> RunnerImage
     }
 }
 
+/// Enroll `agent`'s sandboxes for forge egress (`factory.sandboxEgress`,
+/// #4397) on an agent added with no intake run. The serving revision's values
+/// decide: an agent already recorded `true` is left alone and `chart` is never
+/// awaited. Otherwise one `helm upgrade --reset-then-reuse-values` sets that
+/// one key. The API does not read it, so nothing is rolled. Returns whether
+/// the release was upgraded.
+pub async fn bind_forge_egress<F>(common: CommonOpts, agent: String, chart: F) -> Result<bool>
+where
+    F: std::future::Future<Output = Result<String>>,
+{
+    validate_agent_resource_name(&agent)?;
+    let values = read_release_values(&common).await?;
+    let enrolled = values
+        .as_ref()
+        .and_then(|v| v.pointer("/factory/sandboxEgress"))
+        .and_then(|all| all.get(&agent))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if enrolled {
+        return Ok(false);
+    }
+    let chart = chart.await?;
+    let cmd = OpsCommand::new(
+        "helm",
+        vec![
+            plain("upgrade"),
+            plain(&common.release),
+            plain(&chart),
+            plain("-n"),
+            plain(&common.namespace),
+            plain("--reset-then-reuse-values"),
+            plain("--set"),
+            plain(format!("factory.sandboxEgress.{agent}=true")),
+        ],
+    );
+    let ui = crate::ui::ui();
+    run_step(
+        &ui.checklist(),
+        &format!(
+            "enrolling agent {agent} for forge egress on release {}",
+            common.release
+        ),
+        "enrolled",
+        &cmd,
+    )
+    .await?;
+    Ok(true)
+}
+
 pub async fn bind(opts: BindOpts) -> Result<()> {
     let cmds = bind_commands(&opts)?;
     if cmds.is_empty() {
@@ -1915,7 +1964,7 @@ esac
         let helm = StubbedHelm::install(&serde_json::json!({"factory": {
             "sandboxEgress": {"dark-factory": true, "dark-factory-fast": true}
         }}));
-        let _ = bind_forge_egress(common(), "dark-factory-fast".into(), async {
+        bind_forge_egress(common(), "dark-factory-fast".into(), async {
             panic!("an enrolled agent must not resolve a chart")
         })
         .await
@@ -1931,7 +1980,7 @@ esac
         let helm = StubbedHelm::install(&serde_json::json!({"factory": {
             "sandboxEgress": {"dark-factory": true, "dark-factory-off": false}
         }}));
-        let _ = bind_forge_egress(common(), "dark-factory-fast".into(), async {
+        bind_forge_egress(common(), "dark-factory-fast".into(), async {
             Ok("charts/curie".to_string())
         })
         .await
@@ -1960,7 +2009,7 @@ esac
         let helm = StubbedHelm::install(&serde_json::json!({"factory": {
             "sandboxEgress": {"dark-factory-off": false}
         }}));
-        let _ = bind_forge_egress(common(), "dark-factory-off".into(), async {
+        bind_forge_egress(common(), "dark-factory-off".into(), async {
             Ok("charts/curie".to_string())
         })
         .await

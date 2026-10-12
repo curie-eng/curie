@@ -5419,9 +5419,9 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Give this agent egress to the GitHub API ranges published at <api>/meta (port 443). Repeatable",
-              "id": "github_api_egress",
-              "long": "github-api-egress",
+              "help": "Give this agent's sandboxes egress to the configured code hosts and trackers (factory.sandboxEgress.<AGENT>). Repeatable",
+              "id": "forge_egress",
+              "long": "forge-egress",
               "positional": false,
               "required": false
             },

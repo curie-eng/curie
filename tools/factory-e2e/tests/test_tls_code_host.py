@@ -292,6 +292,15 @@ def test_tls_values_egress_is_exactly_the_stub_and_the_model_provider() -> None:
     assert {entry["cidr"] for entry in egress} == {f"{STUB_IP}/32", *MODEL_CIDRS}
 
 
+def test_tls_values_publication_egress_is_the_stub_code_host_entry() -> None:
+    values = _tls(port=9443)
+    (code_host,) = values["factory"]["codeHosts"]
+    assert code_host["egress"] == [
+        {"cidr": f"{STUB_IP}/32", "ports": [{"protocol": "TCP", "port": 9443}]}
+    ]
+    assert "githubHttpsCidrs" not in (values.get("worker") or {}).get("publication", {})
+
+
 def test_tls_values_drop_github_meta_ranges_a_base_carried() -> None:
     base = fe.install_values(
         _config(),

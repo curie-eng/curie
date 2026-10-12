@@ -64,7 +64,7 @@ pub(super) fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIn
         mention: None,
         card_base_url: None,
         webhook_secret: None,
-        github_api_egress: Vec::new(),
+        forge_egress: vec![AGENT_NAME.into()],
         disable: false,
         timeout_seconds: None,
         app_id: input.app_id.clone(),
@@ -504,6 +504,9 @@ pub fn intake_args(context: &str, intake: &FactoryIntakeOpts, image: &str) -> Ve
     ]);
     if let Some(org) = &intake.org {
         args.extend(["--org".into(), org.clone()]);
+    }
+    for agent in &intake.forge_egress {
+        args.extend(["--forge-egress".into(), agent.clone()]);
     }
     args.push("--runner-image".into());
     args.push(format!("{AGENT_NAME}={image}"));

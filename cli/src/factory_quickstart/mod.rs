@@ -91,6 +91,87 @@ pub struct ForgeFlags {
     pub review_accounts: Vec<String>,
 }
 
+/// One port of a forge egress entry, as the chart's `egress[].ports` reads it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EgressPort {
+    pub protocol: &'static str,
+    pub port: u16,
+}
+
+/// One `factory.codeHosts[]` / `factory.trackers[]` `egress` entry (#4397).
+/// `host` records the hostname a route was resolved from; the chart ignores it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EgressEntry {
+    pub cidr: String,
+    pub ports: Vec<EgressPort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// The egress entries for one forge `target` on TCP `ports`. An IP or CIDR
+/// passes through (an IP as a host route). A hostname is resolved here, on
+/// the operator's machine, by `resolve` to one host route per address with
+/// the hostname recorded; a name that resolves to nothing is refused.
+pub fn forge_egress_entries(
+    target: &str,
+    ports: &[u16],
+    resolve: impl Fn(&str) -> Result<Vec<std::net::IpAddr>>,
+) -> Result<Vec<EgressEntry>> {
+    use std::net::IpAddr;
+    let ports: Vec<EgressPort> = ports
+        .iter()
+        .map(|&port| EgressPort {
+            protocol: "TCP",
+            port,
+        })
+        .collect();
+    let host_route = |ip: IpAddr| match ip {
+        IpAddr::V4(_) => format!("{ip}/32"),
+        IpAddr::V6(_) => format!("{ip}/128"),
+    };
+    let entry = |cidr: String, host: Option<String>| EgressEntry {
+        cidr,
+        ports: ports.clone(),
+        host,
+    };
+    if let Ok(ip) = target.parse::<IpAddr>() {
+        return Ok(vec![entry(host_route(ip), None)]);
+    }
+    if let Some((addr, prefix)) = target.split_once('/') {
+        let ip: IpAddr = addr.parse().map_err(|_| {
+            CliError::usage(format!(
+                "forge egress {target:?} is not an IP, CIDR or hostname"
+            ))
+        })?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        match prefix.parse::<u8>() {
+            Ok(bits) if bits <= max => return Ok(vec![entry(format!("{ip}/{bits}"), None)]),
+            _ => {
+                return Err(CliError::usage(format!(
+                    "forge egress {target:?} has an invalid prefix length"
+                ))
+                .into())
+            }
+        }
+    }
+    let mut addresses = resolve(target).map_err(|error| {
+        CliError::failure(format!("could not resolve forge host {target}: {error:#}"))
+    })?;
+    let mut seen = std::collections::HashSet::new();
+    addresses.retain(|ip| seen.insert(*ip));
+    if addresses.is_empty() {
+        return Err(CliError::failure(format!(
+            "forge host {target} resolved to no address, so no egress can be written for it"
+        ))
+        .with_fix("pass the host's IP or CIDR instead, or fix its DNS")
+        .into());
+    }
+    Ok(addresses
+        .into_iter()
+        .map(|ip| entry(host_route(ip), Some(target.to_string())))
+        .collect())
+}
+
 /// The error for a forge kind this build has no quickstart module for.
 fn forge_not_installed(kind: &str) -> anyhow::Error {
     CliError::unsupported(format!(
@@ -786,7 +867,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 }));
             }
             Action::Intake(opts) => {
-                let values = intake_values(opts, &[]);
+                let values = intake_values(opts);
                 let intake = values
                     .pointer("/factory/intake")
                     .and_then(|v| v.as_str())

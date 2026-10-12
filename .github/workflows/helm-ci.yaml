@@ -1010,10 +1010,10 @@ jobs:
           set -euo pipefail
           bash charts/curie/ci/byo-endpoint-egress-assertions.sh
 
-      # Prove a nil worker.publication.githubHttpsCidrs cannot collapse the
-      # tokenless publication job's GitHub egress rule to an empty to: (allow-all
-      # on 443). Also rejects that empty-to shape on every rendered
-      # NetworkPolicy, not just this one template (#2321).
+      # Prove an empty factory code host egress list cannot collapse the
+      # tokenless publication job's egress rule to an empty to: (allow-all).
+      # Also rejects that empty-to shape on every rendered NetworkPolicy, not
+      # just this one template (#2321, #4397).
       - name: helm render assertions (NetworkPolicy empty egress to)
         run: |
           set -euo pipefail

@@ -510,10 +510,10 @@ pub(crate) enum ClusterAction {
         /// CURIE_GITHUB_WEBHOOK_SECRET; never both. The secret never enters argv.
         #[arg(long, value_name = "PATH")]
         webhook_secret_file: Option<PathBuf>,
-        /// Give this agent egress to the GitHub API ranges published at
-        /// <api>/meta (port 443). Repeatable.
-        #[arg(long = "github-api-egress", value_name = "AGENT")]
-        github_api_egress: Vec<String>,
+        /// Give this agent's sandboxes egress to the configured code hosts and
+        /// trackers (factory.sandboxEgress.<AGENT>). Repeatable.
+        #[arg(long = "forge-egress", value_name = "AGENT")]
+        forge_egress: Vec<String>,
         /// Turn the factory intake off; changes nothing else.
         #[arg(long)]
         disable: bool,

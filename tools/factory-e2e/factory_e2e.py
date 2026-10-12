@@ -1312,6 +1312,9 @@ def install_values(
                 "mention": config.mention,
             }
         ],
+        # The github entries carry no egress, so the chart's built-in GitHub
+        # set applies to the factory agent's sandboxes (#4397).
+        "sandboxEgress": {FACTORY_AGENT: True},
     }
     if card_base_url:
         values["factory"]["cardBaseUrl"] = card_base_url
@@ -2763,15 +2766,10 @@ class Preflight:
         )
 
     def egress_cidrs(self) -> list[str]:
-        """Sandbox egress: GitHub's API ranges (the bundle's GitHub MCP server
-        calls it from the sandbox) and, with a real model, OpenRouter."""
+        """Model egress for the sandbox: OpenRouter, with a real model. GitHub
+        is forge egress, reached through factory.sandboxEgress (#4397)."""
 
-        status, meta = http_json("GET", GITHUB_API + "/meta")
-        ranges = meta.get("api") if status == 200 and isinstance(meta, dict) else None
-        if not isinstance(ranges, list) or not ranges:
-            raise PreflightFailed(f"could not read GitHub's API address ranges (HTTP {status})")
-        cidrs = [str(cidr) for cidr in ranges if ":" not in str(cidr)]
-        return cidrs + self.model_provider_cidrs()
+        return self.model_provider_cidrs()
 
     def model_provider_cidrs(self) -> list[str]:
         """OpenRouter's current IPv4 addresses with a real model, else none."""

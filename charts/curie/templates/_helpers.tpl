@@ -2322,14 +2322,14 @@ no {{ .key }} in this container's env: nothing to stage. This is expected for a 
 Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
 array: every connectorSecrets agent, every registryEgress agent (#3083), and
 every runnerImages agent (ADR-0173), and every workspaceSizeLimits agent (#3523),
-and every string in agentSandbox.poolAgents.
+every true factory.sandboxEgress, and every string in agentSandbox.poolAgents.
 */}}
 {{- define "curie.agentSandboxPoolAgents" -}}
 {{- $extra := list -}}
 {{- if kindIs "slice" .Values.agentSandbox.poolAgents -}}
 {{- $extra = .Values.agentSandbox.poolAgents -}}
 {{- end -}}
-{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) $extra -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) (include "curie.factory.sandboxAgents" . | fromJsonArray) $extra -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}
 
@@ -2465,7 +2465,7 @@ true
 {{- $doc := dict "code_hosts" list "trackers" list "card_base_url" (get $factory "cardBaseUrl" | default "" | toString) -}}
 {{- $_ := set $doc "bindings" (include "curie.factory.snake" (dict "v" (get $factory "bindings" | default list)) | fromJson).v -}}
 {{- range (include "curie.factory.credentials" . | fromJsonArray) -}}
-{{- $out := (include "curie.factory.snake" (dict "v" .entry) | fromJson).v -}}
+{{- $out := (include "curie.factory.snake" (dict "v" (omit .entry "egress")) | fromJson).v -}}
 {{- $credential := (include "curie.factory.snake" (dict "v" (omit .credential "existingSecret" "existingSecretKey" "privateKey" "clientSecret" "token")) | fromJson).v -}}
 {{- $_ := set $credential "type" (get .credential "type" | default "github_app") -}}
 {{- $_ := set $credential (printf "%s_file" .field) (printf "%s/%s" (include "curie.factory.mount" .) .path) -}}
@@ -2534,6 +2534,7 @@ true
 {{- if not (and (get .credential "existingSecret") (get .credential "existingSecretKey")) -}}
 {{- fail (printf "%s credential needs existingSecret and existingSecretKey" $where) -}}
 {{- end -}}
+{{- range (get .entry "egress" | default list) }}{{ include "curie.objectStore.egressEntry" (dict "key" (printf "%s egress" $where) "entry" .) }}{{ end -}}
 {{- $own := get .credential "appId" -}}
 {{- if and $appId $own (eq (get .credential "type" | default "github_app") "github_app") (ne (include "curie.factory.str" $own) $appId) -}}
 {{- fail (printf "%s credential appId %s differs from api.githubAppId %s; the factory and git-flow must use one GitHub App" $where (include "curie.factory.str" $own) $appId) -}}
@@ -2548,4 +2549,24 @@ true
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{/* Forge egress (#4397): an entry's own, else the built-in GitHub set. */}}
+{{- define "curie.factory.egress" -}}
+{{- $f := .root.Values.factory | default dict -}}
+{{- $gh := list -}}
+{{- range splitList " " "192.30.252.0/22 185.199.108.0/22 140.82.112.0/20 143.55.64.0/20 2a0a:a440::/29 2606:50c0::/32 20.201.28.151/32 20.201.28.148/32 20.205.243.166/32 20.205.243.168/32 20.87.245.0/32 20.87.245.6/32 4.237.22.38/32 4.237.22.34/32 4.228.31.150/32 4.228.31.149/32 20.207.73.82/32 20.207.73.85/32 20.27.177.113/32 20.27.177.116/32 20.200.245.247/32 20.200.245.245/32 20.175.192.147/32 20.175.192.149/32 20.233.83.145/32 20.233.83.146/32 20.29.134.23/32 20.29.134.17/32 20.199.39.232/32 20.199.39.228/32 20.217.135.5/32 20.217.135.0/32 4.225.11.194/32 4.225.11.201/32 4.208.26.197/32 4.208.26.200/32 20.26.156.215/32 20.26.156.210/32 172.182.252.133/32 172.182.252.137/32 4.249.131.164/32 4.249.131.166/32 48.202.248.40/32 48.202.248.39/32 48.204.201.5/32 48.204.201.2/32" }}{{ $gh = append $gh (dict "cidr" . "ports" (list (dict "protocol" "TCP" "port" 443))) }}{{ end -}}
+{{- $hosts := get $f "codeHosts" | default list -}}
+{{- $out := ternary $gh list (not $hosts) -}}
+{{- range concat $hosts (ternary (get $f "trackers" | default list) list (hasKey . "sandbox")) -}}
+{{- $out = concat $out (get . "egress" | default (ternary $gh list (eq (get . "kind") "github"))) -}}
+{{- end -}}
+{{- toJson (uniq $out) -}}
+{{- end -}}
+{{- define "curie.factory.sandboxAgents" -}}
+{{- $out := list -}}
+{{- range $a, $on := get (.Values.factory | default dict) "sandboxEgress" | default dict -}}
+{{- if or (gt (len $a) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $a)) }}{{ fail (printf "factory.sandboxEgress.%s has an invalid agent name" $a) }}{{ end -}}
+{{- if $on }}{{ $out = append $out $a }}{{ end -}}
+{{- end -}}
+{{- toJson $out -}}
 {{- end -}}

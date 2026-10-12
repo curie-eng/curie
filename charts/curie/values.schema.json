@@ -2,6 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "definitions": {
+    "forge": {"properties": {"egress": {"type": "array", "items": {"required": ["cidr", "ports"]}}}},
     "computePodDisruptionBudget": {
       "type": "object",
       "description": "Optional PodDisruptionBudget for a compute-plane Deployment (issue #1574). minAvailable, when set, replaces maxUnavailable. A budget allowing zero voluntary disruptions at the configured replica count needs allowBlockingDrain: true; the template refuses it otherwise.",
@@ -139,8 +140,8 @@
         "intake": {"type": "string", "enum": ["poll", "webhook"]},
         "cardBaseUrl": {"type": "string"},
         "ciWaitSeconds": {"type": "integer", "minimum": 1, "maximum": 10800},
-        "codeHosts": {"type": "array"},
-        "trackers": {"type": "array"},
+        "codeHosts": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
+        "trackers": {"type": "array", "items": {"$ref": "#/definitions/forge"}},
         "bindings": {"type": "array", "items": {"type": "object", "properties": {"repos": {"type": "array", "items": {"type": "object", "properties": {"ci": {
           "type": "object", "additionalProperties": false,
           "properties": {
@@ -149,7 +150,7 @@
               "paths": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
               "pendingKeyPrefix": {"type": ["string", "null"], "minLength": 1}}},
             "metadataRerunKeys": {"type": "array", "items": {"type": "string", "minLength": 1}}}}}}}}}},
-        "sandboxEgress": {"type": "object"}
+        "sandboxEgress": {"type": "object", "additionalProperties": {"type": "boolean"}}
       }
     },
     "api": {
@@ -345,12 +346,7 @@
               "type": "array",
               "items": {"type": "string", "minLength": 1, "maxLength": 512}
             },
-            "allowDependencyAdditions": {"type": "boolean"},
-            "githubHttpsCidrs": {
-              "type": "array",
-              "minItems": 1,
-              "items": {"type": "string", "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$"}
-            }
+            "allowDependencyAdditions": {"type": "boolean"}
             }
           }
       }
