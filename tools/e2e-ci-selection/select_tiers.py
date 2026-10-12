@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import re
+import shlex
 import subprocess
 import tomllib
 from dataclasses import dataclass
@@ -62,6 +64,8 @@ UPGRADE_WORKFLOW_JOBS = frozenset(
     }
 )
 WORKFLOW_PATH = ".github/workflows/ci.yaml"
+CHART_JOB = "e2e-cluster-chart-regressions"
+SCENARIO_SCRIPT = re.compile(r"^(?:charts/curie/ci|scripts)/[^\s]+\.sh(?:$|[;|&])")
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CARGO_MANIFEST = "cli/Cargo.toml"
 # A version-only diff (#3858) still runs this rung: it proves the new version
@@ -104,12 +108,26 @@ UniqueKeyLoader.add_constructor(
 
 
 @dataclass(frozen=True)
+class ChartScenario:
+    step: str
+    inputs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ChartScenarios:
+    job: str
+    shared_inputs: tuple[str, ...]
+    scenarios: dict[str, ChartScenario]
+
+
+@dataclass(frozen=True)
 class Registry:
     fallback: tuple[str, ...]
     exact: dict[str, tuple[str, ...]]
     prefixes: dict[str, tuple[str, ...]]
     ignored_exact: tuple[str, ...]
     ignored_prefixes: tuple[str, ...]
+    chart_scenarios: ChartScenarios
 
 
 def _mapping(value: object, label: str) -> dict[str, object]:
@@ -147,6 +165,44 @@ def _tier_rules(value: object, label: str) -> dict[str, tuple[str, ...]]:
 
 def _matches_prefix(path: str, prefix: str) -> bool:
     return path == prefix or path.startswith(f"{prefix}/")
+
+
+def _inputs(value: object, label: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value or any(
+        not isinstance(path, str) or not path or path.startswith("/") or path.endswith("/")
+        for path in value
+    ):
+        raise RegistryError(f"{label} must be a nonempty list of valid paths")
+    return tuple(value)
+
+
+def _chart_registry(value: object) -> ChartScenarios:
+    section = _mapping(value, "chart_scenarios")
+    if set(section) != {"job", "shared_inputs", "scenarios"}:
+        raise RegistryError("chart_scenarios must define job, shared_inputs, and scenarios")
+    if section["job"] != CHART_JOB:
+        raise RegistryError(f"chart_scenarios.job must be {CHART_JOB}")
+    shared_inputs = _inputs(section["shared_inputs"], "chart_scenarios.shared_inputs")
+    entries = _mapping(section["scenarios"], "chart_scenarios.scenarios")
+    if not entries:
+        raise RegistryError("chart_scenarios.scenarios must not be empty")
+    scenarios: dict[str, ChartScenario] = {}
+    step_names: set[str] = set()
+    for scenario_id, value in entries.items():
+        if not re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", scenario_id):
+            raise RegistryError("chart_scenarios contains an invalid scenario id")
+        label = f"chart_scenarios.scenarios.{scenario_id}"
+        entry = _mapping(value, label)
+        if set(entry) != {"step", "inputs"}:
+            raise RegistryError(f"{label} must define step and inputs")
+        step = entry["step"]
+        if not isinstance(step, str) or not step:
+            raise RegistryError(f"{label}.step must be a nonempty string")
+        if step in step_names:
+            raise RegistryError(f"duplicate chart scenario step: {step}")
+        step_names.add(step)
+        scenarios[scenario_id] = ChartScenario(step, _inputs(entry["inputs"], f"{label}.inputs"))
+    return ChartScenarios(CHART_JOB, shared_inputs, scenarios)
 
 
 # Fail-closed pytest set. Ignore rules may skip compose+pytest, but never
@@ -282,7 +338,10 @@ def _load_registry(path: Path) -> Registry:
         if any(_matches_prefix(prefix, ignored) for prefix in prefixes):
             raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
 
-    return Registry(fallback, exact, prefixes, tuple(ignored_exact), tuple(ignored_prefixes))
+    chart_scenarios = _chart_registry(root.get("chart_scenarios"))
+    return Registry(
+        fallback, exact, prefixes, tuple(ignored_exact), tuple(ignored_prefixes), chart_scenarios
+    )
 
 
 def _is_ignored(registry: Registry, path: str) -> bool:
@@ -307,6 +366,80 @@ def _select_path(registry: Registry, path: str) -> set[str]:
             matched = True
             selected.update(tiers)
     return selected if matched else set(registry.fallback)
+
+
+def _chart_steps(job: str, head: str | None) -> list[dict[str, object]]:
+    if head is None:
+        content = Path(WORKFLOW_PATH).read_text(encoding="utf-8")
+    else:
+        content = subprocess.run(
+            ["git", "show", f"{head}:{WORKFLOW_PATH}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    try:
+        document = yaml.load(content, Loader=UniqueKeyLoader)
+    except yaml.YAMLError as exc:
+        raise RegistryError("workflow YAML is malformed") from exc
+    if not isinstance(document, dict):
+        raise RegistryError("workflow root must be a mapping")
+    jobs = _mapping(document.get("jobs"), "workflow jobs")
+    selected_job = _mapping(jobs.get(job), f"workflow job {job}")
+    steps = selected_job.get("steps")
+    if not isinstance(steps, list):
+        raise RegistryError(f"workflow job {job} must define a steps list")
+    return [_mapping(step, f"workflow job {job} step") for step in steps]
+
+
+def _is_scenario_step(step: dict[str, object]) -> bool:
+    run = step.get("run")
+    if not isinstance(run, str):
+        return False
+    for line in run.replace("\\\n", " ").splitlines():
+        try:
+            words = shlex.split(line, comments=True)
+        except ValueError:
+            continue
+        if any(SCENARIO_SCRIPT.match(word) for word in words):
+            return True
+    return False
+
+
+def _select_chart_scenarios(
+    registry: Registry,
+    paths: list[str],
+    selected_tiers: set[str],
+    push: bool,
+    head: str | None,
+) -> list[str]:
+    if "cluster" not in selected_tiers:
+        return []
+    chart = registry.chart_scenarios
+    fallback = any(
+        not _is_ignored(registry, path)
+        and path not in registry.exact
+        and not any(_matches_prefix(path, prefix) for prefix in registry.prefixes)
+        for path in paths
+    )
+    if push or fallback:
+        selected = set(chart.scenarios)
+    else:
+        selected = {
+            scenario_id
+            for scenario_id, scenario in chart.scenarios.items()
+            if any(
+                _matches_scenario(path, (*chart.shared_inputs, *scenario.inputs))
+                for path in paths
+            )
+        }
+    registered_steps = {scenario.step for scenario in chart.scenarios.values()}
+    if any(
+        _is_scenario_step(step) and step.get("name") not in registered_steps
+        for step in _chart_steps(chart.job, head)
+    ):
+        selected.add("unregistered")
+    return sorted(selected)
 
 
 def _changed_paths(base: str, head: str) -> list[str]:
@@ -499,6 +632,7 @@ def _render(
     version_only: bool,
     factory_needed: bool,
     approval_resume_needed: bool,
+    chart_scenarios: list[str],
 ) -> str:
     lines = [f"{OUTPUT_KEYS[tier]}={'true' if tier in selected else 'false'}" for tier in TIERS]
     skill_local = ",".join(tier for tier in TIERS[:2] if tier in selected)
@@ -514,6 +648,7 @@ def _render(
     lines.append(
         f"approval_resume={'true' if approval_resume_needed else 'false'}"
     )
+    lines.append("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
     return "\n".join(lines) + "\n"
 
 
@@ -599,6 +734,10 @@ def _run() -> None:
     released_upgrade_full = (
         args.push or workflow_upgrade_changed
     ) and "released-upgrade" in selected
+    chart_scenarios = _select_chart_scenarios(
+        registry, paths, selected, args.push, args.head if not args.path else None
+    )
+    print("chart_scenarios=" + json.dumps(chart_scenarios, separators=(",", ":")))
 
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
@@ -614,6 +753,7 @@ def _run() -> None:
                 version_only,
                 factory_needed,
                 approval_resume_needed,
+                chart_scenarios,
             )
         )
 

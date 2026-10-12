@@ -2596,8 +2596,9 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
     )
     assert calico_index < steps.index(staging[0]) < steps.index(staging[1])
     assert steps.index(staging[1]) < steps.index(staging[2]) < steps.index(workspace)
+    assert workspace["if"] == _chart_step_if("workspace-diagnostic")
     for step in staging:
-        assert step.get("if") == workspace.get("if"), step
+        assert "if" not in step, step
         assert "continue-on-error" not in step
     download, load, stage = staging
     assert download["uses"].startswith("actions/download-artifact@")
@@ -3092,7 +3093,9 @@ def test_unregistered_chart_scenario_fails_closed_in_each_selection_mode(
         paths = ("apps/api/src/curie_api/main.py",)
     completed, output = _invoke_selector(tmp_path, *paths, **options)
     assert completed.returncode == 0, completed.stderr
-    expected = CHART_IDS if mode == "push" else ("quota-progress", "workspace-diagnostic")
+    expected = CHART_IDS if mode in {"push", "revisions"} else (
+        "quota-progress", "workspace-diagnostic"
+    )
     assert json.loads(_outputs_of(output)["chart_scenarios"]) == sorted((*expected, "unregistered"))
     docs, docs_output = _invoke_selector(tmp_path, "docs/example.md", cwd=repository)
     assert docs.returncode == 0, docs.stderr
