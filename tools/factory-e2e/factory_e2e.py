@@ -72,6 +72,7 @@ import base64
 import dataclasses
 import datetime as dt
 import fcntl
+import hashlib
 import http.client
 import ipaddress
 import json
@@ -108,13 +109,15 @@ CHART_COMPONENTS = {
     "ui": "curie-ui",
 }
 RUNNER_IMAGE = "curie-runner"
-RELEASE = "curie"
 # The chart's DB_SCHEMA; the in-chart role's search_path does not include it.
 DB_SCHEMA = "curie"
 DEFAULT_LABEL = "curie-factory"
 NAMESPACE_PREFIX = "test-factory-"
 APP_KEY_REF = "factory-e2e-github-app"
-SANDBOX_CRD = "sandboxes.agents.x-k8s.io"
+# The shared agent-sandbox controller, read the same way `curie cluster up`
+# reads it (cli/src/ops/up.rs) to decide whether this install deploys one.
+SANDBOX_CONTROLLER_NAMESPACE = "agent-sandbox-system"
+SANDBOX_CONTROLLER_DEPLOYMENT = "agent-sandbox-controller"
 OWNER_LABEL = "app.kubernetes.io/managed-by=curie-factory-e2e"
 RUN_ANNOTATION = "curie.dev/factory-e2e-run"
 # "<hostname>:<pid>" of the process that created the namespace, so a later run
@@ -974,13 +977,38 @@ def install_values(
         values["security"].setdefault("networkPolicy", {})["allowedEgress"] = allowed
     if sandbox_pod_quota is not None:
         values["resourceQuota"] = {"hard": {"sandboxPodCount": str(sandbox_pod_quota)}}
-    if config.priority_classes is not None:
-        platform, sandbox = config.priority_classes
-        values["priorityClasses"] = {
-            "platform": {"create": False, "name": platform},
-            "sandbox": {"create": False, "name": sandbox},
-        }
     return values
+
+
+def release_name(namespace: str) -> str:
+    """The Helm release for a run in ``namespace``.
+
+    Per run, not "curie": the chart names its cluster-scoped objects (the
+    ValidatingAdmissionPolicy ``<release>-runner-resources``, ClusterRoles,
+    PriorityClasses) from the release, so a fixed name collides with another
+    release named curie on the same cluster.
+    """
+
+    return "curie-" + hashlib.sha256(namespace.encode()).hexdigest()[:4]
+
+
+def priority_class_values(priority_classes: tuple[str, str] | None, release: str) -> dict[str, Any]:
+    """The chart's priorityClasses block for one run.
+
+    Configured names are reused as they are. Otherwise the release creates its
+    own per-release classes, which ``helm uninstall`` removes again.
+    """
+
+    if priority_classes is None:
+        return {
+            "platform": {"create": True, "name": f"{release}-platform"},
+            "sandbox": {"create": True, "name": f"{release}-sandbox"},
+        }
+    platform, sandbox = priority_classes
+    return {
+        "platform": {"create": False, "name": platform},
+        "sandbox": {"create": False, "name": sandbox},
+    }
 
 
 def helm_upgrade_command(
@@ -1620,6 +1648,7 @@ class Preflight:
         self.admission_timeout = admission_timeout
         self.teardown = Teardown()
         self.run_id = uuid.uuid4().hex[:12]
+        self.release = release_name(namespace)
         self.created_crds: list[str] = []
         self.evidence: dict[str, Any] = {
             "schema": "curie.factory-e2e.evidence/v1",
@@ -1628,7 +1657,7 @@ class Preflight:
             "image_tag": f"sha-{candidate}",
             "kube_context": config.kube_context,
             "namespace": namespace,
-            "release": RELEASE,
+            "release": self.release,
             "run_id": "",
             "started_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
             "steps": [],
@@ -1680,7 +1709,7 @@ class Preflight:
                 self.namespace,
                 "exec",
                 "-i",
-                f"statefulset/{RELEASE}-postgres",
+                f"statefulset/{self.release}-postgres",
                 "--",
                 "sh",
                 "-c",
@@ -1844,7 +1873,7 @@ class Preflight:
         self.step("namespace created", namespace=self.namespace)
 
     def publication_namespace(self) -> str:
-        return f"{self.namespace}-{RELEASE}-publication"
+        return f"{self.namespace}-{self.release}-publication"
 
     def _owned(self, name: str) -> bool:
         raw = self.kubectl("get", "namespace", name, "--ignore-not-found", "-o", "json")
@@ -1901,7 +1930,7 @@ class Preflight:
                 "--kube-context",
                 self.config.kube_context,
                 "uninstall",
-                RELEASE,
+                release_name(name),
                 "-n",
                 name,
                 "--no-hooks",
@@ -1919,7 +1948,7 @@ class Preflight:
                 f"{uninstall.stderr.strip()[-500:]}"
             )
         names = [name]
-        publication = f"{name}-{RELEASE}-publication"
+        publication = f"{name}-{release_name(name)}-publication"
         raw = self.kubectl("get", "namespace", publication, "--ignore-not-found", "-o", "json")
         if raw.strip():
             annotations = json.loads(raw)["metadata"].get("annotations") or {}
@@ -1951,7 +1980,7 @@ class Preflight:
                     "--kube-context",
                     self.config.kube_context,
                     "uninstall",
-                    RELEASE,
+                    self.release,
                     "-n",
                     self.namespace,
                     "--no-hooks",
@@ -1996,11 +2025,67 @@ class Preflight:
             "verified_absent": True,
         }
 
-    def install(self) -> None:
-        chart = self.extract_chart()
-        consumer = bool(
-            self.kubectl("get", "crd", SANDBOX_CRD, "--ignore-not-found", "-o", "name").strip()
+    def existing_sandbox_controller(self) -> bool:
+        """Whether the shared agent-sandbox controller Deployment already runs.
+
+        Same rule as `curie cluster up`: an existing controller is reused, a
+        NotFound means this release deploys its own, and any other read failure
+        stops the run before Helm touches the cluster.
+        """
+
+        try:
+            out = self.kubectl(
+                "-n",
+                SANDBOX_CONTROLLER_NAMESPACE,
+                "get",
+                "deployment",
+                SANDBOX_CONTROLLER_DEPLOYMENT,
+                "--ignore-not-found",
+                "-o",
+                "name",
+            )
+        except PreflightFailed as exc:
+            raise PreflightFailed(
+                f"cannot read deployment {SANDBOX_CONTROLLER_NAMESPACE}/"
+                f"{SANDBOX_CONTROLLER_DEPLOYMENT} to decide sandbox controller reuse: {exc}"
+            ) from exc
+        return bool(out.strip())
+
+    def release_values(
+        self,
+        config: FactoryConfig,
+        *,
+        sandbox_pod_quota: int | None,
+        card_base_url: str = "",
+    ) -> dict[str, Any]:
+        """install_values plus this run's per-release PriorityClasses.
+
+        The one builder for install() and helm_upgrade(), so the two agree.
+        """
+
+        values = install_values(
+            config,
+            candidate=self.candidate,
+            app_key_secret=APP_KEY_REF,
+            consumer_controller=self._consumer_controller,
+            egress_cidrs=self._egress_cidrs,
+            sandbox_pod_quota=sandbox_pod_quota,
+            card_base_url=card_base_url,
         )
+        values["priorityClasses"] = priority_class_values(config.priority_classes, self.release)
+        return values
+
+    def install(self) -> None:
+        # Read before any CRD, Secret or Helm call: a failed read must leave
+        # the cluster untouched.
+        consumer = self.existing_sandbox_controller()
+        if consumer:
+            self.step(
+                "sandbox controller reused",
+                namespace=SANDBOX_CONTROLLER_NAMESPACE,
+                deployment=SANDBOX_CONTROLLER_DEPLOYMENT,
+            )
+        chart = self.extract_chart()
         for manifest in sorted((chart / "crds").glob("*.yaml")):
             match = re.search(r"^  name:\s*(\S+)", manifest.read_text(), re.MULTILINE)
             if (
@@ -2043,14 +2128,7 @@ class Preflight:
         self._consumer_controller = consumer
         self._egress_cidrs = list(egress_cidrs)
         self._sandbox_quota = quota
-        values = install_values(
-            self.config,
-            candidate=self.candidate,
-            app_key_secret=APP_KEY_REF,
-            consumer_controller=consumer,
-            egress_cidrs=egress_cidrs,
-            sandbox_pod_quota=quota,
-        )
+        values = self.release_values(self.config, sandbox_pod_quota=quota)
         values_file = self.workdir / "values.json"
         fd = os.open(values_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
@@ -2062,7 +2140,7 @@ class Preflight:
                 "--kube-context",
                 self.config.kube_context,
                 "install",
-                RELEASE,
+                self.release,
                 str(chart),
                 "-n",
                 self.namespace,
@@ -2122,7 +2200,7 @@ class Preflight:
                 "-n",
                 self.namespace,
                 "port-forward",
-                f"svc/{RELEASE}-api",
+                f"svc/{self.release}-api",
                 f"{port}:8000",
                 "--address",
                 "127.0.0.1",
@@ -2143,7 +2221,9 @@ class Preflight:
 
         _wait("the api through port-forward", 120, healthy)
         secret = json.loads(
-            self.kubectl("-n", self.namespace, "get", "secret", f"{RELEASE}-secrets", "-o", "json")
+            self.kubectl(
+                "-n", self.namespace, "get", "secret", f"{self.release}-secrets", "-o", "json"
+            )
         )
         data = secret["data"]
         self.api_key = base64.b64decode(data["apiKey"]).decode()
@@ -2261,7 +2341,9 @@ class Preflight:
         copy = self.workdir / "bundle"
         shutil.rmtree(copy, ignore_errors=True)
         shutil.copytree(bundle, copy)
-        runner = f"{GHCR.removeprefix('https://')}/{IMAGE_OWNER}/{RUNNER_IMAGE}:sha-{self.candidate}"
+        runner = (
+            f"{GHCR.removeprefix('https://')}/{IMAGE_OWNER}/{RUNNER_IMAGE}:sha-{self.candidate}"
+        )
         log(f"curie build (the bundle's runner layer on {runner})")
         argv = [
             self.config.curie_bin,
@@ -2299,7 +2381,14 @@ class Preflight:
         self.issue_token = token
         self._issue_token_minted = time.time()
         secrets = [token, self.api_key, self.config.model_api_key, self.worker_token]
-        common = ["--namespace", self.namespace, "--release", RELEASE, "--api-url", self.api_url]
+        common = [
+            "--namespace",
+            self.namespace,
+            "--release",
+            self.release,
+            "--api-url",
+            self.api_url,
+        ]
         log("curie cluster deploy (the default dark-factory bundle)")
         self._curie(
             [
@@ -2621,15 +2710,7 @@ class Preflight:
 
         assert self.chart_dir is not None, "install() extracts the chart first"
         config = self.config if model is None else dataclasses.replace(self.config, model=model)
-        values = install_values(
-            config,
-            candidate=self.candidate,
-            app_key_secret=APP_KEY_REF,
-            consumer_controller=self._consumer_controller,
-            egress_cidrs=self._egress_cidrs,
-            sandbox_pod_quota=quota,
-            card_base_url=self.tunnel_url,
-        )
+        values = self.release_values(config, sandbox_pod_quota=quota, card_base_url=self.tunnel_url)
         values_file = self.workdir / "values.json"
         fd = os.open(str(values_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
@@ -2641,7 +2722,7 @@ class Preflight:
         run(
             helm_upgrade_command(
                 context=self.config.kube_context,
-                release=RELEASE,
+                release=self.release,
                 chart=str(self.chart_dir),
                 namespace=self.namespace,
                 values_file=str(values_file),
@@ -2669,7 +2750,7 @@ class Preflight:
         it, deploy the bundle again; that is what creates the pool.
         """
 
-        name = agent_warm_pool_name(RELEASE, FACTORY_AGENT)
+        name = agent_warm_pool_name(self.release, FACTORY_AGENT)
         if self._pool_exists(name):
             return
         log(f"sandbox warm pool {name} is missing; deploying the bundle again")
@@ -3024,7 +3105,7 @@ class Preflight:
             "--namespace",
             self.namespace,
             "--release",
-            RELEASE,
+            self.release,
             "--api-url",
             self.api_url,
         ]
@@ -3112,7 +3193,7 @@ class Preflight:
         return {
             "kube_context": self.config.kube_context,
             "namespace": self.namespace,
-            "release": RELEASE,
+            "release": self.release,
             "api_url": self.api_url,
             "tunnel_url": self.tunnel_url,
             "webhook_url": f"{self.tunnel_url}/github/webhook" if self.tunnel_url else "",
@@ -3828,10 +3909,7 @@ def revision(p: Preflight) -> dict[str, Any]:
         comment["body"], hit = record_agent_text(comment["body"], known)
         disclosed = disclosed or hit
     ended_at = min(
-        (
-            str(comment.get("updated_at") or comment.get("created_at") or "")
-            for comment in comments
-        ),
+        (str(comment.get("updated_at") or comment.get("created_at") or "") for comment in comments),
         default=None,
     )
     elapsed, _execution = ending_times(latest, labelled_at=p.labelled_at, ended_at=ended_at)
@@ -4755,7 +4833,7 @@ def _doctor_claims_line(p: Preflight) -> str | None:
         "--namespace",
         p.namespace,
         "--release",
-        RELEASE,
+        p.release,
     ]
     env = {
         **os.environ,
@@ -4778,7 +4856,7 @@ def _doctor_claims_line(p: Preflight) -> str | None:
 def _helm_popen(p: Preflight, values_file: Path, timeout: str) -> subprocess.Popen[str]:
     argv = helm_upgrade_command(
         context=p.config.kube_context,
-        release=RELEASE,
+        release=p.release,
         chart=str(p.chart_dir),
         namespace=p.namespace,
         values_file=str(values_file),
@@ -4831,7 +4909,7 @@ def _sigkill_drain(p: Preflight, obs: dict[str, Any]) -> str:
     host = os.environ.get("CURIE_FACTORY_NODE_SSH_HOST") or node
     script = (
         f"pid=$(sudo -n crictl inspect {container_id} | "
-        "python3 -c 'import json,sys;print(json.load(sys.stdin)[\"info\"][\"pid\"])') "
+        'python3 -c \'import json,sys;print(json.load(sys.stdin)["info"]["pid"])\') '
         '&& sudo -n kill -KILL "$pid" && echo "$pid"'
     )
     try:
@@ -4941,7 +5019,7 @@ def quiesce(p: Preflight) -> dict[str, Any]:
         obs["path_a_drain_job_active_after_cancel"] = bool(
             job and int((job.get("status") or {}).get("active") or 0) > 0
         )
-        job_name = ((job or {}).get("metadata") or {}).get("name") or f"{RELEASE}-upgrade-drain"
+        job_name = ((job or {}).get("metadata") or {}).get("name") or f"{p.release}-upgrade-drain"
         obs["doctor_worker_claims_line"] = _doctor_claims_line(p)
         cancelled_at = time.time()
 
@@ -5417,9 +5495,7 @@ def run_hidden_tests(case_id: str, checkout: Path) -> dict[str, Any]:
     """Run the case's hidden checks against a checkout the coding run never saw."""
 
     if case_id == "positive":
-        failures = _probe_convert(
-            checkout, [(1, "nmi", "m", 1852), (1, "nmi", "km", 1.852)]
-        )
+        failures = _probe_convert(checkout, [(1, "nmi", "m", 1852), (1, "nmi", "km", 1.852)])
     elif case_id == "failing-test":
         tests = checkout / "unitconv" / "tests" / "test_convert.py"
         text = tests.read_text() if tests.is_file() else ""

@@ -1506,7 +1506,7 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_ACTOR_TOKEN` or `CURIE_FACTORY_ACTOR_GH_USER` | A dedicated test GitHub account with write access that opens issues, comments and moves the fixture branch (a `gh` login for the second). It must not be the operator's own account |
 | `CURIE_FACTORY_OPERATOR_LOGIN` | The operator's GitHub login, compared with the actor's (default: the login of the default `gh` account). The run is refused when they match, and refused too when neither is known, naming this variable to set |
 | `CURIE_FACTORY_LABEL`, `CURIE_FACTORY_MENTION` | Intake label (default `curie-factory`) and mention login (default the App slug) |
-| `CURIE_FACTORY_PRIORITY_CLASSES` | `<platform>,<sandbox>`: reuse existing PriorityClasses instead of creating them |
+| `CURIE_FACTORY_PRIORITY_CLASSES` | `<platform>,<sandbox>`: reuse existing PriorityClasses. Unset, the run's release (`curie-` plus 4 hex characters derived from the namespace, so it installs beside another release named `curie`) creates `<release>-platform` and `<release>-sandbox` and removes them on uninstall |
 | `CURIE_FACTORY_WEBHOOK_RESTORE_URL` | URL to leave on the App webhook (default: the URL found at start, or the parked URL when that was a dead quick tunnel) |
 | `CURIE_FACTORY_CLOUDFLARED` | cloudflared binary (default `cloudflared` on PATH) |
 | `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |

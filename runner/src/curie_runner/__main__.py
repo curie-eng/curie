@@ -316,7 +316,8 @@ def _format_check_line(check: dict[str, Any]) -> str:
             "delegated_to in the data block above. If you change its paths, you may "
             "use publish_changes only after confirming that check selects all "
             "changed paths, and the pull request body must state that in-sandbox "
-            "verification was unavailable and CI is pending proof."
+            "verification was unavailable and the delegated check had not reported "
+            "when this pull request was opened; the issue status comment reports its result."
         )
     parts.append(f"Missing binaries: {missing_text}. Blocked services: {blocked_text}.")
     failure_reason = check.get("failure_reason")
