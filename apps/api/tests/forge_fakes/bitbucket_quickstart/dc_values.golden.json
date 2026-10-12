@@ -1,0 +1,48 @@
+{
+  "codeHosts": [
+    {
+      "name": "bitbucket-dc",
+      "kind": "bitbucket_dc",
+      "host": "bbdc.example.invalid",
+      "apiUrl": "https://bbdc.example.invalid:8443/bitbucket",
+      "credential": {
+        "type": "static_token",
+        "existingSecret": "curie-bitbucket-dc-token",
+        "existingSecretKey": "token"
+      },
+      "egress": [
+        {
+          "cidr": "192.0.2.10/32",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 8443
+            }
+          ],
+          "host": "bbdc.example.invalid"
+        },
+        {
+          "cidr": "2001:db8::10/128",
+          "ports": [
+            {
+              "protocol": "TCP",
+              "port": 8443
+            }
+          ],
+          "host": "bbdc.example.invalid"
+        }
+      ]
+    }
+  ],
+  "repo": {
+    "alias": "demo",
+    "codeHost": "bitbucket-dc",
+    "projectId": "1",
+    "path": "FAC/demo"
+  },
+  "reviewFeedbackAllowlist": {
+    "bitbucket-dc": [
+      "101"
+    ]
+  }
+}
