@@ -403,7 +403,16 @@ def create_app() -> FastAPI:
     # Which credential the platform will clone with (ADR-0092, #1262). One
     # line, no secret, and a warning when the App is set up only halfway.
     log_credential_path(get_settings())
-    app = FastAPI(title="Curie API", version="0.1.0", lifespan=lifespan)
+    # FastAPI 0.142 otherwise installs its own global TracerProvider with OTLP
+    # exporters when OTEL_EXPORTER_OTLP_ENDPOINT is set, opening its own request
+    # span that reparents Curie's producer span. curie_telemetry.bootstrap_service_telemetry
+    # already owns export for curie-api (#4410).
+    app = FastAPI(
+        title="Curie API",
+        version="0.1.0",
+        lifespan=lifespan,
+        telemetry={"auto_configure": False},
+    )
 
     @app.get("/health", tags=["health"])
     async def health() -> dict[str, str]:
