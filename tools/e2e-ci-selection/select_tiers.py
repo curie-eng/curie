@@ -277,10 +277,8 @@ def _load_registry(path: Path) -> Registry:
         ignored_prefixes.append(ignored)
 
     for ignored in ignored_prefixes:
-        # Reject only when this ignore would hide a selected exact path or prefix.
+        # Exact paths can opt back in, but selected prefixes cannot be hidden.
         # A more-specific ignored child of a selected prefix is a hole, not an overlap.
-        if any(_matches_prefix(path, ignored) for path in exact):
-            raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
         if any(_matches_prefix(prefix, ignored) for prefix in prefixes):
             raise RegistryError(f"ignored prefix overlaps a selected rule: {ignored}")
 
@@ -288,6 +286,8 @@ def _load_registry(path: Path) -> Registry:
 
 
 def _is_ignored(registry: Registry, path: str) -> bool:
+    if path in registry.exact:
+        return False
     return path in registry.ignored_exact or any(
         _matches_prefix(path, prefix) for prefix in registry.ignored_prefixes
     )
