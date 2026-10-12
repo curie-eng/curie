@@ -209,6 +209,7 @@ def test_moving_a_binding_onto_a_declared_identity_stores_it(
             "address": "C0EXAMPLE1",
             "adapter": "second",
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
     assert _stored(agent_id) == {"C0EXAMPLE1": "second"}

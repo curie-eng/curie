@@ -104,13 +104,18 @@ spec:
     {{- end }}
     {{- $byPorts := dict }}
     {{- range $egress }}
-    {{- $_ := set $byPorts (toJson .ports) (append (get $byPorts (toJson .ports) | default list) .cidr) }}
+    {{- $block := dict "cidr" .cidr "except" (include "curie.egress.ipBlockExcept" (dict "entry" . "root" $) | fromJsonArray) }}
+    {{- $_ := set $byPorts (toJson .ports) (append (get $byPorts (toJson .ports) | default list) $block) }}
     {{- end }}
-    {{- range $ports, $cidrs := $byPorts }}
+    {{- range $ports, $blocks := $byPorts }}
     - to:
-      {{- range $cidrs }}
+      {{- range $blocks }}
         - ipBlock:
-            cidr: {{ . | quote }}
+            cidr: {{ .cidr | quote }}
+            {{- with .except }}
+            except:
+              {{- toYaml . | nindent 14 }}
+            {{- end }}
       {{- end }}
       ports:
         {{- toYaml (fromJsonArray $ports) | nindent 8 }}

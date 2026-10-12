@@ -254,6 +254,9 @@ class GitHubAPI:
         # fixtures cannot address each other's request-derived Valkey keys.
         self.label_event_base = uuid.uuid4().int >> 80
         self.label_event_ids: dict[int, int] = {}
+        # Issue number -> its comments, for the marked label refusal comment.
+        self.issue_comments: dict[int, list[dict[str, Any]]] = {}
+        self._comment_ids = itertools.count(9000)
 
     def advance_label_event(self, number: int) -> None:
         """Record a newer labeled timeline event. A relabel webhook reads it."""
@@ -290,6 +293,21 @@ class GitHubAPI:
                     ),
                 },
             )
+        if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/comments"):
+            # An issue's comments: the factory's marked refusal comment (#4361
+            # decision 9) is listed, then posted as the App.
+            number = int(path.split("/")[-2])
+            listed = self.issue_comments.setdefault(number, [])
+            if request.method == "POST":
+                comment = {
+                    "id": next(self._comment_ids),
+                    "body": json.loads(request.content)["body"],
+                    "user": {"id": 1, "login": "curie[bot]", "type": "Bot"},
+                    "performed_via_github_app": {"id": int(APP_ID)},
+                }
+                listed.append(comment)
+                return httpx.Response(201, json=comment)
+            return httpx.Response(200, json=listed)
         if path.startswith(f"/repos/{REPO}/issues/") and path.endswith("/events"):
             number = int(path.split("/")[-2])
             event_id = self.label_event_ids.get(number, self.label_event_base + number)

@@ -417,6 +417,22 @@ def test_a_reminting_credential_is_refused_on_a_forge_that_cannot_use_it() -> No
     _load(_edit(samples.github_document(), "trackers.0.credential", samples.static_token()))
 
 
+def test_a_github_tracker_and_code_host_on_one_host_must_share_one_app() -> None:
+    other_app = {**samples.github_app(), "app_id": "654321"}
+    _refused(
+        _edit(samples.github_document(), "code_hosts.0.credential", other_app),
+        r"tracker 'github-issues' \(GitHub App 123456\) and code host 'github'"
+        r" \(GitHub App 654321\)",
+    )
+    same_app = {**samples.github_app(), "private_key": "-----BEGIN KEY-----y"}
+    config = _load(_edit(samples.github_document(), "code_hosts.0.credential", same_app))
+    apps = [entry.credential for entry in (*config.trackers, *config.code_hosts)]
+    assert [(app.type, getattr(app, "app_id", None)) for app in apps] == [
+        ("github_app", "123456"),
+        ("github_app", "123456"),
+    ]
+
+
 def test_a_static_token_has_one_expiry_declaration() -> None:
     both = samples.static_token(expires_at="2027-01-31T00:00:00Z", never_expires=True)
     _refused(_edit(samples.jira_document(), "code_hosts.1.credential", both), "not both")

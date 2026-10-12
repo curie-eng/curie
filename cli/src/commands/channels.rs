@@ -199,8 +199,10 @@ pub(super) struct ChannelBindingPresentation<'a> {
     address: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     adapter: Option<&'a str>,
+    /// Present on every tracker binding (`TRIGGER_LABEL_KINDS`), where `null`
+    /// is a binding the install label serves; absent on any other kind.
     #[serde(skip_serializing_if = "Option::is_none")]
-    trigger_label: Option<&'a str>,
+    trigger_label: Option<Option<&'a str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<&'static str>,
 }
@@ -224,7 +226,9 @@ pub(super) fn channel_binding_presentation(
         kind: &binding.kind,
         address: &binding.address,
         adapter: channel_binding_named_identity(binding),
-        trigger_label: binding.trigger_label.as_deref(),
+        trigger_label: TRIGGER_LABEL_KINDS
+            .contains(&binding.kind.as_str())
+            .then_some(binding.trigger_label.as_deref()),
         warning: channel_binding_never_resolves(&binding.kind, &binding.address)
             .then_some(CHANNEL_BINDING_NEVER_RESOLVES_WARNING),
     }

@@ -140,7 +140,8 @@ one effective label.**
 2. Admission is refused, with an upserted marked status comment, in this
    order:
    1. `work_item_other_agent`: the issue already has a WorkItem whose agent is
-      not L's agent and still serves R. The comment says the issue belongs to
+      not L's agent, whether or not that agent still has a surface on R. The
+      comment says the issue belongs to
       the run that agent's label started and that a new issue is needed to run
       it under L.
    2. `label_conflict`: the issue's current labels, from the `verify_current`
@@ -158,9 +159,10 @@ one effective label.**
 4. Removing label L cancels the issue's WorkItem only when L equals
    `work_items.trigger_label`; removing any other label returns
    `label_not_admitting` and leaves the WorkItem alone. A WorkItem admitted
-   before the column existed (NULL) compares L with the effective label of its
-   agent's surface on R when that surface still exists, otherwise with the
-   configured tracker label. Closing the issue cancels as before. A tracker
+   before the column existed (NULL) was admitted when the configured tracker
+   label was the only install label, so it compares L with that label alone;
+   no surface is consulted, so removing or moving its agent's surface does not
+   change what cancels it. Closing the issue cancels as before. A tracker
    label change does not strand running work: removing the old label still
    cancels it.
 5. The poller makes one pass per repository, with one repository read and one

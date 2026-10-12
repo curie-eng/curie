@@ -395,6 +395,9 @@ pub enum Action {
         bundle: Option<PathBuf>,
         /// The operator bundle's locked runner image; `None` is the platform runner.
         runner_image: Option<String>,
+        /// Repositories this agent already holds under the requested effective
+        /// label. Their `surfaces --add` is skipped so a rerun is idempotent.
+        bound: Vec<String>,
     },
 }
 
@@ -976,6 +979,22 @@ fn check_bindings(input: &PlanInput) -> Result<()> {
     Ok(())
 }
 
+/// The repositories this agent already holds a GitHub binding on. Run after
+/// `check_bindings`, which refuses an own binding under another effective
+/// label, so each of these already carries the requested one.
+fn already_bound(input: &PlanInput) -> Vec<String> {
+    input
+        .repos
+        .iter()
+        .filter(|repo| {
+            input.bindings.iter().any(|binding| {
+                binding.agent == input.agent && binding.repo.eq_ignore_ascii_case(repo)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// The flags a register path rerun carries when they are not their defaults.
 fn rerun_flags(input: &PlanInput) -> Vec<String> {
     let mut flags = Vec::new();
@@ -1150,6 +1169,11 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         label: input.label.clone(),
         runner_image: bundle.as_ref().and(input.runner_image.clone()),
         bundle,
+        bound: if add_agent {
+            already_bound(input)
+        } else {
+            Vec::new()
+        },
     };
     match path {
         QuickstartPath::Install => {
@@ -1365,6 +1389,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 label,
                 bundle,
                 runner_image,
+                bound,
             } => {
                 let dir = match bundle {
                     None => {
@@ -1396,8 +1421,12 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     agent,
                     label.as_deref(),
                     &dir,
+                    bound,
                 ) {
                     lines.push(format!("curie {}", args.join(" ")));
+                }
+                for repo in bound {
+                    lines.push(skip_bound_line(agent, repo));
                 }
                 lines.push(format!(
                     "curie cluster overrides {agent} --context {context} --namespace {namespace} --release {release} --execution-deadline {deadline_seconds}"
@@ -1412,6 +1441,11 @@ pub fn describe(planned: &Planned) -> Vec<String> {
         }
     }
     lines
+}
+
+/// The plan line for a repository whose binding is already in place.
+pub fn skip_bound_line(agent: &str, repo: &str) -> String {
+    format!("skip binding github={repo}: agent {agent} already holds it under the requested label")
 }
 
 pub fn plan_touches_forbidden_tool(lines: &[String]) -> Option<String> {
@@ -2467,6 +2501,7 @@ mod tests {
             DEFAULT_AGENT,
             None,
             &bundle_dir("ns", "rel", DEFAULT_AGENT),
+            &[],
         );
         assert_eq!(argvs.len(), 3, "{argvs:?}");
         assert_eq!(&argvs[0][..2], ["cluster", "deploy"]);
@@ -2519,7 +2554,8 @@ mod tests {
                 &repos[..1],
                 DEFAULT_AGENT,
                 None,
-                &bundle_dir("ns", "rel", DEFAULT_AGENT)
+                &bundle_dir("ns", "rel", DEFAULT_AGENT),
+                &[]
             )
             .len(),
             2
@@ -2824,17 +2860,71 @@ mod tests {
             "acme/widgets",
             Some("curie-factory-fast"),
         )];
+        let skip = skip_bound_line("dark-factory-fast", "acme/widgets");
         let text = plan_text(&input);
-        assert!(
-            text.contains("--add github=acme/widgets --label curie-factory-fast"),
-            "{text}"
-        );
-        // An own null binding equals an explicit install label.
+        assert!(!text.contains("--add github=acme/widgets"), "{text}");
+        assert!(text.contains(&skip), "{text}");
+        // An own null binding equals an explicit install label: the plan
+        // still deploys and never POSTs the label the API would refuse.
         input.bindings = vec![binding("dark-factory-fast", "acme/widgets", None)];
         input.label = Some("curie-factory".into());
-        quickstart_plan(&input).unwrap();
+        let planned = quickstart_plan(&input).unwrap();
+        let Some(Action::Deploy {
+            context,
+            namespace,
+            release,
+            repos,
+            agent,
+            label,
+            bound,
+            ..
+        }) = planned
+            .actions
+            .iter()
+            .find(|action| matches!(action, Action::Deploy { .. }))
+        else {
+            panic!("no deploy action: {:?}", planned.actions);
+        };
+        assert_eq!(bound, &["acme/widgets".to_string()]);
+        let argvs = deploy_args(
+            context,
+            namespace,
+            release,
+            repos,
+            agent,
+            label.as_deref(),
+            Path::new("/bundle"),
+            bound,
+        );
+        assert_eq!(argvs.len(), 1, "{argvs:?}");
+        assert_eq!(&argvs[0][..2], ["cluster", "deploy"]);
+        let text = describe(&planned).join("\n");
+        assert!(text.contains("cluster deploy"), "{text}");
+        assert!(
+            !text.contains("cluster surfaces dark-factory-fast"),
+            "{text}"
+        );
+        assert!(text.contains(&skip), "{text}");
         input.label = None;
-        quickstart_plan(&input).unwrap();
+        let text = plan_text(&input);
+        assert!(!text.contains("--add github=acme/widgets"), "{text}");
+        assert!(text.contains(&skip), "{text}");
+        // Liveness: only the held repository is skipped; a new one still binds.
+        let mut wider = add_input();
+        wider.repos = vec!["acme/widgets".into(), "acme/other".into()];
+        wider.recorded.as_mut().unwrap().repo_allowlist = wider.repos.clone();
+        wider.bindings = vec![binding(
+            "dark-factory-fast",
+            "acme/widgets",
+            Some("curie-factory-fast"),
+        )];
+        let text = plan_text(&wider);
+        assert!(!text.contains("--add github=acme/widgets"), "{text}");
+        assert!(
+            text.contains("--add github=acme/other --label curie-factory-fast"),
+            "{text}"
+        );
+        assert!(text.contains(&skip), "{text}");
     }
 
     #[test]
@@ -3118,12 +3208,22 @@ mod tests {
             }
             assert_eq!(recorded_intake(&broken), None, "{pointer}");
         }
-        // The legacy api.github* keys are not the record.
-        let legacy = serde_json::json!({"api": {
-            "githubFactoryIngressEnabled": true, "githubFactoryIntake": "poll",
-            "githubAppId": "12345", "githubFactoryLabel": "curie-factory",
+        // The removed api.* factory keys are not the record. Their names come
+        // from the chart's guard file, the only place allowed to spell them.
+        let mut api = serde_json::json!({
+            "githubAppId": "12345",
             "githubAppExistingSecret": "factory-app"
-        }});
+        });
+        let removed: Vec<&str> =
+            include_str!("../../../charts/curie/files/legacy-factory-keys.yaml")
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("- api."))
+                .collect();
+        assert!(removed.len() >= 3, "{removed:?}");
+        for key in removed {
+            api[key] = serde_json::json!(true);
+        }
+        let legacy = serde_json::json!({ "api": api });
         assert_eq!(recorded_intake(&legacy), None);
     }
 }

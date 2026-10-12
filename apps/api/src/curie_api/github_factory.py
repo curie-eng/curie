@@ -39,7 +39,7 @@ from .forges.github.binding import (
 )
 from .forges.github.comments import static_token
 from .forges.github.identity import delivery_uuid
-from .forges.github.tracker import GitHubTracker, last_label_event
+from .forges.github.tracker import GitHubTracker, IssueFacts, last_label_event
 from .forges.hosts import (
     factory_code_host,
     factory_code_host_entry,
@@ -161,6 +161,37 @@ async def verify_current(
     registry = forges_registry(settings)
     tracker = await _tracker(notice, registry=registry, client=client)
     facts = await tracker.verify_notice(notice)
+    return _verified(notice, registry, client, tracker, facts)
+
+
+async def verify_polled(
+    notice: FactoryNotice,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    tracker: GitHubTracker,
+    repository: Any,
+) -> VerifiedIssue:
+    """`verify_current` for a notice a poll pass built.
+
+    The pass already minted its repository's installation token and read the
+    repository once (#4361 decision 14), so the notice is confirmed with that
+    ``tracker`` and against that ``repository`` object; only the issue is
+    re-read, for the labels admission and cancellation judge.
+    """
+
+    registry = forges_registry(settings)
+    facts = await tracker.verify_issue(notice, repository)
+    return _verified(notice, registry, client, tracker, facts)
+
+
+def _verified(
+    notice: FactoryNotice,
+    registry: ForgeRegistry,
+    client: httpx.AsyncClient,
+    tracker: GitHubTracker,
+    facts: IssueFacts,
+) -> VerifiedIssue:
     return VerifiedIssue(
         labels=facts.labels,
         default_branch=facts.default_branch,
@@ -312,22 +343,18 @@ async def _fresh_base(
     return resolved
 
 
-async def admitting_label(
-    session: AsyncSession, registry: ForgeRegistry, item: WorkItem
-) -> str | None:
+def admitting_label(registry: ForgeRegistry, item: WorkItem) -> str | None:
     """The label whose removal cancels ``item`` (#4361 decision 10).
 
-    The label stored when it was admitted or last readmitted. A WorkItem
-    admitted before that was stored compares with its agent's GitHub surface on
-    the repository when it still holds one, else with the configured GitHub
-    tracker label. Never resolves a binding by label (ADR 0161).
+    The label stored when it was admitted or last readmitted. A WorkItem with
+    no stored label predates the column, when the configured GitHub tracker
+    label was the only install label, so it compares with that alone. Never
+    consults a binding: a removed or moved surface cannot change what cancels
+    the run (ADR 0161).
     """
 
     if item.trigger_label is not None:
         return item.trigger_label
-    binding = await agent_binding(session, item.agent_id, item.repository_path)
-    if binding is not None:
-        return effective_trigger_label(binding, registry)
     tracker = registry.github_tracker()
     return None if tracker is None else tracker.config.label
 
@@ -358,19 +385,14 @@ async def _refuse_label_admission(
     Returns the labels the repository's surfaces serve.
 
     1. ``work_item_other_agent``: the issue's WorkItem, cancelled or not,
-       belongs to another agent that still serves the repository; its
-       conversation and PR lineage stay there. When that agent no longer
-       serves it (its surface moved), dispatch refuses ``identity_mismatch``.
+       belongs to another agent, whether or not that agent still serves the
+       repository; its conversation and PR lineage stay there.
     2. ``label_conflict``: the issue carries two or more labels bound on the
        repository. A run already admitted is not touched.
     """
 
-    if (
-        existing is not None
-        and existing.agent_id != binding.agent_id
-        and await agent_binding(session, existing.agent_id, notice.repo_full_name) is not None
-    ):
-        owner = await admitting_label(session, registry, existing)
+    if existing is not None and existing.agent_id != binding.agent_id:
+        owner = admitting_label(registry, existing)
         await _comment_label_refusal(
             verified.tracker,
             notice.issue_number,
@@ -524,9 +546,7 @@ async def cancel_notice(
         raise FactoryRefused("identity_mismatch")
     # Closing cancels whatever label admitted it; removing a label cancels
     # only when it is the label that admitted it (#4361 decision 10).
-    if notice.action == "unlabeled" and notice.label != await admitting_label(
-        session, registry, item
-    ):
+    if notice.action == "unlabeled" and notice.label != admitting_label(registry, item):
         return ignored("label_not_admitting")
     result = await workitem_dispatch.cancel(
         session, work_item_id=item.id, expected_version=item.version

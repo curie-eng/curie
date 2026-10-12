@@ -190,11 +190,15 @@ def test_a_relabel_during_a_running_execution_keeps_its_base_until_the_replaceme
     assert after["base_label_ignored"] is None
 
 
-def test_a_readmission_refused_for_identity_mismatch_leaves_the_base_unchanged(
+def test_a_readmission_refused_for_another_agent_leaves_the_base_unchanged(
     admitted: Any,  # noqa: F811
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """The issue's WorkItem stays its agent's after that agent's surface moves
+    off the repository, so the new agent's readmission is refused at admission
+    with ``work_item_other_agent`` (#4361 decision 9) and the base is kept."""
+
     client, github, _sink = admitted
     _train(monkeypatch, tmp_path, client)
     number = 30962
@@ -224,7 +228,9 @@ def test_a_readmission_refused_for_identity_mismatch_leaves_the_base_unchanged(
 
     refused = _labelled(client, github, number, "base:next")
 
-    assert _code(refused) == "identity_mismatch"
+    assert _code(refused) == "work_item_other_agent"
+    (comment,) = github.issue_comments[number]
+    assert "another agent's" in comment["body"], comment["body"]
     after = _item(number)
     assert after["agent_id"] == before["agent_id"]
     assert (

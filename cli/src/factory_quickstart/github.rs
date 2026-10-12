@@ -426,6 +426,13 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     if let (Some(dir), true) = (&opts.plugin_dir, targeted.is_some()) {
         crate::cluster_secrets::check_layered_runner_base(&common, dir).await?;
     }
+    // The add agent path's first mutation is the egress bind, so its
+    // published layer is rendered and checked here, before it. The install
+    // path renders inside intake, ahead of that path's first release write.
+    let mut rendered_image = None;
+    if let (QuickstartPath::AddAgent, None) = (planned.path, &opts.plugin_dir) {
+        rendered_image = Some(render_and_check(&common, &opts.agent).await?);
+    }
     if let (QuickstartPath::AddAgent, Some(recorded)) = (planned.path, &recorded) {
         app = Some(recorded_app(&common, recorded, &opts.repos).await?);
     }
@@ -435,6 +442,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         release_has_real_model,
         app.as_ref(),
         install_label,
+        rendered_image,
     )
     .await
 }
@@ -488,6 +496,7 @@ async fn execute(
     mut release_has_real_model: bool,
     app: Option<&crate::factory_toolchain::AppPreflight>,
     install_label: Option<String>,
+    mut rendered_image: Option<String>,
 ) -> Result<QuickstartOutput> {
     crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
     if planned.skipped_cluster_up {
@@ -496,7 +505,6 @@ async fn execute(
     let mut prompted = false;
     let mut prompted_model = None;
     let mut intake_json = serde_json::Value::Null;
-    let mut rendered_image: Option<String> = None;
     let mut credit_remaining_usd = None;
     for action in &planned.actions {
         if matches!(action, Action::Deploy { .. }) {
@@ -632,6 +640,7 @@ async fn execute(
                 label,
                 bundle,
                 runner_image,
+                bound,
             } => {
                 let (dir, image) = match bundle {
                     Some(dir) => (dir.clone(), runner_image.clone()),
@@ -662,6 +671,7 @@ async fn execute(
                     agent,
                     label.as_deref(),
                     &dir,
+                    bound,
                 )
                 .into_iter()
                 .enumerate()
@@ -674,6 +684,9 @@ async fn execute(
                         "Binding GitHub repository".to_string()
                     };
                     run_self(&args, &step).await?;
+                }
+                for repo in bound {
+                    crate::ui::ui().note(&skip_bound_line(agent, repo));
                 }
                 run_self(
                     &cluster_agent(
@@ -814,7 +827,9 @@ pub fn intake_args(context: &str, intake: &FactoryIntakeOpts, image: &str) -> Ve
 /// The deploy argvs, in order: `cluster deploy` of `bundle` as `agent` with the
 /// first repository as its git-flow repository, then one GitHub surface
 /// binding per repository, carrying `--label` when set, so the one agent
-/// serves each.
+/// serves each. A repository in `bound` already carries this agent's binding
+/// under the requested label and gets no `surfaces --add`.
+#[allow(clippy::too_many_arguments)]
 pub fn deploy_args(
     context: &str,
     namespace: &str,
@@ -823,6 +838,7 @@ pub fn deploy_args(
     agent: &str,
     label: Option<&str>,
     bundle: &Path,
+    bound: &[String],
 ) -> Vec<Vec<String>> {
     let first = repos.first().cloned().unwrap_or_default();
     let mut argvs = vec![vec![
@@ -843,7 +859,7 @@ pub fn deploy_args(
         "--repo".into(),
         first,
     ]];
-    for repo in repos {
+    for repo in repos.iter().filter(|repo| !bound.contains(repo)) {
         let mut extra = vec!["--add".into(), format!("github={repo}")];
         if let Some(label) = label {
             extra.extend(["--label".into(), label.into()]);

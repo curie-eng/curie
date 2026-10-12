@@ -324,9 +324,10 @@ fn trigger_label_list_shows_label_in_human_and_json() {
             .iter()
             .find(|s| s["address"] == OTHER_REPO)
             .expect("the unlabelled surface");
-        assert!(
-            plain.get("trigger_label").is_none_or(|v| v.is_null()),
-            "{tier}: an unlabelled surface carries no label: {value}"
+        assert_eq!(
+            plain.get("trigger_label"),
+            Some(&serde_json::Value::Null),
+            "{tier}: an unlabelled surface carries trigger_label null: {value}"
         );
         assert!(
             server.recorded().iter().all(|r| r.method == "GET"),

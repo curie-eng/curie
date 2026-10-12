@@ -368,11 +368,22 @@ publications = [
 if "publication" in spec:
     if len(publications) != 1:
         fail(f"expected one publication egress NetworkPolicy, got {[p['metadata']['name'] for p in publications]}")
-    got, _ = ip_rules(publications[0])
-    want = expand(spec["publication"])
+    got, excepts = ip_rules(publications[0])
+    pub = spec["publication"]
+    if not isinstance(pub, dict):
+        pub = {"pairs": pub}
+    want = expand(pub["pairs"])
     if got != want:
         fail(f"publication egress: missing {sorted(want - got)}, unexpected {sorted(got - want)}")
-    print(f"  ok [{label}]: publication Job egress is exactly {len(want)} (cidr, port) pairs")
+    # The publication Job carves exactly what the sandbox policy carves
+    # (curie.egress.ipBlockExcept): an entry's own except plus private ranges.
+    for cidr, needed in (pub.get("excepts") or {}).items():
+        if set(excepts.get(cidr, [])) != set(needed):
+            fail(f"publication {cidr} must except exactly {sorted(needed)}, got {excepts.get(cidr)}")
+    for cidr, carved in excepts.items():
+        if carved and cidr not in (pub.get("excepts") or {}):
+            fail(f"publication {cidr} has unexpected excepts {carved}")
+    print(f"  ok [{label}]: publication Job egress is exactly {len(want)} (cidr, port) pairs with their excepts")
 
 forge_policies = {
     d["metadata"]["name"]: d for d in docs
@@ -438,6 +449,13 @@ egress "sandboxEgress, github entries with no egress" \
 egress "operator egress on code host and tracker" \
   '{"publication": [["10.20.0.5/32", 8443]], "sandbox": {"dark-factory": {"pairs": [["10.20.0.5/32", 8443], ["172.0.0.0/8", 443]], "excepts": {"172.0.0.0/8": ["172.16.0.0/12"]}}}}' \
   -f "$WORK/egress.yaml" "${SANDBOX[@]}" --set 'factory.sandboxEgress.dark-factory=true'
+# A broad code host route keeps its operator except and gains the private
+# carve-out on the publication Job policy exactly as on the sandbox policy.
+egress "code host egress with an operator except" \
+  '{"publication": {"pairs": [["172.0.0.0/8", 443]], "excepts": {"172.0.0.0/8": ["172.99.0.0/16", "172.16.0.0/12"]}}, "sandbox": {"dark-factory": {"pairs": [["172.0.0.0/8", 443]], "excepts": {"172.0.0.0/8": ["172.99.0.0/16", "172.16.0.0/12"]}}}}' \
+  -f "$WORK/egress.yaml" "${SANDBOX[@]}" --set 'factory.sandboxEgress.dark-factory=true' \
+  --set-json 'factory.codeHosts[0].egress=[{"cidr":"172.0.0.0/8","ports":[{"protocol":"TCP","port":443}],"except":["172.99.0.0/16"]}]' \
+  --set-json 'factory.trackers[0].egress=[{"cidr":"172.0.0.0/8","ports":[{"protocol":"TCP","port":443}],"except":["172.99.0.0/16"]}]'
 # The egress fields are chart-only: CURIE_FORGES still carries no egress or host.
 render -f "$WORK/egress.yaml" | check factory
 # Two agents get one policy each; an agent set to false gets none.

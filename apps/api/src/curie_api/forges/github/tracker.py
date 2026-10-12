@@ -742,14 +742,24 @@ class GitHubTracker:
         delivery audit records, exactly as the intake always has.
         """
 
-        token = await self._token()
         repository = await get_github_json(
             self._client,
             api=self._api,
-            token=token,
+            token=await self._token(),
             path=self._repo_path,
             refusal="repository_unavailable",
         )
+        return await self.verify_issue(notice, repository)
+
+    async def verify_issue(self, notice: FactoryNotice, repository: Any) -> IssueFacts:
+        """`verify_notice` against a repository object already read.
+
+        A poll pass reads its repository once (#4361 decision 14) and confirms
+        each notice against that read; the issue is always re-read here,
+        since its labels decide admission and cancellation.
+        """
+
+        token = await self._token()
         if not repository_identity_matches(
             repository,
             repository_id=notice.repository_id,

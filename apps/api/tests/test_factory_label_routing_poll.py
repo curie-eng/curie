@@ -33,6 +33,7 @@ from test_factory_label_routing import (  # noqa: E402
     FAST,
     INSTALL,
     LabelFactory,
+    _cancelled,
     _owner,
     label_factory,
 )
@@ -62,12 +63,15 @@ def _cursor_etags() -> dict[str, Any]:
 
 
 def _seed_pre_label_cursor() -> None:
-    """The cursor a release before #4361 left: one ``issues`` key."""
+    """The cursor a release before #4361 left: one ``issues`` key, in place of
+    any keys an earlier pass stored."""
 
     _execute(
         "INSERT INTO curie.factory_poll_cursors "
         "(tracker_kind, tracker_host, tracker_scope_id, scope_path, etags, updated_at) "
-        "VALUES ('github', 'github.com', :scope, :path, CAST(:etags AS jsonb), now())",
+        "VALUES ('github', 'github.com', :scope, :path, CAST(:etags AS jsonb), now()) "
+        "ON CONFLICT (tracker_kind, tracker_host, tracker_scope_id) "
+        "DO UPDATE SET etags = EXCLUDED.etags",
         {"scope": str(REPO_ID), "path": REPO, "etags": '{"issues": "\\"pre-4361\\""}'},
     )
 
@@ -90,17 +94,55 @@ def _reconcile(factory: LabelFactory) -> None:
     asyncio.run(go())
 
 
+def _count_token_mints(factory: LabelFactory) -> list[str]:
+    """Record every installation token the App credentials hand out."""
+
+    from curie_api.github_app import GitHubCredentials
+
+    mints: list[str] = []
+    for name in ("fresh_installation_token", "token_for_verified_installation", "token_for"):
+        original = getattr(GitHubCredentials, name)
+
+        def counted(self: Any, *args: Any, _name: str = name, _original: Any = original) -> Any:
+            mints.append(_name)
+            return _original(self, *args)
+
+        factory.monkeypatch.setattr(GitHubCredentials, name, counted)
+    return mints
+
+
 def test_label_routing_poll_one_pass_reads_the_repository_once_and_lists_each_label(
     factory: LabelFactory,
 ) -> None:
-    factory.two_agents()
+    """R1 finding 7: with an actionable issue under each label and a run to
+    cancel, the pass still reads the repository once and mints one token; each
+    notice re-reads only its issue."""
+
+    full, fast = factory.two_agents()
+    cancelled = factory.github.open_issue(INSTALL)
+    factory.poll()
+    assert _owner(cancelled) == full
+    factory.github.unlabel(cancelled, INSTALL)
+    first = factory.github.open_issue(INSTALL)
+    second = factory.github.open_issue(FAST)
     _seed_pre_label_cursor()
     factory.github.calls.clear()
+    mints = _count_token_mints(factory)
 
     factory.poll()
 
     github = factory.github
+    assert _owner(first) == full
+    assert _owner(second) == fast
+    assert _cancelled(cancelled)
     assert len(_get(github, f"/repos/{REPO}")) == 1, [r.url.path for r in github.calls]
+    # One tracker token for the pass; no notice mints its own. Each fresh
+    # admission's base branch read goes through the code host connection and
+    # its own credential (`token_for`), which is not the pass's tracker token.
+    assert mints.count("fresh_installation_token") == 1, mints
+    assert "token_for_verified_installation" not in mints, mints
+    for number in (first, second, cancelled):
+        assert _get(github, f"/repos/{REPO}/issues/{number}"), number
     listings = github.listings()
     assert sorted(r.url.params.get("labels") for r in listings) == sorted([INSTALL, FAST])
     # The first pass after the switch lists each label unconditionally; the
@@ -167,6 +209,7 @@ def test_label_routing_poll_reconciler_walks_both_labels(factory: LabelFactory) 
     first = factory.github.open_issue(INSTALL, age=_OLD)
     second = factory.github.open_issue(FAST, age=_OLD)
     factory.github.calls.clear()
+    mints = _count_token_mints(factory)
 
     _reconcile(factory)
 
@@ -175,6 +218,14 @@ def test_label_routing_poll_reconciler_walks_both_labels(factory: LabelFactory) 
     )
     assert _owner(first) == full
     assert _owner(second) == fast
+    # Decision 14 holds for the reconciler too: its admissions reuse the pass's
+    # one repository read and token, and re-read only their issue.
+    github = factory.github
+    assert len(_get(github, f"/repos/{REPO}")) == 1, [r.url.path for r in github.calls]
+    assert mints.count("fresh_installation_token") == 1, mints
+    assert "token_for_verified_installation" not in mints, mints
+    for number in (first, second):
+        assert _get(github, f"/repos/{REPO}/issues/{number}"), number
 
 
 def test_label_routing_poll_skips_a_repository_outside_the_allowlist(

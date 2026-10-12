@@ -2275,23 +2275,31 @@ not already listed is appended. A narrow entry equal to or inside a private
 range gets no private except, which is the re-allow path for a private peer.
 See those helpers for the containment/family rules.
 */}}
+{{/* The except list of one egress entry as JSON: its own `except`, else the
+     metadata carve-out, plus every private range its CIDR strictly contains.
+     Args: dict "entry" "root". Shared by ipBlockRules and the publication Job
+     policy so both carve the same ranges. */}}
+{{- define "curie.egress.ipBlockExcept" -}}
+{{- $excepts := list }}
+{{- if .entry.except }}
+{{- $excepts = .entry.except }}
+{{- else }}
+{{- $excepts = without (splitList "," (include "curie.metadataExcept" .entry.cidr | trim)) "" }}
+{{- end }}
+{{- range without (splitList "," (include "curie.privateExcept" (dict "cidr" .entry.cidr "root" .root) | trim)) "" }}
+{{- if not (has . $excepts) }}
+{{- $excepts = append $excepts . }}
+{{- end }}
+{{- end }}
+{{- toJson $excepts }}
+{{- end -}}
 {{- define "curie.egress.ipBlockRules" -}}
 {{- $root := .root }}
 {{- range .entries }}
 - to:
     - ipBlock:
         cidr: {{ .cidr }}
-        {{- $excepts := list }}
-        {{- if .except }}
-        {{- $excepts = .except }}
-        {{- else }}
-        {{- $excepts = without (splitList "," (include "curie.metadataExcept" .cidr | trim)) "" }}
-        {{- end }}
-        {{- range without (splitList "," (include "curie.privateExcept" (dict "cidr" .cidr "root" $root) | trim)) "" }}
-        {{- if not (has . $excepts) }}
-        {{- $excepts = append $excepts . }}
-        {{- end }}
-        {{- end }}
+        {{- $excepts := include "curie.egress.ipBlockExcept" (dict "entry" . "root" $root) | fromJsonArray }}
         {{- if $excepts }}
         except:
           {{- toYaml $excepts | nindent 10 }}

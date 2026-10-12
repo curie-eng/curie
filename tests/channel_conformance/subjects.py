@@ -713,7 +713,7 @@ class GitHubSubject(_KernelEgressSubject):
                 "issue_comment",
                 payload,
                 str(uuid.uuid4()),
-                label="factory",
+                labels={"factory"},
                 mention=_GITHUB_MENTION,
             )
             kind, address, conversation_id = github_reply_route(

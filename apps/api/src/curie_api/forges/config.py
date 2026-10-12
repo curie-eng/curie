@@ -492,6 +492,7 @@ class ForgesConfig(_Model):
                 )
             scopes[scope] = binding.name
             _check_binding(binding, tracker, code_hosts)
+        _check_one_github_app(self.trackers, self.code_hosts)
         return self
 
     def tracker(self, name: str) -> TrackerConfig:
@@ -499,6 +500,35 @@ class ForgesConfig(_Model):
 
     def code_host(self, name: str) -> CodeHostConfig:
         return next(host for host in self.code_hosts if host.name == name)
+
+
+def _check_one_github_app(
+    trackers: tuple[TrackerConfig, ...], code_hosts: tuple[CodeHostConfig, ...]
+) -> None:
+    """A GitHub tracker and a GitHub code host on one host act as one App.
+
+    The factory recognizes its own issue and pull request comments by the App
+    that wrote them, so two App ids on one host would make each side's marked
+    comments look foreign to the other and break their dedupe.
+    """
+
+    for tracker in trackers:
+        if tracker.kind != types.GITHUB or not isinstance(
+            tracker.credential, GitHubAppCredentialConfig
+        ):
+            continue
+        for host in code_hosts:
+            if (
+                host.kind == types.GITHUB
+                and host.host == tracker.host
+                and isinstance(host.credential, GitHubAppCredentialConfig)
+                and host.credential.app_id != tracker.credential.app_id
+            ):
+                raise ValueError(
+                    f"tracker {tracker.name!r} (GitHub App {tracker.credential.app_id}) and"
+                    f" code host {host.name!r} (GitHub App {host.credential.app_id}) are both"
+                    f" on {tracker.host} and must use the same GitHub App"
+                )
 
 
 def _check_binding(

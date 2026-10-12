@@ -269,6 +269,35 @@ class LabelFactory:
         )
         assert removed.status_code == 204, removed.text
 
+    def move_off(self, agent_id: str) -> None:
+        """Move the agent's GitHub surface off the repository, onto a Slack
+        channel, so the agent keeps a binding but no surface on it."""
+
+        moved = self.client.patch(
+            f"/agents/{agent_id}/channels",
+            headers=self.headers(),
+            params={"kind": "github", "address": REPO},
+            json={"kind": "slack", "address": f"C0{uuid.uuid4().hex[:8].upper()}"},
+        )
+        assert moved.status_code == 200, moved.text
+
+    def change_owner_surface(self, agent_id: str, change: str) -> None:
+        """Take the agent's surface off the repository: ``removed`` deletes it,
+        ``moved`` moves it to another location, and ``relabelled`` removes it
+        and binds the repository again under the fast label."""
+
+        if change == "moved":
+            self.move_off(agent_id)
+            return
+        self.unbind(agent_id)
+        if change == "relabelled":
+            added = self.client.post(
+                f"/agents/{agent_id}/channels",
+                headers=self.headers(),
+                json={"kind": "github", "address": REPO, "trigger_label": FAST},
+            )
+            assert added.status_code == 201, added.text
+
     # Intake doors ---------------------------------------------------------------
 
     def poll(self) -> None:
@@ -519,6 +548,34 @@ def test_label_routing_another_agents_label_after_cancellation_is_still_refused(
     _admitted(factory.labelled(intake, number, INSTALL))
     assert _owner(number) == full
     assert not _cancelled(number)
+
+
+@pytest.mark.parametrize("intake", INTAKES)
+@pytest.mark.parametrize("change", ["removed", "moved"])
+def test_label_routing_another_agents_label_is_refused_after_the_owner_left(
+    factory: LabelFactory, intake: str, change: str
+) -> None:
+    """R1 finding 6: the WorkItem belongs to its agent whether or not that
+    agent still has a surface on the repository, so another agent's label is
+    refused with the marked comment, never admitted and never left to a
+    dispatch ``identity_mismatch``."""
+
+    full = factory.agent_with_spare_binding()
+    fast = factory.agent({"kind": "github", "address": REPO, "trigger_label": FAST})
+    number = _admit(factory, intake, INSTALL)
+    requests = _requests(number)
+    factory.change_owner_surface(full, change)
+
+    refused = factory.labelled(intake, number, FAST)
+
+    _refused(refused, "work_item_other_agent")
+    assert _owner(number) == full != fast
+    assert _requests(number) == requests
+    (comment,) = _refusal_comments(factory.github, number)
+    assert _names_both(comment["body"]), comment["body"]
+    # Liveness: the fast agent's label still admits a new issue.
+    fresh, _response = factory.opened(intake, FAST)
+    assert _owner(fresh) == fast
 
 
 # --- AC 4.4: removing one agent's label ---------------------------------------------
@@ -821,40 +878,48 @@ def _forget_stored_label(number: int) -> None:
 
 
 @pytest.mark.parametrize("intake", INTAKES)
-def test_label_routing_null_row_uses_binding_effective_label(
-    factory: LabelFactory, intake: str
+@pytest.mark.parametrize("change", ["removed", "moved", "relabelled"])
+def test_label_routing_null_row_cancels_under_the_tracker_label_whatever_the_binding(
+    factory: LabelFactory, intake: str, change: str
 ) -> None:
-    """A pre-migration WorkItem compares the removed label with its agent's
-    binding's effective label: ``curie-factory-fast`` here, not the tracker's."""
+    """R1 finding 5: a WorkItem with no stored label predates the column, when
+    the tracker label was the only install label, so removing that label
+    cancels it however its agent's surface changed since. ``relabelled`` binds
+    the repository again under the fast label, which a binding lookup would
+    have compared with instead."""
 
-    agent_id = factory.agent({"kind": "github", "address": REPO, "trigger_label": FAST})
-    number = _admit(factory, intake, FAST)
+    agent_id = factory.agent_with_spare_binding()
+    number = _admit(factory, intake, INSTALL)
     _forget_stored_label(number)
-    factory.github.label(number, INSTALL)
+    factory.change_owner_surface(agent_id, change)
 
-    ignored = factory.unlabelled(intake, number, INSTALL)
+    removed = factory.unlabelled(intake, number, INSTALL)
 
-    if ignored is not None:
-        assert _code(ignored) in {"label_not_admitting", "unrelated_label"}, ignored.text
-    assert not _cancelled(number)
-
-    factory.unlabelled(intake, number, FAST)
-
+    if removed is not None:
+        assert removed.json()["status"] == "factory_cancelled", removed.text
     assert _cancelled(number)
     assert _owner(number) == agent_id
 
 
 @pytest.mark.parametrize("intake", INTAKES)
-def test_label_routing_null_row_without_binding_uses_tracker_label(
+def test_label_routing_null_row_is_not_cancelled_by_the_bindings_label(
     factory: LabelFactory, intake: str
 ) -> None:
+    """The negative twin: with its agent's surface rebound under the fast
+    label, removing the fast label from a NULL row's issue does not cancel it."""
+
     agent_id = factory.agent_with_spare_binding()
     number = _admit(factory, intake, INSTALL)
     _forget_stored_label(number)
-    factory.unbind(agent_id)
+    factory.change_owner_surface(agent_id, "relabelled")
+    factory.github.label(number, FAST)
 
+    ignored = factory.unlabelled(intake, number, FAST)
+
+    if ignored is not None:
+        assert _code(ignored) == "label_not_admitting", ignored.text
+    assert not _cancelled(number)
     factory.unlabelled(intake, number, INSTALL)
-
     assert _cancelled(number)
 
 

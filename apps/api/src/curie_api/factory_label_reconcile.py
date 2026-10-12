@@ -145,7 +145,7 @@ async def _reconcile_repository(
             label=label,
         )
         admitted += await _reconcile_label(
-            sessionmaker, settings, client, tracker, installation_id, now
+            sessionmaker, settings, client, tracker, installation_id, now, repository
         )
     return admitted
 
@@ -157,8 +157,13 @@ async def _reconcile_label(
     tracker: GitHubTracker,
     installation_id: int,
     now: datetime,
+    repository: dict[str, Any],
 ) -> int:
-    """Admit the open issues carrying ``tracker.label`` that have no WorkItem."""
+    """Admit the open issues carrying ``tracker.label`` that have no WorkItem.
+
+    Each admission is confirmed with the pass's ``tracker`` and against its one
+    ``repository`` read (#4361 decision 14); only the issue is re-read.
+    """
 
     repo, repository_id, label = tracker.repo_full_name, tracker.repository_id, tracker.label
     issues, _etag = await tracker.labeled_open_issues(None)
@@ -215,7 +220,7 @@ async def _reconcile_label(
             sender_login,
             label=label,
         )
-        if await _admit(sessionmaker, settings, client, notice):
+        if await _admit(sessionmaker, settings, client, notice, tracker, repository):
             admitted += 1
     return admitted
 
@@ -225,6 +230,8 @@ async def _admit(
     settings: Settings,
     client: httpx.AsyncClient,
     notice: FactoryNotice,
+    tracker: GitHubTracker,
+    repository: dict[str, Any],
 ) -> bool:
     async with sessionmaker() as session:
         try:
@@ -234,7 +241,13 @@ async def _admit(
             if await github_factory.work_item_for(session, issue) is not None:
                 await session.rollback()
                 return False
-            verified = await github_factory.verify_current(notice, settings=settings, client=client)
+            verified = await github_factory.verify_polled(
+                notice,
+                settings=settings,
+                client=client,
+                tracker=tracker,
+                repository=repository,
+            )
             outcome = await github_factory.admit_notice(session, notice, settings, verified)
         except (FeedbackUnavailable, FeedbackIgnored) as exc:
             await session.rollback()

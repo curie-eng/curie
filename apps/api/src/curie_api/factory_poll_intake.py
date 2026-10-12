@@ -234,6 +234,7 @@ async def _poll_repository(
                 label=label,
             ),
             installation_id=installation_id,
+            repository=repository,
         )
     await _cancel_stale(
         sessionmaker,
@@ -242,6 +243,7 @@ async def _poll_repository(
         cursor,
         tracker,
         installation_id=installation_id,
+        repository=repository,
     )
     if not serves:
         await _save_cursor(sessionmaker, scope, cursor)
@@ -257,6 +259,7 @@ async def _poll_repository(
         token=token,
         repo_path=repo_path,
         installation_id=installation_id,
+        repository=repository,
     )
     owned = await open_pulls(
         sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
@@ -299,6 +302,7 @@ async def _admit_labeled(
     tracker: GitHubTracker,
     *,
     installation_id: int,
+    repository: dict[str, Any],
 ) -> None:
     label = tracker.label
     key = f"issues:{label}"
@@ -340,7 +344,7 @@ async def _admit_labeled(
                 # Later base labels only report disagreement with the frozen base.
                 # Reusing the admission here would cancel or replace the live run.
                 notice = replace(notice, disposition="base_label")
-            await _apply_notice(sessionmaker, settings, client, notice)
+            await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
         except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
             deferred = True
             logger.info("factory labeled issue poll for %s issue %s deferred", repo, number)
@@ -356,6 +360,7 @@ async def _cancel_stale(
     tracker: GitHubTracker,
     *,
     installation_id: int,
+    repository: dict[str, Any],
 ) -> None:
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
     registry = forges_registry(settings)
@@ -371,7 +376,7 @@ async def _cancel_stale(
         # Each WorkItem against the label that admitted it (#4361 decision 10).
         admitting: dict[int, str] = {}
         for item in items:
-            label = await github_factory.admitting_label(session, registry, item)
+            label = github_factory.admitting_label(registry, item)
             if label is not None:
                 admitting[int(item.tracker_issue_id)] = label
     keys = {f"issue:{number}:{label}" for number, label in admitting.items()}
@@ -419,7 +424,7 @@ async def _cancel_stale(
                 sender_login,
                 label=label,
             )
-            await _apply_notice(sessionmaker, settings, client, notice)
+            await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
         except (Unavailable, FeedbackUnavailable, FeedbackIgnored):
             logger.info("factory stale issue poll for %s issue %s deferred", repo, number)
 
@@ -456,6 +461,7 @@ async def _admit_mentions(
     token: str,
     repo_path: str,
     installation_id: int,
+    repository: dict[str, Any],
 ) -> None:
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
     listed, etag = await tracker.issue_comments_since(
@@ -525,7 +531,7 @@ async def _admit_mentions(
             comment_id=comment_id,
             comment_body=body,
         )
-        await _apply_notice(sessionmaker, settings, client, notice)
+        await _apply_notice(sessionmaker, settings, client, notice, tracker, repository)
     cursor.comments_since = advance(cursor.comments_since, listed, "created_at", "updated_at")
     if etag:
         cursor.etags["issue-comments"] = etag
@@ -536,14 +542,23 @@ async def _apply_notice(
     settings: Settings,
     client: httpx.AsyncClient,
     notice: FactoryNotice,
+    tracker: GitHubTracker,
+    repository: dict[str, Any],
 ) -> None:
+    """Apply one polled notice, confirmed with the pass's token and against
+    its one repository read (#4361 decision 14)."""
+
     async with sessionmaker() as session:
         try:
             await github_factory.lock_issue(
                 session, github_factory.notice_issue(notice, forges_registry(settings))
             )
-            verified = await github_factory.verify_current(
-                notice, settings=settings, client=client
+            verified = await github_factory.verify_polled(
+                notice,
+                settings=settings,
+                client=client,
+                tracker=tracker,
+                repository=repository,
             )
             if notice.disposition == "cancel":
                 await github_factory.cancel_notice(session, notice, settings)

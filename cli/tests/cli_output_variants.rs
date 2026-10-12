@@ -447,6 +447,22 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                         allowed_callers: None,
                         trigger_label: None,
                     },
+                    // Tracker bindings carry `trigger_label`: a named one, and
+                    // null where the install label serves the binding (#4361).
+                    ChannelBinding {
+                        kind: "github".to_string(),
+                        address: "acme/widgets".to_string(),
+                        adapter: None,
+                        allowed_callers: None,
+                        trigger_label: Some("curie-factory-fast".to_string()),
+                    },
+                    ChannelBinding {
+                        kind: "github".to_string(),
+                        address: "acme/other".to_string(),
+                        adapter: None,
+                        allowed_callers: None,
+                        trigger_label: None,
+                    },
                 ],
                 changed: true,
             },

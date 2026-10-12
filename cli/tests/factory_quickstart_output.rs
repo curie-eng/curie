@@ -174,6 +174,7 @@ if tool == 'kubectl':
             items = [{'apiVersion':'v1','kind':'ConfigMap','metadata':{'name':'acme-settings','namespace':ns},'data':{'setting':'value'}}] if os.environ.get('QUICKSTART_NON_DEFAULT_OBJECTS') == '1' else []
             emit({'apiVersion':'v1','kind':'List','items':items})
         if kind == 'serviceaccounts': emit({'apiVersion':'v1','kind':'List','items':[]})
+        if kind in ['secret','secrets'] and name and name == os.environ.get('QUICKSTART_APP_SECRET'): print((root / 'app.pem').read_text()); sys.exit(0)
         if kind in ['secret','secrets']: absent(kind, name)
         if kind in ['priorityclass','priorityclasses'] and name not in ['-o','--output']: emit(owned('PriorityClass',name))
         if kind in ['deployment','deployments'] and name == 'agent-sandbox-controller': emit(owned('Deployment',name))
@@ -356,6 +357,9 @@ impl Fixture {
                     Response::json(200, r#"{"name":"curie-factory"}"#)
                 }
                 ("GET", "/meta") => Response::json(200, r#"{"api":["192.0.2.0/24"]}"#),
+                ("POST", "/repos/acme/widgets/labels") => {
+                    Response::json(201, r#"{"name":"curie-factory-fast"}"#)
+                }
                 _ => Response::json(404, r#"{"message":"Not Found"}"#),
             }
         });
@@ -1072,6 +1076,111 @@ fn a_different_runner_base_is_refused_before_the_binding_upgrade() {
         helm_upgrade_calls(&fixture).len(),
         before,
         "the binding upgrade ran before the refusal: {shown}"
+    );
+}
+
+/// A release that records factory intake on the fixture, so a run with no
+/// App flags takes the add agent path, its runner digest set to `digest`.
+fn record_factory_intake(fixture: &Fixture, digest: Option<&str>) {
+    let mut values: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.dir.path().join("values")).unwrap())
+            .unwrap();
+    values["factory"] = json!({
+        "enabled": true,
+        "intake": "poll",
+        "trackers": [{"kind": "github", "label": "curie-factory"}],
+        "codeHosts": [{"kind": "github", "credential": {
+            "appId": "1234567",
+            "existingSecret": "factory-app",
+            "existingSecretKey": "private-key.pem"
+        }}]
+    });
+    values["api"]["githubRepoAllowlist"] = json!(["acme/widgets"]);
+    if let Some(digest) = digest {
+        values["agentSandbox"]["runner"]["digest"] = json!(digest);
+    }
+    fixture.record_values(values);
+}
+
+/// Every write the add agent path can make: a Helm upgrade (the egress
+/// bind), a namespace write, a GitHub write (the trigger label), and a
+/// platform write (deploy, surfaces, overrides, budget).
+fn add_agent_writes(fixture: &Fixture) -> (usize, usize, usize, usize) {
+    let writes = |server: &MockServer| {
+        server
+            .recorded()
+            .iter()
+            .filter(|request| request.method != "GET")
+            .count()
+    };
+    (
+        helm_upgrade_calls(fixture).len(),
+        namespace_mutations(fixture).len(),
+        writes(&fixture.github),
+        writes(&fixture.platform),
+    )
+}
+
+#[test]
+fn an_add_agent_runner_base_mismatch_is_refused_before_any_mutation() {
+    let add = [
+        "--color",
+        "never",
+        "--agent",
+        "dark-factory-fast",
+        "--label",
+        "curie-factory-fast",
+    ];
+    // Liveness: on a matching base the same run reaches the mutations, so
+    // the refusal below is the check running first, not a fixture gap.
+    let fixture = Fixture::new();
+    let (code, shown) = fixture.run(false, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    record_factory_intake(&fixture, None);
+    let before = add_agent_writes(&fixture);
+    let output = fixture
+        .command(false, &add)
+        .env("QUICKSTART_APP_SECRET", "factory-app")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = add_agent_writes(&fixture);
+    assert!(after.0 > before.0, "the egress bind never ran: {shown}");
+    assert!(
+        after.2 > before.2,
+        "the trigger label was never created: {shown}"
+    );
+
+    let fixture = Fixture::new();
+    let (code, shown) = fixture.run(false, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    record_factory_intake(
+        &fixture,
+        Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+    );
+    let before = add_agent_writes(&fixture);
+    let output = fixture
+        .command(false, &add)
+        .env("QUICKSTART_APP_SECRET", "factory-app")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{shown}");
+    assert!(shown.contains("Checking the runner base failed"), "{shown}");
+    assert_eq!(
+        add_agent_writes(&fixture),
+        before,
+        "the add agent path mutated before its runner base check: {shown}"
     );
 }
 
