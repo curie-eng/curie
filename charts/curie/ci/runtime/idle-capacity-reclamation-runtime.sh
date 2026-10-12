@@ -402,11 +402,17 @@ def batch(phase, count, *, progress=True, stale=None, expect_pressure=False):
                 assert by_key[key]["status"] is None, "a stale old route unexpectedly became reachable"
         # A previously observed active runner may disappear only after it was
         # observed safely idle or its own real CLI turn had successfully ended.
-        live_names = {pod["metadata"]["name"] for pod in pods.values()}
+        # Pods are snapshotted before routes: a just-created active route may
+        # legitimately arrive before its Pod has ever entered a snapshot.
+        # The Kubernetes substrate addresses the runner Pod by sandbox_name
+        # (SandboxSubstrate.pod_termination); retain its first observed UID so
+        # a same-name replacement does not conceal an actual disappearance.
         for old in seen_routes.values():
             record = old["record"]
             claim = record["claim_name"]
-            if claim not in active_claims or record["sandbox_name"] in live_names:
+            observed_uid = next((uid for uid, pod in seen_pods.items()
+                                 if pod["metadata"]["name"] == record["sandbox_name"]), None)
+            if claim not in active_claims or observed_uid is None or observed_uid in pods:
                 continue
             own_turn = next((turn for turn in turns if matches(old, turn)), None)
             # Reply delivery can trail DONE and deletion by a few network hops.
