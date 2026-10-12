@@ -6,7 +6,7 @@ source for `tool-manifest.schema.json` and `tool-catalog-entry.schema.json`.
 Export them with `manifest_schema()` and `catalog_entry_schema()`, then write
 JSON with sorted keys, two-space indentation and a trailing newline.
 
-The CLI will produce `/etc/curie/tool-manifest.json` during a repository runner
+The CLI will produce `/etc/curie/tool-manifest.json` during a repository runner <!-- doclint:ignore-line -->
 image build, and the runner will read it from that image. Catalog entries declare pinned
 platform source images, cache paths under the writable `/home/runner`, registry
 hosts and version probe argv. These contracts do not yet build images or run
