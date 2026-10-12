@@ -17,10 +17,12 @@ and to `--evidence` when given.
 
 `--dry-run` lists every step and launches nothing. It fails on an entry with
 an unset step field, and reports "not installed" for an entry whose forge
-drivers are not installed. github+github, jira_cloud+github,
-jira_cloud+bitbucket_cloud and jira_cloud+bitbucket_dc are installed today; the
-GitLab entries are complete step definitions waiting on their drivers in
-tools/factory-e2e/forges/. Bitbucket pairs only with a Jira Cloud tracker.
+drivers are not installed or whose pairing is refused. github+github and
+jira_cloud+github are installed today; the GitLab entries are complete step
+definitions waiting on their drivers in tools/factory-e2e/forges/. Bitbucket
+pairs only with a Jira Cloud tracker, and both Bitbucket entries are refused
+until the combined Jira Cloud and Bitbucket quickstart lands (#4400): their
+drivers are installed but no install path sets up that pairing yet.
 
 The jira_cloud+github entry is driven by the jira_cloud driver (`--forge
 jira_cloud`), which delegates the change, CI, review and merge steps to the
@@ -98,6 +100,8 @@ class Pairing:
     code_host: str
     installed: bool
     steps: tuple[Step, ...]
+    # Why an entry whose drivers are installed is still not installed.
+    refused: str | None = None
 
     @property
     def key(self) -> str:
@@ -251,8 +255,15 @@ def _loop_step(tracker: str, code_host: str) -> Step:
     )
 
 
-def _pairing(tracker: str, code_host: str, *, installed: bool) -> Pairing:
-    return Pairing(tracker, code_host, installed, (_loop_step(tracker, code_host),))
+def _pairing(
+    tracker: str, code_host: str, *, installed: bool, refused: str | None = None
+) -> Pairing:
+    return Pairing(tracker, code_host, installed, (_loop_step(tracker, code_host),), refused)
+
+
+# The Bitbucket drivers are installed, but nothing installs a Jira Cloud tracker
+# beside a Bitbucket code host until the combined quickstart lands.
+BITBUCKET_REFUSED = "the combined Jira Cloud and Bitbucket quickstart is not in this build (#4400)"
 
 
 PAIRINGS: dict[str, Pairing] = {
@@ -262,8 +273,8 @@ PAIRINGS: dict[str, Pairing] = {
         _pairing("jira_cloud", "github", installed=True),
         _pairing("gitlab", "gitlab", installed=False),
         _pairing("jira_cloud", "gitlab", installed=False),
-        _pairing("jira_cloud", "bitbucket_cloud", installed=True),
-        _pairing("jira_cloud", "bitbucket_dc", installed=True),
+        _pairing("jira_cloud", "bitbucket_cloud", installed=False, refused=BITBUCKET_REFUSED),
+        _pairing("jira_cloud", "bitbucket_dc", installed=False, refused=BITBUCKET_REFUSED),
     )
 }
 
@@ -308,6 +319,8 @@ def _missing_drivers(pairing: Pairing) -> list[str]:
 
 
 def _not_installed(pairing: Pairing) -> str:
+    if pairing.refused:
+        return f"{pairing.key} is not installed: {pairing.refused}"
     missing = _missing_drivers(pairing) or [pairing.key]
     if len(missing) == 1:
         return f"{pairing.key} is not installed: the {missing[0]} forge driver is not installed"

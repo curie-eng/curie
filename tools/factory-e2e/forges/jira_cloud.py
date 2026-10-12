@@ -59,6 +59,10 @@ SITE_KEYS = (
 CLOSE_STEP = "close Jira test issues"
 # The comment property the factory's status comment carries.
 STATUS_PROPERTY = "curie.factory"
+# Comment paging: the issue listing's page size and the bulk read's id cap.
+COMMENT_PAGE_SIZE = 100
+COMMENT_LIST_IDS_LIMIT = 1000
+MAX_COMMENT_PAGES = 1000
 # The tracker label `curie factory quickstart --tracker jira-cloud` writes.
 QUICKSTART_LABEL = "curie-factory"
 # The tracker poll interval the quickstart leaves at its default; the
@@ -338,10 +342,75 @@ class JiraCloudDriver:
     # -- tracker evidence --
 
     def _status_comments(self, key: str) -> int | None:
-        status, body = self._jira("labeler", "GET", f"/issue/{key}/comment?expand=properties")
-        if status != 200 or not isinstance(body, dict):
+        """The bot's status comments on ``key``, read the way Jira Cloud REST v3 allows.
+
+        The issue-comments listing does not expand entity properties, so this
+        lists the comment ids page by page, then reads the bot's comments with
+        their properties through the bulk endpoint, as the adapter does
+        (apps/api/src/curie_api/forges/jira_cloud/comments.py). See
+        https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comments/
+        """
+
+        ids = self._bot_comment_ids(key)
+        if ids is None:
             return None
-        return bot_comment_count(body, self.site.bot_account_id)
+        listed: list[dict[str, Any]] = []
+        for start in range(0, len(ids), COMMENT_LIST_IDS_LIMIT):
+            page = self._comments_with_properties(ids[start : start + COMMENT_LIST_IDS_LIMIT])
+            if page is None:
+                return None
+            listed.extend(page)
+        return bot_comment_count({"comments": listed}, self.site.bot_account_id)
+
+    def _bot_comment_ids(self, key: str) -> list[int] | None:
+        """Ids of the bot's comments on ``key`` from every page of the listing."""
+
+        ids: list[int] = []
+        start = 0
+        for _ in range(MAX_COMMENT_PAGES):
+            status, page = self._jira(
+                "labeler",
+                "GET",
+                f"/issue/{key}/comment?startAt={start}&maxResults={COMMENT_PAGE_SIZE}",
+            )
+            comments = page.get("comments") if isinstance(page, dict) else None
+            if status != 200 or not isinstance(comments, list):
+                return None
+            for comment in comments:
+                if not isinstance(comment, dict):
+                    continue
+                author = comment.get("author") or {}
+                comment_id = str(comment.get("id"))
+                if author.get("accountId") == self.site.bot_account_id and comment_id.isdigit():
+                    ids.append(int(comment_id))
+            start += len(comments)
+            total = page.get("total")
+            if not comments or not isinstance(total, int) or start >= total:
+                return ids
+        return None
+
+    def _comments_with_properties(self, ids: list[int]) -> list[dict[str, Any]] | None:
+        """The comments ``ids`` with their entity properties, every page, or None."""
+
+        listed: list[dict[str, Any]] = []
+        start = 0
+        for _ in range(MAX_COMMENT_PAGES):
+            status, page = self._jira(
+                "labeler",
+                "POST",
+                f"/comment/list?expand=properties&startAt={start}&maxResults={len(ids)}",
+                {"ids": ids},
+            )
+            values = page.get("values") if isinstance(page, dict) else None
+            if status != 200 or not isinstance(values, list):
+                return None
+            listed.extend(value for value in values if isinstance(value, dict))
+            if page.get("isLast") is True:
+                return listed
+            if not values:
+                return None
+            start += len(values)
+        return None
 
     def _remote_links(self, key: str, change: fe.ChangeRef | None) -> int | None:
         if change is None:

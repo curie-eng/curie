@@ -233,6 +233,8 @@ class FakeJira:
         self.admit_bot_labels = False
         self.duplicate_admission = False
         self.extra_status_comment = False
+        # Jira's per-page cap on comment reads; small values force paging.
+        self.comment_page_size = 5000
         self.link_pull_request = True
         self.fail_label: set[str] = set()
         self.fail_close: set[str] = set()
@@ -290,6 +292,8 @@ class FakeJira:
             return 200, me
         if method == "POST" and parts == ["issue"]:
             return self._create(actor, body)
+        if method == "POST" and parts == ["comment", "list"]:
+            return self._comment_list(query, body)
         if parts[:1] == ["comment"] and len(parts) >= 3 and parts[2] == "properties":
             return self._comment_property(parts)
         if parts[:1] != ["issue"] or len(parts) < 2:
@@ -306,12 +310,20 @@ class FakeJira:
             self._apply_labels(issue, body, actor)
             return 204, None
         if method == "GET" and rest == ["comment"]:
+            # Jira Cloud's issue listing pages and never expands entity
+            # properties, whatever ``expand`` asks for.
             comments = issue["comments"]
+            start = int((query.get("startAt") or ["0"])[0])
+            size = min(int((query.get("maxResults") or ["5000"])[0]), self.comment_page_size)
+            page = [
+                {k: v for k, v in c.items() if k != "properties"}
+                for c in copy.deepcopy(comments[start : start + size])
+            ]
             return 200, {
-                "startAt": 0,
-                "maxResults": 5000,
+                "startAt": start,
+                "maxResults": size,
                 "total": len(comments),
-                "comments": copy.deepcopy(comments),
+                "comments": page,
             }
         if method == "GET" and rest == ["remotelink"]:
             links = issue["links"]
@@ -430,6 +442,30 @@ class FakeJira:
             recorded_links = copy.deepcopy(_fixture("remotelinks.json"))
             recorded_links[0]["globalId"] = recorded_links[0]["object"]["url"] = PR_URL
             issue["links"].extend(recorded_links)
+
+    def _comment_list(self, query: dict[str, list[str]], body: Any) -> tuple[int, Any]:
+        """POST /comment/list: the only read that expands comment properties."""
+
+        wanted = [str(i) for i in (body or {}).get("ids") or []]
+        expand = "properties" in (query.get("expand") or [""])[0].split(",")
+        found = [
+            copy.deepcopy(comment)
+            for issue in self.issues.values()
+            for comment in issue["comments"]
+            if comment["id"] in wanted
+        ]
+        if not expand:
+            found = [{k: v for k, v in c.items() if k != "properties"} for c in found]
+        start = int((query.get("startAt") or ["0"])[0])
+        size = min(int((query.get("maxResults") or ["50"])[0]), self.comment_page_size)
+        values = found[start : start + size]
+        return 200, {
+            "startAt": start,
+            "maxResults": size,
+            "total": len(found),
+            "isLast": start + len(values) >= len(found),
+            "values": values,
+        }
 
     def _comment_property(self, parts: list[str]) -> tuple[int, Any]:
         for issue in self.issues.values():
@@ -822,6 +858,25 @@ def test_tracker_evidence_on_a_complete_run(
     assert len(bot_labelled) == 1 and bot_labelled[0] != first["key"]
     # Exactly one WorkItem: the labeler's label admitted one, the bot's none.
     assert [issue["key"] for _wid, issue in rig.jira.work_items] == [first["key"]]
+
+
+def test_status_comments_read_properties_through_the_bulk_endpoint_across_pages(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rig = _rig(tmp_path, monkeypatch)
+    rig.jira.extra_status_comment = True
+    rig.jira.comment_page_size = 1
+    driver = rig.driver()
+    driver.open_and_label_ticket("Title", "Body", time.time())
+    first = _first_issue(rig.jira)
+
+    assert driver._status_comments(first["key"]) == 2
+    listings = rig.jira.actor_requests("GET", f"/issue/{first['key']}/comment")
+    assert len(listings) == len(first["comments"])
+    bulk = rig.jira.actor_requests("POST", "/comment/list")
+    assert bulk and all(r["query"].get("expand") == ["properties"] for r in bulk)
+    bot_ids = {int(c["id"]) for c in first["comments"] if c["author"]["accountId"] == BOT_ACCOUNT}
+    assert {i for r in bulk for i in r["body"]["ids"]} == bot_ids
 
 
 @pytest.mark.parametrize(

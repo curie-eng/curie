@@ -376,9 +376,10 @@ permissions:
 
 1. Browse Projects, on the projects the factory should serve and no others.
 2. Add Comments.
-3. Edit Issues.
-4. Link Issues.
-5. Browse users and groups, only when start authority is a group.
+3. Edit Own Comments, so the factory can edit its status comment in place.
+4. Edit Issues.
+5. Link Issues.
+6. Browse users and groups, only when start authority is a group.
 
 Scope comes from Jira's permissions, not from Curie configuration. The factory
 sees every issue the factory account can browse that carries the label, and
