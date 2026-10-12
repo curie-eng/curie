@@ -233,14 +233,85 @@ def test_select_lists_added_and_modified_assertions_only(tmp_path: Path) -> None
     ]
 
 
+def _needs(job: dict[str, object]) -> list[str]:
+    needs = job.get("needs", [])
+    return [needs] if isinstance(needs, str) else list(needs)  # type: ignore[arg-type]
+
+
+def _runs(job: dict[str, object]) -> str:
+    return "\n".join(str(step.get("run", "")) for step in job["steps"])  # type: ignore[attr-defined]
+
+
 def test_required_verdict_runs_the_gate_on_every_changed_assertion() -> None:
     jobs = yaml.safe_load(CI.read_text())["jobs"]
-    steps = jobs["e2e-required"]["steps"]
-    runs = "\n".join(str(step.get("run", "")) for step in steps)
-    assert "registration --workflow .github/workflows/ci.yaml" in runs
-    assert "receipts --dir" in runs
-    assert "self-test --workflow .github/workflows/ci.yaml" in runs
+    registration = jobs["runtime-assertion-registration"]
+    required = jobs["e2e-required"]
+    registration_runs = _runs(registration)
+    assert "self-test --workflow .github/workflows/ci.yaml" in registration_runs
+    assert "registration --workflow .github/workflows/ci.yaml" in registration_runs
+    assert _needs(registration) == ["changes"]
+    assert "runtime-assertion-registration" in _needs(required)
+    required_runs = _runs(required)
+    assert "receipts --dir" in required_runs
+    assert "registration --workflow" not in required_runs
+    assert "self-test --workflow" not in required_runs
     assert "runtime_assertions" in jobs["changes"]["outputs"]
+
+
+def test_registration_job_and_step_conditions_skip_only_the_empty_list() -> None:
+    job = yaml.safe_load(CI.read_text())["jobs"]["runtime-assertion-registration"]
+    # The job runs on every event and every verdict.
+    assert "if" not in job
+    steps = {step.get("name"): step for step in job["steps"]}
+    # Negative controls run on every verdict (#3391).
+    assert "if" not in steps["Runtime assertion gate negative controls"]
+    # Skipped only for the empty list; any nonempty list runs the guard.
+    guard = steps["Changed runtime assertions are registered"]
+    assert guard["if"] == "needs.changes.outputs.runtime_assertions != '[]'"
+
+
+def _run_registration_guard(
+    scripts: list[str], cluster_selected: str
+) -> subprocess.CompletedProcess[str]:
+    job = yaml.safe_load(CI.read_text())["jobs"]["runtime-assertion-registration"]
+    name = "Changed runtime assertions are registered"
+    steps = [s for s in job["steps"] if s.get("name") == name]
+    assert len(steps) == 1
+    environment = os.environ.copy()
+    environment.update(
+        {"RUNTIME_ASSERTIONS": json.dumps(scripts), "CLUSTER_SELECTED": cluster_selected}
+    )
+    return subprocess.run(
+        ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", steps[0]["run"]],
+        cwd=REPO_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_registration_guard_fails_an_unregistered_changed_assertion() -> None:
+    result = _run_registration_guard(
+        ["charts/curie/ci/runtime/unregistered-negative-control.sh"], "true"
+    )
+    assert result.returncode != 0
+    assert "unregistered" in result.stdout + result.stderr
+
+
+def test_registration_guard_fails_when_the_cluster_tier_was_not_selected() -> None:
+    result = _run_registration_guard(
+        ["charts/curie/ci/runtime/unregistered-negative-control.sh"], "false"
+    )
+    assert result.returncode != 0
+    assert "cluster tier" in result.stdout + result.stderr
+
+
+def test_registration_guard_passes_a_registered_changed_assertion() -> None:
+    result = _run_registration_guard(
+        ["charts/curie/ci/runtime/publication-job-assertions.sh"], "true"
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_self_test_passes_on_the_real_workflow() -> None:

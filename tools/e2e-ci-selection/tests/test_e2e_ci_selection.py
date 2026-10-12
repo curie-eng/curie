@@ -1393,9 +1393,7 @@ def test_exact_path_under_ignored_prefix_is_selected(tmp_path: Path) -> None:
             "    compose.dev.yaml: [local]\n    scripts/selected.sh: [cluster]",
         ).replace("    docs: []", "    docs: []\n    scripts: []")
     )
-    selected, selected_output = _invoke_selector(
-        tmp_path, "scripts/selected.sh", registry=registry
-    )
+    selected, selected_output = _invoke_selector(tmp_path, "scripts/selected.sh", registry=registry)
     assert selected.returncode == 0, selected.stderr
     assert selected_output == _expected_output("cluster", chart_scenarios=())
     for path in ("scripts/other.sh", "scripts/selected.sh/child.sh"):
@@ -1495,6 +1493,7 @@ def test_more_specific_ignored_child_of_selected_prefix_is_allowed(tmp_path: Pat
 
 AGGREGATE_EXPRESSIONS = {
     "changes_result": "${{ needs.changes.result }}",
+    "registration_result": "${{ needs.runtime-assertion-registration.result }}",
     "event_name": "${{ github.event_name }}",
     "skill_selected": "${{ needs.changes.outputs.skill }}",
     "local_selected": "${{ needs.changes.outputs.local }}",
@@ -2110,6 +2109,7 @@ def _aggregate_contract() -> tuple[str, dict[str, str]]:
     assert job["name"] == "E2E required"
     assert set(job["needs"]) == {
         "changes",
+        "runtime-assertion-registration",
         "e2e-ladder",
         "e2e-ladder-release",
         "e2e-ladder-cluster",
@@ -2152,6 +2152,7 @@ def _run_aggregate(
         script = script_transform(script)
     state = {
         "changes_result": "success",
+        "registration_result": "success",
         "event_name": "push",
         "skill_selected": "false",
         "local_selected": "false",
@@ -2187,6 +2188,15 @@ def _run_aggregate(
         text=True,
         check=False,
     )
+
+
+@pytest.mark.parametrize("value", ["failure", "skipped", "cancelled"])
+def test_e2e_required_fails_unless_runtime_assertion_registration_succeeds(value: str) -> None:
+    passing = _run_aggregate()
+    assert passing.returncode == 0, passing.stdout + passing.stderr
+
+    blocked = _run_aggregate(registration_result=value)
+    assert blocked.returncode != 0, blocked.stdout + blocked.stderr
 
 
 def test_e2e_required_validates_docs_only_ladder_skips(tmp_path: Path) -> None:
@@ -2844,12 +2854,8 @@ def test_aggregate_rejects_malformed_scripted_factory_selection(selected: str) -
     assert completed.returncode != 0, completed.stdout + completed.stderr
 
 
-@pytest.mark.parametrize(
-    ("selected", "result"), [("true", "success"), ("false", "skipped")]
-)
-def test_negative_control_covers_scripted_factory_result(
-    selected: str, result: str
-) -> None:
+@pytest.mark.parametrize(("selected", "result"), [("true", "success"), ("false", "skipped")])
+def test_negative_control_covers_scripted_factory_result(selected: str, result: str) -> None:
     state = {
         "event_name": "pull_request",
         "factory_selected": selected,
