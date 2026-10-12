@@ -4,6 +4,12 @@ Date: 2026-10-11
 
 Status: Accepted
 
+**Superseded in part by [ADR 0215](0215-each-tracker-surface-starts-factory-work-under-its-own-trigger-label.md)**
+(back-link added under [ADR 0045](0045-the-status-line-is-the-mutable-part-of-an-immutable-adr.md)):
+decision 4 and consequence 4. Two surfaces on one repository are allowed when
+their effective trigger labels differ; two with the same effective label, or
+two on one agent, stay refused. Everything else in this ADR stands.
+
 Accepted with explicit maintainer approval on 2026-10-09 (Brian Conn),
 alongside implementation under ADR 0102.
 
