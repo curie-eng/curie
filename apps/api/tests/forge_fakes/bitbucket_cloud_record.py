@@ -534,6 +534,8 @@ _REPO_SEGMENTS = re.compile(
 CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie", "set-cookie"})
 # First segments under bitbucket.org that are product routes, not a workspace.
 BITBUCKET_ROUTES = frozenset({"account", "site", "product", "dashboard", "repo"})
+# The workspace-scoped route that project pages live under: bitbucket.org/<workspace>/workspace/...
+WORKSPACE_ROUTE = "workspace"
 PLACEHOLDER_EMAIL = "placeholder@example.invalid"
 PLACEHOLDER_AUTHOR = f"Placeholder User <{PLACEHOLDER_EMAIL}>"
 PLACEHOLDER_AVATAR = "https://example.invalid/avatar.png"
@@ -680,7 +682,10 @@ def _segment_finding(where: str, prefix: str, first: str, second: str | None) ->
         allowed = (
             first in BITBUCKET_ROUTES
             or _placeholder_id(first)
-            or (first == PLACEHOLDER_WORKSPACE and second in {None, PLACEHOLDER_SLUG})
+            or (
+                first == PLACEHOLDER_WORKSPACE
+                and second in {None, PLACEHOLDER_SLUG, WORKSPACE_ROUTE}
+            )
             or (
                 first == "workspaces"
                 and second is not None
