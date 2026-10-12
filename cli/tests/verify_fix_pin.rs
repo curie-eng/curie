@@ -930,6 +930,66 @@ pythonpath = ["."]
 }
 
 #[test]
+fn factory_python_selector_is_pinned_by_a_real_selected_assertion_failure() {
+    let selector = "tools/factory-e2e/tests/test_pin.py::test_selected";
+    let fixture = Fixture::new(
+        "tools/factory-e2e/tests/test_pin.py",
+        "from pin_fixture import value\n\n\ndef test_selected():\n    assert value() == 1\n",
+    );
+    fixture.commit(
+        &[
+            (
+                "pyproject.toml",
+                r#"[project]
+name = "pin-fixture"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8.3"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+"#,
+            ),
+            ("pin_fixture.py", "def value():\n    return 1\n"),
+        ],
+        "Add factory Python fixture",
+    );
+    let change = fixture.commit(
+        &[
+            ("pin_fixture.py", "def value():\n    return 2\n"),
+            (
+                "tools/factory-e2e/tests/test_pin.py",
+                "from pin_fixture import value\n\n\ndef test_selected():\n    assert value() == 2\n",
+            ),
+        ],
+        "Fix factory Python behavior",
+    );
+
+    let output = fixture
+        .command(&change, selector)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .output()
+        .expect("run verify fix pin");
+    let shown = output_text(&output);
+    assert!(
+        output.status.success(),
+        "the factory selector must prove the pin\n{shown}"
+    );
+    assert!(stdout_has_result(&output, "PINNED"), "{shown}");
+    assert!(
+        shown.contains("1 failed"),
+        "pytest must report the selected failure\n{shown}"
+    );
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
 fn local_python_selector_reports_unpinned_when_reversal_stays_green() {
     let selector = "cli/tests/local/test_pin.py::test_selected";
     let fixture = Fixture::new(
