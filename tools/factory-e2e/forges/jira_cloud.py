@@ -18,7 +18,10 @@ one ``key=value`` per line:
 5. ``bot_email``, ``bot_account_id`` and ``bot_token_file``: the factory
    account the quickstart installs, and a file holding its API token.
 
-A token is read from its file for each request and goes only into that
+Every Jira REST call goes through the API gateway,
+``https://api.atlassian.com/ex/jira/<cloud_id>/rest/api/3``, so the test
+accounts' tokens are scoped API tokens; the site host is used only for browse
+links. A token is read from its file for each request and goes only into that
 request's Basic Authorization header: never into argv, evidence, logs or an
 error message.
 
@@ -182,6 +185,13 @@ def _token(site: JiraSite, actor: str) -> str:
     return token
 
 
+def gateway_url(site: JiraSite) -> str:
+    """The Atlassian API gateway for the site. A scoped API token authenticates
+    only here; the site URL answers it 401."""
+
+    return f"https://api.atlassian.com/ex/jira/{site.cloud_id}"
+
+
 def jira_request(
     site: JiraSite, actor: str, method: str, path: str, body: Any = None
 ) -> tuple[int, Any]:
@@ -190,7 +200,7 @@ def jira_request(
     email = site.labeler_email if actor == "labeler" else site.bot_email
     basic = base64.b64encode(f"{email}:{_token(site, actor)}".encode()).decode()
     headers = {"Authorization": f"Basic {basic}", "Accept": "application/json"}
-    url = f"https://{site.site}/rest/api/3{path}"
+    url = f"{gateway_url(site)}/rest/api/3{path}"
     return fe.http_json(method, url, headers=headers, body=body)
 
 
@@ -601,7 +611,7 @@ def install_jira(p: fe.Preflight) -> None:
         "--code-host",
         "github",
         "--forge-url",
-        f"https://{site.site}",
+        gateway_url(site),
         "--token-file",
         str(site.bot_token_file),
         "--forge-username",

@@ -389,7 +389,11 @@ grant the account Browse Projects on it.
 A classic API token uses the site root as `--forge-url`, for example
 `https://example.atlassian.net`. A scoped token uses the API gateway,
 `https://api.atlassian.com/ex/jira/<cloudId>`; the cloud id is the one
-`https://<site>.atlassian.net/_edge/tenant_info` reports.
+`https://<site>.atlassian.net/_edge/tenant_info` reports. Jira answers a scoped
+token with 401 on the site root, so match the URL to the token. Either way,
+quickstart reads the site host from Jira for issue links, and the tracker's
+`apiUrl` is the URL you passed. The example below uses a classic token; for a
+scoped token, pass `--forge-url https://api.atlassian.com/ex/jira/<cloudId>`.
 
 ### Who may start work
 

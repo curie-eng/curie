@@ -15,8 +15,9 @@ The production contract the fakes below rely on:
    ``load_site(environ)`` reads it and raises ``fe.ConfigError`` naming a
    missing key, never a value.
 2. Every Jira request goes through ``fe.http_json(method, url, headers=...,
-   body=...)`` to ``https://<site>/rest/api/3/...`` or
-   ``https://api.atlassian.com/ex/jira/<cloud_id>/rest/api/3/...``, with
+   body=...)`` to the API gateway,
+   ``https://api.atlassian.com/ex/jira/<cloud_id>/rest/api/3/...`` (scoped
+   tokens authenticate only there; the site host is only for browse links), with
    ``Authorization: Basic base64(<email>:<token>)``; the token is read from the
    token file. The platform is read through ``Preflight.api`` and the GitHub
    pull request through ``Preflight.as_actor``.
@@ -255,13 +256,12 @@ class FakeJira:
         assert parsed.scheme == "https", url
         path = parsed.path
         host = parsed.hostname or ""
-        if host == "api.atlassian.com":
-            match = re.match(r"/ex/jira/([^/]+)(/.*)$", path)
-            assert match, url
-            assert match.group(1) == self.cloud_id, f"scoped URL for another cloud: {url}"
-            path = match.group(2)
-        else:
-            assert host == self.site, f"Jira request to another site: {url}"
+        # Scoped API tokens answer only on the gateway: a site URL is a defect.
+        assert host == "api.atlassian.com", f"Jira request off the API gateway: {url}"
+        match = re.match(r"/ex/jira/([^/]+)(/.*)$", path)
+        assert match, url
+        assert match.group(1) == self.cloud_id, f"gateway URL for another cloud: {url}"
+        path = match.group(2)
         self.hosts.add(host)
         lowered = {k.lower(): v for k, v in (headers or {}).items()}
         auth = lowered.get("authorization")
@@ -736,7 +736,7 @@ def test_requests_go_to_the_env_file_site_not_a_hardcoded_one(
         rig = _rig(tmp_path / sub, monkeypatch, site=site, cloud_id=cloud_id)
         rig.driver().open_and_label_ticket("Title", "Body", time.time())
         assert rig.jira.requests, "the driver made no Jira request"
-        assert rig.jira.hosts <= {site, "api.atlassian.com"}, rig.jira.hosts
+        assert rig.jira.hosts == {"api.atlassian.com"}, rig.jira.hosts
 
 
 # --- credentials: Basic auth from the token files, never anywhere else ---------------
@@ -1379,7 +1379,7 @@ def test_install_jira_runs_the_quickstart_with_the_token_file_never_the_token(
     assert len(_flag(argv, "--plugin-dir")) == 1
     assert _flag(argv, "--tracker") == ["jira-cloud"]
     assert _flag(argv, "--code-host") == ["github"]
-    assert _flag(argv, "--forge-url") == [f"https://{SITE}"]
+    assert _flag(argv, "--forge-url") == [f"https://api.atlassian.com/ex/jira/{CLOUD_ID}"]
     assert _flag(argv, "--token-file") == [str(tmp_path / "jira" / "bot-token")]
     assert _flag(argv, "--forge-username") == [BOT_EMAIL]
     # The labeler's accountId, read from /myself with the labeler's token.
