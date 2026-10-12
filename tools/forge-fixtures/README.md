@@ -15,9 +15,10 @@ one of `up`, `self-test`, or `down`, followed by `--state-dir <dir>` and the
 optional `--advertise-host <host>` and `--port <port>`. `cli/scripts/forge-fixture.sh`
 runs it with `python3`. All fixture state lives under the state directory.
 
-The reserved kinds are `gitlab` and `bitbucket-dc`. Neither is installed yet:
-until its `fixture.py` exists, `curie dev forge-fixture` for that kind exits
-nonzero with a "not installed" message and creates no state.
+The reserved kinds are `gitlab` and `bitbucket-dc`. `gitlab` is installed; see
+`gitlab/README.md`. `bitbucket-dc` is not installed yet: until its `fixture.py`
+exists, `curie dev forge-fixture` for that kind exits nonzero with a "not
+installed" message and creates no state.
 
 ## Adding a fixture
 
