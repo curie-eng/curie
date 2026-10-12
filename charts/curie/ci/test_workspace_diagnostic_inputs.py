@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import sqlite3
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -40,9 +41,15 @@ CLUSTER_OBJECTS = (
 
 # These executables replace external tools only. Run the real scenario so its
 # validation, preflight, and EXIT trap remain the paths under test.
+# Observed Kubernetes API snapshots showed a terminating namespace retaining
+# its pods-remaining condition after all pods and PVCs had disappeared. The
+# stateful mode models the pod-grace estimate and delayed reconciliation in:
+# https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/controller/namespace/deletion/namespaced_resources_deleter.go
+# https://github.com/kubernetes/kubernetes/blob/v1.31.0/pkg/controller/namespace/namespace_controller.go
 TOOL_STUB = r"""
 import os
 import shlex
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -52,11 +59,116 @@ with Path(os.environ["WSDIAG_CALL_LOG"]).open("a") as log:
     log.write(shlex.join([tool, *args]) + "\n")
 if os.environ.get("WSDIAG_MODE") != "cluster":
     raise SystemExit(91)
+state = None
+if os.environ.get("WSDIAG_STATEFUL_CLEANUP") == "1":
+    state = sqlite3.connect(os.environ["WSDIAG_CLUSTER_STATE"])
+    state.executescript('''
+        CREATE TABLE IF NOT EXISTS namespaces (
+            name TEXT PRIMARY KEY,
+            namespace_present INTEGER,
+            pods_present INTEGER,
+            pod_delete_requested INTEGER,
+            namespace_delete_requested INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS events (
+            sequence INTEGER PRIMARY KEY,
+            action TEXT,
+            namespace TEXT,
+            pods_present INTEGER
+        );
+        INSERT OR IGNORE INTO namespaces VALUES ('acme-existing', 1, 1, 0, 0);
+    ''')
+    state.commit()
+
+
+def record(action, namespace, pods_present):
+    state.execute(
+        "INSERT INTO events(action, namespace, pods_present) VALUES (?, ?, ?)",
+        (action, namespace, pods_present),
+    )
+    state.commit()
+
+
+namespace = next(
+    (args[index + 1] for index, argument in enumerate(args[:-1])
+     if argument in {"-n", "--namespace"}),
+    "default",
+)
 if tool == "kubectl":
     if "config" in args:
         if "current-context" in args or "get-contexts" in args:
             print(os.environ["CURIE_SCENARIO_CONTEXT"])
         raise SystemExit(0)
+    if state is not None:
+        action = next((argument for argument in args if argument in {"get", "delete", "wait"}), "")
+        if action:
+            tail = args[args.index(action) + 1:]
+            target = next((argument for argument in tail if not argument.startswith("-")), "")
+            kind, separator, name = target.partition("/")
+            if not separator:
+                index = tail.index(target) if target else -1
+                name = (
+                    tail[index + 1]
+                    if index >= 0 and len(tail) > index + 1
+                    and not tail[index + 1].startswith("-") else ""
+                )
+            if kind in {"pod", "pods"} and action in {"delete", "wait"}:
+                targets = (
+                    [row[0] for row in state.execute("SELECT name FROM namespaces")]
+                    if "--all-namespaces" in args or "-A" in args else [namespace]
+                )
+                for target_namespace in targets:
+                    row = state.execute(
+                        "SELECT pods_present, pod_delete_requested FROM namespaces WHERE name = ?",
+                        (target_namespace,),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    if action == "wait" and row[0] and not row[1]:
+                        raise SystemExit(1)
+                    waits = action == "wait" or "--wait=false" not in args
+                    state.execute(
+                        "UPDATE namespaces SET pod_delete_requested = 1, pods_present = ? "
+                        "WHERE name = ?",
+                        (0 if waits else row[0], target_namespace),
+                    )
+                    if os.environ.get("WSDIAG_POD_DRAIN_FAILURE") == "1":
+                        # The API accepted deletion, but the client's watch failed.
+                        record("pod-drain-failed", target_namespace, 0 if waits else row[0])
+                        raise SystemExit(97)
+                    record(
+                        "pod-drained" if waits else "pod-delete-requested",
+                        target_namespace,
+                        0 if waits else row[0],
+                    )
+                raise SystemExit(0)
+            if kind in {"ns", "namespace", "namespaces"} and name:
+                row = state.execute(
+                    "SELECT namespace_present, pods_present, namespace_delete_requested "
+                    "FROM namespaces WHERE name = ?",
+                    (name,),
+                ).fetchone()
+                if row is not None:
+                    if action == "delete":
+                        # Content can disappear while the pod-grace estimate
+                        # still postpones the namespace's next reconciliation.
+                        state.execute(
+                            "UPDATE namespaces SET namespace_present = ?, pods_present = 0, "
+                            "namespace_delete_requested = 1 WHERE name = ?",
+                            (row[0] if row[2] else int(bool(row[1])), name),
+                        )
+                        record("namespace-delete", name, row[1])
+                        raise SystemExit(0)
+                    if action == "wait":
+                        record("namespace-wait", name, row[1])
+                        raise SystemExit(1 if row[0] else 0)
+                    if row[0]:
+                        print(f"namespace/{name}")
+                        raise SystemExit(0)
+                    ignore_missing = (
+                        "--ignore-not-found" in args or "--ignore-not-found=true" in args
+                    )
+                    raise SystemExit(0 if ignore_missing else 1)
     if "get" in args:
         tail = args[args.index("get") + 1:]
         aliases = {
@@ -87,9 +199,17 @@ if tool == "kubectl":
     raise SystemExit(92)
 if tool == "curie":
     Path(os.environ["WSDIAG_INSTALL_MARKER"]).touch()
+    if state is not None:
+        state.execute("INSERT OR REPLACE INTO namespaces VALUES (?, 1, 1, 0, 0)", (namespace,))
+        record("partial-install", namespace, 1)
     raise SystemExit(93)
 if tool == "helm":
     if "uninstall" in args:
+        if state is not None:
+            row = state.execute(
+                "SELECT pods_present FROM namespaces WHERE name = ?", (namespace,)
+            ).fetchone()
+            record("helm-uninstall", namespace, row[0] if row else 0)
         raise SystemExit(0)
     if "list" in args:
         print("[]" if "json" in args or "-o=json" in args or "--output=json" in args else "")
@@ -119,6 +239,21 @@ class Scenario:
 
     def calls(self) -> list[list[str]]:
         return [shlex.split(line) for line in self.log.read_text().splitlines()]
+
+    def cleanup_state(self) -> tuple[dict[str, tuple[int, int]], list[tuple[str, str, int]]]:
+        with sqlite3.connect(self.environment["WSDIAG_CLUSTER_STATE"]) as state:
+            resources = {
+                name: (namespace_present, pods_present)
+                for name, namespace_present, pods_present in state.execute(
+                    "SELECT name, namespace_present, pods_present FROM namespaces"
+                )
+            }
+            events = list(
+                state.execute(
+                    "SELECT action, namespace, pods_present FROM events ORDER BY sequence"
+                )
+            )
+        return resources, events
 
 
 @pytest.fixture
@@ -153,6 +288,14 @@ def scenario(tmp_path: Path) -> Scenario:
         "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:wsdiag-acme",
     }
     return Scenario(environment, log, tools / "curie")
+
+
+@pytest.fixture
+def partial_install_with_pods(scenario: Scenario, tmp_path: Path) -> Scenario:
+    scenario.environment["WSDIAG_MODE"] = "cluster"
+    scenario.environment["WSDIAG_STATEFUL_CLEANUP"] = "1"
+    scenario.environment["WSDIAG_CLUSTER_STATE"] = str(tmp_path / "cluster-state.sqlite3")
+    return scenario
 
 
 def assert_input_rejected(scenario: Scenario, variable: str) -> None:
@@ -262,3 +405,57 @@ def test_failed_install_cleans_owned_objects_and_preserves_existing_crds(
         assert bool(deletions) == (crd != existing_crd), (crd, deletions)
         if crd != existing_crd:
             assert any(index > install_index for index in inventory), (crd, calls)
+
+
+def test_partial_install_drains_owned_pods_before_namespace_deletion(
+    partial_install_with_pods: Scenario,
+) -> None:
+    scenario = partial_install_with_pods
+    completed = scenario.run()
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, "the primary install failure must remain a failed scenario"
+    assert "candidate cluster install failed" in output, output
+    assert (
+        "OK: owned release, namespaces, controller resources, priority classes, "
+        "and new CRDs are gone"
+        in output
+    ), output
+    assert "owned namespace deletion did not complete" not in output, output
+    assert "PASS:" not in output, output
+    resources, events = scenario.cleanup_state()
+    owned_namespace = "test-4367-wsdiag-12345-1"
+    assert resources[owned_namespace] == (0, 0), resources
+    assert resources["acme-existing"] == (1, 1), resources
+    owned_events = [
+        (action, pods) for action, namespace, pods in events if namespace == owned_namespace
+    ]
+    assert ("partial-install", 1) in owned_events, events
+    assert ("namespace-delete", 0) in owned_events, events
+    assert ("namespace-wait", 0) in owned_events, events
+    uninstall_index = owned_events.index(("helm-uninstall", 1))
+    drained_index = owned_events.index(("pod-drained", 0))
+    namespace_delete_index = owned_events.index(("namespace-delete", 0))
+    assert uninstall_index < drained_index < namespace_delete_index, events
+
+
+def test_pod_drain_tool_failure_fails_cleanup_even_after_pods_disappear(
+    partial_install_with_pods: Scenario,
+) -> None:
+    scenario = partial_install_with_pods
+    scenario.environment["WSDIAG_POD_DRAIN_FAILURE"] = "1"
+    completed = scenario.run()
+    output = completed.stdout + completed.stderr
+    assert completed.returncode != 0, output
+    assert "candidate cluster install failed" in output, output
+    assert any(
+        line.startswith("FAIL:") and "pod" in line.lower() for line in output.splitlines()
+    ), output
+    assert "OK: owned release" not in output, output
+    assert "owned namespace deletion did not complete" not in output, output
+    assert "PASS:" not in output, output
+    resources, events = scenario.cleanup_state()
+    owned_namespace = "test-4367-wsdiag-12345-1"
+    assert resources[owned_namespace] == (0, 0), resources
+    assert resources["acme-existing"] == (1, 1), resources
+    assert ("pod-drain-failed", owned_namespace, 0) in events, events
+    assert ("namespace-delete", owned_namespace, 0) in events, events
