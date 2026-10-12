@@ -160,7 +160,7 @@ def test_upgrade_matrix_download_retries_connection_resets() -> None:
     """
     script = (REPO_ROOT / "cli/scripts/cluster-upgrade-matrix.sh").read_text()
     start = script.index("download_pin()")
-    body = script[start:script.index("\nfetch_published", start)]
+    body = script[start : script.index("\nfetch_published", start)]
     assert "--retry 5" in body
     assert "--retry-all-errors" in body
     assert "--retry-delay 5" in body
@@ -236,7 +236,10 @@ def test_docker_hub_pulls_go_through_the_mirror() -> None:
             for step in steps:
                 if not isinstance(step, dict) or _action(step) != "docker/setup-buildx-action":
                     continue
-                config = (step.get("with") or {}).get("config-inline")
+                # `buildkitd-config-inline` is the action's current input name;
+                # `config-inline` is its older alias, still used by older jobs.
+                inputs = step.get("with") or {}
+                config = inputs.get("buildkitd-config-inline") or inputs.get("config-inline")
                 name = step.get("name") or "setup-buildx"
                 if not isinstance(config, str) or MIRROR_HOST not in config:
                     gaps.append(

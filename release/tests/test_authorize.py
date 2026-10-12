@@ -1650,6 +1650,26 @@ class TestRequiredNamesMatchCiWorkflows:
             "image while the binaries and the GitHub Release publish anyway."
         )
 
+    def test_docker_daemon_image_build_is_a_required_check(self):
+        # The per-run Docker daemon image is a release.yaml `build` matrix row
+        # outside `examples/`, so the connector guard above cannot see it. Its
+        # ci.yaml job name is read from the workflow, not from the constant.
+        release_doc = yaml.safe_load(
+            (REPO_ROOT / ".github" / "workflows" / "release.yaml").read_text()
+        )
+        release_rows = release_doc["jobs"]["build"]["strategy"]["matrix"]["include"]
+        assert any(
+            row.get("dockerfile") == "apps/docker-daemon/Dockerfile" for row in release_rows
+        ), "release.yaml no longer builds the docker-daemon image; revisit this guard"
+
+        ci_name = yaml.safe_load(CI_YAML.read_text())["jobs"]["docker-daemon"]["name"]
+
+        assert ci_name in authorize_module.REQUIRED_CHECK_NAMES, (
+            f"ci.yaml job {ci_name!r} builds an image release.yaml publishes, so a red "
+            "build would skip the manifest merge for every image; require it in "
+            "release/authorize.py"
+        )
+
 
 class TestHelmCiWorkflowTriggers:
     """Pin the deliberate push and pull request trigger asymmetry."""
