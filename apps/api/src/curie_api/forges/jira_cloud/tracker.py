@@ -122,15 +122,14 @@ def _label_tokens(value: Any) -> set[str]:
     return set(value.split()) if isinstance(value, str) else set()
 
 
-def _label_items(history: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+def _field_items(history: Mapping[str, Any], field: str) -> list[Mapping[str, Any]]:
     items = history.get("items")
     if not isinstance(items, list):
         return []
     return [
         item
         for item in items
-        if isinstance(item, dict)
-        and (item.get("field") == "labels" or item.get("fieldId") == "labels")
+        if isinstance(item, dict) and (item.get("field") == field or item.get("fieldId") == field)
     ]
 
 
@@ -140,7 +139,7 @@ def adds_label(history: Mapping[str, Any], label: str) -> bool:
     return any(
         label in _label_tokens(item.get("toString"))
         and label not in _label_tokens(item.get("fromString"))
-        for item in _label_items(history)
+        for item in _field_items(history, "labels")
     )
 
 
@@ -148,17 +147,12 @@ def removes_label(history: Mapping[str, Any], label: str) -> bool:
     return any(
         label in _label_tokens(item.get("fromString"))
         and label not in _label_tokens(item.get("toString"))
-        for item in _label_items(history)
+        for item in _field_items(history, "labels")
     )
 
 
 def changes_status(history: Mapping[str, Any]) -> bool:
-    items = history.get("items")
-    return isinstance(items, list) and any(
-        isinstance(item, dict)
-        and (item.get("field") == "status" or item.get("fieldId") == "status")
-        for item in items
-    )
+    return bool(_field_items(history, "status"))
 
 
 def mentions(node: Any, account_id: str) -> bool:

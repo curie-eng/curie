@@ -167,9 +167,11 @@ async def _poll_locked(
                 continue
             surface_kind, location = binding_location(binding, tracker)
             scope = _Scope(registry, settings, client, tracker, binding, surface_kind, location)
+            running = await _running(sessionmaker, scope)
+            labels = await _labels(sessionmaker, scope, running)
             sweeps = {
                 label
-                for label in await _labels(sessionmaker, scope)
+                for label in labels
                 if _take(
                     due,
                     f"sweep:{tracker.name}:{binding.name}:{label}",
@@ -178,7 +180,14 @@ async def _poll_locked(
                 )
             }
             if polling or sweeps:
-                await _poll_binding(sessionmaker, scope, polling=polling, sweeps=sweeps)
+                await _poll_binding(
+                    sessionmaker,
+                    scope,
+                    running,
+                    labels if polling else sorted(sweeps),
+                    polling=polling,
+                    sweeps=sweeps,
+                )
 
 
 async def _cancel_orphans(
@@ -217,12 +226,15 @@ async def _cancel_orphans(
         )
 
 
-async def _labels(sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope) -> list[str]:
+async def _labels(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    scope: _Scope,
+    running: dict[str, list[TrackerIssueRef]],
+) -> list[str]:
     """The labels bound on the binding's surface plus those its open work runs under."""
 
     async with sessionmaker() as session:
         bound = await bound_labels(session, scope.registry, scope.surface_kind, scope.location)
-    running = await _running(sessionmaker, scope)
     return sorted(set(bound) | set(running))
 
 
@@ -250,12 +262,12 @@ async def _running(
 async def _poll_binding(
     sessionmaker: async_sessionmaker[AsyncSession],
     scope: _Scope,
+    running: dict[str, list[TrackerIssueRef]],
+    labels: list[str],
     *,
     polling: bool,
     sweeps: set[str],
 ) -> None:
-    running = await _running(sessionmaker, scope)
-    labels = sorted(sweeps | (set(await _labels(sessionmaker, scope)) if polling else set()))
     for label in labels:
         try:
             tracker = tracker_for_binding(scope.registry, scope.client, scope.binding, label=label)

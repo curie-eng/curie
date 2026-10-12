@@ -175,9 +175,9 @@ def stored_repository(
     was the only code host, and names it.
     """
 
-    if kind is None or host is None:
-        return repository_ref(settings, path=path, project_id=project_id)
     stored = repository_ref(settings, path=path, project_id=project_id)
+    if kind is None or host is None:
+        return stored
     return RepositoryRef(kind, host, stored.project_id, path)
 
 
