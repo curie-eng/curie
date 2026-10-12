@@ -140,6 +140,11 @@ cleanup() {
     helm --kube-context "$CONTEXT" uninstall "$RELEASE" -n "$NAMESPACE" \
         --ignore-not-found --wait --timeout 60s >"$WORKDIR/uninstall.log" 2>&1 \
         || { echo "FAIL: could not uninstall the owned release" >&2; cleanup_status=1; }
+    # The namespace controller estimates remaining pod termination grace and
+    # can defer reconciliation after those pods are gone. Drain owned pods
+    # first, retaining their normal grace period, before namespace deletion.
+    kc delete pods --all --ignore-not-found --wait=true --timeout=60s >"$WORKDIR/delete-pods.log" 2>&1 \
+        || { echo "FAIL: could not drain pods in the owned namespace" >&2; cleanup_status=1; }
     kc delete namespace "$NAMESPACE" --ignore-not-found --wait=false >"$WORKDIR/delete-namespace.log" 2>&1 \
         || { echo "FAIL: could not delete the owned namespace" >&2; cleanup_status=1; }
     kc wait --for=delete "namespace/$NAMESPACE" --timeout=60s >"$WORKDIR/wait-namespace.log" 2>&1 \
