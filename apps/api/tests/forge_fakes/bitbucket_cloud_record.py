@@ -534,6 +534,8 @@ _REPO_SEGMENTS = re.compile(
 CREDENTIAL_HEADERS = frozenset({"authorization", "proxy-authorization", "cookie", "set-cookie"})
 # First segments under bitbucket.org that are product routes, not a workspace.
 BITBUCKET_ROUTES = frozenset({"account", "site", "product", "dashboard", "repo"})
+# The workspace-scoped route that project pages live under: bitbucket.org/<workspace>/workspace/...
+WORKSPACE_ROUTE = "workspace"
 PLACEHOLDER_EMAIL = "placeholder@example.invalid"
 PLACEHOLDER_AUTHOR = f"Placeholder User <{PLACEHOLDER_EMAIL}>"
 PLACEHOLDER_AVATAR = "https://example.invalid/avatar.png"
@@ -617,15 +619,17 @@ def scrub(
             if not _PLACEHOLDER_UUID.fullmatch(lowered) and lowered not in uuids:
                 uuids[lowered] = f"00000000-0000-4000-8000-{len(uuids) + 1:012d}"
     replacements: list[tuple[re.Pattern[str], str]] = []
-    for original, placeholder in [*accounts.items(), *names.items()]:
-        for form in dict.fromkeys((original, quote(original, safe=""))):
-            replacements.append((_bounded(form), placeholder))
+    # Workspace and slug first: a team workspace's owner display name is its slug, so
+    # the name patterns must not rewrite URL segments before these run.
     for form in dict.fromkeys(
         (f"{workspace}/{slug}", f"{quote(workspace, safe='')}/{quote(slug, safe='')}")
     ):
         replacements.append((_bounded(form), f"{PLACEHOLDER_WORKSPACE}/{PLACEHOLDER_SLUG}"))
     replacements.append((_bounded(workspace), PLACEHOLDER_WORKSPACE))
     replacements.append((_bounded(slug), PLACEHOLDER_SLUG))
+    for original, placeholder in [*accounts.items(), *names.items()]:
+        for form in dict.fromkeys((original, quote(original, safe=""))):
+            replacements.append((_bounded(form), placeholder))
 
     def host(url: re.Match[str]) -> str:
         parts = urlsplit(url[0])
@@ -678,7 +682,15 @@ def _segment_finding(where: str, prefix: str, first: str, second: str | None) ->
         allowed = (
             first in BITBUCKET_ROUTES
             or _placeholder_id(first)
-            or (first == PLACEHOLDER_WORKSPACE and second in {None, PLACEHOLDER_SLUG})
+            or (
+                first == PLACEHOLDER_WORKSPACE
+                and second in {None, PLACEHOLDER_SLUG, WORKSPACE_ROUTE}
+            )
+            or (
+                first == "workspaces"
+                and second is not None
+                and (second == PLACEHOLDER_WORKSPACE or _placeholder_id(second))
+            )
         )
     return None if allowed else f"{where}: repository segment {first[:3]}..."
 

@@ -54,6 +54,7 @@ WORKSPACE = "example-workspace"
 SLUG = "example-repo"
 REPO_UUID = "{00000000-0000-4000-8000-000000000001}"
 WORKSPACE_UUID = "{00000000-0000-4000-8000-000000000002}"
+PROJECT_UUID = "{00000000-0000-4000-8000-000000000003}"
 MAIN = "main"
 
 # The factory's repository access token and the bot account it acts as.
@@ -395,13 +396,45 @@ class BitbucketCloudFake:
         }
 
     def _repository(self) -> dict[str, Any]:
+        avatar = f"{HTML_BASE}/workspaces/{self.workspace}/avatar/?ts=1760000000"
         return {
             **self._repo_min(),
             "slug": self.slug,
             "is_private": True,
             "scm": "git",
             "mainbranch": {"type": "branch", "name": self.mainbranch},
-            "workspace": {"type": "workspace", "slug": self.workspace, "uuid": WORKSPACE_UUID},
+            # Shape observed on a team workspace on 2026-10-12: the owner's display name
+            # and username are the workspace slug, its avatar is under
+            # /account/<slug>/avatar/; the workspace avatar is under
+            # /workspaces/<slug>/avatar/; the project links are under
+            # /<slug>/workspace/projects/<KEY>.
+            "owner": {
+                "type": "team",
+                "display_name": self.workspace,
+                "username": self.workspace,
+                "uuid": WORKSPACE_UUID,
+                "links": {"avatar": {"href": f"{HTML_BASE}/account/{self.workspace}/avatar/"}},
+            },
+            "workspace": {
+                "type": "workspace",
+                "slug": self.workspace,
+                "name": self.workspace,
+                "uuid": WORKSPACE_UUID,
+                "links": {"avatar": {"href": avatar}},
+            },
+            "project": {
+                "type": "project",
+                "key": "PROJ",
+                "name": "Example Project",
+                "uuid": PROJECT_UUID,
+                "links": {
+                    "html": {"href": f"{HTML_BASE}/{self.workspace}/workspace/projects/PROJ"},
+                    "avatar": {
+                        "href": f"{HTML_BASE}/{self.workspace}/workspace/projects/PROJ"
+                        "/avatar/32?ts=1760000000"
+                    },
+                },
+            },
             "links": {
                 "self": {"href": self._repo_api},
                 "html": {"href": f"{HTML_BASE}/{self.full_name}"},
