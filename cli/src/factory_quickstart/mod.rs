@@ -77,6 +77,10 @@ pub struct RecordedIntake {
     /// The Secret and data key holding the App private key.
     pub pem_secret: String,
     pub pem_secret_key: String,
+    /// The `jira` entries of `factory.trackers` and `factory.bindings`, which
+    /// a Jira quickstart wrote and every Jira agent on the release serves.
+    pub jira_tracker: Option<serde_json::Value>,
+    pub jira_binding: Option<serde_json::Value>,
 }
 
 /// One agent's GitHub binding on the serving release, as the API lists it.
@@ -130,12 +134,19 @@ pub fn recorded_intake(values: &serde_json::Value) -> Option<RecordedIntake> {
                 .collect()
         })
         .unwrap_or_default();
+    let named = |list: &str| {
+        factory.get(list)?.as_array()?.iter().find(|entry| {
+            entry.get("name").and_then(|v| v.as_str()) == Some(jira_cloud::BINDING_NAME)
+        })
+    };
     Some(RecordedIntake {
         app_id,
         install_label,
         repo_allowlist,
         pem_secret,
         pem_secret_key,
+        jira_tracker: named("trackers").cloned(),
+        jira_binding: named("bindings").cloned(),
     })
 }
 
@@ -1130,9 +1141,20 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         (false, None) => QuickstartPath::Register,
     };
     // #4362 decision 5, in order, before any mutation.
+    // The `jira` tracker and binding serve every Jira agent on the release,
+    // so the add agent path writes them only when the release has none.
+    let mut write_jira = input.jira.is_some();
     if let (QuickstartPath::AddAgent, Some(recorded)) = (path, &input.recorded) {
         refuse_install_flags(input.model_explicit, input.org.as_deref())?;
         check_recorded_allowlist(input, recorded)?;
+        if let Some(jira) = &input.jira {
+            write_jira = jira_cloud::check_recorded(
+                jira,
+                recorded.jira_tracker.as_ref(),
+                recorded.jira_binding.as_ref(),
+                &input.release,
+            )?;
+        }
     }
     // A Jira agent holds no GitHub surface, so the GitHub binding rules do
     // not apply to it.
@@ -1246,6 +1268,7 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
     let jira = input
         .jira
         .as_ref()
+        .filter(|_| write_jira)
         .map(|jira| Action::JiraTracker(Box::new(jira.clone())));
     match path {
         QuickstartPath::Install => {
@@ -2805,6 +2828,8 @@ mod tests {
             repo_allowlist: vec!["acme/widgets".into()],
             pem_secret: "factory-app".into(),
             pem_secret_key: "private-key.pem".into(),
+            jira_tracker: None,
+            jira_binding: None,
         }
     }
 

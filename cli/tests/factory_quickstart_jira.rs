@@ -731,8 +731,153 @@ fn add_agent_input() -> PlanInput {
         repo_allowlist: repos(),
         pem_secret: "curie-github-app".into(),
         pem_secret_key: "private-key".into(),
+        jira_tracker: None,
+        jira_binding: None,
     });
     input
+}
+
+/// The add agent path on a release whose `jira` tracker and binding another
+/// Jira agent already serves.
+fn add_agent_on_jira_release(tracker: Value, binding: Value) -> PlanInput {
+    let mut input = add_agent_input();
+    let recorded = input.recorded.as_mut().unwrap();
+    recorded.jira_tracker = Some(tracker);
+    recorded.jira_binding = Some(binding);
+    input
+}
+
+/// The refusal's message and fix, after checking it exits 2 and carries no
+/// token.
+fn usage_refusal(input: &PlanInput) -> String {
+    let error = quickstart_plan(input).expect_err("a differing jira entry is refused");
+    let cli = error
+        .downcast_ref::<curie::exit::CliError>()
+        .expect("a CliError");
+    assert_eq!(cli.class.code(), USAGE_EXIT, "{error:#}");
+    let text = format!("{}\n{}", cli.message, cli.fix.clone().unwrap_or_default());
+    assert_no_token(&text, "the refusal");
+    assert_no_token(&err_text(&error), "the refusal");
+    text
+}
+
+#[test]
+fn jira_add_agent_preserves_an_identical_recorded_tracker_and_binding() {
+    pinned_tmpdir();
+    let plan = fixture_plan();
+    // The recorded egress was resolved at an earlier preflight; it is kept.
+    let mut tracker = plan.tracker.clone();
+    tracker["egress"] = json!([{"cidr": "192.0.2.99/32", "ports": [{"protocol": "TCP", "port": 443}], "host": "jira.example.com"}]);
+    let planned = quickstart_plan(&add_agent_on_jira_release(tracker, plan.binding.clone()))
+        .expect("an identical jira entry is served as is");
+    assert_eq!(
+        action_names(&planned.actions),
+        ["egress", "label", "deploy"],
+        "no JiraTracker write: other agents' intake is not rewritten"
+    );
+    assert_eq!(deploy_binding(&planned.actions).as_deref(), Some(BINDING));
+}
+
+#[test]
+fn jira_add_agent_writes_the_entry_the_release_lacks() {
+    pinned_tmpdir();
+    let plan = fixture_plan();
+    let mut input = add_agent_input();
+    input.recorded.as_mut().unwrap().jira_tracker = Some(plan.tracker.clone());
+    let planned = quickstart_plan(&input).unwrap();
+    assert_eq!(
+        action_names(&planned.actions),
+        ["jira", "egress", "label", "deploy"]
+    );
+}
+
+#[test]
+fn jira_add_agent_refuses_a_binding_with_a_differing_repository_set() {
+    let plan = fixture_plan();
+    let mut binding = plan.binding.clone();
+    binding["repos"].as_array_mut().unwrap().push(
+        json!({"alias": "gears", "codeHost": "github", "projectId": "42", "path": "acme/gears"}),
+    );
+    let text = usage_refusal(&add_agent_on_jira_release(plan.tracker.clone(), binding));
+    assert!(text.contains("binding `jira`"), "{text}");
+    assert!(text.contains("its repos is"), "{text}");
+    assert!(
+        text.contains("acme/gears"),
+        "names the recorded value: {text}"
+    );
+    assert!(text.contains("--repo"), "says how to proceed: {text}");
+}
+
+#[test]
+fn jira_add_agent_refuses_a_binding_with_a_differing_start_allowlist() {
+    let plan = fixture_plan();
+    let mut binding = plan.binding.clone();
+    binding["startAuthority"] = json!({"type": "allowlist", "accounts": [STARTER, SECOND_STARTER]});
+    let text = usage_refusal(&add_agent_on_jira_release(plan.tracker.clone(), binding));
+    assert!(text.contains("its startAuthority is"), "{text}");
+    assert!(text.contains(SECOND_STARTER), "{text}");
+    assert!(text.contains("--start-account or --start-group"), "{text}");
+}
+
+#[test]
+fn jira_add_agent_refuses_a_tracker_on_a_differing_site() {
+    let plan = fixture_plan();
+    let mut tracker = plan.tracker.clone();
+    tracker["host"] = json!("other.atlassian.net");
+    tracker["apiUrl"] = json!("https://other.atlassian.net");
+    let mut binding = plan.binding.clone();
+    binding["trackerScopeId"] = json!(OTHER_CLOUD_ID);
+    let text = usage_refusal(&add_agent_on_jira_release(tracker, binding));
+    assert!(text.contains("tracker `jira`"), "{text}");
+    assert!(text.contains("its apiUrl is"), "{text}");
+    assert!(text.contains("https://other.atlassian.net"), "{text}");
+    assert!(text.contains("--forge-url"), "{text}");
+    assert!(text.contains("factory.trackers[jira].apiUrl"), "{text}");
+}
+
+#[test]
+fn jira_install_path_still_writes_over_a_recorded_jira_entry() {
+    // Liveness: the install path rewrites the intake whole, Jira included,
+    // and a first install with nothing recorded writes the entries.
+    pinned_tmpdir();
+    let plan = fixture_plan();
+    let mut tracker = plan.tracker.clone();
+    tracker["apiUrl"] = json!("https://other.atlassian.net");
+    let mut install = add_agent_on_jira_release(tracker, plan.binding.clone());
+    install.app_id = Some("12345".into());
+    install.private_key_file = Some("/keys/app.pem".into());
+    install.agent = DEFAULT_AGENT.into();
+    let planned = quickstart_plan(&install).unwrap();
+    assert!(action_names(&planned.actions).contains(&"jira"));
+    let first = quickstart_plan(&install_input()).unwrap();
+    assert_eq!(
+        action_names(&first.actions),
+        ["external", "cluster", "intake", "jira", "deploy"]
+    );
+}
+
+#[test]
+fn recorded_intake_reads_the_jira_tracker_and_binding_by_name() {
+    let plan = fixture_plan();
+    let values = json!({
+        "api": {"githubRepoAllowlist": [REPO]},
+        "factory": {
+            "enabled": true,
+            "intake": "poll",
+            "codeHosts": [{"name": "github", "kind": "github", "credential": {"appId": "12345", "existingSecret": "curie-github-app"}}],
+            "trackers": [{"name": "github", "kind": "github", "label": "curie-factory"}, plan.tracker],
+            "bindings": [{"name": "ops", "tracker": "github"}, plan.binding],
+        }
+    });
+    let recorded = curie::factory_quickstart::recorded_intake(&values).unwrap();
+    assert_eq!(recorded.jira_tracker, Some(plan.tracker));
+    assert_eq!(recorded.jira_binding, Some(plan.binding));
+    let mut github_only = values.clone();
+    github_only["factory"]["trackers"] =
+        json!([{"name": "github", "kind": "github", "label": "curie-factory"}]);
+    github_only["factory"]["bindings"] = json!([]);
+    let recorded = curie::factory_quickstart::recorded_intake(&github_only).unwrap();
+    assert_eq!((recorded.jira_tracker, recorded.jira_binding), (None, None));
 }
 
 /// `bundle_dir` embeds the temp dir; pin it like the #4346 goldens do.
