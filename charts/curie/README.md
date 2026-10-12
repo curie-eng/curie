@@ -870,12 +870,15 @@ keys carries a `checksum/secret` pod-template annotation. It hashes only that
 pod's consumed keys from the same once-per-render plaintext content emitted by
 the Secret, including rendered `extraEnv` references. A `helm upgrade` that
 changes a consumed key rolls its consumers; unchanged Secret content, unrelated
-keys, replica counts and image tags leave the checksum unchanged. Pods that
-consume no chart-owned keys, chart Jobs and the SandboxTemplate carry no such
-annotation. Foreign `existingSecret` contents are excluded; rotating a foreign
-Secret in place generally needs an explicit rollout unless a component already
-has its own rotation mechanism. Restarting a store does not rotate the password
-in its persisted database; coordinate that database-side change separately.
+keys, replica counts and image tags leave the checksum unchanged. The first
+upgrade onto this chart adds the annotation and rolls each current consumer
+once, including all four backing StatefulSets when they use chart-owned
+credentials. Pods that consume no chart-owned keys, chart Jobs and the
+SandboxTemplate carry no such annotation. Foreign `existingSecret` contents are
+excluded, so rotating one in place still needs a manual restart; existing
+component-specific rotation mechanisms continue to apply. Restarting a store
+does not rotate the password in its persisted database; coordinate that
+database-side change separately.
 
 Dev installs derive their installation identity from the namespace and release
 name so identical inputs render identical checksums (#1135, ADR-0144). Reinstalling
