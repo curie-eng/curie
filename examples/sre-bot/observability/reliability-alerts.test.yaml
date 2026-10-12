@@ -856,14 +856,13 @@ tests:
   # One installation can run several mail adapters, one per mailbox, named
   # with a suffix. PromQL label matchers are fully anchored, so
   # `deployment=~".*mail-adapter"` matches `mail-adapter` and not
-  # `mail-adapter-brand`. On the downstream cluster that measured this, two of
-  # its three adapters could never alert.
+  # `acme-mail-adapter-example`, so a suffixed adapter needs the trailing wildcard.
   - name: a suffixed mail adapter with unavailable replicas fires
     interval: 1m
     input_series:
-      - series: 'kube_deployment_spec_replicas{namespace="curie",deployment="mail-adapter-brand"}'
+      - series: 'kube_deployment_spec_replicas{namespace="curie",deployment="acme-mail-adapter-example"}'
         values: '1x15'
-      - series: 'kube_deployment_status_replicas_unavailable{namespace="curie",deployment="mail-adapter-brand"}'
+      - series: 'kube_deployment_status_replicas_unavailable{namespace="curie",deployment="acme-mail-adapter-example"}'
         values: '1x15'
     alert_rule_test:
       - eval_time: 10m
@@ -873,7 +872,7 @@ tests:
               severity: page
               component: curie-token
               namespace: curie
-              deployment: mail-adapter-brand
+              deployment: acme-mail-adapter-example
             exp_annotations:
               summary: Mail adapter replicas are unavailable
               description: The mail adapter Deployment has unavailable replicas. An expired channel token fails /readyz and surfaces here without inspecting a token value.

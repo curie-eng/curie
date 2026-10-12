@@ -84,16 +84,13 @@ tester grades only what needs no spec, and marks the report `(no spec)`:
   invitation list is the allowlist: the bot can post anywhere it is invited.
   Never invite it to an externally shared channel. Nothing else stops it
   probing there.
-- **A GitHub token for the tester itself**, never a person's. It is needed
-  only for repositories listed under "Where you work". Use either a
-  fine-grained token on a machine account, or a GitHub App installation
-  token, limited to those repositories with **Contents: Read** and nothing
-  else. The token sits in the sandbox's environment, so its scope is the real
-  bound. A tester that reads every target through the workspace
-  still needs the secret bound, because the manifest declares it: give it a
-  token that can read no private repository. The manifest declares the secret either way. With no repository
-  listed, give it a token that can read no private repository, such as a
-  fine-grained token limited to public repositories.
+- **An optional GitHub token for the tester itself**, never a person's. Omit
+  `GITHUB_PERSONAL_ACCESS_TOKEN` for Slack-only campaigns, request specs,
+  attached specs and recorded exchanges. Bind it only when the tester will
+  read repositories listed under "Where you work". Use a fine-grained machine
+  account token or GitHub App installation token limited to those repositories
+  with **Contents: Read**. Without it, skip authenticated GitHub reads and ask
+  for the spec in the request; never invent repository access.
 - **Enough agent steps for a campaign.** The runner ends a turn after
   `CURIE_MAX_TURNS` model steps, 20 by default. A campaign takes well over a
   hundred: every probe, read and wait is a step. Set it for the tester's
@@ -172,12 +169,14 @@ TCP 443:
 ```bash
 export MEAN_TESTER_SLACK_BOT_TOKEN=xoxb-...   # the tester's own app
 export MEAN_TESTER_SLACK_TEAM_ID=T...         # the workspace the app is installed in
-export GITHUB_PERSONAL_ACCESS_TOKEN=...       # Contents: Read, listed repositories only
 curie build --plugin-dir examples/mean-tester --registry <registry-ref>
 curie cluster deploy --plugin-dir examples/mean-tester --target dev \
-  --secret MEAN_TESTER_SLACK_BOT_TOKEN --secret MEAN_TESTER_SLACK_TEAM_ID \
-  --secret GITHUB_PERSONAL_ACCESS_TOKEN
+  --secret MEAN_TESTER_SLACK_BOT_TOKEN --secret MEAN_TESTER_SLACK_TEAM_ID
 ```
+
+For authenticated reads of listed repositories, export
+`GITHUB_PERSONAL_ACCESS_TOKEN` and add `--secret GITHUB_PERSONAL_ACCESS_TOKEN` to
+the deploy command. Omit both for Slack-only campaigns and recorded exchanges.
 
 `curie build` builds the runner layer that carries the Slack and GitHub
 servers and records its digest in `connectors.lock.yaml`. The deploy refuses

@@ -96,6 +96,17 @@ workspace and preserves the shell arguments, exit status and signals. Missing or
 nonexecutable launchers reject session startup instead of selecting another shell.
 Declared connector secrets remain available to bundle tools.
 
+SDK initialization writes a start record and a finish record to the runner log
+under the fixed phase `sdk_initialize`. The finish record carries the outcome
+(`success`, `failure` or `cancelled`), monotonic elapsed milliseconds, the SDK
+version and, on failure only, the exception class. It never carries options,
+environment, prompts or exception text. Every Claude CLI stderr line still reaches
+the runner's stderr for the whole session. While connect runs, the runner also
+keeps a copy of those lines, redacted before it is kept and bounded to the newest
+8192 UTF-8 bytes. A failed initialization emits that tail as one WARNING; success
+and cancellation discard it, and nothing is kept after connect ends. The original
+exception propagates unchanged, with no retry or timeout change.
+
 Each `text_delta` the runner emits is one whole assistant text block, and a
 consumer joins deltas as they come. The same boundary therefore starts a later
 block of the turn on its own paragraph (a blank line), unless the model already
@@ -350,24 +361,28 @@ marker. This grouping is replay metadata, never approval or tool authority.
   inference from adjacency, result arrival, tool name, or prose may combine
   independent messages or move a dependent call before the result it consumes.
 - **RUNNER-HISTORY-GROUP-4:** Old role/content-only records remain readable.
-  Unambiguous sequential call/result history works without a native checkpoint.
-  A legacy checkpoint can supply missing group identity only when its assistant
-  and user conversation rows match the authoritative portable prefix exactly
-  and unambiguously, with valid IDs and causal boundaries. Its prompt snapshots,
+  Unambiguous sequential call/result history works without a native checkpoint. A
+  legacy checkpoint can supply missing group identity only when its assistant and
+  user conversation rows match the authoritative portable prefix exactly and
+  unambiguously, with valid IDs and causal boundaries. Its prompt snapshots,
   attachment availability, other envelope fields, and extra content are never
   imported by this recovery. If an overlapping tool-call sequence needs grouping
-  that neither portable metadata nor validated native mapping proves, never
-  submit that known corrupt replay or manufacture a result. Replay that one turn
-  as its visible text instead: the turn runs from a genuine user message to the
-  next one, and it becomes that user message followed by one assistant message
-  carrying the turn's assistant text blocks in order (or, if it had none, a text
-  saying its tool activity could not be replayed). Every other turn keeps its
-  rows unchanged, a native checkpoint is set aside, and the runner logs a WARNING
-  naming the session and the number of turns reduced, never their content.
-  Refusing the whole history instead strands the thread: the runner exits
-  before it is ready, every retry and every later message in that thread fails
-  the same way, and a thread whose key is fixed, such as an inbound hook's, can
-  never start fresh.
+  that neither portable metadata nor validated native mapping proves, never submit
+  that known corrupt replay or manufacture a result. Replay that one turn as its
+  visible text instead: the turn runs from a genuine user message (a user row
+  carrying no tool result) to the next one, and it becomes that user message
+  followed by one assistant message carrying the turn's assistant text blocks in
+  order (or, if it had none, a text saying its tool activity could not be
+  replayed). Subagent messages (those with a parent tool call) are not portable
+  history; only the parent's `Agent` call and its result are. Overlap that spans
+  turns is reduced the same way, both the turn that adds the overlapping call and
+  each earlier turn still holding an unanswered call, plus any later turn holding
+  a result for a reduced call. Every other turn keeps its rows unchanged, a native
+  checkpoint is set aside, and the runner logs a WARNING naming the session and
+  the number of turns reduced, never their content. Refusing the whole history
+  instead strands the thread: the runner exits before it is ready, every retry and
+  every later message in that thread fails the same way, and a thread whose key is
+  fixed, such as an inbound hook's, can never start fresh.
 - **RUNNER-HISTORY-GROUP-5:** Reject malformed persisted group metadata and
   inconsistent provenance, including attribution on user rows and reuse across
   genuine user or distinct assistant-group boundaries. Preserve group identity

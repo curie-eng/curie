@@ -38,7 +38,7 @@
 //! (not even the agent lookup) and, at the cluster tier, before connection
 //! discovery. Ids must be canonical lowercase UUIDs. The token is never printed.
 
-mod support;
+use crate::support;
 
 use std::process::{Command, Output};
 

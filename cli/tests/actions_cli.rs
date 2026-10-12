@@ -24,7 +24,7 @@
 //!   row's `refusal_code` or `failure_code` (null when confirmed)
 //! - any error   -> the ADR-0021 `{"error", "fix"}` object
 
-mod support;
+use crate::support;
 
 use std::process::{Command, Output};
 

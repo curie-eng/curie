@@ -29,8 +29,9 @@ the same shared function. The swap
 axis here is the state backend, and it is a SOFT seam: the store is reached over the HTTP
 state API, not a typed in-process port, so a second backend is a persistence change behind
 that API rather than a `Protocol` swap. A separate concrete route store, `AffinityStore`,
-records one narrow thing (the `thread_key -> sandbox route` binding on Valkey, with atomic
-acquire and TTL expiry) and is not the general store. The typed in-process port the kernel
+records the `thread_key -> sandbox route` binding on Valkey, with atomic acquire and
+TTL expiry, plus claim credential ids retained for release reporting. It is not the
+general store. The typed in-process port the kernel
 would write arbitrary run state through (#23) is still unextracted, per "the second
 implementation teaches the interface."
 
@@ -120,6 +121,14 @@ authenticated, with its verified claims, is carried through as
 `apps/api/src/curie_api/routers/state.py::StateCaller`), resolved by
 `apps/api/src/curie_api/routers/state.py::require_state_access`.
 
+Both boot scopes carry the same `cred` id. Before accepting either one,
+`apps/api/src/curie_api/routers/state.py::_check_credential_current` checks Valkey
+for a release record: a released id is refused with 403, and an unavailable check
+returns 503. A token without `cred` retains its expiry-based lifetime. The worker reports
+release through `apps/api/src/curie_api/routers/state.py::release_sandbox_credential`,
+which keeps the refusal record for 24 hours. Thus sandbox state access depends on
+Valkey authorization state as well as the Postgres data backend.
+
 Every completed state delete, shared or binding scoped and including a
 transcript, and every operator memory edit or delete, leaves one INFO line on
 the `curie_api.state_mutation` logger, plus one `curie.state.mutation` count
@@ -151,6 +160,17 @@ route-state contract:
 - `mark_suspended(thread_key, history_ref, ttl_seconds) -> RouteRecord` (`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore.mark_suspended`)
 
 The stored value is a `RouteRecord` (`apps/worker/src/curie_worker/sandbox/types.py::RouteRecord`) JSON-serialized. This is route affinity, not general workflow state.
+
+The same concrete store also retains `(agent, credential id)` by claim name for up to
+24 hours through `AffinityStore.remember_claim_credential`, looks it up through
+`AffinityStore.claim_credential`, removes it through `AffinityStore.forget_claim_credential`,
+and scans retained records through `AffinityStore.iter_claim_credentials`
+(`apps/worker/src/curie_worker/sandbox/affinity.py::AffinityStore`). These are ids,
+not bearer tokens. `SandboxSubstrate._report_boot_credential` reports the release
+before claim deletion and removes the retained record only after the API accepts it.
+A failed or unwired report remains for reaping to retry after confirming the claim is
+gone (`apps/worker/src/curie_worker/sandbox/substrate.py::SandboxSubstrate._retry_unreported_credentials`).
+Its TTL backstops those pending reports; it is not proof that the API recorded a release.
 
 ## Implementations today
 

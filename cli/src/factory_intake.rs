@@ -545,8 +545,13 @@ async fn plan_app(
     recorded: &serde_json::Value,
     app_id: &str,
     preflight: crate::factory_toolchain::AppPreflight,
-) -> Result<AppPlan> {
-    let crate::factory_toolchain::AppPreflight { pem, api, app } = preflight;
+) -> Result<(AppPlan, crate::factory_app::PublicationIdentity)> {
+    let crate::factory_toolchain::AppPreflight {
+        pem,
+        api,
+        app,
+        publication,
+    } = preflight;
     let repos_inferred = opts.repos.is_empty();
     let repos = crate::factory_app::resolve_allowlist(&opts.repos, &app)?;
     opts.repos = repos.clone();
@@ -580,27 +585,30 @@ async fn plan_app(
             labels_missing.push(repo);
         }
     }
-    Ok(AppPlan {
-        labels_missing,
-        app,
-        api,
-        app_id: app_id.to_string(),
-        secret_name,
-        secret_key,
-        secret,
-        mention: crate::factory_app::Chosen {
-            value: mention,
-            inferred: mention_inferred,
+    Ok((
+        AppPlan {
+            labels_missing,
+            app,
+            api,
+            app_id: app_id.to_string(),
+            secret_name,
+            secret_key,
+            secret,
+            mention: crate::factory_app::Chosen {
+                value: mention,
+                inferred: mention_inferred,
+            },
+            repos: crate::factory_app::Chosen {
+                value: repos,
+                inferred: repos_inferred,
+            },
+            label: crate::factory_app::Chosen {
+                value: label,
+                inferred: label_inferred,
+            },
         },
-        repos: crate::factory_app::Chosen {
-            value: repos,
-            inferred: repos_inferred,
-        },
-        label: crate::factory_app::Chosen {
-            value: label,
-            inferred: label_inferred,
-        },
-    })
+        publication,
+    ))
 }
 
 fn app_dry_run_lines(opts: &FactoryIntakeOpts, key_file: &Path) -> Vec<String> {
@@ -613,6 +621,7 @@ fn app_dry_run_lines(opts: &FactoryIntakeOpts, key_file: &Path) -> Vec<String> {
         ),
         format!("# GET {api}/app with an App JWT (slug, id check)"),
         format!("# GET {api}/app/installations"),
+        format!("# GET {api}/users/<app-slug>[bot] for its publication author identity"),
         format!(
             "# POST {api}/app/installations/<id>/access_tokens, then GET {api}/installation/repositories per installation"
         ),
@@ -683,6 +692,12 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
             lines.insert(0, crate::factory_toolchain::PLAN_NOTE.into());
         } else if !opts.disable {
             lines.push(crate::factory_toolchain::SKIPPED_NOTE.into());
+            if let Some(slug) = &opts.mention {
+                let api = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
+                lines.push(format!(
+                    "# GET {api}/users/{slug}[bot] for its publication author identity"
+                ));
+            }
         }
         if !opts.disable && !opts.github_api_egress.is_empty() {
             let api = crate::github_app::github_api_url(crate::github_app::DEFAULT_CLONE_BASE);
@@ -702,6 +717,7 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
         )));
     }
     let mut app_plan = None;
+    let mut publication = None;
     if !opts.disable {
         // Repository auth and inference are a preflight, before any Helm read
         // or context-dependent setup. Reuse its tokens for the setup plan.
@@ -711,6 +727,13 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
             crate::ui::ui().note(crate::factory_toolchain::SKIPPED_NOTE);
             None
         };
+        if let (None, Some(slug)) = (&preflight, &opts.mention) {
+            publication = Some(
+                crate::factory_app::GithubApi::new()?
+                    .bot_publication_identity(slug)
+                    .await?,
+            );
+        }
         let recorded = fetch_release_values(&opts.common)
             .await?
             .unwrap_or(serde_json::Value::Null);
@@ -726,16 +749,26 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
             }
             None => {}
             Some((id, _)) => {
-                app_plan = Some(
-                    plan_app(
-                        &mut opts,
-                        &recorded,
-                        id,
-                        preflight.expect("App arguments have a completed preflight"),
-                    )
-                    .await?,
-                );
+                let (plan, identity) = plan_app(
+                    &mut opts,
+                    &recorded,
+                    id,
+                    preflight.expect("App arguments have a completed preflight"),
+                )
+                .await?;
+                app_plan = Some(plan);
+                publication = Some(identity);
             }
+        }
+        // Helm get values returns user values, without the chart's defaults.
+        // Either present, non-null operator field owns the whole identity,
+        // including an explicit empty or numeric value.
+        if ["gitUserName", "gitUserEmail"].iter().any(|key| {
+            recorded
+                .pointer(&format!("/worker/publication/{key}"))
+                .is_some_and(|value| !value.is_null())
+        }) {
+            publication = None;
         }
         let mut planned = intake_values(&opts, &[]);
         if let Some(plan) = &app_plan {
@@ -768,6 +801,14 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
     let mut values = intake_values(&opts, &cidrs);
     if let Some(plan) = &app_plan {
         merge_api(&mut values, &app_values(plan));
+    }
+    if let Some(identity) = &publication {
+        values["worker"] = serde_json::json!({
+            "publication": {
+                "gitUserName": identity.name,
+                "gitUserEmail": identity.email,
+            }
+        });
     }
     let timeout = match opts.timeout_seconds {
         Some(explicit) => explicit,

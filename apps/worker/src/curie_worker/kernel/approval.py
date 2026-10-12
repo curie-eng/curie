@@ -72,10 +72,13 @@ class _ApprovalPause:
 
     ``failure_detail`` is the API's redacted, clipped coded refusal (#3617)
     when the create was refused with one; the factory run reports it.
+    ``abandoned`` means the WorkItem run bound to the event was given up as a
+    stale owner, so nothing was created and nothing may be posted (#4331).
     """
 
     created: bool
     failure_detail: str | None = None
+    abandoned: bool = False
 
     @classmethod
     def refused(cls, detail: str | None) -> _ApprovalPause:
@@ -572,8 +575,13 @@ async def _pause_for_approval(
 
     Returns whether the approval was created and, when it was not, the
     API's coded refusal (#3617) for the factory run's detail, if any.
+    A WorkItem run abandoned as a stale owner creates nothing (#4331). The
+    abandonment arrives asynchronously from the heartbeat, so it is checked
+    at entry, immediately before the create, and again after it returns.
     """
 
+    if self._approval_run_abandoned(qevent):
+        return _ApprovalPause(created=False, abandoned=True)
     handle = routing._reply_handle_for(qevent)
     # Both identities are live in this function and they are not
     # interchangeable: ``thread`` is the BARE adapter conversation id used
@@ -704,6 +712,8 @@ async def _pause_for_approval(
         if parsed_publication is not None and parsed_publication.kind in {"execute", "ci"}
         else None
     )
+    if self._approval_run_abandoned(qevent):
+        return _ApprovalPause(created=False, abandoned=True)
     try:
         if is_publication:
             publication_creator = self._publication_creator
@@ -858,11 +868,19 @@ async def _pause_for_approval(
         # not constrain. The API rejected these with a 422 before the model
         # was shared, which surfaced here as ApprovalBackendError; both still
         # escalate to a human rather than stranding the turn.
+        if self._approval_run_abandoned(qevent):
+            # #4331: abandoned while the create retried; nobody to escalate for.
+            return _ApprovalPause(created=False, abandoned=True)
         refusal = exc.refusal if isinstance(exc, ApprovalBackendError) else None
         if refusal is not None and refusal.startswith("publication.work_item_cancelled:"):
             logger.info("approval create refused for cancelled work item %s", qevent.event_id)
             return _ApprovalPause.refused(refusal)
-        logger.warning("approval create failed for %s: %s", qevent.event_id, exc)
+        logger.warning(
+            "approval create failed for %s: %s: %s",
+            qevent.event_id,
+            type(exc).__name__,
+            exc,
+        )
         await self._escalate(
             qevent,
             route,
@@ -871,6 +889,17 @@ async def _pause_for_approval(
             failure_class="approval-create-failed",
         )
         return _ApprovalPause.refused(refusal)
+    if self._approval_run_abandoned(qevent):
+        # #4331: the thread route may now name a successor's claim, so this
+        # worker neither touches the workspace nor suspends.
+        logger.warning(
+            "%s %s for %s was created before the run's abandonment was observed; "
+            "leaving it to the API termination chain",
+            "publication" if is_publication else "approval",
+            created.id,
+            qevent.event_id,
+        )
+        return _ApprovalPause(created=False, abandoned=True)
 
     progress_plan = constants._TURN_PROGRESS.get()
     if progress_plan is not None and self._progress is not None:
@@ -1257,3 +1286,24 @@ async def _escalate_unanswerable_email_approval(
         "here can answer.",
         failure_class="approval-no-email-approvers",
     )
+
+
+def _approval_run_abandoned(self: Kernel, qevent: QueuedTurn) -> bool:
+    """True when the WorkItem run bound to this event was abandoned (#4331).
+
+    A stale owner's approval would outlive the request the API already
+    handed to a successor, so it is not created.
+    """
+
+    parsed = parse_work_item_event_id(qevent.event_id)
+    if parsed is None or parsed.kind not in {"execute", "ci"}:
+        return False
+    run = self._work_item_runs.get(parsed.request_id)
+    if run is None or run.event_id != qevent.event_id or not run.abandoned:
+        return False
+    logger.warning(
+        "work-item %s was abandoned as a stale owner; creating no approval for %s",
+        run.request_id,
+        qevent.event_id,
+    )
+    return True

@@ -8,8 +8,7 @@
 //! Hook Jobs use Helm's documented `helm.sh/hook` annotation:
 //! https://helm.sh/docs/topics/charts_hooks/
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::PathBuf;

@@ -22,7 +22,7 @@ use crate::ui::DryRunPlan;
 pub const DEFAULT_KIND_NAME: &str = "curie-factory";
 pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
 pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-5-5";
-pub const DEFAULT_DEADLINE_SECONDS: u32 = 3600;
+pub const DEFAULT_DEADLINE_SECONDS: u32 = 10800;
 pub const DEFAULT_BUDGET_USD: f64 = 5.0;
 pub const AGENT_NAME: &str = "dark-factory";
 pub const GVISOR_OFF_SET: &str = "security.gvisor.mode=off";
@@ -2061,7 +2061,7 @@ mod tests {
         assert!(text.contains("--env prod"), "{text}");
         assert!(text.contains("--repo acme/widgets"), "{text}");
         assert!(text.contains("--add github=acme/widgets"), "{text}");
-        assert!(text.contains("--execution-deadline 3600"), "{text}");
+        assert!(text.contains("--execution-deadline 10800"), "{text}");
         assert!(text.contains("--policy auto"), "{text}");
         assert!(text.contains("--limit 5"), "{text}");
         assert!(text.contains("use CURIE_CREDENTIALS (no prompt)"), "{text}");
@@ -2229,7 +2229,7 @@ mod tests {
         input.credential_in_env = true;
         let lines = describe(&quickstart_plan(&input).unwrap());
         let dir = bundle_dir("curie", "curie");
-        // The complete ordered plan the pre-#4346 code printed for this input.
+        // The complete ordered single-repository plan, retaining the stable deadline fix.
         let expected: Vec<String> = vec![
             crate::factory_toolchain::PLAN_NOTE.to_string(),
             "Kubernetes context: kind-curie-factory because --context was passed".to_string(),
@@ -2240,7 +2240,7 @@ mod tests {
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
             format!("curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
             "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),
-            "curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 3600".to_string(),
+            "curie cluster overrides dark-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800".to_string(),
             "curie cluster publication-policy dark-factory --context kind-curie-factory --namespace curie --release curie --policy auto".to_string(),
             "curie cluster budget dark-factory --context kind-curie-factory --namespace curie --release curie --limit 5".to_string(),
         ];

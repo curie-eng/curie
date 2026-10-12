@@ -1,21 +1,25 @@
-"""The scripted Messages endpoint matches content and fails closed (#3814).
+"""Exercise replay matching and recording through the Messages HTTP boundary.
 
-Streaming frames follow https://platform.claude.com/docs/en/api/messages-streaming.
-Recording proxies an Anthropic-compatible base such as
-https://openrouter.ai/api (https://openrouter.ai/docs/api-reference/overview).
+Streaming follows https://platform.claude.com/docs/en/api/messages-streaming.
+The recording provider is Anthropic compatible, as documented at
+https://openrouter.ai/docs/api-reference/overview.
 """
 
 from __future__ import annotations
 
+import http.client
 import importlib.util
 import json
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
+from curie_runner.sender_frame import frame_user_turn
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -51,80 +55,140 @@ def _message(name: str, text: str) -> dict[str, Any]:
     }
 
 
-def _request(system: str, user: str, *, stream: bool = False) -> dict[str, Any]:
+def _request(
+    system: str, user: str, *, ordinal: int = 0, stream: bool = False
+) -> dict[str, Any]:
+    messages: list[dict[str, Any]] = [{"role": "user", "content": user}]
+    for index in range(ordinal):
+        messages += [
+            {"role": "assistant", "content": f"Earlier answer {index}"},
+            {"role": "user", "content": f"Later result {index}"},
+        ]
     return {
         "model": "scripted",
         "max_tokens": 32,
         "stream": stream,
         "system": system,
-        "messages": [{"role": "user", "content": user}],
+        "messages": messages,
     }
 
 
-def _exchange(system: str, tool: str) -> dict[str, Any]:
-    body = _request(system, "review this diff" if "diff" in system else "plan the change")
+def _exchange(user: str, tool: str, *, ordinal: int = 0) -> dict[str, Any]:
     return {
-        "match": ms.normalize({"method": "POST", "path": "/v1/messages", "body": body}),
-        "message": _message(tool, system),
+        "lane_key": ms.scrub(user),
+        "ordinal": ordinal,
+        "message": _message(tool, "recorded response"),
     }
 
 
-def _post(base: str, payload: dict[str, Any]) -> tuple[int, bytes, str]:
-    data = json.dumps(payload).encode()
+def _post(
+    base: str, payload: dict[str, Any], *, headers: dict[str, str] | None = None
+) -> tuple[int, bytes, str]:
     request = Request(
         base + "/v1/messages",
-        data=data,
-        headers={"Content-Type": "application/json"},
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", **(headers or {})},
         method="POST",
     )
     try:
         with urlopen(request, timeout=5) as response:
             return response.status, response.read(), response.headers.get("Content-Type", "")
-    except Exception as exc:
-        if not hasattr(exc, "code"):
-            raise
-        return int(exc.code), exc.read(), exc.headers.get("Content-Type", "")
+    except HTTPError as exc:
+        return exc.code, exc.read(), exc.headers.get("Content-Type", "")
 
 
-def test_normalize_ignores_stream_ids_and_urls() -> None:
-    left = {
-        "system": "plan reviewer https://github.com/acme/fixture/issues/4",
-        "stream": True,
-        "messages": [{"content": "toolu_abc msg_def " + "a" * 40}],
-    }
-    right = {
-        "stream": False,
-        "messages": [{"content": "toolu_xyz msg_zzz " + "b" * 40}],
-        "system": "plan reviewer https://github.com/other/repo/issues/9",
-    }
-    assert ms.normalize(left) == ms.normalize(right)
+def test_replay_ignores_system_tools_model_and_later_messages(tmp_path: Path) -> None:
+    path = tmp_path / "transcript.json"
+    ms.dump_transcript(path, [_exchange("plan the change", "Plan", ordinal=1)])
+    script = ms.ModelScript(path)
+    script.start()
+    try:
+        payload = _request(
+            "Today is 2027-01-02. Completely different system.", "plan the change", ordinal=1
+        )
+        payload["model"] = "another-model"
+        payload["tools"] = [{"name": "DifferentTool", "input_schema": {"type": "object"}}]
+        payload["messages"][-1]["content"] = "Ran 8 tests in 0.987s instead of 0.123s"
+        status, body, _ = _post(script.base_url, payload)
+        assert status == 200
+        assert json.loads(body)["content"][0]["name"] == "Plan"
+    finally:
+        script.close()
 
 
-def test_serve_matches_plan_and_diff_reviewers_and_rejects_unknown(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("recorded", "replayed"),
+    [
+        ("Review on 2026-10-06", "Review on 2027-01-02"),
+        ("Tests finished in 0.123s", "Tests finished in 12.987s"),
+        ("Ran tests in 0.123 seconds", "Ran tests in 2.987 seconds"),
+        (
+            "Review https://github.com/acme-corp/acme-bot/issues/4 at "
+            "2026-10-06T10:20:30Z with toolu_abc msg_def " + "a" * 40,
+            "Review https://github.com/acme-corp/acme-bot/issues/9 at "
+            "2027-01-02T11:22:33Z with toolu_xyz msg_zzz " + "b" * 40,
+        ),
+    ],
+)
+def test_replay_scrubs_first_user_dates_durations_and_ids(
+    tmp_path: Path, recorded: str, replayed: str
+) -> None:
+    path = tmp_path / "transcript.json"
+    ms.dump_transcript(path, [_exchange(recorded, "Edit")])
+    script = ms.ModelScript(path)
+    script.start()
+    try:
+        status, body, content_type = _post(
+            script.base_url, _request("A new system prompt", replayed, stream=True)
+        )
+        assert status == 200
+        assert "text/event-stream" in content_type
+        assert b"Edit" in body
+    finally:
+        script.close()
+
+
+def test_replay_selects_interleaved_lanes_and_assistant_ordinals(tmp_path: Path) -> None:
     path = tmp_path / "transcript.json"
     ms.dump_transcript(
         path,
         [
-            _exchange("You are the plan reviewer.", "Plan"),
-            _exchange("You are the diff reviewer.", "Diff"),
+            _exchange("plan the change", "Plan"),
+            _exchange("review the diff", "Diff"),
+            _exchange("plan the change", "Finish", ordinal=1),
         ],
     )
     script = ms.ModelScript(path)
     script.start()
     try:
-        status, body, content_type = _post(
-            script.base_url,
-            _request("You are the diff reviewer.", "review this diff", stream=True),
-        )
-        assert status == 200
-        assert "text/event-stream" in content_type
-        assert b"Diff" in body
+        for user, ordinal, tool in [
+            ("review the diff", 0, "Diff"),
+            ("plan the change", 1, "Finish"),
+            ("plan the change", 0, "Plan"),
+        ]:
+            status, body, _ = _post(
+                script.base_url, _request("ignored system", user, ordinal=ordinal)
+            )
+            assert status == 200
+            assert json.loads(body)["content"][0]["name"] == tool
+    finally:
+        script.close()
+
+
+@pytest.mark.parametrize(
+    ("user", "ordinal"), [("a different first user message", 0), ("plan the change", 1)]
+)
+def test_replay_rejects_an_unrecorded_lane_or_ordinal(
+    tmp_path: Path, user: str, ordinal: int
+) -> None:
+    path = tmp_path / "transcript.json"
+    ms.dump_transcript(path, [_exchange("plan the change", "Plan")])
+    script = ms.ModelScript(path)
+    script.start()
+    try:
         status, body, _ = _post(
-            script.base_url, _request("You are the plan reviewer.", "plan the change")
+            script.base_url, _request("same system", user, ordinal=ordinal)
         )
-        assert status == 200
-        assert json.loads(body)["content"][0]["name"] == "Plan"
-        status, body, _ = _post(script.base_url, _request("You are a stranger.", "hello"))
         assert status == 422
         assert json.loads(body)["error"]["type"] == "unexpected_request"
     finally:
@@ -132,8 +196,27 @@ def test_serve_matches_plan_and_diff_reviewers_and_rejects_unknown(tmp_path: Pat
             script.close()
 
 
-def test_record_proxies_and_replays(tmp_path: Path) -> None:
-    seen: dict[str, str] = {}
+def test_replay_cannot_reuse_an_exchange(tmp_path: Path) -> None:
+    path = tmp_path / "transcript.json"
+    ms.dump_transcript(path, [_exchange("plan the change", "Plan")])
+    script = ms.ModelScript(path)
+    script.start()
+    try:
+        payload = _request("ignored system", "plan the change")
+        assert _post(script.base_url, payload)[0] == 200
+        assert _post(script.base_url, payload)[0] == 422
+    finally:
+        with pytest.raises(ms.UnexpectedRequest):
+            script.close()
+
+
+def test_record_injects_environment_key_and_saves_only_replay_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    provider_key = "example-provider-key"
+    client_key = "example-cluster-key"
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", provider_key)
+    seen: list[dict[str, str]] = []
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args: Any) -> None:
@@ -142,7 +225,13 @@ def test_record_proxies_and_replays(tmp_path: Path) -> None:
         def do_POST(self) -> None:  # noqa: N802
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
-            seen["key"] = self.headers.get("x-api-key", "")
+            seen.append(
+                {
+                    "key": self.headers.get("x-api-key", ""),
+                    "authorization": self.headers.get("Authorization", ""),
+                    "version": self.headers.get("anthropic-version", ""),
+                }
+            )
             message = _message("Edit", "recorded")
             if json.loads(raw).get("stream"):
                 payload = ms.message_to_sse(message)
@@ -157,47 +246,343 @@ def test_record_proxies_and_replays(tmp_path: Path) -> None:
             self.wfile.write(payload)
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread_started = __import__("threading").Thread(target=server.serve_forever, daemon=True)
-    thread_started.start()
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
     output = tmp_path / "recorded.json"
+    recorder = ms.ModelScript(
+        output, record=True, upstream=f"http://127.0.0.1:{server.server_address[1]}"
+    )
+    recorder.start()
     try:
-        recorder = ms.ModelScript(
-            output,
-            record=True,
-            upstream=f"http://127.0.0.1:{server.server_address[1]}",
-        )
-        recorder.start()
-        status, body, _ = _post(
-            recorder.base_url,
-            _request("You are the implementer.", "add fahrenheit", stream=True),
-        )
-        assert status == 200
-        assert b"Edit" in body
-        request = Request(
-            recorder.base_url + "/v1/messages",
-            data=json.dumps(
-                _request("You are the implementer.", "add fahrenheit", stream=True)
-            ).encode(),
-            headers={"Content-Type": "application/json", "x-api-key": "sk-or-test-secret"},
-            method="POST",
-        )
-        with urlopen(request, timeout=5) as response:
-            assert response.status == 200
-        recorder.close()
+        for ordinal, stream in [(0, True), (1, False)]:
+            status, body, _ = _post(
+                recorder.base_url,
+                _request(
+                    "private system request marker", "add Kelvin", ordinal=ordinal, stream=stream
+                ),
+                headers={
+                    "x-api-key": client_key,
+                    "Authorization": f"Bearer {client_key}",
+                    "anthropic-version": "2023-06-01",
+                },
+            )
+            assert status == 200
+            assert b"Edit" in body
     finally:
+        recorder.close()
         server.shutdown()
         server.server_close()
-    assert seen["key"] == "sk-or-test-secret"
-    saved = json.loads(output.read_text())
+        thread.join(timeout=5)
+    assert len(seen) == 2
+    assert all(item["key"] == provider_key for item in seen)
+    assert all(client_key not in item["authorization"] for item in seen)
+    assert all(item["version"] == "2023-06-01" for item in seen)
+    text = output.read_text()
+    for excluded in (provider_key, client_key, "private system request marker", "sk-or-"):
+        assert excluded not in text
+    saved = json.loads(text)
+    assert saved["version"] == 1
     assert len(saved["exchanges"]) == 2
+    assert all(
+        set(exchange) == {"lane_key", "ordinal", "message"} for exchange in saved["exchanges"]
+    )
+    assert [exchange["ordinal"] for exchange in saved["exchanges"]] == [0, 1]
+    assert all(exchange["lane_key"] == "add Kelvin" for exchange in saved["exchanges"])
+
+    monkeypatch.delenv("CURIE_FACTORY_RECORD_KEY")
     replay = ms.ModelScript(output)
     replay.start()
     try:
         status, body, _ = _post(
-            replay.base_url,
-            _request("You are the implementer.", "add fahrenheit"),
+            replay.base_url, _request("another system", "add Kelvin", ordinal=1)
         )
         assert status == 200
         assert json.loads(body)["content"][0]["name"] == "Edit"
     finally:
         replay.close()
+
+
+def test_record_close_waits_for_an_in_flight_exchange_before_writing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A request still waiting on the provider at close must reach the transcript."""
+
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-provider-key")
+    received = threading.Event()
+    release = threading.Event()
+
+    class SlowProvider(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            received.set()
+            release.wait(timeout=10)
+            payload = json.dumps(_message("Edit", "recorded")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowProvider)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    output = tmp_path / "recorded.json"
+    recorder = ms.ModelScript(
+        output, record=True, upstream=f"http://127.0.0.1:{server.server_address[1]}"
+    )
+    recorder.start()
+    results: list[tuple[int, bytes, str]] = []
+    client = threading.Thread(
+        target=lambda: results.append(
+            _post(recorder.base_url, _request("system", "add Kelvin"))
+        ),
+        daemon=True,
+    )
+    releaser = threading.Timer(0.5, release.set)
+    try:
+        client.start()
+        assert received.wait(timeout=5)
+        releaser.start()
+        recorder.close()
+        # close() returned, so the in-flight handler finished writing its
+        # response; the client only has to read bytes already sent.
+        client.join(timeout=2)
+        assert not client.is_alive()
+        assert release.is_set()
+        assert results and results[0][0] == 200
+        saved = json.loads(output.read_text())
+        assert len(saved["exchanges"]) == 1
+        assert saved["exchanges"][0]["lane_key"] == "add Kelvin"
+        assert saved["exchanges"][0]["message"]["content"][0]["name"] == "Edit"
+    finally:
+        release.set()
+        releaser.cancel()
+        client.join(timeout=5)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+def test_record_close_fails_when_the_in_flight_drain_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An exhausted drain must fail close() after saving the completed exchanges.
+
+    Returning normally would let a recording run pass with an exchange the
+    provider charged for but the transcript never received.
+    """
+
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-provider-key")
+    monkeypatch.setattr(ms, "CLOSE_DRAIN_TIMEOUT_S", 0.3)
+    held = threading.Event()
+    release = threading.Event()
+
+    class Provider(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            if json.loads(raw)["messages"][0]["content"] == "hold the provider":
+                held.set()
+                release.wait(timeout=10)
+            payload = json.dumps(_message("Edit", "recorded")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    output = tmp_path / "recorded.json"
+    recorder = ms.ModelScript(
+        output, record=True, upstream=f"http://127.0.0.1:{server.server_address[1]}"
+    )
+    recorder.start()
+    client = threading.Thread(
+        target=lambda: _post(recorder.base_url, _request("system", "hold the provider")),
+        daemon=True,
+    )
+    try:
+        status, body, _ = _post(recorder.base_url, _request("system", "add Kelvin"))
+        assert status == 200
+        assert b"Edit" in body
+        client.start()
+        assert held.wait(timeout=5)
+        returned, errors = _close_within(recorder, 5)
+        assert returned, "close() must stay bounded by the drain timeout"
+        assert not release.is_set(), "the held request must still be in flight at close"
+        assert len(errors) == 1, "close() must fail when the drain times out"
+        assert "drain" in str(errors[0]).lower()
+        saved = json.loads(output.read_text())
+        assert [exchange["lane_key"] for exchange in saved["exchanges"]] == ["add Kelvin"]
+    finally:
+        release.set()
+        client.join(timeout=5)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+def _close_within(script: Any, seconds: float) -> tuple[bool, list[BaseException]]:
+    """Run close() off-thread and report whether it returned in time."""
+
+    errors: list[BaseException] = []
+
+    def close() -> None:
+        try:
+            script.close()
+        except BaseException as exc:  # noqa: BLE001 - reported to the test
+            errors.append(exc)
+
+    closer = threading.Thread(target=close, daemon=True)
+    closer.start()
+    closer.join(timeout=seconds)
+    return not closer.is_alive(), errors
+
+
+def _keep_alive_exchange(
+    base: str, payload: dict[str, Any]
+) -> tuple[http.client.HTTPConnection, int, bytes]:
+    """Send one request on a persistent connection and leave it open and idle."""
+
+    host, port = base.removeprefix("http://").split(":")
+    connection = http.client.HTTPConnection(host, int(port), timeout=10)
+    connection.request(
+        "POST",
+        "/v1/messages",
+        body=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    response = connection.getresponse()
+    body = response.read()
+    assert not response.will_close, "the server must keep the HTTP/1.1 connection open"
+    return connection, response.status, body
+
+
+def test_record_close_is_bounded_with_an_idle_keep_alive_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An idle persistent connection must not hold close() or the transcript."""
+
+    monkeypatch.setenv("CURIE_FACTORY_RECORD_KEY", "example-provider-key")
+
+    class Provider(BaseHTTPRequestHandler):
+        def log_message(self, fmt: str, *args: Any) -> None:
+            return
+
+        def do_POST(self) -> None:  # noqa: N802
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            payload = json.dumps(_message("Edit", "recorded")).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    output = tmp_path / "recorded.json"
+    recorder = ms.ModelScript(
+        output, record=True, upstream=f"http://127.0.0.1:{server.server_address[1]}"
+    )
+    recorder.start()
+    connection: http.client.HTTPConnection | None = None
+    try:
+        connection, status, body = _keep_alive_exchange(
+            recorder.base_url, _request("system", "add Kelvin")
+        )
+        assert status == 200
+        assert b"Edit" in body
+        returned, errors = _close_within(recorder, 5)
+        assert returned, "close() blocked on an idle keep-alive connection"
+        assert errors == []
+        saved = json.loads(output.read_text())
+        assert len(saved["exchanges"]) == 1
+        assert saved["exchanges"][0]["lane_key"] == "add Kelvin"
+        assert saved["exchanges"][0]["message"]["content"][0]["name"] == "Edit"
+    finally:
+        if connection is not None:
+            connection.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+
+
+def test_replay_close_is_bounded_with_an_idle_keep_alive_client(tmp_path: Path) -> None:
+    """Replay close() must not wait on a client that is merely holding a connection."""
+
+    path = tmp_path / "transcript.json"
+    ms.dump_transcript(path, [_exchange("plan the change", "Plan")])
+    script = ms.ModelScript(path)
+    script.start()
+    connection: http.client.HTTPConnection | None = None
+    try:
+        connection, status, body = _keep_alive_exchange(
+            script.base_url, _request("ignored system", "plan the change")
+        )
+        assert status == 200
+        assert json.loads(body)["content"][0]["name"] == "Plan"
+        returned, errors = _close_within(script, 5)
+        assert returned, "close() blocked on an idle keep-alive connection"
+        assert errors == []
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def test_committed_transcripts_store_no_requests_or_provider_keys() -> None:
+    for path in (ROOT / "transcripts").glob("*.json"):
+        text = path.read_text()
+        assert "sk-or-" not in text
+        for exchange in json.loads(text)["exchanges"]:
+            assert set(exchange) == {"lane_key", "ordinal", "message"}
+
+
+def test_factory_transcript_replays_the_actual_scheduled_sender_frame() -> None:
+    path = ROOT / "transcripts/unitconv-issue.json"
+    prompt = frame_user_turn(
+        "job", "", "https://forge.example.com/acme-corp/acme-bot/issues/3815", "github"
+    )
+    lane = ms.scrub(prompt)
+    exchanges = [item for item in ms.load_transcript(path) if item["lane_key"] == lane]
+    assert [item["ordinal"] for item in exchanges] == list(range(18))
+    script = ms.ModelScript(path)
+    script.start()
+    try:
+        for item in exchanges:
+            status, body, _ = _post(
+                script.base_url, _request("system", prompt, ordinal=item["ordinal"])
+            )
+            assert status == 200
+            assert json.loads(body) == item["message"]
+    finally:
+        script.close()
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        frame_user_turn("message", "U0EXAMPLE1", "https://forge.example.com/issue", "github"),
+        frame_user_turn("job", "", "https://forge.example.com/issue", "slack"),
+        frame_user_turn("job", "", "different issue text", "github"),
+        "https://forge.example.com/issue",
+    ],
+    ids=["person-event", "different-channel", "different-text", "missing-frame"],
+)
+def test_factory_transcript_rejects_a_different_sender_lane(prompt: str) -> None:
+    script = ms.ModelScript(ROOT / "transcripts/unitconv-issue.json")
+    script.start()
+    try:
+        status, body, _ = _post(script.base_url, _request("system", prompt))
+        assert status == 422
+        assert json.loads(body)["error"]["type"] == "unexpected_request"
+    finally:
+        with pytest.raises(ms.UnexpectedRequest):
+            script.close()

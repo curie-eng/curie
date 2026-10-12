@@ -40,6 +40,7 @@ from curie_worker.sandbox import MissingAgentPoolError, QuotaRejection
 from curie_worker.workitem_dispatch import (
     WorkItemAcquireGrant,
     WorkItemConflict,
+    WorkItemEvent,
     WorkItemRunning,
     WorkItemStartGrant,
     parse_work_item_event_id,
@@ -260,6 +261,20 @@ def test_ci_id_with_a_malformed_uuid_does_not_parse() -> None:
     assert parse_work_item_event_id("work-item-not-a-uuid-ci-2") is None
 
 
+def test_ci_fix_round_is_the_parsed_round_and_refuses_other_events() -> None:
+    request_id = uuid.uuid4()
+    parsed = parse_work_item_event_id(f"work-item-{request_id}-ci-3")
+    assert parsed is not None
+    assert parsed.ci_fix_round == 3
+
+    execute = parse_work_item_event_id(work_item_events.execute_event_id(request_id, 1))
+    assert execute is not None
+    with pytest.raises(ValueError):
+        _ = execute.ci_fix_round
+    with pytest.raises(ValueError):
+        _ = WorkItemEvent(request_id=request_id, kind="ci", generation=None).ci_fix_round
+
+
 def test_execute_and_terminate_ids_still_parse() -> None:
     request_id = uuid.uuid4()
     execute = parse_work_item_event_id(f"work-item-{request_id}-execute-1")
@@ -301,8 +316,9 @@ def test_a_ci_turn_is_a_factory_work_item_turn(make_harness) -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("round_", [2, 3])
 def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished(
-    make_harness,
+    make_harness, round_: int
 ) -> None:
     async def exercise() -> None:
         async with make_harness(
@@ -321,7 +337,7 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
                 ),
             ]
 
-            await h.kernel.process_event(_ci_turn(request_id))
+            await h.kernel.process_event(_ci_turn(request_id, round_))
 
             assert "running_for_conversation" in work_items.calls
             assert "acquire" not in work_items.calls
@@ -334,6 +350,7 @@ def test_an_unpublished_fix_turn_finishes_the_same_request_as_ci_fix_unpublished
             assert finish["outcome"] == "failed"
             assert finish["cause"] == "ci_fix_unpublished"
             assert finish["detail"] is None
+            assert finish["ci_fix_round"] == round_
             # A CI fix turn has its own bounded loop: no #3128 continuation.
             assert len(h.runner.opened) == 1
 
@@ -438,6 +455,9 @@ def test_factory_continuation_waits_past_max_attempts_then_runs(
             assert len(work_items.finishes) == 1
             assert work_items.finishes[0][1]["cause"] == (
                 "ci_fix_unpublished" if continuation == "ci" else "no_pull_request"
+            )
+            assert work_items.finishes[0][1]["ci_fix_round"] == (
+                2 if continuation == "ci" else None
             )
             retries = [record for record in caplog.records if "capacity retry" in record.message]
             assert len(retries) == 4
@@ -569,6 +589,7 @@ def test_ci_fix_that_cannot_start_settles_runner_escalated(
             assert len(work_items.finishes) == 1
             assert work_items.finishes[0][1]["cause"] == "runner_escalated"
             assert work_items.finishes[0][1]["detail"] is None
+            assert work_items.finishes[0][1]["ci_fix_round"] is None
             assert await h.kernel._markers.is_terminal(turn.event_id)
 
     asyncio.run(exercise())

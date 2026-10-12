@@ -18,8 +18,7 @@
 //!
 //! Env is set per child `Command` (never process env), so tests run in parallel.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::path::Path;

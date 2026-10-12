@@ -957,6 +957,11 @@ async def _route_and_start(
             runner_resources=runner_resources,
             remaining_s=remaining_s,
         )
+        # Only the run bound to this event records the claim its turn is
+        # on; an unrelated same-thread event must not overwrite it (#4331).
+        if run.event_id == queued_event_id:
+            run.claim_name = handle.claim_name
+            run.sandbox_name = handle.sandbox_name
     if run is not None and agent_id is not None:
         # Lets a kill find this run if it later parks for approval (#3564).
         run.agent_id = agent_id

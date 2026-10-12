@@ -1,6 +1,6 @@
 //! `curie hook fire` at the skill, local, and cluster tiers (#2932).
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::process::{Command, Output, Stdio};

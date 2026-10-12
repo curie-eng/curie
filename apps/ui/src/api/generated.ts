@@ -5779,6 +5779,8 @@ export interface components {
         FinishBody: {
             /** Cause */
             cause: string;
+            /** Ci Fix Round */
+            ci_fix_round?: number | null;
             /** Detail */
             detail?: string | null;
             /**
@@ -6178,7 +6180,9 @@ export interface components {
         };
         /**
          * IssueReadResult
-         * @description The issue verbatim. The platform parses and stores none of it.
+         * @description The issue verbatim with its execution deadline and total allowed seconds.
+         *
+         *     The platform parses and stores none of the issue content.
          */
         IssueReadResult: {
             /** Author */
@@ -6189,6 +6193,13 @@ export interface components {
             comments: components["schemas"]["IssueReadComment"][];
             /** Comments Truncated */
             comments_truncated: boolean;
+            /**
+             * Execution Deadline
+             * Format: date-time
+             */
+            execution_deadline: string;
+            /** Execution Seconds */
+            execution_seconds: number;
             /** Issue Number */
             issue_number: number;
             /** Repo Full Name */

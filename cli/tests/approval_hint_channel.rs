@@ -21,7 +21,7 @@
 //! - `HINT_CHANNEL_LOOKUP_BUDGET` bounds the whole advisory lookup, including
 //!   cluster port-forward startup.
 
-mod support;
+use crate::support;
 
 use curie::api::ApiClient;
 use support::{serve, MockServer, Response};

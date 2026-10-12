@@ -10,8 +10,7 @@
 //! pure comparator over a drifted fixture to prove it rejects each class by
 //! execution, mirroring `cli/tests/api_field_parity.rs`.
 
-#[path = "support/schema_inventory.rs"]
-mod schema_inventory;
+use crate::support::schema_inventory;
 
 use std::collections::BTreeMap;
 

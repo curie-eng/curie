@@ -18,6 +18,7 @@ from plugin_format import PLATFORM_PUBLISH_TOOL_NAME
 
 from ..approvals import (
     ApprovalBackendError,
+    PullRequestNotAdopted,
 )
 from ..reply_sink import (
     TargetRoute,
@@ -233,6 +234,17 @@ async def _continue_unpublished(
         if memory_grant is not None:
             self._record_turn_deadline(memory_grant, left)
         memory._note_live_memory_turn(turn)
+    except PullRequestNotAdopted as exc:
+        logger.info("work-item continuation refused for %s: %s", qevent.event_id, exc)
+        return failures.TurnOutcome(
+            terminal_ok=False,
+            saw_side_effect=outcome.saw_side_effect,
+            classification="pull-request-not-adopted",
+            error_message=str(exc),
+            tools_called=outcome.tools_called,
+            assistant_text=outcome.assistant_text,
+            continued=True,
+        )
     except failures.ToolAccessUnenforced as exc:
         logger.warning("work-item continuation refused for %s: %s", qevent.event_id, exc)
         return failures.TurnOutcome(

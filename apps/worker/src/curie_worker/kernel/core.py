@@ -242,6 +242,7 @@ class Kernel:
     _settled_from_record = approval._settled_from_record
     _place_the_resumed_reply = approval._place_the_resumed_reply
     _adopt_remembered_notice_ref = approval._adopt_remembered_notice_ref
+    _approval_run_abandoned = approval._approval_run_abandoned
     _pause_for_approval = approval._pause_for_approval
     _escalate_unanswerable_email_approval = approval._escalate_unanswerable_email_approval
     _is_approval_resume = staticmethod(approval_key._is_approval_resume)

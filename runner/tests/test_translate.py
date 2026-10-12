@@ -584,6 +584,78 @@ def test_unknown_error_without_credit_text_stays_unclassified() -> None:
     assert "upstream exploded" in errors[0].message
 
 
+# --- A model endpoint that cannot be reached (#4333) --------------------------
+
+# Observed in a chaos run with runner model egress blocked: the SDK reported the
+# failed model call as error="server_error" with this provider text.
+_CONNECTION_REFUSED = "API Error: Connection refused (ECONNREFUSED)"
+
+
+def _errored(error: str, text: str, state: TurnState | None = None) -> list[ErrorEvent]:
+    msg = AssistantMessage(content=[TextBlock(text=text)], model="<synthetic>", error=error)
+    return [e for e in _translate(msg, state) if isinstance(e, ErrorEvent)]
+
+
+def test_server_error_connection_refused_is_model_unreachable() -> None:
+    state = TurnState()
+    errors = _errored("server_error", _CONNECTION_REFUSED, state)
+    assert len(errors) == 1
+    assert errors[0].classification == "model-unreachable"
+    assert state.error_classification == "model-unreachable"
+    assert _CONNECTION_REFUSED in errors[0].message
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "API Error: connect ECONNREFUSED 10.0.0.1:443",
+        "API Error: connect ENETUNREACH 10.0.0.1:443",
+        "API Error: connect EHOSTUNREACH 10.0.0.1:443",
+        "API Error: connect ETIMEDOUT 10.0.0.1:443",
+        "API Error: read ECONNRESET",
+        "API Error: getaddrinfo ENOTFOUND api.example.invalid",
+        "API Error: getaddrinfo EAI_AGAIN api.example.invalid",
+        "API Error: Connection refused",
+        "API Error: Connection error.",
+        "api error: connection refused (econnrefused)",
+        "API ERROR: CONNECTION ERROR",
+        "api error: getaddrinfo eai_again api.example.invalid",
+    ],
+)
+def test_server_error_connection_tokens_are_model_unreachable(text: str) -> None:
+    errors = _errored("server_error", text)
+    assert len(errors) == 1
+    assert errors[0].classification == "model-unreachable"
+    assert text in errors[0].message
+
+
+def test_server_error_with_provider_500_is_server_error_not_unreachable() -> None:
+    errors = _errored("server_error", "API Error: 500 Internal server error")
+    assert len(errors) == 1
+    assert errors[0].classification == "server-error"
+    assert "500 Internal server error" in errors[0].message
+
+
+def test_unknown_error_with_connection_text_is_not_model_unreachable() -> None:
+    errors = _errored("unknown", _CONNECTION_REFUSED)
+    assert len(errors) == 1
+    assert errors[0].classification == "unclassified"
+
+
+def test_server_error_usage_limit_text_stays_usage_limited_not_unreachable() -> None:
+    state = TurnState()
+    errors = _errored("server_error", "You've hit your session limit", state)
+    assert errors[0].classification == "model-usage-limited"
+    assert state.usage_limited
+
+
+def test_server_error_credit_text_stays_credit_exhausted_not_unreachable() -> None:
+    state = TurnState()
+    errors = _errored("server_error", _OPENROUTER_402, state)
+    assert errors[0].classification == "model-credit-exhausted"
+    assert state.credit_exhausted
+
+
 # --- A reviewer subagent's credit refusal ends the turn (#3935) ---------------
 
 # Measured 2026-10-04 on bundled CLI 2.1.281: a subagent request answered HTTP
@@ -1048,9 +1120,7 @@ def test_spend_credit_and_openrouter_limits_keep_the_credit_remedy(text: str) ->
 
 def test_subscription_usage_refusal_is_sticky_after_later_recoverable_errors() -> None:
     state = TurnState()
-    events = _translate(
-        AssistantMessage(content=[], model="m", error="rate_limit"), state
-    )
+    events = _translate(AssistantMessage(content=[], model="m", error="rate_limit"), state)
     events += _translate(_later_rate_limit(), state)
     events += _translate(_later_overloaded(), state)
     events += _translate(_success_result(), state)
@@ -1062,8 +1132,13 @@ def test_subscription_usage_refusal_is_sticky_after_later_recoverable_errors() -
 @pytest.mark.parametrize("text", _SUBSCRIPTION_USAGE_LIMIT_MESSAGES)
 def test_terminal_sdk_result_usage_limit_is_classified(text: str) -> None:
     result = ResultMessage(
-        subtype="error_during_execution", duration_ms=1, duration_api_ms=1,
-        is_error=True, num_turns=1, session_id="s", result=text,
+        subtype="error_during_execution",
+        duration_ms=1,
+        duration_api_ms=1,
+        is_error=True,
+        num_turns=1,
+        session_id="s",
+        result=text,
     )
     events = _translate(result)
     assert events[0].classification == "model-usage-limited"
@@ -1075,8 +1150,10 @@ def test_finance_text_without_existing_credit_match_is_not_a_subscription_limit(
     text: str,
 ) -> None:
     errors = [
-        event for event in _translate(
+        event
+        for event in _translate(
             AssistantMessage(content=[TextBlock(text=text)], model="m", error="unknown")
-        ) if isinstance(event, ErrorEvent)
+        )
+        if isinstance(event, ErrorEvent)
     ]
     assert [event.classification for event in errors] == ["unclassified"]

@@ -1,7 +1,7 @@
 //! Deployment-level repository-workspace intent across local, cluster fan-out,
 //! wire JSON, and the generated command manifests.
 
-mod support;
+use crate::support;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

@@ -1,8 +1,7 @@
 //! Binary and public surface regressions for cluster secret lifecycle and
 //! rendered Helm passthrough values.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
@@ -421,6 +420,7 @@ fn assert_parser_edge_cases_are_masked(rendered: &str, surface: &str) {
 
 fn pure_up() -> UpOpts {
     UpOpts {
+        file_values: None,
         retained_mail_values: None,
         retained_runner_values: None,
         saved_credentials: None,
@@ -440,6 +440,7 @@ fn pure_up() -> UpOpts {
             UNCLOSED_LIST_EXPRESSION.to_string(),
         ],
         set_string: vec![SET_STRING_EXPRESSION.to_string()],
+        set_json: vec![],
         allow_egress_host: vec![],
         resolved_egress_cidrs: vec![],
         allow_web_egress: vec![],

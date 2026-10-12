@@ -31,6 +31,7 @@ from curie_telemetry.redact import redact_text
 from ..actions import ActionBackendError
 from ..approvals import (
     ApprovalBackendError,
+    PullRequestNotAdopted,
     ReviewAuthorityUnavailable,
     VerifiedReviewFeedback,
 )
@@ -483,7 +484,8 @@ async def _attempt_turn(
         # fall into the clause below and answer to the name "runner-error",
         # pointing an operator at a runner that never saw the fault. Retry
         # behavior is deliberately identical (`workspace-error` is
-        # retryable); only the name and the log line change.
+        # retryable); the classification and log identify the fault, and the
+        # terminal diagnostic carries a redacted, bounded reason naming the stage.
         record_reclaimed_retry()
         release_order()
         self._log_workspace_start_failure(
@@ -494,7 +496,13 @@ async def _attempt_turn(
             agent_name=agent_name,
             workspace_deployment_id=workspace_deployment_id,
         )
-        return failures.TurnOutcome(terminal_ok=False, classification="workspace-error")
+        return failures.TurnOutcome(
+            terminal_ok=False,
+            classification="workspace-error",
+            error_message=" ".join(redact_text(str(exc)).split())[
+                : constants._ESCALATION_DETAIL_MAX
+            ],
+        )
     except AttachmentResolutionError as exc:
         record_reclaimed_retry()
         release_order()
@@ -507,6 +515,15 @@ async def _attempt_turn(
         )
         await self._reply_for(qevent, route, constants._UNAVAILABLE_ATTACHMENT_REPLY)
         return failures.TurnOutcome(terminal_ok=True, start_failed=True)
+    except PullRequestNotAdopted as exc:
+        record_reclaimed_retry()
+        release_order()
+        logger.info("turn start refused for %s: %s", qevent.event_id, exc)
+        return failures.TurnOutcome(
+            terminal_ok=False,
+            classification="pull-request-not-adopted",
+            error_message=str(exc),
+        )
     except failures.ToolAccessUnenforced as exc:
         # @spec WORKER-TOOL-ACCESS-2: a failed turn, escalated under its own
         # class and never retried (the class is not retryable); the model
@@ -794,6 +811,7 @@ async def _attempt_turn(
                         scratch_root=Path(self._config.workspace_scratch_root),
                         git_timeout_seconds=(self._config.publication_git_command_timeout_seconds),
                         protected_paths=self._config.publication_protected_paths,
+                        allow_dependency_additions=self._config.publication_allow_dependency_additions,
                     )
                     outcome.publication_snapshot = snapshot
                 except WorkspacePreparationError as exc:
@@ -980,7 +998,12 @@ async def _consume(
         # RETRYABLE_CLASSIFICATIONS: a retry would re-execute a side effect,
         # which is the rule ADR-0013 already holds, and escalation puts a
         # human in front of the gap.
-        logger.error("action ledger write failed for %s: %s", qevent.event_id, exc)
+        logger.error(
+            "action ledger write failed for %s: %s: %s",
+            qevent.event_id,
+            type(exc).__name__,
+            exc,
+        )
         return failures.TurnOutcome(
             terminal_ok=False,
             saw_side_effect=acc.saw_side_effect,

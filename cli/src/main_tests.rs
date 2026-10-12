@@ -2256,3 +2256,27 @@ fn quickstart_multi_repo_clap_splits_a_comma_list() {
     );
     assert!(try_parse_from(["curie", "factory", "quickstart"]).is_err());
 }
+
+#[test]
+fn cluster_upgrade_parses_allow_stock_layer_clear() {
+    let parsed = try_parse_from([
+        "curie",
+        "cluster",
+        "upgrade",
+        "--to",
+        "0.9.0",
+        "--allow-stock-layer-clear",
+    ])
+    .expect("cluster upgrade should accept the explicit stock clear flag");
+    match parsed.command {
+        Some(Command::Cluster {
+            action:
+                ClusterAction::Upgrade {
+                    allow_stock_layer_clear,
+                    ..
+                },
+            ..
+        }) => assert!(allow_stock_layer_clear),
+        _ => panic!("expected cluster upgrade"),
+    }
+}

@@ -28,6 +28,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             .await?,
         ),
         ClusterAction::Up {
+            values_files,
             namespace,
             release,
             chart,
@@ -46,6 +47,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             forward_only,
             e2e_connector_identity,
         } => {
+            let file_values = ops::load_values_files(&values_files).await?;
             let mut set = set;
             if forward_only {
                 set.push("api.migrate.forwardOnly=true".to_string());
@@ -78,6 +80,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             emit(
                 ops::up(
                     UpOpts {
+                        file_values,
                         retained_mail_values: None,
                         // Resolved by ops::up from the recorded release values.
                         retained_runner_values: None,
@@ -91,6 +94,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                         no_expose,
                         set,
                         set_string: vec![],
+                        set_json: vec![],
                         allow_egress_host,
                         // Populated by ops::up (resolve named providers to host
                         // routes on a live run); empty here so the pure builder and
@@ -162,6 +166,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             .await?,
         ),
         ClusterAction::Upgrade {
+            values_files,
             to,
             namespace,
             release,
@@ -169,7 +174,10 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             yes,
             dry_run,
             forward_only,
+            allow_stock_layer_clear,
+            take_over,
         } => {
+            let file_values = ops::load_values_files(&values_files).await?;
             let resolved = artifacts::resolve_chart(
                 chart.as_deref(),
                 artifacts::Channel::current(),
@@ -180,6 +188,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             let chart = materialize_upgrade_chart(resolved, dry_run).await?;
             emit(
                 ops::upgrade(UpgradeOpts {
+                    file_values,
                     common: CommonOpts {
                         namespace,
                         release,
@@ -189,6 +198,8 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     chart,
                     yes,
                     forward_only,
+                    allow_stock_layer_clear,
+                    take_over,
                 })
                 .await?,
             )

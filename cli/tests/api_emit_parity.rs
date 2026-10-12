@@ -7,15 +7,7 @@
 // `emit_parity::violations` for exactly what this narrower gate does and does
 // not catch, and why.
 
-// This binary reuses only `field_parity::walk_structs`/`CollectedStruct` (the
-// struct inventory); its own `violations`/`Violation` public surface (that
-// binary's entry point) is unused here, hence the blanket allow rather than
-// picking through the module's exports one by one.
-#[path = "support/emit_parity.rs"]
-mod emit_parity;
-#[path = "support/field_parity.rs"]
-#[allow(dead_code)]
-mod field_parity;
+use crate::support::emit_parity;
 
 use emit_parity::{violations, EmitViolation};
 use serde_json::Value;

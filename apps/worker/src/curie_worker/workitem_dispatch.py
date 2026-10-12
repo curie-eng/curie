@@ -60,6 +60,14 @@ class WorkItemEvent:
     def is_ci_fix(self) -> bool:
         return self.kind == "ci"
 
+    @property
+    def ci_fix_round(self) -> int:
+        """The CI fix round of a ``ci`` event; any other event has none."""
+
+        if self.kind != "ci" or self.generation is None:
+            raise ValueError(f"work-item {self.kind} event carries no CI fix round")
+        return self.generation
+
 
 @dataclass(frozen=True)
 class WorkItemAcquireGrant:
@@ -354,6 +362,7 @@ class WorkItemDispatchClient:
         outcome: str,
         cause: str,
         detail: str | None,
+        ci_fix_round: int | None,
         budget_s: float = DEFAULT_BUDGET_S,
     ) -> None:
         await self._post_settlement(
@@ -363,6 +372,7 @@ class WorkItemDispatchClient:
                 "outcome": outcome,
                 "cause": cause,
                 "detail": detail,
+                "ci_fix_round": ci_fix_round,
             },
             budget_s=budget_s,
         )
@@ -526,7 +536,7 @@ class WorkItemDispatchClient:
             )
         except httpx.HTTPError as exc:
             raise WorkItemTransportError(
-                "work-item dispatch endpoint is unreachable"
+                f"work-item dispatch endpoint is unreachable: {type(exc).__name__}"
             ) from exc
         return self._post_result(response)
 
@@ -583,6 +593,11 @@ class WorkItemRun:
         self.thread_key = thread_key
         self.started = False
         self.finished = False
+        # Set when the heartbeat gives the request up as a stale owner. A
+        # finished run may release its own claim; an abandoned one releases
+        # nothing and creates no approval, since the API termination chain owns
+        # the lost request's teardown (ADR 0206, #4331).
+        self.abandoned = False
         self.held = False
         self.runtime_epoch: int | None = None
         self.claim_name: str | None = None
@@ -622,6 +637,11 @@ class WorkItemRun:
             self.finished = True
 
     async def start(self, *, claim_name: str, sandbox_name: str) -> WorkItemStartGrant:
+        # Recorded before the API call so a start refused on a terminal code
+        # (#3208) still knows the claim it made, and its release stays fenced
+        # to that claim (#4331). runtime_epoch stays the started-ness signal.
+        self.claim_name = claim_name
+        self.sandbox_name = sandbox_name
         grant = await self._client.start(
             self.request_id,
             owner=self.owner,
@@ -631,8 +651,6 @@ class WorkItemRun:
         )
         self.started = True
         self.runtime_epoch = grant.runtime_epoch
-        self.claim_name = claim_name
-        self.sandbox_name = sandbox_name
         self.execution_deadline = grant.execution_deadline
         interval = max(_MIN_HEARTBEAT_INTERVAL_S, grant.heartbeat_interval_s)
         self._heartbeat_task = asyncio.create_task(
@@ -669,7 +687,9 @@ class WorkItemRun:
             self.request_id, runtime_epoch=self.runtime_epoch, budget_s=self._write_budget_s()
         )
 
-    async def finish(self, *, outcome: str, cause: str, detail: str | None) -> None:
+    async def finish(
+        self, *, outcome: str, cause: str, detail: str | None, ci_fix_round: int | None
+    ) -> None:
         if self.runtime_epoch is None:
             raise WorkItemTransportError("work-item finish called before start")
         await self._client.finish(
@@ -678,6 +698,7 @@ class WorkItemRun:
             outcome=outcome,
             cause=cause,
             detail=detail,
+            ci_fix_round=ci_fix_round,
             budget_s=self._write_budget_s(),
         )
         self.finished = True

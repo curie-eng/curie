@@ -269,7 +269,7 @@ class ActionClient:
                 self._client, url, json=body, headers=headers, budget_s=budget_s
             )
         except httpx.HTTPError as exc:
-            raise ActionBackendError(f"{what} failed: {exc}") from exc
+            raise ActionBackendError(f"{what} failed: {type(exc).__name__}: {exc}") from exc
 
     async def _post(
         self,

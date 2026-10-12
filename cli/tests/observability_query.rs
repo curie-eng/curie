@@ -5,7 +5,7 @@
 //! success/error emitters, and a wire-level HTTP peer. No test reaches
 //! Langfuse, Prometheus, Kubernetes, or another observability backend.
 
-mod support;
+use crate::support;
 
 use std::collections::BTreeSet;
 use std::fs;

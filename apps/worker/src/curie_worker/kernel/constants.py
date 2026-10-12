@@ -161,6 +161,8 @@ _NO_EGRESS_ROUTE = TargetRoute()
 # ``sandbox-capacity`` (#3693) is a ResourceQuota refusal on an approval resume,
 # which retries rather than taking the ordinary capacity reply. It is named
 # apart from ``runner-error`` because no runner was reached: the agent was busy.
+# ``model-unreachable`` (#4333) is a transport failure before the model provider
+# answered, so it is transient; the side-effect check above still runs first.
 RETRYABLE_CLASSIFICATIONS = frozenset(
     {
         "rate-limit",
@@ -169,6 +171,7 @@ RETRYABLE_CLASSIFICATIONS = frozenset(
         "sandbox-capacity",
         "sandbox-terminated",
         "workspace-error",
+        "model-unreachable",
     }
 )
 
@@ -201,6 +204,9 @@ PLATFORM_ERROR_CLASSIFICATIONS = frozenset(
         # #3071: the SDK's turn cap ran out (``error_max_turns``). Not retryable:
         # a retry would spend the same budget and stop at the same place.
         "max-turns",
+        # #4333: the model endpoint was unreachable at the transport layer.
+        # Retryable (see RETRYABLE_CLASSIFICATIONS).
+        "model-unreachable",
         # WORKER-TOOL-ACCESS-5: the runner's refusals of a restricted turn
         # (``curie_runner.tool_access``), and the worker's own for a runner that
         # cannot enforce one. Not retryable: the same runner refuses again.
@@ -215,6 +221,7 @@ WORKER_LOCAL_DISPLAY_CLASSIFICATIONS = frozenset(
     {
         "ownership-store-unavailable",
         "runner-timeout-unconfirmed",
+        "pull-request-not-adopted",
         "sandbox-capacity",
         "sandbox-terminated",
         # ADR 0100: the kernel's own refusal of a granted turn whose runner
@@ -235,11 +242,13 @@ _ESCALATION_CAUSES = {
     "model-credential-rejected": "model_credential_rejected",
     "rate-limit": "model_rate_limited",
     "server-error": "model_error",
+    "model-unreachable": "model_unreachable",
     "budget-exceeded": "budget_exceeded",
     "runner-timeout": "runner_timeout",
     "runner-timeout-unconfirmed": "runner_timeout",
     "sandbox-terminated": "sandbox_terminated",
     "workspace-error": "workspace_error",
+    "pull-request-not-adopted": "pull_request_not_adopted",
     "history-persistence-error": "history_capacity",
     # #3401: max-turns and an unclassified runner failure used to collapse into
     # runner_escalated, so a consumer that only read the terminus cause could
@@ -332,14 +341,17 @@ _EARLY_STOP_PROMPT = (
     "Your last turn ended before any work was reported or published. Start the "
     "work on the issue now, report progress as you go, and call publish_changes "
     "only when the change is complete and reviewed. If it cannot be done, post "
-    "the skill's `Could not complete:` explanation instead."
+    "the skill's `Could not complete:` explanation instead. If this request needs "
+    "no change to the open pull request, reply beginning with `No changes needed:` "
+    "and give the reason."
 )
-
 _UNPUBLISHED_PROMPT = (
     "Your last turn ended before the work was published. Continue from the last "
     "phase and round you reported. Call publish_changes only when the work is "
     "complete and reviewed. If you cannot finish, post the skill's "
-    "`Could not complete:` explanation instead."
+    "`Could not complete:` explanation instead. If this request needs no change "
+    "to the open pull request, reply beginning with `No changes needed:` and give "
+    "the reason."
 )
 
 # How long the reclaim preflight waits for a previous owner's runner to go idle

@@ -31,9 +31,7 @@ scenario = _load()
 
 
 def _load_kind():
-    spec = importlib.util.spec_from_file_location(
-        "curie_scripted_kind", ROOT / "scripted_kind.py"
-    )
+    spec = importlib.util.spec_from_file_location("curie_scripted_kind", ROOT / "scripted_kind.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -63,19 +61,21 @@ def test_fixture_paths_are_on_the_publication_request() -> None:
 
 def test_scripted_values_put_the_proxy_on_the_worker() -> None:
     kind = _load_kind()
-    kind.refuse_context("kind-curie-e2e")
-    with pytest.raises(kind.ScriptedScenarioError):
-        kind.refuse_context("k8")
     values = kind.scripted_values(
         model_base_url="http://10.1.2.3:8080",
         github_api="https://10.9.9.9:8443/api/v3",
         clone_base="https://10.9.9.9:8443",
         ca_configmap="github-stub-ca",
+        runner_image="localhost:24111/curie-runner",
     )
+    assert values["agentSandbox"]["runner"]["image"] == "localhost:24111/curie-runner"
     assert {"name": "CURIE_MODEL_BASE_URL", "value": "http://10.1.2.3:8080"} in values["worker"][
         "extraEnv"
     ]
-    assert values["api"]["githubStubCaConfigMap"] == "github-stub-ca"
+    assert "githubStubCaConfigMap" not in values["api"]
+    assert values["codeHostTrust"]["caBundle"]["configMapRef"] == {
+        "name": "github-stub-ca", "key": "ca.pem"
+    }
     assert {"cidr": "10.1.2.3/32", "ports": [{"protocol": "TCP", "port": 8080}]} in values[
         "security"
     ]["networkPolicy"]["allowedEgress"]
@@ -85,3 +85,41 @@ def test_reintroducing_curie_path_prefixes_fails_the_scenario() -> None:
     filtered = scenario.legacy_3617_paths(scenario.FIXTURE_CHANGED_PATHS)
     with pytest.raises(scenario.ScenarioAssertionError, match="unitconv"):
         scenario.assert_publication_paths(filtered)
+
+
+@pytest.mark.parametrize("outcome", ["passed", "failed"])
+def test_driver_verdict_accepts_an_observed_preflight_and_both_fixture_paths(
+    outcome: str,
+) -> None:
+    kind = _load_kind()
+    assert kind.verdict(outcome, list(scenario.FIXTURE_CHANGED_PATHS)) == 0
+
+
+def test_driver_verdict_rejects_an_unavailable_preflight() -> None:
+    kind = _load_kind()
+    assert kind.verdict("unavailable", list(scenario.FIXTURE_CHANGED_PATHS)) == 1
+
+
+@pytest.mark.parametrize("missing", scenario.FIXTURE_CHANGED_PATHS)
+def test_driver_verdict_rejects_each_missing_fixture_path(missing: str) -> None:
+    kind = _load_kind()
+    paths = [path for path in scenario.FIXTURE_CHANGED_PATHS if path != missing]
+    assert kind.verdict("passed", paths) == 1
+
+
+@pytest.mark.parametrize("flag", ["--context", "--model-base-url"])
+def test_scripted_parser_refuses_removed_external_cluster_flags(flag: str) -> None:
+    import factory_e2e as fe
+
+    with pytest.raises(SystemExit):
+        fe.parse_args(["scripted", flag, "example"])
+
+
+def test_scripted_parser_owns_its_cluster_and_supports_recording_and_image_builds() -> None:
+    import factory_e2e as fe
+
+    args = fe.parse_args(["scripted", "--build-images", "--record"])
+    assert args.build_images is True
+    assert args.record is True
+    assert not hasattr(args, "context")
+    assert not hasattr(args, "model_base_url")

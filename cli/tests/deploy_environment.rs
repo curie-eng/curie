@@ -3,9 +3,8 @@
 
 #![cfg(unix)]
 
-mod support;
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support;
+use crate::support::executable as test_executable;
 
 use curie::scaffold::scaffold;
 use serde_json::{json, Value};

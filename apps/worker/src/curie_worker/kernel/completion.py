@@ -139,12 +139,14 @@ async def _complete(
                     run.held = True
             elif outcome == "delivered":
                 ci_fix = parsed is not None and parsed.is_ci_fix
-                if ci_fix:
-                    cause = (
-                        "runner_escalated"
-                        if turn is not None and turn.start_failed
-                        else "ci_fix_unpublished"
-                    )
+                # Only an unpublished fix turn names its round (#4330).
+                ci_fix_round: int | None = None
+                if parsed is not None and parsed.is_ci_fix:
+                    if turn is not None and turn.start_failed:
+                        cause = "runner_escalated"
+                    else:
+                        cause = "ci_fix_unpublished"
+                        ci_fix_round = parsed.ci_fix_round
                 elif turn is None or self._is_approval_resume(qevent.event_id):
                     cause = "no_pull_request"
                 else:
@@ -159,6 +161,7 @@ async def _complete(
                             if ci_fix or turn is None
                             else failures._finish_detail(turn.assistant_text)
                         ),
+                        ci_fix_round=ci_fix_round,
                     )
                 except WorkItemConflict as exc:
                     if exc.code != "publication_pending":
@@ -173,10 +176,15 @@ async def _complete(
                     outcome="failed",
                     cause=failures._escalation_cause(turn),
                     detail=turn.error_message if turn is not None else None,
+                    ci_fix_round=None,
                 )
             else:
                 await self._finish_or_settle(
-                    run, outcome="failed", cause="runner_failed", detail=None
+                    run,
+                    outcome="failed",
+                    cause="runner_failed",
+                    detail=None,
+                    ci_fix_round=None,
                 )
         except WorkItemConflict as exc:
             logger.warning(

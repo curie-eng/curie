@@ -5625,6 +5625,19 @@
             "title": "Cause",
             "type": "string"
           },
+          "ci_fix_round": {
+            "anyOf": [
+              {
+                "maximum": 3.0,
+                "minimum": 2.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ci Fix Round"
+          },
           "detail": {
             "anyOf": [
               {
@@ -6504,7 +6517,7 @@
         "type": "object"
       },
       "IssueReadResult": {
-        "description": "The issue verbatim. The platform parses and stores none of it.",
+        "description": "The issue verbatim with its execution deadline and total allowed seconds.\n\nThe platform parses and stores none of the issue content.",
         "properties": {
           "author": {
             "anyOf": [
@@ -6531,6 +6544,15 @@
           "comments_truncated": {
             "title": "Comments Truncated",
             "type": "boolean"
+          },
+          "execution_deadline": {
+            "format": "date-time",
+            "title": "Execution Deadline",
+            "type": "string"
+          },
+          "execution_seconds": {
+            "title": "Execution Seconds",
+            "type": "integer"
           },
           "issue_number": {
             "title": "Issue Number",
@@ -6564,7 +6586,9 @@
           "state",
           "author",
           "comments",
-          "comments_truncated"
+          "comments_truncated",
+          "execution_deadline",
+          "execution_seconds"
         ],
         "title": "IssueReadResult",
         "type": "object"

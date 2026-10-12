@@ -423,6 +423,20 @@ It pushes the branch to the base repository, so a `push` or `pull_request`
 workflow there runs the changed files with the repository's Actions secrets
 before a person reviews the pull request. Keep those secrets in GitHub
 environments that require reviewers. Human approval is the default.
+
+The worker also refuses new third-party dependency names by default, including
+new transitive lockfile entries. It checks `pyproject.toml`, `uv.lock`,
+`Cargo.toml`, `Cargo.lock`, `package.json`, `pnpm-lock.yaml` and
+`package-lock.json` by basename at any repository depth, comparing the base tree
+with the tree after applying the patch. Version changes to existing names are
+allowed. Path, workspace, editable, virtual and directory sources are ignored;
+Git sources count as third-party. A new file has an empty dependency set before
+the patch, and an in-scope file that cannot be parsed is refused. The install-wide
+setting `worker.publication.allowDependencyAdditions` defaults to `false` and is
+rendered as `CURIE_PUBLICATION_ALLOW_DEPENDENCY_ADDITIONS` on the worker. Set it
+to `true` to allow additions for every publication, including factory work and
+human-approved requests. The `.github/` and protected-path refusals still apply.
+
 An operator can opt one agent into automatic publication with
 `curie local publication-policy` or `curie cluster publication-policy` and
 `--policy auto`. That still records an approval, names the platform policy as

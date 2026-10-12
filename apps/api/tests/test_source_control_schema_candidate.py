@@ -53,6 +53,7 @@ def test_new_candidate_has_its_own_window_and_append_only_revision() -> None:
     data = catalog()
     assert data["windows"].get("0.12.2") == {"schema_min": "0076", "schema_head": "0081"}
     assert data["windows"].get("0.12.3") == {"schema_min": "0076", "schema_head": "0093"}
+    assert data["windows"].get("0.12.4") == {"schema_min": "0076", "schema_head": "0093"}
     assert data["windows"].get("0.13.0") == {"schema_min": "0103", "schema_head": "0103"}
     assert data["revisions"][-9:] == [
         "0095",
@@ -80,7 +81,7 @@ def test_every_prior_registered_window_is_exactly_preserved() -> None:
     actual = catalog()["windows"]
     assert {name: actual[name] for name in expected} == expected
     assert actual["0.12.1"] == {"schema_min": "0076", "schema_head": "0076"}
-    assert set(actual) - set(expected) <= {"0.12.1", "0.12.2", "0.12.3", "0.13.0"}
+    assert set(actual) - set(expected) <= {"0.12.1", "0.12.2", "0.12.3", "0.12.4", "0.13.0"}
 
 
 def test_released_0076_startup_refuses_without_migrating_then_0101_starts(

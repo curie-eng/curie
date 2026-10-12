@@ -8,8 +8,7 @@
 //! stub, and a failed or empty serving set is a separate case in
 //! `doctor_release_health.rs`.
 
-#[path = "support/executable.rs"]
-mod test_executable;
+use crate::support::executable as test_executable;
 
 use std::ffi::OsString;
 use std::fs;

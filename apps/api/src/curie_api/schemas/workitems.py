@@ -3,7 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
 
 
 class IssueReadContextMint(BaseModel):
@@ -40,7 +40,10 @@ class IssueReadComment(BaseModel):
 
 
 class IssueReadResult(BaseModel):
-    """The issue verbatim. The platform parses and stores none of it."""
+    """The issue verbatim with its execution deadline and total allowed seconds.
+
+    The platform parses and stores none of the issue content.
+    """
 
     repo_full_name: str
     issue_number: int
@@ -50,6 +53,8 @@ class IssueReadResult(BaseModel):
     author: str | None
     comments: list[IssueReadComment]
     comments_truncated: bool
+    execution_deadline: AwareDatetime
+    execution_seconds: int
 
 
 WorkItemOutcomeState = Literal[

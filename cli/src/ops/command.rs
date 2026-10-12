@@ -34,6 +34,11 @@ pub struct OpsCommand {
 /// or the echoed command line). Note the value still lands in the process argv --
 /// acceptable only for low-sensitivity tokens that already live in a k8s Secret.
 ///
+/// `MaskedJsonSet` is a `helm --set-json key=<json>` carrying a migrated
+/// operator object (#4322). The JSON is executed verbatim but never rendered:
+/// it used to travel in a private values document, and a policy object has no
+/// meaningful masked prefix.
+///
 /// `SecretValuesFile` carries one or more secret `helm` values (dotted key ->
 /// value) that must **never** reach the process table. Before execution it is
 /// materialized into a private (0600) temporary values file and replaced by a
@@ -48,6 +53,10 @@ pub enum CmdArg {
         key: String,
         value: String,
     },
+    MaskedJsonSet {
+        key: String,
+        json: MaskedJson,
+    },
     SecretValuesFile(Vec<(String, String)>),
     PrivateJsonValuesFile(PrivateHelmValues),
     SecretPatchFile {
@@ -57,6 +66,17 @@ pub enum CmdArg {
     /// A whole helm values document that may hold secret material, delivered
     /// as a private `-f <path>` and never displayed.
     SecretValuesDocument(serde_json::Value),
+}
+
+/// The JSON of a [`CmdArg::MaskedJsonSet`]. Its `Debug` form is masked too, so
+/// a logged or asserted command cannot print the value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MaskedJson(pub String);
+
+impl std::fmt::Debug for MaskedJson {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<masked json>")
+    }
 }
 
 impl CmdArg {
@@ -70,6 +90,7 @@ impl CmdArg {
             CmdArg::Plain(s) => vec![s.clone()],
             CmdArg::HelmSetExpression(expression) => vec![expression.clone()],
             CmdArg::SecretSet { key, value } => vec![format!("{key}={value}")],
+            CmdArg::MaskedJsonSet { key, json } => vec![format!("{key}={}", json.0)],
             CmdArg::SecretValuesFile(_)
             | CmdArg::PrivateJsonValuesFile(_)
             | CmdArg::SecretPatchFile { .. }
@@ -94,6 +115,7 @@ impl CmdArg {
                 vec![mask_helm_set_expression(expression)]
             }
             CmdArg::SecretSet { key, value } => vec![format!("{key}={}", mask_secret(value))],
+            CmdArg::MaskedJsonSet { key, .. } => vec![format!("{key}=<masked json>")],
             CmdArg::PrivateJsonValuesFile(values) => vec![
                 "-f".to_string(),
                 format!(
