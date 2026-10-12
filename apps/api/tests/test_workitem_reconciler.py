@@ -22,16 +22,17 @@ from aci_protocol import (
     TurnSource,
 )
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
-from curie_api import workitems
 from curie_api.config import get_settings
 from curie_api.forges.hosts import github_issue_ref, repository_ref
 from curie_api.main import create_app
 from curie_api.workitem_dispatch import acquire, admit, defer, fence_published
 from curie_api.workitem_reconciler import WorkItemReconciler
+from curie_api.workitems import lifecycle as workitems
 from curie_telemetry import build_resource, configure_meter_provider
 from curie_telemetry import metrics as telemetry_metrics
 from curie_telemetry import tracing as telemetry_tracing
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
+from forge_fakes.github_comments import ci_pending
 from opentelemetry import trace
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
@@ -53,7 +54,6 @@ from test_factory_terminus import (  # noqa: F401 (fixtures)
     _request,
     _start_running,
     admitted,
-    ci_pending,
     comments,
 )
 

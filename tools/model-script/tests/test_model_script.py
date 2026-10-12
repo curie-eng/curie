@@ -19,6 +19,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
+from curie_runner.sender_frame import frame_user_turn
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -542,3 +543,46 @@ def test_committed_transcripts_store_no_requests_or_provider_keys() -> None:
         assert "sk-or-" not in text
         for exchange in json.loads(text)["exchanges"]:
             assert set(exchange) == {"lane_key", "ordinal", "message"}
+
+
+def test_factory_transcript_replays_the_actual_scheduled_sender_frame() -> None:
+    path = ROOT / "transcripts/unitconv-issue.json"
+    prompt = frame_user_turn(
+        "job", "", "https://forge.example.com/acme-corp/acme-bot/issues/3815", "github"
+    )
+    lane = ms.scrub(prompt)
+    exchanges = [item for item in ms.load_transcript(path) if item["lane_key"] == lane]
+    assert [item["ordinal"] for item in exchanges] == list(range(18))
+    script = ms.ModelScript(path)
+    script.start()
+    try:
+        for item in exchanges:
+            status, body, _ = _post(
+                script.base_url, _request("system", prompt, ordinal=item["ordinal"])
+            )
+            assert status == 200
+            assert json.loads(body) == item["message"]
+    finally:
+        script.close()
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        frame_user_turn("message", "U0EXAMPLE1", "https://forge.example.com/issue", "github"),
+        frame_user_turn("job", "", "https://forge.example.com/issue", "slack"),
+        frame_user_turn("job", "", "different issue text", "github"),
+        "https://forge.example.com/issue",
+    ],
+    ids=["person-event", "different-channel", "different-text", "missing-frame"],
+)
+def test_factory_transcript_rejects_a_different_sender_lane(prompt: str) -> None:
+    script = ms.ModelScript(ROOT / "transcripts/unitconv-issue.json")
+    script.start()
+    try:
+        status, body, _ = _post(script.base_url, _request("system", prompt))
+        assert status == 422
+        assert json.loads(body)["error"]["type"] == "unexpected_request"
+    finally:
+        with pytest.raises(ms.UnexpectedRequest):
+            script.close()

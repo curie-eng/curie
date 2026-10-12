@@ -52,6 +52,7 @@ from sqlalchemy import make_url, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from test_factory_progress import ACTIVITY, DECLARATION, STAGED_DECLARATION, progress_token, report
 from test_factory_terminus import (  # noqa: F401  (fixtures)
+    ISSUE_REPLY,
     REPO,
     REVISION_REPLY_COLUMNS,
     REVISION_REPLY_VALUES,
@@ -1655,7 +1656,9 @@ def test_later_request_status_comments_continue_on_the_existing_pr_until_termina
         "SELECT * FROM curie.publications WHERE execution_request_id = :id",
         {"id": first["id"]},
     )
-    successor = _insert_revision(first["work_item_id"], number, "Continue the requested issue work")
+    successor = _insert_revision(
+        first["work_item_id"], number, "Continue the requested issue work", ISSUE_REPLY
+    )
     _execute(
         "INSERT INTO curie.factory_terminal_notices (execution_request_id, work_item_id) "
         "VALUES (:request, :item)",
@@ -1708,7 +1711,12 @@ def test_queued_review_revision_replies_that_it_waits_for_the_current_run(
     client, github, sink = admitted
     sink.by_path = True
     number, pr, first = _published_issue(client, github, sink)
-    running = _insert_revision(first["work_item_id"], number, pr, "discussion_r88203")
+    running = _insert_revision(
+        first["work_item_id"],
+        number,
+        _revision_objective(pr, "discussion_r88203"),
+        _revision_reply(pr, "discussion_r88203"),
+    )
     _start_running(running)
     assert report(client, running, "implement", round=1).status_code == 201
     _reconcile()
@@ -1819,7 +1827,12 @@ def _live_revision(
 ) -> tuple[int, int, uuid.UUID, Any]:
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
-    revision = _insert_revision(first["work_item_id"], number, pr, fragment)
+    revision = _insert_revision(
+        first["work_item_id"],
+        number,
+        _revision_objective(pr, fragment),
+        _revision_reply(pr, fragment),
+    )
     _start_running(revision)
     # A revision inserted without a status row gets one from its first report.
     assert report(client, revision, "implement", round=1).status_code == 201

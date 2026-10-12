@@ -204,6 +204,7 @@ def _fail(request_id: uuid.UUID, epoch: int) -> None:
             outcome="failed",
             cause="deadline_halted",
             detail=None,
+            ci_fix_round=None,
         )
         assert getattr(result, "code", None) is None, result
 

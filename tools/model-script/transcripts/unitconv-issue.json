@@ -2,7 +2,7 @@
   "version": 1,
   "exchanges": [
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 0,
       "message": {
         "id": "msg_KHqQdN6aeatzINv0USoY",
@@ -44,7 +44,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 1,
       "message": {
         "id": "msg_wkrDxwFeBfWMhklfC1pJ",
@@ -95,7 +95,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 2,
       "message": {
         "id": "msg_TXZNAaEjkUHQFIOefs2u",
@@ -136,7 +136,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 3,
       "message": {
         "id": "msg_nOScCThZ573KE9lYBGiq",
@@ -192,7 +192,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 4,
       "message": {
         "id": "msg_WE11zD2AwUIQirDzo0kE",
@@ -245,7 +245,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 5,
       "message": {
         "id": "msg_LBFhH5z43XBAk54OEZUX",
@@ -290,7 +290,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 6,
       "message": {
         "id": "msg_JLE0ptpg5pEN3ce5BTPm",
@@ -679,7 +679,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 7,
       "message": {
         "id": "msg_rh69oZ6Cq4YAKa8El0Ob",
@@ -1023,7 +1023,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 8,
       "message": {
         "id": "msg_tLw8jLOTNk8QNpDEApKr",
@@ -1068,7 +1068,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 9,
       "message": {
         "id": "msg_gLwrr1vRj72kDJe5bk2j",
@@ -1108,7 +1108,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 10,
       "message": {
         "id": "msg_rMlR2uw7eWjRsup5Csdn",
@@ -1146,7 +1146,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 11,
       "message": {
         "id": "msg_koOWoBBww7rTFScSXMtA",
@@ -1204,7 +1204,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 12,
       "message": {
         "id": "msg_LfWnE3lkFdGYnByVsZYd",
@@ -1244,7 +1244,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 13,
       "message": {
         "id": "msg_MINW7gPSroUfMxvBZExn",
@@ -1282,7 +1282,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 14,
       "message": {
         "id": "msg_Q0ez1mmQmWRvMbz2p0cB",
@@ -1328,7 +1328,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 15,
       "message": {
         "id": "msg_K42piQ7o5VXDqCt1Dxei",
@@ -1791,7 +1791,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 16,
       "message": {
         "id": "msg_1mXuWxAsOEoNDEWHV1Mt",
@@ -1836,7 +1836,7 @@
       }
     },
     {
-      "lane_key": "<v>",
+      "lane_key": "[platform-sender curie-sender-boundary]\nevent: job\nchannel: github\nperson: none\nrole: scheduled run\n[user-message curie-sender-boundary]\n<v>\n[end-user-message curie-sender-boundary]",
       "ordinal": 17,
       "message": {
         "id": "msg_latKkkoBBUpiAWZrYV77",

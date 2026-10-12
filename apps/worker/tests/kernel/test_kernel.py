@@ -6322,7 +6322,8 @@ class _MarkerRetryClock:
     """Inject arithmetic and sleeps locally; keep actual Valkey writes real."""
 
     def __init__(self) -> None:
-        self.now = time.monotonic()
+        # Half-second retry increments stay exact regardless of host uptime.
+        self.now = float(int(time.monotonic()))
         self.owner_task = asyncio.current_task()
         self.delays: list[float] = []
         self.after_sleep: Callable[[], None] | None = None

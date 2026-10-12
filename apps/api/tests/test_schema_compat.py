@@ -115,10 +115,14 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
     )
     # The tracker identity contract (0103, #3831) is pending, so a rollback-safe
     # upgrade is refused and only a forward-only one converges.
-    refused = apply_upgrade(forward_only=False, alembic_config=alembic_config())
+    refused = apply_upgrade(
+        forward_only=False, before_apply=lambda: None, alembic_config=alembic_config()
+    )
     assert refused.outcome == "refused"
     assert current_revision() == branch_head
-    result = apply_upgrade(forward_only=True, alembic_config=alembic_config())
+    result = apply_upgrade(
+        forward_only=True, before_apply=lambda: None, alembic_config=alembic_config()
+    )
     assert result.action == "apply"
     assert result.outcome == "applied"
     assert result.rollback_compatible is False
