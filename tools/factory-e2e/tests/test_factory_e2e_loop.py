@@ -616,7 +616,7 @@ DRIVER_METHODS = (
     "reset_fixture",
     "pin_fixture_base",
 )
-NOT_INSTALLED_FORGES = ("gitlab", "jira_cloud", "bitbucket_cloud", "bitbucket_dc")
+NOT_INSTALLED_FORGES = ("gitlab", "jira_cloud")
 
 
 def test_base_defines_the_driver_protocol_without_importing_the_harness(

@@ -40,7 +40,8 @@ from curie_api.forges.registry import (
 from curie_api.forges.types import CredentialScope
 from forge_fakes import config_samples as samples
 
-INSTALLED = frozenset({types.GITHUB})
+INSTALLED_CODE_HOSTS = frozenset({types.GITHUB, types.BITBUCKET_CLOUD, types.BITBUCKET_DC})
+INSTALLED_TRACKERS = frozenset({types.GITHUB})
 GHE_API = "https://ghe.example.com/api/v3"
 GHE_HOST = "ghe.example.com"
 REPO = "acme-corp/api"
@@ -216,11 +217,6 @@ def _gitlab_tracker(name: str = "corp-gitlab") -> dict[str, Any]:
 
 RESERVED_ENTRIES: dict[str, tuple[str, dict[str, Any]]] = {
     "gitlab-code_host": ("code_hosts", samples.gitlab_code_host("corp-gitlab")),
-    "bitbucket_cloud-code_host": ("code_hosts", samples.bitbucket_code_host("corp-bb")),
-    "bitbucket_dc-code_host": (
-        "code_hosts",
-        {**samples.bitbucket_code_host("corp-bbdc"), "kind": "bitbucket_dc"},
-    ),
     "gitlab-tracker": ("trackers", _gitlab_tracker()),
     "jira_cloud-tracker": ("trackers", samples.jira_tracker("corp-jira")),
 }
@@ -262,15 +258,15 @@ def test_every_configurable_kind_is_installed_or_refused() -> None:
     reserved_trackers = {
         entry["kind"] for section, entry in RESERVED_ENTRIES.values() if section == "trackers"
     }
-    assert set(get_args(CodeHostKind)) == INSTALLED | reserved_code_hosts
-    assert set(get_args(TrackerKind)) == INSTALLED | reserved_trackers
+    assert set(get_args(CodeHostKind)) == INSTALLED_CODE_HOSTS | reserved_code_hosts
+    assert set(get_args(TrackerKind)) == INSTALLED_TRACKERS | reserved_trackers
 
 
 def test_a_github_only_config_passes_the_installed_check(private_key: str) -> None:
     check_installed(_config(_github_entries(private_key)))
 
 
-@pytest.mark.parametrize("module", ["gitlab", "jira_cloud", "bitbucket_cloud", "bitbucket_dc"])
+@pytest.mark.parametrize("module", ["gitlab", "jira_cloud"])
 def test_reserved_packages_register_not_installed(module: str) -> None:
     importlib.import_module(f"curie_api.forges.{module}")
     kind = module
@@ -279,6 +275,19 @@ def test_reserved_packages_register_not_installed(module: str) -> None:
 
     with pytest.raises(NotInstalled, match=kind):
         check_installed(_config({section: [entry]}))
+
+
+BITBUCKET_ENTRIES: dict[str, dict[str, Any]] = {
+    "bitbucket_cloud": samples.bitbucket_code_host("corp-bb"),
+    "bitbucket_dc": {**samples.bitbucket_code_host("corp-bbdc"), "kind": "bitbucket_dc"},
+}
+
+
+@pytest.mark.parametrize("module", sorted(BITBUCKET_ENTRIES))
+def test_bitbucket_packages_register_an_installed_code_host(module: str) -> None:
+    importlib.import_module(f"curie_api.forges.{module}")
+
+    check_installed(_config({"code_hosts": [BITBUCKET_ENTRIES[module]]}))
 
 
 def test_a_kind_cannot_be_registered_twice() -> None:

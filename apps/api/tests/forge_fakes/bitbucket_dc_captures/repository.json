@@ -1,0 +1,39 @@
+{
+  "slug": "demo",
+  "id": 1,
+  "name": "demo",
+  "hierarchyId": "0a1b2c3d4e5f6a7b8c9d",
+  "scmId": "git",
+  "state": "AVAILABLE",
+  "statusMessage": "Available",
+  "forkable": true,
+  "project": {
+    "key": "FAC",
+    "id": 1,
+    "name": "Factory",
+    "public": false,
+    "type": "NORMAL",
+    "links": {
+      "self": [
+        {
+          "href": "https://bbdc.example.invalid/projects/FAC"
+        }
+      ]
+    }
+  },
+  "public": false,
+  "archived": false,
+  "links": {
+    "clone": [
+      {
+        "href": "https://bbdc.example.invalid/scm/fac/demo.git",
+        "name": "http"
+      }
+    ],
+    "self": [
+      {
+        "href": "https://bbdc.example.invalid/projects/FAC/repos/demo/browse"
+      }
+    ]
+  }
+}
