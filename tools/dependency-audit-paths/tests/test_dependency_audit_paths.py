@@ -6,7 +6,7 @@ import copy
 import posixpath
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -31,7 +31,10 @@ EXPECTED_PATHS = [
 def _workflow() -> dict[str, Any]:
     # BaseLoader preserves GitHub Actions' `on` key instead of treating it as
     # a YAML 1.1 boolean. All values relevant to these tests are strings.
-    return yaml.load(WORKFLOW_PATH.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    return cast(
+        dict[str, Any],
+        yaml.load(WORKFLOW_PATH.read_text(encoding="utf-8"), Loader=yaml.BaseLoader),
+    )
 
 
 def _audited_lockfiles(workflow: dict[str, Any]) -> set[str]:

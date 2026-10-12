@@ -165,10 +165,10 @@ GITLEAKS_COMMAND = r"""docker run --rm -v "${{ github.workspace }}:/repo" \
   ${GITLEAKS_LOG_OPTS:+"$GITLEAKS_LOG_OPTS"}"""
 COMPILE_CI_COMMAND = "cargo test --locked"
 COMPILE_FAST_COMMAND = "cargo check --locked --tests"
-TYPESCRIPT_COMMAND = r"""npx --yes json-schema-to-typescript@15.0.4 \
-  packages/aci-protocol/schema/aci-protocol.schema.json \
+TYPESCRIPT_COMMAND = r"""pnpm --dir tools/contract-codegen exec json2ts \
+  "${{ github.workspace }}/packages/aci-protocol/schema/aci-protocol.schema.json" \
   --unreachableDefinitions \
-  -o packages/aci-protocol/generated/ts/aci-protocol.ts
+  -o "${{ github.workspace }}/packages/aci-protocol/generated/ts/aci-protocol.ts"
 git diff --exit-code -- packages/aci-protocol/generated/ts/aci-protocol.ts"""
 MANIFEST_COMMAND = (
     r"""pnpm gen:manifest
@@ -179,6 +179,13 @@ git diff --exit-code src/generated/commandManifest.ts \
 # A fresh hook worktree has no node_modules. This is dependency setup from CI,
 # not another selected gate, and --dry-run never runs it.
 UI_SETUP = exact("ui", "Install dependencies", "pnpm install --frozen-lockfile", "apps/ui", "setup")
+CONTRACTS_SETUP = exact(
+    "contracts-ts",
+    "Install dependencies",
+    "pnpm --dir tools/contract-codegen install --frozen-lockfile",
+    ".",
+    "setup",
+)
 CHECKS = (
     exact(
         "action-pins",
@@ -261,8 +268,8 @@ CHECKS = (
     exact(
         "contracts-ts",
         "tsc --noEmit on generated ACI types",
-        "npx --yes -p typescript@5.9.3 tsc --noEmit -p "
-        "packages/aci-protocol/generated/ts/tsconfig.json",
+        "pnpm --dir tools/contract-codegen exec tsc --noEmit -p "
+        '"${{ github.workspace }}/packages/aci-protocol/generated/ts/tsconfig.json"',
         ".",
         "contracts",
     ),
@@ -282,7 +289,7 @@ def load_workflow(root: Path, filename: str) -> dict[str, Any]:
 
 
 def validate_workflows(root: Path) -> None:
-    declarations = (*CHECKS, UI_SETUP)
+    declarations = (*CHECKS, UI_SETUP, CONTRACTS_SETUP)
     workflows = {
         name: load_workflow(root, name) for name in {check.workflow for check in declarations}
     }
@@ -334,7 +341,7 @@ def selected_checks(paths: list[str]) -> list[Check]:
             groups.add("python")
         if path.startswith(("cli/", "packages/aci-protocol/")):
             groups.add("rust")
-        if path.startswith("packages/aci-protocol/"):
+        if path.startswith(("packages/aci-protocol/", "tools/contract-codegen/")):
             groups.add("contracts")
         if path.startswith("cli/"):
             groups.add("cli")
@@ -1082,6 +1089,12 @@ def render_command(root: Path, check: Check, base: str, head: str) -> str:
         '"${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"',
         shlex.quote(range_),
     )
+    if check.job == "contracts-ts":
+        command = re.sub(
+            r'"\$\{\{ github\.workspace \}\}/([^"]+)"',
+            lambda match: shlex.quote(str(root / match[1])),
+            command,
+        )
     if check.job == "gitleaks":
         workflow = load_workflow(root, "gitleaks.yaml")
         image = workflow["jobs"]["gitleaks"]["env"]["GITLEAKS_IMAGE"]
@@ -1149,6 +1162,14 @@ def execute_checks(root: Path, base: str, head: str, dry_run: bool, report: dict
                 flush=True,
             )
             command = f"{UI_SETUP.command}\n{command}"
+        elif check.job == "contracts-ts":
+            print(
+                "preflight: prerequisite "
+                f"{CONTRACTS_SETUP.workflow}:{CONTRACTS_SETUP.job}: {CONTRACTS_SETUP.step}",
+                file=sys.stderr,
+                flush=True,
+            )
+            command = f"{CONTRACTS_SETUP.command}\n{command}"
         try:
             result = run_process(["bash", "-e", "-o", "pipefail", "-c", command], root / check.cwd)
             exit_code, output = result.returncode, result.stdout

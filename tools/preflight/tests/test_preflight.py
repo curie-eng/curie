@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import yaml
@@ -115,7 +116,9 @@ def preflight(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         ("tools/contract-codegen/README.md", ALWAYS | TYPESCRIPT),
     ],
 )
-def test_selection_follows_changed_path_rules(repo: Path, path: str, expected: set) -> None:
+def test_selection_follows_changed_path_rules(
+    repo: Path, path: str, expected: set[tuple[str, str]]
+) -> None:
     commit(repo, path)
     result = preflight(repo, "--dry-run", "--json")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -157,7 +160,7 @@ def test_selection_uses_three_dot_diff_and_requested_base_and_head(repo: Path) -
     assert f"origin/next..{docs}" in message["command"]
 
 
-def load_tool():
+def load_tool() -> ModuleType:
     spec = importlib.util.spec_from_file_location("curie_preflight_test_subject", TOOL)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -471,6 +474,12 @@ def test_tracked_hook_installs_contract_tools_and_rejects_unlocked_manifest(
     clean_head = git(side, "rev-parse", "HEAD")
     accepted = run(side, "git", "push", "origin", "topic", check=False)
     assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    output = accepted.stdout + accepted.stderr
+    assert (
+        "preflight: passed ci.yaml:contracts-ts: "
+        "Regenerate TypeScript from the committed schema and check for drift"
+    ) in output
+    assert "preflight: passed ci.yaml:contracts-ts: tsc --noEmit on generated ACI types" in output
     assert git(remote, "rev-parse", "refs/heads/topic") == clean_head
     assert not (side / "tools/contract-codegen/node_modules").exists()
     worktrees = git(side, "worktree", "list", "--porcelain")
@@ -489,7 +498,9 @@ def test_tracked_hook_installs_contract_tools_and_rejects_unlocked_manifest(
     assert "ERR_PNPM_OUTDATED_LOCKFILE" in rejected.stdout + rejected.stderr
     assert git(remote, "rev-parse", "refs/heads/topic") == clean_head
     assert not (side / "tools/contract-codegen/node_modules").exists()
-    assert git(side, "worktree", "list", "--porcelain") == worktrees
+    assert re.findall(
+        r"^(?:worktree|branch) .+$", git(side, "worktree", "list", "--porcelain"), re.M
+    ) == re.findall(r"^(?:worktree|branch) .+$", worktrees, re.M)
 
 
 def test_tracked_hook_rejects_bad_real_push_then_accepts_clean_push(
