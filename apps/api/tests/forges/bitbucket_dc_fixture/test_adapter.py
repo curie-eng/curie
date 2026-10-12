@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
+import anyio
 import pytest
 from curie_api.forges.authority import feedback_actionable
 from curie_api.forges.types import (
@@ -148,6 +150,21 @@ async def test_pull_request_open_find_update_read(
     assert closed is not None and closed.state is PullRequestState.CLOSED
 
 
+async def _head_after_rescope(adapter: Any, ref: Any, pushed: str) -> str:
+    """The pull request's head once it reports ``pushed``, or the last head read.
+
+    Data Center moves a pull request to a pushed commit asynchronously, so a
+    read straight after the push can still return the previous head.
+    """
+
+    deadline = time.monotonic() + 30
+    while True:
+        head: str = (await adapter.read_pull_request(ref)).head_sha
+        if head == pushed or time.monotonic() >= deadline:
+            return head
+        await anyio.sleep(0.5)
+
+
 @pytest.mark.anyio
 async def test_status_rollup_failed_then_successful_and_old_head_ignored(
     adapter: Any, live: Any, repository: RepositoryRef
@@ -156,7 +173,7 @@ async def test_status_rollup_failed_then_successful_and_old_head_ignored(
     old = pull.head_sha
     live.post_status(old, "unit-tests", "FAILED")
     new = live.push(pull.head_ref, "fix the tests")
-    assert (await adapter.read_pull_request(pull.ref)).head_sha == new
+    assert await _head_after_rescope(adapter, pull.ref, new) == new
 
     live.post_status(new, "unit-tests", "FAILED")
     assert (await adapter.observe_ci(repository, new)).state is RollupState.FAILURE
