@@ -86,7 +86,8 @@ PLACEHOLDER_NAMES = frozenset(
 # First path segments on gitlab.com and bitbucket.org that are product routes,
 # not a group or workspace.
 GITLAB_ROUTES = frozenset({"api", "help", "explore", "users", "dashboard", "oauth", "search", "-"})
-BITBUCKET_ROUTES = frozenset({"account", "site", "product", "dashboard", "repo"})
+# `workspaces` is followed by the workspace, which its own site rule reads.
+BITBUCKET_ROUTES = frozenset({"account", "site", "product", "dashboard", "repo", "workspaces"})
 
 # Each token rule: (rule id, pattern, length of the fixed prefix). The body
 # after the prefix is what the placeholder check reads.
@@ -137,6 +138,11 @@ SITE_RULES: tuple[tuple[str, re.Pattern[str], frozenset[str]], ...] = (
     (
         "bitbucket-workspace",
         re.compile(r"\bapi\.bitbucket\.org/2\.0/(?:repositories|workspaces)/" + _NAME),
+        frozenset(),
+    ),
+    (
+        "bitbucket-workspace",
+        re.compile(r"(?<![A-Za-z0-9_.-])bitbucket\.org/workspaces/" + _NAME),
         frozenset(),
     ),
     (
@@ -391,6 +397,11 @@ PLANTED: dict[str, tuple[str, str]] = {
         "bitbucket-workspace",
         "https://" + "bitbucket.org/" + _tenant() + "/app.git",
     ),
+    # A team workspace's avatar link names the workspace after the route.
+    "bitbucket-web-workspace-avatar": (
+        "bitbucket-workspace",
+        "https://" + "bitbucket.org/workspaces/" + _tenant() + "/avatar/?ts=1760000000",
+    ),
     # The placeholder workspace is exempt only exactly; a real repository
     # under a real workspace, or a name that merely starts with it, is not.
     "bitbucket-api-real-workspace-example-repo": (
@@ -495,6 +506,9 @@ PLACEHOLDERS: dict[str, str] = {
     + "bitbucket.org/"
     + "example-workspace/example-repo",
     "bitbucket-web-route": "https://" + "bitbucket.org/" + "account/settings",
+    "bitbucket-web-workspace-avatar-example": "https://"
+    + "bitbucket.org/"
+    + "workspaces/example-workspace/avatar/?ts=1760000000",
     "gitlab-group-example": "https://" + "gitlab.com/" + "example/app",
     "gitlab-api-projects": "https://" + "gitlab.com/api/v4/projects/" + "42",
     "gitlab-group-api-demo": "https://" + "gitlab.com/api/v4/groups/" + "demo",
