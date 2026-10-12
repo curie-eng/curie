@@ -66,7 +66,7 @@ PAYLOADS = Path(__file__).resolve().parent / "jira_payloads"
 SITE_HOST = "acme.atlassian.example"
 SITE = f"https://{SITE_HOST}"
 GATEWAY_HOST = "api.atlassian.example"
-CLOUD_ID = "a1b2c3d4-0000-4000-8000-000000000001"
+CLOUD_ID = "11111111-1111-1111-1111-111111111111"
 SCOPED_API = f"https://{GATEWAY_HOST}/ex/jira/{CLOUD_ID}"
 
 BOT_EMAIL = "factory-bot@example.com"

@@ -432,7 +432,7 @@ def test_repository_policy_matches_the_id_first_then_the_path_case_insensitively
 
 # Jira Cloud and kind-neutral lookups (#4358, plan D13 and D14) ----------------------
 
-JIRA_SITE_ID = "a1b2c3d4-0000-4000-8000-000000000001"
+JIRA_SITE_ID = "11111111-1111-1111-1111-111111111111"
 
 
 def _jira_entries(private_key: str) -> dict[str, Any]:
