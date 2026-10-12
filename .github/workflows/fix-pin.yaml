@@ -24,12 +24,13 @@ jobs:
     # suite. Run 34528877480 is one of those: the build ran, for 251s.
     #
     # Nothing here is waste in itself, so this does not delete a step, it moves
-    # them off the path. They are unchanged, including the direct cargo build:
-    # a `rust` selector makes verify-fix-pin.sh run `cargo test` out of
-    # CARGO_TARGET_DIR, so that build warms the directory the verification then
-    # compiles in, and is not merely producing the binary the check invokes.
-    # Swapping it for the artifact rust-build already uploads would leave a
-    # rust selector to compile from cold, which is why it stays a direct build.
+    # them off the path. The build stays direct and restores a shared dependency
+    # Cargo cache. rust-cache v2 defaults cache-workspace-crates to false,
+    # removing the workspace's curie artifacts before saving. Its key hashes
+    # rustc, Cargo.lock and Cargo.toml; Cargo fingerprints version, features,
+    # profile and rustc, so curie is always compiled from this checkout.
+    # A `rust` selector builds the debug crate in a detached worktree. Its
+    # reversed run never uses the release driver as the code under test.
     # The comment it carried about living "inside the required Python status"
     # is now met by this job being its own required status.
     #
@@ -83,6 +84,13 @@ jobs:
           python3 tools/fix-pin-ci/check.py
           --event "$GITHUB_EVENT_PATH"
           --needs-curie
+      - name: Cargo cache
+        if: steps.fix-pin-curie.outputs.needed == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: cli
+          shared-key: curie-cli-release
+          cache-on-failure: true
       - name: Build the current curie binary for fix pin verification
         if: steps.fix-pin-curie.outputs.needed == 'true'
         run: cargo build --release --locked --manifest-path cli/Cargo.toml
