@@ -121,6 +121,14 @@ impl Fixture {
 printf 'helm\t%s\n' "$*" >> "$CURIE_CAPACITY_CALLS"
 if [ "$1" = template ]; then
     case " $* " in
+        *" --show-only templates/priorityclass.yaml "*|*" --show-only=templates/priorityclass.yaml "*)
+            printf '%s\n' 'Error: could not find template templates/priorityclass.yaml in chart' >&2
+            exit 1
+            ;;
+        *" --show-only templates/preflight-gvisor.yaml "*|*" --show-only=templates/preflight-gvisor.yaml "*)
+            printf '%s\n' 'Error: could not find template templates/preflight-gvisor.yaml in chart' >&2
+            exit 1
+            ;;
         *" --show-only "*|*" --show-only="*)
             printf 'Error: could not find template %s in chart\n' "$*" >&2
             exit 1
