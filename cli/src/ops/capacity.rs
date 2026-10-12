@@ -76,7 +76,7 @@ impl Projection {
             / allocatable;
         Ok(Self {
             amount,
-            percentage: if tenths % 10 == 0 {
+            percentage: if tenths.is_multiple_of(10) {
                 (tenths / 10).to_string()
             } else {
                 format!("{}.{}", tenths / 10, tenths % 10)
