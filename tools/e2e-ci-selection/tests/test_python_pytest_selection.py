@@ -51,6 +51,23 @@ def _invoke_selector(
 
 
 PYTEST_SELECTED = "steps.python-runtime.outputs.pytest == 'true'"
+STATIC_JOB = "python-static"
+STATIC_REQUIREMENT_STEP = "Require static gates to pass"
+# #4471: the gates that moved from the required job into STATIC_JOB, in order.
+MOVED_STATIC_STEPS = (
+    "Lockfile is up to date",
+    "Alembic revision gate",
+    "Alembic cross-train lineage",
+    "Schema window gate",
+    "Ruff",
+    "Mypy",
+    "Import boundaries (harness SDK containment)",
+    "Docs gate (catalog drift + agent contract + citations)",
+    "Wire tolerance gate (_AciModel model_validate call sites)",
+    "Shellcheck sre-bot platform-upgrade script",
+    "Release tests",
+    "ACI wire-lock base gate",
+)
 SHARD_COUNT = 3
 ALWAYS_RUN_PYTHON_STEPS = (
     "Alembic revision gate",
@@ -259,8 +276,14 @@ def test_required_python_job_keeps_ruleset_name_and_is_not_skippable() -> None:
     assert job["name"] == "Python (ruff + mypy + pytest)"
     # It waits for the shards only to aggregate them; always() keeps it
     # reporting the required check whatever the shards did.
-    assert job["needs"] == ["changes", "python-pytest"]
+    assert job["needs"] == ["changes", "python-pytest", "python-static"]
     assert job["if"] == "always()"
+
+    # #4471: the static gates run in their own job, parallel to the shards.
+    static = _python_job(STATIC_JOB)
+    assert static["name"] == "Python static gates"
+    assert _needs(static) == ["changes"]
+    assert "if" not in static
 
     # #3858: the shards no longer boot runners just to skip. They wait for the
     # `changes` selection and run only when it selected pytest; the required
@@ -314,10 +337,13 @@ def test_python_job_gates_compose_and_pytest_on_selector_output() -> None:
     assert len(report_tokens) == 1, report_tokens
     assert {"R", "s"} <= set(report_tokens[0][2:])
 
-    # The required job boots no stack and runs no suite of its own.
+    # The required job boots no stack and runs no suite of its own, and
+    # neither does the static job.
     required = _named_steps()
+    static = _named_steps(STATIC_JOB)
     for name in GATED_RUNTIME_STEPS:
         assert name not in required, name
+        assert name not in static, name
     assert (
         named["Decide whether compose and pytest are needed"]["run"]
         == (required["Decide whether compose and pytest are needed"]["run"])
@@ -325,7 +351,7 @@ def test_python_job_gates_compose_and_pytest_on_selector_output() -> None:
 
 
 def test_python_static_gates_stay_unconditional() -> None:
-    named = _named_steps()
+    named = _named_steps(STATIC_JOB)
     for name in ALWAYS_RUN_PYTHON_STEPS:
         step = named[name]
         assert "if" not in step, name
@@ -335,8 +361,31 @@ def test_python_static_gates_stay_unconditional() -> None:
     assert "scripts/check-docs.sh" in _string(docs, "run")
 
 
+def test_static_job_holds_exactly_the_moved_gates_in_order() -> None:
+    """#4471: the twelve gates moved out of the required job, order preserved."""
+    static_names = [
+        step["name"]
+        for step in _python_job(STATIC_JOB)["steps"]
+        if isinstance(step, dict) and isinstance(step.get("name"), str)
+    ]
+    expected = [
+        "Install uv",
+        "Back off before retrying Install uv",
+        "Install uv (retry)",
+        "Lockfile is up to date",
+        "Sync workspace",
+        *MOVED_STATIC_STEPS[1:],
+    ]
+    assert static_names == expected
+
+    required = _named_steps()
+    for name in MOVED_STATIC_STEPS:
+        assert name not in required, name
+    assert "Sync workspace" in required
+
+
 def test_aci_wire_lock_base_gate_compares_against_the_event_branch() -> None:
-    script = _string(_named_steps()["ACI wire-lock base gate"], "run")
+    script = _string(_named_steps(STATIC_JOB)["ACI wire-lock base gate"], "run")
     branch = "${{ github.base_ref || github.ref_name }}"
     assert script.count(branch) == 2
     assert f'git fetch --no-tags --depth=1 origin "{branch}"' in script
@@ -571,15 +620,47 @@ def test_shard_download_runs_only_when_pytest_was_selected() -> None:
     assert _string(download, "if") == PYTEST_SELECTED
 
 
-def test_release_tests_run_in_the_required_job_when_pytest_is_skipped() -> None:
+def test_release_tests_run_in_the_static_job_when_pytest_is_skipped() -> None:
     """#3858: a version-only diff still runs the release tests on the new commit.
 
     The shards cover release/tests whenever pytest is selected, so the step
-    runs only on the skip path.
+    runs only on the skip path. #4471: it lives in the static job, so it reads
+    the selection from `changes` rather than from a step in the same job.
     """
-    step = _named_steps()["Release tests"]
-    assert _string(step, "if") == PYTEST_NOT_SELECTED
+    step = _named_steps(STATIC_JOB)["Release tests"]
+    assert _string(step, "if") == "needs.changes.outputs.pytest == 'false'"
     assert _string(step, "run").strip() == "uv run pytest -q release/tests"
+    assert "Release tests" not in _named_steps()
+
+
+def test_static_gate_requirement_step_sits_before_the_shard_download() -> None:
+    """#4471: the python job's step order puts the static check first."""
+    names = [
+        step["name"]
+        for step in _python_job()["steps"]
+        if isinstance(step, dict) and isinstance(step.get("name"), str)
+    ]
+    assert names.index(STATIC_REQUIREMENT_STEP) + 1 == names.index("Download shard results")
+
+
+@pytest.mark.parametrize("static_result", ["success", "failure", "skipped", "cancelled"])
+def test_required_job_passes_only_when_the_static_job_succeeded(
+    tmp_path: Path, static_result: str
+) -> None:
+    """#4471: run the real step; only a success result lets the required job pass."""
+    step = _named_steps()[STATIC_REQUIREMENT_STEP]
+    # The default success() condition is what makes this step fail the job, so it
+    # must not be gated or made non-fatal.
+    assert "if" not in step
+    assert "continue-on-error" not in step
+    bindings = _bindings(step, {"static_result": "${{ needs.python-static.result }}"})
+    assert bindings == {"static_result": "STATIC_RESULT"}
+    result = _run_bash(_string(step, "run"), {"STATIC_RESULT": static_result}, tmp_path)
+    if static_result == "success":
+        assert result.returncode == 0, result.stdout + result.stderr
+    else:
+        assert result.returncode != 0
+        assert static_result in result.stdout + result.stderr
 
 
 def test_changes_job_exports_pytest_and_version_only() -> None:
