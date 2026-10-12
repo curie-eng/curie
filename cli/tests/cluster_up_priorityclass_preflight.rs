@@ -152,6 +152,7 @@ exit 64
             &bin_dir,
             "kubectl",
             r#"#!/bin/sh
+curie_test_capacity_read "$@"
 if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
     if [ "$3" = "target-namespace" ]; then
         printf '%s\n' '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"target-namespace","labels":{"curietech.ai/created-by":"target-release","curietech.ai/created-in":"target-namespace"},"uid":"uid-target-namespace","resourceVersion":"17"}}'

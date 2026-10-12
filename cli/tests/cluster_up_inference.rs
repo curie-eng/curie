@@ -89,8 +89,8 @@ if [ "$1" = "template" ]; then
             exit 1
             ;;
     esac
-    printf 'unexpected helm template invocation: %s\n' "$*" >&2
-    exit 64
+    printf '%s\n' 'apiVersion: apps/v1' 'kind: Deployment' 'metadata:' '  name: acme-platform' 'spec:' '  template:' '    spec:' '      containers:' '        - name: platform' '          resources:' '            requests:' '              cpu: 100m' '              memory: 128Mi'
+    exit 0
 fi
 
 if [ "$1" = "upgrade" ] && [ "$2" = "--install" ]; then
@@ -129,6 +129,7 @@ exit 64
             "kubectl",
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$CURIE_TEST_KUBECTL_LOG"
+curie_test_capacity_read "$@"
 
 if [ "$1" = "get" ] && [ "$2" = "namespace" ]; then
     if [ "$3" = "target-namespace" ]; then

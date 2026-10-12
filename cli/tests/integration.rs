@@ -44,6 +44,7 @@ mod cluster_secret_scope_kind;
 mod cluster_stub_trust;
 mod cluster_target;
 mod cluster_up_admission_fast_fail;
+mod cluster_up_capacity_preflight;
 mod cluster_up_e2e_connector_identity;
 mod cluster_up_gvisor_preflight;
 mod cluster_up_inference;
