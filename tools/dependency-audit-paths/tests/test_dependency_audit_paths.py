@@ -22,6 +22,8 @@ EXPECTED_PATHS = [
     "**/pyproject.toml",
     "apps/ui/pnpm-lock.yaml",
     "apps/ui/package.json",
+    "tools/contract-codegen/pnpm-lock.yaml",
+    "tools/contract-codegen/package.json",
     ".github/workflows/dependency-audit.yaml",
 ]
 
@@ -78,8 +80,19 @@ def test_every_audited_lockfile_is_covered() -> None:
         "packages/aci-protocol/generated/rust/Cargo.lock",
         "uv.lock",
         "apps/ui/pnpm-lock.yaml",
+        "tools/contract-codegen/pnpm-lock.yaml",
     }
     _assert_lockfiles_covered(workflow)
+
+
+def test_contract_codegen_lockfile_cannot_lose_pull_request_coverage() -> None:
+    workflow = copy.deepcopy(_workflow())
+    lockfile = "tools/contract-codegen/pnpm-lock.yaml"
+    assert lockfile in _audited_lockfiles(workflow)
+    workflow["on"]["pull_request"]["paths"].remove(lockfile)
+
+    with pytest.raises(AssertionError, match=re.escape(lockfile)):
+        _assert_lockfiles_covered(workflow)
 
 
 @pytest.mark.parametrize(

@@ -110,6 +110,9 @@ def preflight(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         ("apps/ui/src/example.ts", ALWAYS | {("ui", "Lint")}),
         ("packages/aci-protocol/schema/example.json", ALWAYS | RUST | TYPESCRIPT),
         ("packages/aci-protocol/example.py", ALWAYS | PYTHON | RUST | TYPESCRIPT),
+        ("tools/contract-codegen/package.json", ALWAYS | TYPESCRIPT),
+        ("tools/contract-codegen/pnpm-lock.yaml", ALWAYS | TYPESCRIPT),
+        ("tools/contract-codegen/README.md", ALWAYS | TYPESCRIPT),
     ],
 )
 def test_selection_follows_changed_path_rules(repo: Path, path: str, expected: set) -> None:
@@ -132,6 +135,11 @@ def test_selection_follows_changed_path_rules(repo: Path, path: str, expected: s
     workflow = yaml.safe_load((ROOT / ".github/workflows/gitleaks.yaml").read_text())
     assert workflow["jobs"]["gitleaks"]["env"]["GITLEAKS_IMAGE"] in scan["command"]
     assert "origin/main..HEAD" in scan["command"]
+    for check in plan["checks"]:
+        if check["job"] == "contracts-ts":
+            assert "${{ github.workspace }}" not in check["command"]
+            assert "pnpm --dir tools/contract-codegen exec" in check["command"]
+            assert str(repo / "packages/aci-protocol") in check["command"]
 
 
 def test_selection_uses_three_dot_diff_and_requested_base_and_head(repo: Path) -> None:
@@ -194,6 +202,32 @@ def test_drift_guard_rejects_mutated_compile_only_preflight_command(
     monkeypatch.setattr(module, "CHECKS", replacement)
     with pytest.raises(ValueError, match=name):
         module.validate_workflows(ROOT)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Install dependencies",
+        "Regenerate TypeScript from the committed schema and check for drift",
+        "tsc --noEmit on generated ACI types",
+    ],
+)
+@pytest.mark.parametrize("mutation", ["missing", "command"])
+def test_drift_guard_protects_locked_contract_toolchain(
+    tmp_path: Path, name: str, mutation: str
+) -> None:
+    shutil.copytree(ROOT / ".github/workflows", tmp_path / ".github/workflows")
+    path = tmp_path / ".github/workflows/ci.yaml"
+    workflow = yaml.safe_load(path.read_text())
+    steps = workflow["jobs"]["contracts-ts"]["steps"]
+    step = next(step for step in steps if step.get("name") == name)
+    if mutation == "missing":
+        steps.remove(step)
+    else:
+        step["run"] += " --example-mutated-flag"
+    path.write_text(yaml.safe_dump(workflow, sort_keys=False))
+    with pytest.raises(ValueError, match=name):
+        load_tool().validate_workflows(tmp_path)
 
 
 def test_fast_rejects_attribution_and_names_check_with_output_tail(repo: Path) -> None:
@@ -392,6 +426,70 @@ def test_tracked_hook_installs_ui_dependencies_and_runs_real_lint(
     assert git(remote, "rev-parse", "refs/heads/topic") == clean_head
     worktrees = git(side, "worktree", "list", "--porcelain")
     assert len(re.findall(r"^worktree ", worktrees, re.M)) == 2
+
+
+@pytest.fixture
+def contracts_hook_repo(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, Path]:
+    for relative in (
+        "tools/contract-codegen/package.json",
+        "tools/contract-codegen/pnpm-lock.yaml",
+        "packages/aci-protocol/schema/aci-protocol.schema.json",
+        "packages/aci-protocol/generated/ts/aci-protocol.ts",
+        "packages/aci-protocol/generated/ts/tsconfig.json",
+    ):
+        destination = repo / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, destination)
+    assert not (repo / "tools/contract-codegen/node_modules").exists()
+    if shutil.which("pnpm") is None:
+        if shutil.which("npm") is None:
+            pytest.fail("npm is required to acquire pnpm for this contract hook test")
+        toolchain = tmp_path / "pnpm-toolchain"
+        run(
+            tmp_path,
+            "npm",
+            "install",
+            "--prefix",
+            str(toolchain),
+            "--no-audit",
+            "--no-fund",
+            "pnpm@9.15.9",
+        )
+        monkeypatch.setenv(
+            "PATH", f"{toolchain / 'node_modules/.bin'}{os.pathsep}{os.environ['PATH']}"
+        )
+    return prepare_hook(repo, tmp_path)
+
+
+def test_tracked_hook_installs_contract_tools_and_rejects_unlocked_manifest(
+    contracts_hook_repo: tuple[Path, Path],
+) -> None:
+    side, remote = contracts_hook_repo
+    commit(side, "tools/contract-codegen/README.md", "Add contract toolchain notes")
+    clean_head = git(side, "rev-parse", "HEAD")
+    accepted = run(side, "git", "push", "origin", "topic", check=False)
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert git(remote, "rev-parse", "refs/heads/topic") == clean_head
+    assert not (side / "tools/contract-codegen/node_modules").exists()
+    worktrees = git(side, "worktree", "list", "--porcelain")
+    assert len(re.findall(r"^worktree ", worktrees, re.M)) == 2
+
+    path = side / "tools/contract-codegen/package.json"
+    manifest = json.loads(path.read_text())
+    manifest["devDependencies"]["typescript"] = "5.9.2"
+    path.write_text(json.dumps(manifest) + "\n")
+    git(side, "add", "tools/contract-codegen/package.json")
+    git(side, "commit", "-qm", "Exercise unlocked contract dependency refusal")
+    rejected = run(side, "git", "push", "origin", "topic", check=False)
+    assert rejected.returncode != 0
+    # pnpm documents --frozen-lockfile as refusing a manifest/lock mismatch:
+    # https://pnpm.io/9.x/cli/install#--frozen-lockfile
+    assert "ERR_PNPM_OUTDATED_LOCKFILE" in rejected.stdout + rejected.stderr
+    assert git(remote, "rev-parse", "refs/heads/topic") == clean_head
+    assert not (side / "tools/contract-codegen/node_modules").exists()
+    assert git(side, "worktree", "list", "--porcelain") == worktrees
 
 
 def test_tracked_hook_rejects_bad_real_push_then_accepts_clean_push(
