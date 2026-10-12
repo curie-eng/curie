@@ -617,15 +617,17 @@ def scrub(
             if not _PLACEHOLDER_UUID.fullmatch(lowered) and lowered not in uuids:
                 uuids[lowered] = f"00000000-0000-4000-8000-{len(uuids) + 1:012d}"
     replacements: list[tuple[re.Pattern[str], str]] = []
-    for original, placeholder in [*accounts.items(), *names.items()]:
-        for form in dict.fromkeys((original, quote(original, safe=""))):
-            replacements.append((_bounded(form), placeholder))
+    # Workspace and slug first: a team workspace's owner display name is its slug, so
+    # the name patterns must not rewrite URL segments before these run.
     for form in dict.fromkeys(
         (f"{workspace}/{slug}", f"{quote(workspace, safe='')}/{quote(slug, safe='')}")
     ):
         replacements.append((_bounded(form), f"{PLACEHOLDER_WORKSPACE}/{PLACEHOLDER_SLUG}"))
     replacements.append((_bounded(workspace), PLACEHOLDER_WORKSPACE))
     replacements.append((_bounded(slug), PLACEHOLDER_SLUG))
+    for original, placeholder in [*accounts.items(), *names.items()]:
+        for form in dict.fromkeys((original, quote(original, safe=""))):
+            replacements.append((_bounded(form), placeholder))
 
     def host(url: re.Match[str]) -> str:
         parts = urlsplit(url[0])
@@ -679,6 +681,11 @@ def _segment_finding(where: str, prefix: str, first: str, second: str | None) ->
             first in BITBUCKET_ROUTES
             or _placeholder_id(first)
             or (first == PLACEHOLDER_WORKSPACE and second in {None, PLACEHOLDER_SLUG})
+            or (
+                first == "workspaces"
+                and second is not None
+                and (second == PLACEHOLDER_WORKSPACE or _placeholder_id(second))
+            )
         )
     return None if allowed else f"{where}: repository segment {first[:3]}..."
 

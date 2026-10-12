@@ -154,6 +154,7 @@ def test_bitbucket_recordings_scrub_leaves_nothing_real(
     assert scan_recording(clean, _real_values(real)) == []
     text = json.dumps(clean)
     assert f"{PLACEHOLDER_WORKSPACE}/{PLACEHOLDER_SLUG}" in text
+    assert f"bitbucket.org/workspaces/{PLACEHOLDER_WORKSPACE}/avatar/" in text
     assert "placeholder-account-1" in text
     assert clean["meta"]["repo_uuid"].startswith("{00000000-0000-4000-8000-")
     # Still a recording the replay reads.
@@ -203,6 +204,20 @@ def test_bitbucket_recordings_planted_repository_segment_fails(clean: dict[str, 
     # The same link on the placeholder names passes.
     clean["exchanges"][0]["response"]["body"]["links"]["html"]["href"] = (
         "https://" + "bitbucket.org/" + f"{PLACEHOLDER_WORKSPACE}/{PLACEHOLDER_SLUG}"
+    )
+    assert scan_recording(clean) == []
+
+
+def test_bitbucket_recordings_planted_workspace_avatar_segment_fails(
+    clean: dict[str, Any],
+) -> None:
+    href = "https://" + "bitbucket.org/" + "workspaces/" + "real" + "-ws/avatar/"
+    clean["exchanges"][0]["response"]["body"]["links"]["html"]["href"] = href
+    findings = scan_recording(clean)
+    assert len(findings) == 1 and "repository segment" in findings[0]
+    # The same link on the placeholder workspace passes.
+    clean["exchanges"][0]["response"]["body"]["links"]["html"]["href"] = (
+        "https://" + "bitbucket.org/" + f"workspaces/{PLACEHOLDER_WORKSPACE}/avatar/"
     )
     assert scan_recording(clean) == []
 

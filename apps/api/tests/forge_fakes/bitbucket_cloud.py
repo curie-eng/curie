@@ -395,13 +395,28 @@ class BitbucketCloudFake:
         }
 
     def _repository(self) -> dict[str, Any]:
+        avatar = f"{HTML_BASE}/workspaces/{self.workspace}/avatar/?ts=1760000000"
         return {
             **self._repo_min(),
             "slug": self.slug,
             "is_private": True,
             "scm": "git",
             "mainbranch": {"type": "branch", "name": self.mainbranch},
-            "workspace": {"type": "workspace", "slug": self.workspace, "uuid": WORKSPACE_UUID},
+            # Shape observed on a team workspace on 2026-10-12: the owner display name
+            # equals the workspace slug; the workspace avatar is under /workspaces/<slug>/avatar/.
+            "owner": {
+                "type": "team",
+                "display_name": self.workspace,
+                "uuid": WORKSPACE_UUID,
+                "links": {"avatar": {"href": avatar}},
+            },
+            "workspace": {
+                "type": "workspace",
+                "slug": self.workspace,
+                "name": self.workspace,
+                "uuid": WORKSPACE_UUID,
+                "links": {"avatar": {"href": avatar}},
+            },
             "links": {
                 "self": {"href": self._repo_api},
                 "html": {"href": f"{HTML_BASE}/{self.full_name}"},
