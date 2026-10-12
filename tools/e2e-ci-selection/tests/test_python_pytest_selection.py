@@ -40,7 +40,7 @@ def _invoke_selector(
     environment["GITHUB_OUTPUT"] = str(output_path)
     completed = subprocess.run(
         command,
-        cwd=cwd or tmp_path,
+        cwd=cwd or REPO_ROOT,
         env=environment,
         capture_output=True,
         text=True,
@@ -204,6 +204,9 @@ def test_empty_revision_diff_fails_closed_to_pytest(tmp_path: Path) -> None:
     subprocess.run(["git", "config", "user.name", "Test User"], cwd=repository, check=True)
     (repository / "docs").mkdir()
     (repository / "docs" / "guides.md").write_text("one sentence.\n")
+    workflow = repository / ".github/workflows/ci.yaml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(WORKFLOW.read_text())
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
     subprocess.run(["git", "commit", "-m", "base"], cwd=repository, check=True)
     head = subprocess.run(
@@ -241,6 +244,9 @@ def test_deleting_a_docs_guides_sentence_does_not_select_pytest(tmp_path: Path) 
     guides.joinpath("getting-started.md").write_text(
         "First sentence.\nSecond sentence that a docs-only edit can delete.\n"
     )
+    workflow = repository / ".github/workflows/ci.yaml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(WORKFLOW.read_text())
     subprocess.run(["git", "add", "."], cwd=repository, check=True)
     subprocess.run(["git", "commit", "-m", "base"], cwd=repository, check=True)
     base = subprocess.run(
