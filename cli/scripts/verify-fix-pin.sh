@@ -123,6 +123,9 @@ fi
 
 is_test_path() {
   case "$1" in
+    tools/factory-e2e/tests/*.py)
+      return 0
+      ;;
     apps/*/tests/* | packages/*/tests/* | runner/tests/* | cli/tests/* | charts/curie/ci/*)
       return 0
       ;;
@@ -164,6 +167,13 @@ case "$selector" in
   apps/*/tests/*.py::* | packages/*/tests/*.py::* | runner/tests/*.py::*)
     selector_file=${selector%%::*}
     if [[ "$selector" == "$selector_file" || -z "${selector#*::}" ]]; then
+      fail "unsupported selector: $selector"
+    fi
+    selector_kind=python
+    ;;
+  tools/factory-e2e/tests/*.py::*)
+    selector_file=${selector%%::*}
+    if [[ ! "$selector" =~ ^tools/factory-e2e/tests/([A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.py::([A-Za-z_][A-Za-z0-9_]*::)*test[A-Za-z0-9_]*(\[[A-Za-z0-9_.-]+\])?$ ]]; then
       fail "unsupported selector: $selector"
     fi
     selector_kind=python

@@ -39,6 +39,10 @@ PYPROJECT = REPO_ROOT / "pyproject.toml"
 VERIFY_FIX_PIN = REPO_ROOT / "cli" / "scripts" / "verify-fix-pin.sh"
 
 VALID_SELECTOR = "apps/api/tests/test_fix_pin_ci_gate.py::test_exact_declaration"
+FACTORY_SELECTOR = (
+    "tools/factory-e2e/tests/test_scripted_driver.py::"
+    "test_scripted_driver_records_the_curie_bin_it_used"
+)
 LOCAL_SELECTOR = "cli/tests/local/test_deploy.py::test_deploy"
 LOCAL_LIVE_SELECTOR = "cli/tests/local/test_live.py::test_live"
 LIVE_SELECTOR = "runner/tests/test_live.py::test_example"
@@ -386,6 +390,18 @@ def test_exact_declaration_calls_the_verifier_with_one_argv_selector(tmp_path: P
     ]
 
 
+def test_factory_python_selector_calls_the_verifier_at_the_ci_boundary(tmp_path: Path) -> None:
+    completed, call_log = _run_checker(tmp_path, f"Fix pin: {FACTORY_SELECTOR}\n")
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(call_log.read_text(encoding="utf-8")) == [
+        "dev",
+        "verify-fix-pin",
+        "HEAD",
+        FACTORY_SELECTOR,
+    ]
+
+
 @pytest.mark.parametrize(
     "selector",
     [
@@ -478,6 +494,10 @@ def test_invalid_or_duplicate_declarations_fail_closed_without_calling_curie(
         "-h",
         "cli/tests/verify_fix_pin.rs::--no-run",
         "tools/fix-pin-ci/tests/test_fix_pin_ci.py::test_not_supported",
+        "tools/other-tool/tests/test_pin.py::test_pin",
+        "tools/factory-e2e/test_pin.py::test_pin",
+        "tools/factory-e2e/tests/../test_pin.py::test_pin",
+        "tools/factory-e2e/tests/test_pin.py::helper",
         "apps/api/tests/test_fix_pin_ci_gate.py",
         "cli/tests/test_pin.py::test_pin",
         "cli/tests/local/nested/test_pin.py::test_pin",

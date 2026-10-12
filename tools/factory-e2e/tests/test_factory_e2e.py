@@ -128,10 +128,12 @@ def test_secrets_stay_out_of_repr(tmp_path: Path) -> None:
     assert "actor-token" not in text
 
 
-def test_cli_exits_2_with_clear_message_when_credentials_missing(tmp_path: Path) -> None:
+def test_cli_exits_2_with_clear_message_when_credentials_missing(
+    tmp_path: Path, candidate_curie: Path
+) -> None:
     result = subprocess.run(
         ["python3", str(REPO_ROOT / "tools/factory-e2e/factory_e2e.py"), "preflight"],
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)},
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CURIE_BIN": str(candidate_curie)},
         capture_output=True,
         text=True,
     )
@@ -442,12 +444,104 @@ def test_config_env_overrides_model_bundle_and_curie_bin(tmp_path: Path) -> None
         tmp_path,
         CURIE_FACTORY_MODEL="vendor/other-model",
         CURIE_FACTORY_BUNDLE_DIR=str(bundle),
-        CURIE_FACTORY_CURIE_BIN="/opt/bin/curie",
+        CURIE_BIN="/opt/bin/curie",
     )
     assert config.model == "vendor/other-model"
     assert isinstance(config.bundle_dir, Path)
     assert config.bundle_dir == bundle
     assert config.curie_bin == "/opt/bin/curie"
+
+
+@pytest.mark.parametrize("mode", [["preflight"], ["run", "--scenario", "cancel-waiting"]])
+@pytest.mark.parametrize("selection", ["absolute", "relative", "path-name", "default"])
+def test_main_records_and_uses_the_resolved_curie_binary(
+    mode: list[str],
+    selection: str,
+    candidate_curie: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    for key, value in _env(_app_dir(tmp_path)).items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", str(candidate_curie.parent))
+    if selection == "default":
+        monkeypatch.delenv("CURIE_BIN")
+    else:
+        value = {
+            "absolute": str(candidate_curie),
+            "relative": "./bin/curie",
+            "path-name": "curie",
+        }[selection]
+        monkeypatch.setenv("CURIE_BIN", value)
+    monkeypatch.setattr(fe, "_repo_root", lambda: REPO_ROOT)
+    monkeypatch.setattr(fe, "_resolve_candidate", lambda *a, **k: "c" * 40)
+    monkeypatch.setattr(fe.signal, "signal", lambda *a: None)
+
+    def execute(preflight: fe.Preflight, _driver: Any) -> None:
+        assert preflight.config.curie_bin == str(candidate_curie)
+        monkeypatch.setenv("CURIE_BIN", str(tmp_path / "changed-selection"))
+        monkeypatch.setenv("PATH", "")
+        assert fe.run([preflight.config.curie_bin, "build"]).strip() == str(candidate_curie)
+
+    monkeypatch.setattr(fe.Preflight, "run", execute)
+    evidence_path = tmp_path / "evidence.json"
+
+    assert fe.main([*mode, "--evidence", str(evidence_path)]) == 0
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence["curie_bin"] == str(candidate_curie)
+    assert evidence["curie_version"] == "curie 0.0.0-test"
+    assert (
+        f"factory-e2e: curie binary {candidate_curie} (curie 0.0.0-test)"
+        in capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("mode", [["preflight"], ["run", "--scenario", "cancel-waiting"]])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing",
+        "not-executable",
+        "version-failed",
+        "empty-version",
+        "symlink-loop",
+        "invalid-version",
+    ],
+)
+def test_invalid_curie_binary_refuses_before_factory_actions(
+    mode: list[str],
+    failure: str,
+    candidate_curie: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    if failure == "missing":
+        monkeypatch.setenv("CURIE_BIN", str(tmp_path / "missing-curie"))
+    elif failure == "not-executable":
+        candidate_curie.chmod(0o644)
+    elif failure == "version-failed":
+        candidate_curie.write_text("#!/bin/sh\nexit 9\n")
+    elif failure == "empty-version":
+        candidate_curie.write_text("#!/bin/sh\nexit 0\n")
+    elif failure == "symlink-loop":
+        candidate_curie.unlink()
+        candidate_curie.symlink_to(candidate_curie.name)
+    else:
+        candidate_curie.write_text("#!/bin/sh\nprintf '\\377\\n'\n")
+
+    def refuse_action(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("binary validation must precede cluster and GitHub actions")
+
+    monkeypatch.setattr(fe, "load_config", refuse_action)
+    monkeypatch.setattr(fe, "_resolve_candidate", refuse_action)
+    monkeypatch.setattr(fe, "http_json", refuse_action)
+    monkeypatch.setattr(fe.Preflight, "run", refuse_action)
+
+    assert fe.main(mode) == fe.EXIT_CONFIG
+    assert "CURIE_BIN" in capsys.readouterr().err
 
 
 def test_bundle_dir_that_is_not_a_directory_is_refused(tmp_path: Path) -> None:

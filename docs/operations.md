@@ -1453,6 +1453,16 @@ source checkout, `kubectl`, `helm`, `openssl` and `cloudflared`.
    got HTTP 200 and `factory_admitted`, and
    `GET /v1/internal/work-items/requests/{id}` returns the admitted WorkItem.
 
+`curie dev factory-e2e scripted` runs the factory on its own disposable kind
+cluster with a GitHub stub and recorded model responses. Scripted mode honors
+`CURIE_BIN`, including when `--build-images` builds the runner with that CLI.
+Every factory mode defaults to `curie` on PATH when `CURIE_BIN` is unset,
+resolves the executable to an absolute path before any cluster or GitHub
+action, and prints that path with the first line of its `--version` output.
+The evidence JSON records these as `curie_bin` and `curie_version`. An
+unresolvable binary or a failed version probe refuses the run and names
+`CURIE_BIN`.
+
 Before it creates its namespace, the driver removes what a crashed run on this
 machine left behind. Each namespace it creates carries its run id and a
 `curie.dev/factory-e2e-holder` annotation of `<hostname>:<pid>`. A harness
@@ -1509,7 +1519,7 @@ Every identity is an operator input. Nothing names a specific App or account:
 | `CURIE_FACTORY_PRIORITY_CLASSES` | `<platform>,<sandbox>`: reuse existing PriorityClasses. Unset, the run's release (`curie-` plus 4 hex characters derived from the namespace, so it installs beside another release named `curie`) creates `<release>-platform` and `<release>-sandbox` and removes them on uninstall |
 | `CURIE_FACTORY_WEBHOOK_RESTORE_URL` | URL to leave on the App webhook (default: the URL found at start, or the parked URL when that was a dead quick tunnel) |
 | `CURIE_FACTORY_CLOUDFLARED` | cloudflared binary (default `cloudflared` on PATH) |
-| `CURIE_FACTORY_CURIE_BIN` | `curie` binary that deploys the bundle (default `curie` on PATH) |
+| `CURIE_BIN` | `curie` binary used by every factory mode (default `curie` on PATH) |
 | `CURIE_FACTORY_BUNDLE_DIR` | Bundle to deploy (default `examples/dark-factory`) |
 | `CURIE_FACTORY_MODEL_API_KEY` | Model credential. Set, the install runs a real model with the worker budget raised to the execution bound; unset, the model is fake |
 | `CURIE_FACTORY_MODEL_BASE_URL` or `--model-base-url` | Anthropic-compatible base URL. The worker receives it as `CURIE_MODEL_BASE_URL` through `worker.extraEnv`. The host must be the model proxy pod IP; sandbox egress allows that `/32` and port. `curie dev model-script record` is the proxy that writes a transcript while it forwards to `https://openrouter.ai/api`. `curie dev model-script serve` replays that transcript and fails if a request, including a plan or diff reviewer call, was not recorded |

@@ -24,7 +24,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.request import Request, urlopen
 
 import factory_e2e as fe
@@ -403,7 +403,7 @@ class ScriptedRun:
 
     def admit_model_call(self) -> None:
         self.assert_record_budget(self.provider_remaining(), RECORD_REQUEST_RESERVE_USD)
-        with sqlite3.connect(self.record_ledger) as database:
+        with sqlite3.connect(cast(Path, self.record_ledger)) as database:
             database.execute("BEGIN IMMEDIATE")
             calls = database.execute(
                 "SELECT model_calls FROM attempts WHERE id=?", (self.run_id,)
@@ -473,7 +473,7 @@ class ScriptedRun:
         self.recording_closed = True
 
     def prerequisites(self) -> None:
-        for binary in ("docker", "kind", "helm", "kubectl", "openssl", "git", self.curie):
+        for binary in ("docker", "kind", "helm", "kubectl", "openssl", "git"):
             if shutil.which(binary) is None:
                 raise fe.ConfigError(f"missing required executable: {Path(binary).name}")
         self.check_disk("scripted factory")
@@ -1119,10 +1119,13 @@ class ScriptedRun:
 def main(args: argparse.Namespace) -> int:
     try:
         validate_configuration(args)
+        curie_bin, curie_version = fe.resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
     except fe.ConfigError as exc:
         print(f"factory-e2e: {exc}", file=sys.stderr)
         return fe.EXIT_CONFIG
     run = ScriptedRun(args)
+    run.curie = curie_bin
+    run.evidence.update(curie_bin=curie_bin, curie_version=curie_version)
     result = fe.EXIT_FAILED
     previous_handlers: dict[int, Any] = {}
 
