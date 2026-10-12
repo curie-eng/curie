@@ -550,9 +550,10 @@ pub async fn preflight(
     app_id: &str,
     key: &std::path::Path,
     requested: &[String],
+    all_installed: bool,
 ) -> Result<AppPreflight> {
     let pem = crate::factory_app::read_private_key(key)?;
-    preflight_with_pem(app_id, pem, requested).await
+    preflight_with_pem(app_id, pem, requested, all_installed).await
 }
 
 /// [`preflight`] for a PEM already in memory, such as one read from the App
@@ -561,10 +562,11 @@ pub async fn preflight_with_pem(
     app_id: &str,
     pem: String,
     requested: &[String],
+    all_installed: bool,
 ) -> Result<AppPreflight> {
     let api = GithubApi::new()?;
     let app = crate::factory_app::inspect_app(&api, app_id, &pem).await?;
-    let repos = crate::factory_app::resolve_allowlist(requested, &app)?;
+    let repos = crate::factory_app::resolve_allowlist(requested, &app, all_installed)?;
     announce(&api, &app, &repos).await?;
     let publication = api.bot_publication_identity(&app.slug).await?;
     Ok(AppPreflight {

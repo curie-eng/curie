@@ -183,9 +183,10 @@ curie cluster overrides dark-factory --execution-deadline 10800
 curie cluster factory
 
 # The rerun confirms the App with GET /app, takes the mention from its slug,
-# and uses its installed repositories as the allowlist (--repo, repeatable,
-# is checked against them instead). The label defaults to curie-factory and
-# is created in each repository. The key goes into the Secret
+# and checks each --repo (repeatable) against its installed repositories.
+# Use --all-installed-repos explicitly to allow the whole installation.
+# The label defaults to curie-factory and is created in each allowlisted
+# repository. The key goes into the Secret
 # curie-github-app (key privateKey) through kubectl stdin; a Secret that
 # holds another App's key is refused. Polling does not need a webhook secret.
 # Pass --webhook-secret-file (or CURIE_GITHUB_WEBHOOK_SECRET) only for webhook
@@ -193,7 +194,8 @@ curie cluster factory
 # against the API boot gate and applies nothing if one value is missing. The
 # values survive a later `curie cluster up`.
 curie cluster factory \
-  --app-id <app-id> --private-key-file ./app.pem --intake poll
+  --app-id <app-id> --private-key-file ./app.pem --intake poll \
+  --repo acme-corp/acme-bot
 
 curie cluster deploy --plugin-dir ./dark-factory \
   --agent dark-factory --env prod --repo acme-corp/acme-bot
