@@ -52,6 +52,20 @@ updates:
       - dependency-name: "typescript"
         update-types: ["version-update:semver-major"]
 
+  # The contract generator and compiler have their own committed pnpm lockfile.
+  - package-ecosystem: npm
+    directory: /tools/contract-codegen
+    schedule:
+      interval: weekly
+    labels: ["dependencies"]
+    groups:
+      contract-codegen:
+        patterns: ["*"]
+    # Review compiler major changes separately from routine toolchain updates.
+    ignore:
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+
   # First-party image bases. Each FROM is pinned to a version plus digest
   # (#2320); this ecosystem raises the bumps as reviewable PRs so a nightly
   # ladder rebuild does not silently pick up a new base. Directories are the

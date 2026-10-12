@@ -196,6 +196,7 @@ def test_claim_template_spec_injects_secret_refs_on_the_runner_only() -> None:
         secret_name="curie-thread-0123456789-abc123-tokens",
         token_names=token_names,
         runner_resources=None,
+        claim="curie-thread-0123456789-abc123",
     )
 
     assert source == pristine, "the source template spec must not be mutated"
@@ -234,6 +235,11 @@ def test_claim_template_spec_injects_secret_refs_on_the_runner_only() -> None:
     stripped_source = copy.deepcopy(pristine)
     _runner(stripped).pop("env")
     _runner(stripped_source).pop("env")
+    # The one other difference is the claim label on the pod template.
+    assert (
+        stripped["podTemplate"]["metadata"]["labels"].pop(CLAIM_LABEL)
+        == "curie-thread-0123456789-abc123"
+    )
     assert stripped == stripped_source
 
 
@@ -243,7 +249,11 @@ def test_claim_template_spec_appends_when_the_runner_has_no_env() -> None:
     key = BootEnv.env_key("history_token")
 
     spec = claim_template_spec(
-        source, secret_name="c-tokens", token_names=[key], runner_resources=None
+        source,
+        secret_name="c-tokens",
+        token_names=[key],
+        runner_resources=None,
+        claim="c",
     )
 
     assert _runner(spec)["env"] == [
@@ -265,6 +275,7 @@ def test_claim_template_spec_applies_runner_resources_to_every_container() -> No
         secret_name="c-tokens",
         token_names=[BootEnv.env_key("runner_token")],
         runner_resources=_OVERRIDE,
+        claim="c",
     )
 
     pod = spec["podTemplate"]["spec"]
@@ -294,7 +305,55 @@ def test_claim_template_spec_refuses_an_invalid_resources_shape(bad: dict[str, A
             secret_name="c-tokens",
             token_names=[BootEnv.env_key("runner_token")],
             runner_resources=bad,
+            claim="c",
         )
+
+
+# -- 4b. claim label on the sandbox pod -----------------------------------------
+
+
+@pytest.mark.parametrize("runner_resources", [None, _OVERRIDE], ids=["plain", "resources"])
+def test_claim_template_spec_labels_the_sandbox_pod_with_the_claim(
+    runner_resources: dict[str, Any] | None,
+) -> None:
+    source = _chart_spec()
+    pristine = copy.deepcopy(source)
+
+    spec = claim_template_spec(
+        source,
+        secret_name="c-tokens",
+        token_names=[BootEnv.env_key("runner_token")],
+        runner_resources=runner_resources,
+        claim="curie-thread-1-abc",
+    )
+
+    assert spec["podTemplate"]["metadata"]["labels"] == {
+        "curietech.ai/agent": "acme-a",
+        CLAIM_LABEL: "curie-thread-1-abc",
+    }
+    assert source == pristine, "the source template spec must not be mutated"
+    assert CLAIM_LABEL not in source["podTemplate"]["metadata"]["labels"]
+
+
+@pytest.mark.parametrize("runner_resources", [None, _OVERRIDE], ids=["plain", "resources"])
+def test_claim_template_spec_labels_a_pod_template_with_no_metadata(
+    runner_resources: dict[str, Any] | None,
+) -> None:
+    source = _chart_spec()
+    del source["podTemplate"]["metadata"]
+    pristine = copy.deepcopy(source)
+
+    spec = claim_template_spec(
+        source,
+        secret_name="c-tokens",
+        token_names=[BootEnv.env_key("runner_token")],
+        runner_resources=runner_resources,
+        claim="curie-thread-1-abc",
+    )
+
+    assert spec["podTemplate"]["metadata"] == {"labels": {CLAIM_LABEL: "curie-thread-1-abc"}}
+    assert source == pristine
+    assert "metadata" not in source["podTemplate"]
 
 
 # -- 5. no runner container ---------------------------------------------------
@@ -310,6 +369,7 @@ def test_claim_template_spec_without_runner_container_raises() -> None:
             secret_name="c-tokens",
             token_names=[BootEnv.env_key("runner_token")],
             runner_resources=None,
+            claim="c",
         )
 
 
@@ -321,7 +381,11 @@ def test_claim_template_spec_finds_the_runner_when_it_is_not_first() -> None:
     key = BootEnv.env_key("runner_token")
 
     spec = claim_template_spec(
-        source, secret_name="c-tokens", token_names=[key], runner_resources=None
+        source,
+        secret_name="c-tokens",
+        token_names=[key],
+        runner_resources=None,
+        claim="c",
     )
 
     out = spec["podTemplate"]["spec"]["containers"]

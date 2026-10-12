@@ -29,7 +29,9 @@ from .resources import (
 
 # The label every per-claim object carries, valued with the claim name. The
 # chart's cleanup and worker-secrets admission policies key on it, and the
-# reaper sweep selects on it.
+# reaper sweep selects on it. The per-claim SandboxTemplate's pod template
+# carries it too, so the sandbox pod itself is selectable by one run's claim
+# name (the per-run NetworkPolicy, ADR 0217).
 CLAIM_LABEL = "curietech.ai/sandbox-claim"
 
 # Every boot-env value that authenticates the sandbox to something. Named from
@@ -166,10 +168,14 @@ def claim_template_spec(
     secret_name: str,
     token_names: Iterable[str],
     runner_resources: dict[str, Any] | None,
+    claim: str,
     executor_secret_names: frozenset[str] | None = None,
     executor_withheld: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Copy ``source_spec`` with each token read from ``secret_name`` on the runner.
+
+    The copy's ``podTemplate.metadata.labels`` also gain ``CLAIM_LABEL=claim``
+    (existing pod labels kept), so the sandbox pod carries the claim name.
 
     Only the container named ``runner`` gets the references; init containers
     never see a token. A same-name entry already on the runner (a warm-pod
@@ -215,6 +221,8 @@ def claim_template_spec(
             }
         )
     runner["env"] = env
+    pod_template = spec["podTemplate"]
+    pod_template.setdefault("metadata", {}).setdefault("labels", {})[CLAIM_LABEL] = claim
     return spec
 
 
