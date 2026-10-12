@@ -110,13 +110,17 @@ def test_binding_location_names_the_surface_the_pass_lists() -> None:
     assert surfaces.binding_location(binding, tracker) == ("jira", jira_fake.BINDING_NAME)
 
 
-class _RepositoryTracker:
-    """A repository-scoped tracker connection a test installs for ``gitlab``."""
+class _GitLabTracker:
+    """The tracker connection a test installs for ``gitlab``: binding scoped,
+    as every non-GitHub kind must be (`registry.check_tracker_scope`)."""
 
     def __init__(self, config: Any, *args: Any, **kwargs: Any) -> None:
         self.config = config
 
-    def for_repository(self, *args: Any, **kwargs: Any) -> Any:
+    def for_binding(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("a reply route makes no tracker")
+
+    def issue_url(self, *args: Any, **kwargs: Any) -> str:
         raise AssertionError("a reply route makes no tracker")
 
 
@@ -142,7 +146,7 @@ def gitlab_installed(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     from curie_api.forges import registry
 
     monkeypatch.delitem(_kind_table(registry), "gitlab")
-    registry.register("gitlab", tracker=_RepositoryTracker, code_host=_CodeHost)
+    registry.register("gitlab", tracker=_GitLabTracker, code_host=_CodeHost)
     yield
 
 
@@ -410,3 +414,60 @@ def test_tracker_for_binding_builds_through_the_registry() -> None:
     assert tracker.kind == types.JIRA_CLOUD
     assert tracker.label == "factory-fast"
     assert trackers.tracker_for_binding(registry, client, binding).label == jira_fake.LABEL
+
+
+def test_work_item_policy_is_the_serving_binding_s_entry_on_any_code_host() -> None:
+    """r1 finding 4: a Jira WorkItem on a Bitbucket repository gets that
+    binding's CI policy; a lookup on the GitHub code host alone found none."""
+
+    from forge_fakes import config_samples as samples
+
+    document = jira_fake.jira_document()
+    document["code_hosts"] = [
+        {
+            **samples.bitbucket_code_host(),
+            "host": "bitbucket.org",
+            "api_url": "https://api.bitbucket.org/2.0",
+            "credential": samples.static_token(),
+        }
+    ]
+    binding = document["bindings"][0]
+    binding["repos"] = [
+        {
+            "alias": "web",
+            "code_host": "bitbucket",
+            "project_id": "{6f1c0000-0000-4000-8000-000000000003}",
+            "path": "acme/web",
+            "ci": {"required": {"key": "Web tests", "paths": ["web"], "pending_key_prefix": None}},
+        }
+    ]
+    binding["default_repo"] = "web"
+    registry = _registry(document)
+    tracker = registry.config.trackers[0]
+    issue = TrackerIssueRef(types.JIRA_CLOUD, tracker.host, jira_fake.CLOUD_ID, "10001", "WEB-1")
+    web = RepositoryRef(
+        types.BITBUCKET_CLOUD,
+        "bitbucket.org",
+        "{6f1c0000-0000-4000-8000-000000000003}",
+        "acme/web",
+    )
+
+    policy = trackers.work_item_policy(registry, issue, web)
+
+    assert policy is not None and policy.alias == "web"
+    assert policy.ci.required is not None and policy.ci.required.key == "Web tests"
+    assert registry.github_repository_policy("acme/web") is None
+    # A scope no binding serves has no policy at all.
+    other = TrackerIssueRef(types.JIRA_CLOUD, tracker.host, "another-site", "10001", "WEB-1")
+    assert trackers.work_item_policy(registry, other, web) is None
+
+
+def test_work_item_policy_keeps_the_github_answer_for_a_github_issue() -> None:
+    registry = _registry()
+    issue = TrackerIssueRef(types.GITHUB, "github.com", str(REPO_ID), str(ISSUE_NUMBER))
+    repository = RepositoryRef(types.GITHUB, "github.com", str(REPO_ID), REPO)
+
+    expected = registry.github_repository_policy(REPO)
+
+    assert expected is not None
+    assert trackers.work_item_policy(registry, issue, repository) is expected

@@ -6,11 +6,12 @@ bot account the tracker's ``mention`` names, and the binding's start authority
 (an account allowlist or a group, decision 13). Every read and write goes to
 Jira Cloud REST v3 through `curie_api.forges.jira_cloud.transport`.
 
-Identity (decision 3): before its first poll the tracker reads the site's
-``/_edge/tenant_info`` and ``/rest/api/3/myself``. A cloudId other than the
-binding's scope, or an accountId other than ``mention``, raises `Unauthorized`
-naming the mismatch, so a wrong scope can never split one ticket into two
-WorkItems. The answer is cached on the connection, so it is read once.
+Identity (decision 3, `curie_api.forges.jira_cloud.identity`): before its
+first poll and before every label, comment or link write the tracker checks the
+site's cloudId against the binding's scope and the token's accountId against
+``mention``, raising `Unauthorized` naming the mismatch, so a wrong scope can
+never split one ticket into two WorkItems and a wrong token never writes. The
+answer is cached on the connection, so it is read once.
 
 Polling (decisions 6 to 12, plan D2). The cursor is opaque to the core and is
 ``"<T>;<ids>"``: ``T`` is the largest issue ``updated`` seen, in epoch ms, and
@@ -33,13 +34,14 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo
 
 from curie_api.forges.capabilities import TRACKER_OPERATIONS, Operation, Support
 from curie_api.forges.config import AccountAllowlist, GroupAuthority, StartAuthority
-from curie_api.forges.errors import NotFound, Unauthorized, Unavailable
+from curie_api.forges.errors import NotFound, Unavailable
 from curie_api.forges.jira_cloud import adf
 from curie_api.forges.jira_cloud.comments import JiraMarkedComments
+from curie_api.forges.jira_cloud.identity import IdentityCache, verify_identity
 from curie_api.forges.jira_cloud.transport import Forbidden, JiraTransport
 from curie_api.forges.types import (
     JIRA_CLOUD,
@@ -64,15 +66,6 @@ _HISTORY = "h"
 _COMMENT = "c"
 _ID_TOKEN = re.compile(rf"[{_HISTORY}{_COMMENT}][0-9]+")
 _COMMENT_SELF = re.compile(r"/issue/([0-9]+)/comment/")
-
-
-@dataclass
-class IdentityCache:
-    """What the site and the token say they are, read once per connection."""
-
-    cloud_id: str | None = None
-    account_id: str | None = None
-    time_zone: str = "UTC"
 
 
 @dataclass(frozen=True)
@@ -113,13 +106,6 @@ def jira_ms(value: Any) -> int | None:
         except ValueError:
             continue
     return None
-
-
-def _zone(name: str) -> ZoneInfo:
-    try:
-        return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
-        return ZoneInfo("UTC")
 
 
 def _actor(user: Any) -> Actor | None:
@@ -256,7 +242,13 @@ class JiraTracker:
         self._identity = identity
         self._page_size = page_size
         self._comments = JiraMarkedComments(
-            transport, host=host, scope_id=scope_id, mention=mention, page_size=page_size
+            transport,
+            host=host,
+            site_origin=site_origin,
+            scope_id=scope_id,
+            mention=mention,
+            identity=identity,
+            page_size=page_size,
         )
 
     @property
@@ -322,28 +314,13 @@ class JiraTracker:
     async def _verify_identity(self) -> ZoneInfo:
         """Decision 3: the site is the binding's cloudId and the token is the bot."""
 
-        cache = self._identity
-        if cache.cloud_id is None or cache.account_id is None:
-            try:
-                tenant = await self._transport.anonymous_get(
-                    f"{self._site_origin}/_edge/tenant_info", what="tenant_info"
-                )
-            except NotFound:
-                raise Unavailable("tenant_info") from None
-            # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-myself/#api-rest-api-3-myself-get
-            myself = await self._transport.get("/myself", what="myself")
-            cloud_id = tenant.get("cloudId") if isinstance(tenant, dict) else None
-            account_id = myself.get("accountId") if isinstance(myself, dict) else None
-            if not isinstance(cloud_id, str) or not isinstance(account_id, str):
-                raise Unavailable("identity")
-            zone = myself.get("timeZone")
-            cache.time_zone = zone if isinstance(zone, str) and zone else "UTC"
-            cache.cloud_id, cache.account_id = cloud_id, account_id
-        if cache.cloud_id != self._scope_id:
-            raise Unauthorized("cloud id mismatch: the site is not the binding's tracker scope")
-        if cache.account_id != self._mention:
-            raise Unauthorized("bot account mismatch: the token is not the tracker's mention")
-        return _zone(cache.time_zone)
+        return await verify_identity(
+            self._transport,
+            self._identity,
+            site_origin=self._site_origin,
+            scope_id=self._scope_id,
+            mention=self._mention,
+        )
 
     # Tracker port -------------------------------------------------------
 
@@ -530,11 +507,11 @@ class JiraTracker:
         return _Pending(ref, actor, str(event_id), Disposition.CANCEL)
 
     async def verify_current(self, notice: MarkedNotice) -> bool:
-        """Re-reads the issue every time (decision 12)."""
+        """Re-reads the issue every time (decision 12). An admission or a
+        mention is current only while the issue keeps its label and is not done,
+        so a mention after the label went, or after done, revises nothing."""
 
         issue_id = self._issue_id(notice.issue)
-        if notice.disposition is Disposition.MENTION:
-            return await self._mention_current(issue_id, notice)
         try:
             fields = _fields(await self._read_issue(issue_id, "labels,status"))
         except NotFound:
@@ -545,6 +522,8 @@ class JiraTracker:
             return not labelled or done
         if not labelled or done:
             return False
+        if notice.disposition is Disposition.MENTION:
+            return await self._mention_current(issue_id, notice)
         latest = self._latest(
             await self._changelog(issue_id), lambda h: adds_label(h, notice.marker)
         )
@@ -665,6 +644,7 @@ class JiraTracker:
         operations.extend({"remove": name} for name in remove if name != add)
         if not operations:
             return
+        await self._verify_identity()
         try:
             # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/#api-rest-api-3-issue-issueidorkey-put
             await self._transport.put(
@@ -697,6 +677,7 @@ class JiraTracker:
         so a second call updates the same link."""
 
         issue_id = self._issue_id(issue)
+        await self._verify_identity()
         number = pull_request.ref.number
         title = f"PR #{number}: {pull_request.title}" if pull_request.title else f"PR #{number}"
         # https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-remote-links/#api-rest-api-3-issue-issueidorkey-remotelink-post

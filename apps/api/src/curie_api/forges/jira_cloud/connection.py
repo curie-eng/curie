@@ -17,7 +17,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from curie_api.forges.config import BindingConfig, StaticTokenCredentialConfig, TrackerConfig
-from curie_api.forges.jira_cloud.tracker import IdentityCache, JiraTracker, browse_url
+from curie_api.forges.jira_cloud.identity import IdentityCache
+from curie_api.forges.jira_cloud.tracker import JiraTracker, browse_url
 from curie_api.forges.jira_cloud.transport import JiraTransport
 from curie_api.forges.types import TrackerIssueRef
 

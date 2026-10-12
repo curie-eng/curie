@@ -16,7 +16,7 @@ import httpx
 
 from curie_api.config import Settings
 from curie_api.forges import surfaces, types
-from curie_api.forges.config import BindingConfig
+from curie_api.forges.config import BindingConfig, RepositoryBindingConfig
 from curie_api.forges.connections import RepositoryTrackerConnection
 from curie_api.forges.errors import NotFound, Unavailable
 from curie_api.forges.hosts import repository_ref
@@ -44,6 +44,26 @@ def binding_for_scope(registry: ForgeRegistry, issue: TrackerIssueRef) -> Bindin
     return None
 
 
+def work_item_policy(
+    registry: ForgeRegistry, issue: TrackerIssueRef, repository: RepositoryRef
+) -> RepositoryBindingConfig | None:
+    """The repository policy (bases, CI) a WorkItem on ``issue`` runs under
+    (#4358 plan D15, r1 finding 4).
+
+    A GitHub issue keeps today's answer, ``repository``'s entry on the GitHub
+    code host. Any other issue reads ``repository``'s entry in the binding
+    serving the issue's scope, on whichever code host the repository records;
+    None when no binding serves the scope or the binding does not list it.
+    """
+
+    if issue.kind == types.GITHUB:
+        return registry.github_repository_policy(repository.path)
+    binding = binding_for_scope(registry, issue)
+    if binding is None:
+        return None
+    return registry.binding_repository_policy(binding, repository)
+
+
 def tracker_for_binding(
     registry: ForgeRegistry,
     client: httpx.AsyncClient,
@@ -53,8 +73,9 @@ def tracker_for_binding(
 ) -> Tracker:
     """The tracker on ``binding``'s scope; ``label`` replaces the entry's label.
 
-    Raises ``Unavailable("tracker_not_binding_scoped")`` for a repository-scoped
-    tracker kind.
+    Every non-GitHub tracker kind is binding scoped: the registry refuses at
+    config load a kind whose connection is not (`registry.check_tracker_scope`).
+    A GitHub binding raises ``Unavailable("tracker_not_binding_scoped")``.
     """
 
     return registry.binding_tracker(binding.tracker).for_binding(client, binding, label=label)

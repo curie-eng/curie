@@ -14,13 +14,22 @@ from __future__ import annotations
 import base64
 import logging
 import traceback
+import uuid
 
 import httpx
 import pytest
+from curie_api.factory_comment_text import marker_for
 from curie_api.forges import types
 from curie_api.forges.errors import ForgeError, Unauthorized, Unavailable
-from curie_api.forges.types import RepositoryRef
+from curie_api.forges.types import (
+    PullRequest,
+    PullRequestRef,
+    PullRequestState,
+    ReplyTarget,
+    RepositoryRef,
+)
 from forge_fakes.jira import (
+    BOT_ACCOUNT_ID,
     BOT_EMAIL,
     CLOUD_ID,
     GATEWAY_HOST,
@@ -37,6 +46,17 @@ from forge_fakes.jira import (
 OTHER_CLOUD = "a1b2c3d4-0000-4000-8000-0000000000ff"
 OTHER_BOT = "712020:00000000-0000-4000-8000-0000000000bf"
 REPOSITORY = RepositoryRef(types.GITHUB, "github.com", "4401", "acme-corp/acme-bot")
+HUMAN_ID = "712020:00000000-0000-4000-8000-000000000101"
+MARKER = marker_for(uuid.UUID("00000000-0000-4000-8000-000000000001"))
+PULL = PullRequest(
+    ref=PullRequestRef(REPOSITORY, "12"),
+    head_sha="a" * 40,
+    head_ref="factory/proj-1",
+    base_ref="main",
+    state=PullRequestState.OPEN,
+    url="https://github.com/acme-corp/acme-bot/pull/12",
+    title="Fix it",
+)
 SECRETS = (TOKEN, base64.b64encode(f"{BOT_EMAIL}:{TOKEN}".encode()).decode())
 
 
@@ -244,3 +264,104 @@ async def test_jira_identity_errors_from_every_port_call_carry_no_token(
                     _assert_no_secret(_printed(failed))
 
     _assert_nothing_logged(caplog)
+
+
+# Writes (decision 3 before every write, r1 finding 1) -----------------------------
+
+
+def _marked_human_comment(fake: JiraFake) -> tuple[ReplyTarget, str]:
+    """An issue with a person's comment that carries the status marker property."""
+
+    human = fake.add_user(HUMAN_ID, "Human 1")
+    issue = fake.seed_issue("Ticket")
+    pasted = fake.add_comment(
+        issue.id,
+        human,
+        "a person's comment",
+        properties={"curie.factory": {"marker": MARKER, "body_sha256": "0" * 64}},
+    )
+    return ReplyTarget.on_issue(fake.ref(issue)), pasted
+
+
+@pytest.mark.anyio
+async def test_jira_identity_a_mention_naming_a_person_never_selects_or_edits_their_comment() -> (
+    None
+):
+    """``mention`` misconfigured to a person's accountId: the token is still the
+    bot, so the status comments refuse before selecting that person's marked
+    comment as the bot's own, and nothing is written."""
+
+    fake = JiraFake()
+    target, pasted = _marked_human_comment(fake)
+    tracker = jira_tracker(fake, mention=HUMAN_ID)
+    comments = tracker.marked_comments
+
+    with pytest.raises(Unauthorized) as refused:
+        await comments.find_marked(target, MARKER)
+    with pytest.raises(Unauthorized):
+        await comments.upsert_marked(target, MARKER, "Status: WORKING\n")
+
+    assert "account" in str(refused.value).lower()
+    assert HUMAN_ID not in str(refused.value)
+    assert fake.writes == 0
+    assert fake.requests_of("comment_list") == []
+    assert fake.comment(pasted).properties["curie.factory"]["marker"] == MARKER
+
+
+@pytest.mark.anyio
+async def test_jira_identity_a_wrong_identity_refuses_label_and_link_writes() -> None:
+    fake = JiraFake(cloud_id=OTHER_CLOUD)
+    issue = fake.seed_issue("Ticket")
+    ref = fake.ref(issue)
+    tracker = jira_tracker(fake, scope_id=OTHER_CLOUD, mention=HUMAN_ID)
+
+    with pytest.raises(Unauthorized):
+        await tracker.set_state_label(ref, add="curie-factory:working", remove=())
+    with pytest.raises(Unauthorized):
+        await tracker.link_pull_request(ref, PULL)
+
+    assert fake.writes == 0
+    assert fake.requests_of("issue_update") == []
+    assert fake.requests_of("remote_link_create") == []
+
+
+@pytest.mark.anyio
+async def test_jira_identity_a_wrong_site_refuses_status_comments() -> None:
+    fake = JiraFake(cloud_id=OTHER_CLOUD)
+    target, _pasted = _marked_human_comment(fake)
+    tracker = jira_tracker(fake, scope_id=CLOUD_ID)
+    # The issue reference names the binding's scope, not the site's cloudId.
+    assert target.issue is not None
+    target = ReplyTarget.on_issue(
+        types.TrackerIssueRef(
+            target.issue.kind, target.issue.host, CLOUD_ID, target.issue.issue_id, None
+        )
+    )
+
+    with pytest.raises(Unauthorized) as refused:
+        await tracker.marked_comments.upsert_marked(target, MARKER, "Status: WORKING\n")
+
+    assert "cloud" in str(refused.value).lower()
+    assert fake.writes == 0
+
+
+@pytest.mark.anyio
+async def test_jira_identity_the_configured_bot_writes_after_one_verification() -> None:
+    """Liveness for the write refusals above: the bot's own identity writes a
+    status comment, a label and a link, and the identity is read once."""
+
+    fake = JiraFake()
+    target, pasted = _marked_human_comment(fake)
+    assert target.issue is not None
+    tracker = jira_tracker(fake, mention=BOT_ACCOUNT_ID)
+
+    created = await tracker.marked_comments.upsert_marked(target, MARKER, "Status: WORKING\n")
+    await tracker.set_state_label(target.issue, add="curie-factory:working", remove=())
+    await tracker.link_pull_request(target.issue, PULL)
+
+    assert created.written is True and created.comment.id != pasted
+    assert len(fake.requests_of("comment_create")) == 1
+    assert len(fake.requests_of("issue_update")) == 1
+    assert len(fake.requests_of("remote_link_create")) == 1
+    assert len(fake.requests_of("tenant_info")) == 1
+    assert len(fake.requests_of("myself")) == 1

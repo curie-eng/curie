@@ -5,7 +5,11 @@ it does on GitHub. It is stored instead as the comment entity property
 ``curie.factory`` with value ``{"marker": ..., "body_sha256": ...}``
 (https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issue-comment-properties/).
 Ownership is that property plus the bot's own ``accountId``: a person who
-copies the property onto a comment of theirs is neither found nor edited.
+copies the property onto a comment of theirs is neither found nor edited. The
+``accountId`` is the tracker's configured ``mention``, so before any comment is
+selected the site's cloudId and the token's accountId are verified against the
+binding (decision 3, `curie_api.forges.jira_cloud.identity`); a token that is
+not the bot is `Unauthorized` and edits nothing.
 
 The body is converted to ADF (`curie_api.forges.jira_cloud.adf`). A body over
 30,000 characters is cut at the last line boundary under that length and ends
@@ -25,6 +29,7 @@ from typing import Any
 from curie_api.forges.capabilities import MARKED_COMMENT_OPERATIONS, Operation, Support
 from curie_api.forges.errors import NotFound, Unavailable
 from curie_api.forges.jira_cloud import adf
+from curie_api.forges.jira_cloud.identity import IdentityCache, verify_identity
 from curie_api.forges.jira_cloud.transport import MAX_PAGES, JiraTransport
 from curie_api.forges.types import JIRA_CLOUD, MarkedComment, ReplyTarget, UpsertResult
 
@@ -69,14 +74,18 @@ class JiraMarkedComments:
         transport: JiraTransport,
         *,
         host: str,
+        site_origin: str,
         scope_id: str,
         mention: str,
+        identity: IdentityCache,
         page_size: int = 100,
     ) -> None:
         self._transport = transport
         self.host = host
+        self._site_origin = site_origin
         self._scope_id = scope_id
         self._mention = mention
+        self._identity = identity
         self._page_size = page_size
 
     def _issue_id(self, target: ReplyTarget) -> str:
@@ -133,9 +142,17 @@ class JiraMarkedComments:
         )
 
     async def _find(self, target: ReplyTarget, marker: str) -> _Found | None:
-        """Our own comment carrying ``marker``, from a complete listing."""
+        """Our own comment carrying ``marker``, from a complete listing, once the
+        token is verified to be the bot ``mention`` names."""
 
         issue_id = self._issue_id(target)
+        await verify_identity(
+            self._transport,
+            self._identity,
+            site_origin=self._site_origin,
+            scope_id=self._scope_id,
+            mention=self._mention,
+        )
         comments, _total = await self._transport.comments(
             issue_id, newest_first=False, page_size=self._page_size
         )

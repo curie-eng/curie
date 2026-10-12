@@ -28,6 +28,7 @@ from curie_api.forges.config import (
 from curie_api.forges.connections import BindingTrackerConnection
 from curie_api.forges.credential_providers import ExpiryReport, expiry_for
 from curie_api.forges.errors import Unavailable
+from curie_api.forges.types import RepositoryRef
 
 if TYPE_CHECKING:
     from curie_api.config import Settings
@@ -62,7 +63,15 @@ class NotInstalled(ValueError):
 def register(
     kind: str, *, tracker: TrackerFactory | None, code_host: CodeHostFactory | None
 ) -> None:
-    """Install ``kind`` with its connection factories. A kind registers once."""
+    """Install ``kind`` with its connection factories. A kind registers once.
+
+    The tracker contract (#4358 plan D13): GitHub's tracker is repository
+    scoped and keeps its own webhook and poll intake; every other kind is polled
+    per binding by the generic intake pass, so its ``tracker`` factory must
+    build a `BindingTrackerConnection`. Building a registry refuses one that
+    does not (`check_tracker_scope`), so the mistake surfaces at config load,
+    never at poll time.
+    """
 
     if kind in _KINDS:
         raise ValueError(f"forge kind {kind!r} is already registered")
@@ -94,6 +103,17 @@ def check_installed(config: ForgesConfig) -> None:
         _factory(host.kind, "code_host", f"code host {host.name!r}")
     for tracker in config.trackers:
         _factory(tracker.kind, "tracker", f"tracker {tracker.name!r}")
+
+
+def check_tracker_scope(name: str, kind: str, connection: TrackerConnection) -> None:
+    """Refuse a non-GitHub tracker whose connection is not binding scoped."""
+
+    if kind != types.GITHUB and not isinstance(connection, BindingTrackerConnection):
+        raise ValueError(
+            f"tracker {name!r} uses kind {kind!r}, whose connection is not binding scoped:"
+            " every tracker kind but github is polled per binding and must register a"
+            " BindingTrackerConnection"
+        )
 
 
 @dataclass(frozen=True)
@@ -130,6 +150,8 @@ class ForgeRegistry:
             )
             for tracker in config.trackers
         }
+        for tracker in config.trackers:
+            check_tracker_scope(tracker.name, tracker.kind, self._trackers[tracker.name])
         self._code_hosts: dict[str, CodeHostConnection] = {
             host.name: _factory(host.kind, "code_host", host.name)(host, ca_bundle=ca_bundle)
             for host in config.code_hosts
@@ -162,8 +184,8 @@ class ForgeRegistry:
         """The code host entry of ``kind`` on ``host``, the pair a stored
         repository records (#4358 plan D14 item 1).
 
-        `_single_github` makes the GitHub answer unique; with none configured
-        the lookup is ``Unavailable("code_host_unconfigured")``.
+        The config admits one entry per kind and host, so the answer is unique;
+        with none configured the lookup is ``Unavailable("code_host_unconfigured")``.
         """
 
         found = next(
@@ -194,13 +216,34 @@ class ForgeRegistry:
     def repository_policy(
         self, kind: str, host: str, path: str, project_id: str | None
     ) -> RepositoryBindingConfig | None:
-        """The binding entry of one repository: matched by its immutable id
-        first, so a renamed repository keeps its policy, then by path
-        case-insensitively."""
+        """The binding entry of one repository across every binding: matched by
+        its immutable id first, so a renamed repository keeps its policy, then by
+        path case-insensitively."""
 
+        return self._policy(self.config.bindings, kind, host, path, project_id)
+
+    def binding_repository_policy(
+        self, binding: BindingConfig, repository: RepositoryRef
+    ) -> RepositoryBindingConfig | None:
+        """``repository``'s entry in ``binding`` alone, matched as
+        `repository_policy` matches, so a repository two bindings share never
+        borrows the other binding's policy (#4358 plan D15)."""
+
+        return self._policy(
+            (binding,), repository.kind, repository.host, repository.path, repository.project_id
+        )
+
+    def _policy(
+        self,
+        bindings: tuple[BindingConfig, ...],
+        kind: str,
+        host: str,
+        path: str,
+        project_id: str | None,
+    ) -> RepositoryBindingConfig | None:
         candidates = [
             repo
-            for binding in self.config.bindings
+            for binding in bindings
             for repo in binding.repos
             if (code_host := self.config.code_host(repo.code_host)).kind == kind
             and code_host.host == host

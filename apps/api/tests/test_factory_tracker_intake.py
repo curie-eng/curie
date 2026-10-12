@@ -432,6 +432,39 @@ def test_label_removal_cancels_the_work_item(intake: Intake) -> None:
     assert all(r["status"] not in {"waiting", "running"} for r in _requests(item["id"]))
 
 
+@pytest.mark.parametrize("change", ["removed", "rescoped"])
+def test_work_on_a_scope_no_binding_serves_is_cancelled(intake: Intake, change: str) -> None:
+    """r1 finding 3: with its binding gone the WorkItem can no longer be polled
+    or cancelled through a tracker, so the next poll of the tracker cancels it."""
+
+    intake.agent()
+    issue = _issue(intake)
+    intake.jira.add_label(issue.id, LABEL, intake.starter)
+    intake.poll()
+    [item] = _work_items(issue)
+    # Liveness: a poll while the binding still serves the scope cancels nothing.
+    intake.poll()
+    [kept] = _work_items(issue)
+    assert kept["cancelled_at"] is None
+
+    document = _document()
+    if change == "removed":
+        document["bindings"] = [b for b in document["bindings"] if b["name"] != BINDING]
+    else:
+        document["bindings"][-1]["tracker_scope_id"] = "a1b2c3d4-0000-4000-8000-0000000000ff"
+    intake.configure(document)
+    requests_before = len(intake.jira.requests)
+    intake.poll()
+
+    [cancelled] = _work_items(issue)
+    assert cancelled["cancelled_at"] is not None
+    assert all(r["status"] not in {"waiting", "running"} for r in _requests(item["id"]))
+    # The issue still carries its label; the cancel came from the missing binding.
+    assert LABEL in intake.jira.issue(issue.id).labels
+    if change == "removed":
+        assert len(intake.jira.requests) == requests_before
+
+
 # --- refusals ------------------------------------------------------------------------
 
 

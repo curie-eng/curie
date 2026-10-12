@@ -4,12 +4,14 @@ A connection is one configured tracker or code host. It holds the entry's
 config and credential and yields the adapters the factory core talks to
 through `curie_api.forges.ports`.
 
-A tracker connection is scoped one of two ways (#4358 plan D13). A native
-tracker (GitHub, later GitLab) yields a tracker per repository, because its
-issues live in the repository the binding names. A tracker-only kind (Jira
-Cloud) yields a tracker per binding, because one site serves every repository
-the binding lists. Both refinements are runtime checkable, so the registry can
-refuse the wrong one by name instead of failing on a missing method.
+A tracker connection is scoped one of two ways (#4358 plan D13). GitHub's
+yields a tracker per repository, because its issues live in the repository the
+binding names, and GitHub keeps its own webhook and poll intake. Every other
+kind yields a tracker per binding, because the generic intake pass polls each
+binding's scope; a native kind's binding names exactly its own repository.
+Both refinements are runtime checkable, so building the registry refuses a
+non-GitHub kind that is not binding scoped, naming it
+(`registry.check_tracker_scope`), instead of failing at poll time.
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ class TrackerConnection(Protocol):
 
 @runtime_checkable
 class RepositoryTrackerConnection(TrackerConnection, Protocol):
-    """A tracker whose issues live in one repository (GitHub)."""
+    """A tracker whose issues live in one repository: GitHub's alone."""
 
     def for_repository(
         self,
@@ -49,8 +51,8 @@ class RepositoryTrackerConnection(TrackerConnection, Protocol):
 
 @runtime_checkable
 class BindingTrackerConnection(TrackerConnection, Protocol):
-    """A tracker one binding scopes (Jira Cloud): its scope id and start
-    authority come from the binding, not from a repository."""
+    """A tracker one binding scopes (every kind but GitHub): its scope id and
+    start authority come from the binding, not from a repository."""
 
     def for_binding(
         self, client: httpx.AsyncClient, binding: BindingConfig, *, label: str | None = None

@@ -12,7 +12,15 @@ from __future__ import annotations
 import pytest
 from curie_api.forges.identity import notice_request_id
 from curie_api.forges.types import Disposition, MarkedNotice, NoticePage
-from forge_fakes.jira import LABEL, JiraFake, JiraUser, jira_tracker
+from forge_fakes.jira import (
+    BOT_ACCOUNT_ID,
+    BOT_NAME,
+    LABEL,
+    JiraFake,
+    JiraUser,
+    adf_mention,
+    jira_tracker,
+)
 
 
 @pytest.fixture
@@ -146,3 +154,50 @@ async def test_jira_cancel_the_removal_is_found_when_it_predates_the_cursor() ->
     page = await tracker.poll_marked(caught_up.cursor, running=(fake.ref(issue),))
 
     assert [(n.disposition, n.event_id) for n in page.notices] == [(Disposition.CANCEL, removed)]
+
+
+async def _mentioned(fake: JiraFake, human: JiraUser) -> tuple[object, MarkedNotice]:
+    """A labelled issue whose person mentioned the bot: its id and the MENTION."""
+
+    issue = fake.seed_issue("Ticket", status="In Progress")
+    fake.add_label(issue.id, LABEL, human)
+    tracker = jira_tracker(fake)
+    admitted = await tracker.poll_marked(None, running=())
+    fake.advance(30)
+    fake.add_comment(issue.id, human, adf_mention(BOT_ACCOUNT_ID, BOT_NAME, before="Again "))
+    page = await tracker.poll_marked(admitted.cursor, running=())
+    (mention,) = _of(page, Disposition.MENTION)
+    return issue.id, mention
+
+
+@pytest.mark.anyio
+async def test_jira_cancel_a_mention_on_a_labelled_open_issue_is_current() -> None:
+    """Liveness for the two races below."""
+
+    fake = JiraFake()
+    _issue_id, mention = await _mentioned(fake, _human(fake))
+
+    assert await jira_tracker(fake).verify_current(mention) is True
+
+
+@pytest.mark.anyio
+async def test_jira_cancel_a_mention_after_the_label_was_removed_is_not_current() -> None:
+    fake = JiraFake()
+    human = _human(fake)
+    issue_id, mention = await _mentioned(fake, human)
+
+    fake.remove_label(issue_id, LABEL, human)
+
+    assert await jira_tracker(fake).verify_current(mention) is False
+
+
+@pytest.mark.anyio
+async def test_jira_cancel_a_mention_after_the_issue_is_done_is_not_current() -> None:
+    fake = JiraFake()
+    human = _human(fake)
+    issue_id, mention = await _mentioned(fake, human)
+
+    fake.set_status(issue_id, "Done", human)
+
+    assert LABEL in fake.issue(issue_id).labels
+    assert await jira_tracker(fake).verify_current(mention) is False

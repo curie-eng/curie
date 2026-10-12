@@ -310,12 +310,29 @@ class _FakeConnection:
         self.config = config
 
 
-def _fake_kind() -> str:
+class _FakeBindingTracker(_FakeConnection):
+    """A binding-scoped tracker connection, the shape every non-GitHub kind registers."""
+
+    def for_binding(self, client: Any, binding: Any, *, label: str | None = None) -> Any:
+        raise NotImplementedError
+
+    def issue_url(self, issue: Any) -> str:
+        raise NotImplementedError
+
+
+class _FakeRepositoryTracker(_FakeConnection):
+    """A repository-scoped tracker connection, GitHub's shape."""
+
+    def for_repository(self, client: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+
+def _fake_kind(tracker: type[_FakeConnection] = _FakeBindingTracker) -> str:
     """A kind registered installed for one test, with a fresh name so the
     one-registration rule never trips across tests."""
 
     kind = f"test_fake_{uuid.uuid4().hex[:8]}"
-    register(kind, tracker=_FakeConnection, code_host=_FakeConnection)
+    register(kind, tracker=tracker, code_host=_FakeConnection)
     return kind
 
 
@@ -360,6 +377,33 @@ def test_registry_builds_a_kind_registered_installed(private_key: str) -> None:
     assert registry.tracker("fake-tracker").config.name == "fake-tracker"
     assert registry.code_host("fake-host").config.name == "fake-host"
     assert registry.github_tracker() is registry.tracker("corp-issues")
+
+
+def test_registry_refuses_a_non_github_tracker_kind_that_is_not_binding_scoped(
+    private_key: str,
+) -> None:
+    """r1 finding 9: the generic intake polls every non-GitHub tracker per
+    binding, so a kind registering a repository-scoped connection is refused when
+    the registry is built (config load), naming the entry and kind. The test
+    above is the liveness case: a binding-scoped kind builds."""
+
+    kind = _fake_kind(_FakeRepositoryTracker)
+    github = _config(_github_entries(private_key))
+    config = ForgesConfig.model_construct(
+        code_hosts=github.code_hosts,
+        trackers=(*github.trackers, _constructed_tracker(kind, "native-issues")),
+        bindings=(),
+        card_base_url="",
+    )
+
+    with pytest.raises(ValueError) as refused:
+        build_registry(config)
+
+    message = str(refused.value)
+    assert "'native-issues'" in message and kind in message
+    assert "BindingTrackerConnection" in message
+    # GitHub, repository scoped, is the one kind exempt.
+    assert isinstance(build_registry(github).tracker("corp-issues"), RepositoryTrackerConnection)
 
 
 # One GitHub ------------------------------------------------------------------------

@@ -65,12 +65,12 @@ from curie_api.workitems import lifecycle
 from . import factory_progress
 from .config import Settings
 from .forges.capabilities import Operation, Support, supports
-from .forges.config import CiPolicyConfig
+from .forges.config import CiPolicyConfig, RepositoryBindingConfig
 from .forges.errors import ForgeError
 from .forges.hosts import issue_url
 from .forges.ports import CodeHost
-from .forges.registry import ForgeRegistry, forges_registry
-from .forges.trackers import code_host_for_repository, stored_repository
+from .forges.registry import forges_registry
+from .forges.trackers import code_host_for_repository, stored_repository, work_item_policy
 from .forges.types import (
     STATUS_KEY_PREFIX,
     CheckSource,
@@ -234,9 +234,7 @@ async def observe(
     except ForgeError:
         # Mergeability stays unknown; the checks above still stand.
         return view
-    return replace(
-        view, conflicted=pull.conflicted, merged=pull.state is PullRequestState.MERGED
-    )
+    return replace(view, conflicted=pull.conflicted, merged=pull.state is PullRequestState.MERGED)
 
 
 def _stamp(moment: datetime | None) -> str | None:
@@ -386,24 +384,22 @@ def ci_policies(config: CiPolicyConfig) -> tuple[PythonCiPolicy | None, Metadata
     return python_ci, (MetadataCiPolicy.from_keys(keys) if keys else None)
 
 
-def ci_policy_config(registry: ForgeRegistry, repo_full_name: str) -> CiPolicyConfig:
-    """The CI policy of ``owner/name``'s forge binding, matched case-insensitively;
-    empty for a repository with no binding."""
+def ci_policy_config(policy: RepositoryBindingConfig | None) -> CiPolicyConfig:
+    """The CI config of a repository binding entry; empty with no entry."""
 
-    entry = registry.github_repository_policy(repo_full_name)
-    return entry.ci if entry is not None else CiPolicyConfig()
+    return policy.ci if policy is not None else CiPolicyConfig()
 
 
-def python_ci_policy(registry: ForgeRegistry, repo_full_name: str) -> PythonCiPolicy | None:
-    """The configured policy for ``owner/name``, matched case-insensitively."""
+def python_ci_policy(policy: RepositoryBindingConfig | None) -> PythonCiPolicy | None:
+    """The required Python CI policy of a repository binding entry."""
 
-    return ci_policies(ci_policy_config(registry, repo_full_name))[0]
+    return ci_policies(ci_policy_config(policy))[0]
 
 
-def metadata_ci_policy(registry: ForgeRegistry, repo_full_name: str) -> MetadataCiPolicy | None:
-    """The configured metadata policy, matched case insensitively."""
+def metadata_ci_policy(policy: RepositoryBindingConfig | None) -> MetadataCiPolicy | None:
+    """The metadata rerun policy of a repository binding entry."""
 
-    return ci_policies(ci_policy_config(registry, repo_full_name))[1]
+    return ci_policies(ci_policy_config(policy))[1]
 
 
 @dataclass(frozen=True)
@@ -1089,10 +1085,15 @@ async def gate(
     observed_sha = lineage.head_sha
     changed_paths = _publication_changed_paths(facts.publications)
     changed_python_paths = python_paths(changed_paths)
-    python_ci = python_ci_policy(registry, lineage.repo_full_name or work_item.repository_path)
-    metadata_ci = metadata_ci_policy(
-        registry, lineage.repo_full_name or work_item.repository_path
+    # The policy of the binding that chose this repository, on its own code
+    # host (#4358 plan D15); a GitHub WorkItem keeps its path-matched entry.
+    policy = work_item_policy(
+        registry,
+        work_item.tracker_issue,
+        replace(repository, path=lineage.repo_full_name or work_item.repository_path),
     )
+    python_ci = python_ci_policy(policy)
+    metadata_ci = metadata_ci_policy(policy)
     unselected_path = unselected_python_path(changed_paths, python_ci)
     preflight_verdict: Verdict | None = None
     delegated_checks: tuple[str, ...] = ()

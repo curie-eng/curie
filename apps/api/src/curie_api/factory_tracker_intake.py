@@ -12,6 +12,10 @@ each notice goes through the same admission the GitHub path applies:
    chosen binding's policy) choice, each refused with one marked comment;
 4. the shared WorkItem dispatch: ``readmit``, ``admit_revision`` or a cancel.
 
+A running WorkItem of a configured tracker whose scope no binding serves any
+more (the binding was removed or rescoped) can no longer be polled, admitted or
+cancelled through a tracker, so each poll of that tracker cancels it.
+
 The opaque ``poll_marked`` cursor is kept per label in the tracker scope's
 ``factory_poll_cursors`` row, under ``etags["marked:<label>"]``, and saved only
 after every notice of a page was applied or deliberately refused. A refused
@@ -50,7 +54,13 @@ from .forges.registry import ForgeRegistry, forges_registry
 from .forges.resolution import REFUSAL_MARKER as REPO_REFUSAL_MARKER
 from .forges.resolution import Refusal, refusal_body, resolve_repository
 from .forges.surfaces import agent_binding, binding_location, bound_labels
-from .forges.trackers import issue_link, mention_objective, reply_route, tracker_for_binding
+from .forges.trackers import (
+    binding_for_scope,
+    issue_link,
+    mention_objective,
+    reply_route,
+    tracker_for_binding,
+)
 from .forges.types import (
     GITHUB,
     Disposition,
@@ -150,6 +160,8 @@ async def _poll_locked(
         if tracker.kind == GITHUB:
             continue
         polling = _take(due, f"poll:{tracker.name}", clock, tracker.poll_interval_s)
+        if polling:
+            await _cancel_orphans(sessionmaker, registry, tracker)
         for binding in config.bindings:
             if binding.tracker != tracker.name:
                 continue
@@ -167,6 +179,42 @@ async def _poll_locked(
             }
             if polling or sweeps:
                 await _poll_binding(sessionmaker, scope, polling=polling, sweeps=sweeps)
+
+
+async def _cancel_orphans(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    registry: ForgeRegistry,
+    tracker: TrackerConfig,
+) -> None:
+    """Cancel the tracker's running WorkItems whose scope no binding serves."""
+
+    async with sessionmaker() as session:
+        rows = await session.scalars(
+            select(WorkItem).where(
+                WorkItem.tracker_kind == tracker.kind,
+                WorkItem.tracker_host == tracker.host,
+                WorkItem.cancelled_at.is_(None),
+            )
+        )
+        orphans = [
+            item.tracker_issue
+            for item in rows
+            if binding_for_scope(registry, item.tracker_issue) is None
+        ]
+    for issue in orphans:
+        async with sessionmaker() as session:
+            await lock_issue(session, issue)
+            existing = await work_item_for(session, issue)
+            if existing is None or existing.cancelled_at is not None:
+                continue
+            result = await cancel_work_item(session, existing)
+            await session.commit()
+        logger.warning(
+            "tracker intake cancelled work item %s on tracker %s: no binding serves its scope (%s)",
+            existing.id,
+            tracker.name,
+            result.status,
+        )
 
 
 async def _labels(sessionmaker: async_sessionmaker[AsyncSession], scope: _Scope) -> list[str]:

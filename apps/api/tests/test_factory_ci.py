@@ -955,7 +955,10 @@ def test_the_metadata_ci_policy_setting_defaults_to_empty() -> None:
     settings = Settings()
     assert settings.forges.bindings == ()
     registry = forges_registry(settings)
-    assert factory_ci.metadata_ci_policy(registry, "acme-corp/unit-converter") is None
+    assert (
+        factory_ci.metadata_ci_policy(registry.github_repository_policy("acme-corp/unit-converter"))
+        is None
+    )
 
 
 def test_the_metadata_ci_policy_setting_parses_and_matches_case_insensitively() -> None:
@@ -973,15 +976,18 @@ def test_the_metadata_ci_policy_setting_parses_and_matches_case_insensitively() 
     )
 
     assert factory_ci.metadata_ci_policy(
-        registry, "acme-corp/unit-converter"
+        registry.github_repository_policy("acme-corp/unit-converter")
     ) == factory_ci.MetadataCiPolicy(
         checks=("Publication description guard",),
         statuses=("ci/publication-description",),
     )
     assert factory_ci.metadata_ci_policy(
-        registry, "ACME-CORP/ANOTHER-REPOSITORY"
+        registry.github_repository_policy("ACME-CORP/ANOTHER-REPOSITORY")
     ) == factory_ci.MetadataCiPolicy(checks=("Release notes guard",), statuses=())
-    assert factory_ci.metadata_ci_policy(registry, "acme-corp/acme-fixture") is None
+    assert (
+        factory_ci.metadata_ci_policy(registry.github_repository_policy("acme-corp/acme-fixture"))
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -997,7 +1003,7 @@ def test_a_metadata_ci_policy_may_configure_only_one_surface(
     registry = _registry(("acme-corp/unit-converter", {"metadata_rerun_keys": keys}))
 
     assert factory_ci.metadata_ci_policy(
-        registry, "acme-corp/unit-converter"
+        registry.github_repository_policy("acme-corp/unit-converter")
     ) == factory_ci.MetadataCiPolicy(checks=checks, statuses=statuses)
 
 
@@ -1142,7 +1148,10 @@ def test_the_python_ci_policy_setting_defaults_to_empty() -> None:
     settings = Settings()
     assert settings.forges.bindings == ()
     registry = forges_registry(settings)
-    assert factory_ci.python_ci_policy(registry, "acme-corp/unit-converter") is None
+    assert (
+        factory_ci.python_ci_policy(registry.github_repository_policy("acme-corp/unit-converter"))
+        is None
+    )
 
 
 def test_the_python_ci_policy_setting_parses_and_matches_case_insensitively() -> None:
@@ -1163,11 +1172,17 @@ def test_the_python_ci_policy_setting_parses_and_matches_case_insensitively() ->
         ),
     )
     assert (
-        factory_ci.python_ci_policy(registry, "Acme-Corp/Unit-Converter")
+        factory_ci.python_ci_policy(registry.github_repository_policy("Acme-Corp/Unit-Converter"))
         == conversion_python_ci()
     )
-    assert factory_ci.python_ci_policy(registry, "acme/widgets") == custom_python_ci()
-    assert factory_ci.python_ci_policy(registry, "acme-corp/acme-fixture") is None
+    assert (
+        factory_ci.python_ci_policy(registry.github_repository_policy("acme/widgets"))
+        == custom_python_ci()
+    )
+    assert (
+        factory_ci.python_ci_policy(registry.github_repository_policy("acme-corp/acme-fixture"))
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -1675,7 +1690,9 @@ def test_policy_settings_become_check_keys_with_statuses_prefixed() -> None:
         )
     )
 
-    config = factory_ci.ci_policy_config(registry, "Acme-Corp/Unit-Converter")
+    config = factory_ci.ci_policy_config(
+        registry.github_repository_policy("Acme-Corp/Unit-Converter")
+    )
 
     assert config.required is not None
     assert (config.required.key, config.required.pending_key_prefix) == (
@@ -1704,7 +1721,7 @@ def test_a_check_run_named_like_a_status_key_is_escaped_and_never_matches_the_st
         )
     )
 
-    config = factory_ci.ci_policy_config(registry, "acme-corp/acme-bot")
+    config = factory_ci.ci_policy_config(registry.github_repository_policy("acme-corp/acme-bot"))
 
     assert config.metadata_rerun_keys == ("check:status:lint", "status:lint")
     _python, metadata = factory_ci.ci_policies(config)
@@ -1996,7 +2013,8 @@ def test_the_ci_wait_no_longer_takes_the_factory_github_accessor() -> None:
 
 @pytest.mark.usefixtures("clean_db")
 def test_ci_wait_uses_the_work_item_code_host_entry(
-    admitted: Any, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+    admitted: Any,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from forge_fakes.github import INSTALLATION_ID, REPO, REPO_ID
     from forge_fakes.github_comments import _rows, ci_green
