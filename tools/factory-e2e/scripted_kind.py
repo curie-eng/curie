@@ -776,13 +776,15 @@ class ScriptedRun:
             if request_ids:
                 request_id = next(iter(request_ids))
                 self.evidence["execution_request_id"] = request_id
-                if not advanced and time.monotonic() >= next_publication_probe:
+                if time.monotonic() >= next_publication_probe:
                     exists = self.sql(
                         "SELECT to_json(EXISTS(SELECT 1 FROM curie.publications "
                         f"WHERE execution_request_id='{request_id}'::uuid))"
                     )
                     next_publication_probe = time.monotonic() + 10
                     if exists:
+                        self.capture_publication_runtime()
+                    if exists and not advanced:
                         self.stub.advance(1800)
                         advanced = True
             final = [row for row in comments if fe._NOTICE_FINAL in row["body"]]
@@ -795,6 +797,91 @@ class ScriptedRun:
                 self.assert_record_budget(self.provider_remaining())
             time.sleep(2)
         raise ScriptedScenarioError("final issue comment timed out after 2400 seconds")
+
+    def capture_publication_runtime(self) -> None:
+        """Preserve bounded status/log evidence while publication pods still exist."""
+
+        def safe(value: str) -> str:
+            redacted = fe.record_agent_text(value, self.secrets)[0] or ""
+            return re.sub(r"https?://[^\s\"<>]+", "https://example.com", redacted)
+
+        try:
+            resources = json.loads(
+                self.kubectl(
+                    "-n",
+                    self.namespace,
+                    "get",
+                    "jobs,pods",
+                    "-l",
+                    "curietech.ai/component=publication",
+                    "-o",
+                    "json",
+                    timeout=10,
+                )
+            )
+            snapshots = []
+            for item in resources.get("items", [])[:8]:
+                status = item.get("status", {})
+                snapshot: dict[str, Any] = {
+                    "kind": item["kind"],
+                    "phase": status.get("phase"),
+                    "active": status.get("active"),
+                    "failed": status.get("failed"),
+                    "succeeded": status.get("succeeded"),
+                    "conditions": [
+                        {
+                            key: safe(str(condition[key]))
+                            for key in ("type", "status", "reason", "message")
+                            if key in condition
+                        }
+                        for condition in status.get("conditions", [])[:8]
+                    ],
+                }
+                if item["kind"] == "Pod":
+                    snapshot["containers"] = [
+                        {
+                            "restart_count": container.get("restartCount"),
+                            "state": {
+                                state: {
+                                    key: safe(str(value))
+                                    for key, value in detail.items()
+                                    if key in ("reason", "message", "exitCode", "signal")
+                                }
+                                for state, detail in container.get("state", {}).items()
+                            },
+                        }
+                        for container in (
+                            status.get("initContainerStatuses", [])
+                            + status.get("containerStatuses", [])
+                        )[:8]
+                    ]
+                    try:
+                        snapshot["logs"] = safe(
+                            self.kubectl(
+                                "-n",
+                                self.namespace,
+                                "logs",
+                                item["metadata"]["name"],
+                                "--all-containers=true",
+                                "--tail=40",
+                                "--limit-bytes=4096",
+                                "--pod-running-timeout=2s",
+                                timeout=5,
+                            )
+                        )
+                    except (RuntimeError, OSError, subprocess.SubprocessError) as exc:
+                        snapshot["logs_error"] = type(exc).__name__
+                snapshots.append(snapshot)
+            # An empty list after worker cleanup must not erase the last observation.
+            if snapshots:
+                if not any(item["kind"] == "Pod" for item in snapshots):
+                    snapshots.extend(
+                        item for item in self.evidence.get("publication_runtime", [])
+                        if item["kind"] == "Pod"
+                    )
+                self.evidence["publication_runtime"] = snapshots
+        except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            self.evidence["publication_runtime_error"] = type(exc).__name__
 
     def sql(self, query: str) -> Any:
         output = self.kubectl(

@@ -1234,3 +1234,41 @@ def test_failed_publication_evidence_survives_verdict_without_transport_or_crede
     assert "patch_bytes" not in queries[0]
     assert "'error', error" in queries[0]
     assert "example-sensitive-token" not in json.dumps(run.evidence)
+
+
+def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    run.secrets = ["example-sensitive-token"]
+    calls: list[tuple[str, ...]] = []
+    remaining = True
+
+    def kubectl(*args: str, timeout: float) -> str:
+        calls.append(args)
+        assert timeout <= 10
+        if "get" in args:
+            return json.dumps({"items": [{
+                "kind": "Pod", "metadata": {"name": "example-publication"},
+                "spec": {"env": [{"value": "example-sensitive-token"}]},
+                "status": {"phase": "Pending", "containerStatuses": [{
+                    "restartCount": 0, "state": {"waiting": {
+                        "reason": "ImagePullBackOff",
+                        "message": "cannot pull https://registry.example.test/image",
+                    }},
+                }]},
+            }] if remaining else []})
+        assert "--tail=40" in args and "--limit-bytes=4096" in args
+        return "example-sensitive-token failed HTTPS https://stub.example.test/path"
+
+    monkeypatch.setattr(run, "kubectl", kubectl)
+    run.capture_publication_runtime()
+    snapshot = run.evidence["publication_runtime"][0]
+    assert snapshot["phase"] == "Pending"
+    assert snapshot["containers"][0]["state"]["waiting"]["reason"] == "ImagePullBackOff"
+    assert snapshot["logs"] == "[REDACTED] failed HTTPS https://example.com"
+    assert "spec" not in snapshot
+    remaining = False
+    run.capture_publication_runtime()
+    assert run.evidence["publication_runtime"] == [snapshot]
+    assert all("curietech.ai/component=publication" in call for call in calls if "get" in call)
