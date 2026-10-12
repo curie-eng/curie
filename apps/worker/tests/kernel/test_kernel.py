@@ -4517,6 +4517,97 @@ def test_unreadable_oldest_runner_does_not_block_later_safe_reclamation(
     asyncio.run(go())
 
 
+@pytest.mark.parametrize("stale_routes", [False, True])
+def test_quota_pressure_repeated_passes_reach_completed_route_after_four_unreadable_routes(
+    make_harness,
+    stale_routes: bool,
+) -> None:
+    async def go() -> None:
+        async with make_harness(
+            binding=_HistoryBinding(),
+            claim_timeout_seconds=0.05,
+            per_sandbox_runners=8,
+            **_PRESSURE_LEASE_KNOBS,
+        ) as h:
+            unreadable = [
+                await _safe_pressure_candidate(h, f"tUnreadablePressure{number}")
+                for number in range(4)
+            ]
+            active = await _safe_pressure_candidate(h, "tActivePressure")
+            nondurable = await _safe_pressure_candidate(h, "tNondurablePressure")
+            completed = await _safe_pressure_candidate(h, "tCompletedPressure")
+            protected = [*unreadable, active, nondurable]
+
+            # Explicit expiry order keeps all four unreadable routes ahead of
+            # the completed candidate, regardless of Valkey SCAN order.
+            for number, candidate in enumerate([*protected, completed]):
+                assert h.substrate._affinity.touch(  # noqa: SLF001
+                    candidate.thread_key, 30 + number
+                )
+            for candidate in unreadable:
+                h.runners[candidate.port].status_fails = True
+            h.runners[active.port].turn_active = True
+            h.runners[nondurable.port].history_durable = False
+            h.runners[completed.port].session_status = SessionStatus.DONE.value
+
+            if stale_routes:
+                # A prior phase owns only substrate resources. Its affinity
+                # records intentionally survive to reproduce stale routes.
+                for candidate in unreadable:
+                    h.fake_k8s.delete_claim(
+                        candidate.claim_name, request_timeout_seconds=1.0
+                    )
+                    assert candidate.sandbox_name not in h.fake_k8s.sandboxes
+                    record = h.substrate._affinity.get(candidate.thread_key)  # noqa: SLF001
+                    assert record is not None
+                    assert record.handle == candidate
+            deleted_before_pressure = set(h.fake_k8s.deleted_claims)
+            h.fake_k8s.quota_headroom_results = [True]
+
+            results = []
+            for _ in range(3):
+                probes_before = sum(
+                    len(runner.status_headers) for runner in h.runners.values()
+                )
+                result = await h.kernel._reclaim_idle_route(  # noqa: SLF001
+                    _thread_key("tPressureTrigger"),
+                    _quota_rejection(),
+                    remaining_s=120.0,
+                )
+                results.append(result)
+                probes_after = sum(
+                    len(runner.status_headers) for runner in h.runners.values()
+                )
+                # Fairness must not expand the existing per-pass probe cap.
+                assert probes_after - probes_before <= 4
+                for candidate in protected:
+                    record = h.substrate._affinity.get(candidate.thread_key)  # noqa: SLF001
+                    assert record is not None
+                    assert record.handle == candidate
+                assert not (
+                    set(h.fake_k8s.deleted_claims) - deleted_before_pressure
+                ).intersection(candidate.claim_name for candidate in protected)
+                if result.reclaimed:
+                    break
+
+            assert results[-1].reclaimed, "old unreadable routes starved a safe completed route"
+            assert results[-1].outcome == "reclaimed"
+            assert len(results) > 1
+            assert h.substrate.lookup(completed.thread_key) is None
+            assert completed.claim_name in h.fake_k8s.deleted_claims
+
+            await h.kernel.process_event(
+                qevent("resume the reclaimed completed thread", thread="tCompletedPressure")
+            )
+            resumed = h.substrate.lookup(completed.thread_key)
+            assert resumed is not None
+            assert resumed.claim_name != completed.claim_name
+            assert resumed.history_ref == completed.history_ref
+            assert h.runners[resumed.port].opened == ["resume the reclaimed completed thread"]
+
+    asyncio.run(go())
+
+
 @pytest.mark.parametrize("race", ["touch", "replace", "lease-loss"])
 def test_quota_pressure_loses_races_without_deleting_the_candidate(
     make_harness,
