@@ -273,7 +273,10 @@ exit 64
             .current_dir(self.temp.path())
             .stdin(Stdio::null())
             .stderr(Stdio::from(stderr))
-            .env("PATH", std::env::join_paths(paths).expect("join fixture PATH"))
+            .env(
+                "PATH",
+                std::env::join_paths(paths).expect("join fixture PATH"),
+            )
             .env("CI", "1")
             .env("TERM", "dumb")
             .env("NO_COLOR", "1")
@@ -341,7 +344,11 @@ fn assert_cpu_warning(shown: &str) {
         .lines()
         .filter(|line| line.contains("warn") && line.contains("capacity:"))
         .collect();
-    assert_eq!(warnings.len(), 1, "one CPU warning, no memory warning:\n{shown}");
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one CPU warning, no memory warning:\n{shown}"
+    );
     assert!(warnings[0].to_lowercase().contains("cpu"), "{shown}");
     assert!(warnings[0].contains("160%"), "{shown}");
     assert!(warnings[0].contains("shortfall"), "{shown}");
@@ -385,8 +392,15 @@ fn forbidden_nodes_skips_advisory_and_preserves_install_exit_code() {
     assert_eq!(output.status.code(), baseline_output.status.code());
     forbidden.assert_one_install();
     let shown = stderr(&output);
-    assert_eq!(shown.matches("capacity preflight skipped:").count(), 1, "{shown}");
-    assert!(shown.contains("Forbidden"), "the skip must explain the failed read:\n{shown}");
+    assert_eq!(
+        shown.matches("capacity preflight skipped:").count(),
+        1,
+        "{shown}"
+    );
+    assert!(
+        shown.contains("Forbidden"),
+        "the skip must explain the failed read:\n{shown}"
+    );
     assert!(
         fs::read_to_string(&forbidden.stderr_at_install)
             .unwrap()
@@ -412,7 +426,11 @@ fn failed_pod_read_or_malformed_input_skips_once_and_still_installs() {
         assert_success(&output);
         fixture.assert_one_install();
         let shown = stderr(&output);
-        assert_eq!(shown.matches("capacity preflight skipped:").count(), 1, "{failure}: {shown}");
+        assert_eq!(
+            shown.matches("capacity preflight skipped:").count(),
+            1,
+            "{failure}: {shown}"
+        );
         assert!(!shown.contains("warn  capacity:"), "{failure}: {shown}");
     }
 }
@@ -423,13 +441,19 @@ fn json_stdout_keeps_the_committed_cluster_up_schema() {
     let output = fixture.run_up(&["--json"]);
     assert_success(&output);
     let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
-        panic!("stdout must contain exactly one JSON value: {error}\n{}", String::from_utf8_lossy(&output.stdout))
+        panic!(
+            "stdout must contain exactly one JSON value: {error}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        )
     });
     let schema: Value = serde_json::from_str(include_str!("../schema/cluster-up.schema.json"))
         .expect("committed cluster up schema parses");
     let validator = jsonschema::validator_for(&schema).expect("cluster up schema compiles");
     assert!(validator.is_valid(&value), "{value}");
-    assert_eq!(value, json!({"status": "up", "namespace": NAMESPACE, "release": RELEASE}));
+    assert_eq!(
+        value,
+        json!({"status": "up", "namespace": NAMESPACE, "release": RELEASE})
+    );
     assert_cpu_warning(&stderr(&output));
     fixture.assert_warning_before_install();
     fixture.assert_one_install();
@@ -482,5 +506,8 @@ fn both_capacity_reads_use_the_pinned_context_and_active_pod_selector() {
     }
     let pods = reads.iter().find(|line| line.contains("get pods")).unwrap();
     assert!(pods.contains("--all-namespaces"), "{pods}");
-    assert!(pods.contains("status.phase!=Succeeded,status.phase!=Failed"), "{pods}");
+    assert!(
+        pods.contains("status.phase!=Succeeded,status.phase!=Failed"),
+        "{pods}"
+    );
 }

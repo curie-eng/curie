@@ -15,6 +15,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::commands::{self, DeployOpts, DeployTier};
+use crate::ops::capacity::{is_transient_condition_taint, parse_memory_quantity};
 use crate::ui::{CliOutput, DryRunPlan, Ui};
 
 const OBSERVABILITY_NAMESPACE: &str = "observability";
@@ -3464,16 +3465,6 @@ fn alloy_can_schedule_on(node: &Node) -> bool {
         })
 }
 
-fn is_transient_condition_taint(key: &str) -> bool {
-    matches!(
-        key,
-        "node.kubernetes.io/not-ready"
-            | "node.kubernetes.io/unreachable"
-            | "node.kubernetes.io/network-unavailable"
-            | "node.cloudprovider.kubernetes.io/uninitialized"
-    )
-}
-
 fn select_log_runtime(nodes: &[Node]) -> Result<LogRuntime> {
     if nodes.is_empty() {
         bail!("no nodes found to select Alloy log parser; inspect `kubectl get nodes -o json`");
@@ -3755,43 +3746,6 @@ fn optional_memory(requests: &BTreeMap<String, String>, pod: &str, owner: &str) 
 fn checked_add(left: u128, right: u128) -> Result<u128> {
     left.checked_add(right)
         .ok_or_else(|| anyhow!("pod memory request overflowed"))
-}
-
-fn parse_memory_quantity(quantity: &str) -> Result<u128> {
-    let quantity = quantity.trim();
-    let (number, multiplier) = [
-        ("Ei", 1024f64.powi(6)),
-        ("Pi", 1024f64.powi(5)),
-        ("Ti", 1024f64.powi(4)),
-        ("Gi", 1024f64.powi(3)),
-        ("Mi", 1024f64.powi(2)),
-        ("Ki", 1024f64),
-        ("E", 1000f64.powi(6)),
-        ("P", 1000f64.powi(5)),
-        ("T", 1000f64.powi(4)),
-        ("G", 1000f64.powi(3)),
-        ("M", 1000f64.powi(2)),
-        ("K", 1000f64),
-        ("k", 1000f64),
-        ("m", 0.001f64),
-        ("u", 0.000_001f64),
-        ("n", 0.000_000_001f64),
-    ]
-    .into_iter()
-    .find_map(|(suffix, multiplier)| {
-        quantity
-            .strip_suffix(suffix)
-            .map(|number| (number, multiplier))
-    })
-    .unwrap_or((quantity, 1f64));
-    let number = number
-        .parse::<f64>()
-        .with_context(|| format!("unsupported Kubernetes memory quantity {quantity:?}"))?;
-    let bytes = number * multiplier;
-    if !bytes.is_finite() || bytes < 0.0 || bytes > u128::MAX as f64 {
-        bail!("unsupported Kubernetes memory quantity {quantity:?}");
-    }
-    Ok(bytes.ceil() as u128)
 }
 
 #[cfg(test)]

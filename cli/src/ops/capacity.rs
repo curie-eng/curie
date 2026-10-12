@@ -1,3 +1,578 @@
+//! Advisory platform requests accounting from the final Helm render.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::{plain, run_capture, CommonOpts, OpsCommand};
+use crate::ui::Ui;
+
+const MIB: u128 = 1024 * 1024;
+
+#[derive(Clone, Copy, Default)]
+struct Requests {
+    cpu: u128,
+    memory: u128,
+}
+
+impl Requests {
+    fn add(self, other: Self) -> Result<Self> {
+        Ok(Self {
+            cpu: self
+                .cpu
+                .checked_add(other.cpu)
+                .context("CPU request total overflowed")?,
+            memory: self
+                .memory
+                .checked_add(other.memory)
+                .context("memory request total overflowed")?,
+        })
+    }
+
+    fn multiply(self, count: u128) -> Result<Self> {
+        Ok(Self {
+            cpu: self
+                .cpu
+                .checked_mul(count)
+                .context("CPU request total overflowed")?,
+            memory: self
+                .memory
+                .checked_mul(count)
+                .context("memory request total overflowed")?,
+        })
+    }
+
+    fn max(self, other: Self) -> Self {
+        Self {
+            cpu: self.cpu.max(other.cpu),
+            memory: self.memory.max(other.memory),
+        }
+    }
+}
+
+struct Projection {
+    amount: u128,
+    percentage: String,
+    shortfall: Option<u128>,
+}
+
+impl Projection {
+    fn new(amount: u128, allocatable: u128) -> Result<Self> {
+        if allocatable == 0 {
+            bail!("eligible nodes have zero allocatable capacity");
+        }
+        let weighted = amount
+            .checked_mul(5)
+            .context("projected request total overflowed")?;
+        let threshold = allocatable
+            .checked_mul(4)
+            .context("allocatable capacity total overflowed")?;
+        let tenths = amount
+            .checked_mul(1000)
+            .context("projected request percentage overflowed")?
+            / allocatable;
+        Ok(Self {
+            amount,
+            percentage: if tenths % 10 == 0 {
+                (tenths / 10).to_string()
+            } else {
+                format!("{}.{}", tenths / 10, tenths % 10)
+            },
+            shortfall: (weighted > threshold).then(|| weighted.div_ceil(4) - allocatable),
+        })
+    }
+}
+
+struct Report {
+    install: Requests,
+    allocatable: Requests,
+    existing: Requests,
+    eligible_nodes: usize,
+    gke: bool,
+    cpu: Projection,
+    memory: Projection,
+}
+
+impl Report {
+    fn messages(&self) -> (String, Vec<String>, Option<&'static str>) {
+        let note = format!(
+            "capacity: install requests {}m CPU and {}Mi memory across {} eligible nodes; already requested {}m CPU and {}Mi memory; projected CPU {}% and memory {}% of allocatable",
+            self.install.cpu,
+            self.install.memory.div_ceil(MIB),
+            self.eligible_nodes,
+            self.existing.cpu,
+            self.existing.memory.div_ceil(MIB),
+            self.cpu.percentage,
+            self.memory.percentage,
+        );
+        let mut warnings = Vec::new();
+        if let Some(shortfall) = self.cpu.shortfall {
+            warnings.push(format!(
+                "capacity: projected CPU {}% ({}m requested / {}m allocatable) exceeds 80%; additional allocatable shortfall: {}m",
+                self.cpu.percentage, self.cpu.amount, self.allocatable.cpu, shortfall,
+            ));
+        }
+        if let Some(shortfall) = self.memory.shortfall {
+            warnings.push(format!(
+                "capacity: projected memory {}% ({}Mi requested / {}Mi allocatable) exceeds 80%; additional allocatable shortfall: {}Mi",
+                self.memory.percentage,
+                self.memory.amount.div_ceil(MIB),
+                self.allocatable.memory.div_ceil(MIB),
+                shortfall.div_ceil(MIB),
+            ));
+        }
+        let recommendation = (!warnings.is_empty()).then_some(if self.gke {
+            "On GKE, use a node pool of e2-standard-4 or larger with three nodes."
+        } else {
+            "Add nodes or use larger nodes until allocatable grows by the shortfall."
+        });
+        (note, warnings, recommendation)
+    }
+}
+
+fn quantity(value: &Value, cpu: bool) -> Result<u128> {
+    let text = match value {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => number.to_string(),
+        _ => bail!("unsupported resource quantity"),
+    };
+    if cpu {
+        parse_cpu_quantity(&text).map_err(|_| anyhow!("unsupported CPU quantity"))
+    } else {
+        // The shared parser retains the example installer's original error
+        // details. Never expose those details from this advisory calculation.
+        parse_memory_quantity(&text).map_err(|_| anyhow!("unsupported memory quantity"))
+    }
+}
+
+fn resource_requests(resources: &Value) -> Result<Requests> {
+    if !resources.is_object() {
+        bail!("malformed resource requests");
+    }
+    Ok(Requests {
+        cpu: resources
+            .get("cpu")
+            .map_or(Ok(0), |value| quantity(value, true))?,
+        memory: resources
+            .get("memory")
+            .map_or(Ok(0), |value| quantity(value, false))?,
+    })
+}
+
+fn container_requests(container: &Value) -> Result<Requests> {
+    if !container.is_object() {
+        bail!("malformed pod container");
+    }
+    let Some(resources) = container.get("resources").filter(|value| !value.is_null()) else {
+        return Ok(Requests::default());
+    };
+    if !resources.is_object() {
+        bail!("malformed container resources");
+    }
+    for key in ["requests", "limits"] {
+        if resources
+            .get(key)
+            .is_some_and(|value| !value.is_null() && !value.is_object())
+        {
+            bail!("malformed container resource requests or limits");
+        }
+    }
+    let request = |name, cpu| {
+        resources["requests"]
+            .get(name)
+            .or_else(|| resources["limits"].get(name))
+            .map_or(Ok(0), |value| quantity(value, cpu))
+    };
+    Ok(Requests {
+        cpu: request("cpu", true)?,
+        memory: request("memory", false)?,
+    })
+}
+
+fn optional_array<'a>(value: &'a Value, key: &str) -> Result<&'a [Value]> {
+    match value.get(key) {
+        None | Some(Value::Null) => Ok(&[]),
+        Some(Value::Array(items)) => Ok(items),
+        _ => bail!("malformed resource list"),
+    }
+}
+
+fn pod_requests(spec: &Value) -> Result<Requests> {
+    let containers = spec["containers"]
+        .as_array()
+        .filter(|containers| !containers.is_empty())
+        .context("malformed pod container list")?;
+    let mut steady = Requests::default();
+    for container in containers {
+        steady = steady.add(container_requests(container)?)?;
+    }
+    let mut sidecars = Requests::default();
+    let mut init_max = Requests::default();
+    for container in optional_array(spec, "initContainers")? {
+        let requests = container_requests(container)?;
+        // Restartable init containers remain running in later init stages.
+        // https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/#resource-sharing-within-containers
+        if container["restartPolicy"].as_str() == Some("Always") {
+            sidecars = sidecars.add(requests)?;
+            init_max = init_max.max(sidecars);
+        } else {
+            init_max = init_max.max(sidecars.add(requests)?);
+        }
+    }
+    let requests = steady.add(sidecars)?.max(init_max);
+    match spec.get("overhead").filter(|value| !value.is_null()) {
+        Some(overhead) => requests.add(resource_requests(overhead)?),
+        None => Ok(requests),
+    }
+}
+
+fn replicas(spec: &Value, key: &str) -> Result<u128> {
+    match spec.get(key) {
+        None => Ok(1),
+        Some(value) => value
+            .as_u64()
+            .map(u128::from)
+            .context("malformed workload replica count"),
+    }
+}
+
+fn namespace_of<'a>(document: &'a Value, namespace: &'a str) -> &'a str {
+    document["metadata"]["namespace"]
+        .as_str()
+        .unwrap_or(namespace)
+}
+
+fn rendered_requests(
+    rendered: &str,
+    eligible_nodes: usize,
+    upgrade: bool,
+    namespace: &str,
+) -> Result<Requests> {
+    let mut documents = Vec::new();
+    for document in serde_norway::Deserializer::from_str(rendered) {
+        let value = Value::deserialize(document).map_err(|_| anyhow!("malformed Helm render"))?;
+        if value.is_null() {
+            continue;
+        }
+        if !value.is_object() {
+            bail!("malformed Helm resource");
+        }
+        documents.push(value);
+    }
+    let mut templates = BTreeMap::new();
+    for document in &documents {
+        if document["kind"].as_str() == Some("SandboxTemplate") {
+            let name = document["metadata"]["name"]
+                .as_str()
+                .context("malformed SandboxTemplate identity")?;
+            let key = (namespace_of(document, namespace), name);
+            if templates.insert(key, document).is_some() {
+                bail!("duplicate SandboxTemplate identity");
+            }
+        }
+    }
+    let phases = if upgrade {
+        ["pre-upgrade", "post-upgrade"]
+    } else {
+        ["pre-install", "post-install"]
+    };
+    let mut total = Requests::default();
+    let mut hook_max = Requests::default();
+    for document in &documents {
+        let spec = &document["spec"];
+        let requests = match document["kind"].as_str() {
+            Some("Deployment" | "StatefulSet") => {
+                pod_requests(&spec["template"]["spec"])?.multiply(replicas(spec, "replicas")?)?
+            }
+            Some("DaemonSet") => {
+                pod_requests(&spec["template"]["spec"])?.multiply(eligible_nodes as u128)?
+            }
+            Some("Job") => {
+                if let Some(hook) = document["metadata"]["annotations"].get("helm.sh/hook") {
+                    let hook = hook.as_str().context("malformed Helm hook annotation")?;
+                    if hook.split(',').any(|phase| phases.contains(&phase.trim())) {
+                        hook_max = hook_max.max(pod_requests(&spec["template"]["spec"])?);
+                    }
+                    continue;
+                }
+                pod_requests(&spec["template"]["spec"])?.multiply(replicas(spec, "parallelism")?)?
+            }
+            Some("Pod") => {
+                if document["metadata"]["annotations"]
+                    .get("helm.sh/hook")
+                    .is_some()
+                {
+                    continue;
+                }
+                pod_requests(spec)?.multiply(replicas(spec, "parallelism")?)?
+            }
+            Some("SandboxWarmPool") => {
+                let name = spec["sandboxTemplateRef"]["name"]
+                    .as_str()
+                    .context("malformed SandboxWarmPool template reference")?;
+                let template = templates
+                    .get(&(namespace_of(document, namespace), name))
+                    .context("SandboxWarmPool template is missing from the render")?;
+                pod_requests(&template["spec"]["podTemplate"]["spec"])?
+                    .multiply(replicas(spec, "replicas")?)?
+            }
+            _ => continue,
+        };
+        total = total.add(requests)?;
+    }
+    total.add(hook_max)
+}
+
+fn calculate(
+    rendered: &str,
+    nodes: &Value,
+    pods: &Value,
+    upgrade: bool,
+    namespace: &str,
+    release: &str,
+) -> Result<Report> {
+    let nodes = nodes["items"].as_array().context("malformed node list")?;
+    let pods = pods["items"].as_array().context("malformed pod list")?;
+    let mut eligible = BTreeSet::new();
+    let mut allocatable = Requests::default();
+    let mut gke = false;
+    for node in nodes {
+        gke |= node["metadata"]["labels"]
+            .get("cloud.google.com/gke-nodepool")
+            .is_some();
+        let ready = optional_array(&node["status"], "conditions")?
+            .iter()
+            .any(|condition| {
+                condition["type"].as_str() == Some("Ready")
+                    && condition["status"].as_str() == Some("True")
+            });
+        let hard_taint = optional_array(&node["spec"], "taints")?
+            .iter()
+            .any(|taint| {
+                matches!(taint["effect"].as_str(), Some("NoSchedule" | "NoExecute"))
+                    && !is_transient_condition_taint(taint["key"].as_str().unwrap_or(""))
+            });
+        if !ready || node["spec"]["unschedulable"].as_bool() == Some(true) || hard_taint {
+            continue;
+        }
+        let name = node["metadata"]["name"]
+            .as_str()
+            .context("malformed node identity")?;
+        if !eligible.insert(name) {
+            bail!("duplicate node identity");
+        }
+        let resources = &node["status"]["allocatable"];
+        if resources.get("cpu").is_none() || resources.get("memory").is_none() {
+            bail!("eligible node allocatable CPU or memory is missing");
+        }
+        allocatable = allocatable.add(resource_requests(resources)?)?;
+    }
+    if eligible.is_empty() {
+        bail!("no eligible nodes");
+    }
+    let mut existing = Requests::default();
+    for pod in pods {
+        if matches!(
+            pod["status"]["phase"].as_str(),
+            Some("Succeeded" | "Failed")
+        ) {
+            continue;
+        }
+        if !pod["spec"]["nodeName"]
+            .as_str()
+            .is_some_and(|name| eligible.contains(name))
+        {
+            continue;
+        }
+        if pod["metadata"]["namespace"].as_str() == Some(namespace)
+            && pod["metadata"]["labels"]["app.kubernetes.io/instance"].as_str() == Some(release)
+        {
+            continue;
+        }
+        existing = existing.add(pod_requests(&pod["spec"])?)?;
+    }
+    let install = rendered_requests(rendered, eligible.len(), upgrade, namespace)?;
+    let projected = existing.add(install)?;
+    Ok(Report {
+        install,
+        allocatable,
+        existing,
+        eligible_nodes: eligible.len(),
+        gke,
+        cpu: Projection::new(projected.cpu, allocatable.cpu)?,
+        memory: Projection::new(projected.memory, allocatable.memory)?,
+    })
+}
+
+async fn read_cluster(args: Vec<super::CmdArg>, context: &str, resource: &str) -> Result<Value> {
+    let mut args = args;
+    args.push(plain("--context"));
+    args.push(plain(context));
+    let command = OpsCommand::new("kubectl", args);
+    let capture = tokio::time::timeout(Duration::from_secs(20), run_capture(&command))
+        .await
+        .map_err(|_| anyhow!("{resource} read exceeded 20 seconds"))?
+        .map_err(|_| anyhow!("could not read {resource}"))?;
+    let (ok, output, stderr) = capture;
+    if !ok {
+        if stderr.contains("Forbidden") {
+            bail!("Forbidden while listing {resource}");
+        }
+        bail!("could not list {resource}");
+    }
+    serde_json::from_str(&output).map_err(|_| anyhow!("malformed {resource} JSON"))
+}
+
+pub(super) async fn preflight(render: OpsCommand, common: &CommonOpts, upgrade: bool, ui: &Ui) {
+    let result = async {
+        let (ok, rendered, _) = tokio::time::timeout(Duration::from_secs(20), run_capture(&render))
+            .await
+            .map_err(|_| anyhow!("chart render exceeded 20 seconds"))?
+            .map_err(|_| anyhow!("could not render chart requests"))?;
+        if !ok {
+            bail!("could not render chart requests");
+        }
+        let context = std::env::var("HELM_KUBECONTEXT")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .or_else(crate::kube_context::current_context_name)
+            .context("no pinned Kubernetes context")?;
+        let nodes = read_cluster(
+            vec![plain("get"), plain("nodes"), plain("-o"), plain("json")],
+            &context,
+            "nodes",
+        )
+        .await?;
+        let pods = read_cluster(
+            vec![
+                plain("get"),
+                plain("pods"),
+                plain("--all-namespaces"),
+                plain("--field-selector=status.phase!=Succeeded,status.phase!=Failed"),
+                plain("-o"),
+                plain("json"),
+            ],
+            &context,
+            "pods",
+        )
+        .await?;
+        calculate(
+            &rendered,
+            &nodes,
+            &pods,
+            upgrade,
+            &common.namespace,
+            &common.release,
+        )
+    }
+    .await;
+    match result {
+        Ok(report) => {
+            let (note, warnings, recommendation) = report.messages();
+            ui.note(&note);
+            for warning in warnings {
+                ui.warn(&warning);
+            }
+            if let Some(recommendation) = recommendation {
+                ui.note(recommendation);
+            }
+        }
+        Err(error) => ui.note(&format!("capacity preflight skipped: {error}")),
+    }
+}
+
+fn parse_cpu_quantity(quantity: &str) -> Result<u128> {
+    let quantity = quantity.trim();
+    let (number, precision, scale) = match quantity.strip_suffix('m') {
+        Some(number) => (number, 0, 1),
+        None => (quantity, 3, 1000),
+    };
+    let number = number.strip_prefix('+').unwrap_or(number);
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if whole.is_empty() && fraction.is_empty()
+        || !whole.bytes().all(|digit| digit.is_ascii_digit())
+        || !fraction.bytes().all(|digit| digit.is_ascii_digit())
+    {
+        bail!("unsupported Kubernetes CPU quantity");
+    }
+    let mut millicores = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u128>()
+            .map_err(|_| anyhow!("CPU quantity overflowed"))?
+    }
+    .checked_mul(scale)
+    .context("CPU quantity overflowed")?;
+    let mut decimal = 0u128;
+    for offset in 0..precision {
+        decimal = decimal * 10
+            + fraction
+                .as_bytes()
+                .get(offset)
+                .map_or(0, |digit| u128::from(digit - b'0'));
+    }
+    millicores = millicores
+        .checked_add(decimal)
+        .context("CPU quantity overflowed")?;
+    if fraction.bytes().skip(precision).any(|digit| digit != b'0') {
+        millicores = millicores
+            .checked_add(1)
+            .context("CPU quantity overflowed")?;
+    }
+    Ok(millicores)
+}
+
+pub(crate) fn is_transient_condition_taint(key: &str) -> bool {
+    matches!(
+        key,
+        "node.kubernetes.io/not-ready"
+            | "node.kubernetes.io/unreachable"
+            | "node.kubernetes.io/network-unavailable"
+            | "node.cloudprovider.kubernetes.io/uninitialized"
+    )
+}
+
+pub(crate) fn parse_memory_quantity(quantity: &str) -> Result<u128> {
+    let quantity = quantity.trim();
+    let (number, multiplier) = [
+        ("Ei", 1024f64.powi(6)),
+        ("Pi", 1024f64.powi(5)),
+        ("Ti", 1024f64.powi(4)),
+        ("Gi", 1024f64.powi(3)),
+        ("Mi", 1024f64.powi(2)),
+        ("Ki", 1024f64),
+        ("E", 1000f64.powi(6)),
+        ("P", 1000f64.powi(5)),
+        ("T", 1000f64.powi(4)),
+        ("G", 1000f64.powi(3)),
+        ("M", 1000f64.powi(2)),
+        ("K", 1000f64),
+        ("k", 1000f64),
+        ("m", 0.001f64),
+        ("u", 0.000_001f64),
+        ("n", 0.000_000_001f64),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| {
+        quantity
+            .strip_suffix(suffix)
+            .map(|number| (number, multiplier))
+    })
+    .unwrap_or((quantity, 1f64));
+    let number = number
+        .parse::<f64>()
+        .with_context(|| format!("unsupported Kubernetes memory quantity {quantity:?}"))?;
+    let bytes = number * multiplier;
+    if !bytes.is_finite() || bytes < 0.0 || bytes > u128::MAX as f64 {
+        bail!("unsupported Kubernetes memory quantity {quantity:?}");
+    }
+    Ok(bytes.ceil() as u128)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
