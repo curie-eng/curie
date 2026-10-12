@@ -217,6 +217,20 @@ def main():
     dev = {"security": {"allowDevDefaults": True}}
     dev_docs = render("dev", dev)
     base = audit(dev_docs, "dev")
+    null_passthrough = merge(dev, {
+        "agentSandbox": {"runner": {"credentials": None}},
+        "dispatcher": {"slack": {"appToken": None, "botToken": None, "signingSecret": None}},
+        "mailAdapter": {"channelToken": None, "egressSecret": None, "agentmail": {"apiKey": None}},
+    })
+    null_docs = render("null passthrough credentials", null_passthrough)
+    null_content = chart_secret(null_docs)[1]
+    for key in (
+        "agentCredentials", "slackAppToken", "slackBotToken", "slackSigningSecret",
+        "mailAgentmailApiKey", "mailChannelToken", "mailEgressSecret",
+    ):
+        require(null_content.get(key) == "", f"null passthrough credentials: {key} must emit an empty string")
+    audit(null_docs, "null passthrough credentials")
+    print("OK: null passthrough credentials emit empty strings with matching workload hashes")
     for label, overlay in (
         ("identical input", {}),
         ("API replica change", {"api": {"replicas": 2}}),
