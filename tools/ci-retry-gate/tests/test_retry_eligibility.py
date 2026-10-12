@@ -63,6 +63,8 @@ RETRY_ALLOWLIST = frozenset(
         ("ci.yaml", "rust-lint", "Install uv"),
         ("ci.yaml", "rust-test", "Install uv"),
         ("ci.yaml", "rust-test", "Install Helm for CLI consumer render tests"),
+        # Like the UI job, this acquires pnpm before repository code runs.
+        ("ci.yaml", "contracts-ts", "Install pnpm"),
         ("ci.yaml", "contracts-ts", "Install Node"),
         ("ci.yaml", "ui", "Install pnpm"),
         ("ci.yaml", "ui", "Install Node"),
@@ -263,7 +265,7 @@ Identity = tuple[str, str, str]
 class LocatedStep(NamedTuple):
     """A step together with the position that fixes its order within its job."""
 
-    index: int
+    step_index: int
     step: dict[str, Any]
 
 
@@ -516,7 +518,7 @@ def _trio_problems(base: str, trio: Trio) -> list[str]:
         problems.append(f"no `{base}{RETRY_SUFFIX}` step")
     if backoff is None or retry is None:
         return problems
-    if not (attempt.index < backoff.index < retry.index):
+    if not (attempt.step_index < backoff.step_index < retry.step_index):
         problems.append("attempt, backoff, and retry are out of order")
     if not _continue_on_error(attempt.step):
         problems.append("attempt carries no `continue-on-error: true`, so the retry is dead")
