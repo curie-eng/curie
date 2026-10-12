@@ -56,8 +56,8 @@ CONTRACT = "0041"
 # the Agent ORM and resolver read the tenant-scope columns of 0101 (#2911), and
 # factory status replies read the typed reply target columns of 0102, and
 # WorkItems are keyed by their tracker issue (0103 contract, #3831), and
-# channel and WorkItem reads carry the trigger label of 0104 (#4361).
-APP_SCHEMA_MIN = "0104"
+# channel and WorkItem reads carry the trigger label of 0105 (#4361).
+APP_SCHEMA_MIN = "0105"
 REVIEW_SCHEMA_MIN = "0063"
 PREV = "0040"
 
@@ -140,7 +140,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0101",
             "0102",
             "0103",
-            "0104",
+            "0105",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -153,9 +153,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0101",
             "0102",
             "0103",
-            "0104",
+            "0105",
         }
-    assert current_revision() == "0104"
+    assert current_revision() == "0105"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -237,11 +237,11 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
         assert can_serve(released, window, known) is False
     # #2911: the Agent ORM and the resolver read 0101's tenant-scope columns, and
     # factory status replies read 0102's typed reply target and 0103 keys
-    # WorkItems by their tracker issue (#3831), and 0104 adds the trigger
+    # WorkItems by their tracker issue (#3831), and 0105 adds the trigger
     # label (#4361), so the schemas below it are refused too.
-    for below_tenant_scope in sorted(known - {"0104"}):
+    for below_tenant_scope in sorted(known - {"0105"}):
         assert can_serve(below_tenant_scope, window, known) is False
-    assert can_serve("0104", window, known) is True
+    assert can_serve("0105", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:

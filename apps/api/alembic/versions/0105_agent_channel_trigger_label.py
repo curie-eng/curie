@@ -20,7 +20,7 @@ Downgrade refuses, naming each location, while any ``(kind, address,
 adapter)`` holds two rows, since the narrower key cannot hold them. Otherwise
 it restores the old key and drops the CHECK and both columns.
 
-Revision ID: 0104
+Revision ID: 0105
 Revises: 0103
 Create Date: 2026-10-11
 """
@@ -30,7 +30,7 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0104"
+revision: str = "0105"
 down_revision: str | None = "0103"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
@@ -82,8 +82,8 @@ def downgrade() -> None:
     if shared:
         rows = "; ".join(f"{kind}:{address} held by {held}" for kind, address, held in shared)
         raise RuntimeError(
-            "cannot downgrade below 0104: several bindings share one route under different "
-            f"trigger labels, which the pre-0104 key holds to one row ({rows}). Remove all "
+            "cannot downgrade below 0105: several bindings share one route under different "
+            f"trigger labels, which the pre-0105 key holds to one row ({rows}). Remove all "
             "but one binding on each first. Nothing was changed."
         )
     op.drop_constraint(ROUTE_KEY, TABLE, type_="unique", schema=SCHEMA)

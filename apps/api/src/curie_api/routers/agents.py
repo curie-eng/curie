@@ -158,7 +158,7 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
         "address)"
     ),
     # Migration 0070's key: the route is the triple (ADR-0168 decision 3),
-    # widened by the trigger label in 0104 (#4361).
+    # widened by the trigger label in 0105 (#4361).
     "agent_channels_route_key": (
         "another agent is already bound to that channel kind and address under that "
         "identity and trigger label; one agent per route (bind another identity or "
