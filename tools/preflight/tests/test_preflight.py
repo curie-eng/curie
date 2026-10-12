@@ -22,7 +22,7 @@ ALWAYS = {
     ("gitleaks", "Run gitleaks"),
 }
 PYTHON = {
-    ("python", step)
+    ("python-static", step)
     for step in (
         "Lockfile is up to date",
         "Alembic revision gate",
@@ -170,7 +170,7 @@ def test_drift_guard_rejects_mutated_workflow(tmp_path: Path, mutation: str) -> 
     if mutation == "compile_ci_command":
         job, name = "rust-lint", "Generated ACI protocol crate compiles"
     else:
-        job, name = "python", "Ruff"
+        job, name = "python-static", "Ruff"
     steps = workflow["jobs"][job]["steps"]
     step = next(step for step in steps if step.get("name") == name)
     if mutation == "missing":

@@ -615,7 +615,7 @@ def _assert_checkout_fetches_tags(steps: list[dict]) -> None:
 
 def test_python_ci_job_runs_schema_window_after_alembic_gate() -> None:
     workflow = yaml.safe_load((REPO_ROOT / ".github/workflows/ci.yaml").read_text())
-    steps = workflow["jobs"]["python"]["steps"]
+    steps = workflow["jobs"]["python-static"]["steps"]
     _assert_checkout_fetches_tags(steps)
 
     matching_steps = [step for step in steps if step.get("run") == CHECK_COMMAND]
@@ -630,7 +630,7 @@ def test_python_ci_job_runs_schema_window_after_alembic_gate() -> None:
     )
     assert alembic_index < gate_index
     # The dev stack boots only in the pytest shards, so the gate stays cheap and
-    # cluster-free in the required Python job.
+    # cluster-free in the static Python job.
     assert not any(step.get("name") == "Start dev stack" for step in steps)
 
 
