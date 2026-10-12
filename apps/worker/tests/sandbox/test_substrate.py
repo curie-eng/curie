@@ -1176,6 +1176,150 @@ def test_delete_detached_requires_claim_and_sandbox_disappearance(
 
 
 @dataclass
+class _TransientPressureGoneReadClient(FakeSandboxClient):
+    unreadable: str = "claim"
+    transient_reads_remaining: int | None = 2
+    target_claim: str | None = None
+    target_sandbox: str | None = None
+    read_calls: list[tuple[str, float]] = field(default_factory=list)
+    observed_gone: set[str] = field(default_factory=set)
+    headroom_observations: list[set[str]] = field(default_factory=list)
+
+    def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None:
+        claim = self.claims.get(name)
+        assert claim is not None
+        self.target_claim = name
+        self.target_sandbox = claim.sandbox_name
+        super().delete_claim(name, request_timeout_seconds=request_timeout_seconds)
+
+    def _read_after_delete(self, kind: str, request_timeout_seconds: float) -> None:
+        assert 0 < request_timeout_seconds <= 1.0
+        self.read_calls.append((kind, request_timeout_seconds))
+        if kind == self.unreadable and (
+            self.transient_reads_remaining is None or self.transient_reads_remaining > 0
+        ):
+            if self.transient_reads_remaining is not None:
+                self.transient_reads_remaining -= 1
+            raise _transient()
+        self.observed_gone.add(kind)
+
+    def get_claim(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> ClaimView | None:
+        if name != self.target_claim:
+            return super().get_claim(name, request_timeout_seconds=request_timeout_seconds)
+        self._read_after_delete("claim", request_timeout_seconds)
+        return None
+
+    def get_sandbox(
+        self, name: str, *, request_timeout_seconds: float
+    ) -> SandboxView | None:
+        if name != self.target_sandbox:
+            return super().get_sandbox(name, request_timeout_seconds=request_timeout_seconds)
+        self._read_after_delete("sandbox", request_timeout_seconds)
+        return None
+
+    def quota_has_headroom(
+        self,
+        rejection: QuotaRejection,
+        *,
+        request_timeout_seconds: float,
+    ) -> bool:
+        self.headroom_observations.append(set(self.observed_gone))
+        return super().quota_has_headroom(
+            rejection, request_timeout_seconds=request_timeout_seconds
+        )
+
+
+@pytest.mark.parametrize("unreadable", ["claim", "sandbox"])
+def test_delete_detached_recovers_transient_disappearance_reads_before_exact_quota_proof(
+    affinity: AffinityStore, config: SubstrateConfig, unreadable: str
+) -> None:
+    fake_k8s = _TransientPressureGoneReadClient(unreadable=unreadable)
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-pressure-transient")
+    unrelated = substrate.claim("T-pressure-unrelated")
+    record = affinity.get(handle.thread_key)
+    assert record is not None
+    assert affinity.delete_if_claim(handle.thread_key, handle.claim_name)
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"pods": "1", "limits.cpu": "1"},
+        used={"pods": "2", "limits.cpu": "2"},
+        hard={"pods": "2", "limits.cpu": "2"},
+    )
+    fake_k8s.quota_headroom_results = [False, True]
+    created_before = list(fake_k8s.created)
+
+    assert substrate.delete_detached(
+        record, rejection, deadline=time.monotonic() + 1.0
+    )
+
+    assert sum(kind == unreadable for kind, _timeout in fake_k8s.read_calls) >= 3
+    assert fake_k8s.headroom_observations == [
+        {"claim", "sandbox"},
+        {"claim", "sandbox"},
+    ]
+    assert [observed for observed, _timeout in fake_k8s.quota_headroom_calls] == [
+        rejection,
+        rejection,
+    ]
+    assert fake_k8s.deleted == [handle.claim_name]
+    assert fake_k8s.created == created_before
+    assert handle.claim_name not in fake_k8s.claims
+    assert handle.sandbox_name not in fake_k8s.sandboxes
+    assert unrelated.claim_name in fake_k8s.claims
+    assert unrelated.sandbox_name in fake_k8s.sandboxes
+    assert affinity.get(unrelated.thread_key) == RouteRecord(handle=unrelated)
+
+
+@pytest.mark.parametrize("unreadable", ["claim", "sandbox"])
+def test_delete_detached_sustained_transient_reads_never_prove_absence_or_extend_deadline(
+    affinity: AffinityStore, config: SubstrateConfig, unreadable: str
+) -> None:
+    fake_k8s = _TransientPressureGoneReadClient(
+        unreadable=unreadable, transient_reads_remaining=None
+    )
+    fast = replace(
+        config,
+        poll_interval_seconds=0.001,
+        poll_interval_max_seconds=0.001,
+    )
+    substrate = SandboxSubstrate(fake_k8s, affinity, fast)
+    handle = substrate.claim("T-pressure-unavailable")
+    record = affinity.get(handle.thread_key)
+    assert record is not None
+    assert affinity.delete_if_claim(handle.thread_key, handle.claim_name)
+    rejection = QuotaRejection(
+        quota_name="curie-sandbox-quota",
+        requested={"pods": "1"},
+        used={"pods": "2"},
+        hard={"pods": "2"},
+    )
+    fake_k8s.quota_headroom_results = [True]
+    created_before = list(fake_k8s.created)
+    started = time.monotonic()
+
+    assert not substrate.delete_detached(record, rejection, deadline=started + 0.05)
+
+    elapsed = time.monotonic() - started
+    assert 0.04 <= elapsed < 0.2
+    assert sum(kind == unreadable for kind, _timeout in fake_k8s.read_calls) >= 2
+    assert all(0 < timeout <= 0.05 for _kind, timeout in fake_k8s.read_calls)
+    assert unreadable not in fake_k8s.observed_gone
+    assert fake_k8s.headroom_observations == []
+    assert fake_k8s.quota_headroom_calls == []
+    assert fake_k8s.deleted == [handle.claim_name]
+    assert fake_k8s.created == created_before
+    assert affinity.get(handle.thread_key) is None
+
+
+@dataclass
 class _DeadlineReadClient(FakeSandboxClient):
     claim_reads: int = 0
     sandbox_reads: int = 0
