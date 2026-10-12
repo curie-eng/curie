@@ -1103,13 +1103,13 @@ def test_session_capture_keeps_only_the_parent_agent_call_and_result(monkeypatch
     anyio.run(run)
     (record,) = store.records
     assert record.messages == (
-        ConversationMessage(role="user", content="acme request"),
+        ConversationMessage(role="user", content=_sent("acme request")),
         _agent_call_row(GROUP),
         _agent_result_row(),
         _grouped(_text("assistant", "acme final answer"), OTHER),
     )
     assert [m for m in record.messages if m.role == "user" and not is_tool_result_message(m)] == [
-        ConversationMessage(role="user", content="acme request")
+        ConversationMessage(role="user", content=_sent("acme request"))
     ]
     assert len(_split_turns(record.messages)) == 1
 

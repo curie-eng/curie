@@ -12,6 +12,7 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import signal
 import socket
@@ -832,9 +833,29 @@ class ScriptedRun:
             f"WHERE r.execution_request_id='{request_id}'::uuid "
             "AND r.phase='verification_preflight'), 'publications', "
             "(SELECT json_agg(json_build_object('changed_paths', changed_paths, "
-            "'execution_request_id', execution_request_id)) FROM curie.publications "
+            "'execution_request_id', execution_request_id, 'status', status, "
+            "'error', error, 'result_delivery_error', result_delivery_error, "
+            "'resource_cleanup_error', resource_cleanup_error)) FROM curie.publications "
             f"WHERE execution_request_id='{request_id}'::uuid))"
         )
+        # Keep only durable outcome metadata, never patch bytes, credentials,
+        # repository transport URLs or raw runner logs. Capture before verdicts
+        # so a failed publication survives the owned cluster teardown.
+        self.evidence["publication_outcomes"] = [
+            {
+                key: re.sub(r"https?://[^\s\"<>]+", "https://example.com", value)
+                if isinstance(value, str)
+                else value
+                for key, value in {
+                    "status": row["status"],
+                    **{
+                        key: fe.record_agent_text(row.get(key), self.secrets)[0]
+                        for key in ("error", "result_delivery_error", "resource_cleanup_error")
+                    },
+                }.items()
+            }
+            for row in observed["publications"] or []
+        ]
         preflights = observed["preflights"] or []
         publications = observed["publications"] or []
         if len(preflights) != 1 or len(publications) != 1:

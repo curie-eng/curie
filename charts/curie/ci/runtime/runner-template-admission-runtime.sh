@@ -184,7 +184,7 @@ fixture() { printf '%s/fixtures/%s.json\n' "$OUT" "$1"; }
 command -v helm >/dev/null || fail "helm is required"
 python3 -c 'import yaml' 2>/dev/null || fail "python3 with PyYAML is required"
 k api-resources --api-group=admissionregistration.k8s.io -o name 2>/dev/null \
-  | grep -qx 'validatingadmissionpolicies.admissionregistration.k8s.io' \
+  | grep -x 'validatingadmissionpolicies.admissionregistration.k8s.io' >/dev/null \
   || fail "context $CTX serves no admissionregistration.k8s.io/v1 ValidatingAdmissionPolicy (Kubernetes 1.30 or newer is required)"
 KUBE_VERSION="$(k version -o json | python3 -c 'import json,sys; print(json.load(sys.stdin)["serverVersion"]["gitVersion"].lstrip("v").split("+")[0])')"
 [[ -n "$KUBE_VERSION" ]] || fail "could not read the server version of $CTX"

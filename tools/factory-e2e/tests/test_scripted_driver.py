@@ -1198,3 +1198,39 @@ def test_present_local_images_pass_the_check_and_reach_resource_creation(
         calls.index(("docker", "image", "inspect", image)) < first_mutation for image in sk.IMAGES
     )
     assert "stop at first resource command" in _evidence(tmp_path)["error"]
+
+
+def test_failed_publication_evidence_survives_verdict_without_transport_or_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    request_id = "00000000-0000-0000-0000-000000000001"
+    run.evidence["execution_request_id"] = request_id
+    run.evidence["final_comment"] = {"body": f"<!-- curie-execution-request:{request_id} -->"}
+    run.secrets = ["example-sensitive-token"]
+    queries: list[str] = []
+
+    def durable_observation(query: str) -> dict[str, Any]:
+        queries.append(query)
+        return {
+            "preflights": [{"outcome": "passed"}],
+            "publications": [{
+                "changed_paths": ["src/unitconv/core.py", "tests/test_core.py"],
+                "status": "failed",
+                "error": "credential refused example-sensitive-token https://stub.example.test/token",
+                "result_delivery_error": None,
+                "resource_cleanup_error": None,
+            }],
+        }
+
+    monkeypatch.setattr(run, "sql", durable_observation)
+    monkeypatch.setattr(sk, "assert_observed", lambda *_: None)
+    run.stub = type("EmptyPulls", (), {"_rows": lambda self, _: []})()
+    with pytest.raises(sk.ScriptedScenarioError, match="exactly one stub pull request"):
+        run.observe()
+    outcome = run.evidence["publication_outcomes"][0]
+    assert outcome["status"] == "failed"
+    assert outcome["error"] == "credential refused [REDACTED] https://example.com"
+    assert "patch_bytes" not in queries[0]
+    assert "'error', error" in queries[0]
+    assert "example-sensitive-token" not in json.dumps(run.evidence)
