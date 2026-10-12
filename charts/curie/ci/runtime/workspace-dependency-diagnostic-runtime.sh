@@ -1,37 +1,86 @@
 #!/usr/bin/env bash
 # #4367: a real repository-selection HTTP 500 reaches the failed turn reply.
-# Each invocation builds this checkout, owns a fresh kind cluster, and tears it
-# down. This also works when verify-fix-pin reverses only the product changes.
-# Prerequisites: Docker, kind, kubectl, Helm, Cargo, Python 3, setsid, and network
-# access to the pinned build dependencies and chart backing-service images.
+# fix-pin-provision: candidate-stack
+# The caller supplies the candidate CLI, context, run ID, and loaded images.
+# This scenario owns only its release and the resources installed by it.
+# Prerequisites: kubectl, Helm, Python 3 with PyYAML, setsid, and network access
+# to the chart backing-service images.
 set -euo pipefail
 umask 077
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 fail() { echo "FAIL: $*" >&2; exit 1; }
-for command in docker kind kubectl helm cargo python3 setsid; do
+for variable in CURIE_BIN CURIE_SCENARIO_CONTEXT CURIE_SCENARIO_RUN_ID \
+    CURIE_SCENARIO_API_IMAGE CURIE_SCENARIO_WORKER_IMAGE CURIE_SCENARIO_RUNNER_IMAGE; do
+    [[ -n "${!variable:-}" ]] || fail "$variable is required"
+done
+[[ -f "$CURIE_BIN" && -x "$CURIE_BIN" ]] || fail "CURIE_BIN must name an executable curie binary"
+command -v python3 >/dev/null || fail "required executable is unavailable: python3"
+# Validate all inputs, including context existence, before invoking any
+# infrastructure tool. Read the same kubeconfig files the caller's tools use.
+python3 - <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+
+def fail(variable, reason):
+    print(f"FAIL: {variable} {reason}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+context = os.environ["CURIE_SCENARIO_CONTEXT"]
+if re.search(r"[\s\x00-\x1f\x7f]", context) or context.startswith("-"):
+    fail("CURIE_SCENARIO_CONTEXT", "must name one kubeconfig context")
+if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,24}", os.environ["CURIE_SCENARIO_RUN_ID"]):
+    fail("CURIE_SCENARIO_RUN_ID", "must match ^[a-z0-9][a-z0-9-]{0,24}$")
+component = r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+host_component = r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?"
+host = rf"(?:{host_component}(?:\.{host_component})*|\[[A-Fa-f0-9:]+\])(?::[0-9]+)?"
+repository = rf"(?:{host}/)?{component}(?:/{component})*"
+for variable in ("CURIE_SCENARIO_API_IMAGE", "CURIE_SCENARIO_WORKER_IMAGE", "CURIE_SCENARIO_RUNNER_IMAGE"):
+    image = os.environ[variable]
+    name, separator, tag = image.rpartition(":")
+    if not separator or not re.fullmatch(repository, name) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
+        fail(variable, "must be a repository:tag image reference")
+try:
+    import yaml
+except ImportError:
+    fail("CURIE_SCENARIO_CONTEXT", "validation requires Python 3 with PyYAML")
+kubeconfig = os.environ.get("KUBECONFIG") or str(pathlib.Path.home() / ".kube/config")
+contexts = {}
+for filename in dict.fromkeys(path for path in kubeconfig.split(os.pathsep) if path):
+    path = pathlib.Path(filename)
+    if not path.exists():
+        continue
+    try:
+        config = yaml.safe_load(path.read_text()) or {}
+        entries = config.get("contexts", [])
+        if not isinstance(entries, list):
+            fail("CURIE_SCENARIO_CONTEXT", "cannot read the caller's kubeconfig contexts")
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
+                fail("CURIE_SCENARIO_CONTEXT", "cannot read the caller's kubeconfig contexts")
+            contexts.setdefault(entry["name"], entry.get("context"))
+    except (OSError, ValueError, AttributeError, yaml.YAMLError):
+        fail("CURIE_SCENARIO_CONTEXT", "cannot read the caller's kubeconfig")
+if not isinstance(contexts.get(context), dict):
+    fail("CURIE_SCENARIO_CONTEXT", "is absent from the caller's kubeconfig")
+PY
+for command in kubectl helm setsid; do
     command -v "$command" >/dev/null || fail "required executable is unavailable: $command"
 done
-docker info >/dev/null 2>&1 || fail "Docker is unavailable"
-
-RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
-CLUSTER="acme-workspace-diagnostic-$RUN_ID"
-CONTEXT="kind-$CLUSTER"
-NAMESPACE="test-4367-workspace-diagnostic"
-RELEASE="acme-workspace"
+CURIE_BIN="$(python3 -c 'import os; print(os.path.abspath(os.environ["CURIE_BIN"]))')"
+CONTEXT="$CURIE_SCENARIO_CONTEXT"
+NAMESPACE="test-4367-wsdiag-$CURIE_SCENARIO_RUN_ID"
+RELEASE="wsdiag-$CURIE_SCENARIO_RUN_ID"
 FULLNAME="$RELEASE-curie"
 AGENT="acme-workspace-bot"
-TAG="workspace-diagnostic-$RUN_ID"
 GATE="workspace-cold-start"
-OWNED_KIND=0
 POSTGRES_REPLICAS=""
 POSTGRES_STOPPED=0
 MESSAGE_PID=""
-IMAGES=()
-# Keep build artifacts outside every Docker build context.
-WORKDIR="$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="curie-workspace-diagnostic-"))')"
-export KUBECONFIG="$WORKDIR/kubeconfig"
-export CURIE_CONFIG_DIR="$WORKDIR/curie-config"
 # Never forward the invoking shell's model, GitHub, Slack, or API credentials.
 # The fresh release uses only the published development defaults.
 unset CURIE_CREDENTIALS ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL
@@ -39,7 +88,31 @@ unset CURIE_GITHUB_TOKEN GITHUB_TOKEN GH_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN
 unset CURIE_API_URL CURIE_API_KEY CURIE_VALKEY_PASSWORD CURIE_NAMESPACE CURIE_STREAM
 unset CURIE_MODEL_BASE_URL CURIE_FAKE_MODEL CURIE_FAKE_SCRIPT CURIE_FAKE_SCRIPT_FILE
 
-kc() { kubectl --kubeconfig "$KUBECONFIG" --context "$CONTEXT" -n "$NAMESPACE" "$@"; }
+kc() { kubectl --context "$CONTEXT" -n "$NAMESPACE" "$@"; }
+CLUSTER_OBJECTS=(
+    namespace/agent-sandbox-system
+    clusterrole/agent-sandbox-controller
+    clusterrole/agent-sandbox-controller-extensions
+    clusterrole/agent-sandbox-controller-networkpolicies-read
+    clusterrolebinding/agent-sandbox-controller
+    clusterrolebinding/agent-sandbox-controller-extensions
+    clusterrolebinding/agent-sandbox-controller-networkpolicies-read
+    priorityclass/curie-platform
+    priorityclass/curie-sandbox
+)
+# An occupied scenario namespace would make its release and data unowned too.
+for object in "namespace/$NAMESPACE" "${CLUSTER_OBJECTS[@]}"; do
+    existing="$(kc get "$object" --ignore-not-found -o name)" || fail "could not inventory $object"
+    [[ -z "$existing" ]] || fail "refusing to install while $object exists"
+done
+ABSENT_CRDS=()
+for crd in sandboxes.agents.x-k8s.io sandboxclaims.extensions.agents.x-k8s.io \
+    sandboxtemplates.extensions.agents.x-k8s.io sandboxwarmpools.extensions.agents.x-k8s.io; do
+    existing="$(kc get "crd/$crd" --ignore-not-found -o name)" || fail "could not inventory CRD $crd"
+    [[ -n "$existing" ]] || ABSENT_CRDS+=("$crd")
+done
+WORKDIR="$(python3 -c 'import tempfile; print(tempfile.mkdtemp(prefix="curie-workspace-diagnostic-"))')"
+export CURIE_CONFIG_DIR="$WORKDIR/curie-config"
 stop_message() {
     [[ -n "$MESSAGE_PID" ]] || return 0
     # The CLI and its port-forwards are in this invocation's own process group.
@@ -57,40 +130,55 @@ restore_postgres() {
     POSTGRES_STOPPED=0
 }
 cleanup() {
-    local status=$? cleanup_status=0 remaining image
+    local status=$? cleanup_status=0 remaining object crd
     trap - EXIT INT TERM
     set +e
     stop_message
     if (( POSTGRES_STOPPED )); then
         restore_postgres || { echo "FAIL: could not restore recorded PostgreSQL replicas" >&2; cleanup_status=1; }
     fi
-    if (( OWNED_KIND )); then
-        kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || cleanup_status=1
-        remaining="$(kind get clusters 2>/dev/null)" || cleanup_status=1
-        if [[ $'\n'"$remaining"$'\n' == *$'\n'"$CLUSTER"$'\n'* ]]; then
-            echo "FAIL: owned kind cluster still exists" >&2
+    helm --kube-context "$CONTEXT" uninstall "$RELEASE" -n "$NAMESPACE" \
+        --ignore-not-found --wait --timeout 60s >"$WORKDIR/uninstall.log" 2>&1 \
+        || { echo "FAIL: could not uninstall the owned release" >&2; cleanup_status=1; }
+    # The namespace controller estimates remaining pod termination grace and
+    # can defer reconciliation after those pods are gone. Drain owned pods
+    # first, retaining their normal grace period, before namespace deletion.
+    kc delete pods --all --ignore-not-found --wait=true --timeout=60s >"$WORKDIR/delete-pods.log" 2>&1 \
+        || { echo "FAIL: could not drain pods in the owned namespace" >&2; cleanup_status=1; }
+    kc delete namespace "$NAMESPACE" --ignore-not-found --wait=false >"$WORKDIR/delete-namespace.log" 2>&1 \
+        || { echo "FAIL: could not delete the owned namespace" >&2; cleanup_status=1; }
+    kc wait --for=delete "namespace/$NAMESPACE" --timeout=60s >"$WORKDIR/wait-namespace.log" 2>&1 \
+        || { echo "FAIL: owned namespace deletion did not complete" >&2; cleanup_status=1; }
+    kc wait --for=delete namespace/agent-sandbox-system --timeout=60s >"$WORKDIR/wait-controller.log" 2>&1 \
+        || { echo "FAIL: controller namespace deletion did not complete" >&2; cleanup_status=1; }
+    for crd in "${ABSENT_CRDS[@]}"; do
+        kc delete "crd/$crd" --ignore-not-found --wait=false >"$WORKDIR/delete-crd.log" 2>&1 \
+            || { echo "FAIL: could not delete owned CRD $crd" >&2; cleanup_status=1; }
+        kc wait --for=delete "crd/$crd" --timeout=60s >"$WORKDIR/wait-crd.log" 2>&1 \
+            || { echo "FAIL: owned CRD $crd deletion did not complete" >&2; cleanup_status=1; }
+    done
+    for object in "namespace/$NAMESPACE" "${CLUSTER_OBJECTS[@]}" "${ABSENT_CRDS[@]/#/crd/}"; do
+        if ! remaining="$(kc get "$object" --ignore-not-found -o name 2>"$WORKDIR/verify-objects.log")"; then
+            echo "FAIL: could not verify teardown of $object" >&2
             cleanup_status=1
-        fi
-        remaining="$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER")" || cleanup_status=1
-        if [[ -n "$remaining" ]]; then
-            echo "FAIL: owned kind node containers remain" >&2
-            cleanup_status=1
-        fi
-    fi
-    for image in "${IMAGES[@]}"; do
-        if docker image inspect "$image" >/dev/null 2>&1; then
-            docker image rm "$image" >/dev/null 2>&1 || cleanup_status=1
-        fi
-        if docker image inspect "$image" >/dev/null 2>&1; then
-            echo "FAIL: an owned candidate image tag remains" >&2
+        elif [[ -n "$remaining" ]]; then
+            echo "FAIL: owned object $object remains" >&2
             cleanup_status=1
         fi
     done
+    if ! remaining="$(helm --kube-context "$CONTEXT" list -n "$NAMESPACE" --all --short \
+        --filter "^$RELEASE$" 2>"$WORKDIR/verify-release.log")"; then
+        echo "FAIL: could not verify release teardown" >&2
+        cleanup_status=1
+    elif [[ -n "$remaining" ]]; then
+        echo "FAIL: owned release remains" >&2
+        cleanup_status=1
+    fi
     rm -rf -- "$WORKDIR" || cleanup_status=1
     if (( cleanup_status )); then
         exit 1
     fi
-    echo "OK: owned kind cluster, node containers, and candidate tags are gone"
+    echo "OK: owned release, namespaces, controller resources, priority classes, and new CRDs are gone"
     if (( status == 0 )); then
         echo "PASS: repository-selection HTTP 500 reached workspace-error finalized=false; restored PostgreSQL finalized the next turn"
     fi
@@ -100,66 +188,23 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-clusters="$(kind get clusters)" || fail "could not inventory kind clusters"
-[[ $'\n'"$clusters"$'\n' != *$'\n'"$CLUSTER"$'\n'* ]] || fail "generated kind cluster name is already occupied"
-[[ -z "$(docker ps -aq --filter "label=io.x-k8s.kind.cluster=$CLUSTER")" ]] || fail "generated cluster name has existing containers"
-
-echo "Building the candidate CLI and uniquely tagged API, worker, and runner images"
-# Rebuild from the active checkout even when CURIE_BIN names a prebuilt binary:
-# the reversed Fix pin run must execute its own product, including the CLI.
-cargo build --locked --manifest-path "$REPO_ROOT/cli/Cargo.toml" \
-    --target-dir "$WORKDIR/cargo" >"$WORKDIR/cargo.log" 2>&1 || fail "candidate CLI build failed"
-BIN="$WORKDIR/cargo/debug/curie"
-for component in api worker runner; do
-    image="curie-$component:$TAG"
-    IMAGES+=("$image")
-    [[ "$component" == runner ]] && dockerfile="runner/Dockerfile" || dockerfile="apps/$component/Dockerfile"
-    docker build --file "$REPO_ROOT/$dockerfile" --tag "$image" "$REPO_ROOT" \
-        >"$WORKDIR/build-$component.log" 2>&1 || fail "candidate $component image build failed"
-done
-
-# Match CI's enforcing CNI and Kubernetes version on this owned cluster.
-cat >"$WORKDIR/kind.yaml" <<'YAML'
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-networking:
-  disableDefaultCNI: true
-  podSubnet: "192.168.0.0/16"
-nodes:
-  - role: control-plane
-YAML
-python3 - "$WORKDIR/calico.yaml" <<'PY'
-import hashlib, pathlib, sys, urllib.request
-url = "https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/calico.yaml"
-with urllib.request.urlopen(url, timeout=30) as response:
-    manifest = response.read()
-assert hashlib.sha256(manifest).hexdigest() == "be59408bf990e96276f631d2f9285c2a0f9802194c0ad1cecdb6d9c52623a1c8", "Calico manifest digest mismatch"
-pathlib.Path(sys.argv[1]).write_bytes(manifest)
-PY
-# Register ownership before creation so a partial kind startup is cleaned too.
-OWNED_KIND=1
-kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" \
-    --image kindest/node:v1.31.0 --config "$WORKDIR/kind.yaml" \
-    >"$WORKDIR/kind.log" 2>&1 || fail "owned kind cluster creation failed"
-[[ "$(kubectl --kubeconfig "$KUBECONFIG" --context "$CONTEXT" config current-context)" == "$CONTEXT" ]] \
-    || fail "private kubeconfig does not select the owned cluster"
-kubectl --kubeconfig "$KUBECONFIG" --context "$CONTEXT" apply -f "$WORKDIR/calico.yaml" \
-    >"$WORKDIR/calico.log" 2>&1 || fail "owned cluster Calico install failed"
-kubectl --kubeconfig "$KUBECONFIG" --context "$CONTEXT" -n kube-system \
-    rollout status daemonset/calico-node --timeout=300s >/dev/null
-kubectl --kubeconfig "$KUBECONFIG" --context "$CONTEXT" \
-    wait --for=condition=Ready node --all --timeout=300s >/dev/null
-kind load docker-image --name "$CLUSTER" "${IMAGES[@]}" >"$WORKDIR/load.log" 2>&1 \
-    || fail "candidate image import failed"
-
 # Keep the API endpoint serving through this test's bounded database outage.
 # /ready still probes the real database; /health remains process-local. These
 # test-only cadences preserve the required liveness-after-readiness ordering.
+# A values file preserves caller-supplied tags as strings, including numeric
+# tags that Helm's --set would otherwise coerce.
+python3 - "$WORKDIR/images.yaml" <<'PY'
+import os, pathlib, sys, yaml
+images = {component: os.environ[f"CURIE_SCENARIO_{component.upper()}_IMAGE"].rsplit(":", 1)
+          for component in ("api", "worker", "runner")}
+values = {component: {"image": {"repository": images[component][0], "tag": images[component][1]}}
+          for component in ("api", "worker")}
+values["agentSandbox"] = {"runner": {"image": images["runner"][0], "tag": images["runner"][1]}}
+pathlib.Path(sys.argv[1]).write_text(yaml.safe_dump(values))
+PY
 sets=(
     --set "fullnameOverride=$FULLNAME"
-    --set api.image.repository=curie-api --set "api.image.tag=$TAG" --set api.image.pullPolicy=Never
-    --set worker.image.repository=curie-worker --set "worker.image.tag=$TAG" --set worker.image.pullPolicy=Never
-    --set agentSandbox.runner.image=curie-runner --set "agentSandbox.runner.tag=$TAG"
+    --set api.image.pullPolicy=Never --set worker.image.pullPolicy=Never
     --set agentSandbox.runner.imagePullPolicy=Never --set agentSandbox.runner.prewarm.imagePullPolicy=Never
     --set agentSandbox.deploy=true --set agentSandbox.controller.deploy=true
     --set agentSandbox.platformPool.replicas=0 --set agentSandbox.runner.fakeModel=true
@@ -170,21 +215,24 @@ sets=(
     --set clickhouse.deploy=false --set otelCollector.deploy=false --set otelCollector.telemetryDisabled=true
     --set ui.deploy=false --set dispatcher.deploy=false --set mailAdapter.deploy=false
 )
-cd "$WORKDIR"
-"$BIN" cluster --context "$CONTEXT" up --namespace "$NAMESPACE" --release "$RELEASE" \
-    --chart "$REPO_ROOT/charts/curie" --dev --fake-model --no-expose "${sets[@]}" \
+# Keep the caller's working directory so relative KUBECONFIG paths retain
+# their meaning. CLI state and every scenario artifact use private paths.
+"$CURIE_BIN" cluster --context "$CONTEXT" up --namespace "$NAMESPACE" --release "$RELEASE" \
+    --chart "$REPO_ROOT/charts/curie" --values-file "$WORKDIR/images.yaml" \
+    --dev --fake-model --no-expose "${sets[@]}" \
     >"$WORKDIR/install.log" 2>&1 || fail "candidate cluster install failed"
 for component in api worker; do
+    image_variable="CURIE_SCENARIO_${component^^}_IMAGE"
     kc rollout status "deployment/$FULLNAME-$component" --timeout=300s >/dev/null
-    [[ "$(kc get "deployment/$FULLNAME-$component" -o jsonpath='{.spec.template.spec.containers[0].image}')" == "curie-$component:$TAG" ]] \
+    [[ "$(kc get "deployment/$FULLNAME-$component" -o jsonpath='{.spec.template.spec.containers[0].image}')" == "${!image_variable}" ]] \
         || fail "the $component Deployment is not using the candidate image"
 done
 [[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_CLAIM_TIMEOUT_SECONDS")].value}')" == 90 ]] \
     || fail "worker claim timeout must retain its normal 90-second value"
 [[ "$(kc get deployment "$FULLNAME-worker" -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="CURIE_WORKSPACE_ENABLED")].value}')" == true ]] \
     || fail "real workspace selection must be enabled"
-"$BIN" init "$AGENT" --dir "$WORKDIR/bundle" >"$WORKDIR/init.log" 2>&1
-"$BIN" --json cluster --context "$CONTEXT" deploy --namespace "$NAMESPACE" --release "$RELEASE" \
+"$CURIE_BIN" init "$AGENT" --dir "$WORKDIR/bundle" >"$WORKDIR/init.log" 2>&1
+"$CURIE_BIN" --json cluster --context "$CONTEXT" deploy --namespace "$NAMESPACE" --release "$RELEASE" \
     --chart "$REPO_ROOT/charts/curie" --plugin-dir "$WORKDIR/bundle" --agent "$AGENT" \
     --slack-channel C0EXAMPLE1 >"$WORKDIR/deploy.json" 2>"$WORKDIR/deploy.log" \
     || fail "candidate agent deployment failed"
@@ -200,7 +248,7 @@ kc rollout status "deployment/$FULLNAME-worker" --timeout=300s >/dev/null
 # database, stream transport, and reply delivery are otherwise unmodified.
 kc create configmap "$GATE" --from-literal=release=hold >/dev/null
 kc get sandboxtemplates -o json >"$WORKDIR/templates.json"
-python3 - "$WORKDIR/templates.json" "$WORKDIR" "curie-runner:$TAG" "$GATE" <<'PY'
+python3 - "$WORKDIR/templates.json" "$WORKDIR" "$CURIE_SCENARIO_RUNNER_IMAGE" "$GATE" <<'PY'
 import json, pathlib, sys
 templates = json.loads(pathlib.Path(sys.argv[1]).read_text())["items"]
 root, image, gate = pathlib.Path(sys.argv[2]), sys.argv[3], sys.argv[4]
@@ -234,7 +282,7 @@ done <"$WORKDIR/template-names"
 start_turn() {
     local phase=$1 thread
     thread="$(python3 -c 'import time; stamp=time.time_ns(); print(f"{stamp // 10**9}.{stamp % 10**9 // 10**3:06}")')"
-    setsid "$BIN" --json cluster --context "$CONTEXT" message \
+    setsid "$CURIE_BIN" --json cluster --context "$CONTEXT" message \
         --namespace "$NAMESPACE" --release "$RELEASE" --agent "$AGENT" --channel C0EXAMPLE1 \
         --chart "$REPO_ROOT/charts/curie" \
         --thread "$thread" --timeout-secs 300 "Reply with a short workspace diagnostic check." \
