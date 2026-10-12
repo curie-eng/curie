@@ -236,4 +236,6 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0212 | [A work item owner rides through a store outage and stops its turn when it cannot](0212-a-work-item-owner-rides-through-a-store-outage-and-stops-its-turn-when-it-cannot.md) | Draft |
 | 0214 | [One factory agent serves every GitHub repository bound to it](0214-one-factory-agent-serves-every-github-repository-bound-to-it.md) | Accepted |
 | 0215 | [Each tracker surface starts factory work under its own trigger label](0215-each-tracker-surface-starts-factory-work-under-its-own-trigger-label.md) | Accepted |
+| 0216 | [A factory repository binding selects its own runner image, built from a tool catalog](0216-a-factory-repository-binding-selects-its-own-runner-image-built-from-a-tool-catalog.md) | Accepted |
+| 0217 | [A factory run that opts into Docker gets its own daemon outside the sandbox](0217-a-factory-run-that-opts-into-docker-gets-its-own-daemon-outside-the-sandbox.md) | Accepted |
 <!-- END GENERATED: adr-index -->
