@@ -35,6 +35,7 @@ from curie_api.forges import types
 from curie_api.forges.capabilities import NATIVE_FORGES, mandatory_capabilities
 from curie_api.forges.errors import InvalidPairing
 from curie_api.forges.paths import valid_repository_path
+from curie_api.forges.runner_config import DockerConfig, RunnerConfig
 from curie_api.github_review_events import valid_github_login
 
 # The kinds a deployment may configure. The in-memory kinds are test adapters
@@ -338,6 +339,8 @@ class RepositoryBindingConfig(_Model):
     bases: tuple[str, ...] = ()
     default_base: str | None = None
     ci: CiPolicyConfig = Field(default_factory=CiPolicyConfig)
+    runner: RunnerConfig | None = None
+    docker: DockerConfig | None = None
 
     @field_validator("alias")
     @classmethod
@@ -357,6 +360,11 @@ class RepositoryBindingConfig(_Model):
             raise ValueError(f"repository {self.alias!r} bases must be unique branch names")
         if self.default_base is not None and self.default_base not in self.bases:
             raise ValueError(f"repository {self.alias!r} default_base must be one of its bases")
+        if self.docker is not None and self.docker.enabled:
+            if self.runner is None or "docker-cli" not in self.runner.tools:
+                raise ValueError(
+                    f"repository {self.alias!r} docker.enabled requires runner tool docker-cli"
+                )
         return self
 
 
@@ -494,6 +502,7 @@ class ForgesConfig(_Model):
             _check_binding(binding, tracker, code_hosts)
         _check_github_pairing(self.trackers, self.code_hosts)
         _check_one_github_app(self.trackers, self.code_hosts)
+        _check_repository_runner_configs(self.bindings, code_hosts)
         return self
 
     def tracker(self, name: str) -> TrackerConfig:
@@ -501,6 +510,48 @@ class ForgesConfig(_Model):
 
     def code_host(self, name: str) -> CodeHostConfig:
         return next(host for host in self.code_hosts if host.name == name)
+
+
+def _check_repository_runner_configs(
+    bindings: tuple[BindingConfig, ...], code_hosts: dict[str, CodeHostConfig]
+) -> None:
+    """One resolved repository identity has one effective runner declaration.
+
+    Activated declarations also need an unambiguous repository path for the
+    deferred worker pool map. Legacy bindings without those declarations keep
+    their existing cross-host path behavior.
+    """
+
+    declarations: dict[
+        tuple[str, str, str], tuple[str, RunnerConfig | None, DockerConfig]
+    ] = {}
+    paths: dict[str, tuple[set[tuple[str, str, str]], bool, str]] = {}
+    for binding in bindings:
+        for repo in binding.repos:
+            host = code_hosts[repo.code_host]
+            identity = (host.kind, host.host, repo.project_id)
+            label = f"binding {binding.name!r} repository {repo.alias!r}"
+            docker = repo.docker or DockerConfig(enabled=False)
+            previous = declarations.get(identity)
+            if previous is not None and (previous[1], previous[2]) != (repo.runner, docker):
+                raise ValueError(
+                    f"{previous[0]} and {label} have conflicting runner or docker declarations"
+                )
+            declarations[identity] = (label, repo.runner, docker)
+            path = repo.path.lower() if host.kind == types.GITHUB else repo.path
+            active = repo.runner is not None or docker.enabled or bool(docker.egress_allowlist)
+            prior_path = paths.get(path)
+            if prior_path is None:
+                paths[path] = ({identity}, active, label)
+                continue
+            identities, previously_active, prior_label = prior_path
+            if identities != {identity} and (active or previously_active):
+                raise ValueError(
+                    f"{prior_label} and {label} share path {path!r} across different repository"
+                    " identities; a runner or docker declaration requires an unambiguous path"
+                )
+            identities.add(identity)
+            paths[path] = (identities, active or previously_active, prior_label)
 
 
 def _check_github_pairing(

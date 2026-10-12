@@ -1,0 +1,123 @@
+{
+  "$defs": {
+    "EgressPort": {
+      "additionalProperties": false,
+      "description": "One TCP destination port, matching the chart's existing egress shape.",
+      "properties": {
+        "port": {
+          "maximum": 65535,
+          "minimum": 1,
+          "title": "Port",
+          "type": "integer"
+        },
+        "protocol": {
+          "const": "TCP",
+          "default": "TCP",
+          "title": "Protocol",
+          "type": "string"
+        }
+      },
+      "required": [
+        "port"
+      ],
+      "title": "EgressPort",
+      "type": "object"
+    },
+    "EgressRule": {
+      "additionalProperties": false,
+      "description": "A destination CIDR and its allowed TCP ports.",
+      "properties": {
+        "cidr": {
+          "pattern": "^[^\\s/]+/[0-9]{1,3}$",
+          "title": "Cidr",
+          "type": "string"
+        },
+        "ports": {
+          "items": {
+            "$ref": "#/$defs/EgressPort"
+          },
+          "minItems": 1,
+          "title": "Ports",
+          "type": "array"
+        }
+      },
+      "required": [
+        "cidr",
+        "ports"
+      ],
+      "title": "EgressRule",
+      "type": "object"
+    },
+    "RepoRunnerPool": {
+      "additionalProperties": false,
+      "description": "An opaque pool with index, amd64 and arm64 image identities in order.",
+      "properties": {
+        "base": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "title": "Base",
+          "type": "string"
+        },
+        "digests": {
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            }
+          ],
+          "title": "Digests",
+          "type": "array"
+        },
+        "docker": {
+          "title": "Docker",
+          "type": "boolean"
+        },
+        "egress": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/EgressRule"
+          },
+          "title": "Egress",
+          "type": "array"
+        },
+        "pool": {
+          "maxLength": 63,
+          "pattern": "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$",
+          "title": "Pool",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pool",
+        "digests",
+        "base",
+        "docker"
+      ],
+      "title": "RepoRunnerPool",
+      "type": "object"
+    }
+  },
+  "$id": "https://curietech.ai/schemas/repo-runner-pools.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The repository binding paths carried by worker repository names.",
+  "patternProperties": {
+    "^[A-Za-z0-9_][A-Za-z0-9._~-]*(?:/[A-Za-z0-9_][A-Za-z0-9._~-]*)+$": {
+      "$ref": "#/$defs/RepoRunnerPool"
+    }
+  },
+  "propertyNames": {
+    "pattern": "^[A-Za-z0-9_][A-Za-z0-9._~-]*(?:/[A-Za-z0-9_][A-Za-z0-9._~-]*)+$",
+    "type": "string"
+  },
+  "title": "RepoRunnerPools",
+  "type": "object"
+}
