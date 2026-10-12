@@ -17,7 +17,11 @@ entirely rather than crash-looping the reconnect supervisor, and
 NOTES.txt prints the `helm upgrade` command to connect Slack later.
 */}}
 {{- $threadedReserved := dict -}}
+{{- $threadedBotAllowlist := "" -}}
 {{- if $.Values.dispatcher.threadedBotAllowlist -}}
+{{- /* Validate typed entries before extraEnv rejects duplicate names, so a
+malformed allowlist still reports its invalid field first. */ -}}
+{{- $threadedBotAllowlist = include "curie.dispatcher.threadedBotAllowlist" $ -}}
 {{- $threadedReserved = dict "CURIE_SLACK_THREADED_BOT_ALLOWLIST" "dispatcher.threadedBotAllowlist" -}}
 {{- end -}}
 {{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "dispatcher" "env" .Values.dispatcher.extraEnv "additionalReserved" (merge $threadedReserved (include "curie.slack.reservedEnv" (dict "root" . "workload" "dispatcher") | fromJson))) -}}
@@ -110,7 +114,7 @@ spec:
             # names it. An empty value renders nothing and reserves nothing, so a
             # pre-existing extraEnv entry keeps working unchanged.
             - name: CURIE_SLACK_THREADED_BOT_ALLOWLIST
-              value: {{ include "curie.dispatcher.threadedBotAllowlist" . | quote }}
+              value: {{ $threadedBotAllowlist | quote }}
             {{- end }}
             {{- $checksumExtraEnv | nindent 12 }}
           # No HTTP port on the dispatcher (Slack Socket Mode is outbound-only),
