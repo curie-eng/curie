@@ -1164,7 +1164,7 @@ credentials and the derived collector header cannot disagree. */}}
 {{- if eq (include "curie.otlpAuthHeaderSecretName" .) (include "curie.secretName" .) -}}
 {{- $_ := set $content "otlpAuthHeader" ((.Values.otelCollector.otlpAuthHeader | default (printf "Basic %s" (printf "%s:%s" .Values.langfuse.init.projectPublicKey $langfuseInitProjectSecretKey | b64enc))) | toString) -}}
 {{- end -}}
-{{- $_ := set $content "agentCredentials" ((.Values.agentSandbox.runner.credentials) | toString) -}}
+{{- $_ := set $content "agentCredentials" (ternary "" (toString .Values.agentSandbox.runner.credentials) (kindIs "invalid" .Values.agentSandbox.runner.credentials)) -}}
 {{- $_ := set $content "adapterCredentials" ((include "curie.adapterCredentials" .) | toString) -}}
 {{- $_ := set $content "apiKey" ((include "curie.managedSecret" (dict "root" . "key" "apiKey" "value" .Values.api.apiKey "default" "curie-dev-key" "hex" false "existingData" $existingSecretData)) | toString) -}}
 {{- $_ := set $content "approvalChatAttesterSecret" ((include "curie.managedSecret" (dict "root" . "key" "approvalChatAttesterSecret" "value" .Values.api.approvalChatAttesterSecret "default" "curie-dev-approval-chat-attester" "hex" false "existingData" $existingSecretData)) | toString) -}}
@@ -1176,17 +1176,17 @@ credentials and the derived collector header cannot disagree. */}}
 {{- $_ := set $content "sealingPreviousPrivateKey" ((.Values.sealing.previousPrivateKey | default "") | toString) -}}
 {{- $_ := set $content "connectorCallerSigningKey" ((include "curie.connectorCallerSigningKey" .) | toString) -}}
 {{- $_ := set $content "connectorCallerVerifyKey" ((include "curie.connectorCallerVerifyKey" .) | toString) -}}
-{{- $_ := set $content "slackAppToken" ((.Values.dispatcher.slack.appToken) | toString) -}}
-{{- $_ := set $content "slackBotToken" ((.Values.dispatcher.slack.botToken) | toString) -}}
-{{- $_ := set $content "slackSigningSecret" ((.Values.dispatcher.slack.signingSecret) | toString) -}}
+{{- $_ := set $content "slackAppToken" (ternary "" (toString .Values.dispatcher.slack.appToken) (kindIs "invalid" .Values.dispatcher.slack.appToken)) -}}
+{{- $_ := set $content "slackBotToken" (ternary "" (toString .Values.dispatcher.slack.botToken) (kindIs "invalid" .Values.dispatcher.slack.botToken)) -}}
+{{- $_ := set $content "slackSigningSecret" (ternary "" (toString .Values.dispatcher.slack.signingSecret) (kindIs "invalid" .Values.dispatcher.slack.signingSecret)) -}}
 {{- if not .Values.mailAdapter.agentmail.apiKeyExistingSecret -}}
-{{- $_ := set $content "mailAgentmailApiKey" ((.Values.mailAdapter.agentmail.apiKey) | toString) -}}
+{{- $_ := set $content "mailAgentmailApiKey" (ternary "" (toString .Values.mailAdapter.agentmail.apiKey) (kindIs "invalid" .Values.mailAdapter.agentmail.apiKey)) -}}
 {{- end -}}
 {{- if not .Values.mailAdapter.channelTokenExistingSecret -}}
-{{- $_ := set $content "mailChannelToken" ((.Values.mailAdapter.channelToken) | toString) -}}
+{{- $_ := set $content "mailChannelToken" (ternary "" (toString .Values.mailAdapter.channelToken) (kindIs "invalid" .Values.mailAdapter.channelToken)) -}}
 {{- end -}}
 {{- if not .Values.mailAdapter.egressSecretExistingSecret -}}
-{{- $_ := set $content "mailEgressSecret" ((.Values.mailAdapter.egressSecret) | toString) -}}
+{{- $_ := set $content "mailEgressSecret" (ternary "" (toString .Values.mailAdapter.egressSecret) (kindIs "invalid" .Values.mailAdapter.egressSecret)) -}}
 {{- end -}}
 {{- $_ := set . "_curieSecretContent" $content -}}
 {{- end -}}
