@@ -19,8 +19,9 @@ the recording, and on any request carrying ``If-None-Match`` (decision 13.4).
 session, its own teardown included, and the cassette is exactly those
 requests. A live run that fails cleans up through `AllowanceTransport`
 instead: at most `CLEANUP_REQUESTS` more requests (find the pull request when
-the run never read it back, decline it, delete the branch), outside the cap and never recorded, since a failed run
-writes no cassette. So an exhausted budget cannot block the cleanup.
+the run never read it back, decline it, delete the branch), outside the cap
+and never recorded, since a failed run writes no cassette. So an exhausted
+budget cannot block the cleanup.
 """
 
 from __future__ import annotations
