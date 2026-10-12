@@ -514,6 +514,7 @@ fn helm_mutation_wall_timeout() -> Duration {
 struct ExpectedSandboxInventory {
     deploy: bool,
     agents: Vec<String>,
+    repository_pools: Vec<(String, String)>,
 }
 
 impl ExpectedSandboxInventory {
@@ -524,25 +525,231 @@ impl ExpectedSandboxInventory {
             Some(serde_json::Value::Bool(value)) => *value,
             Some(_) => anyhow::bail!("agentSandbox.deploy in Helm values is not a boolean"),
         };
-        // Mirrors the chart's curie.agentSandboxPoolAgents: every agent keyed
-        // under connectorSecrets or registryEgress gets a per-agent template.
+        // Mirrors every source in the chart's curie.agentSandboxPoolAgents.
         let mut agents = Vec::new();
-        for key in ["connectorSecrets", "registryEgress"] {
+        for key in [
+            "connectorSecrets",
+            "registryEgress",
+            "runnerImages",
+            "workspaceSizeLimits",
+        ] {
             match sandbox.and_then(|value| value.get(key)) {
                 None | Some(serde_json::Value::Null) => {}
                 Some(serde_json::Value::Object(values)) => agents.extend(values.keys().cloned()),
                 Some(_) => anyhow::bail!("agentSandbox.{key} in Helm values is not a map"),
             }
         }
+        match sandbox.and_then(|value| value.get("poolAgents")) {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::Array(values)) => {
+                for value in values {
+                    agents.push(
+                        value
+                            .as_str()
+                            .context("agentSandbox.poolAgents in Helm values must contain strings")?
+                            .to_owned(),
+                    );
+                }
+            }
+            Some(_) => anyhow::bail!("agentSandbox.poolAgents in Helm values is not a list"),
+        }
+        let factory = values.and_then(|value| value.get("factory"));
+        let factory_egress = match factory.and_then(|value| value.get("sandboxEgress")) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Object(values)) => Some(values),
+            Some(_) => anyhow::bail!("factory.sandboxEgress in Helm values is not a map"),
+        };
+        let factory_agents: Vec<String> = factory_egress
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .filter(|(_, enabled)| enabled.as_bool() == Some(true))
+            .map(|(agent, _)| agent.clone())
+            .collect();
+        agents.extend(factory_agents.iter().cloned());
         agents.sort();
         agents.dedup();
-        Ok(Self { deploy, agents })
+
+        let bindings = match factory.and_then(|value| value.get("bindings")) {
+            None | Some(serde_json::Value::Null) => &[][..],
+            Some(value) => value
+                .as_array()
+                .context("factory.bindings in Helm values is not a list")?
+                .as_slice(),
+        };
+        let mut repositories: Vec<&serde_json::Value> = Vec::new();
+        for binding in bindings {
+            match binding.get("repos") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(value) => repositories.extend(
+                    value
+                        .as_array()
+                        .context("factory.bindings[].repos in Helm values is not a list")?,
+                ),
+            }
+        }
+        let has_runners = repositories
+            .iter()
+            .any(|repo| repo.get("runner").is_some_and(|runner| !runner.is_null()));
+        let mut repository_pools = BTreeSet::new();
+        if has_runners {
+            if factory_agents.len() != 1
+                || factory_egress
+                    .is_some_and(|entries| entries.values().any(|value| !value.is_boolean()))
+            {
+                anyhow::bail!(
+                    "repository runners require exactly one true factory agent in factory.sandboxEgress"
+                );
+            }
+            if !deploy {
+                anyhow::bail!("repository runners require agentSandbox.deploy=true");
+            }
+            let agent = &factory_agents[0];
+            let valid_digest = |digest: &str| {
+                digest.len() == 71
+                    && digest.starts_with("sha256:")
+                    && digest[7..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            };
+            let mut declarations = BTreeMap::new();
+            let mut identities = BTreeMap::new();
+            let mut prefixes = BTreeMap::new();
+            for repo in repositories {
+                let path = repo
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .context("factory.bindings[].repos[].path is not a string")?;
+                if declarations
+                    .insert(path, repo)
+                    .is_some_and(|previous| previous != repo)
+                {
+                    anyhow::bail!(
+                        "conflicting duplicate repository path {path}; repository declarations must be identical"
+                    );
+                }
+                let Some(runner) = repo.get("runner").filter(|runner| !runner.is_null()) else {
+                    continue;
+                };
+                let image = runner
+                    .get("image")
+                    .and_then(serde_json::Value::as_str)
+                    .context("factory.bindings[].repos[].runner.image is not a string")?;
+                let (reference, index) = image
+                    .rsplit_once('@')
+                    .context("factory.bindings[].repos[].runner.image is not a digest image")?;
+                if !valid_digest(index)
+                    || !reference
+                        .bytes()
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_alphanumeric())
+                    || !reference
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"._/:-".contains(&byte))
+                {
+                    anyhow::bail!(
+                        "factory.bindings[].repos[].runner.image must be a CEL-safe digest image reference"
+                    );
+                }
+                let base = runner
+                    .get("base")
+                    .and_then(serde_json::Value::as_str)
+                    .context("factory.bindings[].repos[].runner.base is not a digest")?;
+                let platforms = runner
+                    .get("platformDigests")
+                    .context("factory.bindings[].repos[].runner.platformDigests is missing")?;
+                let amd64 = platforms
+                    .get("linux/amd64")
+                    .and_then(serde_json::Value::as_str)
+                    .context("runner.platformDigests linux/amd64 is not a digest")?;
+                let arm64 = platforms
+                    .get("linux/arm64")
+                    .and_then(serde_json::Value::as_str)
+                    .context("runner.platformDigests linux/arm64 is not a digest")?;
+                if ![base, amd64, arm64].into_iter().all(valid_digest) {
+                    anyhow::bail!(
+                        "repository runner base and platformDigests must be sha256 digests"
+                    );
+                }
+                let identity = (image, base, platforms);
+                if identities
+                    .insert(index, identity)
+                    .is_some_and(|previous| previous != identity)
+                {
+                    anyhow::bail!(
+                        "conflicting repository runner image identity for index digest {index}"
+                    );
+                }
+                let prefix = &index[7..19];
+                if prefixes
+                    .insert(prefix, index)
+                    .is_some_and(|previous| previous != index)
+                {
+                    anyhow::bail!("repository runner digest prefix collision for {prefix}");
+                }
+                if agents
+                    .binary_search(&format!("{agent}-img-{prefix}"))
+                    .is_ok()
+                {
+                    anyhow::bail!(
+                        "repository runner name collision with ordinary agent {agent}-img-{prefix}"
+                    );
+                }
+                repository_pools.insert((agent.clone(), prefix.to_owned()));
+            }
+        }
+        Ok(Self {
+            deploy,
+            agents,
+            repository_pools: repository_pools.into_iter().collect(),
+        })
     }
 }
 
 #[cfg(test)]
 mod expected_sandbox_inventory_tests {
-    use super::ExpectedSandboxInventory;
+    use super::{DesiredSandboxSet, ExpectedSandboxInventory};
+
+    fn repository_values() -> serde_json::Value {
+        let runner = |digit: char| {
+            serde_json::json!({
+                "tools": ["uv"],
+                "image": format!("registry.example.com/acme/runner@sha256:{}", digit.to_string().repeat(64)),
+                "base": format!("sha256:{}", "d".repeat(64)),
+                "platformDigests": {
+                    "linux/amd64": format!("sha256:{}", "e".repeat(64)),
+                    "linux/arm64": format!("sha256:{}", "f".repeat(64))
+                }
+            })
+        };
+        serde_json::json!({
+            "agentSandbox": {
+                "connectorSecrets": {"factory": {"API_TOKEN": "acme-secret"}},
+                "runnerImages": {"factory": format!("registry.example.com/acme/agent@sha256:{}", "c".repeat(64))}
+            },
+            "factory": {
+                "sandboxEgress": {"factory": true, "disabled": false},
+                "bindings": [{"repos": [
+                    {"path": "acme-corp/api", "runner": runner('a')},
+                    {"path": "acme-corp/ui", "runner": runner('a')},
+                    {"path": "acme-corp/tools", "runner": runner('b')},
+                    {"path": "acme-corp/default"}
+                ]}]
+            }
+        })
+    }
+
+    fn sandbox_pairs(names: &[&str]) -> DesiredSandboxSet {
+        let manifest = names
+            .iter()
+            .map(|name| {
+                format!(
+                    "apiVersion: extensions.agents.x-k8s.io/v1beta1\nkind: SandboxTemplate\nmetadata:\n  name: {name}\n---\napiVersion: extensions.agents.x-k8s.io/v1beta1\nkind: SandboxWarmPool\nmetadata:\n  name: {name}-pool\nspec:\n  sandboxTemplateRef:\n    name: {name}\n"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("---\n");
+        DesiredSandboxSet::parse(&manifest).unwrap()
+    }
 
     #[test]
     fn agents_union_connector_secrets_and_registry_egress() {
@@ -553,6 +760,7 @@ mod expected_sandbox_inventory_tests {
         let inventory = ExpectedSandboxInventory::from_values(Some(&values)).unwrap();
         assert!(inventory.deploy);
         assert_eq!(inventory.agents, vec!["alpha", "beta", "gamma"]);
+        assert!(inventory.repository_pools.is_empty());
     }
 
     #[test]
@@ -567,6 +775,120 @@ mod expected_sandbox_inventory_tests {
         let values = serde_json::json!({"agentSandbox": {"registryEgress": ["solo"]}});
         let error = ExpectedSandboxInventory::from_values(Some(&values)).unwrap_err();
         assert!(error.to_string().contains("agentSandbox.registryEgress"));
+    }
+
+    #[test]
+    fn agents_include_every_chart_owned_default_pool() {
+        let values = serde_json::json!({
+            "agentSandbox": {
+                "runnerImages": {"layered": format!("registry.example.com/acme/runner@sha256:{}", "a".repeat(64))},
+                "workspaceSizeLimits": {"workspace": "24Gi"},
+                "poolAgents": ["explicit", "layered"]
+            },
+            "factory": {"sandboxEgress": {"factory": true, "disabled": false}}
+        });
+        let inventory = ExpectedSandboxInventory::from_values(Some(&values)).unwrap();
+        assert_eq!(
+            inventory.agents,
+            vec!["explicit", "factory", "layered", "workspace"]
+        );
+        assert!(inventory.repository_pools.is_empty());
+    }
+
+    #[test]
+    fn repository_pools_are_distinct_from_the_agents_default_image() {
+        let inventory = ExpectedSandboxInventory::from_values(Some(&repository_values())).unwrap();
+        assert_eq!(inventory.agents, vec!["factory"]);
+        assert_eq!(
+            inventory.repository_pools,
+            vec![
+                ("factory".into(), "aaaaaaaaaaaa".into()),
+                ("factory".into(), "bbbbbbbbbbbb".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn repository_runner_requires_exactly_one_factory_agent() {
+        for agents in [
+            serde_json::json!({"disabled": false}),
+            serde_json::json!({"factory": true, "other": true}),
+        ] {
+            let mut values = repository_values();
+            values["factory"]["sandboxEgress"] = agents;
+            let error = ExpectedSandboxInventory::from_values(Some(&values)).unwrap_err();
+            assert!(error.to_string().contains("factory.sandboxEgress"));
+        }
+    }
+
+    #[test]
+    fn multiple_factory_agents_without_repository_runners_remain_valid() {
+        let values = serde_json::json!({"factory": {
+            "sandboxEgress": {"factory": true, "other": true},
+            "bindings": [{"repos": [{"path": "acme-corp/api"}]}]
+        }});
+        let inventory = ExpectedSandboxInventory::from_values(Some(&values)).unwrap();
+        assert_eq!(inventory.agents, vec!["factory", "other"]);
+        assert!(inventory.repository_pools.is_empty());
+    }
+
+    #[test]
+    fn repository_digest_prefix_collision_is_rejected() {
+        let mut values = repository_values();
+        values["factory"]["bindings"][0]["repos"][2]["runner"]["image"] =
+            serde_json::json!(format!(
+                "registry.example.com/acme/runner@sha256:{}{}",
+                "a".repeat(12),
+                "b".repeat(52)
+            ));
+        let error = ExpectedSandboxInventory::from_values(Some(&values)).unwrap_err();
+        assert!(error.to_string().contains("collision"));
+    }
+
+    #[test]
+    fn repository_runner_cannot_collide_with_an_agents_default_pool_name() {
+        let mut values = repository_values();
+        values["agentSandbox"]["poolAgents"] = serde_json::json!(["factory-img-aaaaaaaaaaaa"]);
+        let error = ExpectedSandboxInventory::from_values(Some(&values)).unwrap_err();
+        assert!(error.to_string().contains("collision"));
+    }
+
+    #[test]
+    fn duplicate_repository_with_and_without_runner_is_rejected_in_both_orders() {
+        for reverse in [false, true] {
+            let mut values = repository_values();
+            let repos = values["factory"]["bindings"][0]["repos"]
+                .as_array_mut()
+                .unwrap();
+            repos[3]["path"] = serde_json::json!("acme-corp/api");
+            if reverse {
+                repos.reverse();
+            }
+            let error = ExpectedSandboxInventory::from_values(Some(&values)).unwrap_err();
+            assert!(error.to_string().contains("acme-corp/api"));
+        }
+    }
+
+    #[test]
+    fn deployed_inventory_requires_every_repository_template_and_pool_pair() {
+        let expected = ExpectedSandboxInventory::from_values(Some(&repository_values())).unwrap();
+        let complete = sandbox_pairs(&[
+            "rel-curie-runner",
+            "rel-curie-agent-factory-runner",
+            "rel-curie-agent-factory-img-aaaaaaaaaaaa-runner",
+            "rel-curie-agent-factory-img-bbbbbbbbbbbb-runner",
+        ]);
+        complete.validate_inventory(&expected).unwrap();
+
+        let missing = sandbox_pairs(&[
+            "rel-curie-runner",
+            "rel-curie-agent-factory-runner",
+            "rel-curie-agent-factory-img-aaaaaaaaaaaa-runner",
+        ]);
+        let error = missing.validate_inventory(&expected).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("rel-curie-agent-factory-img-bbbbbbbbbbbb-runner"));
     }
 }
 
@@ -734,6 +1056,22 @@ impl DesiredSandboxSet {
             {
                 anyhow::bail!(
                     "agent {agent} is missing expected SandboxTemplate/SandboxWarmPool pair {template} / {pool}"
+                );
+            }
+        }
+        for (agent, digest_prefix) in &expected.repository_pools {
+            let template = format!("{prefix}-agent-{agent}-img-{digest_prefix}-runner");
+            let pool = format!("{template}-pool");
+            if pool.len() > 63 {
+                anyhow::bail!("repository runner inventory pool name {pool} exceeds 63 characters");
+            }
+            if !templates.contains(template.as_str())
+                || pools
+                    .get(pool.as_str())
+                    .is_none_or(|object| object.template_ref.as_deref() != Some(template.as_str()))
+            {
+                anyhow::bail!(
+                    "repository runner inventory is missing expected SandboxTemplate/SandboxWarmPool pair {template} / {pool}"
                 );
             }
         }

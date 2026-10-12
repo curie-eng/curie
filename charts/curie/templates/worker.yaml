@@ -4,6 +4,7 @@
        agent-sandbox.yaml renders only for the chart's own base name, and only
        while agentSandbox.deploy renders pools at all (#2943). */}}
 {{- $perAgentPools := and .Values.agentSandbox.deploy (eq $warmPool (printf "%s-runner-pool" (include "curie.fullname" .))) }}
+{{- $repoRunners := include "curie.factory.repoRunnerDescriptors" . | fromJsonArray }}
 {{- $workspaceStageBudget := add .Values.worker.workspace.cloneTimeoutSeconds .Values.worker.workspace.archiveTimeoutSeconds .Values.worker.workspace.uploadTimeoutSeconds }}
 {{- $publicationPullSecrets := list }}
 {{- range .Values.agentSandbox.runner.imagePullSecrets }}
@@ -499,6 +500,10 @@ spec:
             # pool nothing rendered (#2943).
             - name: CURIE_AGENT_SANDBOX_POOLS
               value: {{ ternary (include "curie.agentSandboxPoolAgents" . | fromJsonArray | join ",") "" $perAgentPools | quote }}
+            {{- if $repoRunners }}
+            - name: CURIE_REPO_RUNNER_POOLS
+              value: {{ include "curie.factory.repoRunnerPoolsJson" $repoRunners | quote }}
+            {{- end }}
             # The subset whose pool template carries connector secretKeyRefs; a
             # claim whose bundle declares connector secrets needs one (#2943).
             - name: CURIE_AGENT_CONNECTOR_SECRET_POOLS
