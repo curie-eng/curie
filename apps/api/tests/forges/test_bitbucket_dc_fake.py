@@ -356,9 +356,15 @@ async def test_bitbucket_dc_every_request_is_bearer_timed_and_unconditional(
         assert request.headers["authorization"] == f"Bearer {FACTORY_TOKEN}"
         assert "if-none-match" not in request.headers
         assert request.timeout is not None and request.timeout["read"] == 15.0
-        # The context path is kept on every call (decision 5.2).
-        assert request.path.startswith(f"{CONTEXT}/rest/api/latest/"), request.path
-        assert "/build-status/" not in request.path
+        # The context path is kept on every call (decision 5.2). The build
+        # status API is only read for the keys on a commit, which 9.4.24's
+        # repository builds read cannot list (live fixture); never 1.0.
+        legacy = f"{CONTEXT}/rest/build-status/latest/commits/"
+        if request.path.startswith(legacy):
+            assert request.method == "GET", request.path
+        else:
+            assert request.path.startswith(f"{CONTEXT}/rest/api/latest/"), request.path
+        assert "/build-status/1.0/" not in request.path
         assert "/permissions" not in request.path
 
 
@@ -885,10 +891,20 @@ async def test_bitbucket_dc_fake_payloads_match_captures(fake: BitbucketDcFake) 
             (comment, capture("comment.json")),
             (comment["comments"][0], capture("comment.json")["comments"][0]),
             (markup["comments"][0], capture("comment-markup.json")),
-            (await get(f"{repo}/commits/{sha}/builds"), capture("builds.json")),
+            # The repository builds read names one key (live 9.4.24 answers
+            # 400 without it); the build status listing names every key.
+            (await get(f"{repo}/commits/{sha}/builds?key=unit-tests"), capture("builds.json")),
             (
-                (await get(f"{repo}/commits/{sha}/builds"))["values"][0],
-                capture("builds.json")["values"][0],
+                (await get(f"{repo}/commits/{sha}/builds?key=unit-tests"))["commit"],
+                capture("builds.json")["commit"],
+            ),
+            (
+                await get(f"{API_URL}/rest/build-status/latest/commits/{sha}"),
+                capture("build-status-commit.json"),
+            ),
+            (
+                (await get(f"{API_URL}/rest/build-status/latest/commits/{sha}"))["values"][0],
+                capture("build-status-commit.json")["values"][0],
             ),
         ]
         for ours, captured in pairs:
@@ -897,6 +913,10 @@ async def test_bitbucket_dc_fake_payloads_match_captures(fake: BitbucketDcFake) 
         for captured in capture("activities.json")["values"]:
             mine = by_action[(captured["action"], captured.get("commentAction"))]
             assert _keys(mine) == _keys(captured), captured["action"]
+
+        keyless = await client.get(f"{repo}/commits/{sha}/builds", headers=headers)
+        assert keyless.status_code == 400
+        assert keyless.json() == capture("error-400-build-key.json")
 
         refused = await client.get(f"{API_URL}/rest/api/latest/repos")
         assert refused.status_code == 401

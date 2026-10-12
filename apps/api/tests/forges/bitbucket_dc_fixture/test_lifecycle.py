@@ -12,12 +12,28 @@ from typing import Any
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("clean_db")
+
 
 @pytest.fixture
 def pair(live: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Any]:
+    from forge_fakes.bitbucket_lifecycle import BRANCH, bitbucket_pair
+
+    # The lifecycle's branch is the factory's own name for the work item, and a
+    # declined pull request still counts as one on it, so it runs once per
+    # fixture: refuse a reused one by name instead of failing midway.
+    existing = live.helpers._call(
+        live.state,
+        "admin",
+        "GET",
+        f"{live.helpers._repo_api(live.state)}/pull-requests",
+        None,
+        {"at": f"refs/heads/{BRANCH}", "direction": "OUTGOING", "state": "ALL"},
+    )["values"]
+    if existing:
+        pytest.fail(f"the lifecycle needs a fresh fixture: {BRANCH} already has a pull request")
     key_dir = tmp_path / "keys"
     key_dir.mkdir()
-    from forge_fakes.bitbucket_lifecycle import bitbucket_pair
 
     yield from bitbucket_pair(live, monkeypatch, key_dir)
 

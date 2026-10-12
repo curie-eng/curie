@@ -31,9 +31,11 @@ same call, anonymized:
 | `pull-request-merge.json` | `GET .../pull-requests/<id>/merge` |
 | `activities.json` | `GET .../pull-requests/<id>/activities` |
 | `comment.json`, `comment-markup.json` | `GET .../pull-requests/<id>/comments/<id>` without and with `?markup=true` |
-| `builds.json` | `GET .../repos/demo/commits/<sha>/builds` |
-| `error-*.json` | the error body of that status |
+| `builds.json` | `GET .../repos/demo/commits/<sha>/builds?key=<key>` (one status; without `key` it answers 400) |
+| `build-status-commit.json` | `GET /rest/build-status/latest/commits/<sha>` (every key on the commit, server-wide) |
+| `error-*.json` | the error body of that status (`error-400-build-key.json`: the repository builds read without `key`) |
 
-Shapes still to confirm on the fixture: whether a reply produces its own
-`REPLIED` activity, whether the builds `GET` lists every key without a `key`
-parameter, and the `X-RateLimit-*` header names on a 429.
+Confirmed on the 9.4.24 fixture: the repository builds `GET` needs `key` (400
+without it) and returns that one status, so the build files above are the
+fixture's answers, anonymized. Still to confirm: whether a reply produces its
+own `REPLIED` activity, and the `X-RateLimit-*` header names on a 429.

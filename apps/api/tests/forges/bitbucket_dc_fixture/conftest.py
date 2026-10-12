@@ -146,7 +146,14 @@ class BitbucketDcLiveBackend:
         )
 
     def adapter_client(self) -> httpx.AsyncClient:
-        return httpx.AsyncClient(verify=verify_for_bundle(self.state["ca_file"]), timeout=15.0)
+        # The lifecycle drives this one client across several asyncio.run()
+        # calls; a pooled connection outlives its loop on the real fixture
+        # ("Event loop is closed"), so every request opens its own.
+        return httpx.AsyncClient(
+            verify=verify_for_bundle(self.state["ca_file"]),
+            timeout=15.0,
+            limits=httpx.Limits(max_keepalive_connections=0),
+        )
 
     def repository(self) -> RepositoryRef:
         return RepositoryRef(

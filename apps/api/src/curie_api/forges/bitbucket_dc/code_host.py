@@ -9,9 +9,11 @@ A repository is addressed by its stored ``PROJECT/slug`` path; only
 `resolve_repository` and `credential` go by the numeric id, which Data Center
 cannot read directly, so they page through ``GET /repos`` (decision 6.2).
 Review feedback is pull request comments only, read from the activity stream
-(decision 10). ``ci_diagnostics``, ``rerun_failed`` and ``user_can_write`` are
-unsupported (decision 3); review authority falls back to the binding's
-allowlist (decision 11).
+(decision 10). Build keys on a commit come from the build status API's
+commit listing, the only listing 9.4 has, and each key is read back from the
+repository-scoped builds API (decision 9). ``ci_diagnostics``,
+``rerun_failed`` and ``user_can_write`` are unsupported (decision 3); review
+authority falls back to the binding's allowlist (decision 11).
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ import httpx
 
 from curie_api.forges import types
 from curie_api.forges.bitbucket_dc.comments import BitbucketDcMarkedComments
-from curie_api.forges.bitbucket_dc.transport import DcTransport, object_of
+from curie_api.forges.bitbucket_dc.transport import BUILD_STATUS_API, DcTransport, object_of
 from curie_api.forges.bitbucket_dc.version import MINIMUM, ServerTooOld, parse_version
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
 from curie_api.forges.credential_providers import StaticTokenProvider
@@ -107,6 +109,24 @@ def _user_id(user: Any) -> str | None:
     if isinstance(user, dict) and type(user.get("id")) is int:
         return str(user["id"])
     return None
+
+
+def _build_check(key: str, build: Mapping[str, Any], head_sha: str) -> NormalizedCheck:
+    reported = _text(build.get("state"))
+    state = _BUILD_STATES.get(reported)
+    if state is None:
+        logger.warning("Bitbucket Data Center build state %r read as pending", reported)
+        state = CheckState.PENDING
+    return NormalizedCheck(
+        key=status_key(key),
+        state=state,
+        head_sha=head_sha,
+        name=_text(build.get("name")) or key,
+        url=_text(build.get("url")) or None,
+        source=CheckSource.STATUS,
+        reported_state=reported,
+        started_at=_ms_time(build.get("dateAdded")),
+    )
 
 
 @dataclass(frozen=True)
@@ -455,37 +475,36 @@ class BitbucketDcCodeHost:
     # CI ----------------------------------------------------------------------
 
     async def observe_ci(self, repository: RepositoryRef, head_sha: str) -> CiRollup:
-        """The build statuses posted on exactly ``head_sha``, read from the
-        repository-scoped builds API Required Builds reads (decision 9)."""
+        """The build statuses posted on exactly ``head_sha`` in this repository
+        (decision 9).
+
+        Data Center 9.4's repository-scoped builds read answers 400 without a
+        ``key`` and one status with it, so the keys come from the build status
+        commit listing, which is server-wide. Each key's status is then read
+        from the repository-scoped API Required Builds reads; a key that read
+        does not answer was posted by another repository on the same commit
+        and is not reported.
+        """
 
         await self.ensure_version(Operation.OBSERVE_CI)
-        repo = self.repo_path(repository)
+        builds = f"{self.repo_path(repository)}/commits/{quote(head_sha, safe='')}/builds"
         listed = await self._http.pages(
-            f"{repo}/commits/{quote(head_sha, safe='')}/builds",
+            f"/commits/{quote(head_sha, safe='')}",
             what="builds",
             limit=self._page_size,
+            api=BUILD_STATUS_API,
         )
-        checks: dict[str, NormalizedCheck] = {}
-        for build in listed:
-            key = build.get("key")
-            if not isinstance(key, str) or not key:
+        keys = dict.fromkeys(
+            key for build in listed if isinstance(key := build.get("key"), str) and key
+        )
+        checks: list[NormalizedCheck] = []
+        for key in keys:
+            try:
+                build = await self._http.json("GET", builds, what="build", params={"key": key})
+            except NotFound:
                 continue
-            reported = _text(build.get("state"))
-            state = _BUILD_STATES.get(reported)
-            if state is None:
-                logger.warning("Bitbucket Data Center build state %r read as pending", reported)
-                state = CheckState.PENDING
-            checks[key] = NormalizedCheck(
-                key=status_key(key),
-                state=state,
-                head_sha=head_sha,
-                name=_text(build.get("name")) or key,
-                url=_text(build.get("url")) or None,
-                source=CheckSource.STATUS,
-                reported_state=reported,
-                started_at=_ms_time(build.get("dateAdded")),
-            )
-        return CiRollup.on_head(head_sha, tuple(checks.values()))
+            checks.append(_build_check(key, build, head_sha))
+        return CiRollup.on_head(head_sha, tuple(checks))
 
     async def ci_diagnostics(
         self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None
@@ -511,9 +530,11 @@ class BitbucketDcCodeHost:
 
     async def comment_tree(self, pull_request: PullRequestRef) -> CommentTree:
         """Every live comment on the pull request, read from every page of its
-        activities. A comment appears in each activity that touched it (added,
-        replied, edited), with its replies nested; a deleted one is gone from
-        all but its ``DELETED`` activity."""
+        activities. A thread's root appears, as it reads now, in the activity
+        that added it, with its replies nested at any depth (9.4.24 adds no
+        activity of its own for a reply or an edit); a comment that does have
+        one is kept once. A deleted comment is gone from all but its
+        ``DELETED`` activity."""
 
         activities = await self._http.pages(
             f"{self.pull_path(pull_request)}/activities",

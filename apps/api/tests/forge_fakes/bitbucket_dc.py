@@ -310,17 +310,25 @@ class BitbucketDcFake:
         return sha
 
     def post_status(
-        self, sha: str, key: str, state: str, *, name: str | None = None, url: str | None = None
+        self,
+        sha: str,
+        key: str,
+        state: str,
+        *,
+        name: str | None = None,
+        url: str | None = None,
+        description: str | None = None,
     ) -> None:
         """A build status on ``sha`` in Bitbucket's own words (SUCCESSFUL, FAILED,
-        INPROGRESS, CANCELLED, UNKNOWN). The latest status per key wins."""
+        INPROGRESS, CANCELLED, UNKNOWN). The latest status per key wins. Stored
+        in the build status listing's shape."""
 
         self.builds.setdefault(sha, {})[key] = {
-            "key": key,
             "state": state,
+            "key": key,
             "name": name or key,
             "url": url or f"https://ci.example.invalid/{key}/{sha[:8]}",
-            "description": f"{key} {state.lower()}",
+            "description": description or f"{key} {state.lower()}",
             "dateAdded": self.now(),
         }
 
@@ -689,6 +697,10 @@ class BitbucketDcFake:
         pr = f"{repo}/pull-requests/{{pid:int}}"
         return [
             Route(f"{api}/application-properties", self._properties),
+            Route(
+                f"{self.context}/rest/build-status/latest/commits/{{sha}}",
+                self._build_status_listing,
+            ),
             Route(f"{api}/repos", self._list_repos),
             Route(repo, self._get_repo),
             Route(f"{repo}/default-branch", self._get_default_branch),
@@ -814,6 +826,9 @@ class BitbucketDcFake:
         return JSONResponse(found)
 
     async def _builds(self, request: Request) -> Response:
+        # As Data Center 9.4.24 answers it on the live fixture: the repository
+        # scoped read needs ``key`` (400 without) and returns that one status;
+        # an unknown key is a 404 with no body.
         uid = await self._guard(request)
         if isinstance(uid, Response):
             return uid
@@ -821,17 +836,43 @@ class BitbucketDcFake:
         if request.method == "POST":
             body = await request.json()
             self.post_status(
-                sha, body["key"], body["state"], name=body.get("name"), url=body.get("url")
+                sha,
+                body["key"],
+                body["state"],
+                name=body.get("name"),
+                url=body.get("url"),
+                description=body.get("description"),
             )
             self.writes += 1
             return Response(status_code=204)
-        builds = self.builds.get(sha, {})
-        key = request.query_params.get("key")
-        if key is not None:
-            if key not in builds:
-                return JSONResponse(_errors(f"No build status for {key}"), status_code=404)
-            return JSONResponse(builds[key])
-        return self._page(request, list(builds.values()))
+        key = request.query_params.get("key", "")
+        if not key.strip():
+            return JSONResponse(capture("error-400-build-key.json"), status_code=400)
+        build = self.builds.get(sha, {}).get(key)
+        if build is None:
+            return Response(status_code=404)
+        return JSONResponse(self._keyed_build(sha, build))
+
+    def _keyed_build(self, sha: str, build: dict[str, Any]) -> dict[str, Any]:
+        commit = self.commits.get(sha, {"id": sha, "displayId": sha[:11]})
+        return {
+            "createdDate": build["dateAdded"] + 1,
+            **build,
+            "updatedDate": build["dateAdded"],
+            "commit": commit,
+            "projectKey": self.project_key,
+            "repositorySlug": self.slug,
+        }
+
+    async def _build_status_listing(self, request: Request) -> Response:
+        # ``rest/build-status/latest/commits/{sha}``: every key posted on the
+        # commit, from any repository, newest first, paged (live fixture).
+        uid = await self._guard(request)
+        if isinstance(uid, Response):
+            return uid
+        builds = self.builds.get(request.path_params["sha"], {}).values()
+        newest = sorted(builds, key=lambda b: b["dateAdded"], reverse=True)
+        return self._page(request, newest)
 
     async def _pulls(self, request: Request) -> Response:
         uid = await self._guard(request)

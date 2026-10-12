@@ -30,16 +30,22 @@ _RATE_LIMIT_HEADERS = (
 )
 
 
+# The REST API every call uses, and the build status API whose commit listing
+# is the only one that names every build key on a commit (`code_host.observe_ci`).
+REST_API = "/rest/api/latest"
+BUILD_STATUS_API = "/rest/build-status/latest"
+
+
 class DcTransport:
     """Requests to one Bitbucket Data Center as one access token."""
 
     def __init__(self, client: httpx.AsyncClient, *, api_url: str, token: str) -> None:
         self._client = client
-        self.base = f"{api_url.rstrip('/')}/rest/api/latest"
+        self.root = api_url.rstrip("/")
         self._token = token
 
     def __repr__(self) -> str:
-        return f"DcTransport(base={self.base!r})"
+        return f"DcTransport(root={self.root!r})"
 
     async def request(
         self,
@@ -50,15 +56,16 @@ class DcTransport:
         params: Mapping[str, str | int] | None = None,
         json: Any = None,
         allow: Collection[int] = (),
+        api: str = REST_API,
     ) -> httpx.Response:
-        """One request to ``base + path``. A status in ``allow`` is returned
-        to the caller; any other non-2xx answer raises."""
+        """One request to ``path`` under ``api``. A status in ``allow`` is
+        returned to the caller; any other non-2xx answer raises."""
 
         headers = {"Accept": "application/json", "Authorization": f"Bearer {self._token}"}
         try:
             response = await self._client.request(
                 method,
-                f"{self.base}{path}",
+                f"{self.root}{api}{path}",
                 params=params,
                 json=json,
                 headers=headers,
@@ -90,25 +97,38 @@ class DcTransport:
         what: str,
         params: Mapping[str, str | int] | None = None,
         json: Any = None,
+        api: str = REST_API,
     ) -> dict[str, Any]:
         """One JSON object, or `Unavailable` when the answer is not one."""
 
-        response = await self.request(method, path, what=what, params=params, json=json)
+        response = await self.request(method, path, what=what, params=params, json=json, api=api)
         return object_of(response, what)
 
     async def pages(
-        self, path: str, *, what: str, limit: int, params: Mapping[str, str] | None = None
+        self,
+        path: str,
+        *,
+        what: str,
+        limit: int,
+        params: Mapping[str, str] | None = None,
+        api: str = REST_API,
     ) -> list[dict[str, Any]]:
         """Every value of a paged listing, following ``isLastPage`` and
         ``nextPageStart`` for at most `MAX_PAGES` pages."""
 
         values: list[dict[str, Any]] = []
-        async for page in self.iter_pages(path, what=what, limit=limit, params=params):
+        async for page in self.iter_pages(path, what=what, limit=limit, params=params, api=api):
             values.extend(page)
         return values
 
     async def iter_pages(
-        self, path: str, *, what: str, limit: int, params: Mapping[str, str] | None = None
+        self,
+        path: str,
+        *,
+        what: str,
+        limit: int,
+        params: Mapping[str, str] | None = None,
+        api: str = REST_API,
     ) -> AsyncIterator[list[dict[str, Any]]]:
         """The pages of one listing in order, so a caller may stop early. A
         failed page, or a listing longer than `MAX_PAGES`, raises `Unavailable`."""
@@ -121,6 +141,7 @@ class DcTransport:
                     path,
                     what=what,
                     params={**(params or {}), "start": start, "limit": limit},
+                    api=api,
                 )
             except NotFound:
                 # A listing that vanishes mid-way is a failed page, not a missing one.
