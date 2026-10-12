@@ -98,6 +98,7 @@ mod exit_codes;
 mod factory_github_app;
 mod factory_quickstart_context;
 mod factory_quickstart_forges;
+mod factory_quickstart_jira;
 mod factory_quickstart_output;
 mod factory_toolchain;
 mod fake_tier_plumbing;
