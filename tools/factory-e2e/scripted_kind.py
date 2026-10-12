@@ -622,6 +622,7 @@ class ScriptedRun:
                 f"deployment/{deployment}",
                 "--timeout=300s",
             )
+        self.provision_publication_trust()
         self.deploy(registry_ref)
         issue = self.stub._get("issue", 3815)
         issue["labels"] = [{"name": "factory"}]
@@ -630,6 +631,32 @@ class ScriptedRun:
         self.stub._label_event(3815, "factory", "labeled", github.HUMAN)
         self.wait_for_final()
         self.observe()
+
+    def publication_namespace(self) -> str:
+        namespace = self.kubectl(
+            "-n",
+            self.namespace,
+            "get",
+            "deployment/curie-worker",
+            "-o",
+            'jsonpath={.spec.template.spec.containers[?(@.name=="worker")].env[?(@.name=="CURIE_PUBLICATION_NAMESPACE")].value}',
+            timeout=10,
+        ).strip()
+        if not namespace:
+            raise ScriptedScenarioError("worker publication namespace is absent")
+        return namespace
+
+    def provision_publication_trust(self) -> None:
+        # ConfigMap volume references resolve in the Pod's namespace. Helm
+        # creates the publication namespace separately from the platform.
+        self.kubectl(
+            "-n",
+            self.publication_namespace(),
+            "create",
+            "configmap",
+            "github-stub-ca",
+            f"--from-file=ca.pem={self.stub.ca_file}",
+        )
 
     def deploy(self, registry_ref: str) -> None:
         assert self.workdir is not None
@@ -806,17 +833,7 @@ class ScriptedRun:
             return re.sub(r"https?://[^\s\"<>]+", "https://example.com", redacted)
 
         try:
-            publication_namespace = self.kubectl(
-                "-n",
-                self.namespace,
-                "get",
-                "deployment/curie-worker",
-                "-o",
-                'jsonpath={.spec.template.spec.containers[?(@.name=="worker")].env[?(@.name=="CURIE_PUBLICATION_NAMESPACE")].value}',
-                timeout=10,
-            ).strip()
-            if not publication_namespace:
-                raise ScriptedScenarioError("worker publication namespace is absent")
+            publication_namespace = self.publication_namespace()
             resources = json.loads(
                 self.kubectl(
                     "-n",

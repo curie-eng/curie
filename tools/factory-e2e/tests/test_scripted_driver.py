@@ -1236,6 +1236,37 @@ def test_failed_publication_evidence_survives_verdict_without_transport_or_crede
     assert "example-sensitive-token" not in json.dumps(run.evidence)
 
 
+@pytest.mark.parametrize("publication_namespace", ["example-publication", ""])
+def test_publication_trust_uses_actual_worker_namespace_or_refuses(
+    publication_namespace: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    run = sk.ScriptedRun(fe.parse_args(["scripted"]))
+    ca_file = tmp_path / "ca.pem"
+    run.stub = type("StubCa", (), {"ca_file": ca_file})()
+    calls: list[tuple[str, ...]] = []
+
+    def kubectl(*args: str, timeout: float = 300) -> str:
+        calls.append(args)
+        if "deployment/curie-worker" in args:
+            assert args[:2] == ("-n", run.namespace)
+            assert timeout == 10
+            return publication_namespace
+        assert args == (
+            "-n", publication_namespace, "create", "configmap", "github-stub-ca",
+            f"--from-file=ca.pem={ca_file}",
+        )
+        return ""
+
+    monkeypatch.setattr(run, "kubectl", kubectl)
+    if publication_namespace:
+        run.provision_publication_trust()
+        assert len(calls) == 2
+    else:
+        with pytest.raises(sk.ScriptedScenarioError, match="publication namespace is absent"):
+            run.provision_publication_trust()
+        assert len(calls) == 1
+
+
 def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
