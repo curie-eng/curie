@@ -1064,6 +1064,22 @@ def test_close_test_issues_closes_and_unlabels_every_created_issue(
     assert transitions and all(str(r["body"]["transition"]["id"]) == "31" for r in transitions)
 
 
+def test_close_test_issues_also_drops_the_factory_state_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A live run left `curie-factory:pr-open` on its ticket after the trigger
+    # label was removed: teardown must leave a created issue with no labels.
+    rig = _rig(tmp_path, monkeypatch)
+    driver = rig.driver()
+    driver.open_and_label_ticket("Title", "Body", time.time())
+    issue = _first_issue(rig.jira)
+    issue["labels"] = [rig.jira.label, "curie-factory:pr-open"]
+
+    driver.close_test_issues()
+
+    assert issue["labels"] == []
+
+
 def test_an_issue_whose_label_failed_is_still_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

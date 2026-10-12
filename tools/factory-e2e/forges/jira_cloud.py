@@ -494,12 +494,12 @@ class JiraCloudDriver:
         if status != 200 or not isinstance(issue, dict):
             raise fe.PreflightFailed(f"reading issue {issue_id} failed (HTTP {status})")
         fields = issue.get("fields") or {}
-        if self.p.config.label in (fields.get("labels") or []):
+        # The trigger label and every factory state label (curie-factory:*) the
+        # run applied: the issue was created by this driver, so it keeps none.
+        labels = [label for label in fields.get("labels") or [] if isinstance(label, str)]
+        if labels:
             status, _ = self._jira(
-                "labeler",
-                "PUT",
-                f"/issue/{issue_id}",
-                jira_label_update(remove=[self.p.config.label]),
+                "labeler", "PUT", f"/issue/{issue_id}", jira_label_update(remove=labels)
             )
             if status != 204:
                 raise fe.PreflightFailed(f"unlabelling issue {issue_id} failed (HTTP {status})")
