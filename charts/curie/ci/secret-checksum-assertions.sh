@@ -293,6 +293,27 @@ def main():
     require(bool(expected) and changed == expected, "worker API key override must exclude worker from chart-owned apiKey rotation")
     print("OK: a worker CURIE_API_KEY override excludes the unused chart-owned key")
 
+    real_model = merge(dev, {"agentSandbox": {"runner": {
+        "fakeModel": False,
+        "credentials": "credential-assert",
+    }}})
+    credential_workloads = audit(render("real-model credentials", real_model), "real-model credentials")
+    credential_rotated = audit(render("real-model credential rotation", merge(real_model, {
+        "agentSandbox": {"runner": {"credentials": "credential-rotated"}},
+    })), "real-model credential rotation")
+    require(set(credential_rotated) == set(credential_workloads), "real-model credential rotation unexpectedly changed workload membership")
+    expected = {identity for identity, workload in credential_workloads.items() if "agentCredentials" in workload["keys"]}
+    changed = {identity for identity in credential_workloads if credential_rotated[identity]["checksum"] != credential_workloads[identity]["checksum"]}
+    require(bool(expected) and changed == expected, "real-model credential rotation must change exactly its rendered consumers")
+    require("worker" in components(credential_workloads, expected), "real-model credentials must participate in the worker checksum")
+    for label, runner in (
+        ("BYO model credentials", {"credentialsExistingSecret": "acme-model-credentials"}),
+        ("fake-model credential omission", {"fakeModel": True}),
+    ):
+        workloads = audit(render(label, merge(real_model, {"agentSandbox": {"runner": runner}})), label)
+        require(all("agentCredentials" not in workload["keys"] for workload in workloads.values()), f"{label}: unused chart-owned model credentials still participate in a checksum")
+    print("OK: real-model credentials rotate only their consumers; BYO and fake-model paths omit the chart-owned key")
+
     key_free = {
         "rustfs": {
             "deploy": False,
