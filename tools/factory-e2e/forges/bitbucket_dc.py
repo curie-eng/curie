@@ -10,13 +10,16 @@ to the Jira Cloud driver, built on first use.
 The change is the pull request the WorkItem records, CI is the
 repository-scoped build statuses on its head, the review is a top-level
 comment by `reviewer`, and the admin merges, resets and restores. Reads use
-the factory's repository access token. Every request goes through
-``urllib.request.urlopen`` with the fixture CA.
+the factory's repository access token. Every request goes through an opener
+that trusts the fixture CA and refuses every redirect, so a credential is only
+ever sent to the URL the driver named.
 
 Red CI follows the Bitbucket Cloud driver: a FAILED loop gate build on the
-pull request's first head, and the SUCCESSFUL gate on the first later head
-`ci_state` reads with no build at all. The head marked red is never turned
-green.
+pull request's first head, then a watcher that posts the SUCCESSFUL gate once
+on the first later head it reads, while the loop waits for the first request
+to end (#4401 decision 18.1). `ci_state` only reads. The head marked red is
+never turned green. The review's delivery is proved as on Cloud: the WorkItem
+reads back a new request after the comment.
 """
 
 from __future__ import annotations
@@ -27,12 +30,15 @@ import os
 import ssl
 import subprocess
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping, Sequence
+from email.message import Message
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import factory_e2e as fe
 
@@ -48,6 +54,10 @@ FACTORY_BRANCH_PREFIX = "curie/"
 REVIEWER = "reviewer"
 HTTP_TIMEOUT_SECONDS = 30
 PAGE_LIMIT = 100
+# The green watcher reads the head this often, for at most as long as the loop
+# waits for the first request to end.
+WATCH_INTERVAL_SECONDS = 5.0
+WATCH_LIFETIME_SECONDS = float(fe.EXECUTION_BOUND_SECONDS + fe.PUBLICATION_ALLOWANCE_SECONDS)
 _FAILING = frozenset({"FAILED", "STOPPED", "CANCELLED"})
 
 
@@ -65,6 +75,27 @@ def dc_ci_state(builds: Sequence[Mapping[str, Any]]) -> str:
     if any(state != "SUCCESSFUL" for state in states):
         return "pending"
     return "passing"
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow no redirect: the 3xx surfaces as an HTTPError, nothing is re-sent."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: Message,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def _opener(context: ssl.SSLContext) -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context), _RefuseRedirect()
+    )
 
 
 def _secret(path: str, what: str) -> str:
@@ -126,7 +157,10 @@ class BitbucketDcDriver:
         self.admin_auth = _basic(self.admin_user, _secret(admin_password_file, "admin password"))
         self.reviewer_auth = _basic(REVIEWER, _secret(reviewer_password_file, "reviewer password"))
         self._jira: Any = None
-        self._red_heads: set[str] = set()
+        self._change: fe.ChangeRef | None = None
+        self._watch_stop: threading.Event | None = None
+        self._watch_thread: threading.Thread | None = None
+        self.green_heads: list[str] = []
         self._base_sha = ""
 
     # --- HTTP -----------------------------------------------------------
@@ -150,9 +184,7 @@ class BitbucketDcDriver:
             },
         )
         try:
-            with urllib.request.urlopen(
-                request, context=self.context, timeout=HTTP_TIMEOUT_SECONDS
-            ) as response:
+            with _opener(self.context).open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
                 status, data = int(response.status), response.read()
         except urllib.error.HTTPError as exc:
             status, data = exc.code, exc.read()
@@ -193,16 +225,21 @@ class BitbucketDcDriver:
 
     # --- the pull request -----------------------------------------------
 
-    def change_head(self, change: fe.ChangeRef) -> tuple[str | None, int | None]:
+    def _head(self, change: fe.ChangeRef) -> str | None:
         status, pr = self._call("GET", f"/pull-requests/{change.number}")
         if status != 200 or not isinstance(pr, dict):
-            return None, None
+            return None
         head = (pr.get("fromRef") or {}).get("latestCommit")
+        return head if isinstance(head, str) and head else None
+
+    def change_head(self, change: fe.ChangeRef) -> tuple[str | None, int | None]:
+        # The change the green watcher follows once its first head is set red.
+        self._change = change
+        head = self._head(change)
+        if head is None:
+            return None, None
         commits = self._paged(f"/pull-requests/{change.number}/commits")
-        return (
-            head if isinstance(head, str) and head else None,
-            None if commits is None else len(commits),
-        )
+        return head, None if commits is None else len(commits)
 
     # --- CI ---------------------------------------------------------------
 
@@ -221,11 +258,45 @@ class BitbucketDcDriver:
         )
 
     def set_ci_red(self, sha: str) -> dict[str, Any]:
+        """FAILED on ``sha``, then watch the change for the revision to turn green."""
+
+        change = self._change
+        if change is None:
+            raise fe.PreflightFailed("set_ci_red needs the change: read its head first")
         status, _ = self._post_gate(sha, "FAILED", LOOP_GATE_DESCRIPTION)
         if status not in (200, 201, 204):
             raise fe.PreflightFailed(f"setting the red loop gate build failed (HTTP {status})")
-        self._red_heads.add(sha)
-        return {"sha": sha, "context": LOOP_GATE_KEY, "state": "FAILED"}
+        self._start_watch(change, sha)
+        # The commit status vocabulary the loop judge reads (GitHub's).
+        return {"sha": sha, "context": LOOP_GATE_KEY, "state": "failure"}
+
+    def _start_watch(self, change: fe.ChangeRef, red: str) -> None:
+        self._stop_watch()
+        stop = threading.Event()
+        interval = WATCH_INTERVAL_SECONDS
+        deadline = time.monotonic() + WATCH_LIFETIME_SECONDS
+
+        def watch() -> None:
+            while not stop.wait(interval) and time.monotonic() < deadline:
+                head = self._head(change)
+                if not head or head == red:
+                    continue
+                status, _ = self._post_gate(head, "SUCCESSFUL", LOOP_GATE_GREEN)
+                if status in (200, 201, 204):
+                    self.green_heads.append(head)
+                    return
+
+        thread = threading.Thread(target=watch, name="bitbucket-dc-green-gate", daemon=True)
+        self._watch_stop, self._watch_thread = stop, thread
+        thread.start()
+        self.p.teardown.push("stop the green loop gate watcher", self._stop_watch)
+
+    def _stop_watch(self) -> dict[str, Any]:
+        if self._watch_stop is not None and self._watch_thread is not None:
+            self._watch_stop.set()
+            self._watch_thread.join(timeout=HTTP_TIMEOUT_SECONDS * 2)
+        self._watch_stop = self._watch_thread = None
+        return {"green_heads": list(self.green_heads)}
 
     def _builds(self, sha: str) -> list[dict[str, Any]] | None:
         """Each build on ``sha``, read one key at a time; None when any read fails.
@@ -249,14 +320,6 @@ class BitbucketDcDriver:
 
     def ci_state(self, sha: str) -> dict[str, Any]:
         builds = self._builds(sha)
-        if builds == [] and self._red_heads and sha not in self._red_heads:
-            # A revision after the red head: the test side turns it green.
-            status, _ = self._post_gate(sha, "SUCCESSFUL", LOOP_GATE_GREEN)
-            if status not in (200, 201, 204):
-                raise fe.PreflightFailed(
-                    f"setting the green loop gate build failed (HTTP {status})"
-                )
-            builds = self._builds(sha)
         if builds is None:
             return {"sha": sha, "state": "unreadable"}
         return {
@@ -267,7 +330,24 @@ class BitbucketDcDriver:
 
     # --- review and merge --------------------------------------------------
 
+    def _request_count(self, work_item_id: str) -> int | None:
+        detail = self.p.work_item_detail(work_item_id)
+        if detail is None:
+            return None
+        return len([r for r in detail.get("requests") or [] if isinstance(r, dict)])
+
     def post_review(self, change: fe.ChangeRef, text: str) -> dict[str, Any]:
+        """Comment as ``reviewer``, then wait for the factory's poll to admit it.
+
+        The delivery fields mirror a GitHub webhook delivery: the WorkItem
+        read (HTTP 200) that shows a request beyond those it had before the
+        comment, and that request's id.
+        """
+
+        work_item_id = str(self.p.evidence["work_item_id"])
+        before = self._request_count(work_item_id)
+        if before is None:
+            raise fe.PreflightFailed("reading the WorkItem before the review failed")
         body = fe.revision_comment_text(text, self.p.config.mention)
         status, comment = self._call(
             "POST",
@@ -277,7 +357,25 @@ class BitbucketDcDriver:
         )
         if status != 201 or not isinstance(comment, dict) or comment.get("id") is None:
             raise fe.PreflightFailed(f"posting the review comment failed (HTTP {status})")
-        return {"status_code": status, "comment_id": int(comment["id"])}
+
+        def admitted() -> dict[str, Any] | None:
+            detail = self.p.work_item_detail(work_item_id)
+            requests = [r for r in (detail or {}).get("requests") or [] if isinstance(r, dict)]
+            return fe._latest_request(detail or {}) if len(requests) > before else None
+
+        request = fe._wait(
+            f"the factory to admit review comment {comment['id']}",
+            self.p.admission_timeout,
+            admitted,
+            5,
+        )
+        return {
+            "status_code": status,
+            "comment_id": int(comment["id"]),
+            "delivery_id": request.get("id"),
+            "delivery_status_code": 200,
+            "delivery_api_status": "factory_admitted",
+        }
 
     def merge(self, change: fe.ChangeRef) -> dict[str, Any]:
         """Merge as the admin at the version just read."""
@@ -327,8 +425,9 @@ class BitbucketDcDriver:
         return sha
 
     def reset_fixture(self) -> dict[str, Any]:
-        """Decline every open pull request and delete every factory branch, as the admin."""
+        """Stop the green watcher; decline open pull requests, delete factory branches."""
 
+        self._stop_watch()
         open_prs = self._paged("/pull-requests?state=OPEN", auth=self.admin_auth)
         if open_prs is None:
             raise fe.PreflightFailed("listing open fixture pull requests failed")

@@ -4,8 +4,10 @@ Skipped unless ``CURIE_BITBUCKET_DC_FIXTURE`` names the ``state.json`` that
 ``curie dev forge-fixture bitbucket-dc up`` wrote. With the fixture up, this
 opens a pull request on it as the factory token, then drives the driver the
 way the forge loop does: the red loop gate on the first head, a pushed
-revision whose head the driver turns green, a review comment as ``reviewer``,
-and the merge as the admin, read back as merged.
+revision whose head the driver's watcher turns green while ``ci_state`` only
+reads, a review comment as ``reviewer``, and the merge as the admin, read back
+as merged. No platform runs here, so the WorkItem the review's admission is
+read from is a stand-in that gains a request once the comment exists.
 
 Pass or fail, the test leaves the fixture as it found it: it declines the pull
 request if still open, deletes its branch, and, once the merge moved the
@@ -24,6 +26,7 @@ import secrets
 import ssl
 import subprocess
 import sys
+import time
 import urllib.request
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -192,11 +195,20 @@ def mutations(fixture: _Fixture, tmp_path: Path) -> Iterator[_Mutations]:
 
 
 def test_bitbucket_dc_live_driver_posts_status_reviews_and_merges(
-    tmp_path: Path, fixture: _Fixture, mutations: _Mutations
+    tmp_path: Path, fixture: _Fixture, mutations: _Mutations, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = fixture.state
     fe.load_forge_entries()
-    driver = sys.modules["factory_e2e_forges.bitbucket_dc"].BitbucketDcDriver(_preflight(tmp_path))
+    module = sys.modules["factory_e2e_forges.bitbucket_dc"]
+    monkeypatch.setattr(module, "WATCH_INTERVAL_SECONDS", 0.5)
+    driver = module.BitbucketDcDriver(_preflight(tmp_path))
+    try:
+        _drive(driver, state, fixture, mutations)
+    finally:
+        driver.p.teardown.run()
+
+
+def _drive(driver: Any, state: dict[str, Any], fixture: _Fixture, mutations: _Mutations) -> None:
 
     # A branch with one commit, and a pull request from it, as the factory.
     work = mutations.work
@@ -227,23 +239,39 @@ def test_bitbucket_dc_live_driver_posts_status_reviews_and_merges(
     assert first == fixture.git("rev-parse", "HEAD", cwd=work)
     assert count == 1
 
-    # Red on the first head.
-    driver.set_ci_red(first)
+    # Red on the first head, in the judge's vocabulary.
+    assert driver.set_ci_red(first)["state"] == "failure"
     assert driver.ci_state(first)["state"] == "failing"
 
-    # A revision: the driver turns its head green, the first head stays red.
+    # A revision, pushed as the factory would while the loop waits: the
+    # watcher turns its head green on its own, the first head stays red.
     (work / "LIVE.md").write_text("first\nsecond\n")
     fixture.git("commit", "-q", "-am", "Live driver revision", cwd=work)
     fixture.git("push", "-q", "origin", branch, cwd=work)
-    second, count = driver.change_head(change)
-    assert second == fixture.git("rev-parse", "HEAD", cwd=work) != first
-    assert count == 2
+    second = fixture.git("rev-parse", "HEAD", cwd=work)
+    deadline = time.monotonic() + 60
+    while driver.green_heads != [second] and time.monotonic() < deadline:
+        time.sleep(0.5)
+    assert driver.green_heads == [second]
+    assert driver.change_head(change) == (second, 2)
+    assert second != first
     assert driver.ci_state(second)["state"] == "passing"
     assert driver.ci_state(first)["state"] == "failing"
 
-    # The review comment is authored by `reviewer`.
+    # The review comment is authored by `reviewer` and admitted by the stand-in WorkItem.
+    def work_item_detail(_work_item_id: str) -> dict[str, Any]:
+        listed = fixture.call("GET", f"/pull-requests/{change.number}/activities?limit=100")
+        commented = any(item.get("action") == "COMMENTED" for item in listed["values"])
+        return {"requests": [{"id": f"req-{n}", "sequence": n} for n in (1, 2)[: 1 + commented]]}
+
+    driver.p.evidence["work_item_id"] = "wi-live"
+    driver.p.work_item_detail = work_item_detail
     review = driver.post_review(change, "Please add a round trip test.")
     assert review["status_code"] == 201
+    assert (review["delivery_status_code"], review["delivery_api_status"]) == (
+        200,
+        "factory_admitted",
+    )
     comment = fixture.call("GET", f"/pull-requests/{change.number}/comments/{review['comment_id']}")
     assert comment["author"]["slug"] == state["users"]["reviewer"]["slug"]
     assert "Please add a round trip test." in comment["text"]
