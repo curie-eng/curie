@@ -18,7 +18,8 @@ from curie_api.code_host_trust import verify_for_bundle
 from curie_api.forges.bitbucket_dc.transport import TIMEOUT_S
 from curie_api.forges.config import CodeHostConfig, StaticTokenCredentialConfig
 from curie_api.forges.credential_providers import StaticTokenProvider
-from curie_api.forges.types import CredentialHeader
+from curie_api.forges.errors import Unavailable
+from curie_api.forges.types import CredentialHeader, RepositoryRef
 
 if TYPE_CHECKING:
     from curie_api.forges.bitbucket_dc.code_host import BitbucketDcCodeHost
@@ -63,7 +64,10 @@ class BitbucketDcConnection:
         client: httpx.AsyncClient,
         *,
         installations: Mapping[str, int] | None = None,
+        repository: RepositoryRef | None = None,
     ) -> BitbucketDcCodeHost:
+        # An access token has no App installations, and the marked comments
+        # address the pull request a reply target names, so neither scopes it.
         from curie_api.forges.bitbucket_dc.code_host import BitbucketDcCodeHost
 
         return BitbucketDcCodeHost(
@@ -73,3 +77,19 @@ class BitbucketDcConnection:
             token=self._token.get_secret_value(),
             credentials=self._provider,
         )
+
+    async def installation_for(self, repository: RepositoryRef) -> int | None:
+        """None: an access token has no App installation to fence a WorkItem on."""
+
+        return None
+
+    async def installation_token(
+        self,
+        repository: RepositoryRef,
+        installation_id: int,
+        *,
+        timeout_s: float | None = None,
+    ) -> str:
+        """Refused: no WorkItem on this kind records an installation."""
+
+        raise Unavailable("installation")

@@ -7,13 +7,14 @@ fixture. The tracker is registered with monkeypatch in place of the
 ``jira_cloud`` registry entry (decision 15.2), so the test behaves the same
 whether or not the Jira adapter (#4358) has merged.
 
-The factory core still builds GitHub references and adapters in a few seams
+The factory core still builds the install's GitHub adapter in a few seams
 (`curie_api.forges.hosts`), as the ``jira_cloud+github`` pair in
-``tests/forges/test_offline_lifecycle.py`` documents. The same seams are
-replaced here, plus two that only a non-GitHub code host reaches:
-``factory_ci.repository_ref`` and ``lineage_reconciler.pull_request_ref`` build
-GitHub-kind references, which a Bitbucket adapter refuses by design, so they
-are replaced with builders of the backend's kind.
+``tests/forges/test_offline_lifecycle.py`` documents; they are replaced here.
+The WorkItem's own code host (`forges.trackers.code_host_for_repository`, #4358
+plan D14) is replaced by the adapter on the backend's client, in every module
+that imported it. The CI gate, reconciler and status replies otherwise run on
+the stored Bitbucket identity unpatched, and the status replies go through the
+real port branch of ``factory_notices._sync_one`` (#4358 plan D6).
 
 `run_lifecycle` then drives AC 10.1 to 10.7 through the real poll pass,
 admission, reconciler, CI gate, reply sink and cancel path. Placeholder
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -40,7 +42,7 @@ from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER
 from curie_api.forges import registry as forge_registry
-from curie_api.forges import types
+from curie_api.forges import trackers, types
 from curie_api.forges.authority import (
     binding_may_act_on_feedback,
     feedback_actionable,
@@ -61,14 +63,13 @@ from curie_api.forges.config import (
 )
 from curie_api.forges.identity import issue_lock_keys, notice_request_id, revision_request_id
 from curie_api.forges.memory import InMemoryTracker, PageFaults, WriteLedger, all_supported
-from curie_api.forges.ports import CodeHost, Tracker, comments_for
+from curie_api.forges.ports import CodeHost, Tracker
 from curie_api.forges.registry import forges_registry
 from curie_api.forges.types import (
     Actor,
     Disposition,
     FeedbackKind,
     PullRequest,
-    PullRequestRef,
     ReplyTarget,
     RepositoryRef,
     TrackerIssueRef,
@@ -235,8 +236,13 @@ class _MemoryJiraConnection:
         self.config = config
         self._tracker = tracker
 
-    def for_repository(self, client: httpx.AsyncClient, **_: Any) -> Tracker:
+    def for_binding(
+        self, client: httpx.AsyncClient, binding: BindingConfig, *, label: str | None = None
+    ) -> Tracker:
         return self._tracker
+
+    def issue_url(self, issue: TrackerIssueRef) -> str:
+        return self._tracker.issue_url(issue)
 
 
 def install_memory_jira(monkeypatch: pytest.MonkeyPatch, tracker: InMemoryTracker) -> None:
@@ -415,6 +421,8 @@ class BitbucketPair:
     cursor: str | None = None
     feedback_cursor: str | None = None
     pull: PullRequest | None = None
+    # The request whose status the real sink is writing now.
+    _syncing: uuid.UUID | None = None
 
     def _patch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The GitHub-only seams named in the module docstring."""
@@ -424,71 +432,44 @@ class BitbucketPair:
 
         for module, seams in (
             ("curie_api.forges.hosts", ("code_host_for", "factory_code_host")),
-            ("curie_api.factory_ci", ("factory_code_host",)),
-            ("curie_api.lineage_reconciler", ("factory_code_host",)),
             ("curie_api.repository_access", ("code_host_for",)),
             ("curie_api.github_factory", ("factory_code_host",)),
             ("curie_api.routers.publications", ("code_host_for",)),
-            ("curie_api.routers.work_item_outcomes", ("factory_code_host",)),
             ("curie_api.routers.publication_code_host", ("code_host_for",)),
         ):
             for seam in seams:
                 monkeypatch.setattr(f"{module}.{seam}", host)
-        kind, code_host_host = self.repository.kind, self.repository.host
-
-        def repository_ref(
-            _settings: Any, *, path: str, project_id: int | str | None
-        ) -> RepositoryRef:
-            # Every Bitbucket row is admitted with its immutable id; GitHub's
-            # path-only form for older rows has no Bitbucket counterpart.
-            if project_id is None:
-                raise AssertionError(f"stored repository {path!r} carries no project id")
-            return RepositoryRef(kind, code_host_host, str(project_id), path)
-
-        def pull_request_ref(
-            settings: Any, *, path: str, project_id: int | str | None, number: int
-        ) -> PullRequestRef:
-            return PullRequestRef(
-                repository_ref(settings, path=path, project_id=project_id), str(number)
-            )
-
-        monkeypatch.setattr("curie_api.factory_ci.repository_ref", repository_ref)
-        monkeypatch.setattr("curie_api.lineage_reconciler.pull_request_ref", pull_request_ref)
-        monkeypatch.setattr(
-            "curie_api.factory_ci.issue_url",
-            lambda _settings, issue, _repository: self.tracker.issue_url(issue),
-        )
+        original = trackers.code_host_for_repository
+        for name, module in list(sys.modules.items()):
+            if module is not None and name.startswith("curie_api"):
+                if getattr(module, "code_host_for_repository", None) is original:
+                    monkeypatch.setattr(module, "code_host_for_repository", host)
+        # Every status write either port makes, with the request it is for.
+        for side in (self.tracker.marked_comments, self.code_host.marked_comments):
+            monkeypatch.setattr(side, "upsert_marked", self._logged(side.upsert_marked))
         monkeypatch.setattr(factory_notices, "_sync_one", self._sync_one(factory_notices._sync_one))
 
     def _sync_one(self, original: Callable[..., Any]) -> Callable[..., Any]:
-        """The real GitHub-shaped sink first (it must write nothing), then the
-        rendered body through the port the reply target names."""
+        """The real sink, which writes a Jira WorkItem's replies through the
+        ports; remembers the request each write is for."""
 
         async def sync_one(client: httpx.AsyncClient, settings: Any, claim: Any) -> int:
-            written = await original(client, settings, claim)
-            assert written == 0
-            row = claim.row
-            writes = 0
-            if row.finalized_at is None:
-                side = comments_for(claim.target, self.tracker, self.code_host)
-                result = await side.upsert_marked(
-                    claim.target, f"curie-factory-status:{row.execution_request_id}", claim.body
-                )
-                if result.written:
-                    self.replies.append(
-                        Reply(
-                            row.execution_request_id,
-                            claim.target.kind,
-                            result.comment.id,
-                            claim.body,
-                        )
-                    )
-                    writes += 1
-            if claim.latest and row.refused_at is None:
-                writes += await factory_notices._sync_labels(self.tracker, claim)
-            return writes
+            self._syncing = claim.row.execution_request_id
+            try:
+                return int(await original(client, settings, claim))
+            finally:
+                self._syncing = None
 
         return sync_one
+
+    def _logged(self, upsert: Callable[..., Any]) -> Callable[..., Any]:
+        async def upsert_marked(target: ReplyTarget, marker: str, body: str) -> Any:
+            result = await upsert(target, marker, body)
+            if result.written and self._syncing is not None:
+                self.replies.append(Reply(self._syncing, target.kind, result.comment.id, body))
+            return result
+
+        return upsert_marked
 
     # Steps -----------------------------------------------------------------
 
@@ -553,8 +534,7 @@ class BitbucketPair:
             ):
                 return None
             base = await factory_base.resolve_base(
-                registry=forges_registry(get_settings()),
-                repo_full_name=self.repository.path,
+                policy=self.repo,
                 labels=set(),
                 default_branch=self.repository.default_branch,
                 code_host=self.code_host,

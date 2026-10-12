@@ -9,6 +9,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import replace
 from typing import Any, Literal, cast
 
 from aci_protocol import PublicationContext
@@ -16,6 +17,7 @@ from curie_telemetry import TRACEPARENT_STREAM_FIELD, canonicalize_traceparent
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.crud import agents as crud_agents
 from curie_api.crud import approvals as crud_approvals
@@ -44,14 +46,17 @@ from ..auth import (
 )
 from ..config import get_settings
 from ..deps import SessionDep
-from ..forges.errors import ForgeError, Unauthorized, Unavailable
+from ..forges.config import RepositoryBindingConfig
+from ..forges.errors import ForgeError, NotFound, Unauthorized, Unavailable
 from ..forges.hosts import code_host_for, pull_request_ref
+from ..forges.trackers import tracker_for_work_item, work_item_policy
 from ..forges.types import GITHUB, CredentialScope
 from ..models import (
     ExecutionRequest,
     Publication,
     PublicationReviewReservation,
     ThreadPublicationLineage,
+    WorkItem,
 )
 from ..publication_authority import (
     AuthorityRefused,
@@ -75,6 +80,86 @@ from ..workspace_policy import credential_mode, repository_is_allowed
 from .publication_precheck import precheck_error
 
 logger = logging.getLogger(__name__)
+
+
+async def _closing_reference(
+    session: AsyncSession, request: Request, execution_request_id: uuid.UUID
+) -> str | None:
+    """The WorkItem tracker's closing reference for the request's issue.
+
+    None when the request or its WorkItem is unknown (creation refuses it), or
+    for a GitHub WorkItem on an install with no GitHub tracker (a WorkItem the
+    work-items API admitted with no factory intake), which publishes as it
+    always has. Any other WorkItem whose tracker or binding is not configured
+    is refused 409 ``publication.closing_reference_unconfigured``, and a
+    tracker that cannot answer now 503 retryable, so no tracker-admitted body
+    is stored without its reference.
+    """
+
+    execution = await session.get(ExecutionRequest, execution_request_id)
+    if execution is None:
+        return None
+    item = await session.get(WorkItem, execution.work_item_id)
+    if item is None:
+        return None
+    unavailable = HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        {
+            "code": "publication.closing_reference_unavailable",
+            "message": "the tracker could not name the issue; retry shortly",
+        },
+        headers={"Retry-After": "10"},
+    )
+    try:
+        tracker = tracker_for_work_item(
+            request.app.state.forges,
+            request.app.state.http_client,
+            item.tracker_issue,
+            item.repository,
+            item.code_host_installation_id,
+        )
+    except NotFound:
+        if item.tracker_issue.kind == GITHUB:
+            return None
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            {
+                "code": "publication.closing_reference_unconfigured",
+                "message": (
+                    "no configured tracker binding serves the work item's issue, so the"
+                    " pull request body cannot reference it"
+                ),
+            },
+        ) from None
+    except ForgeError:
+        raise unavailable from None
+    try:
+        reference: str = await tracker.closing_reference(item.tracker_issue, item.repository)
+    except ForgeError:
+        raise unavailable from None
+    return reference
+
+
+async def _work_item_policy(
+    session: AsyncSession,
+    request: Request,
+    execution_request_id: uuid.UUID,
+    repo_full_name: str,
+) -> RepositoryBindingConfig | None:
+    """The policy of the binding that chose the request's repository
+    (`work_item_policy`); None when the request or its WorkItem is unknown,
+    which creation refuses."""
+
+    execution = await session.get(ExecutionRequest, execution_request_id)
+    item = None if execution is None else await session.get(WorkItem, execution.work_item_id)
+    if item is None:
+        return None
+    return work_item_policy(
+        request.app.state.forges,
+        item.tracker_issue,
+        replace(item.repository, path=repo_full_name),
+    )
+
 
 router = APIRouter(
     prefix="/publications",
@@ -370,6 +455,7 @@ async def create_publication(
     traceparent = canonicalize_traceparent(request.headers.get(TRACEPARENT_STREAM_FIELD))
 
     if data.work_item_request_id is not None:
+        work_item_request_id = data.work_item_request_id
         prior_paths = (
             await session.scalars(
                 select(Publication.changed_paths).where(
@@ -379,7 +465,9 @@ async def create_publication(
             )
         ).all()
         changed_paths = [path for paths in prior_paths for path in paths] + data.changed_paths
-        python_ci = factory_ci.python_ci_policy(request.app.state.forges, data.repo_full_name)
+        python_ci = factory_ci.python_ci_policy(
+            await _work_item_policy(session, request, work_item_request_id, data.repo_full_name)
+        )
         unselected = factory_ci.unselected_python_path(changed_paths, python_ci)
         if unselected is not None:
             raise HTTPException(
@@ -457,6 +545,12 @@ async def create_publication(
             if missing:
                 body = f"{body.rstrip()}\n\n{'\n'.join(missing)}"
                 data = data.model_copy(update={"body": body})
+        # Every factory pull request body references its ticket (#4358 plan D7),
+        # in the tracker's own form; a body that already carries it is kept.
+        reference = await _closing_reference(session, request, work_item_request_id)
+        if reference is not None and reference not in (data.body or ""):
+            body = f"{data.body}\n\n{reference}" if data.body else reference
+            data = data.model_copy(update={"body": body})
 
     async def metadata_check() -> None:
         if patch:
@@ -966,4 +1060,3 @@ async def cancel_review_revision(
             {"code": exc.code, "message": exc.message},
         ) from None
     return _review_revision_out(row, lineage)
-

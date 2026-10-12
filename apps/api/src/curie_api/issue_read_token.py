@@ -2,7 +2,7 @@
 
 It follows the ADR 0174 publication precheck capability: an HMAC signed claim
 set the sandbox presents to exactly one API route. It names one execution and
-its WorkItem's repository and issue, so it can read nothing else.
+its WorkItem's tracker issue, so it can read nothing else.
 """
 
 from __future__ import annotations
@@ -28,9 +28,10 @@ class IssueReadClaims(BaseModel):
     scope: Literal["work_item.issue_read"]
     work_item_id: uuid.UUID
     execution_request_id: uuid.UUID
-    repo_full_name: str = Field(min_length=3, max_length=512)
-    github_repository_id: int = Field(gt=0)
-    issue_number: int = Field(gt=0)
+    tracker_kind: str = Field(min_length=1, max_length=512)
+    tracker_host: str = Field(min_length=1, max_length=512)
+    tracker_scope_id: str = Field(min_length=1, max_length=512)
+    tracker_issue_id: str = Field(min_length=1, max_length=512)
     iat: int = Field(ge=0)
     exp: int = Field(gt=0)
 

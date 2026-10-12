@@ -19,12 +19,19 @@ and ``jira=`` surface is unconfigured.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from curie_api.forges import types
-from curie_api.forges.config import TrackerConfig
+from curie_api.forges.config import BindingConfig, TrackerConfig
+from curie_api.forges.errors import NotFound
 from curie_api.forges.registry import ForgeRegistry
+from curie_api.forges.types import TrackerIssueRef
+from curie_api.models import AgentChannel
 
 # A tracker surface kind -> the tracker kind that serves it.
 _TRACKER_KIND = {
@@ -33,6 +40,15 @@ _TRACKER_KIND = {
     "jira": types.JIRA_CLOUD,
 }
 TRACKER_SURFACE_KINDS = frozenset(_TRACKER_KIND)
+# A tracker kind -> the surface kind that names its locations (#4358 plan D14).
+SURFACE_KIND = {tracker: surface for surface, tracker in _TRACKER_KIND.items()}
+# What a surface's address names: the repository its issues live in (a native
+# tracker), or the config binding that scopes a tracker-only kind.
+_ADDRESSED_BY: dict[str, Literal["repository", "binding"]] = {
+    "github": "repository",
+    "gitlab": "repository",
+    "jira": "binding",
+}
 
 
 class SurfaceUnconfigured(ValueError):
@@ -123,3 +139,90 @@ def effective_trigger_label(binding: Surface, registry: ForgeRegistry) -> str | 
     except SurfaceUnconfigured:
         return None
     return None if tracker is None else tracker.label
+
+
+def surface_location(
+    registry: ForgeRegistry, issue: TrackerIssueRef, repository_path: str
+) -> tuple[str, str]:
+    """The surface kind and address an issue's replies and surfaces live on.
+
+    A repository-addressed kind (GitHub, GitLab) is located by the repository
+    the issue lives in, ``repository_path``; a binding-addressed kind (Jira) by
+    the config binding serving the issue's tracker scope.
+
+    Raises:
+        NotFound: the issue's kind is not a tracker surface kind (``tracker``),
+            or no configured binding serves its scope (``binding``).
+    """
+
+    surface = SURFACE_KIND.get(issue.kind)
+    if surface is None:
+        raise NotFound("tracker")
+    if _ADDRESSED_BY[surface] == "repository":
+        return surface, repository_path
+    from curie_api.forges.trackers import binding_for_scope
+
+    binding = binding_for_scope(registry, issue)
+    if binding is None:
+        raise NotFound("binding")
+    return surface, binding.name
+
+
+def binding_location(binding: BindingConfig, tracker: TrackerConfig) -> tuple[str, str]:
+    """The surface kind and address that serve ``binding`` on ``tracker``.
+
+    A binding-addressed kind is addressed by the binding's name; a
+    repository-addressed kind by the binding's one repository path.
+    """
+
+    surface = SURFACE_KIND[tracker.kind]
+    if _ADDRESSED_BY[surface] == "binding":
+        return surface, binding.name
+    if len(binding.repos) != 1:
+        raise ValueError(f"binding {binding.name!r} lists more than one {surface} repository")
+    return surface, binding.repos[0].path
+
+
+async def bound_labels(
+    session: AsyncSession, registry: ForgeRegistry, kind: str, address: str
+) -> dict[str, list[AgentChannel]]:
+    """The ``kind`` surfaces at ``address``, grouped by effective trigger label
+    (#4361 decision 14).
+
+    A label that maps to two surfaces is a run time collision (the tracker
+    label was changed to equal an explicit label): it is still one label to
+    list, and admission under it refuses.
+    """
+
+    rows = await session.scalars(
+        select(AgentChannel)
+        .where(AgentChannel.kind == kind, AgentChannel.address == address)
+        .order_by(AgentChannel.agent_id)
+    )
+    grouped: dict[str, list[AgentChannel]] = {}
+    for row in rows:
+        label = effective_trigger_label(row, registry)
+        if label is not None:
+            grouped.setdefault(label, []).append(row)
+    return grouped
+
+
+async def agent_binding(
+    session: AsyncSession, agent_id: uuid.UUID, kind: str, address: str
+) -> AgentChannel | None:
+    """The agent's ``kind`` surface at ``address``, if it still holds one.
+
+    One at most: `crud.channels.refuse_label_overlap` keeps an agent to one
+    surface per location.
+    """
+
+    found: AgentChannel | None = await session.scalar(
+        select(AgentChannel)
+        .where(
+            AgentChannel.agent_id == agent_id,
+            AgentChannel.kind == kind,
+            AgentChannel.address == address,
+        )
+        .limit(1)
+    )
+    return found

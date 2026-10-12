@@ -2,7 +2,8 @@
 
 `run --scenario forge-loop --forge bitbucket_cloud` observes Bitbucket Cloud
 only through it. Bitbucket has no issue tracker, so the ticket is a Jira Cloud
-issue: ticket operations go to the Jira Cloud driver, built on first use. The
+issue: ticket operations and the "close Jira test issues" teardown go to the
+Jira Cloud driver (forges/jira_cloud.py), built on first use. The
 change is the pull request the WorkItem records, CI is the build statuses on
 its head, the review is a top-level pull request comment, and the merge is the
 pull request merge API, on a repository in a dedicated test Bitbucket
@@ -39,7 +40,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from email.message import Message
 from pathlib import Path
 from typing import IO, Any
@@ -52,9 +53,9 @@ GIT_USER = "x-token-auth"
 REPO_VAR = "CURIE_BITBUCKET_CLOUD_REPO"
 TOKEN_FILE_VAR = "CURIE_BITBUCKET_CLOUD_TOKEN_FILE"
 REVIEWER_TOKEN_FILE_VAR = "CURIE_BITBUCKET_CLOUD_REVIEWER_TOKEN_FILE"
-# What the Jira Cloud driver reads; checked here so the run fails before
-# anything is installed (#4401 decision 18.6).
-JIRA_VARS = ("CURIE_JIRA_SITE", "CURIE_JIRA_TOKEN_FILE")
+# What the Jira Cloud driver reads (forges/jira_cloud.py); checked here so the
+# run fails before anything is installed (#4401 decision 18.6).
+JIRA_VARS = ("CURIE_FACTORY_JIRA_ENV_FILE",)
 REQUIRED_VARS = (REPO_VAR, TOKEN_FILE_VAR, REVIEWER_TOKEN_FILE_VAR, *JIRA_VARS)
 
 LOOP_GATE_KEY = "factory-e2e-loop-gate"
@@ -124,6 +125,7 @@ class BitbucketCloudDriver:
     """ForgeDriver (forges/base.py) for Bitbucket Cloud, test writes as the reviewer."""
 
     forge = "bitbucket_cloud"
+    pairing = "jira_cloud+bitbucket_cloud"
 
     def __init__(self, p: fe.Preflight) -> None:
         missing = [name for name in REQUIRED_VARS if not os.environ.get(name, "").strip()]
@@ -210,10 +212,25 @@ class BitbucketCloudDriver:
 
     # --- tickets (Jira Cloud) -------------------------------------------
 
-    def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
+    def _tracker(self) -> Any:
         if self._jira is None:
             self._jira = fe.FORGES["jira_cloud"].driver(self.p)
-        return str(self._jira.open_and_label_ticket(title, body, since))
+        return self._jira
+
+    def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
+        return str(self._tracker().open_and_label_ticket(title, body, since))
+
+    def teardowns(self) -> tuple[tuple[str, Callable[[], Any]], ...]:
+        # The Jira driver closes and unlabels every issue it opened.
+        return tuple(self._tracker().teardowns())
+
+    def tracker_evidence(self, change: fe.ChangeRef | None, work_item_id: str) -> dict[str, Any]:
+        # The Jira tracker evidence is the jira_cloud+github entry's; this
+        # pairing asserts the loop only.
+        return {}
+
+    def judge_tracker(self, evidence: Mapping[str, Any]) -> list[str]:
+        return []
 
     def await_change(self, work_item_id: str) -> fe.ChangeRef | None:
         return fe.await_work_item_change(self.p, work_item_id)

@@ -37,6 +37,7 @@ class Operation(enum.StrEnum):
     LINK_PULL_REQUEST = "tracker.link_pull_request"
     DEPENDENCIES = "tracker.dependencies"
     GROUP_MEMBERSHIP = "tracker.group_membership"
+    TICKET_LABELS = "tracker.ticket_labels"
     # CodeHost
     RESOLVE_REPOSITORY = "code_host.resolve_repository"
     CREDENTIAL = "code_host.credential"

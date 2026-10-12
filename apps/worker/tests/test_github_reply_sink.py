@@ -1,6 +1,7 @@
-"""GitHub reply sink: kind "github" must never reach the HTTP egress adapter.
+"""Tracker reply sink: kinds "github", "gitlab" and "jira" never reach the HTTP
+egress adapter (#4358 plan D9).
 
-The API's factory writer is the only GitHub writer. A GitHub-bound reply
+The API's factory writer is the only tracker writer. A tracker-bound reply
 target carries no endpoint and no adapter credential, so the router must
 acknowledge every event locally (``ReplyAck(ref=None)``) and make no network
 call at all -- not fall through to ``HttpReplyAdapter``, which raises
@@ -25,13 +26,17 @@ from channel_protocol.reply import (
 )
 from curie_worker.config import WorkerConfig
 from curie_worker.reply_sink import (
+    TRACKER_KINDS,
     MissingAdapterCredentialError,
     TargetRoute,
+    TrackerReplySink,
     build_reply_sink,
 )
 
 SLACK_TOKEN = "xoxb-test-bot-token"
 GITHUB_ADDRESS = "acme-corp/acme-bot"
+# A jira surface is addressed by its config binding name (#4358 plan D4).
+JIRA_ADDRESS = "acme-jira"
 
 
 def _target(kind: str, address: str) -> ReplyTarget:
@@ -111,12 +116,57 @@ def test_a_github_turn_completed_acks_locally_with_no_endpoint(
     asyncio.run(go())
 
 
+# --- Every tracker surface kind is acknowledged locally (#4358 plan D9) ------
+
+
+def test_tracker_kinds_are_github_gitlab_and_jira() -> None:
+    assert tuple(TRACKER_KINDS) == ("github", "gitlab", "jira")
+
+
+@pytest.mark.parametrize(
+    ("kind", "address"),
+    [("jira", JIRA_ADDRESS), ("gitlab", "acme-group/acme-bot")],
+)
+def test_a_tracker_reply_update_acks_locally_with_no_endpoint(
+    monkeypatch: pytest.MonkeyPatch, kind: str, address: str
+) -> None:
+    monkeypatch.setattr(aiohttp, "ClientSession", _NoNetworkSession)
+
+    async def go() -> None:
+        sink = build_reply_sink(_config())
+        ack = await sink.emit(
+            _update(kind, address),
+            route=TargetRoute(endpoint=None, adapter=None),
+        )
+        assert ack is not None
+        assert ack.ref is None
+        completed = TurnCompleted(
+            version=REPLY_WIRE_VERSION,
+            event="turn.completed",
+            target=_target(kind, address),
+            event_id="ev-2",
+            outcome="delivered",
+        )
+        done = await sink.emit(completed, route=TargetRoute(endpoint=None, adapter=None))
+        assert done is not None and done.ref is None
+
+    asyncio.run(go())
+
+
+def test_the_tracker_sink_is_one_class_for_every_tracker_kind() -> None:
+    # The sink is tracker neutral; the GitHub-named class is gone.
+    import curie_worker.reply_sink as module
+
+    assert not hasattr(module, "GitHubReplySink")
+    assert TrackerReplySink.__name__ == "TrackerReplySink"
+
+
 # --- Negative: a different non-Slack kind still fails closed with no endpoint -
 
 
 def test_a_non_github_kind_with_no_endpoint_still_raises() -> None:
     # This is the guard against a blanket "no endpoint -> succeed" fix: only
-    # kind "github" may skip the HTTP adapter. Every other kind with no
+    # the tracker kinds may skip the HTTP adapter. Every other kind with no
     # endpoint must still fail closed exactly as it does today.
     async def go() -> None:
         sink = build_reply_sink(_config())

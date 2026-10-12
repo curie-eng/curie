@@ -4,8 +4,9 @@
 Center through it, and the server is the throwaway fixture that
 `curie dev forge-fixture bitbucket-dc up` starts. The driver reads that
 fixture's `state.json` from CURIE_BITBUCKET_DC_FIXTURE: the base URL, the test
-CA, the repository and the passwords of its seeded users. Ticket operations go
-to the Jira Cloud driver, built on first use.
+CA, the repository and the passwords of its seeded users. Ticket operations and
+the "close Jira test issues" teardown go to the Jira Cloud driver
+(forges/jira_cloud.py), built on first use.
 
 The change is the pull request the WorkItem records, CI is the
 repository-scoped build statuses on its head, the review is a top-level
@@ -35,7 +36,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from email.message import Message
 from pathlib import Path
 from typing import IO, Any
@@ -118,6 +119,7 @@ class BitbucketDcDriver:
     """ForgeDriver (forges/base.py) for the Bitbucket Data Center fixture."""
 
     forge = "bitbucket_dc"
+    pairing = "jira_cloud+bitbucket_dc"
 
     def __init__(self, p: fe.Preflight) -> None:
         path = os.environ.get(FIXTURE_VAR, "").strip()
@@ -231,10 +233,25 @@ class BitbucketDcDriver:
 
     # --- tickets (Jira Cloud) -------------------------------------------
 
-    def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
+    def _tracker(self) -> Any:
         if self._jira is None:
             self._jira = fe.FORGES["jira_cloud"].driver(self.p)
-        return str(self._jira.open_and_label_ticket(title, body, since))
+        return self._jira
+
+    def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
+        return str(self._tracker().open_and_label_ticket(title, body, since))
+
+    def teardowns(self) -> tuple[tuple[str, Callable[[], Any]], ...]:
+        # The Jira driver closes and unlabels every issue it opened.
+        return tuple(self._tracker().teardowns())
+
+    def tracker_evidence(self, change: fe.ChangeRef | None, work_item_id: str) -> dict[str, Any]:
+        # The Jira tracker evidence is the jira_cloud+github entry's; this
+        # pairing asserts the loop only.
+        return {}
+
+    def judge_tracker(self, evidence: Mapping[str, Any]) -> list[str]:
+        return []
 
     def await_change(self, work_item_id: str) -> fe.ChangeRef | None:
         return fe.await_work_item_change(self.p, work_item_id)

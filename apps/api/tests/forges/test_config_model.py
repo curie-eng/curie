@@ -237,6 +237,28 @@ def test_jira_pairs_with_any_code_host() -> None:
     _load(document)
 
 
+def test_two_code_host_entries_of_one_kind_on_one_host_are_refused() -> None:
+    """r1 finding 5: a stored repository records only its code host's kind and
+    host, so that pair names exactly one entry and one credential."""
+
+    document = samples.jira_document()
+    gitlab = next(host for host in document["code_hosts"] if host["kind"] == "gitlab")
+    document["code_hosts"].append({**gitlab, "name": "gitlab-second"})
+    _refused(document, "both gitlab on gitlab.example: configure one code host entry per host")
+    # Liveness: the same kind on another host is a second entry of its own.
+    document["code_hosts"][-1] = {
+        **gitlab,
+        "name": "gitlab-second",
+        "host": "gitlab.other.example",
+        "api_url": "https://gitlab.other.example/api/v4",
+    }
+    config = _load(document)
+    assert {(h.kind, h.host) for h in config.code_hosts} >= {
+        ("gitlab", "gitlab.example"),
+        ("gitlab", "gitlab.other.example"),
+    }
+
+
 def test_a_native_binding_lists_exactly_its_own_repository() -> None:
     document = samples.github_document()
     repos = document["bindings"][0]["repos"]

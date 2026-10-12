@@ -1,7 +1,9 @@
 """The forge registry builds the factory's adapters from typed config (#4397 AC 1).
 
 A GitHub code host and tracker entry yield the GitHub adapters, configured from
-the entry and not from the install's settings. Every reserved kind (a kind the
+the entry and not from the install's settings. A Jira Cloud tracker entry
+yields a binding-scoped tracker connection (#4358, plan D13), and a code host is
+found by its kind and host (plan D14). Every reserved kind (a kind the
 config model accepts but this build ships no adapter for) is refused with an
 error naming the kind and the entry, and a valid entry beside it never hides
 the refusal. The refusal is about installation, not the kind name: a kind a
@@ -22,12 +24,18 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from curie_api.forges import types
 from curie_api.forges.config import (
+    BindingConfig,
     CodeHostConfig,
     CodeHostKind,
     ForgesConfig,
     TrackerConfig,
     TrackerKind,
 )
+from curie_api.forges.connections import (
+    BindingTrackerConnection,
+    RepositoryTrackerConnection,
+)
+from curie_api.forges.errors import Unavailable
 from curie_api.forges.github.code_host import GitHubCodeHost
 from curie_api.forges.github.comments import static_token
 from curie_api.forges.github.tracker import GitHubTracker
@@ -41,7 +49,7 @@ from curie_api.forges.types import CredentialScope
 from forge_fakes import config_samples as samples
 
 INSTALLED_CODE_HOSTS = frozenset({types.GITHUB, types.BITBUCKET_CLOUD, types.BITBUCKET_DC})
-INSTALLED_TRACKERS = frozenset({types.GITHUB})
+INSTALLED_TRACKERS = frozenset({types.GITHUB, types.JIRA_CLOUD})
 GHE_API = "https://ghe.example.com/api/v3"
 GHE_HOST = "ghe.example.com"
 REPO = "acme-corp/api"
@@ -218,7 +226,6 @@ def _gitlab_tracker(name: str = "corp-gitlab") -> dict[str, Any]:
 RESERVED_ENTRIES: dict[str, tuple[str, dict[str, Any]]] = {
     "gitlab-code_host": ("code_hosts", samples.gitlab_code_host("corp-gitlab")),
     "gitlab-tracker": ("trackers", _gitlab_tracker()),
-    "jira_cloud-tracker": ("trackers", samples.jira_tracker("corp-jira")),
 }
 
 
@@ -266,11 +273,11 @@ def test_a_github_only_config_passes_the_installed_check(private_key: str) -> No
     check_installed(_config(_github_entries(private_key)))
 
 
-@pytest.mark.parametrize("module", ["gitlab", "jira_cloud"])
+@pytest.mark.parametrize("module", ["gitlab"])
 def test_reserved_packages_register_not_installed(module: str) -> None:
     importlib.import_module(f"curie_api.forges.{module}")
     kind = module
-    section = "trackers" if kind == "jira_cloud" else "code_hosts"
+    section = "code_hosts"
     entry = next(e for s, e in RESERVED_ENTRIES.values() if s == section and e["kind"] == kind)
 
     with pytest.raises(NotInstalled, match=kind):
@@ -303,12 +310,29 @@ class _FakeConnection:
         self.config = config
 
 
-def _fake_kind() -> str:
+class _FakeBindingTracker(_FakeConnection):
+    """A binding-scoped tracker connection, the shape every non-GitHub kind registers."""
+
+    def for_binding(self, client: Any, binding: Any, *, label: str | None = None) -> Any:
+        raise NotImplementedError
+
+    def issue_url(self, issue: Any) -> str:
+        raise NotImplementedError
+
+
+class _FakeRepositoryTracker(_FakeConnection):
+    """A repository-scoped tracker connection, GitHub's shape."""
+
+    def for_repository(self, client: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError
+
+
+def _fake_kind(tracker: type[_FakeConnection] = _FakeBindingTracker) -> str:
     """A kind registered installed for one test, with a fresh name so the
     one-registration rule never trips across tests."""
 
     kind = f"test_fake_{uuid.uuid4().hex[:8]}"
-    register(kind, tracker=_FakeConnection, code_host=_FakeConnection)
+    register(kind, tracker=tracker, code_host=_FakeConnection)
     return kind
 
 
@@ -353,6 +377,33 @@ def test_registry_builds_a_kind_registered_installed(private_key: str) -> None:
     assert registry.tracker("fake-tracker").config.name == "fake-tracker"
     assert registry.code_host("fake-host").config.name == "fake-host"
     assert registry.github_tracker() is registry.tracker("corp-issues")
+
+
+def test_registry_refuses_a_non_github_tracker_kind_that_is_not_binding_scoped(
+    private_key: str,
+) -> None:
+    """r1 finding 9: the generic intake polls every non-GitHub tracker per
+    binding, so a kind registering a repository-scoped connection is refused when
+    the registry is built (config load), naming the entry and kind. The test
+    above is the liveness case: a binding-scoped kind builds."""
+
+    kind = _fake_kind(_FakeRepositoryTracker)
+    github = _config(_github_entries(private_key))
+    config = ForgesConfig.model_construct(
+        code_hosts=github.code_hosts,
+        trackers=(*github.trackers, _constructed_tracker(kind, "native-issues")),
+        bindings=(),
+        card_base_url="",
+    )
+
+    with pytest.raises(ValueError) as refused:
+        build_registry(config)
+
+    message = str(refused.value)
+    assert "'native-issues'" in message and kind in message
+    assert "BindingTrackerConnection" in message
+    # GitHub, repository scoped, is the one kind exempt.
+    assert isinstance(build_registry(github).tracker("corp-issues"), RepositoryTrackerConnection)
 
 
 # One GitHub ------------------------------------------------------------------------
@@ -429,3 +480,90 @@ def test_repository_policy_matches_the_id_first_then_the_path_case_insensitively
     assert by_path.bases == by_id.bases
     assert registry.repository_policy("github", GHE_HOST, "acme-corp/other", "1") is None
     assert registry.binding("acme-api").name == "acme-api"
+
+
+# Jira Cloud and kind-neutral lookups (#4358, plan D13 and D14) ----------------------
+
+JIRA_SITE_ID = "11111111-1111-1111-1111-111111111111"
+
+
+def _jira_entries(private_key: str) -> dict[str, Any]:
+    document = _github_entries(private_key)
+    document["trackers"].append(
+        {
+            "name": "corp-site",
+            "kind": "jira_cloud",
+            "host": "acme.atlassian.example",
+            "api_url": "https://acme.atlassian.example",
+            "credential": {
+                "type": "static_token",
+                "token": "jira-registry-fixture-token",
+                "username": "factory-bot@example.com",
+            },
+            "label": "curie",
+            "mention": "712020:bbbbbbbb-0000-4000-8000-000000000002",
+        }
+    )
+    document["bindings"] = [
+        {
+            "name": "acme-site",
+            "tracker": "corp-site",
+            "tracker_scope_id": JIRA_SITE_ID,
+            "repos": [
+                {
+                    "alias": "api",
+                    "code_host": "corp-github",
+                    "project_id": str(REPO_ID),
+                    "path": REPO,
+                }
+            ],
+            "default_repo": "api",
+            "start_authority": {"type": "group", "group_id": "starters"},
+        }
+    ]
+    return document
+
+
+@pytest.mark.anyio
+async def test_registry_builds_a_jira_tracker_as_a_binding_scoped_connection(
+    private_key: str,
+) -> None:
+    registry = build_registry(_config(_jira_entries(private_key)))
+
+    connection = registry.binding_tracker("corp-site")
+
+    assert connection is registry.tracker("corp-site")
+    assert isinstance(connection, BindingTrackerConnection)
+    assert not isinstance(connection, RepositoryTrackerConnection)
+    assert connection.config.kind == types.JIRA_CLOUD
+    binding: BindingConfig = registry.binding("acme-site")
+    async with httpx.AsyncClient() as client:
+        tracker = connection.for_binding(client, binding)
+    assert (tracker.kind, tracker.host) == (types.JIRA_CLOUD, "acme.atlassian.example")
+    # The GitHub tracker keeps its repository-scoped accessor beside it.
+    github = registry.github_tracker()
+    assert github is registry.tracker("corp-issues")
+    assert isinstance(github, RepositoryTrackerConnection)
+
+
+def test_binding_tracker_refuses_a_repository_scoped_tracker(private_key: str) -> None:
+    registry = build_registry(_config(_jira_entries(private_key)))
+
+    with pytest.raises(Unavailable) as refused:
+        registry.binding_tracker("corp-issues")
+
+    assert str(refused.value) == "tracker_not_binding_scoped"
+
+
+def test_code_host_for_finds_the_entry_by_kind_and_host(private_key: str) -> None:
+    registry = build_registry(_config(_jira_entries(private_key)))
+
+    assert registry.code_host_for(types.GITHUB, GHE_HOST) is registry.code_host("corp-github")
+    for kind, host in (
+        (types.GITHUB, "github.com"),
+        (types.GITLAB, GHE_HOST),
+        (types.BITBUCKET_CLOUD, "bitbucket.example"),
+    ):
+        with pytest.raises(Unavailable) as refused:
+            registry.code_host_for(kind, host)
+        assert str(refused.value) == "code_host_unconfigured"

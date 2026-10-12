@@ -71,6 +71,7 @@ RECONCILER_STEPS = (
     "_settle_overdue_cancellations",
     "_readmit_pending",
     "_reconcile_missed_labels",
+    "_poll_trackers",
     "_redispatch_lapsed_acquisitions",
     "_publish_execute_wakes",
 )

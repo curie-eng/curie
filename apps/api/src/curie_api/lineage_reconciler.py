@@ -36,11 +36,11 @@ from curie_api.crud import lineages as crud_lineages
 from curie_api.crud.errors import PublicationLineageConflict
 from curie_api.forges.errors import ForgeError, Unavailable
 from curie_api.forges.ports import CodeHost
-from curie_api.forges.types import PullRequestRef, PullRequestState
+from curie_api.forges.types import PullRequestRef, PullRequestState, RepositoryRef
 
 from .config import Settings
-from .forges.hosts import factory_code_host, pull_request_ref
 from .forges.registry import forges_registry
+from .forges.trackers import code_host_for_repository, stored_repository
 from .models import ThreadPublicationLineage, WorkItem
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,7 @@ class LineageReconciler:
         self,
         sessionmaker: async_sessionmaker[AsyncSession],
         settings: Settings,
-        code_host: Callable[[], CodeHost],
+        code_host_for: Callable[[RepositoryRef], CodeHost],
         *,
         interval_seconds: float,
         batch_limit: int = 50,
@@ -86,7 +86,7 @@ class LineageReconciler:
             raise ValueError("the lineage reconcile batch limit must be positive")
         self._sessionmaker = sessionmaker
         self._settings = settings
-        self._code_host = code_host
+        self._code_host_for = code_host_for
         self._interval = interval_seconds
         self._batch_limit = batch_limit
         # Lineage ids are read in id order from just past this one, wrapping,
@@ -96,7 +96,12 @@ class LineageReconciler:
     async def _batch(self) -> list[_Open]:
         async with self._sessionmaker() as session:
             query = (
-                select(ThreadPublicationLineage, WorkItem.repository_project_id)
+                select(
+                    ThreadPublicationLineage,
+                    WorkItem.repository_project_id,
+                    WorkItem.code_host_kind,
+                    WorkItem.code_host_host,
+                )
                 .join(WorkItem, WorkItem.publication_lineage_id == ThreadPublicationLineage.id)
                 .where(
                     ThreadPublicationLineage.status == "open",
@@ -120,7 +125,7 @@ class LineageReconciler:
             # Snapshot before the rollback, which expires every loaded row.
             found: list[_Open] = []
             seen: set[uuid.UUID] = set()
-            for lineage, work_item_project_id in rows:
+            for lineage, work_item_project_id, work_item_kind, work_item_host in rows:
                 if lineage.id in seen:
                     continue
                 seen.add(lineage.id)
@@ -133,11 +138,17 @@ class LineageReconciler:
                         head_sha=lineage.head_sha,
                         branch=lineage.branch,
                         pr_url=lineage.pr_url,
-                        pull_request=pull_request_ref(
-                            self._settings,
-                            path=lineage.repo_full_name,
-                            project_id=lineage.repository_project_id or work_item_project_id,
-                            number=lineage.pr_number,
+                        # The code host entry the lineage (or its WorkItem)
+                        # recorded (#4358 plan D14).
+                        pull_request=PullRequestRef(
+                            stored_repository(
+                                self._settings,
+                                kind=lineage.code_host_kind or work_item_kind,
+                                host=lineage.code_host_host or work_item_host,
+                                path=lineage.repo_full_name,
+                                project_id=lineage.repository_project_id or work_item_project_id,
+                            ),
+                            str(lineage.pr_number),
                         ),
                     )
                 )
@@ -173,9 +184,15 @@ class LineageReconciler:
         """One bounded pass over the open factory lineages."""
 
         result = PassResult()
-        code_host = self._code_host()
+        # One code host per stored (kind, host) entry within a pass.
+        hosts: dict[tuple[str, str], CodeHost] = {}
         for item in await self._batch():
+            repository = item.pull_request.repository
+            key = (repository.kind, repository.host)
             try:
+                code_host = hosts.get(key)
+                if code_host is None:
+                    code_host = hosts[key] = self._code_host_for(repository)
                 pull = await code_host.read_pull_request(item.pull_request)
             except Unavailable as exc:
                 result.skipped += 1
@@ -237,7 +254,9 @@ def start_lineage_reconciler(
     reconciler = LineageReconciler(
         sessionmaker,
         settings,
-        lambda: factory_code_host(forges_registry(settings), client),
+        lambda repository: code_host_for_repository(
+            forges_registry(settings), client, repository
+        ),
         interval_seconds=interval,
     )
     return asyncio.create_task(reconciler.run_forever())

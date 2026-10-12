@@ -17,8 +17,10 @@ network:
 5. What the drivers report passes `judge_github_loop`, the loop's judge, on a
    whole loop driven against a stubbed provider, and fails it when the
    factory never pushes the CI fix.
-6. `jira_cloud+bitbucket_cloud` and `jira_cloud+bitbucket_dc` dry-run to exit 0
-   and list every step without constructing a driver (decision 18.7).
+6. `jira_cloud+bitbucket_cloud` and `jira_cloud+bitbucket_dc` are refused as
+   not installed, naming #4400 (the combined Jira Cloud and Bitbucket
+   quickstart), while a dry run still lists every step without constructing a
+   driver, and a real run launches nothing.
 
 The HTTP seam is the HTTPS handler under each driver's opener: the stub
 replaces `urllib.request.HTTPSHandler`, so every request still passes through
@@ -72,8 +74,7 @@ CLOUD_VARS = (
     "CURIE_BITBUCKET_CLOUD_REPO",
     "CURIE_BITBUCKET_CLOUD_TOKEN_FILE",
     "CURIE_BITBUCKET_CLOUD_REVIEWER_TOKEN_FILE",
-    "CURIE_JIRA_SITE",
-    "CURIE_JIRA_TOKEN_FILE",
+    "CURIE_FACTORY_JIRA_ENV_FILE",
 )
 CLOUD_API = "https://api.bitbucket.org/2.0/repositories/example-workspace/example-repo"
 FACTORY_TOKEN = "factory-token-placeholder"
@@ -272,14 +273,13 @@ def _cloud_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     factory.write_text(FACTORY_TOKEN + "\n")
     reviewer = tmp_path / "reviewer-token"
     reviewer.write_text(REVIEWER_TOKEN + "\n")
-    jira = tmp_path / "jira-token"
-    jira.write_text("jira-token-placeholder\n")
+    jira = tmp_path / "jira.env"
+    jira.write_text("site=example.atlassian.net\n")
     values = {
         "CURIE_BITBUCKET_CLOUD_REPO": "example-workspace/example-repo",
         "CURIE_BITBUCKET_CLOUD_TOKEN_FILE": str(factory),
         "CURIE_BITBUCKET_CLOUD_REVIEWER_TOKEN_FILE": str(reviewer),
-        "CURIE_JIRA_SITE": "https://example.invalid",
-        "CURIE_JIRA_TOKEN_FILE": str(jira),
+        "CURIE_FACTORY_JIRA_ENV_FILE": str(jira),
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -1230,20 +1230,21 @@ def _forbid_drivers(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("key", PAIRINGS)
-def test_bitbucket_pairing_dry_run_lists_every_step_and_passes(
+def test_bitbucket_pairing_dry_run_lists_every_step_and_is_refused_naming_4400(
     key: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _forbid_drivers(monkeypatch)
     pairing = acceptance.PAIRINGS[key]
-    assert pairing.installed is True
+    assert pairing.installed is False
     assert acceptance.unset_fields(pairing) == []
 
     out = io.StringIO()
-    assert acceptance.dry_run(key, out) == 0
+    assert acceptance.dry_run(key, out) == fe.EXIT_SCENARIO
 
     text = out.getvalue()
-    assert "  installed\n" in text
-    assert "not installed" not in text
+    assert f"  {key} is not installed: " in text
+    assert "#4400" in text
+    assert "forge driver" not in text
     assert "unset:" not in text
     tracker, code_host = key.split("+")
     assert f"tracker {tracker}, code host {code_host}" in text
@@ -1256,15 +1257,26 @@ def test_bitbucket_pairing_dry_run_lists_every_step_and_passes(
 
 
 @pytest.mark.parametrize("key", PAIRINGS)
-def test_main_dry_run_of_a_bitbucket_pairing_exits_zero(
+def test_main_dry_run_of_a_bitbucket_pairing_is_refused_naming_4400(
     key: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     _forbid_drivers(monkeypatch)
-    assert fe.main(["acceptance", "--pairing", key, "--dry-run"]) == 0
+    assert fe.main(["acceptance", "--pairing", key, "--dry-run"]) == fe.EXIT_SCENARIO
     out = capsys.readouterr().out
-    assert "not installed" not in out
+    assert "not installed" in out and "#4400" in out
     for step in acceptance.PAIRINGS[key].steps:
         assert step.name in out
+
+
+@pytest.mark.parametrize("key", PAIRINGS)
+def test_main_real_run_of_a_bitbucket_pairing_launches_nothing_naming_4400(
+    key: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _forbid_drivers(monkeypatch)
+    monkeypatch.setattr(fe, "load_config", lambda *_a, **_k: pytest.fail("no config load"))
+    assert fe.main(["acceptance", "--pairing", key]) == fe.EXIT_SCENARIO
+    err = capsys.readouterr().err
+    assert "not installed" in err and "#4400" in err
 
 
 def test_the_bitbucket_self_pairings_are_gone() -> None:

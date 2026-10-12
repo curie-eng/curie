@@ -3,7 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict
 
 
 class IssueReadContextMint(BaseModel):
@@ -15,44 +15,25 @@ class IssueReadContextMint(BaseModel):
 
 
 class IssueReadContext(BaseModel):
-    """The execution scoped capability and the one issue it names."""
+    """The execution scoped capability and the one issue it names: ``issue`` is
+    how a person names it (``curie-eng/curie#12`` on GitHub, ``PROJ-12`` on Jira)."""
 
     work_item_id: uuid.UUID
     execution_request_id: uuid.UUID
-    repo_full_name: str
-    issue_number: int
+    issue: str
     capability: str
 
 
-class IssueReadRequest(BaseModel):
-    """The issue the sandbox asks for. Anything but the capability's is refused."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    repo_full_name: str = Field(min_length=3, max_length=512)
-    issue_number: int = Field(gt=0)
-
-
-class IssueReadComment(BaseModel):
-    author: str | None
-    created_at: str | None
-    body: str
-
-
 class IssueReadResult(BaseModel):
-    """The issue verbatim with its execution deadline and total allowed seconds.
+    """The ticket as its tracker renders it in markdown (title, description and
+    comments), its link, and the execution deadline and total allowed seconds.
 
-    The platform parses and stores none of the issue content.
+    The platform parses and stores none of the ticket content.
     """
 
-    repo_full_name: str
-    issue_number: int
-    title: str
-    body: str
-    state: str | None
-    author: str | None
-    comments: list[IssueReadComment]
-    comments_truncated: bool
+    issue: str
+    url: str
+    ticket: str
     execution_deadline: AwareDatetime
     execution_seconds: int
 

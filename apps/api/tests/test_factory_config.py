@@ -284,22 +284,6 @@ def test_a_github_static_token_in_curie_forges_is_refused_naming_the_entry(
                 "credential": {"type": "static_token", "token": "glpat-fixture"},
             },
         ),
-        (
-            "trackers",
-            {
-                "name": "corp-jira",
-                "kind": "jira_cloud",
-                "host": "acme.atlassian.example",
-                "api_url": "https://api.atlassian.example/ex/jira/site",
-                "credential": {
-                    "type": "oauth_client_credentials",
-                    "client_id": "client-1",
-                    "client_secret": "secret-fixture",
-                },
-                "label": "curie",
-                "mention": "712020:bbbbbbbb-0000-4000-8000-000000000002",
-            },
-        ),
     ],
 )
 def test_a_reserved_kind_in_curie_forges_is_refused_at_load_naming_it(

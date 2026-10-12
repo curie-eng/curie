@@ -122,5 +122,12 @@ def redact_factory_comment(body: str) -> str:
     return body
 
 
+def status_marker(request_id: uuid.UUID) -> str:
+    """The core-owned marker of one request's status comment; a tracker
+    adapter decides how to carry it (`MarkedComments.upsert_marked`)."""
+
+    return f"curie-execution-request:{request_id}"
+
+
 def marker_for(request_id: uuid.UUID) -> str:
-    return f"<!-- curie-execution-request:{request_id} -->"
+    return f"<!-- {status_marker(request_id)} -->"

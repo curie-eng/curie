@@ -33,7 +33,13 @@ from sqlalchemy.orm import aliased
 
 from curie_api.workitems import lifecycle
 
-from . import factory_ci, factory_label_reconcile, factory_notices, factory_poll_intake
+from . import (
+    factory_ci,
+    factory_label_reconcile,
+    factory_notices,
+    factory_poll_intake,
+    factory_tracker_intake,
+)
 from .code_host_trust import code_host_verify
 from .config import Settings
 from .forges.registry import forges_registry
@@ -84,6 +90,8 @@ class WorkItemReconciler:
         self._ci_pass = 0
         # Monotonic time of the next missed-label listing (#3081).
         self._labels_due = 0.0
+        # Monotonic due time per tracker poll and refusal sweep (#4358 plan D2).
+        self._trackers_due: dict[str, float] = {}
         self._step_consecutive_failures: dict[str, int] = {}
 
     def _stream(self) -> str:
@@ -148,6 +156,7 @@ class WorkItemReconciler:
             ("settle_overdue_cancellations", self._settle_overdue_cancellations),
             ("readmit_pending", self._readmit_pending),
             ("reconcile_missed_labels", self._reconcile_missed_labels),
+            ("poll_trackers", self._poll_trackers),
             ("redispatch_lapsed_acquisitions", self._redispatch_lapsed_acquisitions),
             ("publish_execute_wakes", self._publish_execute_wakes),
         ):
@@ -544,6 +553,27 @@ class WorkItemReconciler:
                 await factory_label_reconcile.reconcile_missed_labels(
                     self._sessionmaker, settings, client, now=datetime.now(UTC)
                 )
+
+    async def _poll_trackers(self) -> None:
+        """Poll every non-GitHub tracker binding through the ports (#4358 plan D1).
+
+        It runs whatever the GitHub intake mode is: such a tracker has no
+        webhook, so its poll is its intake.
+        """
+
+        settings = self._settings
+        if not settings.factory_enabled:
+            return
+        async with httpx.AsyncClient(
+            timeout=settings.github_app_timeout_seconds, verify=code_host_verify(settings)
+        ) as client:
+            await factory_tracker_intake.poll_trackers(
+                self._sessionmaker,
+                settings,
+                client,
+                due=self._trackers_due,
+                clock=asyncio.get_running_loop().time(),
+            )
 
     async def _sync_status_comments(self) -> None:
         paused_for_upgrade = False

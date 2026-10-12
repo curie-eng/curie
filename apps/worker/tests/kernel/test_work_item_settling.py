@@ -126,9 +126,10 @@ class Api:
             return httpx.Response(
                 200,
                 json={
+                    "work_item_id": str(self.request_id),
                     "execution_request_id": str(self.request_id),
-                    "repo_full_name": "acme-corp/widgets",
-                    "issue_number": 123,
+                    # The tracker-neutral display reference (#4358 plan D8).
+                    "issue": "curie-eng/curie#123",
                     "capability": "example-capability",
                 },
             )
@@ -1370,3 +1371,61 @@ def test_an_unrelated_turn_on_the_thread_never_rebinds_the_runs_claim(
                 assert h.kernel._workspace.releases == []
 
     asyncio.run(go())
+
+
+# --- The issue read context is tracker neutral (#4358 plan D8) ---------------
+
+
+def _issue_read_context(body: dict[str, Any]) -> tuple[str, str]:
+    request_id = uuid.UUID(str(body["execution_request_id"]))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/internal/work-items/issue-read/context"
+        return httpx.Response(200, json=body)
+
+    async def go() -> tuple[str, str]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            client = WorkItemDispatchClient(
+                api_base_url="http://api.example", worker_token="example-token", client=http
+            )
+            return await client.issue_read_context(request_id)
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize("issue", ["curie-eng/curie#123", "PROJ-7"], ids=["github", "jira_cloud"])
+def test_issue_read_context_returns_the_display_reference_the_api_names(issue: str) -> None:
+    request_id = uuid.uuid4()
+    named, capability = _issue_read_context(
+        {
+            "work_item_id": str(uuid.uuid4()),
+            "execution_request_id": str(request_id),
+            "issue": issue,
+            "capability": "example-capability",
+        }
+    )
+    assert (named, capability) == (issue, "example-capability")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"issue": ""},
+        {"issue": None},
+        # The removed GitHub-shaped fields are not read any more.
+        {"repo_full_name": "acme-corp/widgets", "issue_number": 123},
+    ],
+)
+def test_issue_read_context_without_an_issue_reference_is_unusable(
+    body: dict[str, Any],
+) -> None:
+    request_id = uuid.uuid4()
+    with pytest.raises(WorkItemTransportError):
+        _issue_read_context(
+            {
+                "work_item_id": str(uuid.uuid4()),
+                "execution_request_id": str(request_id),
+                "capability": "example-capability",
+                **body,
+            }
+        )

@@ -55,27 +55,34 @@ def stored_reply_target(request: ExecutionRequest, work_item: WorkItem) -> Reply
     return ReplyTarget.on_pull_request(pull_request)
 
 
-def is_issue_follow_up(
-    objective: str | None, *, repo_full_name: str, issue_number: int, clone_base: str
-) -> bool:
+def _first_line(objective: str | None) -> str | None:
     if not isinstance(objective, str) or not objective:
+        return None
+    return objective.split("\n", 1)[0]
+
+
+def is_issue_follow_up(objective: str | None, *, issue_link: str, comment_prefix: str) -> bool:
+    """Whether ``objective`` opens with a comment on the issue at ``issue_link``.
+
+    ``comment_prefix`` is the tracker's comment fragment (`forges.trackers.comment_prefix`).
+    The comment id is a positive 64-bit integer.
+    """
+
+    line = _first_line(objective)
+    if line is None:
         return False
     match = re.fullmatch(
-        rf"{re.escape(clone_base.rstrip('/'))}/{re.escape(repo_full_name)}/issues/{issue_number}#issuecomment-([1-9][0-9]{{0,18}})",
-        objective.split("\n", 1)[0],
+        rf"{re.escape(issue_link)}{re.escape(comment_prefix)}([1-9][0-9]{{0,18}})", line
     )
     return match is not None and int(match.group(1)) <= 2**63 - 1
 
 
-def is_relabel_objective(
-    objective: str | None, *, repo_full_name: str, issue_number: int, clone_base: str
-) -> bool:
-    if not isinstance(objective, str) or not objective:
-        return False
-    return (
-        re.fullmatch(
-            rf"{re.escape(clone_base.rstrip('/'))}/{re.escape(repo_full_name)}/issues/{issue_number}",
-            objective.split("\n", 1)[0],
-        )
-        is not None
-    )
+def is_relabel_objective(objective: str | None, *, issue_link: str, comment_prefix: str) -> bool:
+    """Whether ``objective`` opens with exactly the issue link: a relabel.
+
+    ``comment_prefix`` is accepted so both matchers read one tracker's answer;
+    a bare link carries no comment.
+    """
+
+    del comment_prefix
+    return _first_line(objective) == issue_link

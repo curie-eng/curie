@@ -26,6 +26,7 @@ mod gitlab;
 mod jira_cloud;
 
 pub use github::{deploy_args, intake_args, registration_steps, RerunTarget};
+pub use jira_cloud::{preflight as jira_preflight, JiraPlan};
 
 pub const DEFAULT_KIND_NAME: &str = "curie-factory";
 pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
@@ -61,6 +62,9 @@ pub struct QuickstartOpts {
     /// An operator bundle deployed as given (`--plugin-dir`).
     pub plugin_dir: Option<PathBuf>,
     pub chart: String,
+    /// `--chart` was passed, so `chart` is the operator's and the deploy
+    /// uses it too.
+    pub chart_explicit: bool,
     pub dry_run: bool,
     pub forge: ForgeFlags,
 }
@@ -76,6 +80,10 @@ pub struct RecordedIntake {
     /// The Secret and data key holding the App private key.
     pub pem_secret: String,
     pub pem_secret_key: String,
+    /// The `jira` entries of `factory.trackers` and `factory.bindings`, which
+    /// a Jira quickstart wrote and every Jira agent on the release serves.
+    pub jira_tracker: Option<serde_json::Value>,
+    pub jira_binding: Option<serde_json::Value>,
 }
 
 /// One agent's GitHub binding on the serving release, as the API lists it.
@@ -129,12 +137,19 @@ pub fn recorded_intake(values: &serde_json::Value) -> Option<RecordedIntake> {
                 .collect()
         })
         .unwrap_or_default();
+    let named = |list: &str| {
+        factory.get(list)?.as_array()?.iter().find(|entry| {
+            entry.get("name").and_then(|v| v.as_str()) == Some(jira_cloud::BINDING_NAME)
+        })
+    };
     Some(RecordedIntake {
         app_id,
         install_label,
         repo_allowlist,
         pem_secret,
         pem_secret_key,
+        jira_tracker: named("trackers").cloned(),
+        jira_binding: named("bindings").cloned(),
     })
 }
 
@@ -168,6 +183,12 @@ pub struct ForgeFlags {
     pub token_file: Option<PathBuf>,
     pub ca_file: Option<PathBuf>,
     pub review_accounts: Vec<String>,
+    /// The account a Jira token authenticates as (`--forge-username`).
+    pub forge_username: Option<String>,
+    /// Jira accounts allowed to start work (`--start-account`).
+    pub start_accounts: Vec<String>,
+    /// The Jira group allowed to start work (`--start-group`).
+    pub start_group: Option<String>,
 }
 
 /// One port of a forge egress entry, as the chart's `egress[].ports` reads it.
@@ -315,6 +336,9 @@ pub fn select_forge(forge: &ForgeFlags) -> Result<()> {
                 ("--token-file", forge.token_file.is_some()),
                 ("--ca-file", forge.ca_file.is_some()),
                 ("--review-account", !forge.review_accounts.is_empty()),
+                ("--forge-username", forge.forge_username.is_some()),
+                ("--start-account", !forge.start_accounts.is_empty()),
+                ("--start-group", forge.start_group.is_some()),
             ];
             match shared.iter().find(|(_, set)| *set) {
                 Some((flag, _)) => Err(CliError::usage(format!(
@@ -352,6 +376,8 @@ pub struct PlanInput {
     pub chart: String,
     pub credential_in_env: bool,
     pub release_has_real_model: bool,
+    /// `--chart` was passed; `cluster deploy` then gets it as well.
+    pub chart_explicit: bool,
     pub interactive: bool,
     /// The release is already the chart and the quickstart values, so this
     /// plan must not invoke `cluster up`.
@@ -370,6 +396,9 @@ pub struct PlanInput {
     pub bindings: Vec<AgentBinding>,
     /// The operator bundle's locked runner image; `None` is the platform runner.
     pub runner_image: Option<String>,
+    /// The Jira tracker this agent is bound through (`--tracker jira-cloud`);
+    /// `None` binds each repository's GitHub surface.
+    pub jira: Option<JiraPlan>,
 }
 
 /// Which run this is (#4362 decision 2).
@@ -417,6 +446,8 @@ pub enum Action {
         rerun_flags: Vec<String>,
     },
     Intake(Box<FactoryIntakeOpts>),
+    /// Apply the Jira token Secret and write the Jira tracker and binding.
+    JiraTracker(Box<JiraPlan>),
     /// Enroll an added agent for forge egress (`bind_forge_egress`).
     ForgeEgress {
         agent: String,
@@ -442,6 +473,12 @@ pub enum Action {
         /// Repositories this agent already holds under the requested effective
         /// label. Their `surfaces --add` is skipped so a rerun is idempotent.
         bound: Vec<String>,
+        /// The Jira binding the agent is bound through instead of one GitHub
+        /// surface per repository.
+        jira_binding: Option<String>,
+        /// The operator's `--chart`, passed on to `cluster deploy`; `None`
+        /// lets it resolve its default chart.
+        chart: Option<String>,
     },
 }
 
@@ -1112,11 +1149,26 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         (false, None) => QuickstartPath::Register,
     };
     // #4362 decision 5, in order, before any mutation.
+    // The `jira` tracker and binding serve every Jira agent on the release,
+    // so the add agent path writes them only when the release has none.
+    let mut write_jira = input.jira.is_some();
     if let (QuickstartPath::AddAgent, Some(recorded)) = (path, &input.recorded) {
         refuse_install_flags(input.model_explicit, input.org.as_deref())?;
         check_recorded_allowlist(input, recorded)?;
+        if let Some(jira) = &input.jira {
+            write_jira = jira_cloud::check_recorded(
+                jira,
+                recorded.jira_tracker.as_ref(),
+                recorded.jira_binding.as_ref(),
+                &input.release,
+            )?;
+        }
     }
-    check_bindings(input)?;
+    // A Jira agent holds no GitHub surface, so the GitHub binding rules do
+    // not apply to it.
+    if input.jira.is_none() {
+        check_bindings(input)?;
+    }
     if let (QuickstartPath::Install, Some(recorded)) = (path, &input.recorded) {
         check_allowlist_kept(input, recorded)?;
     }
@@ -1214,13 +1266,26 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         runner_image: bundle.as_ref().and(input.runner_image.clone()),
         bundle,
         // Empty when no release serves yet, so a fresh install still binds.
-        bound: already_bound(input),
+        bound: if input.jira.is_some() {
+            Vec::new()
+        } else {
+            already_bound(input)
+        },
+        jira_binding: input.jira.as_ref().map(|jira| jira.binding_name.clone()),
+        chart: input.chart_explicit.then(|| input.chart.clone()),
     };
+    let jira = input
+        .jira
+        .as_ref()
+        .filter(|_| write_jira)
+        .map(|jira| Action::JiraTracker(Box::new(jira.clone())));
     match path {
         QuickstartPath::Install => {
             actions.push(Action::Intake(Box::new(github::finish_intake_opts(
                 input, &context,
             ))));
+            // The intake writes the GitHub entries whole, so Jira's follow.
+            actions.extend(jira);
             // The intake creates the install label; an agent label is ours.
             if let Some(label) = &input.label {
                 actions.push(Action::TriggerLabel {
@@ -1232,6 +1297,7 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         }
         QuickstartPath::AddAgent => {
             let install = input.recorded.as_ref().map(|r| r.install_label.clone());
+            actions.extend(jira);
             actions.push(Action::ForgeEgress {
                 agent: input.agent.clone(),
             });
@@ -1408,6 +1474,9 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     intake_runner_clause(opts)
                 ));
             }
+            Action::JiraTracker(jira) => {
+                lines.push(jira_tracker_line(jira));
+            }
             Action::ForgeEgress { agent } => {
                 lines.push(format!(
                     "enroll {agent} for forge egress: helm upgrade --reset-then-reuse-values --set factory.sandboxEgress.{agent}=true unless the release already records it; the API does not roll"
@@ -1431,6 +1500,8 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 bundle,
                 runner_image,
                 bound,
+                jira_binding,
+                chart,
             } => {
                 let dir = match bundle {
                     None => {
@@ -1463,6 +1534,8 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     label.as_deref(),
                     &dir,
                     bound,
+                    jira_binding.as_deref(),
+                    chart.as_deref(),
                 ) {
                     lines.push(format!("curie {}", args.join(" ")));
                 }
@@ -1482,6 +1555,14 @@ pub fn describe(planned: &Planned) -> Vec<String> {
         }
     }
     lines
+}
+
+/// The plan line for the Jira tracker action.
+pub fn jira_tracker_line(jira: &JiraPlan) -> String {
+    format!(
+        "Write the Jira Cloud tracker and binding `{}` and Secret {}",
+        jira.binding_name, jira.secret_name
+    )
 }
 
 /// The plan line for a repository whose binding is already in place.
@@ -1641,9 +1722,10 @@ async fn release_matches_quickstart_target(
     Ok((matches, model.to_string()))
 }
 
-/// Runs the quickstart for the selected forge. Only GitHub is installed; the
-/// selection is checked again here so a caller that skipped [`select_forge`]
-/// still cannot run the GitHub flow for another kind.
+/// Runs the quickstart for the selected forge: GitHub, or a Jira Cloud tracker
+/// composed into the GitHub flow. The selection is checked again here so a
+/// caller that skipped [`select_forge`] still cannot run the flow for a kind
+/// this build does not install.
 pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     select_forge(&opts.forge)?;
     github::quickstart(opts).await
@@ -1998,6 +2080,7 @@ mod tests {
             chart: "charts/curie".into(),
             credential_in_env: false,
             release_has_real_model: false,
+            chart_explicit: false,
             interactive: true,
             release_at_target: false,
             agent: DEFAULT_AGENT.into(),
@@ -2007,6 +2090,7 @@ mod tests {
             recorded: None,
             bindings: Vec::new(),
             runner_image: None,
+            jira: None,
         }
     }
 
@@ -2543,6 +2627,8 @@ mod tests {
             None,
             &bundle_dir("ns", "rel", DEFAULT_AGENT),
             &[],
+            None,
+            None,
         );
         assert_eq!(argvs.len(), 3, "{argvs:?}");
         assert_eq!(&argvs[0][..2], ["cluster", "deploy"]);
@@ -2596,7 +2682,9 @@ mod tests {
                 DEFAULT_AGENT,
                 None,
                 &bundle_dir("ns", "rel", DEFAULT_AGENT),
-                &[]
+                &[],
+                None,
+                None,
             )
             .len(),
             2
@@ -2754,6 +2842,8 @@ mod tests {
             repo_allowlist: vec!["acme/widgets".into()],
             pem_secret: "factory-app".into(),
             pem_secret_key: "private-key.pem".into(),
+            jira_tracker: None,
+            jira_binding: None,
         }
     }
 
@@ -2936,6 +3026,8 @@ mod tests {
             label.as_deref(),
             Path::new("/bundle"),
             bound,
+            None,
+            None,
         );
         assert_eq!(argvs.len(), 1, "{argvs:?}");
         assert_eq!(&argvs[0][..2], ["cluster", "deploy"]);

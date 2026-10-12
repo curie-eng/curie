@@ -20,7 +20,7 @@ from curie_api.forges.errors import NotFound, Unavailable
 from curie_api.forges.github.code_host import PATH_ID_PREFIX, GitHubCodeHost
 from curie_api.forges.github.connection import GitHubCodeHostConnection, GitHubTrackerConnection
 from curie_api.forges.ports import CodeHost
-from curie_api.forges.registry import ForgeRegistry
+from curie_api.forges.registry import ForgeRegistry, forges_registry
 from curie_api.forges.types import PullRequestRef, RepositoryRef, TrackerIssueRef
 from curie_api.github_app import GitHubAuth, GitHubCredentials, credentials_for_auth
 
@@ -132,10 +132,13 @@ def issue_url(settings: Settings, issue: TrackerIssueRef, repository: Repository
     """The tracker's link to one issue. Makes no request.
 
     A GitHub issue is on its own repository, so ``repository`` supplies the path.
+    Any other tracker links it through `forges.trackers.issue_link`.
     """
 
     if issue.kind != types.GITHUB:
-        raise NotFound("tracker")
+        from curie_api.forges.trackers import issue_link
+
+        return issue_link(forges_registry(settings), issue, repository)
     from curie_api.forges.github.tracker import issue_url as github_issue_url
 
     return github_issue_url(settings.github_html_base, repository.path, issue)

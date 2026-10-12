@@ -20,7 +20,7 @@ own checks decide whether the fix is green.
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import factory_e2e as fe
@@ -82,6 +82,7 @@ class GitHubDriver:
     """ForgeDriver (forges/base.py) for GitHub, every write as the test actor."""
 
     forge = "github"
+    pairing = "github+github"
 
     def __init__(self, p: fe.Preflight) -> None:
         self.p = p
@@ -197,6 +198,16 @@ class GitHubDriver:
 
     def pin_fixture_base(self) -> None:
         self.p.pin_fixture_base()
+
+    def teardowns(self) -> tuple[tuple[str, Callable[[], Any]], ...]:
+        return ()
+
+    def tracker_evidence(self, change: fe.ChangeRef | None, work_item_id: str) -> dict[str, Any]:
+        # The tracker is the code host: the loop's own observations cover it.
+        return {}
+
+    def judge_tracker(self, evidence: Mapping[str, Any]) -> list[str]:
+        return []
 
 
 fe.register_forge(fe.ForgeEntry(name="github", driver=GitHubDriver, installed=True))

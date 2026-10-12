@@ -50,7 +50,12 @@ EXPECTED_PAIRINGS = {
     "jira_cloud+bitbucket_cloud",
     "jira_cloud+bitbucket_dc",
 }
-INSTALLED = {"github+github", "jira_cloud+bitbucket_cloud", "jira_cloud+bitbucket_dc"}
+INSTALLED = {
+    "github+github",
+    "jira_cloud+github",
+}
+# Installed drivers, refused pairing: the combined quickstart is #4400.
+REFUSED_4400 = {"jira_cloud+bitbucket_cloud", "jira_cloud+bitbucket_dc"}
 NOT_INSTALLED = sorted(EXPECTED_PAIRINGS - INSTALLED)
 NAMESPACE = "test-factory-acceptance"
 
@@ -68,6 +73,9 @@ def test_each_entry_names_its_tracker_code_host_and_install_state(key: str) -> N
     tracker, code_host = key.split("+")
     assert (pairing.tracker, pairing.code_host) == (tracker, code_host)
     assert pairing.installed is (key in INSTALLED)
+    assert (pairing.refused is not None) is (key in REFUSED_4400)
+    if key in REFUSED_4400:
+        assert "#4400" in acceptance._not_installed(pairing)
 
 
 @pytest.mark.parametrize("key", sorted(EXPECTED_PAIRINGS))
@@ -275,7 +283,7 @@ class _KubectlError:
         return subprocess.CompletedProcess(argv, 1, "", self.stderr)
 
 
-def _args(tmp_path: Path) -> Any:
+def _args(tmp_path: Path, pairing: str = "github+github") -> Any:
     issue = tmp_path / "issue.md"
     issue.write_text("Title\n\nBody\n")
     revision = tmp_path / "revision.md"
@@ -284,7 +292,7 @@ def _args(tmp_path: Path) -> Any:
         [
             "acceptance",
             "--pairing",
-            "github+github",
+            pairing,
             "--context",
             "k8",
             "--candidate",
@@ -456,6 +464,8 @@ def _github_loop_evidence() -> dict[str, Any]:
             "cli": [],
             "cli_failures": [],
             "forge": "github",
+            "pairing": "github+github",
+            "tracker": {},
             "change_number": 42,
             "change_url": "https://github.com/acme/fixture/pull/42",
             "head_initial": "a" * 40,
@@ -620,3 +630,204 @@ def test_an_overrun_step_under_the_default_runner_fails_with_its_deadline(
     assert step["exit_code"] is None
     assert any("overran its" in f and "deadline" in f for f in step["failures"]), step
     assert Path(f"{marker}.term").exists()
+
+
+# --- the jira_cloud+github entry (#4358) -------------------------------------------------
+
+JIRA = "jira_cloud+github"
+CLOSE_JIRA = "close Jira test issues"
+TRACKER_ASSERTIONS = {
+    "scenario.tracker.status_comments": 1,
+    "scenario.tracker.remote_links": 1,
+    "scenario.tracker.pr_body_has_key": True,
+    "scenario.tracker.bot_label_admitted": False,
+}
+
+
+def _persisted_map(key: str) -> dict[str, Any]:
+    (step,) = acceptance.PAIRINGS[key].steps
+    return dict(step.persisted_assertions)
+
+
+def _teardown_names(key: str) -> set[str]:
+    return {
+        field.removeprefix("teardown_ok.")
+        for field in _persisted_map(key)
+        if field.startswith("teardown_ok.")
+    }
+
+
+def test_jira_entry_persisted_forge_matches_driver_key() -> None:
+    (step,) = acceptance.PAIRINGS[JIRA].steps
+    assert step.command == ["run", "--scenario", "forge-loop", "--forge", "jira_cloud"]
+    fe.parse_args(list(step.command))
+    persisted = _persisted_map(JIRA)
+    assert persisted["mode"] == "run:forge-loop"
+    assert persisted["forge"] == "jira_cloud"
+    assert persisted["scenario.forge"] == "jira_cloud"
+    assert persisted["scenario.pairing"] == JIRA
+    for field, expected in TRACKER_ASSERTIONS.items():
+        assert persisted[field] == expected, field
+    # Red then green CI and the review revision are still asserted.
+    assert persisted["scenario.red_ci.state"] == "failure"
+    assert persisted["scenario.ci_after_fix.state"] == "passing"
+    assert persisted["scenario.review_delivery_api_status"] == "factory_admitted"
+
+    github = _persisted_map("github+github")
+    assert github["forge"] == "github"
+    assert github["scenario.forge"] == "github"
+    assert github["scenario.pairing"] == "github+github"
+    assert not [f for f in github if f.startswith("scenario.tracker.")]
+
+
+@pytest.mark.parametrize("key", sorted(EXPECTED_PAIRINGS))
+def test_every_entry_asserts_its_pairing_and_a_jira_tracker_its_tracker_evidence(
+    key: str,
+) -> None:
+    persisted = _persisted_map(key)
+    tracker, code_host = key.split("+")
+    assert persisted["scenario.pairing"] == key
+    if tracker == "jira_cloud" and code_host.startswith("bitbucket"):
+        # The Bitbucket driver delegates the ticket and its teardown to the
+        # Jira driver and asserts the loop only.
+        assert persisted["forge"] == persisted["scenario.forge"] == code_host
+        assert not [f for f in persisted if f.startswith("scenario.tracker.")]
+        assert CLOSE_JIRA in _teardown_names(key)
+    elif tracker == "jira_cloud":
+        assert persisted["forge"] == persisted["scenario.forge"] == "jira_cloud"
+        for field, expected in TRACKER_ASSERTIONS.items():
+            assert persisted[field] == expected, field
+        assert CLOSE_JIRA in _teardown_names(key)
+    else:
+        assert persisted["forge"] == persisted["scenario.forge"] == code_host
+        assert not [f for f in persisted if f.startswith("scenario.tracker.")]
+        assert CLOSE_JIRA not in _teardown_names(key)
+
+
+def test_jira_entry_teardown_names_match_the_driver_teardowns() -> None:
+    # The Jira entry is the generic forge-loop teardown plus exactly the step
+    # the Jira driver's teardowns() pushes (pinned on the driver side by
+    # test_jira_driver.py::test_teardowns_is_exactly_the_close_step and
+    # test_close_jira_test_issues_is_a_separate_teardown_step).
+    names = _teardown_names(JIRA)
+    generic = _teardown_names("gitlab+gitlab")
+    assert names - generic == {CLOSE_JIRA}
+    assert generic <= names
+    assert "restore App webhook" not in names
+
+
+def test_jira_entry_inputs_name_the_jira_env_file() -> None:
+    (step,) = acceptance.PAIRINGS[JIRA].steps
+    assert "CURIE_FACTORY_JIRA_ENV_FILE" in step.inputs["credentials"]
+    (github,) = acceptance.PAIRINGS["github+github"].steps
+    assert "CURIE_FACTORY_JIRA_ENV_FILE" not in github.inputs["credentials"]
+
+
+def test_dry_run_of_jira_cloud_github_lists_every_step_and_passes() -> None:
+    out = io.StringIO()
+    assert acceptance.dry_run(JIRA, out) == 0
+    text = out.getvalue()
+    assert "not installed" not in text
+    assert "unset" not in text
+    for step in acceptance.PAIRINGS[JIRA].steps:
+        assert step.name in text
+        assert " ".join(step.command) in text
+        for field, _expected in step.persisted_assertions:
+            assert field in text
+
+
+def _jira_loop_evidence() -> dict[str, Any]:
+    """Evidence as main(), run_loop and _finish write it for a passing Jira loop.
+
+    Written out from the GitHub literal with the Jira differences spelled out,
+    not derived from the persisted assertions.
+    """
+
+    evidence = json.loads(json.dumps(_github_loop_evidence()))
+    evidence["mode"] = "run:forge-loop"
+    evidence["forge"] = "jira_cloud"
+    evidence["issue_number"] = 0
+    scenario = evidence["scenario"]
+    scenario.update(
+        forge="jira_cloud",
+        pairing="jira_cloud+github",
+        issue_number=0,
+        tracker={
+            "key": "FAC-42",
+            "status_comments": 1,
+            "remote_links": 1,
+            "pr_body_has_key": True,
+            "bot_label_admitted": False,
+        },
+    )
+    names = (
+        "close Jira test issues",
+        "reset fixture repository",
+        "stop tunnel",
+        "stop api port-forward",
+        "restore fixture default branch",
+        "delete namespaces",
+    )
+    evidence["teardown"] = [{"step": name, "ok": True, "detail": {}} for name in names]
+    evidence["teardown_ok"] = dict.fromkeys(names, True)
+    evidence["teardown_clean"] = True
+    return evidence
+
+
+def test_jira_entry_passes_on_a_complete_evidence_record(tmp_path: Path) -> None:
+    evidence = _jira_loop_evidence()
+    for field, expected in _persisted_map(JIRA).items():
+        got = acceptance._get_path(evidence, field)
+        assert got is not acceptance._MISSING, f"{field} is not in the harness evidence"
+        assert got == expected, (field, got, expected)
+    args = _args(tmp_path, JIRA)
+    assert acceptance.run(args, runner=_Runner(evidence), kubectl=_Kubectl()) == 0
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["pairing"] == JIRA and summary["result"] == "passed"
+
+
+def _drop(evidence: dict[str, Any], dotted: str) -> None:
+    node = evidence
+    *parents, leaf = dotted.split(".")
+    for part in parents:
+        node = node[part]
+    del node[leaf]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("scenario.tracker.status_comments", 0),
+        ("scenario.tracker.status_comments", 2),
+        ("scenario.tracker.remote_links", 0),
+        ("scenario.tracker.pr_body_has_key", False),
+        ("scenario.tracker.bot_label_admitted", True),
+        ("scenario.pairing", "github+github"),
+        ("scenario.forge", "github"),
+        ("forge", "github"),
+        ("scenario.red_ci.state", "success"),
+        ("scenario.ci_after_fix.state", "failing"),
+        ("scenario.review_delivery_api_status", "factory_ignored"),
+        ("teardown_ok.close Jira test issues", False),
+        ("scenario.tracker.status_comments", None),
+        ("scenario.tracker.remote_links", None),
+        ("scenario.tracker.pr_body_has_key", None),
+        ("scenario.tracker.bot_label_admitted", None),
+        ("scenario.pairing", None),
+        ("teardown_ok.close Jira test issues", None),
+    ],
+)
+def test_jira_entry_fails_when_an_observation_is_missing_or_wrong(
+    field: str, value: Any, tmp_path: Path
+) -> None:
+    evidence = _jira_loop_evidence()
+    if value is None:
+        _drop(evidence, field)
+    else:
+        _set_path(evidence, field, value)
+    args = _args(tmp_path, JIRA)
+    assert acceptance.run(args, runner=_Runner(evidence), kubectl=_Kubectl()) != 0
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["result"] == "failed"
+    failures = summary["steps"][0]["failures"]
+    assert any(field in failure for failure in failures), failures

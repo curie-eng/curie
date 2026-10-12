@@ -1,0 +1,21 @@
+# Expected `describe` output for `curie factory quickstart --tracker jira-cloud
+# --code-host github --agent jira-factory` on the AddAgent path (no App flags,
+# the release records factory intake), #4358 plan S3.3 and S3.4. Derived by
+# hand from the GitHub AddAgent output at 062ff592c: the JiraTracker line is
+# the first action (the path has no cluster steps), and the agent binds
+# `jira=jira` instead of `github=acme/widgets`. Never regenerated from the
+# implementation.
+# ---
+infer repository toolchains before Helm from App-authenticated workflows and manifests; warn about tools or versions absent from the fixed runner
+Kubernetes context: kind-curie-factory because --context was passed
+add agent jira-factory to the factory install on release curie: skip cluster up, App registration, and intake
+model credential: not needed; the release keeps the model it records (no prompt)
+Write the Jira Cloud tracker and binding `jira` and Secret curie-jira-token
+enroll jira-factory for forge egress: helm upgrade --reset-then-reuse-values --set factory.sandboxEgress.jira-factory=true unless the release already records it; the API does not roll
+create the trigger label curie-factory on acme/widgets where it is missing
+render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image
+curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir /tmp/factory-quickstart-golden/curie-factory-quickstart-curie-curie/jira-factory --agent jira-factory --env prod --repo acme/widgets
+curie cluster surfaces jira-factory --context kind-curie-factory --namespace curie --release curie --add jira=jira
+curie cluster overrides jira-factory --context kind-curie-factory --namespace curie --release curie --execution-deadline 10800
+curie cluster publication-policy jira-factory --context kind-curie-factory --namespace curie --release curie --policy auto
+curie cluster budget jira-factory --context kind-curie-factory --namespace curie --release curie --limit 5

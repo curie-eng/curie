@@ -20,13 +20,14 @@ const REPO_SHAPE: &str = "<PROJECT KEY>/<repo slug>";
 
 /// Refuses Bitbucket Data Center flags this build cannot run. Pure: it reads
 /// no file or network. Bitbucket pairs only with the Jira Cloud tracker, so a
-/// valid flag set hands over to that half.
+/// valid flag set reaches the combined Jira quickstart, not in this build
+/// until #4400.
 pub(super) fn check(forge: &ForgeFlags) -> Result<()> {
     if forge.tracker != TrackerKind::JiraCloud {
         return Err(CliError::unsupported(
-            "code host 'bitbucket-dc' pairs only with --tracker jira-cloud; forge kind 'jira-cloud' is not installed in this build",
+            "code host 'bitbucket-dc' pairs only with --tracker jira-cloud, and that pairing is not installed in this build",
         )
-        .with_fix("rerun with --code-host github, or wait for the jira-cloud tracker")
+        .with_fix("rerun with --code-host github")
         .into());
     }
     let Some(forge_url) = forge.forge_url.as_deref() else {
@@ -51,7 +52,7 @@ pub(super) fn check(forge: &ForgeFlags) -> Result<()> {
         .with_fix("pass --review-account <user id>")
         .into());
     }
-    super::jira_cloud::check(forge)
+    Err(super::jira_cloud::code_host_not_installed("bitbucket-dc"))
 }
 
 /// Parses `--forge-url`: https, or plain http only to this machine.
@@ -352,16 +353,18 @@ mod tests {
             token_file: Some(PathBuf::from("bitbucket-dc-token-that-is-never-read")),
             ca_file: None,
             review_accounts: vec!["101".into()],
+            ..ForgeFlags::default()
         }
     }
 
-    /// The Bitbucket half accepted the flags and handed over to the Jira
-    /// tracker half, which is still reserved until #4358.
+    /// The Bitbucket half accepted the flags and reached the combined Jira
+    /// quickstart, which is not in this build until #4400.
     fn assert_reaches_the_jira_half(result: Result<()>, case: &str) {
         if let Err(error) = result {
             assert_eq!(
                 error.to_string(),
-                crate::factory_quickstart::forge_not_installed("jira-cloud").to_string(),
+                crate::factory_quickstart::jira_cloud::code_host_not_installed("bitbucket-dc")
+                    .to_string(),
                 "{case}: the Bitbucket half refused: {error:#}"
             );
         }
@@ -520,13 +523,13 @@ mod tests {
                 let cli = cli_error(&error);
                 assert_eq!(
                     cli.message,
-                    "code host 'bitbucket-dc' pairs only with --tracker jira-cloud; forge kind 'jira-cloud' is not installed in this build",
+                    "code host 'bitbucket-dc' pairs only with --tracker jira-cloud, and that pairing is not installed in this build",
                     "{tracker:?}"
                 );
                 assert_eq!(cli.class, ExitClass::Unsupported, "{tracker:?}");
                 assert_eq!(
                     cli.fix.as_deref(),
-                    Some("rerun with --code-host github, or wait for the jira-cloud tracker"),
+                    Some("rerun with --code-host github"),
                     "{tracker:?}"
                 );
             }

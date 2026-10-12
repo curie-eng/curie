@@ -20,7 +20,6 @@ from .factory_notices import code_span
 from .forges.config import RepositoryBindingConfig
 from .forges.errors import ForgeError
 from .forges.ports import CodeHost, MarkedComments
-from .forges.registry import ForgeRegistry
 from .forges.types import ReplyTarget, RepositoryRef, TrackerIssueRef
 from .github_factory_events import BASE_LABEL_PREFIX
 from .github_review_events import FeedbackUnavailable
@@ -50,13 +49,13 @@ class BaseRefusal:
     reason: str
 
 
-def bases_for(registry: ForgeRegistry, repo_full_name: str) -> RepositoryBindingConfig | None:
-    """The GitHub repository's binding entry when it allows bases, matched
-    case-insensitively. A repository with no binding, or one whose binding
-    lists no bases, may only use its default branch."""
+def bases_for(policy: RepositoryBindingConfig | None) -> RepositoryBindingConfig | None:
+    """``policy`` when it allows bases. ``policy`` is the binding entry the
+    repository was chosen through (#4358 plan D15), so two bindings listing one
+    repository never borrow each other's bases. A repository with no binding,
+    or one whose binding lists no bases, may only use its default branch."""
 
-    entry = registry.github_repository_policy(repo_full_name)
-    return entry if entry is not None and entry.bases else None
+    return policy if policy is not None and policy.bases else None
 
 
 def _named(labels: set[str]) -> set[str]:
@@ -121,8 +120,7 @@ def label_disagreement(
 
 async def resolve_base(
     *,
-    registry: ForgeRegistry,
-    repo_full_name: str,
+    policy: RepositoryBindingConfig | None,
     labels: set[str],
     default_branch: str | None,
     code_host: CodeHost,
@@ -134,7 +132,7 @@ async def resolve_base(
     has no such branch, and raises a `ForgeError` when it cannot answer now.
     """
 
-    choice = choose_base(labels, bases_for(registry, repo_full_name), default_branch)
+    choice = choose_base(labels, bases_for(policy), default_branch)
     if isinstance(choice, BaseRefusal):
         return choice
     try:

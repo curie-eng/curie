@@ -1,0 +1,6 @@
+{
+  "errorMessages": [
+    "Error in the JQL Query: the query is not the shape the factory sends."
+  ],
+  "errors": {}
+}

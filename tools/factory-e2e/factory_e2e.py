@@ -3648,6 +3648,12 @@ class Preflight:
             # tunnel, webhook or fixture repository on real GitHub is touched.
             self.evidence["scenario"] = scenario(self)
             return
+        # A loop scenario resets and reads its fixture only through its forge
+        # driver; every other scenario uses the GitHub fixture directly. Built
+        # first, so a driver missing its own inputs fails before any install.
+        driver = self.loop_driver() if self.scenario_name in LOOP_SCENARIOS else None
+        entry = FORGES.get(self.evidence.get("forge") or "") if driver is not None else None
+        setup = entry.setup if entry is not None else None
         self.check_tools()
         self._lock(f"app-{self.config.app_id}", "this App and its fixture repository")
         self._lock(f"context-{self.config.kube_context}", "this kube context")
@@ -3659,20 +3665,25 @@ class Preflight:
         self.create_namespace()
         self.install()
         self.port_forward()
-        self.bind_agent()
-        # A loop scenario resets and reads its fixture only through its forge
-        # driver; every other scenario uses the GitHub fixture directly.
-        driver = self.loop_driver() if self.scenario_name in LOOP_SCENARIOS else None
+        if setup is None:
+            self.bind_agent()
         reset = driver.reset_fixture if driver is not None else self.reset_fixture
         # Reset BEFORE the webhook points here, so the closures stay off the
         # install; the after-reset is pushed now so it runs once the webhook
         # is already restored.
         self.step("fixture reset before", **reset())
         self.teardown.push("reset fixture repository", reset)
+        # Pushed before the driver creates anything, so they run on every exit.
+        for name, step in driver.teardowns() if driver is not None else ():
+            self.teardown.push(name, step)
         self.ensure_label()
         self.tunnel()
         self.point_card_at_tunnel()
         self.repoint_webhook()
+        if setup is not None:
+            # After the card upgrade: that upgrade rewrites factory.trackers
+            # whole, which would drop a tracker the setup writes.
+            setup(self)
         if scenario is not None:
             self.record_baseline(
                 driver.default_branch_head if driver is not None else self.default_branch_head
@@ -5816,11 +5827,16 @@ DEFAULT_LOOP_REVIEW_TEXT = (
 
 @dataclasses.dataclass(frozen=True)
 class ForgeEntry:
-    """One forge the loop can drive: its driver and whether that driver is written."""
+    """One forge the loop can drive: its driver and whether that driver is written.
+
+    ``setup`` binds the factory agent for this forge in place of
+    ``Preflight.bind_agent`` (the GitHub binding); None keeps bind_agent.
+    """
 
     name: str
     driver: Callable[[Preflight], ForgeDriver]
     installed: bool
+    setup: Callable[[Preflight], None] | None = None
 
 
 # Populated by the entry modules in tools/factory-e2e/forges/, one file per
@@ -6020,6 +6036,7 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
 
     obs = _new_obs(p) if p.issue_number else {"cli": [], "cli_failures": []}
     obs["forge"] = driver.forge
+    obs["pairing"] = driver.pairing
     if not p.issue_number:
         title, body = p.issue_spec or DEFAULT_LOOP_ISSUE
         since = time.time()
@@ -6027,6 +6044,7 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
         driver.open_and_label_ticket(title, body, since)
         obs.update(_new_obs(p))
         obs["forge"] = driver.forge
+        obs["pairing"] = driver.pairing
     work_item_id = str(obs["work_item_id"])
     # The merge moves the default branch; the driver puts it back on teardown.
     driver.pin_fixture_base()
@@ -6034,7 +6052,9 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
     log("loop: waiting for the labelled run to open a pull request")
     change = driver.await_change(work_item_id)
     if change is None:
-        return _finish(p, obs, judge_github_loop(obs))
+        obs["tracker"] = driver.tracker_evidence(None, work_item_id)
+        _timeline(obs, "tracker evidence", **obs["tracker"])
+        return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
     obs["change_number"] = change.number
     obs["change_url"] = change.url
     head, commits = driver.change_head(change)
@@ -6111,8 +6131,10 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
         obs["cli_failures"].append(f"after merge: work-items exited {exit_code}, expected 0")
     obs["change_numbers"] = driver.changes_opened()
     _timeline(obs, "merge observed", work_item=obs["work_item_pr_status"])
+    obs["tracker"] = driver.tracker_evidence(change, work_item_id)
+    _timeline(obs, "tracker evidence", **obs["tracker"])
     p.cli_not_found_check(obs)
-    return _finish(p, obs, judge_github_loop(obs))
+    return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
 
 
 SCENARIOS["forge-loop"] = forge_loop
@@ -6527,9 +6549,7 @@ def run_hidden_tests(case_id: str, checkout: Path) -> dict[str, Any]:
     """Run the case's hidden checks against a checkout the coding run never saw."""
 
     if case_id == "positive":
-        failures = _probe_convert(
-            checkout, [(1, "nmi", "m", 1852), (1, "nmi", "km", 1.852)]
-        )
+        failures = _probe_convert(checkout, [(1, "nmi", "m", 1852), (1, "nmi", "km", 1.852)])
     elif case_id == "failing-test":
         tests = checkout / "unitconv" / "tests" / "test_convert.py"
         text = tests.read_text() if tests.is_file() else ""

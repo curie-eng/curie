@@ -1,0 +1,20 @@
+[
+  {
+    "id": 10000,
+    "self": "https://example.atlassian.net/rest/api/3/issue/FAC-42/remotelink/10000",
+    "globalId": "https://github.com/acme/fixture/pull/42",
+    "object": {
+      "url": "https://github.com/acme/fixture/pull/42",
+      "title": "PR #42: Add nautical miles to unitconv"
+    }
+  },
+  {
+    "id": 10001,
+    "self": "https://example.atlassian.net/rest/api/3/issue/FAC-42/remotelink/10001",
+    "globalId": "https://github.com/acme/fixture/pull/41",
+    "object": {
+      "url": "https://github.com/acme/fixture/pull/41",
+      "title": "PR #41: An earlier attempt"
+    }
+  }
+]

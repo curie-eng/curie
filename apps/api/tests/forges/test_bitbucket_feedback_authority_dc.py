@@ -39,7 +39,10 @@ class _UnusedJira:
     def __init__(self, config: TrackerConfig, *, ca_bundle: str = "") -> None:
         self.config = config
 
-    def for_repository(self, *args: Any, **kwargs: Any) -> Any:
+    def for_binding(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("the tracker is not part of feedback authority")
+
+    def issue_url(self, *args: Any, **kwargs: Any) -> str:
         raise AssertionError("the tracker is not part of feedback authority")
 
 

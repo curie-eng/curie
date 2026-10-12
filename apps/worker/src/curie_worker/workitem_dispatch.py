@@ -487,7 +487,8 @@ class WorkItemDispatchClient:
     async def issue_read_context(self, request_id: uuid.UUID) -> tuple[str, str]:
         """The execution scoped issue read capability (ADR 0187).
 
-        Returns the issue the capability names, as ``owner/repo#number``, and
+        Returns the issue the capability names, as its tracker's display
+        reference (``owner/repo#number`` on GitHub, ``PROJ-12`` on Jira), and
         the capability itself. The worker never reads the issue.
         """
 
@@ -501,7 +502,10 @@ class WorkItemDispatchClient:
             capability = body["capability"]
             if not isinstance(capability, str) or not capability:
                 raise ValueError("issue read context carries no capability")
-            return f"{body['repo_full_name']}#{int(body['issue_number'])}", capability
+            issue = body["issue"]
+            if not isinstance(issue, str) or not issue:
+                raise ValueError("issue read context names no issue")
+            return issue, capability
         except (KeyError, TypeError, ValueError):
             # The body carries the capability: never chain it into a log.
             raise WorkItemTransportError(

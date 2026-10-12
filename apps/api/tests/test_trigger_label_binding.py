@@ -74,10 +74,17 @@ def github_install(
 
 
 class _FakeConnection:
-    """A connection the registry can build for a kind a test installs."""
+    """A connection the registry can build for a kind a test installs. As a
+    tracker it is binding scoped, as every non-GitHub kind must be."""
 
     def __init__(self, config: Any, *args: Any, **kwargs: Any) -> None:
         self.config = config
+
+    def for_binding(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("surface resolution makes no tracker")
+
+    def issue_url(self, *args: Any, **kwargs: Any) -> str:
+        raise AssertionError("surface resolution makes no tracker")
 
 
 def _kind_table(registry: ModuleType) -> dict[str, Any]:

@@ -85,6 +85,9 @@ class BitbucketDcHarness:
     def seed_issue(self, title: str, body: str) -> TrackerIssueRef:
         return self._tracker.seed_issue(title, body)
 
+    def issue_link_suffix(self, issue: TrackerIssueRef) -> str:
+        return f"/issues/{issue.issue_id}"
+
     def apply_label(self, issue: TrackerIssueRef, actor: Actor) -> None:
         self._tracker.apply_label(issue, LABEL, actor)
 

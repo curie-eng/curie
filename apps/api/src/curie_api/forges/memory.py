@@ -58,6 +58,7 @@ from curie_api.forges.types import (
     RerunOutcome,
     RerunRecord,
     ReviewFeedback,
+    TicketLabels,
     TrackerIssueRef,
     UpsertResult,
 )
@@ -174,7 +175,7 @@ class InMemoryMarkedComments(_Declared):
     def seed_comment(self, target: ReplyTarget, author: Actor, body: str) -> str:
         """A comment someone else (or a past run) left; returns its id."""
 
-        comment = _Comment(f"c{next(self._ids)}", author, body)
+        comment = _Comment(str(next(self._ids)), author, body)
         self._accept(target).append(comment)
         return comment.id
 
@@ -437,6 +438,10 @@ class InMemoryTracker(_Declared):
         found = self._issue(issue)
         return f"# {found.title}\n\n{found.body}"
 
+    async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
+        self._gate(Operation.TICKET_LABELS)
+        return TicketLabels(labels=frozenset(self._issue(issue).labels))
+
     async def set_state_label(
         self, issue: TrackerIssueRef, *, add: str | None, remove: Collection[str]
     ) -> None:
@@ -462,7 +467,11 @@ class InMemoryTracker(_Declared):
     async def link_pull_request(self, issue: TrackerIssueRef, pull_request: PullRequest) -> None:
         if not self._gate(Operation.LINK_PULL_REQUEST):
             return
-        self._issue(issue).linked.append(pull_request.ref)
+        # Idempotent, as a tracker's link is (Jira keys it by its global id).
+        linked = self._issue(issue).linked
+        if pull_request.ref in linked:
+            return
+        linked.append(pull_request.ref)
         self.ledger.record()
 
     async def dependencies(self, issue: TrackerIssueRef) -> tuple[TrackerIssueRef, ...]:

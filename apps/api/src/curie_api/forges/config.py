@@ -484,6 +484,7 @@ class ForgesConfig(_Model):
             duplicated = _duplicates(names)
             if duplicated:
                 raise ValueError(f"{what} names are not unique: {duplicated}")
+        _check_one_entry_per_code_host(self.code_hosts)
         code_hosts = {host.name: host for host in self.code_hosts}
         trackers = {tracker.name: tracker for tracker in self.trackers}
         scopes: dict[tuple[str, str, str], str] = {}
@@ -510,6 +511,24 @@ class ForgesConfig(_Model):
 
     def code_host(self, name: str) -> CodeHostConfig:
         return next(host for host in self.code_hosts if host.name == name)
+
+
+def _check_one_entry_per_code_host(code_hosts: tuple[CodeHostConfig, ...]) -> None:
+    """One code host entry per (kind, host).
+
+    A stored repository records only its code host's kind and host, so that
+    pair must name exactly one entry and one credential (#4358 plan D14).
+    """
+
+    seen: dict[tuple[str, str], str] = {}
+    for host in code_hosts:
+        identity = (host.kind, host.host)
+        if identity in seen:
+            raise ValueError(
+                f"code hosts {seen[identity]!r} and {host.name!r} are both {host.kind} on"
+                f" {host.host}: configure one code host entry per host"
+            )
+        seen[identity] = host.name
 
 
 def _check_repository_runner_configs(

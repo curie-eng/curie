@@ -498,6 +498,19 @@ class MarkedNotice:
 
 
 @dataclass(frozen=True)
+class TicketLabels:
+    """An issue's current label names and component names (#4358 decision 4).
+
+    Admission reads ``labels`` for the ``base:`` and ``repo:`` labels and label
+    conflicts, and ``components`` for a binding's component map (ADR 0197
+    identity 3). A tracker without components reports none.
+    """
+
+    labels: frozenset[str]
+    components: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
 class NoticePage:
     """A complete poll since a cursor and the cursor to poll from next."""
 

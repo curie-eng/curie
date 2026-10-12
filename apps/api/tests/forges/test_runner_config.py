@@ -216,7 +216,14 @@ def test_repository_identity_and_path_consistency(case: str, refused: bool) -> N
     if refused:
         with pytest.raises(ValidationError) as error:
             ForgesConfig.model_validate(document)
-        terms = ("path",) if case == "cross-host-active" else ("runner", "docker")
+        if case == "cross-host-active":
+            terms: tuple[str, ...] = ("path",)
+        elif case == "host-alias-conflict":
+            # Two entries for one kind and host are refused before any runner
+            # comparison: a stored repository names one entry by kind and host.
+            terms = ("one code host entry per host",)
+        else:
+            terms = ("runner", "docker")
         messages = [e["msg"].lower() for e in error.value.errors(include_input=False)]
         assert any(term in message for term in terms for message in messages), messages
     else:

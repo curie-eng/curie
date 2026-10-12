@@ -688,6 +688,9 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                 token_file,
                 ca_file,
                 review_accounts,
+                forge_username,
+                start_accounts,
+                start_group,
             } => {
                 let forge = curie::factory_quickstart::ForgeFlags {
                     code_host,
@@ -696,9 +699,13 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                     token_file,
                     ca_file,
                     review_accounts,
+                    forge_username,
+                    start_accounts,
+                    start_group,
                 };
                 // Refuse an unusable forge selection before the chart fetch.
                 curie::factory_quickstart::select_forge(&forge)?;
+                let chart_explicit = chart.is_some();
                 let resolved = artifacts::resolve_chart(
                     chart.as_deref(),
                     artifacts::Channel::current(),
@@ -725,6 +732,7 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                             label,
                             plugin_dir,
                             chart,
+                            chart_explicit,
                             dry_run,
                             forge,
                         },

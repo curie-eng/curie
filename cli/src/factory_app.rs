@@ -277,6 +277,38 @@ impl GithubApi {
             .ok_or_else(|| CliError::failure("GitHub commit response carries no valid sha").into())
     }
 
+    /// The numeric id of `repo`, read with the App's installation token so a
+    /// private repository answers (#4358). A repository outside the
+    /// installation is refused with the allowlist's install fix.
+    /// https://docs.github.com/en/rest/repos/repos#get-a-repository
+    pub async fn repository_id(&self, app: &InstalledApp, repo: &str) -> Result<u64> {
+        resolve_allowlist(&[repo.to_string()], app, false)?;
+        let (owner, name) = repo
+            .split_once('/')
+            .ok_or_else(|| CliError::usage("repository must be owner/repo"))?;
+        let token = app
+            .token_for(repo)
+            .ok_or_else(|| CliError::failure("repository is outside the App installation"))?;
+        let (status, metadata) = self
+            .call(
+                reqwest::Method::GET,
+                self.url(&["repos", owner, name]),
+                Some(token),
+                None,
+            )
+            .await?;
+        if !(200..300).contains(&status) {
+            return Err(unexpected(status, &format!("GET repository {repo}")));
+        }
+        metadata
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|id| *id > 0)
+            .ok_or_else(|| {
+                CliError::failure(format!("GitHub returned no repository id for {repo}")).into()
+            })
+    }
+
     /// A directory is an array and a file has base64 content. Neither auth
     /// failures nor malformed successful responses mean a missing manifest.
     /// https://docs.github.com/en/rest/repos/contents#get-repository-content
