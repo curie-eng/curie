@@ -1037,7 +1037,10 @@ pressure Redis call or deletion.
 After one exact idle route is detached and deleted, the worker polls the exact
 named ResourceQuota in its configured namespace within the existing 20 second
 cleanup window. It retries only when live spec and status hard limits agree and
-every rejected resource has enough current headroom. The worker Role grants
+every rejected resource has enough current headroom. A transient claim or
+sandbox disappearance read supplies no observation and is polled again within
+that same window. Both resources must be confirmed absent before quota
+headroom can authorize the retry. The worker Role grants
 only namespaced `get` on core `resourcequotas`. A missing permission, malformed
 quantity, mismatched spec and status limits, or timeout fails closed. The
 rejected claim or another quota can consume the freed capacity before the full

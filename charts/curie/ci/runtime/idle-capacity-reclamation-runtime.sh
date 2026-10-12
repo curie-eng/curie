@@ -12,8 +12,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 for command in docker kind kubectl helm cargo python3 setsid; do
     command -v "$command" >/dev/null || fail "required executable is unavailable: $command"
 done
-export DOCKER_HOST=unix:///var/run/docker.sock
-unset DOCKER_CONTEXT
+# Use the caller-selected Docker engine for builds, kind, and owned cleanup.
 docker info >/dev/null 2>&1 || fail "Docker is unavailable"
 
 RUN_ID="$(python3 -c 'import uuid; print(uuid.uuid4().hex[:12])')"
