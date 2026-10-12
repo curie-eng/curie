@@ -806,10 +806,21 @@ class ScriptedRun:
             return re.sub(r"https?://[^\s\"<>]+", "https://example.com", redacted)
 
         try:
+            publication_namespace = self.kubectl(
+                "-n",
+                self.namespace,
+                "get",
+                "deployment/curie-worker",
+                "-o",
+                'jsonpath={.spec.template.spec.containers[?(@.name=="worker")].env[?(@.name=="CURIE_PUBLICATION_NAMESPACE")].value}',
+                timeout=10,
+            ).strip()
+            if not publication_namespace:
+                raise ScriptedScenarioError("worker publication namespace is absent")
             resources = json.loads(
                 self.kubectl(
                     "-n",
-                    self.namespace,
+                    publication_namespace,
                     "get",
                     "jobs,pods",
                     "-l",
@@ -819,6 +830,7 @@ class ScriptedRun:
                     timeout=10,
                 )
             )
+            self.evidence["publication_runtime_resource_count"] = len(resources.get("items", []))
             snapshots = []
             for item in resources.get("items", [])[:8]:
                 status = item.get("status", {})
@@ -859,7 +871,7 @@ class ScriptedRun:
                         snapshot["logs"] = safe(
                             self.kubectl(
                                 "-n",
-                                self.namespace,
+                                publication_namespace,
                                 "logs",
                                 item["metadata"]["name"],
                                 "--all-containers=true",
@@ -876,7 +888,8 @@ class ScriptedRun:
             if snapshots:
                 if not any(item["kind"] == "Pod" for item in snapshots):
                     snapshots.extend(
-                        item for item in self.evidence.get("publication_runtime", [])
+                        item
+                        for item in self.evidence.get("publication_runtime", [])
                         if item["kind"] == "Pod"
                     )
                 self.evidence["publication_runtime"] = snapshots

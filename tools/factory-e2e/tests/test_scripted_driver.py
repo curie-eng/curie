@@ -1247,6 +1247,10 @@ def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
     def kubectl(*args: str, timeout: float) -> str:
         calls.append(args)
         assert timeout <= 10
+        if "deployment/curie-worker" in args:
+            assert args[:2] == ("-n", run.namespace)
+            return "example-publication-namespace"
+        assert args[:2] == ("-n", "example-publication-namespace")
         if "get" in args:
             return json.dumps({"items": [{
                 "kind": "Pod", "metadata": {"name": "example-publication"},
@@ -1271,4 +1275,6 @@ def test_publication_runtime_keeps_bounded_redacted_pod_failure_after_removal(
     remaining = False
     run.capture_publication_runtime()
     assert run.evidence["publication_runtime"] == [snapshot]
-    assert all("curietech.ai/component=publication" in call for call in calls if "get" in call)
+    assert all(
+        "curietech.ai/component=publication" in call for call in calls if "jobs,pods" in call
+    )
