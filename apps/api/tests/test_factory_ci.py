@@ -10,6 +10,7 @@ https://docs.github.com/en/rest/commits/statuses#get-the-combined-status-for-a-s
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import json
 import re
@@ -22,14 +23,17 @@ import pytest
 from channel_protocol import work_item_events
 from channel_protocol.work_item_events import WorkItemEventId, parse_work_item_event_id
 from curie_api import factory_ci, factory_notices
-from curie_api.config import Settings
+from curie_api.config import Settings, get_settings
 from curie_api.forges.config import ForgesConfig
 from curie_api.forges.github.ci import CiDetail
 from curie_api.forges.registry import ForgeRegistry, build_registry, forges_registry
 from curie_api.forges.types import check_run_key
 from curie_api.workitems import lifecycle
 from forge_fakes.github import ci_view, forges_document, github_repository_binding
+from forge_fakes.github_comments import admitted, comments  # noqa: F401  (fixtures)
 from pydantic import ValidationError
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine
 
 HEAD = "a1" * 20
 BASE_HEAD = "b0" * 20
@@ -1933,3 +1937,116 @@ def test_a_preexisting_failure_cannot_skip_the_metadata_rerun_wait() -> None:
         metadata_ci=conversion_metadata_ci(),
     )
     assert unread.kind == "failing"
+
+
+# --- The CI wait reads the WorkItem's stored code host (#4358 plan S2.27) ----------
+
+
+def _spy_code_host_for_repository(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[Any, Any]]:
+    """Record every per-WorkItem code host selection, delegating to the real one.
+
+    Replaced in ``curie_api.forges.trackers`` and in every loaded module that
+    imported it by name.
+    """
+
+    import sys
+
+    from curie_api.forges import trackers
+
+    original = trackers.code_host_for_repository
+    seen: list[tuple[Any, Any]] = []
+
+    def spy(registry: Any, client: Any, repository: Any, **kwargs: Any) -> Any:
+        seen.append((repository, kwargs.get("installations")))
+        return original(registry, client, repository, **kwargs)
+
+    for name, module in list(sys.modules.items()):
+        if (
+            module is not None
+            and name.startswith("curie_api")
+            and getattr(module, "code_host_for_repository", None) is original
+        ):
+            monkeypatch.setattr(module, "code_host_for_repository", spy)
+    return seen
+
+
+def _rewrite_stored_identity(statement: str, params: dict[str, Any]) -> None:
+    """Rewrite a column the work item identity trigger guards, as a row an
+    earlier admission wrote that way: triggers are off for this one transaction."""
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(text(statement), params)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def test_the_ci_wait_no_longer_takes_the_factory_github_accessor() -> None:
+    source = inspect.getsource(factory_ci)
+    assert "factory_code_host(" not in source
+    assert "repository_ref(" not in source
+
+
+@pytest.mark.usefixtures("clean_db")
+def test_ci_wait_uses_the_work_item_code_host_entry(
+    admitted: Any, monkeypatch: pytest.MonkeyPatch  # noqa: F811
+) -> None:
+    from forge_fakes.github import INSTALLATION_ID, REPO, REPO_ID
+    from forge_fakes.github_comments import _rows, ci_green
+    from test_factory_ci_wait import _published, _terminal
+    from test_factory_terminus import _reconcile
+
+    client, github, sink = admitted
+    seen = _spy_code_host_for_repository(monkeypatch)
+    number = 9771
+    sink.ci_script = [ci_green()]
+    published = _published(client, github, sink, number)
+    item = _rows(
+        "SELECT code_host_kind, code_host_host, code_host_installation_id "
+        "FROM curie.work_items WHERE id = :id",
+        {"id": published["work_item_id"]},
+    )[0]
+
+    _reconcile()
+
+    assert _terminal(number) == ("completed", "completed")
+    assert seen, "the CI wait chose no code host through the stored repository"
+    repository, installations = seen[0]
+    assert (repository.kind, repository.host, repository.project_id, repository.path) == (
+        item["code_host_kind"],
+        item["code_host_host"],
+        str(REPO_ID),
+        REPO,
+    )
+    assert installations == {REPO: item["code_host_installation_id"] or INSTALLATION_ID}
+
+    # A WorkItem recorded on a code host entry this install no longer configures
+    # is never observed through the GitHub entry: nothing completes.
+    other = 9772
+    sink.ci_script = [ci_green()]
+    moved = _published(client, github, sink, other)
+    _rewrite_stored_identity(
+        "UPDATE curie.work_items SET code_host_host = 'ghe.example' WHERE id = :id",
+        {"id": moved["work_item_id"]},
+    )
+    _rewrite_stored_identity(
+        "UPDATE curie.thread_publication_lineages SET code_host_host = 'ghe.example' "
+        "WHERE id = (SELECT publication_lineage_id FROM curie.work_items WHERE id = :id) "
+        "AND code_host_kind IS NOT NULL",
+        {"id": moved["work_item_id"]},
+    )
+    observed = list(sink.ci_observations)
+    seen.clear()
+
+    _reconcile()
+
+    assert _terminal(other) == ("running", None)
+    assert any(repository.host == "ghe.example" for repository, _ in seen)
+    assert sink.ci_observations == observed

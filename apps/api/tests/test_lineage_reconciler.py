@@ -16,10 +16,11 @@ from typing import Any
 import pytest
 from curie_api.config import get_settings
 from curie_api.forges.errors import ForgeError, Unavailable
-from curie_api.forges.types import PullRequest, PullRequestRef, PullRequestState
+from curie_api.forges.types import PullRequest, PullRequestRef, PullRequestState, RepositoryRef
 from curie_api.lineage_reconciler import LineageReconciler, PassResult
 from curie_api.models import ThreadPublicationLineage
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from apps.api.tests.test_workitem_outcomes import (  # noqa: F401 - the stack fixture
@@ -102,7 +103,8 @@ def _passes(code_host: _CodeHost, count: int = 1) -> list[PassResult]:
             reconciler = LineageReconciler(
                 async_sessionmaker(engine, expire_on_commit=False),
                 get_settings(),
-                lambda: code_host,  # type: ignore[arg-type, return-value]
+                # One code host per stored (kind, host) pair (#4358 plan S2.28).
+                lambda _repository: code_host,  # type: ignore[arg-type, return-value]
                 interval_seconds=60,
             )
             return [await reconciler.run_once() for _ in range(count)]
@@ -195,3 +197,95 @@ def test_a_second_pass_is_idempotent(client: TestClient, auth_headers: dict[str,
     assert len(code_host.reads) == 1
     after = _lineage(lineage_id)
     assert (after.status, after.version) == ("merged", before.version + 1)
+
+
+def _rewrite_stored_identity(statement: str, params: dict[str, Any]) -> None:
+    """Rewrite a column the work item identity trigger guards, as a row an
+    earlier admission wrote that way: triggers are off for this one transaction."""
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(text(statement), params)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+# --- Each lineage reads its own stored code host (#4358 plan S2.28, r2 finding 1) --
+
+
+def _move_to_host(lineage_id: uuid.UUID, host: str) -> None:
+    """Record the lineage's repository on another code host entry, as a WorkItem
+    admitted on that entry stores it."""
+
+    _rewrite_stored_identity(
+        "UPDATE curie.thread_publication_lineages SET code_host_host = :host "
+        "WHERE id = :id AND code_host_kind IS NOT NULL",
+        {"host": host, "id": lineage_id},
+    )
+    _rewrite_stored_identity(
+        "UPDATE curie.work_items SET code_host_host = :host WHERE publication_lineage_id = :id",
+        {"host": host, "id": lineage_id},
+    )
+
+
+@pytest.mark.parametrize(
+    ("stored_host", "expected"),
+    [(None, "merged"), ("ghe.example", "closed"), ("unconfigured.example", "open")],
+    ids=["install_github", "another_entry", "unconfigured"],
+)
+def test_each_lineage_reads_its_own_code_host_entry(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    stored_host: str | None,
+    expected: str,
+) -> None:
+    _seeded, lineage_id = _seed_open_pr(client, auth_headers)
+    if stored_host is not None:
+        _move_to_host(lineage_id, stored_host)
+    branch = _lineage(lineage_id).branch
+    # Each code host entry answers differently, so the recorded state names
+    # the entry that was read.
+    github = _CodeHost(branch, PullRequestState.MERGED)
+    ghe = _CodeHost(branch, PullRequestState.CLOSED)
+    asked: list[RepositoryRef] = []
+
+    def code_host_for(repository: RepositoryRef) -> _CodeHost:
+        asked.append(repository)
+        if repository.host == "ghe.example":
+            return ghe
+        if repository.host == "unconfigured.example":
+            raise Unavailable("code_host_unconfigured")
+        return github
+
+    async def run() -> PassResult:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            reconciler = LineageReconciler(
+                async_sessionmaker(engine, expire_on_commit=False),
+                get_settings(),
+                code_host_for,  # type: ignore[arg-type]
+                interval_seconds=60,
+            )
+            return await reconciler.run_once()
+        finally:
+            await engine.dispose()
+
+    result = asyncio.run(run())
+
+    assert [repository.path for repository in asked] == [REPO]
+    if stored_host is not None:
+        assert [repository.host for repository in asked] == [stored_host]
+    assert _lineage(lineage_id).status == expected
+    if expected == "open":
+        # An unconfigured entry is skipped like a rate limit, never read elsewhere.
+        assert (result.read, result.skipped, result.rate_limited) == (0, 1, False)
+        assert github.reads == [] and ghe.reads == []
+    elif expected == "closed":
+        assert github.reads == [] and len(ghe.reads) == 1
+    else:
+        assert ghe.reads == [] and len(github.reads) == 1

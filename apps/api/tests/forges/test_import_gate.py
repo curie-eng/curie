@@ -38,10 +38,8 @@ ALLOWLIST: frozenset[str] = frozenset(
         "apps/api/src/curie_api/github_factory_review.py",
         "apps/api/src/curie_api/github_review_store.py",
         "apps/api/src/curie_api/github_review_truth.py",
-        "apps/api/src/curie_api/issue_read.py",
         "apps/api/src/curie_api/publication_authority.py",
         "apps/api/src/curie_api/publication_truth.py",
-        "apps/api/src/curie_api/workitems/lifecycle.py",
     }
 )
 

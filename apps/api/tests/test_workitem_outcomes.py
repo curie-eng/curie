@@ -1570,7 +1570,11 @@ def _observe(
         settings = get_settings()
         async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
             return await workitem_outcomes.observe_ci(
-                _code_host(client, fake), settings, lineage, work_item
+                _code_host(client, fake),
+                settings,
+                lineage,
+                work_item,
+                repository=repository_ref(settings, path=REPO, project_id="101"),
             )
 
     return asyncio.run(run()), seen
@@ -3072,12 +3076,19 @@ def _ci_view(host: _RollupHost, **lineage: Any) -> Any:
         "repository_project_id": None,
     }
     values.update(lineage)
+    # The router passes the stored repository it chose the code host by (#4358 S2.29).
+    repository = repository_ref(
+        get_settings(),
+        path=values["repo_full_name"],
+        project_id=values["repository_project_id"] or "101",
+    )
     return asyncio.run(
         workitem_outcomes.observe_ci(
             host,  # type: ignore[arg-type]
             get_settings(),
             SimpleNamespace(**values),  # type: ignore[arg-type]
             SimpleNamespace(repository_project_id="101"),  # type: ignore[arg-type]
+            repository=repository,
         )
     )
 
@@ -3128,3 +3139,63 @@ def test_ci_view_without_a_pull_request_or_head_reads_nothing() -> None:
     unread = _ci_view(host, head_sha=None)
     assert (unread.state, unread.reason) == ("unavailable", "no_head_sha")
     assert host.calls == []
+
+
+def _rewrite_stored_identity(statement: str, params: dict[str, Any]) -> None:
+    """Rewrite a column the work item identity trigger guards, as a row an
+    earlier admission wrote that way: triggers are off for this one transaction."""
+
+    async def run() -> None:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(text("SET LOCAL session_replication_role = replica"))
+                await conn.execute(text(statement), params)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+# --- The outcome CI view reads the stored code host entry (#4358 plan S2.29) ----
+
+
+def test_outcome_ci_view_uses_the_stored_code_host_and_reports_app_not_configured_when_absent(
+    stack: TestClient,
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    agent = _agent(stack, auth_headers)
+    seeded = _completed(stack, agent)
+    publication = _publish(stack, agent["deployment_id"])
+    _resolve(stack, auth_headers, publication["approval_id"])
+    _open_pr(stack, publication["id"])
+    _complete(seeded)
+    _factory_forges(monkeypatch, stack, tmp_path)
+    creds = _FakeCreds(error=GitHubAppError(f"mint failed {SECRET_SENTINEL}"))
+    _mint_with(monkeypatch, creds)
+
+    # The WorkItem's stored code host is the configured GitHub entry: the view
+    # reaches its App, which answers with a mint failure.
+    reached = _detail(stack, auth_headers, seeded.work_item_id)
+    assert reached["ci"]["state"] == "unavailable"
+    assert reached["ci"]["reason"] != "app_not_configured"
+    assert [repo for repo, _ in creds.calls] == [REPO]
+
+    # Recorded on a code host entry this install does not configure: the view
+    # never borrows the GitHub entry, and says it cannot observe.
+    lineage_id = uuid.UUID(publication["lineage_id"])
+    _rewrite_stored_identity(
+        "UPDATE curie.work_items SET code_host_host = 'ghe.example' WHERE id = :id",
+        {"id": seeded.work_item_id},
+    )
+    _rewrite_stored_identity(
+        "UPDATE curie.thread_publication_lineages SET code_host_host = 'ghe.example' "
+        "WHERE id = :id AND code_host_kind IS NOT NULL",
+        {"id": lineage_id},
+    )
+    absent = _detail(stack, auth_headers, seeded.work_item_id)
+    assert absent["ci"]["state"] == "unavailable"
+    assert absent["ci"]["reason"] == "app_not_configured"
+    assert len(creds.calls) == 1

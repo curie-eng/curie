@@ -263,7 +263,8 @@ def _open_lineage(work_item_id: uuid.UUID, *, status: str = "open") -> None:
 
 
 def _bases_entry(registry: ForgeRegistry, repo: str) -> tuple[list[str], str | None]:
-    entry = bases_for(registry, repo)
+    # The GitHub path passes the repository's GitHub binding policy (#4358 plan D15).
+    entry = bases_for(registry.github_repository_policy(repo))
     assert entry is not None
     return list(entry.bases), entry.default_base
 
@@ -278,7 +279,7 @@ def test_factory_bases_default_to_empty_so_every_repo_uses_its_default_branch() 
     settings = Settings(_env_file=None)
 
     assert not settings.forges.bindings
-    assert bases_for(forges_registry(settings), REPO) is None
+    assert bases_for(forges_registry(settings).github_repository_policy(REPO)) is None
 
 
 def test_factory_bases_parse_from_the_environment(
@@ -804,3 +805,61 @@ def test_another_apps_comment_carrying_the_refusal_marker_is_not_adopted(
     # Curie's own comment (configured app id 51) is adopted on the next pass.
     assert _code(_label(client, api, number, "base:next")) == "base_missing"
     assert len(api.posts()) == 1
+
+
+# --- The policy comes from the chosen binding (#4358 plan D15, r1 finding 4) -------
+
+
+def _policy(**fields: Any) -> Any:
+    from curie_api.forges.config import RepositoryBindingConfig
+
+    return RepositoryBindingConfig.model_validate(
+        {"alias": "repo", "code_host": "github", "project_id": str(REPO_ID), "path": REPO, **fields}
+    )
+
+
+def test_bases_for_reads_only_the_policy_it_is_given() -> None:
+    assert bases_for(None) is None
+    assert bases_for(_policy()) is None
+    listed = _policy(bases=["main", "next"], default_base="main")
+    assert bases_for(listed) is listed
+
+
+@pytest.mark.parametrize(
+    ("policy", "labels", "expected"),
+    [
+        # The selected binding allows `next`: the label picks it.
+        ({"bases": ["main", "next"]}, {"base:next"}, "next"),
+        # The selected binding lists no bases: only the default branch, so a
+        # `base:` label another binding would allow is refused.
+        ({}, {"base:next"}, None),
+        ({"bases": ["main", "next"], "default_base": "next"}, set(), "next"),
+    ],
+)
+def test_resolve_base_takes_the_policy_in_place_of_a_repository_lookup(
+    policy: dict[str, Any], labels: set[str], expected: str | None
+) -> None:
+    from curie_api.factory_base import BaseRefusal, ResolvedBase, resolve_base
+    from curie_api.forges import types
+    from curie_api.forges.memory import InMemoryCodeHost
+
+    code_host = InMemoryCodeHost(kind=types.GITHUB, host="github.com")
+    repository = code_host.seed_repository(REPO, project_id=str(REPO_ID))
+    code_host.push(repository, "main", "initial commit")
+    code_host.push(repository, "next", "next commit")
+
+    async def go() -> Any:
+        return await resolve_base(
+            policy=_policy(**policy),
+            labels=labels,
+            default_branch="main",
+            code_host=code_host,
+            repository=repository,
+        )
+
+    result = asyncio.run(go())
+    if expected is None:
+        assert isinstance(result, BaseRefusal), result
+    else:
+        assert isinstance(result, ResolvedBase), result
+        assert result.branch == expected

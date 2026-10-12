@@ -11,7 +11,7 @@ import pytest
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, result_section, status_body
 from curie_api.factory_progress import PhaseSlot, PhaseView, StageSlot
-from curie_api.factory_reply_target import is_relabel_objective
+from curie_api.factory_reply_target import is_issue_follow_up, is_relabel_objective
 from curie_api.forges.github.comments import GitHubMarkedComments, static_token
 from curie_api.forges.github.marked_comments import (
     GitHubCommentClient,
@@ -473,20 +473,19 @@ def test_marked_notice_create_update_and_unchanged_use_the_redacted_body(existin
     asyncio.run(exercise())
 
 
-_RELABEL_BASE = "https://github.com"
 _RELABEL_URL = "https://github.com/acme-corp/acme-bot/issues/7"
+_GITHUB_PREFIX = "#issuecomment-"
+_JIRA_URL = "https://acme.atlassian.example/browse/PROJ-7"
+_JIRA_PREFIX = "?focusedCommentId="
 
 
-@pytest.mark.parametrize("clone_base", [_RELABEL_BASE, f"{_RELABEL_BASE}/"])
 @pytest.mark.parametrize(
     "objective", [_RELABEL_URL, f"{_RELABEL_URL}\n\nRelabelled by a maintainer."]
 )
-def test_a_relabel_objective_is_the_bare_issue_url(objective: str, clone_base: str) -> None:
-    """#4345 AC6: the first line is exactly the issue URL under the clone base."""
+def test_a_relabel_objective_is_the_bare_issue_url(objective: str) -> None:
+    """#4345 AC6: the first line is exactly the issue link."""
 
-    assert is_relabel_objective(
-        objective, repo_full_name="acme-corp/acme-bot", issue_number=7, clone_base=clone_base
-    )
+    assert is_relabel_objective(objective, issue_link=_RELABEL_URL, comment_prefix=_GITHUB_PREFIX)
 
 
 @pytest.mark.parametrize(
@@ -510,5 +509,52 @@ def test_anything_but_the_bare_issue_url_is_not_a_relabel_objective(
     """#4345 AC6: fragments, PR URLs, other issues or repos, and trailing paths refuse."""
 
     assert not is_relabel_objective(
-        objective, repo_full_name="acme-corp/acme-bot", issue_number=7, clone_base=_RELABEL_BASE
+        objective, issue_link=_RELABEL_URL, comment_prefix=_GITHUB_PREFIX
+    )
+
+
+# --- Tracker-neutral recognition (#4358 plan S2.12) ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("link", "prefix"),
+    [(_RELABEL_URL, _GITHUB_PREFIX), (_JIRA_URL, _JIRA_PREFIX)],
+    ids=["github", "jira_cloud"],
+)
+def test_a_follow_up_is_the_issue_link_with_a_comment_id(link: str, prefix: str) -> None:
+    assert is_issue_follow_up(f"{link}{prefix}10100", issue_link=link, comment_prefix=prefix)
+    assert is_issue_follow_up(
+        f"{link}{prefix}10100\n\nA maintainer asked again.", issue_link=link, comment_prefix=prefix
+    )
+    # The bare link is a relabel, not a follow-up, on every tracker.
+    assert not is_issue_follow_up(link, issue_link=link, comment_prefix=prefix)
+    assert is_relabel_objective(link, issue_link=link, comment_prefix=prefix)
+    assert not is_relabel_objective(f"{link}{prefix}10100", issue_link=link, comment_prefix=prefix)
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        f"{_JIRA_URL}?focusedCommentId=0",
+        f"{_JIRA_URL}?focusedCommentId=99999999999999999999",
+        f"{_JIRA_URL}#issuecomment-10100",
+        "https://acme.atlassian.example/browse/PROJ-8?focusedCommentId=10100",
+        f"{_JIRA_URL}?focusedCommentId=10100x",
+        None,
+    ],
+)
+def test_a_jira_follow_up_names_this_issue_and_a_valid_comment_id(objective: str | None) -> None:
+    assert not is_issue_follow_up(objective, issue_link=_JIRA_URL, comment_prefix=_JIRA_PREFIX)
+
+
+def test_github_follow_up_recognition_is_unchanged() -> None:
+    assert is_issue_follow_up(
+        f"{_RELABEL_URL}#issuecomment-{2**63 - 1}",
+        issue_link=_RELABEL_URL,
+        comment_prefix=_GITHUB_PREFIX,
+    )
+    assert not is_issue_follow_up(
+        f"{_RELABEL_URL}#issuecomment-{2**63}",
+        issue_link=_RELABEL_URL,
+        comment_prefix=_GITHUB_PREFIX,
     )
