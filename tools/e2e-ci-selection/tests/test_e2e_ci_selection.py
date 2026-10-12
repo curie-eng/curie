@@ -231,6 +231,20 @@ def test_selector_and_workflow_paths_do_not_boot_kind(tmp_path: Path, path: str)
     _assert_selection(tmp_path, path, (), pytest_needed=True)
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "scripts/check-netpol-enforcement.sh",
+        "scripts/check-connector-caller-enforcement.sh",
+        "scripts/check-mail-adapter-otel-egress.sh",
+        "scripts/check-runner-byo-egress.sh",
+        "tools/runtime-assertion-gate/run.sh",
+    ],
+)
+def test_cluster_job_scripts_select_cluster(tmp_path: Path, path: str) -> None:
+    _assert_selection(tmp_path, path, ("cluster",))
+
+
 def test_ui_dockerfile_selects_images_without_e2e(tmp_path: Path) -> None:
     _assert_selection(
         tmp_path,
@@ -648,6 +662,43 @@ def test_released_upgrade_jobs_select_their_inline_repo_inputs() -> None:
     }
 
 
+def test_tier_gated_jobs_select_their_repo_scripts() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    registry = _loaded_registry(REGISTRY)
+    tiers_by_output = {OUTPUT_KEYS[tier]: tier for tier in BASE_TIERS}
+    checked_jobs: set[str] = set()
+    problems: set[str] = set()
+    for job_name, job in jobs.items():
+        condition = job.get("if", "")
+        if not isinstance(condition, str):
+            continue
+        outputs = set(
+            re.findall(
+                r"needs\.changes\.outputs\.(skill|local|local_release|cluster)\b",
+                condition,
+            )
+        )
+        if not outputs:
+            continue
+        checked_jobs.add(job_name)
+        for step in job["steps"]:
+            run = step.get("run")
+            if not isinstance(run, str):
+                continue
+            for reference in _repo_root_references(run):
+                if not reference.startswith(("scripts/", "tools/")):
+                    continue
+                if not (REPO_ROOT / reference).exists():
+                    continue
+                selected = _SELECTOR_MODULE._select_path(registry, reference)
+                for output in outputs:
+                    tier = tiers_by_output[output]
+                    if tier not in selected:
+                        problems.add(f"{job_name}: {reference}: does not select {tier}")
+    assert {"e2e-ladder-cluster", "e2e-cluster-chart-regressions"} <= checked_jobs
+    assert not problems, "Tier-gated job script selection gaps:\n" + "\n".join(sorted(problems))
+
+
 def test_inline_upgrade_guard_rejects_new_unselected_helper() -> None:
     assert _unselected_matrix_inputs("python3 cli/src/main.rs --check\n") == [
         "cli/src/main.rs: does not select released-upgrade"
@@ -723,6 +774,7 @@ def test_genuine_documentation_only_selects_no_runtime_e2e_tiers(
         ("scripts/README.md", False),
         ("scripts/check-docs.sh", False),
         ("scripts/check-pr-body.sh", False),
+        ("tools/fix-pin-ci/check.py", True),
         (".github/workflows/pr-body.yaml", True),
         ("release/authorize.py", True),
         ("runner/tests/test_repo_toolchain_proof_ci.py", True),
@@ -1201,6 +1253,25 @@ rules:
   ignored_prefixes:
     docs: []
 """
+
+
+def test_exact_path_under_ignored_prefix_is_selected(tmp_path: Path) -> None:
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        VALID_REGISTRY.replace(
+            "    compose.dev.yaml: [local]",
+            "    compose.dev.yaml: [local]\n    scripts/selected.sh: [cluster]",
+        ).replace("    docs: []", "    docs: []\n    scripts: []")
+    )
+    selected, selected_output = _invoke_selector(
+        tmp_path, "scripts/selected.sh", registry=registry
+    )
+    assert selected.returncode == 0, selected.stderr
+    assert selected_output == _expected_output("cluster")
+    for path in ("scripts/other.sh", "scripts/selected.sh/child.sh"):
+        ignored, ignored_output = _invoke_selector(tmp_path, path, registry=registry)
+        assert ignored.returncode == 0, ignored.stderr
+        assert ignored_output == _expected_output(pytest_needed=False)
 
 
 @pytest.mark.parametrize(

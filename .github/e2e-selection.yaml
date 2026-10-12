@@ -5,6 +5,12 @@ rules:
     compose.dev.yaml: [local]
     pyproject.toml: [skill, local, local-release, cluster]
     uv.lock: [skill, local, local-release, cluster]
+    # These scripts run in cluster-gated jobs despite their ignored parent trees.
+    scripts/check-netpol-enforcement.sh: [cluster]
+    scripts/check-connector-caller-enforcement.sh: [cluster]
+    scripts/check-mail-adapter-otel-egress.sh: [cluster]
+    scripts/check-runner-byo-egress.sh: [cluster]
+    tools/runtime-assertion-gate/run.sh: [cluster]
     # The upgrade matrix and the repository files it reads. A test scans the
     # script's $REPO_ROOT reads and fails on any that skips released-upgrade.
     cli/scripts/gnu-process.py: [released-upgrade]
