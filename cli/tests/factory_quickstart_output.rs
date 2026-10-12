@@ -40,6 +40,7 @@ with (root / 'calls').open('a') as log:
     log.write(json.dumps([tool, *args]) + '\n')
 ns = os.environ.get('QUICKSTART_NAMESPACE', 'curie')
 release = os.environ.get('QUICKSTART_RELEASE', 'curie')
+values_file = root / ('values' if release == 'curie' else 'values-' + release)
 def emit(value):
     print(json.dumps(value)); sys.exit(0)
 def deep_merge(dst, src):
@@ -64,7 +65,7 @@ def apply_set(doc, expression):
         cursor[parts[-1]] = {'true': True, 'false': False, 'null': None}.get(raw, raw)
 def record_upgrade(args):
     try:
-        doc = json.loads((root / 'values').read_text())
+        doc = json.loads(values_file.read_text())
     except Exception:
         doc = {}
     if not isinstance(doc, dict):
@@ -85,7 +86,7 @@ def record_upgrade(args):
             index += 2
             continue
         index += 1
-    (root / 'values').write_text(json.dumps(doc))
+    values_file.write_text(json.dumps(doc))
 def absent(kind, name):
     print('Error from server (NotFound): ' + kind + ' "' + name + '" not found', file=sys.stderr)
     sys.exit(1)
@@ -108,7 +109,9 @@ if tool == 'helm':
     if args[:2] == ['get','values']:
         if os.environ.get('QUICKSTART_REMOVE_KEY_AFTER_PREFLIGHT') == '1':
             (root / 'app.pem').unlink(missing_ok=True)
-        print((root / 'values').read_text()); sys.exit(0)
+        if not values_file.exists():
+            print('Error: release: not found', file=sys.stderr); sys.exit(1)
+        print(values_file.read_text()); sys.exit(0)
     if args[:2] == ['get','hooks']: sys.exit(0)
     if args[:2] == ['get','metadata']: emit({'appVersion':os.environ['QUICKSTART_VERSION'],'version':os.environ['QUICKSTART_VERSION'],'chart':'curie-'+os.environ['QUICKSTART_VERSION']})
     if args[:2] == ['get','manifest']: emit(deployment)

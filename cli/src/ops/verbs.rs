@@ -4505,7 +4505,11 @@ async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> 
 /// an operator-managed Secret elsewhere in the namespace. Decoded server-side by
 /// kubectl's `base64decode` so the plaintext never lands in argv (#524). `None`
 /// when the Secret, the key, or the cluster is unreachable.
-async fn read_secret_key(namespace: &str, secret_name: &str, data_key: &str) -> Option<String> {
+pub(crate) async fn read_secret_key(
+    namespace: &str,
+    secret_name: &str,
+    data_key: &str,
+) -> Option<String> {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![

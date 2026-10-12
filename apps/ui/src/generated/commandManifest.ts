@@ -9338,6 +9338,33 @@ export const commandManifest = {
               "required": false
             },
             {
+              "default_values": [
+                "dark-factory"
+              ],
+              "global": false,
+              "help": "Agent to deploy. On a release that already records factory intake and with no App flags, the agent is added to that install: no cluster up, App registration, or intake",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Trigger label for this agent's GitHub bindings. Default: none, so the install label serves them",
+              "id": "label",
+              "long": "label",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Operator bundle to deploy as given, with its locked runner image or the platform runner. Default: the published dark factory bundle",
+              "id": "plugin_dir",
+              "long": "plugin-dir",
+              "positional": false,
+              "required": false
+            },
+            {
               "global": false,
               "help": "Helm chart. Default: the version pinned chart on release builds; local charts/curie on dev builds",
               "id": "chart",

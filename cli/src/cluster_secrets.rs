@@ -26,7 +26,7 @@ use crate::ops::{plain, require_on_path, run_step, CmdArg, CommonOpts, OpsComman
 pub const CLUSTER_SECRET_PLACEHOLDER: &str = "secretKeyRef";
 
 /// Chart agent names match templates/agent-sandbox.yaml.
-fn validate_agent_resource_name(agent: &str) -> Result<()> {
+pub fn validate_agent_resource_name(agent: &str) -> Result<()> {
     // `self` is reserved for `admits` (ADR-0168 decision 7), where it means
     // the agent this bundle is deployed as. A real agent named `self` would
     // be indistinguishable from that sentinel wherever `admits` is resolved.

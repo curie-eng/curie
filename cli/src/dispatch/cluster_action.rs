@@ -1037,7 +1037,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             yes,
             dry_run,
         } => {
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::kill(
                     AgentActionOpts {
@@ -1061,16 +1068,9 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     dry_run,
                 },
         } => {
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(
-                ClusterConn {
-                    api_url,
-                    api_key: None,
-                    namespace,
-                    release,
-                },
-                dry_run,
-            )
-            .await?;
+            let (api_url, api_key, _cluster_api_pf) =
+                commands::resolve_cluster_conn(api_url, None, &namespace, &release, dry_run)
+                    .await?;
             emit(commands::console_login(&api_url, &api_key, &subject, dry_run).await?)
         }
         ClusterAction::Resume {
@@ -1078,7 +1078,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             conn,
             dry_run,
         } => {
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::resume(AgentActionOpts {
                     api_url,
@@ -1124,7 +1131,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 runner_resources,
                 clear_runner_resources,
             )?;
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::overrides_with_memory_writes(
                     AgentActionOpts {
@@ -1153,7 +1167,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             conn,
             dry_run,
         } => {
-            let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::publication_policy(
                     AgentActionOpts {
@@ -1186,7 +1207,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             // cost a cluster lookup, nor be reported as a connection
             // failure instead of the usage error it is.
             let change = commands::ChannelChange::resolve(add, remove, endpoint, adapter, label)?;
-            let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::channel_bindings(
                     AgentActionOpts {
@@ -1213,7 +1241,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             // `Surfaces`: a malformed id must be a usage error, not a
             // cluster lookup that then fails for an unrelated reason.
             let change = commands::CallersChange::resolve(set, clear)?;
-            let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::channel_callers(
                     AgentActionOpts {
@@ -1240,7 +1275,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         } => {
             let namespace = conn.namespace.clone();
             let release = conn.release.clone();
-            let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _port_forward) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 crate_channel_token::channel_token(crate_channel_token::ChannelTokenOpts {
                     common: CommonOpts {
@@ -1266,7 +1308,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             conn,
             dry_run,
         } => {
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::budget(
                     AgentActionOpts {
@@ -1288,7 +1337,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             yes,
             dry_run,
         } => {
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::reset_thread(
                     AgentActionOpts {
@@ -1314,7 +1370,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             let id = commands::validated_work_item_id(id)?;
             // `_cluster_api_pf` is the port-forward guard; it must live for
             // the whole call.
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::work_items(commands::WorkItemsOpts {
                     api_url,
@@ -1334,7 +1397,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             conn,
             dry_run,
         } => {
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::schedules(commands::SchedulesOpts {
                     api_url,
@@ -1352,13 +1422,11 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 ClusterHookAction::Fire { dry_run, .. }
                 | ClusterHookAction::Record { dry_run, .. } => *dry_run,
             };
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(
-                ClusterConn {
-                    api_url: conn.api_url,
-                    api_key: conn.api_key,
-                    namespace: conn.namespace,
-                    release: conn.release,
-                },
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
                 dry_run,
             )
             .await?;
@@ -1404,7 +1472,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             yes,
             dry_run,
         } => {
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::delete(
                     AgentActionOpts {
@@ -1424,7 +1499,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 conn,
                 dry_run,
             } = target;
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::versions(AgentActionOpts {
                     api_url,
@@ -1446,7 +1528,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 conn,
                 dry_run,
             } = target;
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             let opts = AgentActionOpts {
                 api_url,
                 api_key,
@@ -1475,7 +1564,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 conn,
                 dry_run,
             } = target;
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             let opts = AgentActionOpts {
                 api_url,
                 api_key,
@@ -1499,7 +1595,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             let verb = verb.validate()?;
             // `_cluster_api_pf` is the port-forward guard; it must live for
             // the whole call.
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, false).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                false,
+            )
+            .await?;
             emit(
                 commands::actions(
                     commands::ActionsOpts {
@@ -1520,7 +1623,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             let verb = verb.validate()?;
             // `_cluster_api_pf` is the port-forward guard; it must live for
             // the whole call.
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, false).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                false,
+            )
+            .await?;
             emit(
                 commands::remediation_policy(
                     commands::RemediationPolicyOpts {
@@ -1537,7 +1647,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         ClusterAction::Remediation { verb } => {
             let (verb, conn) = verb.into_parts();
             let verb = verb.validate()?;
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, false).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                false,
+            )
+            .await?;
             emit(
                 commands::remediation(
                     commands::RemediationPolicyOpts {
@@ -1556,7 +1673,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             // Validated before the connection is resolved, so a missing
             // principal or a bad input never reaches discovery or the API.
             let verb = verb.validate()?;
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, false).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                false,
+            )
+            .await?;
             emit(
                 commands::remediation_qualification(
                     commands::RemediationPolicyOpts {
@@ -1597,7 +1721,14 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                 conn,
                 dry_run,
             } = target;
-            let (api_url, api_key, _cluster_api_pf) = resolve_cluster_conn(conn, dry_run).await?;
+            let (api_url, api_key, _cluster_api_pf) = commands::resolve_cluster_conn(
+                conn.api_url,
+                conn.api_key,
+                &conn.namespace,
+                &conn.release,
+                dry_run,
+            )
+            .await?;
             emit(
                 commands::approvals(
                     AgentActionOpts {

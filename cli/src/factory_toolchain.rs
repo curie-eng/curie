@@ -552,6 +552,16 @@ pub async fn preflight(
     requested: &[String],
 ) -> Result<AppPreflight> {
     let pem = crate::factory_app::read_private_key(key)?;
+    preflight_with_pem(app_id, pem, requested).await
+}
+
+/// [`preflight`] for a PEM already in memory, such as one read from the App
+/// key Secret a release records (#4362). The key never reaches argv or disk.
+pub async fn preflight_with_pem(
+    app_id: &str,
+    pem: String,
+    requested: &[String],
+) -> Result<AppPreflight> {
     let api = GithubApi::new()?;
     let app = crate::factory_app::inspect_app(&api, app_id, &pem).await?;
     let repos = crate::factory_app::resolve_allowlist(requested, &app)?;

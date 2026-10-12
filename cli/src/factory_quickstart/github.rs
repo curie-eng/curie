@@ -21,6 +21,27 @@ pub struct RerunTarget<'a> {
     pub org: Option<&'a str>,
 }
 
+/// The App flags every printed rerun ends with.
+const APP_FLAG_PLACEHOLDERS: &str = " --app-id <APP_ID> --private-key-file <PATH.pem>";
+
+/// The runner image an install path intake binds for a published bundle until
+/// the render resolves the published tag (the repository, with no tag).
+pub(super) const PUBLISHED_RUNNER_PENDING: &str = crate::examples::DARK_FACTORY_RUNNER_REPOSITORY;
+
+/// Add the register path's non-default `--agent`, `--label`, and
+/// `--plugin-dir` (#4362 decision 2.3) to the printed rerun, before its App
+/// flags.
+pub(super) fn carry_rerun_flags(steps: &mut [String], flags: &[String]) {
+    if flags.is_empty() {
+        return;
+    }
+    for step in steps.iter_mut().filter(|step| step.starts_with("Rerun:")) {
+        if let Some(head) = step.strip_suffix(APP_FLAG_PLACEHOLDERS) {
+            *step = format!("{head} {}{APP_FLAG_PLACEHOLDERS}", flags.join(" "));
+        }
+    }
+}
+
 pub fn registration_steps(target: &RerunTarget<'_>) -> Vec<String> {
     let mut rerun = format!(
         "Rerun: curie factory quickstart --repo {} --context {}",
@@ -39,7 +60,7 @@ pub fn registration_steps(target: &RerunTarget<'_>) -> Vec<String> {
     if let Some(org) = target.org {
         rerun.push_str(&format!(" --org {org}"));
     }
-    rerun.push_str(" --app-id <APP_ID> --private-key-file <PATH.pem>");
+    rerun.push_str(APP_FLAG_PLACEHOLDERS);
     vec![
         "Open the link and click Create GitHub App. The name, permissions, and the disabled webhook are already filled in.".to_string(),
         "On the App settings page, note the App ID and click Generate a private key to download the .pem file.".to_string(),
@@ -64,21 +85,161 @@ pub(super) fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIn
         mention: None,
         card_base_url: None,
         webhook_secret: None,
-        forge_egress: vec![AGENT_NAME.into()],
+        forge_egress: vec![input.agent.clone()],
         disable: false,
         timeout_seconds: None,
         app_id: input.app_id.clone(),
         private_key_file: input.private_key_file.as_ref().map(PathBuf::from),
         org: input.org.clone(),
         intake: Some(POLL_INTAKE.into()),
-        runner_binding: None,
+        // #4362 decision 7: the published layer, an operator bundle's locked
+        // image, or nothing for the platform runner.
+        runner_binding: match (&input.plugin_dir, &input.runner_image) {
+            (None, _) => Some(crate::factory_intake::RunnerImageBinding {
+                agent: input.agent.clone(),
+                image: PUBLISHED_RUNNER_PENDING.into(),
+            }),
+            (Some(_), Some(image)) => Some(crate::factory_intake::RunnerImageBinding {
+                agent: input.agent.clone(),
+                image: image.clone(),
+            }),
+            (Some(_), None) => None,
+        },
     }
 }
 
+/// #4362 decision 5.3: the operator bundle exists, has a readable manifest,
+/// and passes the lock preflight `cluster deploy` runs. Returns its locked
+/// runner image, or `None` when it declares no runner layer.
+fn check_plugin_dir(dir: &Path) -> Result<Option<String>> {
+    if !dir.is_dir() {
+        return Err(CliError::usage(format!(
+            "--plugin-dir {} is not a directory",
+            dir.display()
+        ))
+        .with_fix("pass a bundle directory, for example one written by curie example dark-factory render --out <DIR>")
+        .into());
+    }
+    let manifest = dir.join(".claude-plugin").join("plugin.json");
+    std::fs::read_to_string(&manifest).map_err(|error| {
+        CliError::usage(format!(
+            "--plugin-dir {} has no readable .claude-plugin/plugin.json: {error}",
+            dir.display()
+        ))
+        .with_fix("pass the root of a plugin bundle")
+    })?;
+    let decl = crate::connector_build::load(dir)?;
+    if decl.runner.is_some() || decl.connectors.values().any(|spec| spec.build.is_some()) {
+        let recomputed = crate::commands::recompute_source_digests(dir, &decl)?;
+        let lock = crate::connector_build::load_lock(dir)?;
+        crate::commands::lock_preflight(
+            dir,
+            &decl,
+            lock.as_ref(),
+            &recomputed,
+            crate::commands::DeployTier::Cluster,
+        )?;
+    }
+    crate::connector_build::locked_runner_image(dir)
+}
+
+/// Every agent's GitHub bindings on the serving release, read once through
+/// the same API connection the `cluster` verbs use (#4362 decision 6).
+async fn read_bindings(common: &CommonOpts) -> Result<Vec<AgentBinding>> {
+    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let (url, key, _port_forward) = crate::commands::resolve_cluster_conn(
+        env("CURIE_API_URL"),
+        env("CURIE_API_KEY"),
+        &common.namespace,
+        &common.release,
+        false,
+    )
+    .await?;
+    let agents = crate::api::ApiClient::new(&url, &key)?
+        .list_agents()
+        .await?;
+    Ok(agents
+        .into_iter()
+        .flat_map(|agent| {
+            let name = agent.name;
+            agent
+                .channels
+                .into_iter()
+                .filter(|binding| binding.kind == "github")
+                .map(move |binding| AgentBinding {
+                    agent: name.clone(),
+                    repo: binding.address,
+                    trigger_label: binding.trigger_label,
+                })
+        })
+        .collect())
+}
+
+/// The serving release's recorded intake and, when this run may bind, its
+/// GitHub bindings. `None` recorded when no revision is serving.
+async fn read_install_state(
+    common: &CommonOpts,
+    opts: &QuickstartOpts,
+) -> Result<(Option<RecordedIntake>, Vec<AgentBinding>)> {
+    let Some((values, _)) = deployed_release_snapshot(common).await? else {
+        return Ok((None, Vec::new()));
+    };
+    let recorded = recorded_intake(&values);
+    let app_flags = opts.app_id.is_some() || opts.private_key_file.is_some();
+    if !app_flags && recorded.is_none() {
+        // The register path binds nothing, so it reads no bindings.
+        return Ok((None, Vec::new()));
+    }
+    if !app_flags {
+        // Decision 3: refuse the install's own flags before any further read.
+        refuse_install_flags(opts.model.is_some(), opts.org.as_deref())?;
+    }
+    Ok((recorded, read_bindings(common).await?))
+}
+
+/// The App the add agent path authenticates as: the PEM is read from the
+/// Secret the release records and stays in memory (#4362 decision 4).
+async fn recorded_app(
+    common: &CommonOpts,
+    recorded: &RecordedIntake,
+    repos: &[String],
+) -> Result<crate::factory_toolchain::AppPreflight> {
+    let pem = crate::ops::read_secret_key(
+        &common.namespace,
+        &recorded.pem_secret,
+        &recorded.pem_secret_key,
+    )
+    .await
+    .ok_or_else(|| {
+        CliError::failure(format!(
+            "could not read the factory App private key from Secret {} key {} in namespace {}",
+            recorded.pem_secret, recorded.pem_secret_key, common.namespace
+        ))
+        .with_fix(format!(
+            "confirm kubectl can read Secret {} in namespace {}, or rerun with --app-id and --private-key-file",
+            recorded.pem_secret, common.namespace
+        ))
+    })?;
+    if !crate::github_app::is_pem_private_key(&pem) {
+        return Err(CliError::failure(format!(
+            "Secret {} key {} does not hold a PEM private key",
+            recorded.pem_secret, recorded.pem_secret_key
+        ))
+        .with_fix("rerun with --app-id and --private-key-file to record the App key again")
+        .into());
+    }
+    crate::factory_toolchain::preflight_with_pem(&recorded.app_id, pem, repos).await
+}
+
 pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
-    // Reject a bad repository list before any prerequisite check, network
-    // preflight, or kube context pin.
+    // Reject a bad repository list, agent, label, or bundle before any
+    // prerequisite check, network preflight, or kube context pin.
     validate_repos(&opts.repos)?;
+    validate_agent_flags(&opts.agent, opts.label.as_deref())?;
+    let runner_image = match &opts.plugin_dir {
+        Some(dir) => check_plugin_dir(dir)?,
+        None => None,
+    };
     let current = if opts.context.is_some() {
         None
     } else {
@@ -92,10 +253,11 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     // The finishing pass discovers repository needs before pinning a kube
     // context or reading Helm. Dry-run describes these reads without making
     // them, and the first pass has no installation credential yet.
+    let mut app = None;
     if !opts.dry_run {
         match (&opts.app_id, &opts.private_key_file) {
             (Some(id), Some(file)) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => {
-                crate::factory_toolchain::preflight(id, file, &opts.repos).await?;
+                app = Some(crate::factory_toolchain::preflight(id, file, &opts.repos).await?);
             }
             (None, None) => {}
             _ => {
@@ -136,6 +298,52 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
             crate::kube_context::pin_for_cluster_command(Some(context))?;
         }
     }
+    let common = CommonOpts {
+        namespace: opts.namespace.clone(),
+        release: opts.release.clone(),
+        dry_run: false,
+    };
+    // #4362 decision 2: the path follows the App flags and the serving
+    // release's recorded intake. A dry run reads only through an explicit
+    // --context; without one, or when a read fails, it plans as if no intake
+    // were recorded and says so.
+    let mut assumed = None;
+    let (recorded, bindings) = if opts.dry_run {
+        match &opts.context {
+            None => {
+                assumed = Some("no --context was passed, so the release was not read; planned as if it records no factory intake".to_string());
+                (None, Vec::new())
+            }
+            Some(context) => {
+                let read = match crate::kube_context::pin_for_cluster_command(Some(context)) {
+                    Ok(_) => read_install_state(&common, &opts).await,
+                    Err(error) => Err(error),
+                };
+                match read {
+                    Ok(state) => state,
+                    // The add agent path's refusal of --model or --org.
+                    Err(error)
+                        if error
+                            .downcast_ref::<CliError>()
+                            .is_some_and(|e| e.class == crate::exit::ExitClass::Usage) =>
+                    {
+                        return Err(error)
+                    }
+                    Err(error) => {
+                        assumed = Some(format!(
+                            "the release could not be read ({error:#}); planned as if it records no factory intake"
+                        ));
+                        (None, Vec::new())
+                    }
+                }
+            }
+        }
+    } else if targeted.is_some() {
+        read_install_state(&common, &opts).await?
+    } else {
+        (None, Vec::new())
+    };
+    let add_agent = opts.app_id.is_none() && recorded.is_some();
     let release_has_real_model = if opts.dry_run || targeted.is_none() {
         false
     } else {
@@ -148,7 +356,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     );
     let model = quickstart_model(opts.model.as_deref(), effective_credential.as_deref());
     let (release_at_target, model) = match &targeted {
-        Some(context) if !opts.dry_run => {
+        Some(context) if !opts.dry_run && !add_agent => {
             release_matches_quickstart_target(
                 &opts,
                 &model,
@@ -159,6 +367,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         }
         _ => (false, model),
     };
+    let install_label = recorded.as_ref().map(|r| r.install_label.clone());
     let planned = quickstart_plan(&PlanInput {
         repos: opts.repos.clone(),
         app_id: opts.app_id.clone(),
@@ -182,14 +391,25 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         // Dry-run reports a non-kind current context instead of refusing it.
         interactive: opts.dry_run || real_interactive,
         release_at_target,
+        agent: opts.agent.clone(),
+        label: opts.label.clone(),
+        plugin_dir: opts.plugin_dir.clone(),
+        model_explicit: opts.model.is_some(),
+        recorded: recorded.clone(),
+        bindings,
+        runner_image,
     })?;
     if opts.dry_run {
         let mut planned = planned;
-        planned.credential =
-            credential_decision(credential_in_env, release_has_real_model, real_interactive);
-        return Ok(QuickstartOutput::DryRun(DryRunPlan {
-            lines: describe(&planned),
-        }));
+        if planned.path != QuickstartPath::AddAgent {
+            planned.credential =
+                credential_decision(credential_in_env, release_has_real_model, real_interactive);
+        }
+        let mut lines = describe(&planned);
+        if let Some(note) = assumed {
+            lines.insert(2, note);
+        }
+        return Ok(QuickstartOutput::DryRun(DryRunPlan { lines }));
     }
     if planned.credential == CredentialDecision::RefuseNonInteractive {
         return Err(
@@ -200,13 +420,74 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
                 .into(),
         );
     }
-    execute(&planned, &opts, release_has_real_model).await
+    // Decision 5.6: a locked runner layer must sit on the installation's
+    // runner before anything is applied. The published layer is checked
+    // when it renders.
+    if let (Some(dir), true) = (&opts.plugin_dir, targeted.is_some()) {
+        crate::cluster_secrets::check_layered_runner_base(&common, dir).await?;
+    }
+    if let (QuickstartPath::AddAgent, Some(recorded)) = (planned.path, &recorded) {
+        app = Some(recorded_app(&common, recorded, &opts.repos).await?);
+    }
+    execute(
+        &planned,
+        &opts,
+        release_has_real_model,
+        app.as_ref(),
+        install_label,
+    )
+    .await
+}
+
+/// Render the published bundle for `agent` and refuse a layer built on
+/// another runner before anything binds it (ADR 0173 decision 5).
+async fn render_and_check(common: &CommonOpts, agent: &str) -> Result<String> {
+    crate::ui::ui().note("Rendering factory bundle");
+    let bundle = bundle_dir(&common.namespace, &common.release, agent);
+    let image = render_published_bundle(&common.namespace, &common.release, agent)
+        .await
+        .map_err(|error| {
+            let (_, fix) = crate::exit::classify(&error);
+            step_error(
+                Path::new("curie"),
+                &["--plugin-dir".into(), bundle.display().to_string()],
+                "Rendering factory bundle",
+                error,
+                fix.as_deref(),
+            )
+        })?;
+    // `cluster deploy` repeats the check; it must not be the first time the
+    // release learns the image.
+    if let Err(error) = crate::cluster_secrets::check_layered_runner_base(common, &bundle).await {
+        let (_, fix) = crate::exit::classify(&error);
+        return Err(step_error(
+            Path::new("curie"),
+            &["--plugin-dir".into(), bundle.display().to_string()],
+            "Checking the runner base",
+            error,
+            fix.as_deref(),
+        ));
+    }
+    Ok(image)
+}
+
+fn app_str(app: &serde_json::Value, key: &str) -> String {
+    app.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn app_bool(app: &serde_json::Value, key: &str) -> bool {
+    app.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 async fn execute(
     planned: &Planned,
     opts: &QuickstartOpts,
     mut release_has_real_model: bool,
+    app: Option<&crate::factory_toolchain::AppPreflight>,
+    install_label: Option<String>,
 ) -> Result<QuickstartOutput> {
     crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
     if planned.skipped_cluster_up {
@@ -270,11 +551,12 @@ async fn execute(
                 namespace,
                 release,
                 model,
+                rerun_flags,
             } => {
                 let model = prompted_model.as_ref().unwrap_or(model);
                 let name = crate::factory_app::random_app_name();
                 let url = crate::factory_app::registration_url(org.as_deref(), &name);
-                let steps = registration_steps(&RerunTarget {
+                let mut steps = registration_steps(&RerunTarget {
                     repos,
                     context,
                     namespace,
@@ -282,6 +564,7 @@ async fn execute(
                     model,
                     org: org.as_deref(),
                 });
+                carry_rerun_flags(&mut steps, rerun_flags);
                 return Ok(QuickstartOutput::Registration {
                     context: planned.context.clone(),
                     url,
@@ -290,43 +573,15 @@ async fn execute(
                 });
             }
             Action::Intake(intake) => {
-                crate::ui::ui().note("Rendering factory bundle");
-                let image =
-                    render_published_bundle(&intake.common.namespace, &intake.common.release)
-                        .await
-                        .map_err(|error| {
-                            let (_, fix) = crate::exit::classify(&error);
-                            step_error(
-                                Path::new("curie"),
-                                &[
-                                    "--plugin-dir".into(),
-                                    bundle_dir(&intake.common.namespace, &intake.common.release)
-                                        .display()
-                                        .to_string(),
-                                ],
-                                "Rendering factory bundle",
-                                error,
-                                fix.as_deref(),
-                            )
-                        })?;
-                rendered_image = Some(image.clone());
-                // ADR 0173 decision 5: refuse a layer built on another runner
-                // before this upgrade binds `agentSandbox.runnerImages`.
-                // `cluster deploy` repeats the check; it must not be the first
-                // time the release learns the image.
-                let bundle = bundle_dir(&intake.common.namespace, &intake.common.release);
-                if let Err(error) =
-                    crate::cluster_secrets::check_layered_runner_base(&intake.common, &bundle).await
-                {
-                    let (_, fix) = crate::exit::classify(&error);
-                    return Err(step_error(
-                        Path::new("curie"),
-                        &["--plugin-dir".into(), bundle.display().to_string()],
-                        "Checking the runner base",
-                        error,
-                        fix.as_deref(),
-                    ));
-                }
+                let image = match &intake.runner_binding {
+                    Some(binding) if binding.image == PUBLISHED_RUNNER_PENDING => {
+                        let image = render_and_check(&intake.common, &binding.agent).await?;
+                        rendered_image = Some(image.clone());
+                        image
+                    }
+                    Some(binding) => binding.image.clone(),
+                    None => String::new(),
+                };
                 let args = intake_args(&planned.context, intake, &image);
                 intake_json = run_self(&args, "Configuring factory intake").await?;
                 if intake_json.get("github_app").is_none() {
@@ -342,6 +597,30 @@ async fn execute(
                     ));
                 }
             }
+            Action::ForgeEgress { agent } => {
+                let chart = opts.chart.clone();
+                crate::cluster_secrets::bind_forge_egress(
+                    CommonOpts {
+                        namespace: opts.namespace.clone(),
+                        release: opts.release.clone(),
+                        dry_run: false,
+                    },
+                    agent.clone(),
+                    async move { Ok(chart) },
+                )
+                .await?;
+            }
+            Action::TriggerLabel { label, repos } => {
+                let app = app.ok_or_else(|| {
+                    CliError::failure(
+                        "no authenticated factory App to create the trigger label with",
+                    )
+                })?;
+                crate::ui::ui().note(&format!("Creating trigger label {label}"));
+                for repo in repos {
+                    crate::factory_app::create_label(&app.api, &app.app, repo, label).await?;
+                }
+            }
             Action::Deploy {
                 context,
                 namespace,
@@ -349,41 +628,57 @@ async fn execute(
                 repos,
                 deadline_seconds,
                 budget_usd,
+                agent,
+                label,
+                bundle,
+                runner_image,
             } => {
-                let dir = bundle_dir(namespace, release);
-                let image = match rendered_image.clone() {
-                    Some(image) => image,
+                let (dir, image) = match bundle {
+                    Some(dir) => (dir.clone(), runner_image.clone()),
                     None => {
-                        crate::ui::ui().note("Rendering factory bundle");
-                        render_published_bundle(namespace, release)
-                            .await
-                            .map_err(|error| {
-                                let (_, fix) = crate::exit::classify(&error);
-                                step_error(
-                                    Path::new("curie"),
-                                    &["--plugin-dir".into(), dir.display().to_string()],
-                                    "Rendering factory bundle",
-                                    error,
-                                    fix.as_deref(),
+                        let image = match rendered_image.clone() {
+                            Some(image) => image,
+                            None => {
+                                render_and_check(
+                                    &CommonOpts {
+                                        namespace: namespace.clone(),
+                                        release: release.clone(),
+                                        dry_run: false,
+                                    },
+                                    agent,
                                 )
-                            })?
+                                .await?
+                            }
+                        };
+                        (bundle_dir(namespace, release, agent), Some(image))
                     }
                 };
                 // `deploy_args` puts the deploy first, then one binding per repository.
-                for (index, args) in deploy_args(context, namespace, release, repos)
-                    .into_iter()
-                    .enumerate()
+                for (index, args) in deploy_args(
+                    context,
+                    namespace,
+                    release,
+                    repos,
+                    agent,
+                    label.as_deref(),
+                    &dir,
+                )
+                .into_iter()
+                .enumerate()
                 {
-                    let step = if index == 0 {
-                        "Deploying dark factory"
+                    let step = if index == 0 && agent == DEFAULT_AGENT {
+                        "Deploying dark factory".to_string()
+                    } else if index == 0 {
+                        format!("Deploying {agent}")
                     } else {
-                        "Binding GitHub repository"
+                        "Binding GitHub repository".to_string()
                     };
-                    run_self(&args, step).await?;
+                    run_self(&args, &step).await?;
                 }
                 run_self(
                     &cluster_agent(
                         "overrides",
+                        agent,
                         context,
                         namespace,
                         release,
@@ -395,6 +690,7 @@ async fn execute(
                 run_self(
                     &cluster_agent(
                         "publication-policy",
+                        agent,
                         context,
                         namespace,
                         release,
@@ -406,6 +702,7 @@ async fn execute(
                 run_self(
                     &cluster_agent(
                         "budget",
+                        agent,
                         context,
                         namespace,
                         release,
@@ -414,34 +711,37 @@ async fn execute(
                     "Setting factory budget",
                 )
                 .await?;
-                let app = intake_json
+                if planned.path == QuickstartPath::AddAgent {
+                    return Ok(QuickstartOutput::AgentAdded {
+                        context: context.clone(),
+                        agent: agent.clone(),
+                        repos: repos.clone(),
+                        trigger_label: label.clone(),
+                        effective_label: label.clone().or(install_label).unwrap_or_default(),
+                        bundle: match bundle {
+                            Some(dir) => dir.display().to_string(),
+                            None => "published".to_string(),
+                        },
+                        runner_image: image,
+                        deadline_seconds: *deadline_seconds,
+                        budget_usd: *budget_usd,
+                        credit_remaining_usd,
+                    });
+                }
+                let github_app = intake_json
                     .get("github_app")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
+                let install_label = app_str(&github_app, "label");
                 return Ok(QuickstartOutput::Ready {
                     context: context.clone(),
                     repo: repos.join(","),
                     intake: POLL_INTAKE.into(),
-                    app_id: app
-                        .get("app_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    slug: app
-                        .get("slug")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    mention: app
-                        .get("mention")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    mention_inferred: app
-                        .get("mention_inferred")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    repos: app
+                    app_id: app_str(&github_app, "app_id"),
+                    slug: app_str(&github_app, "slug"),
+                    mention: app_str(&github_app, "mention"),
+                    mention_inferred: app_bool(&github_app, "mention_inferred"),
+                    repos: github_app
                         .get("repos")
                         .and_then(|v| v.as_array())
                         .map(|list| {
@@ -450,17 +750,12 @@ async fn execute(
                                 .collect()
                         })
                         .unwrap_or_default(),
-                    label: app
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    label_inferred: app
-                        .get("label_inferred")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
+                    effective_label: label.clone().unwrap_or_else(|| install_label.clone()),
+                    label: install_label,
+                    label_inferred: app_bool(&github_app, "label_inferred"),
                     runner_image: image,
-                    agent: AGENT_NAME.into(),
+                    agent: agent.clone(),
+                    trigger_label: label.clone(),
                     deadline_seconds: *deadline_seconds,
                     budget_usd: *budget_usd,
                     credit_remaining_usd,
@@ -473,7 +768,8 @@ async fn execute(
 
 /// The `cluster factory` argv quickstart runs for intake. That command's
 /// `--repo` is repeatable and not comma split, so each repository gets its own
-/// flag.
+/// flag. `image` is the resolved runner image for the intake's runner binding;
+/// with no binding the agent runs the platform runner and no image is passed.
 pub fn intake_args(context: &str, intake: &FactoryIntakeOpts, image: &str) -> Vec<String> {
     let mut args: Vec<String> = vec![
         "cluster".into(),
@@ -508,19 +804,25 @@ pub fn intake_args(context: &str, intake: &FactoryIntakeOpts, image: &str) -> Ve
     for agent in &intake.forge_egress {
         args.extend(["--forge-egress".into(), agent.clone()]);
     }
-    args.push("--runner-image".into());
-    args.push(format!("{AGENT_NAME}={image}"));
+    if let Some(binding) = &intake.runner_binding {
+        args.push("--runner-image".into());
+        args.push(format!("{}={image}", binding.agent));
+    }
     args
 }
 
-/// The deploy argvs, in order: `cluster deploy` with the first repository as
-/// the agent's git-flow repository, then one GitHub surface binding per
-/// repository so the one agent serves each.
+/// The deploy argvs, in order: `cluster deploy` of `bundle` as `agent` with the
+/// first repository as its git-flow repository, then one GitHub surface
+/// binding per repository, carrying `--label` when set, so the one agent
+/// serves each.
 pub fn deploy_args(
     context: &str,
     namespace: &str,
     release: &str,
     repos: &[String],
+    agent: &str,
+    label: Option<&str>,
+    bundle: &Path,
 ) -> Vec<Vec<String>> {
     let first = repos.first().cloned().unwrap_or_default();
     let mut argvs = vec![vec![
@@ -533,28 +835,28 @@ pub fn deploy_args(
         "--release".into(),
         release.into(),
         "--plugin-dir".into(),
-        bundle_dir(namespace, release).display().to_string(),
+        bundle.display().to_string(),
         "--agent".into(),
-        AGENT_NAME.into(),
+        agent.into(),
         "--env".into(),
         "prod".into(),
         "--repo".into(),
         first,
     ]];
     for repo in repos {
+        let mut extra = vec!["--add".into(), format!("github={repo}")];
+        if let Some(label) = label {
+            extra.extend(["--label".into(), label.into()]);
+        }
         argvs.push(cluster_agent(
-            "surfaces",
-            context,
-            namespace,
-            release,
-            &["--add".into(), format!("github={repo}")],
+            "surfaces", agent, context, namespace, release, &extra,
         ));
     }
     argvs
 }
 
-async fn render_published_bundle(namespace: &str, release: &str) -> Result<String> {
-    let dir = bundle_dir(namespace, release);
+async fn render_published_bundle(namespace: &str, release: &str, agent: &str) -> Result<String> {
+    let dir = bundle_dir(namespace, release, agent);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|err| {
             CliError::failure(format!(

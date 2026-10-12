@@ -7,8 +7,8 @@
 //! checkout; the committed files are never regenerated from this tree.
 
 use curie::factory_quickstart::{
-    describe, quickstart_plan, PlanInput, DEFAULT_BUDGET_USD, DEFAULT_DEADLINE_SECONDS,
-    DEFAULT_KIND_NAME, DEFAULT_MODEL,
+    describe, quickstart_plan, PlanInput, DEFAULT_AGENT, DEFAULT_BUDGET_USD,
+    DEFAULT_DEADLINE_SECONDS, DEFAULT_KIND_NAME, DEFAULT_MODEL,
 };
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -41,6 +41,13 @@ fn base() -> PlanInput {
         release_has_real_model: false,
         interactive: true,
         release_at_target: false,
+        agent: DEFAULT_AGENT.into(),
+        label: None,
+        plugin_dir: None,
+        model_explicit: false,
+        recorded: None,
+        bindings: Vec::new(),
+        runner_image: None,
     }
 }
 

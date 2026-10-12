@@ -116,63 +116,6 @@ pub(crate) async fn apply_connectors(
     Ok(())
 }
 
-/// Resolve a cluster verb's API URL, key, and optional loopback tunnel. Explicit
-/// values win. An omitted URL self-plumbs the release API service, while an
-/// omitted key is read from the release Secret.
-pub(crate) async fn resolve_cluster_conn(
-    conn: ClusterConn,
-    dry_run: bool,
-) -> anyhow::Result<(String, String, Option<tokio::process::Child>)> {
-    let ClusterConn {
-        api_url,
-        api_key,
-        namespace,
-        release,
-    } = conn;
-    let api_key = commands::normalize_deploy_api_key(api_key);
-    let key_auto_discovered = api_key.is_none();
-    let local_port = 0;
-    if dry_run {
-        return Ok((
-            api_url.unwrap_or_else(|| format!("http://localhost:{local_port}")),
-            api_key.unwrap_or_default(),
-            None,
-        ));
-    }
-    let api_key = match api_key {
-        Some(key) => key,
-        None => ops::discover_api_key(&namespace, &release).await?,
-    };
-    let tunnel = commands::deploy_api_tunnel(
-        api_url.as_deref(),
-        &namespace,
-        &release,
-        local_port,
-        message::API_REMOTE_PORT,
-    )
-    .await;
-    let (api_url, port_forward) = match tunnel {
-        Some((_fullname, pf_cmd)) => {
-            let (child, effective_port) =
-                message::start_port_forward(&pf_cmd, local_port, "cluster api").await?;
-            (format!("http://127.0.0.1:{effective_port}"), Some(child))
-        }
-        None => {
-            let url = api_url.expect("explicit url when no port-forward");
-            if key_auto_discovered && api::is_insecure_endpoint(&url) {
-                bail!(
-                    "refusing to send the auto-discovered release key over cleartext \
-                     HTTP to {url}: the strong key would leak on the wire. Pass \
-                     --api-key explicitly to acknowledge, use an https:// URL, or omit \
-                     --api-url to reach the release over the loopback port-forward."
-                );
-            }
-            (url, None)
-        }
-    };
-    Ok((api_url, api_key, port_forward))
-}
-
 pub(crate) async fn run_local_observability_query(
     action: LocalObservabilityQuery,
 ) -> Result<Box<dyn curie::ui::CliOutput>> {
@@ -734,6 +677,9 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                 model,
                 execution_deadline,
                 budget,
+                agent,
+                label,
+                plugin_dir,
                 chart,
                 dry_run,
                 code_host,
@@ -775,6 +721,9 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                             model,
                             execution_deadline_seconds: execution_deadline,
                             budget_usd: budget,
+                            agent,
+                            label,
+                            plugin_dir,
                             chart,
                             dry_run,
                             forge,

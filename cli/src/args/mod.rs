@@ -1415,6 +1415,19 @@ pub(crate) enum FactoryAction {
         /// Daily USD budget for the deployed agent.
         #[arg(long, default_value_t = curie::factory_quickstart::DEFAULT_BUDGET_USD)]
         budget: f64,
+        /// Agent to deploy. On a release that already records factory intake
+        /// and with no App flags, the agent is added to that install: no
+        /// cluster up, App registration, or intake.
+        #[arg(long, default_value = curie::factory_quickstart::DEFAULT_AGENT)]
+        agent: String,
+        /// Trigger label for this agent's GitHub bindings. Default: none, so
+        /// the install label serves them.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+        /// Operator bundle to deploy as given, with its locked runner image or
+        /// the platform runner. Default: the published dark factory bundle.
+        #[arg(long, value_name = "DIR")]
+        plugin_dir: Option<PathBuf>,
         /// Helm chart. Default: the version pinned chart on release builds;
         /// local charts/curie on dev builds.
         #[arg(long)]
