@@ -22,8 +22,11 @@ pub const WEBHOOK_SECRET_ENV: &str = "CURIE_GITHUB_WEBHOOK_SECRET";
 pub struct FactoryIntakeOpts {
     pub common: CommonOpts,
     pub chart: String,
-    /// `owner/repo` entries for `api.githubRepoAllowlist`; empty leaves it alone.
+    /// `owner/repo` entries for `api.githubRepoAllowlist`; without App
+    /// credentials, empty reuses the recorded allowlist.
     pub repos: Vec<String>,
+    /// Explicitly allow every repository the GitHub App is installed on.
+    pub all_installed_repos: bool,
     pub label: Option<String>,
     pub mention: Option<String>,
     pub card_base_url: Option<String>,
@@ -659,8 +662,8 @@ async fn plan_app(
         app,
         publication,
     } = preflight;
-    let repos_inferred = opts.repos.is_empty();
-    let repos = crate::factory_app::resolve_allowlist(&opts.repos, &app)?;
+    let repos_inferred = opts.all_installed_repos;
+    let repos = crate::factory_app::resolve_allowlist(&opts.repos, &app, opts.all_installed_repos)?;
     opts.repos = repos.clone();
     let mention_inferred = opts.mention.is_none();
     let mention = opts.mention.clone().unwrap_or_else(|| app.slug.clone());
@@ -742,6 +745,11 @@ fn app_dry_run_lines(opts: &FactoryIntakeOpts, key_file: &Path) -> Vec<String> {
             crate::factory_app::APP_ID_ANNOTATION
         ),
         format!("# GET/POST {api}/repos/<owner>/<repo>/labels for each allowlisted repo"),
+        if opts.all_installed_repos {
+            "# allowlist: every repository the App is installed on (--all-installed-repos)".into()
+        } else {
+            format!("# allowlist: {} (--repo)", opts.repos.join(", "))
+        },
     ]
 }
 
@@ -785,6 +793,9 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
             .into())
         }
     };
+    if !opts.disable && app_args.is_some() && opts.repos.is_empty() && !opts.all_installed_repos {
+        return Err(crate::factory_app::repository_scope_error());
+    }
     if opts.disable && app_args.is_some() {
         return Err(CliError::usage(
             "--disable changes nothing else; drop --app-id/--private-key-file",
@@ -824,7 +835,15 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
         // Repository auth and inference are a preflight, before any Helm read
         // or context-dependent setup. Reuse its tokens for the setup plan.
         let preflight = if let Some((id, file)) = &app_args {
-            Some(crate::factory_toolchain::preflight(id, file, &opts.repos).await?)
+            Some(
+                crate::factory_toolchain::preflight(
+                    id,
+                    file,
+                    &opts.repos,
+                    opts.all_installed_repos,
+                )
+                .await?,
+            )
         } else {
             crate::ui::ui().note(crate::factory_toolchain::SKIPPED_NOTE);
             None
@@ -996,6 +1015,7 @@ mod tests {
             },
             chart: "charts/curie".into(),
             repos: vec!["acme/widgets".into(), "acme/gadgets".into()],
+            all_installed_repos: false,
             label: Some("factory".into()),
             mention: Some("curie-app".into()),
             card_base_url: Some("https://cards.example.trycloudflare.com".into()),

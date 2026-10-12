@@ -491,9 +491,14 @@ pub(crate) enum ClusterAction {
         #[arg(long, value_parser = ["poll", "webhook"])]
         intake: Option<String>,
         /// Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable.
-        /// Sets `api.githubRepoAllowlist`.
+        /// Sets `api.githubRepoAllowlist`. With --app-id, pass at least one
+        /// --repo or use --all-installed-repos to allow the whole installation.
         #[arg(long = "repo", value_name = "OWNER/REPO")]
         repos: Vec<String>,
+        /// Allow every repository the GitHub App is installed on. Requires
+        /// --app-id and cannot be combined with --repo.
+        #[arg(long, conflicts_with = "repos", requires = "app_id")]
+        all_installed_repos: bool,
         /// Issue label that hands an issue to the factory. Required (here or
         /// already recorded on the release); no whitespace, 50 chars max.
         #[arg(long)]
@@ -520,7 +525,8 @@ pub(crate) enum ClusterAction {
         /// The factory GitHub App's numeric App ID. Pair with
         /// --private-key-file. Without both, and with no App recorded on the
         /// release, the command prints the App registration link and applies
-        /// nothing. Mention, allowlist, and label default from the App.
+        /// nothing. Mention and label default from the App. Choose the
+        /// allowlist with --repo (repeatable) or --all-installed-repos.
         #[arg(long, value_name = "ID", requires = "private_key_file")]
         app_id: Option<String>,
         /// File holding the App's PEM private key. Stored in a Kubernetes
