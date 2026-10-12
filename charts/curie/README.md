@@ -929,6 +929,50 @@ the chart collector without setting `otelCollector.endpoint` or
 drop every workload's OTLP destination. It is off by default so the zero-secret
 bare install stays green.
 
+### In-chart RustFS storage
+
+The in-chart RustFS volume claim defaults to `rustfs.persistence.size: 10Gi`.
+Every Langfuse event upload costs about three inodes, and 10Gi on ext4 holds
+655,360 of them, well past the 2-day event retention window. The earlier 3Gi
+default could run out of inodes long before it ran out of bytes (#4408).
+
+A StatefulSet's volume claim template cannot change after creation, so an
+existing install keeps its claim size on upgrade: the chart reads the size back
+from the live RustFS StatefulSet's `data` claim template with Helm `lookup` and
+renders that instead of the default. To grow an existing volume on a storage
+class with `allowVolumeExpansion: true`, patch the claim directly:
+
+```bash
+kubectl patch pvc data-<release>-curie-rustfs-0 -n <namespace> \
+  -p '{"spec":{"resources":{"requests":{"storage":"10Gi"}}}}'
+```
+
+The StatefulSet's claim template keeps the old size after that, which is fine:
+it only applies to claims that do not exist yet.
+
+`lookup` is empty when the chart is rendered without cluster access (`helm
+template`, Argo CD). Those renders get the 10Gi default, which Kubernetes
+refuses on an existing StatefulSet with a different size, so pin
+`rustfs.persistence.size` to the size the StatefulSet's `data` claim template
+requests, not the size of the PVC, which is larger once patched as above:
+
+```bash
+kubectl get statefulset <release>-curie-rustfs -n <namespace> \
+  -o jsonpath='{.spec.volumeClaimTemplates[0].spec.resources.requests.storage}'
+```
+
+A `storage-guard` init container checks the volume. When free inodes or free
+bytes are under 10%, it deletes the event objects under `<rustfs.bucket>/events/`
+that have not changed within `langfuse.eventUpload.retentionDays`, the same
+objects the bucket's lifecycle rule expires, because RustFS exits on a full
+volume before its own expiry can run. It touches nothing outside that prefix, and `retentionDays: 0` disables it.
+
+Because it is an init container, the guard runs when the pod starts (install,
+an upgrade that changes the pod, a reschedule, `kubectl delete pod`), not when
+only the RustFS container restarts. A RustFS container already crash-looping on
+a full volume recovers after `kubectl delete pod <release>-curie-rustfs-0 -n
+<namespace>`, which recreates the pod and runs the guard.
+
 ### Key-free object store auth
 
 Pointing the bundle store at a real cloud object store (`rustfs.deploy: false`)
