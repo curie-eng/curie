@@ -4,6 +4,25 @@
 {{- $connectorProxyPullSecrets = append $connectorProxyPullSecrets .name }}
 {{- end }}
 {{- if .Values.api.deploy }}
+{{- $githubAppId := .Values.api.githubAppId }}
+{{- $githubAppIdDigits := "" }}
+{{- $githubAppIdError := "api.githubAppId must be an empty string or a positive integer of 1 to 18 decimal digits (1..999999999999999999)" }}
+{{- if kindIs "string" $githubAppId }}
+  {{- if and (ne $githubAppId "") (not (regexMatch "^[1-9][0-9]{0,17}$" $githubAppId)) }}
+    {{- fail $githubAppIdError }}
+  {{- end }}
+  {{- $githubAppIdDigits = $githubAppId }}
+{{- else if has (kindOf $githubAppId) (list "int" "int8" "int16" "int32" "int64" "uint" "uint8" "uint16" "uint32" "uint64" "float32" "float64") }}
+  {{- $githubAppIdInteger := int64 $githubAppId }}
+  {{- $githubAppIdDigits = printf "%d" $githubAppIdInteger }}
+  {{- /* Check converted digits to reject float64 values rounded up to 1e18.
+         A float64 upper-bound comparison would round the limit up as well. */}}
+  {{- if or (ne (float64 $githubAppId) (float64 $githubAppIdInteger)) (not (regexMatch "^[1-9][0-9]{0,17}$" $githubAppIdDigits)) }}
+    {{- fail $githubAppIdError }}
+  {{- end }}
+{{- else }}
+  {{- fail $githubAppIdError }}
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -296,7 +315,7 @@ spec:
             # cloning, instead of using GITHUB_TOKEN above. Both empty is fine:
             # public repositories clone with no credential.
             - name: GITHUB_APP_ID
-              value: {{ if .Values.api.githubAppId }}{{ .Values.api.githubAppId | int64 | quote }}{{ else }}""{{ end }}
+              value: {{ $githubAppIdDigits | quote }}
             - name: GITHUB_APP_PRIVATE_KEY
               valueFrom:
                 secretKeyRef:
