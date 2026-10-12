@@ -1,0 +1,7 @@
+[
+  {
+    "name": "jira-software-users",
+    "groupId": "00000000-0000-4000-8000-0000000000f1",
+    "self": "https://acme.atlassian.example/rest/api/3/group?groupId=00000000-0000-4000-8000-0000000000f1"
+  }
+]

@@ -129,7 +129,6 @@ def test_a_key_file_content_never_appears_in_an_error(tmp_path: Path) -> None:
     ("section", "entry"),
     [
         ("code_hosts", samples.gitlab_code_host("corp-gitlab")),
-        ("trackers", samples.jira_tracker("corp-jira")),
     ],
 )
 def test_a_not_installed_kind_is_refused_at_load_naming_kind_and_entry(
@@ -152,3 +151,30 @@ def test_github_static_token_is_refused_naming_the_entry(tmp_path: Path, section
     }
     message = _refused(document, name, "github_app")
     assert "ghp_fixture" not in message
+
+
+def test_a_jira_static_token_entry_loads_its_token_from_the_file(tmp_path: Path) -> None:
+    """#4358 decisions 2 and 22: the Jira API token reaches the API as a mounted
+    file, beside the bot's email as the basic auth username."""
+
+    token_file = _key_file(tmp_path, "jira-token-from-file\n", "token")
+    tracker = {
+        "name": "corp-site",
+        "kind": "jira_cloud",
+        "host": "acme.atlassian.example",
+        "api_url": "https://acme.atlassian.example",
+        "credential": {
+            "type": "static_token",
+            "token_file": str(token_file),
+            "username": "factory-bot@example.com",
+        },
+        "label": "curie",
+        "mention": "712020:bbbbbbbb-0000-4000-8000-000000000002",
+    }
+
+    config = load_forges_json(json.dumps({"trackers": [tracker]}))
+
+    (loaded,) = config.trackers
+    assert loaded.kind == "jira_cloud"
+    assert loaded.credential.username == "factory-bot@example.com"
+    assert loaded.credential.token.get_secret_value().strip() == "jira-token-from-file"

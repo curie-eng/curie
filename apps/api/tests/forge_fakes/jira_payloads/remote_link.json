@@ -1,0 +1,15 @@
+{
+  "id": 10000,
+  "self": "https://acme.atlassian.example/rest/api/3/issue/ED-1/remotelink/10000",
+  "globalId": "https://github.com/acme-corp/acme-bot/pull/12",
+  "application": {},
+  "relationship": null,
+  "object": {
+    "url": "https://github.com/acme-corp/acme-bot/pull/12",
+    "title": "PR #12: Example",
+    "icon": {},
+    "status": {
+      "icon": {}
+    }
+  }
+}
