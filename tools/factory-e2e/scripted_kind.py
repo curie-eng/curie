@@ -131,6 +131,36 @@ def scripted_values(
     return values
 
 
+def publication_stub_egress_policy(policies: dict[str, Any], clone_base: str) -> dict[str, Any]:
+    """A test-owned egress allow from publication Jobs to the GitHub stub.
+
+    ``policies`` is the kubectl List of the chart's publication NetworkPolicies.
+    The new policy selects the same pods in the same namespace. NetworkPolicies
+    are additive, so the chart's policy is left exactly as shipped.
+    """
+
+    items = policies.get("items") or []
+    if len(items) != 1:
+        raise ScriptedScenarioError(
+            f"expected exactly one chart publication NetworkPolicy, found {len(items)}"
+        )
+    chart_policy = items[0]
+    rule = fe.model_proxy_egress(clone_base)
+    return {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+            "name": "scripted-github-stub-publication-egress",
+            "namespace": chart_policy["metadata"]["namespace"],
+        },
+        "spec": {
+            "podSelector": chart_policy["spec"]["podSelector"],
+            "policyTypes": ["Egress"],
+            "egress": [{"to": [{"ipBlock": {"cidr": rule["cidr"]}}], "ports": rule["ports"]}],
+        },
+    }
+
+
 def assert_observed(preflight_outcome: str, publication_paths: list[str]) -> None:
     scenario.assert_preflight_outcome(preflight_outcome)
     scenario.assert_publication_paths(publication_paths)
@@ -619,6 +649,28 @@ class ScriptedRun:
                 f"deployment/{deployment}",
                 "--timeout=300s",
             )
+        # kind enforces NetworkPolicy, and the chart lets publication Jobs
+        # reach only TCP 443 on GitHub's ranges. The stub listens on an
+        # ephemeral port on the kind gateway, so a Job that pushes after
+        # kindnet syncs its pod would hang until the git timeout. Add an
+        # allow for the stub beside the chart's policy, never in place of it.
+        # The policy lives in the owned cluster and is deleted with it.
+        chart_policies = json.loads(
+            self.kubectl(
+                "get",
+                "networkpolicy",
+                "-A",
+                "-l",
+                "app.kubernetes.io/component=publication",
+                "-o",
+                "json",
+            )
+        )
+        stub_policy = self.workdir / "publication-stub-egress.json"
+        stub_policy.write_text(
+            json.dumps(publication_stub_egress_policy(chart_policies, self.stub.base_url))
+        )
+        self.kubectl("apply", "-f", str(stub_policy))
         self.deploy(registry_ref)
         issue = self.stub._get("issue", 3815)
         issue["labels"] = [{"name": "factory"}]
