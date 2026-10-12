@@ -124,13 +124,9 @@ def clean(recorded: tuple[dict[str, Any], dict[str, Any]]) -> dict[str, Any]:
 
 @pytest.mark.parametrize(
     "path",
-    [pytest.param(p, id=p.name) for p in committed_recordings()]
-    or [pytest.param(None, id="none-committed")],
+    [pytest.param(p, id=p.name) for p in committed_recordings()],
 )
-def test_bitbucket_recordings_committed_files_scan_clean(path: Path | None) -> None:
-    if path is None:
-        # Removed once the first live recording is committed (#4401, AC 4).
-        pytest.skip("no Bitbucket Cloud recording is committed yet")
+def test_bitbucket_recordings_committed_files_scan_clean(path: Path) -> None:
     document = json.loads(path.read_text())
     Cassette.from_json(document)
     assert scan_recording(document) == []

@@ -50,14 +50,6 @@ from forge_fakes.bitbucket_cloud_replay import LIFECYCLE, MAX_REQUESTS, Cassette
 
 RECORDING = os.environ.get(ENV_RECORD) == "1"
 
-if not RECORDING and not LIFECYCLE.exists():
-    # Removed once the first live recording is committed (#4401, AC 4).
-    pytest.skip(
-        "no Bitbucket Cloud recording is committed yet: record it once with"
-        f" {ENV_RECORD}=1 and the decision 16 variables",
-        allow_module_level=True,
-    )
-
 FACTORY_TOKEN = "fixture-replay-factory-token"
 REVIEWER_TOKEN = "fixture-replay-reviewer-token"
 RETRY_AFTER = "1234"
