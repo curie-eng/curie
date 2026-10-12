@@ -15,7 +15,12 @@ headers in `RESPONSE_HEADERS` are kept at all.
 request whose method, path, query (as a multiset) or JSON body differs from
 the recording, and on any request carrying ``If-None-Match`` (decision 13.4).
 `RecordingTransport` wraps the real transport for a live run and refuses the
-201st request (decision 16.3).
+201st request (decision 16.3). That cap counts every request of the recorded
+session, its own teardown included, and the cassette is exactly those
+requests. A live run that fails cleans up through `AllowanceTransport`
+instead: at most `CLEANUP_REQUESTS` more requests (decline the pull request,
+delete the branch), outside the cap and never recorded, since a failed run
+writes no cassette. So an exhausted budget cannot block the cleanup.
 """
 
 from __future__ import annotations
@@ -35,6 +40,8 @@ RECORDINGS = Path(__file__).resolve().parent / "bitbucket_cloud_recordings"
 LIFECYCLE = RECORDINGS / "lifecycle.json"
 API_PREFIX = "/2.0"
 MAX_REQUESTS = 200
+# A failed live run's cleanup: one decline and one branch deletion.
+CLEANUP_REQUESTS = 2
 
 # The response headers a recording keeps; every other one is dropped unread.
 RESPONSE_HEADERS = frozenset({"content-type", "retry-after"})
@@ -279,6 +286,28 @@ class RecordingTransport(httpx.AsyncBaseTransport):
             )
         )
         return replayed
+
+    async def aclose(self) -> None:
+        await self.inner.aclose()
+
+
+class AllowanceTransport(httpx.AsyncBaseTransport):
+    """Passes at most ``limit`` requests to ``inner`` and records none of them.
+
+    The reserved allowance a failed live recording cleans up with, apart from
+    the recorded session's budget.
+    """
+
+    def __init__(self, inner: httpx.AsyncBaseTransport, *, limit: int = CLEANUP_REQUESTS) -> None:
+        self.inner = inner
+        self.limit = limit
+        self.used = 0
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self.used >= self.limit:
+            raise AssertionError(f"a recording's cleanup may make at most {self.limit} requests")
+        self.used += 1
+        return await self.inner.handle_async_request(request)
 
     async def aclose(self) -> None:
         await self.inner.aclose()

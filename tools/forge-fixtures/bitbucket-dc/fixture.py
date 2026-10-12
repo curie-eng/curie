@@ -12,7 +12,9 @@ created and the state directory.
 Stdlib only; runs on the system ``python3``. Every external command goes
 through ``runner``, every HTTP request through ``urlopen`` and every reading
 of the time against ``up``'s deadline through ``clock``, all handed to ``main``
-so the unit tests can fake them.
+so the unit tests can fake them. The real ``urlopen`` is ``refusing_urlopen``,
+which follows no redirect, so a password or token is only ever sent to the URL
+the fixture named.
 """
 
 from __future__ import annotations
@@ -37,8 +39,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
+from email.message import Message
 from pathlib import Path
-from typing import Any, Protocol
+from typing import IO, Any, Protocol
 
 SCHEMA = "curie.forge-fixture.bitbucket-dc/v1"
 VERSION = "9.4.24"
@@ -122,6 +125,43 @@ class Opener(Protocol):
         *,
         context: ssl.SSLContext | None = None,
     ) -> Any: ...
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow no redirect: the 3xx surfaces as an HTTPError, nothing is re-sent."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: Message,
+        newurl: str,
+    ) -> None:
+        return None
+
+
+def refusing_urlopen(
+    url: str | urllib.request.Request,
+    data: None = None,
+    timeout: float | None = None,
+    *,
+    context: ssl.SSLContext | None = None,
+) -> Any:
+    """``urllib.request.urlopen`` that refuses every redirect; the real ``Opener``.
+
+    Every request goes through it, the unauthenticated license page read too:
+    one opener leaves no path where a credential follows a redirect, and the
+    license page is a fixed HTTPS URL that answers 200, so a redirect there
+    means Atlassian moved it and ``up`` fails naming the page.
+    """
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context), _RefuseRedirect()
+    )
+    if timeout is None:
+        return opener.open(url, data)
+    return opener.open(url, data, timeout)
 
 
 class FixtureError(Exception):
@@ -921,4 +961,4 @@ def main(
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:], runner=run_command, urlopen=urllib.request.urlopen))
+    sys.exit(main(sys.argv[1:], runner=run_command, urlopen=refusing_urlopen))

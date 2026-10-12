@@ -960,6 +960,15 @@ async def test_bitbucket_dc_fake_payloads_match_captures(fake: BitbucketDcFake) 
         for captured in capture("activities.json")["values"]:
             mine = by_action[(captured["action"], captured.get("commentAction"))]
             assert _keys(mine) == _keys(captured), captured["action"]
+        # Live 9.4.24 adds no activity for the reply: it is only nested under
+        # its inline root, with the root's anchor.
+        captured_kinds = {
+            (a["action"], a.get("commentAction")) for a in capture("activities.json")["values"]
+        }
+        assert set(by_action) == captured_kinds
+        assert len(activities["values"]) == len(capture("activities.json")["values"])
+        (reply,) = by_action[("COMMENTED", "ADDED")]["comment"]["comments"]
+        assert reply["anchor"] == by_action[("COMMENTED", "ADDED")]["comment"]["anchor"]
 
         keyless = await client.get(f"{repo}/commits/{sha}/builds", headers=headers)
         assert keyless.status_code == 400
@@ -968,3 +977,44 @@ async def test_bitbucket_dc_fake_payloads_match_captures(fake: BitbucketDcFake) 
         refused = await client.get(f"{API_URL}/rest/api/latest/repos")
         assert refused.status_code == 401
         assert _keys(refused.json()["errors"][0]) == _keys(capture("error-401.json")["errors"][0])
+
+
+@pytest.mark.anyio
+async def test_bitbucket_dc_replies_and_edits_add_no_activity(fake: BitbucketDcFake) -> None:
+    """As live 9.4.24: a reply shows only nested under its root, an edit only in place."""
+
+    fake.push("curie/demo-change", "Demo change")
+    pid = fake.open_pull("curie/demo-change")
+    top = fake.comment(pid, REVIEWER, "Also update the changelog.")
+    inline = fake.comment(pid, REVIEWER, "Please rename this.", anchor=fake.inline_anchor(pid))
+    async with fake.client() as client:
+        repo = f"{API_URL}/rest/api/latest/projects/FAC/repos/demo"
+        headers = {"Authorization": f"Bearer {FACTORY_TOKEN}"}
+        posted = await client.post(
+            f"{repo}/pull-requests/{pid}/comments",
+            headers=headers,
+            json={"text": "Renamed it.", "parent": {"id": inline}},
+        )
+        assert posted.status_code == 201
+        reply = posted.json()
+        edited = await client.put(
+            f"{repo}/pull-requests/{pid}/comments/{reply['id']}",
+            headers=headers,
+            json={"text": "Renamed it, twice.", "version": reply["version"]},
+        )
+        assert edited.status_code == 200
+        fake.comment(pid, FACTORY, "On it.", parent=top)
+        fake.edit_comment(top, "Also update the changelog, please.")
+        listed = await client.get(f"{repo}/pull-requests/{pid}/activities", headers=headers)
+
+    activities = listed.json()["values"]
+    kinds = [(a["action"], a.get("commentAction")) for a in activities]
+    assert kinds == [("COMMENTED", "ADDED"), ("COMMENTED", "ADDED"), ("OPENED", None)]
+    roots = {a["comment"]["id"]: a["comment"] for a in activities if "comment" in a}
+    assert set(roots) == {top, inline}
+    (inline_reply,) = roots[inline]["comments"]
+    assert inline_reply["text"] == "Renamed it, twice."
+    assert inline_reply["anchor"] == roots[inline]["anchor"]
+    (top_reply,) = roots[top]["comments"]
+    assert "anchor" not in top_reply and "anchor" not in roots[top]
+    assert roots[top]["text"] == "Also update the changelog, please."

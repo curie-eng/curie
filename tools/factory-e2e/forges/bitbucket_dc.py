@@ -58,6 +58,11 @@ PAGE_LIMIT = 100
 # waits for the first request to end.
 WATCH_INTERVAL_SECONDS = 5.0
 WATCH_LIFETIME_SECONDS = float(fe.EXECUTION_BOUND_SECONDS + fe.PUBLICATION_ALLOWANCE_SECONDS)
+# Each watcher request is bounded by this. One iteration makes at most two
+# (the pull request read and the green post), so stopping waits longer than
+# one whole iteration, and a watcher still running after that is a failure.
+WATCH_HTTP_TIMEOUT_SECONDS = 10.0
+WATCH_JOIN_SECONDS = WATCH_HTTP_TIMEOUT_SECONDS * 3
 _FAILING = frozenset({"FAILED", "STOPPED", "CANCELLED"})
 
 
@@ -166,7 +171,13 @@ class BitbucketDcDriver:
     # --- HTTP -----------------------------------------------------------
 
     def _call(
-        self, method: str, url: str, body: Any = None, *, auth: str | None = None
+        self,
+        method: str,
+        url: str,
+        body: Any = None,
+        *,
+        auth: str | None = None,
+        timeout: float = HTTP_TIMEOUT_SECONDS,
     ) -> tuple[int, Any]:
         """(status, JSON body) for one request; status 0 when nothing answered."""
 
@@ -184,7 +195,7 @@ class BitbucketDcDriver:
             },
         )
         try:
-            with _opener(self.context).open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            with _opener(self.context).open(request, timeout=timeout) as response:
                 status, data = int(response.status), response.read()
         except urllib.error.HTTPError as exc:
             status, data = exc.code, exc.read()
@@ -225,8 +236,8 @@ class BitbucketDcDriver:
 
     # --- the pull request -----------------------------------------------
 
-    def _head(self, change: fe.ChangeRef) -> str | None:
-        status, pr = self._call("GET", f"/pull-requests/{change.number}")
+    def _head(self, change: fe.ChangeRef, timeout: float = HTTP_TIMEOUT_SECONDS) -> str | None:
+        status, pr = self._call("GET", f"/pull-requests/{change.number}", timeout=timeout)
         if status != 200 or not isinstance(pr, dict):
             return None
         head = (pr.get("fromRef") or {}).get("latestCommit")
@@ -243,7 +254,9 @@ class BitbucketDcDriver:
 
     # --- CI ---------------------------------------------------------------
 
-    def _post_gate(self, sha: str, state: str, description: str) -> tuple[int, Any]:
+    def _post_gate(
+        self, sha: str, state: str, description: str, timeout: float = HTTP_TIMEOUT_SECONDS
+    ) -> tuple[int, Any]:
         return self._call(
             "POST",
             f"/commits/{sha}/builds",
@@ -255,6 +268,7 @@ class BitbucketDcDriver:
                 "description": description,
             },
             auth=self.admin_auth,
+            timeout=timeout,
         )
 
     def set_ci_red(self, sha: str) -> dict[str, Any]:
@@ -278,10 +292,15 @@ class BitbucketDcDriver:
 
         def watch() -> None:
             while not stop.wait(interval) and time.monotonic() < deadline:
-                head = self._head(change)
+                head = self._head(change, WATCH_HTTP_TIMEOUT_SECONDS)
                 if not head or head == red:
                     continue
-                status, _ = self._post_gate(head, "SUCCESSFUL", LOOP_GATE_GREEN)
+                # A stop that came during the read: write nothing after it.
+                if stop.is_set():
+                    return
+                status, _ = self._post_gate(
+                    head, "SUCCESSFUL", LOOP_GATE_GREEN, WATCH_HTTP_TIMEOUT_SECONDS
+                )
                 if status in (200, 201, 204):
                     self.green_heads.append(head)
                     return
@@ -292,9 +311,21 @@ class BitbucketDcDriver:
         self.p.teardown.push("stop the green loop gate watcher", self._stop_watch)
 
     def _stop_watch(self) -> dict[str, Any]:
-        if self._watch_stop is not None and self._watch_thread is not None:
-            self._watch_stop.set()
-            self._watch_thread.join(timeout=HTTP_TIMEOUT_SECONDS * 2)
+        """Stop the green watcher and wait for it; fails while it is still running.
+
+        A watcher still alive after the join may yet post green, so the run
+        is not torn down. It stays recorded, and the next stop waits again.
+        """
+
+        stop, thread = self._watch_stop, self._watch_thread
+        if stop is not None and thread is not None:
+            stop.set()
+            thread.join(timeout=WATCH_JOIN_SECONDS)
+            if thread.is_alive():
+                raise fe.PreflightFailed(
+                    f"the green loop gate watcher still runs {WATCH_JOIN_SECONDS:g} s "
+                    "after it was stopped; it may still post a green build"
+                )
         self._watch_stop = self._watch_thread = None
         return {"green_heads": list(self.green_heads)}
 

@@ -20,6 +20,11 @@ lands in one ordered recording:
 6. Read the feedback back, twice (the second from the cursor), and verify it.
 7. Decline the pull request, delete the branch, and list what is left open.
 
+When a live run fails, including when it runs out of its request budget,
+`cleanup` declines the pull request and deletes the branch that step 7 has not
+already, through the session's ``cleanup`` client on its own reserved
+allowance. It attempts the deletion even when the decline fails.
+
 `scrub` rewrites everything identifying before a recording is written, and
 `scan_recording` is the check both the recorder and the scrub test apply.
 """
@@ -57,7 +62,9 @@ from curie_api.forges.types import (
 )
 
 from forge_fakes.bitbucket_cloud_replay import (
+    CLEANUP_REQUESTS,
     MAX_REQUESTS,
+    AllowanceTransport,
     Cassette,
     RecordingTransport,
     kept_header,
@@ -145,7 +152,9 @@ class Session:
     reviewer_api: httpx.AsyncClient  # the test side, as the reviewer token
     git: Git
     branch: str
-    live: bool
+    # Live runs only: the factory token on the reserved cleanup allowance. A
+    # replay has nothing to clean up and passes None.
+    cleanup: httpx.AsyncClient | None
 
     @property
     def repo_path(self) -> str:
@@ -175,6 +184,9 @@ class Observed:
     after: FeedbackPage | None = None
     verified: list[bool] = field(default_factory=list)
     declined: PullRequest | None = None
+    # What the teardown or the cleanup has already undone.
+    pull_declined: bool = False
+    branch_deleted: bool = False
     open_after: list[str] = field(default_factory=list)
     branches_after: list[str] = field(default_factory=list)
 
@@ -265,46 +277,73 @@ async def _flow(session: Session, seen: Observed) -> None:
     seen.verified = [await factory.verify_feedback(item) for item in seen.feedback.items]
 
 
-async def _teardown(session: Session, seen: Observed, *, verify: bool) -> None:
+async def _decline(client: httpx.AsyncClient, session: Session, seen: Observed) -> None:
+    assert seen.pull is not None
+    await _ok(await client.post(f"{session.repo_path}/pullrequests/{seen.pull.ref.number}/decline"))
+    seen.pull_declined = True
+
+
+async def _delete_branch(client: httpx.AsyncClient, session: Session, seen: Observed) -> None:
+    branch = quote(session.branch, safe="")
+    deleted = await client.delete(f"{session.repo_path}/refs/branches/{branch}")
+    if deleted.status_code != 204:
+        raise AssertionError(f"deleting the recording branch answered {deleted.status_code}")
+    seen.branch_deleted = True
+
+
+async def _teardown(session: Session, seen: Observed) -> None:
+    """Step 7, recorded: decline, delete, and read back that nothing is left."""
+
     repo_path = session.repo_path
-    if seen.pull is not None:
-        await _ok(
-            await session.api.post(f"{repo_path}/pullrequests/{seen.pull.ref.number}/decline")
-        )
-        if verify:
-            seen.declined = await session.factory.read_pull_request(seen.pull.ref)
-    if seen.head is not None:
-        branch = quote(session.branch, safe="")
-        deleted = await session.api.delete(f"{repo_path}/refs/branches/{branch}")
-        if deleted.status_code != 204:
-            raise AssertionError(f"deleting the recording branch answered {deleted.status_code}")
-    if verify:
-        listed = await _ok(
-            await session.api.get(f"{repo_path}/pullrequests", params={"state": "OPEN"})
-        )
-        seen.open_after = [p["source"]["branch"]["name"] for p in listed["values"]]
-        branches = await _ok(
-            await session.api.get(
-                f"{repo_path}/refs/branches", params={"q": 'name ~ "curie-record-"'}
-            )
-        )
-        seen.branches_after = [b["name"] for b in branches["values"]]
+    assert seen.pull is not None and seen.head is not None
+    await _decline(session.api, session, seen)
+    seen.declined = await session.factory.read_pull_request(seen.pull.ref)
+    await _delete_branch(session.api, session, seen)
+    listed = await _ok(await session.api.get(f"{repo_path}/pullrequests", params={"state": "OPEN"}))
+    seen.open_after = [p["source"]["branch"]["name"] for p in listed["values"]]
+    branches = await _ok(
+        await session.api.get(f"{repo_path}/refs/branches", params={"q": 'name ~ "curie-record-"'})
+    )
+    seen.branches_after = [b["name"] for b in branches["values"]]
+
+
+async def cleanup(client: httpx.AsyncClient, session: Session, seen: Observed) -> None:
+    """Undo what a failed live run left: decline the pull request, delete the branch.
+
+    Each step is attempted whatever the other did; the first failure is raised
+    once both have run.
+    """
+
+    failures: list[Exception] = []
+    if seen.pull is not None and not seen.pull_declined:
+        try:
+            await _decline(client, session, seen)
+        except Exception as failed:  # noqa: BLE001  the branch is still deleted
+            failures.append(failed)
+    if seen.head is not None and not seen.branch_deleted:
+        try:
+            await _delete_branch(client, session, seen)
+        except Exception as failed:  # noqa: BLE001  raised below, after the other step
+            failures.append(failed)
+    if failures:
+        raise failures[0]
 
 
 async def drive(session: Session) -> Observed:
-    """Run the session; a live run tears down even when a step fails."""
+    """Run the session; a live run cleans up when any step fails, its teardown too."""
 
     seen = Observed()
     try:
         await _flow(session, seen)
-    except BaseException:
-        if session.live:
+        await _teardown(session, seen)
+    except BaseException as failure:
+        if session.cleanup is not None:
             try:
-                await _teardown(session, seen, verify=False)
+                await cleanup(session.cleanup, session, seen)
             except Exception as failed:  # noqa: BLE001  the first failure is the one to report
-                logger.error("teardown after a failed recording also failed: %s", type(failed))
+                logger.error("cleanup after a failed recording also failed: %s", type(failed))
+                failure.add_note(f"the cleanup after it also failed: {type(failed).__name__}")
         raise
-    await _teardown(session, seen, verify=True)
     return seen
 
 
@@ -417,10 +456,12 @@ async def record_session(env: Mapping[str, str]) -> tuple[Cassette, Observed]:
     token, reviewer_token = _secret(env[ENV_TOKEN_FILE]), _secret(env[ENV_REVIEWER_TOKEN_FILE])
     branch = f"curie-record-{datetime.now(UTC):%Y%m%dT%H%M%SZ}"
     recording = RecordingTransport(httpx.AsyncHTTPTransport(), limit=MAX_REQUESTS)
+    allowance = AllowanceTransport(httpx.AsyncHTTPTransport(), limit=CLEANUP_REQUESTS)
     async with (
         httpx.AsyncClient(transport=recording, timeout=15.0) as adapter_client,
         side_client(recording, token) as api,
         side_client(recording, reviewer_token) as reviewer_api,
+        side_client(allowance, token) as cleanup_api,
     ):
         session = Session(
             workspace,
@@ -430,7 +471,7 @@ async def record_session(env: Mapping[str, str]) -> tuple[Cassette, Observed]:
             reviewer_api,
             LiveGit(workspace, slug, token),
             branch,
-            live=True,
+            cleanup=cleanup_api,
         )
         seen = await drive(session)
     assert seen.open_after == [] and seen.branches_after == [], "the recording left state behind"

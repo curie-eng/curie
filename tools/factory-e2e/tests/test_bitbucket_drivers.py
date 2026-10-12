@@ -139,6 +139,8 @@ class _Call:
     url: str
     headers: dict[str, str]
     body: Any
+    timeout: float | None = None
+    thread: str = ""
 
 
 class _Response:
@@ -194,7 +196,14 @@ class _Http:
             except ValueError:
                 body = data.decode()
         headers = {key.lower(): value for key, value in request.header_items()}
-        call = _Call(request.get_method(), request.full_url, headers, body)
+        call = _Call(
+            request.get_method(),
+            request.full_url,
+            headers,
+            body,
+            getattr(request, "timeout", None),
+            threading.current_thread().name,
+        )
         self.calls.append(call)
         self.current.call = call
         status, payload, *rest = self.answer(call.method, call.url)
@@ -950,6 +959,97 @@ def test_a_stopped_watcher_posts_nothing(
 
     assert _gate_posts(http, "SUCCESSFUL") == []
     assert driver.green_heads == []
+
+
+def _pr_url(forge: str) -> str:
+    if forge == "bitbucket_cloud":
+        return f"{CLOUD_API}/pullrequests/7"
+    return f"{DC_REST}/pull-requests/7"
+
+
+def _hold_pr_reads(forge: str, http: _Http) -> tuple[threading.Event, threading.Event]:
+    """From now on each pull request read waits for ``release``; ``reading`` marks one."""
+
+    reading, release = threading.Event(), threading.Event()
+    inner = http.answer
+
+    def answer(method: str, url: str) -> tuple[Any, ...]:
+        if method == "GET" and url == _pr_url(forge):
+            reading.set()
+            release.wait(10)
+        return inner(method, url)
+
+    http.answer = answer
+    return reading, release
+
+
+@pytest.mark.parametrize("forge", FORGES)
+def test_a_stop_during_an_in_flight_head_read_prevents_the_green_post(
+    forge: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver, provider, http = _driver_on(forge, tmp_path, monkeypatch)
+    head, _ = driver.change_head(CHANGE)
+    driver.set_ci_red(head)
+    provider.push(GREEN)
+    reading, release = _hold_pr_reads(forge, http)
+    # The watcher is inside a read that will answer the new, green head.
+    assert reading.wait(5)
+
+    results: list[list[dict[str, Any]]] = []
+    teardown = threading.Thread(target=lambda: results.append(driver.p.teardown.run()))
+    teardown.start()
+    assert _until(lambda: driver._watch_stop is not None and driver._watch_stop.is_set())
+    release.set()
+    teardown.join(10)
+
+    assert not teardown.is_alive()
+    (step,) = [r for r in results[0] if r["step"] == "stop the green loop gate watcher"]
+    assert step["ok"], step
+    assert _gate_posts(http, "SUCCESSFUL") == []
+    assert driver.green_heads == []
+
+
+@pytest.mark.parametrize("forge", FORGES)
+def test_teardown_with_a_stuck_watcher_reports_failure(
+    forge: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver, provider, http = _driver_on(forge, tmp_path, monkeypatch)
+    monkeypatch.setattr(_entry_module(forge), "WATCH_JOIN_SECONDS", 0.1)
+    head, _ = driver.change_head(CHANGE)
+    driver.set_ci_red(head)
+    provider.push(GREEN)
+    reading, release = _hold_pr_reads(forge, http)
+    assert reading.wait(5)
+
+    results = driver.p.teardown.run()
+
+    (step,) = [r for r in results if r["step"] == "stop the green loop gate watcher"]
+    assert not step["ok"]
+    assert "still runs" in step["detail"]
+    # Released, the stopped watcher ends without a write, and a second stop succeeds.
+    release.set()
+    assert driver._stop_watch() == {"green_heads": []}
+    assert _gate_posts(http, "SUCCESSFUL") == []
+
+
+@pytest.mark.parametrize("forge", FORGES)
+def test_every_watcher_request_is_short_enough_for_the_join_to_outlast_an_iteration(
+    forge: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _entry_module(forge)
+    driver, provider, http = _driver_on(forge, tmp_path, monkeypatch)
+    head, _ = driver.change_head(CHANGE)
+    driver.set_ci_red(head)
+    provider.push(GREEN)
+    assert _until(lambda: driver.green_heads == [GREEN])
+    driver.p.teardown.run()
+
+    watcher = [c for c in http.calls if c.thread.endswith("-green-gate")]
+    assert watcher and {c.timeout for c in watcher} == {module.WATCH_HTTP_TIMEOUT_SECONDS}
+    # The most requests one iteration makes: the head read (and on Cloud the
+    # short hash's commit read), then the green post.
+    per_iteration = 3 if forge == "bitbucket_cloud" else 2
+    assert module.WATCH_JOIN_SECONDS > per_iteration * module.WATCH_HTTP_TIMEOUT_SECONDS
 
 
 @pytest.mark.parametrize("forge", FORGES)

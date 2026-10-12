@@ -70,6 +70,12 @@ HTTP_TIMEOUT_SECONDS = 30
 # waits for the first request to end.
 WATCH_INTERVAL_SECONDS = 5.0
 WATCH_LIFETIME_SECONDS = float(fe.EXECUTION_BOUND_SECONDS + fe.PUBLICATION_ALLOWANCE_SECONDS)
+# Each watcher request is bounded by this. One iteration makes at most three
+# (the pull request read, the short hash's commit read and the green post), so
+# stopping waits longer than one whole iteration, and a watcher still running
+# after that is a failure.
+WATCH_HTTP_TIMEOUT_SECONDS = 10.0
+WATCH_JOIN_SECONDS = WATCH_HTTP_TIMEOUT_SECONDS * 4
 # How long an accepted (202) merge is read back before it counts as not merged.
 MERGE_SETTLE_SECONDS = 60.0
 _FAILING = frozenset({"FAILED", "STOPPED", "CANCELLED"})
@@ -149,7 +155,13 @@ class BitbucketCloudDriver:
     # --- HTTP -----------------------------------------------------------
 
     def _call(
-        self, method: str, url: str, body: Any = None, *, as_reviewer: bool = False
+        self,
+        method: str,
+        url: str,
+        body: Any = None,
+        *,
+        as_reviewer: bool = False,
+        timeout: float = HTTP_TIMEOUT_SECONDS,
     ) -> tuple[int, Any]:
         """(status, JSON body) for one request; status 0 when nothing answered."""
 
@@ -166,7 +178,7 @@ class BitbucketCloudDriver:
             },
         )
         try:
-            with _opener().open(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+            with _opener().open(request, timeout=timeout) as response:
                 status, data = int(response.status), response.read()
         except urllib.error.HTTPError as exc:
             status, data = exc.code, exc.read()
@@ -213,19 +225,19 @@ class BitbucketCloudDriver:
 
     # --- the pull request -----------------------------------------------
 
-    def _full_hash(self, sha: str) -> str | None:
+    def _full_hash(self, sha: str, timeout: float = HTTP_TIMEOUT_SECONDS) -> str | None:
         if len(sha) == 40:
             return sha
-        status, commit = self._call("GET", f"/commit/{sha}")
+        status, commit = self._call("GET", f"/commit/{sha}", timeout=timeout)
         full = commit.get("hash") if status == 200 and isinstance(commit, dict) else None
         return full if isinstance(full, str) else None
 
-    def _head(self, change: fe.ChangeRef) -> str | None:
-        status, pr = self._call("GET", f"/pullrequests/{change.number}")
+    def _head(self, change: fe.ChangeRef, timeout: float = HTTP_TIMEOUT_SECONDS) -> str | None:
+        status, pr = self._call("GET", f"/pullrequests/{change.number}", timeout=timeout)
         if status != 200 or not isinstance(pr, dict):
             return None
         short = ((pr.get("source") or {}).get("commit") or {}).get("hash")
-        return self._full_hash(short) if isinstance(short, str) and short else None
+        return self._full_hash(short, timeout) if isinstance(short, str) and short else None
 
     def change_head(self, change: fe.ChangeRef) -> tuple[str | None, int | None]:
         # The change the green watcher follows once its first head is set red.
@@ -238,7 +250,9 @@ class BitbucketCloudDriver:
 
     # --- CI ---------------------------------------------------------------
 
-    def _post_gate(self, sha: str, state: str, description: str) -> tuple[int, Any]:
+    def _post_gate(
+        self, sha: str, state: str, description: str, timeout: float = HTTP_TIMEOUT_SECONDS
+    ) -> tuple[int, Any]:
         return self._call(
             "POST",
             f"/commit/{sha}/statuses/build",
@@ -250,6 +264,7 @@ class BitbucketCloudDriver:
                 "description": description,
             },
             as_reviewer=True,
+            timeout=timeout,
         )
 
     def set_ci_red(self, sha: str) -> dict[str, Any]:
@@ -273,10 +288,15 @@ class BitbucketCloudDriver:
 
         def watch() -> None:
             while not stop.wait(interval) and time.monotonic() < deadline:
-                head = self._head(change)
+                head = self._head(change, WATCH_HTTP_TIMEOUT_SECONDS)
                 if not head or head == red:
                     continue
-                status, _ = self._post_gate(head, "SUCCESSFUL", LOOP_GATE_GREEN)
+                # A stop that came during the read: write nothing after it.
+                if stop.is_set():
+                    return
+                status, _ = self._post_gate(
+                    head, "SUCCESSFUL", LOOP_GATE_GREEN, WATCH_HTTP_TIMEOUT_SECONDS
+                )
                 if status in (200, 201):
                     self.green_heads.append(head)
                     return
@@ -287,9 +307,21 @@ class BitbucketCloudDriver:
         self.p.teardown.push("stop the green loop gate watcher", self._stop_watch)
 
     def _stop_watch(self) -> dict[str, Any]:
-        if self._watch_stop is not None and self._watch_thread is not None:
-            self._watch_stop.set()
-            self._watch_thread.join(timeout=HTTP_TIMEOUT_SECONDS * 2)
+        """Stop the green watcher and wait for it; fails while it is still running.
+
+        A watcher still alive after the join may yet post green, so the run
+        is not torn down. It stays recorded, and the next stop waits again.
+        """
+
+        stop, thread = self._watch_stop, self._watch_thread
+        if stop is not None and thread is not None:
+            stop.set()
+            thread.join(timeout=WATCH_JOIN_SECONDS)
+            if thread.is_alive():
+                raise fe.PreflightFailed(
+                    f"the green loop gate watcher still runs {WATCH_JOIN_SECONDS:g} s "
+                    "after it was stopped; it may still post a green build"
+                )
         self._watch_stop = self._watch_thread = None
         return {"green_heads": list(self.green_heads)}
 

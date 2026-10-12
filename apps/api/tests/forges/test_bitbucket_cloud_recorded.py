@@ -108,7 +108,7 @@ async def _replay(
             reviewer_api,
             ReplayGit(cassette.meta),
             cassette.meta["branch"],
-            live=False,
+            cleanup=None,
         )
         try:
             seen = await drive(session)

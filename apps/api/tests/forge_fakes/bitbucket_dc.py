@@ -12,6 +12,12 @@ request (method, path, query, headers, JSON body and the timeout the client
 sent) and can inject a transport error or a scripted answer before the app
 sees the request. Seeding helpers change state directly and count no write;
 `writes` counts only mutating requests the app accepted.
+
+Activities follow live 9.4.24: a top-level or inline comment adds a
+``COMMENTED``/``ADDED`` activity, but a reply adds none and an edit adds none.
+A reply appears only nested under its root, in every activity and read that
+carries the root, and a reply under an inline root carries that anchor too.
+An edit changes the comment in place.
 """
 
 from __future__ import annotations
@@ -351,10 +357,15 @@ class BitbucketDcFake:
         created: int | None = None,
     ) -> int:
         """``author`` comments on ``pull``: top level, inline (``anchor``), or as a
-        reply under ``parent``. ``created`` back-dates it (epoch ms)."""
+        reply under ``parent``. ``created`` back-dates it (epoch ms).
+
+        Only a comment that starts a thread adds an activity. A reply under an
+        inline thread carries its root's anchor."""
 
         if parent is not None and parent not in self.comments:
             raise KeyError(parent)
+        if parent is not None and anchor is None:
+            anchor = self.comments[self._root_of(self.comments[parent])].anchor
         stamp = self.now() if created is None else created
         cid = next(self._ids)
         self.comments[cid] = _Comment(
@@ -367,14 +378,15 @@ class BitbucketDcFake:
             parent=parent,
             anchor=anchor,
         )
-        self._activity(
-            pull,
-            int(author.id),
-            "COMMENTED",
-            comment=cid,
-            comment_action="ADDED" if parent is None else "REPLIED",
-            created=stamp,
-        )
+        if parent is None:
+            self._activity(
+                pull,
+                int(author.id),
+                "COMMENTED",
+                comment=cid,
+                comment_action="ADDED",
+                created=stamp,
+            )
         return cid
 
     def inline_anchor(self, pull: int) -> dict[str, Any]:
@@ -393,7 +405,6 @@ class BitbucketDcFake:
     def edit_comment(self, cid: int, text: str) -> None:
         found = self.comments[cid]
         found.text, found.version, found.updated = text, found.version + 1, self.now()
-        self._activity(found.pull, found.author, "COMMENTED", comment=cid, comment_action="EDITED")
 
     def delete_comment(self, cid: int) -> None:
         found = self.comments[cid]
@@ -1076,7 +1087,6 @@ class BitbucketDcFake:
             )
             return JSONResponse(stale, status_code=409)
         found.text, found.version, found.updated = body["text"], found.version + 1, self.now()
-        self._activity(record.id, uid, "COMMENTED", comment=found.id, comment_action="EDITED")
         self.writes += 1
         return JSONResponse(self._comment_payload(found, markup=markup))
 

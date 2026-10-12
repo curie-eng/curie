@@ -2,7 +2,8 @@
 
 Load by path (``importlib.util.spec_from_file_location``) and pass the dict
 ``load_state`` returns. Stdlib only. Users act with basic auth from their
-password files; ``admin`` merges and declines.
+password files; ``admin`` merges and declines. Requests follow no redirect, so
+a password is only ever sent to the fixture URL the caller named.
 """
 
 from __future__ import annotations
@@ -13,8 +14,9 @@ import os
 import ssl
 import urllib.parse
 import urllib.request
+from email.message import Message
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 SCHEMA = "curie.forge-fixture.bitbucket-dc/v1"
 
@@ -25,6 +27,21 @@ def load_state(path: str | os.PathLike[str]) -> dict[str, Any]:
     if state.get("schema") != SCHEMA or "token_file" not in state:
         raise ValueError(f"{path} is not a finished {SCHEMA} state file")
     return state
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow no redirect: the 3xx surfaces as an HTTPError, nothing is re-sent."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: IO[bytes],
+        code: int,
+        msg: str,
+        headers: Message,
+        newurl: str,
+    ) -> None:
+        return None
 
 
 def _password_file(state: dict[str, Any], user: str) -> str:
@@ -66,7 +83,10 @@ def _call(
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     context = ssl.create_default_context(cafile=state["ca_file"])
-    with urllib.request.urlopen(request, context=context, timeout=30) as response:
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context), _RefuseRedirect()
+    )
+    with opener.open(request, timeout=30) as response:
         raw = response.read()
     return json.loads(raw) if raw else None
 

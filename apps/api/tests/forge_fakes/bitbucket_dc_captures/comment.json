@@ -58,6 +58,16 @@
         "editable": true,
         "transitionable": true,
         "deletable": true
+      },
+      "anchor": {
+        "fromHash": "1f2e3d4c5b6a79807a3f0c9e1d2b4a5f6e7d8c9b",
+        "toHash": "7a3f0c9e1d2b4a5f6e7d8c9b0a1f2e3d4c5b6a79",
+        "line": 1,
+        "lineType": "ADDED",
+        "fileType": "TO",
+        "path": "README.md",
+        "diffType": "EFFECTIVE",
+        "orphaned": false
       }
     }
   ],

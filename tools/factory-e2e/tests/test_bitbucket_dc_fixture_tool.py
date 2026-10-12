@@ -11,9 +11,9 @@ follows:
     ``["up", "--state-dir", D, "--port", "27443"]``. It returns the exit code
     and does not raise for a fixture failure: the reason goes to stderr. The
     script's ``__main__`` block calls it with the real runner and
-    ``urllib.request.urlopen``. ``CURIE_FORGE_FIXTURE_FAIL_AT`` is read from
-    ``os.environ``. ``clock`` is every reading of the time against ``up``'s
-    900 s deadline.
+    ``refusing_urlopen``, which follows no redirect.
+    ``CURIE_FORGE_FIXTURE_FAIL_AT`` is read from ``os.environ``. ``clock`` is
+    every reading of the time against ``up``'s 900 s deadline.
 
 ``runner(argv, *, env=None, input=None, timeout=None, cwd=None)``
     Runs every external command (``docker``, ``docker compose``, ``openssl``,
@@ -47,14 +47,17 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import certifi
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -1137,3 +1140,127 @@ def test_up_seeds_project_repo_users_and_token(
     pushes = [c for c in docker.calls if Path(c["argv"][0]).name == "git" and "push" in c["argv"]]
     assert pushes, "no seed commit was pushed"
     assert any(k.startswith("GIT_CONFIG_") for k in pushes[0]["env"])
+
+
+# --------------------------------------------------------------------------
+# Redirects: an authenticated request is never re-sent elsewhere
+
+
+class _RedirectServer:
+    """A loopback HTTP server: ``/moved`` answers 302 to ``/target``, the rest 200."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[str, str | None]] = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                outer.seen.append((self.path, self.headers.get("Authorization")))
+                if self.path.startswith("/moved"):
+                    self.send_response(302)
+                    self.send_header("Location", f"{outer.url}/target")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                payload = b'{"state": "RUNNING"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_: Any) -> None:
+                return None
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(5)
+
+
+@pytest.fixture
+def redirect_server() -> Iterator[_RedirectServer]:
+    server = _RedirectServer()
+    try:
+        yield server
+    finally:
+        server.close()
+
+
+@pytest.fixture(scope="module")
+def helpers() -> ModuleType:
+    path = FIXTURE_DIR / "helpers.py"
+    spec = importlib.util.spec_from_file_location("curie_bitbucket_dc_helpers", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_real_opener_refuses_a_redirect_without_a_follow_up(
+    fx: ModuleType, redirect_server: _RedirectServer
+) -> None:
+    request = urllib.request.Request(
+        f"{redirect_server.url}/moved", headers={"Authorization": "Basic c2VjcmV0"}
+    )
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        fx.refusing_urlopen(request, timeout=5)
+    assert caught.value.code == 302
+    assert [path for path, _ in redirect_server.seen] == ["/moved"]
+
+
+def test_the_real_opener_reads_a_200(fx: ModuleType, redirect_server: _RedirectServer) -> None:
+    with fx.refusing_urlopen(f"{redirect_server.url}/status", timeout=5) as response:
+        assert json.loads(response.read()) == {"state": "RUNNING"}
+
+
+def test_main_runs_with_the_refusing_opener() -> None:
+    assert "urlopen=refusing_urlopen" in FIXTURE_PATH.read_text()
+
+
+def test_an_authenticated_fixture_call_fails_on_a_redirect(
+    fx: ModuleType, redirect_server: _RedirectServer
+) -> None:
+    client = fx.Http(fx.refusing_urlopen, redirect_server.url, Path(certifi.where()))
+    with pytest.raises(fx.FixtureError, match="HTTP 302"):
+        client.call("GET", "/moved", auth="Basic c2VjcmV0")
+    assert redirect_server.seen == [("/moved", "Basic c2VjcmV0")]
+    assert client.call("GET", "/status", auth="Basic c2VjcmV0") == {"state": "RUNNING"}
+
+
+def _helper_state(tmp_path: Path, base_url: str) -> dict[str, Any]:
+    password = tmp_path / "admin-password"
+    password.write_text("not-a-real-password\n")
+    return {
+        "base_url": base_url,
+        "ca_file": certifi.where(),
+        "project_key": "FAC",
+        "repo_slug": "demo",
+        "admin": {"username": "admin", "password_file": str(password)},
+        "users": {},
+    }
+
+
+def test_a_helper_call_refuses_a_redirect_without_a_follow_up(
+    helpers: ModuleType, redirect_server: _RedirectServer, tmp_path: Path
+) -> None:
+    state = _helper_state(tmp_path, redirect_server.url)
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        helpers._call(state, "admin", "GET", f"{redirect_server.url}/moved")
+    assert caught.value.code == 302
+    assert [path for path, _ in redirect_server.seen] == ["/moved"]
+    assert redirect_server.seen[0][1] is not None
+
+
+def test_a_helper_call_reads_a_200(
+    helpers: ModuleType, redirect_server: _RedirectServer, tmp_path: Path
+) -> None:
+    state = _helper_state(tmp_path, redirect_server.url)
+    assert helpers._call(state, "admin", "GET", f"{redirect_server.url}/status") == {
+        "state": "RUNNING"
+    }

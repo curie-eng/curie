@@ -37,5 +37,9 @@ same call, anonymized:
 
 Confirmed on the 9.4.24 fixture: the repository builds `GET` needs `key` (400
 without it) and returns that one status, so the build files above are the
-fixture's answers, anonymized. Still to confirm: whether a reply produces its
-own `REPLIED` activity, and the `X-RateLimit-*` header names on a 429.
+fixture's answers, anonymized. A reply adds no activity of its own and an edit
+adds no `EDITED` activity: a reply appears only nested in its root's
+`comments`, and a reply under an inline root carries that root's `anchor`, so
+`activities.json` holds no `REPLIED` entry and the nested reply in it,
+`comment.json` and `comment-markup.json` has an `anchor`. Still to confirm: the
+`X-RateLimit-*` header names on a 429.
