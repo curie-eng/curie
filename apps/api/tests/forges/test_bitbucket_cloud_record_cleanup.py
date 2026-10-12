@@ -135,7 +135,8 @@ async def test_an_exhausted_budget_still_declines_and_deletes(fake: BitbucketClo
     assert BRANCH not in fake.branches
     # The recorded session stopped at its budget; the cleanup came from the reserve.
     assert len(recording.exchanges) == recording.limit
-    assert allowance.used == CLEANUP_REQUESTS
+    # The pull request was read back, so no lookup: decline and delete.
+    assert allowance.used == 2 < CLEANUP_REQUESTS
 
 
 @pytest.mark.anyio
@@ -197,3 +198,32 @@ async def test_cleanup_raises_the_decline_failure_after_deleting_the_branch(
 
     assert asked == [("POST", "decline"), ("DELETE", BRANCH)]
     assert (seen.pull_declined, seen.branch_deleted) == (False, True)
+
+
+class _ExhaustAfterOpening(_ExhaustMidSession):
+    """The budget runs out on the request that opens the pull request, so the
+    run never reads its id back."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        opening = request.method == "POST" and request.url.path.endswith("/pullrequests")
+        if opening and self.recording is not None:
+            self.recording.limit = min(self.recording.limit, len(self.recording.exchanges) + 1)
+        return await self.inner.handle_async_request(request)
+
+
+@pytest.mark.anyio
+async def test_a_pull_request_opened_but_never_read_back_is_still_declined(
+    fake: BitbucketCloudFake,
+) -> None:
+    inner = _ExhaustAfterOpening(fake)
+    recording = RecordingTransport(inner)
+    inner.recording = recording
+    allowance = AllowanceTransport(httpx.ASGITransport(app=fake.app))
+
+    with pytest.raises(AssertionError, match="at most"):
+        await _drive(fake, recording, allowance)
+
+    (pull,) = fake.pulls.values()
+    assert pull.state == "DECLINED"
+    assert BRANCH not in fake.branches
+    assert allowance.used == CLEANUP_REQUESTS

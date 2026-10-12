@@ -283,6 +283,26 @@ async def _decline(client: httpx.AsyncClient, session: Session, seen: Observed) 
     seen.pull_declined = True
 
 
+async def _decline_unseen(client: httpx.AsyncClient, session: Session) -> None:
+    """Decline what the branch opened when the run failed before it read the id back.
+
+    Opening the pull request is one request and reading it back another, so a
+    run can fail between them with a pull request open that it never saw.
+    """
+
+    listed = await _ok(
+        await client.get(
+            f"{session.repo_path}/pullrequests",
+            params={"q": f'source.branch.name = "{session.branch}"', "state": "OPEN"},
+        )
+    )
+    numbers = [p["id"] for p in listed["values"]]
+    if len(numbers) > 1:
+        raise AssertionError(f"{len(numbers)} open pull requests on the recording branch")
+    for number in numbers:
+        await _ok(await client.post(f"{session.repo_path}/pullrequests/{number}/decline"))
+
+
 async def _delete_branch(client: httpx.AsyncClient, session: Session, seen: Observed) -> None:
     branch = quote(session.branch, safe="")
     deleted = await client.delete(f"{session.repo_path}/refs/branches/{branch}")
@@ -318,6 +338,11 @@ async def cleanup(client: httpx.AsyncClient, session: Session, seen: Observed) -
     if seen.pull is not None and not seen.pull_declined:
         try:
             await _decline(client, session, seen)
+        except Exception as failed:  # noqa: BLE001  the branch is still deleted
+            failures.append(failed)
+    elif seen.pull is None and seen.head is not None:
+        try:
+            await _decline_unseen(client, session)
         except Exception as failed:  # noqa: BLE001  the branch is still deleted
             failures.append(failed)
     if seen.head is not None and not seen.branch_deleted:

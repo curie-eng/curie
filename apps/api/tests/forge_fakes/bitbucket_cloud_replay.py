@@ -18,8 +18,8 @@ the recording, and on any request carrying ``If-None-Match`` (decision 13.4).
 201st request (decision 16.3). That cap counts every request of the recorded
 session, its own teardown included, and the cassette is exactly those
 requests. A live run that fails cleans up through `AllowanceTransport`
-instead: at most `CLEANUP_REQUESTS` more requests (decline the pull request,
-delete the branch), outside the cap and never recorded, since a failed run
+instead: at most `CLEANUP_REQUESTS` more requests (find the pull request when
+the run never read it back, decline it, delete the branch), outside the cap and never recorded, since a failed run
 writes no cassette. So an exhausted budget cannot block the cleanup.
 """
 
@@ -41,7 +41,7 @@ LIFECYCLE = RECORDINGS / "lifecycle.json"
 API_PREFIX = "/2.0"
 MAX_REQUESTS = 200
 # A failed live run's cleanup: one decline and one branch deletion.
-CLEANUP_REQUESTS = 2
+CLEANUP_REQUESTS = 3
 
 # The response headers a recording keeps; every other one is dropped unread.
 RESPONSE_HEADERS = frozenset({"content-type", "retry-after"})
