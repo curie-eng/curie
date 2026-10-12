@@ -34,6 +34,7 @@ pub mod factory_app;
 pub mod factory_intake;
 pub mod factory_quickstart;
 pub mod factory_toolchain;
+pub mod forge_expiry;
 pub mod github_app;
 pub mod guide;
 pub mod installation;

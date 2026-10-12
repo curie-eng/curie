@@ -85,7 +85,7 @@
       "result": "ClusterStatusOutput",
       "kind": "CliOutput",
       "schema": "cluster-status.schema.json",
-      "version": "1.4"
+      "version": "1.5"
     },
     {
       "result": "ClusterUpOutput",
@@ -139,7 +139,7 @@
       "result": "DoctorOutput",
       "kind": "CliOutput",
       "schema": "doctor.schema.json",
-      "version": "2.1"
+      "version": "2.2"
     },
     {
       "result": "DryRunPlan",
