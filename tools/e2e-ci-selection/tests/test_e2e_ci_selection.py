@@ -2405,7 +2405,7 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
 
     chart = jobs["e2e-cluster-chart-regressions"]
     assert chart["if"] == "${{ needs.changes.outputs.cluster == 'true' }}"
-    assert chart["needs"] == ["changes", "ci-images"]
+    assert chart["needs"] == ["rust-build", "changes", "ci-images"]
     assert "e2e-cluster-chart-regressions" in jobs["e2e-required"]["needs"]
 
     rollout = jobs["e2e-cluster-rollout-recovery"]
@@ -2413,6 +2413,70 @@ def test_single_regression_proofs_run_outside_the_cluster_rung() -> None:
         "${{ github.event_name != 'pull_request' && needs.changes.outputs.cluster == 'true' }}"
     )
     assert "e2e-cluster-rollout-recovery" in jobs["e2e-required"]["needs"]
+
+
+def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
+    jobs = yaml.safe_load(WORKFLOW.read_text())["jobs"]
+    chart = jobs["e2e-cluster-chart-regressions"]
+    assert chart["needs"] == ["rust-build", "changes", "ci-images"]
+    steps = chart["steps"]
+    workspace = next(
+        step
+        for step in steps
+        if step.get("name") == "Workspace dependency failure reaches the terminal diagnostic"
+    )
+    assert workspace["env"] == {
+        "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
+        "CURIE_SCENARIO_CONTEXT": "kind-curie-e2e",
+        "CURIE_SCENARIO_RUN_ID": "${{ github.run_id }}-${{ github.run_attempt }}",
+        "CURIE_SCENARIO_API_IMAGE": "curie-api:wsdiag-${{ github.sha }}",
+        "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:wsdiag-${{ github.sha }}",
+        "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:wsdiag-${{ github.sha }}",
+    }
+    commands = workspace["run"].replace("\\\n", " ")
+    assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
+        "set -euo pipefail",
+        "bash tools/runtime-assertion-gate/run.sh "
+        "charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh",
+    ]
+    staging_names = [
+        "Download the workspace diagnostic CLI",
+        "Load the workspace diagnostic candidate images",
+        "Stage the workspace diagnostic images in kind",
+    ]
+    staging = [step for step in steps if step.get("name") in staging_names]
+    assert [step["name"] for step in staging] == staging_names
+    calico_index = next(
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Install Calico so NetworkPolicy is actually enforced"
+    )
+    assert calico_index < steps.index(staging[0]) < steps.index(staging[1])
+    assert steps.index(staging[1]) < steps.index(staging[2]) < steps.index(workspace)
+    for step in staging:
+        assert step.get("if") == workspace.get("if"), step
+        assert "continue-on-error" not in step
+    download, load, stage = staging
+    assert download["uses"].startswith("actions/download-artifact@")
+    assert download["with"] == {
+        "name": "curie-x86_64-linux-${{ github.sha }}",
+        "path": "cli/target/release",
+    }
+    assert load["uses"] == "./.github/actions/load-ci-images"
+    assert load["with"] == {"images": "{api,worker,runner}"}
+    stage_run = stage["run"]
+    assert "chmod +x cli/target/release/curie" in stage_run
+    assert "docker build" not in stage_run and "cargo build" not in stage_run
+    for component in ("api", "worker", "runner"):
+        assert (
+            f"docker tag curie-ci/{component}:candidate "
+            f"curie-{component}:wsdiag-${{{{ github.sha }}}}"
+        ) in stage_run
+    assert stage_run.count("kind load docker-image") == 1
+    assert "--name curie-e2e" in stage_run
+    image_load = stage_run[stage_run.index("kind load docker-image") :]
+    for component in ("api", "worker", "runner"):
+        assert f"curie-{component}:wsdiag-${{{{ github.sha }}}}" in image_load
 
 
 # #4016: the approval resume kind scenario runs on pull requests whenever a
