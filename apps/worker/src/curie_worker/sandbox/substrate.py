@@ -1132,24 +1132,34 @@ class SandboxSubstrate:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
-                claim_gone = (
-                    self._k8s.get_claim(
-                        record.handle.claim_name,
-                        request_timeout_seconds=min(_GONE_READ_TIMEOUT_S, remaining),
+                claim_gone = sandbox_gone = False
+                try:
+                    claim_gone = (
+                        self._k8s.get_claim(
+                            record.handle.claim_name,
+                            request_timeout_seconds=min(_GONE_READ_TIMEOUT_S, remaining),
+                        )
+                        is None
                     )
-                    is None
-                )
 
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                sandbox_gone = (
-                    self._k8s.get_sandbox(
-                        record.handle.sandbox_name,
-                        request_timeout_seconds=min(_GONE_READ_TIMEOUT_S, remaining),
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    sandbox_gone = (
+                        self._k8s.get_sandbox(
+                            record.handle.sandbox_name,
+                            request_timeout_seconds=min(_GONE_READ_TIMEOUT_S, remaining),
+                        )
+                        is None
                     )
-                    is None
-                )
+                except KubeTransientError as exc:
+                    # A failed read proves neither presence nor absence. Keep
+                    # polling within the original cleanup window, and require
+                    # both real absence observations before the quota proof.
+                    logger.warning(
+                        "idle route reclamation skipped a transient disappearance read: %s",
+                        type(exc).__name__,
+                    )
                 if claim_gone and sandbox_gone:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:

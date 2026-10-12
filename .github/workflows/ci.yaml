@@ -2791,6 +2791,12 @@ jobs:
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
+      - name: Quota progress regression
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          bash tools/runtime-assertion-gate/run.sh \
+            charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |
