@@ -1312,7 +1312,7 @@ check_github_token_empty() {
     return 1
   fi
   if [[ -n "$got" ]]; then
-    echo "sealed render must leave githubToken EMPTY (empty means 'no GitHub credential, public repos only'); got '${got}' -- api.githubToken has been routed through a generating helper (#1109 regression)." >&2
+    echo "sealed render must leave githubToken EMPTY (empty means 'no GitHub credential, public repos only'); got a nonempty credential -- api.githubToken has been routed through a generating helper (#1109 regression)." >&2
     return 1
   fi
   echo "  ok: $label leaves githubToken empty (not generated)"
@@ -2934,8 +2934,8 @@ for source, label, kind, preinstall, classified, class_name, target in (
 PYEOF
 for case_name in job pod exempt upgrade operator operator_upgrade gvisor; do
   case "$case_name" in
-    job) expected_error="hook Job "*"has priorityClassName=None" ;;
-    pod) expected_error="hook Pod "*"has priorityClassName=None" ;;
+    job) expected_error="hook Job *has priorityClassName=None" ;;
+    pod) expected_error="hook Pod *has priorityClassName=None" ;;
     exempt) expected_error="hook Job curie-preflight-avx has priorityClassName='curie-platform', expected None" ;;
     upgrade) expected_error="hook Job curie-schema-migrate has priorityClassName='curie-platform', expected None" ;;
     operator) expected_error="hook Job curie-preflight-avx has priorityClassName=None, expected 'operator-platform-class'" ;;
