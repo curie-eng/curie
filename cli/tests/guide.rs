@@ -242,6 +242,10 @@ fn guide_documents_cluster_up_gvisor_inference_and_fail_closed_contradictions() 
             text.contains("before the first install") && text.contains("NotFound"),
             "{label} primer missing the pre-install NotFound RuntimeClass lookup\n{text}"
         );
+        assert!(
+            text.contains("A present RuntimeClass whose nodeSelector matches no node also infers security.gvisor.mode=off before the first install; explicit auto is an error, while explicit require keeps the preflight gate for clusters that provision sandbox nodes on demand."),
+            "{label} primer missing the unschedulable RuntimeClass inference and explicit require exception\n{text}"
+        );
     }
 }
 
