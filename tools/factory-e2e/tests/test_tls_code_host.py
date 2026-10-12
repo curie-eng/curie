@@ -65,6 +65,9 @@ import factory_e2e as fe
 import pytest
 import tls_code_host
 
+# The sandbox claim kind the collector lists, as the kubectl resource argument.
+CLAIM_RESOURCE = "sandboxclaims" + ".extensions.agents.x-k8s.io"
+
 NAMESPACE = "test-factory-tls0001"
 IMAGE = "registry.example/curie-worker:sha-" + "c" * 40
 STUB_HOST = f"github-stub.{NAMESPACE}.svc.cluster.local"
@@ -915,7 +918,7 @@ class _FakePreflight:
     def kubectl(self, *args: str, check: bool = True) -> str:
         if "jobs" in args:
             raise AssertionError("the publication Job is read from the watch, not polled")
-        if "sandboxclaims.extensions.agents.x-k8s.io" in args:
+        if args[2:4] == ("get", CLAIM_RESOURCE):
             return json.dumps({"items": []})
         if "jsonpath={.status.phase}" in args:
             return "Running"
