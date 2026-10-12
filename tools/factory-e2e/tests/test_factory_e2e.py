@@ -365,8 +365,9 @@ def test_existing_publication_namespace_refuses_the_run(
     )
 
     def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
-        if "test-factory-unit-curie-publication" in argv:
-            return "namespace/test-factory-unit-curie-publication"
+        publication = f"test-factory-unit-{fe.release_name('test-factory-unit')}-publication"
+        if publication in argv:
+            return f"namespace/{publication}"
         return ""
 
     monkeypatch.setattr(fe, "run", fake_run)
@@ -850,9 +851,10 @@ def test_terminus_matcher_ignores_a_live_status_comment_without_the_final_marker
         body="- [ ] **Plan** (in progress)\nStatus: RUNNING\n"
         f"<!-- curie-execution-request:{_RID} -->\n",
     )
-    assert fe.match_terminus_comments(
-        [live], mention="factory", app_id="42", request_ids=[str(_RID)]
-    ) == []
+    assert (
+        fe.match_terminus_comments([live], mention="factory", app_id="42", request_ids=[str(_RID)])
+        == []
+    )
     final = _notice("runner_failed")
     matched = fe.match_terminus_comments(
         [live, final], mention="factory", app_id="42", request_ids=[str(_RID)]
@@ -1369,9 +1371,7 @@ def test_evaluation_report_rejects_a_skipped_pull_request_check() -> None:
     assert any("hidden_tests" in item for item in fe.evaluation_report_failures(report))
     report = _evaluation_report()
     report["passes"][1]["cases"][0]["configured_model"] = "z-ai/glm-5.3"
-    assert any(
-        "configured_model" in item for item in fe.evaluation_report_failures(report)
-    )
+    assert any("configured_model" in item for item in fe.evaluation_report_failures(report))
 
 
 def test_helm_upgrade_reuses_values_so_the_agent_pool_survives() -> None:
@@ -1466,9 +1466,7 @@ def test_runner_escalation_without_a_pull_request_is_a_refusal() -> None:
         agent_final_reply=None,
     )
     assert (
-        fe.judge_outcome(
-            ending, "comment", expect_causes={"no_pull_request", "runner_escalated"}
-        )
+        fe.judge_outcome(ending, "comment", expect_causes={"no_pull_request", "runner_escalated"})
         == []
     )
     assert fe.judge_outcome(ending, "comment")
@@ -1927,8 +1925,9 @@ def test_sql_sets_the_chart_schema_on_the_install_postgres(monkeypatch: pytest.M
     p = object.__new__(fe.Preflight)
     p.config = type("C", (), {"kube_context": "k"})()
     p.namespace = "test-factory-x"
+    p.release = fe.release_name(p.namespace)
     assert p.sql("SELECT 1") == [["", ""]]
-    assert "statefulset/curie-postgres" in seen["argv"]
+    assert f"statefulset/{fe.release_name('test-factory-x')}-postgres" in seen["argv"]
     assert "-csearch_path=curie" in seen["argv"][-1]
     assert seen["input"] == "SELECT 1"
 
@@ -2160,13 +2159,15 @@ def test_sweep_removes_only_stale_namespaces_and_their_release_objects(
     monkeypatch.setattr(fe, "pid_alive", lambda pid: False)
     deleted: list[tuple[str, str]] = []
     helm: list[list[str]] = []
+    dead_release = fe.release_name("test-factory-dead")
+    dead_publication = f"test-factory-dead-{dead_release}-publication"
 
     def kubectl(*args: str, check: bool = True) -> str:
         if args[:2] == ("get", "namespaces"):
             return json.dumps(listing)
         if args[:2] == ("get", "namespace") and ("namespace", args[2]) in deleted:
             return ""
-        if args[:3] == ("get", "namespace", "test-factory-dead-curie-publication"):
+        if args[:3] == ("get", "namespace", dead_publication):
             return json.dumps(
                 {
                     "metadata": {
@@ -2211,9 +2212,11 @@ def test_sweep_removes_only_stale_namespaces_and_their_release_objects(
     monkeypatch.setattr(fe.subprocess, "run", fake_subprocess)
     preflight.sweep_stale_namespaces()
     assert [argv[argv.index("-n") + 1] for argv in helm] == ["test-factory-dead"]
+    # The sweep uninstalls the stale namespace's own release, never "curie".
+    assert [argv[argv.index("uninstall") + 1] for argv in helm] == [dead_release]
     assert deleted == [
         ("namespace", "test-factory-dead"),
-        ("namespace", "test-factory-dead-curie-publication"),
+        ("namespace", dead_publication),
         ("clusterrole", "dead-role"),
     ]
     step = preflight.evidence["steps"][-1]
@@ -2309,6 +2312,167 @@ def test_install_creates_the_crds_it_adds_already_labelled_before_helm(
         "helm install",
     ]
     assert preflight.created_crds == ["sandboxes.agents.x-k8s.io"]
+
+
+@pytest.mark.parametrize(
+    "namespace",
+    ["test-factory-unit", "test-factory-a", "test-factory-0123abcd", "test-factory-" + "z" * 27],
+)
+def test_release_name_is_a_short_deterministic_per_namespace_name(namespace: str) -> None:
+    fe.validate_namespace(namespace)
+    release = fe.release_name(namespace)
+    assert release == fe.release_name(namespace)
+    assert release != "curie"
+    assert release.startswith("curie-")
+    suffix = release.removeprefix("curie-")
+    assert len(suffix) == 4
+    assert all(ch in "0123456789abcdef" for ch in suffix)
+
+
+def test_release_name_differs_between_namespaces() -> None:
+    assert fe.release_name("test-factory-a") != fe.release_name("test-factory-b")
+
+
+def test_longest_namespace_keeps_the_publication_namespace_within_63(tmp_path: Path) -> None:
+    namespace = "test-factory-" + "a" * 27
+    assert len(namespace) == 40
+    fe.validate_namespace(namespace)
+    config = fe.load_config(_env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
+    preflight = fe.Preflight(
+        config,
+        repo_root=REPO_ROOT,
+        candidate="c" * 40,
+        namespace=namespace,
+        evidence_path=tmp_path / "e.json",
+        admission_timeout=1,
+    )
+    publication = preflight.publication_namespace()
+    # The chart's printf "%s-%s-publication" .Release.Namespace fullname, with
+    # fullname equal to the release because it contains "curie".
+    assert publication == f"{namespace}-{fe.release_name(namespace)}-publication"
+    assert len(publication) == 63
+    assert preflight.release == fe.release_name(namespace)
+    assert preflight.evidence["release"] == preflight.release
+
+
+def test_priority_class_values_create_per_release_classes_unless_configured() -> None:
+    assert fe.priority_class_values(None, "curie-ab12") == {
+        "platform": {"create": True, "name": "curie-ab12-platform"},
+        "sandbox": {"create": True, "name": "curie-ab12-sandbox"},
+    }
+    assert fe.priority_class_values(("plat", "sand"), "curie-ab12") == {
+        "platform": {"create": False, "name": "plat"},
+        "sandbox": {"create": False, "name": "sand"},
+    }
+
+
+def test_release_values_carry_per_run_priority_classes_and_install_values_does_not(
+    tmp_path: Path,
+) -> None:
+    preflight = _preflight(tmp_path)
+    bare = fe.install_values(
+        preflight.config, candidate="c" * 40, app_key_secret="k", consumer_controller=False
+    )
+    assert "priorityClasses" not in bare
+    values = preflight.release_values(preflight.config, sandbox_pod_quota=None)
+    release = fe.release_name("test-factory-unit")
+    assert values["priorityClasses"] == {
+        "platform": {"create": True, "name": f"{release}-platform"},
+        "sandbox": {"create": True, "name": f"{release}-sandbox"},
+    }
+
+
+def _install_until_helm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, controller: str | Exception
+) -> tuple[fe.Preflight, list[str], dict[str, Any] | None]:
+    """Drive install() up to a helm install that fails, recording the order."""
+
+    preflight = _preflight(tmp_path)
+    chart = tmp_path / "chart"
+    (chart / "crds").mkdir(parents=True)
+    (chart / "crds" / "sandbox.yaml").write_text("metadata:\n  name: sandboxes.agents.x-k8s.io\n")
+    order: list[str] = []
+    captured: dict[str, Any] = {}
+
+    def kubectl(*args: str, check: bool = True) -> str:
+        if args[:3] == ("-n", fe.SANDBOX_CONTROLLER_NAMESPACE, "get"):
+            assert args[3:5] == ("deployment", fe.SANDBOX_CONTROLLER_DEPLOYMENT)
+            order.append("read controller")
+            if isinstance(controller, Exception):
+                raise controller
+            return controller
+        if args[0] == "label":
+            return "labelled-crd-yaml"
+        if "create" in args:
+            order.append("create secret")
+        return ""
+
+    def fake_run(argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        if argv[0] == "helm":
+            order.append("helm")
+            values_file = Path(argv[argv.index("-f") + 1])
+            captured["values"] = json.loads(values_file.read_text())
+            raise fe.PreflightFailed("helm install stopped by the test")
+        if "create" in argv:
+            order.append("create crd")
+        return ""
+
+    def extract_chart() -> Path:
+        order.append("extract chart")
+        return chart
+
+    monkeypatch.setattr(preflight, "extract_chart", extract_chart)
+    monkeypatch.setattr(preflight, "egress_cidrs", lambda: [])
+    monkeypatch.setattr(preflight, "kubectl", kubectl)
+    monkeypatch.setattr(fe, "run", fake_run)
+    with pytest.raises(fe.PreflightFailed) as raised:
+        preflight.install()
+    captured["error"] = str(raised.value)
+    return preflight, order, captured
+
+
+def test_install_reuses_an_existing_sandbox_controller(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight, order, captured = _install_until_helm(
+        tmp_path, monkeypatch, "deployment.apps/agent-sandbox-controller\n"
+    )
+    assert order[0] == "read controller"
+    assert order[-1] == "helm"
+    assert captured["values"]["agentSandbox"]["controller"]["deploy"] is False
+    assert {
+        "step": "sandbox controller reused",
+        "namespace": "agent-sandbox-system",
+        "deployment": "agent-sandbox-controller",
+    } in preflight.evidence["steps"]
+
+
+def test_install_deploys_the_controller_when_none_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preflight, order, captured = _install_until_helm(tmp_path, monkeypatch, "")
+    assert order[0] == "read controller"
+    assert order[-1] == "helm"
+    assert captured["values"]["agentSandbox"]["controller"]["deploy"] is True
+    release = fe.release_name("test-factory-unit")
+    assert captured["values"]["priorityClasses"]["platform"]["name"] == f"{release}-platform"
+    steps = [step["step"] for step in preflight.evidence["steps"]]
+    assert "sandbox controller reused" not in steps
+
+
+def test_install_stops_before_any_mutation_when_the_controller_read_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    error = fe.PreflightFailed(
+        "kubectl --context failed: Error from server (Forbidden): deployments.apps "
+        '"agent-sandbox-controller" is forbidden'
+    )
+    preflight, order, captured = _install_until_helm(tmp_path, monkeypatch, error)
+    assert order == ["read controller"]
+    assert "is forbidden" in captured["error"]
+    assert "agent-sandbox-system/agent-sandbox-controller" in captured["error"]
+    assert "values" not in captured
+    assert preflight.created_crds == []
 
 
 def test_newest_published_skips_unpublished_commits() -> None:
@@ -2612,8 +2776,7 @@ def test_the_final_reply_falls_back_to_the_transcript_without_a_comment_block() 
 # --- quiesce scenario (#3198) ---
 
 _QUIESCING_LINE = (
-    '{"state":"quiescing","since":"2026-09-27T10:00:00+00:00",'
-    '"revision":3,"ttl_seconds":28}'
+    '{"state":"quiescing","since":"2026-09-27T10:00:00+00:00","revision":3,"ttl_seconds":28}'
 )
 
 
@@ -2649,8 +2812,7 @@ def test_paused_for_upgrade_line_matches_the_api_constant() -> None:
     value = None
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "_PAUSED_FOR_UPGRADE_LINE"
-            for t in node.targets
+            isinstance(t, ast.Name) and t.id == "_PAUSED_FOR_UPGRADE_LINE" for t in node.targets
         ):
             value = ast.literal_eval(node.value)
     assert value is not None
