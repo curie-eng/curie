@@ -874,9 +874,10 @@ def test_terminus_matcher_ignores_a_live_status_comment_without_the_final_marker
         body="- [ ] **Plan** (in progress)\nStatus: RUNNING\n"
         f"<!-- curie-execution-request:{_RID} -->\n",
     )
-    assert fe.match_terminus_comments(
-        [live], mention="factory", app_id="42", request_ids=[str(_RID)]
-    ) == []
+    assert (
+        fe.match_terminus_comments([live], mention="factory", app_id="42", request_ids=[str(_RID)])
+        == []
+    )
     final = _notice("runner_failed")
     matched = fe.match_terminus_comments(
         [live, final], mention="factory", app_id="42", request_ids=[str(_RID)]
@@ -1393,9 +1394,7 @@ def test_evaluation_report_rejects_a_skipped_pull_request_check() -> None:
     assert any("hidden_tests" in item for item in fe.evaluation_report_failures(report))
     report = _evaluation_report()
     report["passes"][1]["cases"][0]["configured_model"] = "z-ai/glm-5.3"
-    assert any(
-        "configured_model" in item for item in fe.evaluation_report_failures(report)
-    )
+    assert any("configured_model" in item for item in fe.evaluation_report_failures(report))
 
 
 def test_helm_upgrade_reuses_values_so_the_agent_pool_survives() -> None:
@@ -1490,9 +1489,7 @@ def test_runner_escalation_without_a_pull_request_is_a_refusal() -> None:
         agent_final_reply=None,
     )
     assert (
-        fe.judge_outcome(
-            ending, "comment", expect_causes={"no_pull_request", "runner_escalated"}
-        )
+        fe.judge_outcome(ending, "comment", expect_causes={"no_pull_request", "runner_escalated"})
         == []
     )
     assert fe.judge_outcome(ending, "comment")
@@ -2636,8 +2633,7 @@ def test_the_final_reply_falls_back_to_the_transcript_without_a_comment_block() 
 # --- quiesce scenario (#3198) ---
 
 _QUIESCING_LINE = (
-    '{"state":"quiescing","since":"2026-09-27T10:00:00+00:00",'
-    '"revision":3,"ttl_seconds":28}'
+    '{"state":"quiescing","since":"2026-09-27T10:00:00+00:00","revision":3,"ttl_seconds":28}'
 )
 
 
@@ -2673,8 +2669,7 @@ def test_paused_for_upgrade_line_matches_the_api_constant() -> None:
     value = None
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "_PAUSED_FOR_UPGRADE_LINE"
-            for t in node.targets
+            isinstance(t, ast.Name) and t.id == "_PAUSED_FOR_UPGRADE_LINE" for t in node.targets
         ):
             value = ast.literal_eval(node.value)
     assert value is not None
@@ -2962,13 +2957,18 @@ def test_egress_cidrs_reads_no_github_meta(tmp_path: Path, monkeypatch: pytest.M
     assert preflight.egress_cidrs() == []
 
 
-def test_egress_cidrs_keeps_only_model_egress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_egress_cidrs_keeps_only_model_egress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     def no_http(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError(f"egress_cidrs must not call the GitHub API: {args}")
 
     def resolve(host: str, port: int, *args: Any) -> list[Any]:
         assert (host, port) == (fe.OPENROUTER_HOST, 443)
-        return [(None, None, None, "", ("104.18.2.9", 443)), (None, None, None, "", ("104.18.3.9", 443))]
+        return [
+            (None, None, None, "", ("104.18.2.9", 443)),
+            (None, None, None, "", ("104.18.3.9", 443)),
+        ]
 
     monkeypatch.setattr(fe, "http_json", no_http)
     monkeypatch.setattr(fe.socket, "getaddrinfo", resolve)

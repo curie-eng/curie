@@ -26,7 +26,9 @@ from curie_api.forges.credential_providers import expiry_for, expiry_warning
 from curie_api.forges.registry import build_registry
 from pydantic import TypeAdapter
 
-VECTOR_PATH = Path(__file__).resolve().parents[4] / "tests" / "vectors" / "forge-credential-expiry.json"
+VECTOR_PATH = (
+    Path(__file__).resolve().parents[4] / "tests" / "vectors" / "forge-credential-expiry.json"
+)
 VECTOR: dict[str, Any] = json.loads(VECTOR_PATH.read_text())
 WARN_BEFORE = timedelta(days=VECTOR["warn_before_days"])
 CREDENTIAL = TypeAdapter(CredentialConfig)
@@ -95,9 +97,9 @@ def test_every_report_line_matches_expiry_for(private_key: str) -> None:
     report = VECTOR["report"]
     now = _at(report["now"])
     assert now is not None
-    entries = [
-        ("code_host", entry) for entry in report["factory"]["codeHosts"]
-    ] + [("tracker", entry) for entry in report["factory"]["trackers"]]
+    entries = [("code_host", entry) for entry in report["factory"]["codeHosts"]] + [
+        ("tracker", entry) for entry in report["factory"]["trackers"]
+    ]
     got = []
     for section, entry in entries:
         expiry = expiry_for(_credential(entry["credential"], private_key))
@@ -124,9 +126,7 @@ def test_the_registry_reports_the_same_expiry_for_its_github_entries(private_key
         for entry in report["factory"][chart_key]:
             if entry["kind"] != "github":
                 continue
-            converted = {
-                _snake(k): v for k, v in entry.items() if k != "credential"
-            }
+            converted = {_snake(k): v for k, v in entry.items() if k != "credential"}
             converted["credential"] = _config_document(entry["credential"], private_key)
             document[config_key].append(converted)
     registry = build_registry(ForgesConfig.model_validate(document))
