@@ -39,6 +39,7 @@ fn base() -> PlanInput {
         chart: "charts/curie".into(),
         credential_in_env: true,
         release_has_real_model: false,
+        chart_explicit: false,
         interactive: true,
         release_at_target: false,
         agent: DEFAULT_AGENT.into(),

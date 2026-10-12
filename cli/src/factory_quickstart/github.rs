@@ -410,6 +410,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         chart: opts.chart.clone(),
         credential_in_env,
         release_has_real_model,
+        chart_explicit: opts.chart_explicit,
         // Dry-run reports a non-kind current context instead of refusing it.
         interactive: opts.dry_run || real_interactive,
         release_at_target,
@@ -679,6 +680,7 @@ async fn execute(
                 runner_image,
                 bound,
                 jira_binding,
+                chart,
             } => {
                 let (dir, image) = match bundle {
                     Some(dir) => (dir.clone(), runner_image.clone()),
@@ -712,6 +714,7 @@ async fn execute(
                     &dir,
                     bound,
                     jira_binding.as_deref(),
+                    chart.as_deref(),
                 )
                 .into_iter()
                 .enumerate()
@@ -872,7 +875,9 @@ pub fn intake_args(context: &str, intake: &FactoryIntakeOpts, image: &str) -> Ve
 /// serves each. A repository in `bound` already carries this agent's binding
 /// under the requested label and gets no `surfaces --add`. With
 /// `jira_binding` the agent is bound once through that Jira binding instead,
-/// which names every repository.
+/// which names every repository. `chart` is the operator's `--chart`, passed
+/// on so the deploy writes connector Secrets with the chart the release runs
+/// rather than resolving the released one; `None` leaves the default.
 #[allow(clippy::too_many_arguments)]
 pub fn deploy_args(
     context: &str,
@@ -884,6 +889,7 @@ pub fn deploy_args(
     bundle: &Path,
     bound: &[String],
     jira_binding: Option<&str>,
+    chart: Option<&str>,
 ) -> Vec<Vec<String>> {
     let first = repos.first().cloned().unwrap_or_default();
     let mut argvs = vec![vec![
@@ -904,6 +910,9 @@ pub fn deploy_args(
         "--repo".into(),
         first,
     ]];
+    if let Some(chart) = chart {
+        argvs[0].extend(["--chart".into(), chart.into()]);
+    }
     let surfaces: Vec<String> = match jira_binding {
         Some(binding) => vec![format!("jira={binding}")],
         None => repos

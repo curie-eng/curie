@@ -62,6 +62,9 @@ pub struct QuickstartOpts {
     /// An operator bundle deployed as given (`--plugin-dir`).
     pub plugin_dir: Option<PathBuf>,
     pub chart: String,
+    /// `--chart` was passed, so `chart` is the operator's and the deploy
+    /// uses it too.
+    pub chart_explicit: bool,
     pub dry_run: bool,
     pub forge: ForgeFlags,
 }
@@ -373,6 +376,8 @@ pub struct PlanInput {
     pub chart: String,
     pub credential_in_env: bool,
     pub release_has_real_model: bool,
+    /// `--chart` was passed; `cluster deploy` then gets it as well.
+    pub chart_explicit: bool,
     pub interactive: bool,
     /// The release is already the chart and the quickstart values, so this
     /// plan must not invoke `cluster up`.
@@ -471,6 +476,9 @@ pub enum Action {
         /// The Jira binding the agent is bound through instead of one GitHub
         /// surface per repository.
         jira_binding: Option<String>,
+        /// The operator's `--chart`, passed on to `cluster deploy`; `None`
+        /// lets it resolve its default chart.
+        chart: Option<String>,
     },
 }
 
@@ -1264,6 +1272,7 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
             already_bound(input)
         },
         jira_binding: input.jira.as_ref().map(|jira| jira.binding_name.clone()),
+        chart: input.chart_explicit.then(|| input.chart.clone()),
     };
     let jira = input
         .jira
@@ -1492,6 +1501,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 runner_image,
                 bound,
                 jira_binding,
+                chart,
             } => {
                 let dir = match bundle {
                     None => {
@@ -1525,6 +1535,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     &dir,
                     bound,
                     jira_binding.as_deref(),
+                    chart.as_deref(),
                 ) {
                     lines.push(format!("curie {}", args.join(" ")));
                 }
@@ -2069,6 +2080,7 @@ mod tests {
             chart: "charts/curie".into(),
             credential_in_env: false,
             release_has_real_model: false,
+            chart_explicit: false,
             interactive: true,
             release_at_target: false,
             agent: DEFAULT_AGENT.into(),
@@ -2616,6 +2628,7 @@ mod tests {
             &bundle_dir("ns", "rel", DEFAULT_AGENT),
             &[],
             None,
+            None,
         );
         assert_eq!(argvs.len(), 3, "{argvs:?}");
         assert_eq!(&argvs[0][..2], ["cluster", "deploy"]);
@@ -2670,6 +2683,7 @@ mod tests {
                 None,
                 &bundle_dir("ns", "rel", DEFAULT_AGENT),
                 &[],
+                None,
                 None,
             )
             .len(),
@@ -3012,6 +3026,7 @@ mod tests {
             label.as_deref(),
             Path::new("/bundle"),
             bound,
+            None,
             None,
         );
         assert_eq!(argvs.len(), 1, "{argvs:?}");

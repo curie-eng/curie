@@ -703,6 +703,7 @@ fn input() -> PlanInput {
         chart: "charts/curie".into(),
         credential_in_env: true,
         release_has_real_model: false,
+        chart_explicit: false,
         interactive: true,
         release_at_target: false,
         agent: DEFAULT_AGENT.into(),
@@ -1016,6 +1017,67 @@ fn jira_tracker_action_follows_intake_on_install_and_leads_add_agent() {
         .any(|line| line.ends_with("--add github=acme/widgets")));
 }
 
+fn deploy_line(input: &PlanInput) -> String {
+    pinned_tmpdir();
+    let planned = quickstart_plan(input).unwrap();
+    describe(&planned)
+        .into_iter()
+        .find(|line| line.starts_with("curie cluster deploy "))
+        .expect("a cluster deploy line")
+}
+
+#[test]
+fn an_explicit_chart_reaches_the_cluster_deploy_argv() {
+    // The deploy writes connector Secrets with a chart; an unreleased build
+    // has no released chart to fetch, so the operator's --chart must reach it.
+    for jira in [true, false] {
+        for mut input in [install_input(), add_agent_input()] {
+            if !jira {
+                input.jira = None;
+            }
+            input.chart = "/tmp/extracted/curie".into();
+            input.chart_explicit = true;
+            let line = deploy_line(&input);
+            assert!(
+                line.ends_with(" --chart /tmp/extracted/curie"),
+                "jira={jira}: {line}"
+            );
+            let argvs = deploy_args(
+                "ctx",
+                "ns",
+                "rel",
+                &repos(),
+                DEFAULT_AGENT,
+                None,
+                Path::new("/bundle"),
+                &[],
+                jira.then_some(BINDING),
+                Some("/tmp/extracted/curie"),
+            );
+            assert_eq!(argvs[0][1], "deploy");
+            assert!(argvs[0].ends_with(&["--chart".into(), "/tmp/extracted/curie".into()]));
+            assert!(
+                argvs[1..].iter().flatten().all(|arg| arg != "--chart"),
+                "only the deploy takes the chart: {argvs:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn without_an_explicit_chart_the_deploy_argv_is_unchanged() {
+    for jira in [true, false] {
+        for mut input in [install_input(), add_agent_input()] {
+            if !jira {
+                input.jira = None;
+            }
+            input.chart = "/tmp/extracted/curie".into();
+            let line = deploy_line(&input);
+            assert!(!line.contains("--chart"), "jira={jira}: {line}");
+        }
+    }
+}
+
 #[test]
 fn jira_deploy_binds_one_jira_surface_instead_of_each_github_repository() {
     let repos = vec!["a/x".to_string(), "b/y".to_string()];
@@ -1038,6 +1100,7 @@ fn jira_deploy_binds_one_jira_surface_instead_of_each_github_repository() {
             bundle,
             &[],
             Some(BINDING),
+            None,
         );
         assert_eq!(argvs[0][1], "deploy", "{argvs:?}");
         let bound = surfaces(&argvs);
@@ -1069,6 +1132,7 @@ fn jira_deploy_binds_one_jira_surface_instead_of_each_github_repository() {
         None,
         bundle,
         &[],
+        None,
         None,
     );
     let adds: Vec<String> = surfaces(&argvs)
