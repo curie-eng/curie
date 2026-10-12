@@ -1,7 +1,7 @@
 """The channel adapters the conformance kit runs against, one registry entry each.
 
 Every subject is driven through the worker's REAL egress seam: a
-``ReplySinkRouter`` with ``GitHubReplySink`` under ``github`` and an
+``ReplySinkRouter`` with ``TrackerReplySink`` under ``github`` and an
 ``HttpReplyAdapter`` as the default, addressed by a ``TargetRoute``. That is the
 kernel's whole view of egress, so each check measures what the platform would
 actually see, and a header-name or status mismatch between the worker and an
@@ -62,8 +62,12 @@ from channel_protocol.conformance import (
     Streaming,
     Upstream,
 )
+from curie_api.forges import types as forge_types
+from curie_api.forges.config import ForgesConfig
+from curie_api.forges.registry import build_registry
+from curie_api.forges.trackers import reply_route
+from curie_api.forges.types import TrackerIssueRef
 from curie_api.github_factory_events import parse_factory_event
-from curie_api.workitems.lifecycle import github_reply_route
 from curie_discord_adapter.config import DiscordConfig
 from curie_discord_adapter.egress import DiscordReplyService
 from curie_discord_adapter.http import create_reply_app
@@ -74,10 +78,10 @@ from curie_mail_adapter.adapter import MailAdapter
 from curie_mail_adapter.config import MailAdapterConfig
 from curie_mail_adapter.egress import EgressHandler, EgressServer
 from curie_worker.reply_sink import (
-    GitHubReplySink,
     HttpReplyAdapter,
     ReplySinkRouter,
     TargetRoute,
+    TrackerReplySink,
 )
 
 SubjectFactory = Callable[[Path], contextlib.AbstractAsyncContextManager[ChannelAdapterSubject]]
@@ -106,10 +110,10 @@ class _KernelEgress:
         credentials = {slug: secret} if slug and secret else {}
         forged = {slug: f"not-{secret}"} if slug and secret else {}
         self._router = ReplySinkRouter(
-            adapters={"github": GitHubReplySink()}, default=HttpReplyAdapter(credentials)
+            adapters={"github": TrackerReplySink()}, default=HttpReplyAdapter(credentials)
         )
         self._forged = ReplySinkRouter(
-            adapters={"github": GitHubReplySink()}, default=HttpReplyAdapter(forged)
+            adapters={"github": TrackerReplySink()}, default=HttpReplyAdapter(forged)
         )
 
     def point_at(self, endpoint: str) -> None:
@@ -668,7 +672,7 @@ _GITHUB_SENDER = {"id": 6601, "login": "octocat", "type": "User"}
 
 
 class GitHubSubject(_KernelEgressSubject):
-    """Factory mention intake on the ingress side, ``GitHubReplySink`` on egress.
+    """Factory mention intake on the ingress side, ``TrackerReplySink`` on egress.
 
     The platform's one GitHub writer is the factory notice path, so the sink
     acks and posts nothing; ``effects`` is empty because no provider call
@@ -716,8 +720,12 @@ class GitHubSubject(_KernelEgressSubject):
                 labels={"factory"},
                 mention=_GITHUB_MENTION,
             )
-            kind, address, conversation_id = github_reply_route(
-                notice.repo_full_name, notice.issue_number
+            # A GitHub issue replies on its repository; no forge entry is read.
+            issue = TrackerIssueRef(
+                forge_types.GITHUB, "github.com", "4401", str(notice.issue_number)
+            )
+            kind, address, conversation_id = reply_route(
+                build_registry(ForgesConfig()), issue, notice.repo_full_name
             )
             turns.append(
                 IngressTurn(
