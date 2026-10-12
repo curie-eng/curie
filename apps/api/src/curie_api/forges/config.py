@@ -30,7 +30,7 @@ from pydantic import (
     model_validator,
 )
 
-from curie_api.config import valid_base_branch
+from curie_api.branches import valid_base_branch
 from curie_api.forges import types
 from curie_api.forges.capabilities import NATIVE_FORGES, mandatory_capabilities
 from curie_api.forges.errors import InvalidPairing
@@ -54,8 +54,15 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+def valid_config_name(value: str) -> bool:
+    """Whether ``value`` is a config name: a binding, tracker or code host name,
+    or a repository alias. A ``jira=`` surface names a binding by it."""
+
+    return bool(_NAME.fullmatch(value))
+
+
 def _name(value: str, what: str) -> str:
-    if not _NAME.fullmatch(value):
+    if not valid_config_name(value):
         raise ValueError(
             f"{what} {value!r} must be 1 to 64 lowercase letters, digits, '.', '_' or '-'"
         )
@@ -485,6 +492,8 @@ class ForgesConfig(_Model):
                 )
             scopes[scope] = binding.name
             _check_binding(binding, tracker, code_hosts)
+        _check_github_pairing(self.trackers, self.code_hosts)
+        _check_one_github_app(self.trackers, self.code_hosts)
         return self
 
     def tracker(self, name: str) -> TrackerConfig:
@@ -492,6 +501,57 @@ class ForgesConfig(_Model):
 
     def code_host(self, name: str) -> CodeHostConfig:
         return next(host for host in self.code_hosts if host.name == name)
+
+
+def _check_github_pairing(
+    trackers: tuple[TrackerConfig, ...], code_hosts: tuple[CodeHostConfig, ...]
+) -> None:
+    """A GitHub tracker pairs only with a GitHub code host on its own host.
+
+    Intake reads a GitHub tracker's issues with the GitHub code host's
+    installation token, whether or not a binding names the pair, so a code host
+    on another host would send that token to the tracker's API.
+    """
+
+    for tracker in trackers:
+        if tracker.kind != types.GITHUB:
+            continue
+        for host in code_hosts:
+            if host.kind == types.GITHUB and host.host != tracker.host:
+                raise ValueError(
+                    f"tracker {tracker.name!r} on {tracker.host} and code host {host.name!r}"
+                    f" on {host.host}: a github tracker pairs only with a github code host"
+                    f" on {tracker.host}"
+                )
+
+
+def _check_one_github_app(
+    trackers: tuple[TrackerConfig, ...], code_hosts: tuple[CodeHostConfig, ...]
+) -> None:
+    """A GitHub tracker and a GitHub code host on one host act as one App.
+
+    The factory recognizes its own issue and pull request comments by the App
+    that wrote them, so two App ids on one host would make each side's marked
+    comments look foreign to the other and break their dedupe.
+    """
+
+    for tracker in trackers:
+        if tracker.kind != types.GITHUB or not isinstance(
+            tracker.credential, GitHubAppCredentialConfig
+        ):
+            continue
+        for host in code_hosts:
+            if (
+                host.kind == types.GITHUB
+                and host.host == tracker.host
+                and isinstance(host.credential, GitHubAppCredentialConfig)
+                and host.credential.app_id != tracker.credential.app_id
+            ):
+                raise ValueError(
+                    f"tracker {tracker.name!r} (GitHub App {tracker.credential.app_id}) and"
+                    f" code host {host.name!r} (GitHub App {host.credential.app_id}) are both"
+                    f" on {tracker.host} and must use the same GitHub App"
+                )
 
 
 def _check_binding(

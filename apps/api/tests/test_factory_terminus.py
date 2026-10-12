@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER, cause_text, result_section
+from curie_api.forges.registry import forges_registry
 from curie_api.workitem_dispatch import DispatchConflict, acquire, start
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
@@ -422,6 +423,14 @@ def test_runner_escalation_posts_one_comment_and_completed_needs_a_pull_request(
     assert "runner_escalated" in sink.comments[0]["body"]
     _assert_one_final_comment([c["body"] for c in sink.comments], row["id"])
     assert _request(number)["version"] == version
+
+
+def _follow_up_objective(number: int, comment_id: int) -> str:
+    """A mention objective as the factory writes it: under the code host's web base."""
+
+    code_host = forges_registry(get_settings()).github_code_host()
+    assert code_host is not None
+    return f"{code_host.html_base}/{REPO}/issues/{number}#issuecomment-{comment_id}"
 
 
 def _unadopted_pr_lineages(work_item_id: uuid.UUID, *, open_pr: bool, html_base: str) -> uuid.UUID:
@@ -1613,7 +1622,7 @@ def test_a_mention_with_no_changes_completes_naming_the_open_pull_request(
     number, pr, first = _published_issue(client, github, sink)
     sink.requests.clear()
     sink.ci_observations.clear()
-    objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88120"
+    objective = _follow_up_objective(number, 88120)
     revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
     _start_running(revision)
     detail = f"{padding}No changes needed: the existing tests already cover this request."
@@ -1731,7 +1740,7 @@ def test_a_no_change_reply_outside_an_open_follow_up_still_fails(
         request_id = first["id"]
     else:
         number, pr, first = _published_issue(client, github, sink)
-        objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88122"
+        objective = _follow_up_objective(number, 88122)
         if case == "mismatched_pr":
             objective = _revision_objective(pr + 1, "discussion_r88122")
         request_id = _insert_revision(
@@ -1954,7 +1963,7 @@ def test_a_no_change_follow_up_defers_to_its_in_flight_publication(
     client, github, sink = admitted
     sink.by_path = True
     number, _pr, first = _published_issue(client, github, sink)
-    objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88123"
+    objective = _follow_up_objective(number, 88123)
     revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
     _start_running(revision)
     _attach_revision_publication(first["work_item_id"], revision, status="pending")
@@ -1979,7 +1988,7 @@ def test_a_no_change_follow_up_cannot_complete_after_its_execution_deadline(
     client, github, sink = admitted
     sink.by_path = True
     number, _pr, first = _published_issue(client, github, sink)
-    objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88124"
+    objective = _follow_up_objective(number, 88124)
     revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
 
     async def expired_runtime() -> None:
@@ -2025,7 +2034,7 @@ def test_a_no_change_follow_up_preserves_stale_version_fencing(admitted: Any, st
     client, github, sink = admitted
     sink.by_path = True
     number, _pr, first = _published_issue(client, github, sink)
-    objective = f"https://github.com/{REPO}/issues/{number}#issuecomment-88125"
+    objective = _follow_up_objective(number, 88125)
     revision = _insert_revision(first["work_item_id"], number, objective, ISSUE_REPLY)
     _start_running(revision)
     versions = _rows(

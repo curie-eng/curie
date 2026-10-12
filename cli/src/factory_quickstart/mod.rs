@@ -19,12 +19,20 @@ use crate::factory_intake::{intake_values, FactoryIntakeOpts};
 use crate::ops::{require_on_path, CommonOpts};
 use crate::ui::DryRunPlan;
 
+mod bitbucket_cloud;
+mod bitbucket_dc;
+mod github;
+mod gitlab;
+mod jira_cloud;
+
+pub use github::{deploy_args, intake_args, registration_steps, RerunTarget};
+
 pub const DEFAULT_KIND_NAME: &str = "curie-factory";
 pub const DEFAULT_MODEL: &str = "z-ai/glm-5.3-flash";
 pub const ANTHROPIC_DEFAULT_MODEL: &str = "claude-sonnet-5-5";
 pub const DEFAULT_DEADLINE_SECONDS: u32 = 10800;
 pub const DEFAULT_BUDGET_USD: f64 = 5.0;
-pub const AGENT_NAME: &str = "dark-factory";
+pub const DEFAULT_AGENT: &str = "dark-factory";
 pub const GVISOR_OFF_SET: &str = "security.gvisor.mode=off";
 pub const POLL_INTAKE: &str = "poll";
 /// Display model matching the dark-factory bundle's `progress/phases.json`.
@@ -46,8 +54,240 @@ pub struct QuickstartOpts {
     pub model: Option<String>,
     pub execution_deadline_seconds: u32,
     pub budget_usd: f64,
+    /// The agent to deploy (`--agent`, default [`DEFAULT_AGENT`]).
+    pub agent: String,
+    /// The trigger label for this agent's GitHub bindings (`--label`).
+    pub label: Option<String>,
+    /// An operator bundle deployed as given (`--plugin-dir`).
+    pub plugin_dir: Option<PathBuf>,
     pub chart: String,
     pub dry_run: bool,
+    pub forge: ForgeFlags,
+}
+
+/// The factory intake a serving release records (#4362 decision 2), read from
+/// the `factory.*` values `cluster factory` writes and `api.githubRepoAllowlist`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedIntake {
+    pub app_id: String,
+    /// The GitHub tracker label: the effective label of a binding with none.
+    pub install_label: String,
+    pub repo_allowlist: Vec<String>,
+    /// The Secret and data key holding the App private key.
+    pub pem_secret: String,
+    pub pem_secret_key: String,
+}
+
+/// One agent's GitHub binding on the serving release, as the API lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentBinding {
+    pub agent: String,
+    pub repo: String,
+    /// `None` is served by the install label.
+    pub trigger_label: Option<String>,
+}
+
+/// The github entry of a `factory.codeHosts` or `factory.trackers` list.
+fn github_entry<'a>(factory: &'a serde_json::Value, list: &str) -> Option<&'a serde_json::Value> {
+    factory
+        .get(list)?
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("kind").and_then(|v| v.as_str()) == Some("github"))
+}
+
+fn non_empty_str(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(text) if !text.is_empty() => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+/// The recorded factory intake in a release's user values, or `None` unless
+/// all of it is there: `factory.enabled` true, a non-empty `factory.intake`, a
+/// github tracker with a label, and a github code host whose credential names
+/// the App id and its key Secret.
+pub fn recorded_intake(values: &serde_json::Value) -> Option<RecordedIntake> {
+    let factory = values.get("factory")?;
+    if factory.get("enabled") != Some(&serde_json::Value::Bool(true)) {
+        return None;
+    }
+    non_empty_str(factory.get("intake"))?;
+    let install_label = non_empty_str(github_entry(factory, "trackers")?.get("label"))?;
+    let credential = github_entry(factory, "codeHosts")?.get("credential")?;
+    let app_id = non_empty_str(credential.get("appId"))?;
+    let pem_secret = non_empty_str(credential.get("existingSecret"))?;
+    let pem_secret_key = non_empty_str(credential.get("existingSecretKey"))
+        .unwrap_or_else(|| crate::github_app::DEFAULT_APP_KEY_DATA_KEY.to_string());
+    let repo_allowlist = values
+        .pointer("/api/githubRepoAllowlist")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(RecordedIntake {
+        app_id,
+        install_label,
+        repo_allowlist,
+        pem_secret,
+        pem_secret_key,
+    })
+}
+
+/// The code host the factory publishes to (`--code-host`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum CodeHostKind {
+    #[default]
+    Github,
+    Gitlab,
+    BitbucketCloud,
+    BitbucketDc,
+}
+
+/// The tracker the factory takes issues from (`--tracker`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TrackerKind {
+    #[default]
+    Github,
+    Gitlab,
+    JiraCloud,
+}
+
+/// The forge selection and the flags only a non-GitHub forge reads. GitHub
+/// takes its URL and credential from the App (`--app-id`,
+/// `--private-key-file`), so it refuses these.
+#[derive(Debug, Clone, Default)]
+pub struct ForgeFlags {
+    pub code_host: CodeHostKind,
+    pub tracker: TrackerKind,
+    pub forge_url: Option<String>,
+    pub token_file: Option<PathBuf>,
+    pub ca_file: Option<PathBuf>,
+    pub review_accounts: Vec<String>,
+}
+
+/// One port of a forge egress entry, as the chart's `egress[].ports` reads it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EgressPort {
+    pub protocol: &'static str,
+    pub port: u16,
+}
+
+/// One `factory.codeHosts[]` / `factory.trackers[]` `egress` entry (#4397).
+/// `host` records the hostname a route was resolved from; the chart ignores it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EgressEntry {
+    pub cidr: String,
+    pub ports: Vec<EgressPort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+/// The egress entries for one forge `target` on TCP `ports`. An IP or CIDR
+/// passes through (an IP as a host route). A hostname is resolved here, on
+/// the operator's machine, by `resolve` to one host route per address with
+/// the hostname recorded; a name that resolves to nothing is refused.
+pub fn forge_egress_entries(
+    target: &str,
+    ports: &[u16],
+    resolve: impl Fn(&str) -> Result<Vec<std::net::IpAddr>>,
+) -> Result<Vec<EgressEntry>> {
+    use std::net::IpAddr;
+    let ports: Vec<EgressPort> = ports
+        .iter()
+        .map(|&port| EgressPort {
+            protocol: "TCP",
+            port,
+        })
+        .collect();
+    let host_route = |ip: IpAddr| match ip {
+        IpAddr::V4(_) => format!("{ip}/32"),
+        IpAddr::V6(_) => format!("{ip}/128"),
+    };
+    let entry = |cidr: String, host: Option<String>| EgressEntry {
+        cidr,
+        ports: ports.clone(),
+        host,
+    };
+    if let Ok(ip) = target.parse::<IpAddr>() {
+        return Ok(vec![entry(host_route(ip), None)]);
+    }
+    if let Some((addr, prefix)) = target.split_once('/') {
+        let ip: IpAddr = addr.parse().map_err(|_| {
+            CliError::usage(format!(
+                "forge egress {target:?} is not an IP, CIDR or hostname"
+            ))
+        })?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        match prefix.parse::<u8>() {
+            Ok(bits) if bits <= max => return Ok(vec![entry(format!("{ip}/{bits}"), None)]),
+            _ => {
+                return Err(CliError::usage(format!(
+                    "forge egress {target:?} has an invalid prefix length"
+                ))
+                .into())
+            }
+        }
+    }
+    let mut addresses = resolve(target).map_err(|error| {
+        CliError::failure(format!("could not resolve forge host {target}: {error:#}"))
+    })?;
+    let mut seen = std::collections::HashSet::new();
+    addresses.retain(|ip| seen.insert(*ip));
+    if addresses.is_empty() {
+        return Err(CliError::failure(format!(
+            "forge host {target} resolved to no address, so no egress can be written for it"
+        ))
+        .with_fix("pass the host's IP or CIDR instead, or fix its DNS")
+        .into());
+    }
+    Ok(addresses
+        .into_iter()
+        .map(|ip| entry(host_route(ip), Some(target.to_string())))
+        .collect())
+}
+
+/// The error for a forge kind this build has no quickstart module for.
+fn forge_not_installed(kind: &str) -> anyhow::Error {
+    CliError::unsupported(format!(
+        "forge kind '{kind}' is not installed in this build"
+    ))
+    .with_fix("rerun with --code-host github and --tracker github, or omit both")
+    .into()
+}
+
+/// Refuses a forge selection this build cannot run. Pure: it reads no file,
+/// network, or cluster, so the caller runs it before resolving the chart.
+/// GitHub refuses the non-GitHub flags; any other kind is routed to its module.
+pub fn select_forge(forge: &ForgeFlags) -> Result<()> {
+    match (forge.code_host, forge.tracker) {
+        (CodeHostKind::Github, TrackerKind::Github) => {
+            let shared = [
+                ("--forge-url", forge.forge_url.is_some()),
+                ("--token-file", forge.token_file.is_some()),
+                ("--ca-file", forge.ca_file.is_some()),
+                ("--review-account", !forge.review_accounts.is_empty()),
+            ];
+            match shared.iter().find(|(_, set)| *set) {
+                Some((flag, _)) => Err(CliError::usage(format!(
+                    "{flag} applies only to a non-github --code-host or --tracker; GitHub uses the App from --app-id and --private-key-file"
+                ))
+                .with_fix(format!("remove {flag}, or pass the --code-host or --tracker it is for"))
+                .into()),
+                None => Ok(()),
+            }
+        }
+        // A reserved kind's not-installed error wins over any pairing rule.
+        (CodeHostKind::Gitlab, _) => gitlab::check(forge),
+        (CodeHostKind::BitbucketCloud, _) => bitbucket_cloud::check(forge),
+        (CodeHostKind::BitbucketDc, _) => bitbucket_dc::check(forge),
+        (CodeHostKind::Github, TrackerKind::Gitlab) => gitlab::check(forge),
+        (CodeHostKind::Github, TrackerKind::JiraCloud) => jira_cloud::check(forge),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +312,31 @@ pub struct PlanInput {
     /// The release is already the chart and the quickstart values, so this
     /// plan must not invoke `cluster up`.
     pub release_at_target: bool,
+    /// The agent to deploy.
+    pub agent: String,
+    /// The trigger label for this agent's bindings; `None` is the install label.
+    pub label: Option<String>,
+    /// An operator bundle deployed as given; `None` renders the published one.
+    pub plugin_dir: Option<PathBuf>,
+    /// `--model` was passed, which the add agent path refuses.
+    pub model_explicit: bool,
+    /// The factory intake the serving release records, if any.
+    pub recorded: Option<RecordedIntake>,
+    /// The GitHub bindings the serving release holds, read once.
+    pub bindings: Vec<AgentBinding>,
+    /// The operator bundle's locked runner image; `None` is the platform runner.
+    pub runner_image: Option<String>,
+}
+
+/// Which run this is (#4362 decision 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickstartPath {
+    /// No App flags and no recorded intake: print the App registration link.
+    Register,
+    /// App flags passed: install, intake, and deploy the agent.
+    Install,
+    /// No App flags on a release that records intake: add the agent to it.
+    AddAgent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +349,8 @@ pub enum CredentialDecision {
     PromptOnce,
     /// No key, no recorded model, and no terminal.
     RefuseNonInteractive,
+    /// The add agent path runs no `cluster up`, so it needs no key.
+    NotNeeded,
 }
 
 #[derive(Debug, Clone)]
@@ -102,8 +369,19 @@ pub enum Action {
         namespace: String,
         release: String,
         model: String,
+        /// `--agent`, `--label`, and `--plugin-dir` when not their defaults.
+        rerun_flags: Vec<String>,
     },
     Intake(Box<FactoryIntakeOpts>),
+    /// Enroll an added agent for forge egress (`bind_forge_egress`).
+    ForgeEgress {
+        agent: String,
+    },
+    /// Create the trigger label on each repository that lacks it.
+    TriggerLabel {
+        label: String,
+        repos: Vec<String>,
+    },
     Deploy {
         context: String,
         namespace: String,
@@ -111,6 +389,15 @@ pub enum Action {
         repos: Vec<String>,
         deadline_seconds: u32,
         budget_usd: f64,
+        agent: String,
+        label: Option<String>,
+        /// The operator bundle; `None` renders the published dark factory.
+        bundle: Option<PathBuf>,
+        /// The operator bundle's locked runner image; `None` is the platform runner.
+        runner_image: Option<String>,
+        /// Repositories this agent already holds under the requested effective
+        /// label. Their `surfaces --add` is skipped so a rerun is idempotent.
+        bound: Vec<String>,
     },
 }
 
@@ -124,6 +411,9 @@ pub struct Planned {
     pub actions: Vec<Action>,
     /// `cluster up` was left out because the release is already at the target.
     pub skipped_cluster_up: bool,
+    pub path: QuickstartPath,
+    pub agent: String,
+    pub release: String,
 }
 
 #[derive(Debug)]
@@ -146,11 +436,31 @@ pub enum QuickstartOutput {
         repos: Vec<String>,
         label: String,
         label_inferred: bool,
-        runner_image: String,
+        /// `None` when the agent runs the platform runner.
+        runner_image: Option<String>,
         agent: String,
+        /// The agent's own binding label; `None` when the install label serves it.
+        trigger_label: Option<String>,
+        /// The label that starts this agent's work.
+        effective_label: String,
         deadline_seconds: u32,
         budget_usd: f64,
         /// OpenRouter credit left to the model credential, when it was read.
+        credit_remaining_usd: Option<f64>,
+    },
+    /// An agent added to a release that already records factory intake.
+    AgentAdded {
+        context: String,
+        agent: String,
+        repos: Vec<String>,
+        trigger_label: Option<String>,
+        effective_label: String,
+        /// `published`, or the operator bundle directory.
+        bundle: String,
+        /// `None` when the agent runs the platform runner.
+        runner_image: Option<String>,
+        deadline_seconds: u32,
+        budget_usd: f64,
         credit_remaining_usd: Option<f64>,
     },
 }
@@ -184,6 +494,8 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 label_inferred,
                 runner_image,
                 agent,
+                trigger_label,
+                effective_label,
                 deadline_seconds,
                 budget_usd,
                 credit_remaining_usd,
@@ -203,10 +515,36 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 },
                 "runner_image": runner_image,
                 "agent": agent,
+                "trigger_label": trigger_label,
+                "effective_label": effective_label,
                 "execution_deadline_seconds": deadline_seconds,
                 "budget_usd": budget_usd,
                 "reviewer_model": REVIEWER_MODEL,
                 "run_credit_usd": RUN_CREDIT_USD,
+                "credit_remaining_usd": credit_remaining_usd,
+            }),
+            Self::AgentAdded {
+                context,
+                agent,
+                repos,
+                trigger_label,
+                effective_label,
+                bundle,
+                runner_image,
+                deadline_seconds,
+                budget_usd,
+                credit_remaining_usd,
+            } => serde_json::json!({
+                "phase": "agent_added",
+                "context": context,
+                "agent": agent,
+                "repos": repos,
+                "trigger_label": trigger_label,
+                "effective_label": effective_label,
+                "bundle": bundle,
+                "runner_image": runner_image,
+                "execution_deadline_seconds": deadline_seconds,
+                "budget_usd": budget_usd,
                 "credit_remaining_usd": credit_remaining_usd,
             }),
         }
@@ -234,6 +572,7 @@ impl crate::ui::CliOutput for QuickstartOutput {
                 label_inferred,
                 runner_image,
                 agent,
+                effective_label,
                 deadline_seconds,
                 budget_usd,
                 credit_remaining_usd,
@@ -257,7 +596,8 @@ impl crate::ui::CliOutput for QuickstartOutput {
                     repos.join(", ")
                 ));
                 ui.payload(&format!(
-                    "Deployed {agent} from {runner_image}. Execution deadline {deadline_seconds}s. Publication auto. Budget {budget_usd} USD."
+                    "Deployed {agent} from {}. Label {effective_label} starts its work. Execution deadline {deadline_seconds}s. Publication auto. Budget {budget_usd} USD.",
+                    runner_source(runner_image.as_deref())
                 ));
                 // Worded apart from the pre-deploy low-credit warning.
                 let credit_left = credit_remaining_usd
@@ -268,7 +608,41 @@ impl crate::ui::CliOutput for QuickstartOutput {
                     budget_display(RUN_CREDIT_USD)
                 ));
             }
+            Self::AgentAdded {
+                context,
+                agent,
+                repos,
+                effective_label,
+                bundle,
+                runner_image,
+                deadline_seconds,
+                budget_usd,
+                credit_remaining_usd,
+                ..
+            } => {
+                ui.payload(&format!(
+                    "Added {agent} to the factory install on context {context} for {}.",
+                    repos.join(", ")
+                ));
+                ui.payload(&format!(
+                    "Label {effective_label} starts its work. Bundle {bundle} on {}. Execution deadline {deadline_seconds}s. Publication auto. Budget {budget_usd} USD.",
+                    runner_source(runner_image.as_deref())
+                ));
+                if let Some(left) = credit_remaining_usd {
+                    ui.payload(&format!(
+                        "The model key has {left:.2} USD of OpenRouter credit left."
+                    ));
+                }
+            }
         }
+    }
+}
+
+/// "image X" or "the platform runner", for the human output.
+fn runner_source(image: Option<&str>) -> String {
+    match image {
+        Some(image) => image.to_string(),
+        None => "the platform runner".to_string(),
     }
 }
 
@@ -374,45 +748,6 @@ pub fn credential_decision(
     }
 }
 
-pub struct RerunTarget<'a> {
-    pub repos: &'a [String],
-    pub context: &'a str,
-    pub namespace: &'a str,
-    pub release: &'a str,
-    pub model: &'a str,
-    pub org: Option<&'a str>,
-}
-
-pub fn registration_steps(target: &RerunTarget<'_>) -> Vec<String> {
-    let mut rerun = format!(
-        "Rerun: curie factory quickstart --repo {} --context {}",
-        target.repos.join(","),
-        target.context
-    );
-    for (flag, value, default) in [
-        ("--namespace", target.namespace, "curie"),
-        ("--release", target.release, "curie"),
-        ("--model", target.model, DEFAULT_MODEL),
-    ] {
-        if value != default {
-            rerun.push_str(&format!(" {flag} {value}"));
-        }
-    }
-    if let Some(org) = target.org {
-        rerun.push_str(&format!(" --org {org}"));
-    }
-    rerun.push_str(" --app-id <APP_ID> --private-key-file <PATH.pem>");
-    vec![
-        "Open the link and click Create GitHub App. The name, permissions, and the disabled webhook are already filled in.".to_string(),
-        "On the App settings page, note the App ID and click Generate a private key to download the .pem file.".to_string(),
-        format!(
-            "Click Install App and install it on {}.",
-            repos_prose(target.repos)
-        ),
-        rerun,
-    ]
-}
-
 pub fn kind_context_name(kind_name: &str) -> String {
     format!("kind-{kind_name}")
 }
@@ -494,10 +829,185 @@ fn context_reason(
     }
 }
 
-pub fn bundle_dir(namespace: &str, release: &str) -> PathBuf {
+/// Where the published bundle renders for `agent`. The default agent's path
+/// is the one every earlier quickstart used.
+pub fn bundle_dir(namespace: &str, release: &str, agent: &str) -> PathBuf {
     std::env::temp_dir()
         .join(format!("curie-factory-quickstart-{namespace}-{release}"))
-        .join(AGENT_NAME)
+        .join(agent)
+}
+
+/// Decision 5.1 and 5.2 of #4362: the agent is a valid per-agent resource
+/// name and the label passes the `surfaces --label` rule.
+pub fn validate_agent_flags(agent: &str, label: Option<&str>) -> Result<()> {
+    crate::cluster_secrets::validate_agent_resource_name(agent).map_err(|error| {
+        anyhow::Error::from(
+            CliError::usage(format!("--agent {agent:?} is refused: {error:#}")).with_fix(
+                "pass a lowercase DNS label of at most 40 characters other than self, for example --agent dark-factory-fast",
+            ),
+        )
+    })?;
+    if let Some(label) = label {
+        crate::commands::valid_trigger_label(label)?;
+    }
+    Ok(())
+}
+
+/// `--model` and `--org` configure the install, so the add agent path refuses
+/// them (#4362 decision 3).
+pub fn refuse_install_flags(model_explicit: bool, org: Option<&str>) -> Result<()> {
+    if model_explicit {
+        return Err(CliError::usage(
+            "--model configures the install, not an added agent, and this release already records factory intake; change the install's model with `curie cluster up --model <MODEL>`",
+        )
+        .with_fix("drop --model and rerun")
+        .into());
+    }
+    if org.is_some() {
+        return Err(CliError::usage(
+            "--org picks where the factory App is registered, and this release already records an App; manage it with `curie cluster github-app`",
+        )
+        .with_fix("drop --org and rerun")
+        .into());
+    }
+    Ok(())
+}
+
+/// True when an allowlist entry admits `repo`: the same name, or `owner/*`.
+fn allowlist_admits(allowlist: &[String], repo: &str) -> bool {
+    let owner = repo.split_once('/').map(|(owner, _)| owner);
+    allowlist.iter().any(|entry| {
+        entry.eq_ignore_ascii_case(repo)
+            || entry
+                .strip_suffix("/*")
+                .is_some_and(|wild| owner.is_some_and(|owner| owner.eq_ignore_ascii_case(wild)))
+    })
+}
+
+/// Decision 5.4: every repository is admitted by the recorded allowlist.
+fn check_recorded_allowlist(input: &PlanInput, recorded: &RecordedIntake) -> Result<()> {
+    let missing: Vec<&String> = input
+        .repos
+        .iter()
+        .filter(|repo| !allowlist_admits(&recorded.repo_allowlist, repo))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut entries = recorded.repo_allowlist.clone();
+    entries.extend(missing.iter().map(|repo| repo.to_string()));
+    let missing: Vec<String> = missing.into_iter().cloned().collect();
+    Err(CliError::usage(format!(
+        "the factory install on release {} does not admit {}; widen its allowlist with `curie cluster factory --repo {}`, then rerun",
+        input.release,
+        repos_prose(&missing),
+        entries.join(",")
+    ))
+    .with_fix(format!(
+        "run curie cluster factory --repo {} and rerun",
+        entries.join(",")
+    ))
+    .into())
+}
+
+/// Decision 5.7: an install path run must not drop a recorded allowlist entry.
+fn check_allowlist_kept(input: &PlanInput, recorded: &RecordedIntake) -> Result<()> {
+    let dropped: Vec<String> = recorded
+        .repo_allowlist
+        .iter()
+        .filter(|entry| {
+            !input
+                .repos
+                .iter()
+                .any(|repo| repo.eq_ignore_ascii_case(entry))
+        })
+        .cloned()
+        .collect();
+    if dropped.is_empty() {
+        return Ok(());
+    }
+    let mut repos = input.repos.clone();
+    repos.extend(dropped.iter().cloned());
+    Err(CliError::usage(format!(
+        "the intake would replace the recorded allowlist and drop {}, which another agent may serve",
+        repos_prose(&dropped)
+    ))
+    .with_fix(format!("rerun with --repo {}", repos.join(",")))
+    .into())
+}
+
+/// Decision 5.5: a binding's effective label is its own label or the install
+/// label. Another agent may not hold the requested effective label on a
+/// repository, and this agent's own binding there must already carry it.
+fn check_bindings(input: &PlanInput) -> Result<()> {
+    let install = input.recorded.as_ref().map(|r| r.install_label.as_str());
+    let requested = input.label.as_deref().or(install);
+    for repo in &input.repos {
+        for binding in input
+            .bindings
+            .iter()
+            .filter(|binding| binding.repo.eq_ignore_ascii_case(repo))
+        {
+            let held = binding.trigger_label.as_deref().or(install);
+            let shown = |label: Option<&str>| label.unwrap_or("the install label").to_string();
+            if binding.agent == input.agent {
+                if held != requested {
+                    return Err(CliError::usage(format!(
+                        "agent {} already holds github={repo} under label {}, not {}; run `curie cluster surfaces {} --remove github={repo}`, then rerun",
+                        input.agent,
+                        shown(held),
+                        shown(requested),
+                        input.agent
+                    ))
+                    .with_fix(format!(
+                        "run curie cluster surfaces {} --remove github={repo} and rerun",
+                        input.agent
+                    ))
+                    .into());
+                }
+            } else if held == requested {
+                return Err(CliError::usage(format!(
+                    "agent {} already serves {repo} under label {}; pass --label with a label no other agent uses on {repo}",
+                    binding.agent,
+                    shown(held)
+                ))
+                .with_fix("rerun with a distinct --label <LABEL>")
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The repositories this agent already holds a GitHub binding on. Run after
+/// `check_bindings`, which refuses an own binding under another effective
+/// label, so each of these already carries the requested one.
+fn already_bound(input: &PlanInput) -> Vec<String> {
+    input
+        .repos
+        .iter()
+        .filter(|repo| {
+            input.bindings.iter().any(|binding| {
+                binding.agent == input.agent && binding.repo.eq_ignore_ascii_case(repo)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// The flags a register path rerun carries when they are not their defaults.
+fn rerun_flags(input: &PlanInput) -> Vec<String> {
+    let mut flags = Vec::new();
+    if input.agent != DEFAULT_AGENT {
+        flags.extend(["--agent".to_string(), input.agent.clone()]);
+    }
+    if let Some(label) = &input.label {
+        flags.extend(["--label".to_string(), label.clone()]);
+    }
+    if let Some(dir) = &input.plugin_dir {
+        flags.extend(["--plugin-dir".to_string(), dir.display().to_string()]);
+    }
+    flags
 }
 
 /// True when helm user values show a real model install (`fakeModel: false`).
@@ -507,6 +1017,7 @@ pub fn release_has_real_model(values: &serde_json::Value) -> bool {
 
 pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
     validate_repos(&input.repos)?;
+    validate_agent_flags(&input.agent, input.label.as_deref())?;
     let finishing = match (&input.app_id, &input.private_key_file) {
         (None, None) => false,
         (Some(id), Some(path)) => {
@@ -551,6 +1062,21 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
             return Err(unconfirmed_context_error(name));
         }
     }
+    let path = match (finishing, &input.recorded) {
+        (true, _) => QuickstartPath::Install,
+        (false, Some(_)) => QuickstartPath::AddAgent,
+        (false, None) => QuickstartPath::Register,
+    };
+    // #4362 decision 5, in order, before any mutation.
+    if let (QuickstartPath::AddAgent, Some(recorded)) = (path, &input.recorded) {
+        refuse_install_flags(input.model_explicit, input.org.as_deref())?;
+        check_recorded_allowlist(input, recorded)?;
+    }
+    check_bindings(input)?;
+    if let (QuickstartPath::Install, Some(recorded)) = (path, &input.recorded) {
+        check_allowlist_kept(input, recorded)?;
+    }
+    let add_agent = path == QuickstartPath::AddAgent;
 
     let owned_kind = kind_context_name(&input.kind_name);
     let context = input
@@ -561,8 +1087,10 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
     // Kind is created only when nothing is targeted. A kind context, including
     // the one this command created on a previous run, still gets gVisor off
     // and the CoreDNS scale. A remote context does not.
-    let kind_target = input.explicit_context.is_none() && input.current_context.is_none()
-        || is_kind_context(&context);
+    // The add agent path never touches the cluster underneath the release.
+    let kind_target = !add_agent
+        && (input.explicit_context.is_none() && input.current_context.is_none()
+            || is_kind_context(&context));
     let kind_cluster = kind_target.then(|| {
         if is_kind_context(&context) {
             context.trim_start_matches("kind-").to_string()
@@ -624,31 +1152,64 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
     // ADR 0114 and ADR 0193 keep install-fact inference inside `cluster up`.
     // The skip stays here: quickstart does not invoke `cluster up` when the
     // release is already that chart and these values.
-    if !input.release_at_target {
+    let skipped_cluster_up = input.release_at_target && !add_agent;
+    if !input.release_at_target && !add_agent {
         actions.push(Action::Cluster { args: up });
     }
 
-    if finishing {
-        actions.push(Action::Intake(Box::new(finish_intake_opts(
-            input, &context,
-        ))));
-        actions.push(Action::Deploy {
-            context: context.clone(),
-            namespace: input.namespace.clone(),
-            release: input.release.clone(),
-            repos: input.repos.clone(),
-            deadline_seconds: input.execution_deadline_seconds,
-            budget_usd: input.budget_usd,
-        });
-    } else {
-        actions.push(Action::Register {
-            org: input.org.clone(),
-            repos: input.repos.clone(),
-            context: context.clone(),
-            namespace: input.namespace.clone(),
-            release: input.release.clone(),
-            model: input.model.clone(),
-        });
+    let bundle = input.plugin_dir.clone();
+    let deploy = Action::Deploy {
+        context: context.clone(),
+        namespace: input.namespace.clone(),
+        release: input.release.clone(),
+        repos: input.repos.clone(),
+        deadline_seconds: input.execution_deadline_seconds,
+        budget_usd: input.budget_usd,
+        agent: input.agent.clone(),
+        label: input.label.clone(),
+        runner_image: bundle.as_ref().and(input.runner_image.clone()),
+        bundle,
+        // Empty when no release serves yet, so a fresh install still binds.
+        bound: already_bound(input),
+    };
+    match path {
+        QuickstartPath::Install => {
+            actions.push(Action::Intake(Box::new(github::finish_intake_opts(
+                input, &context,
+            ))));
+            // The intake creates the install label; an agent label is ours.
+            if let Some(label) = &input.label {
+                actions.push(Action::TriggerLabel {
+                    label: label.clone(),
+                    repos: input.repos.clone(),
+                });
+            }
+            actions.push(deploy);
+        }
+        QuickstartPath::AddAgent => {
+            let install = input.recorded.as_ref().map(|r| r.install_label.clone());
+            actions.push(Action::ForgeEgress {
+                agent: input.agent.clone(),
+            });
+            if let Some(label) = input.label.clone().or(install) {
+                actions.push(Action::TriggerLabel {
+                    label,
+                    repos: input.repos.clone(),
+                });
+            }
+            actions.push(deploy);
+        }
+        QuickstartPath::Register => {
+            actions.push(Action::Register {
+                org: input.org.clone(),
+                repos: input.repos.clone(),
+                context: context.clone(),
+                namespace: input.namespace.clone(),
+                release: input.release.clone(),
+                model: input.model.clone(),
+                rerun_flags: rerun_flags(input),
+            });
+        }
     }
 
     let context_reason = context_reason(
@@ -662,51 +1223,60 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         context,
         context_reason,
         kind_cluster,
-        credential: credential_decision(
-            input.credential_in_env,
-            input.release_has_real_model,
-            input.interactive,
-        ),
+        credential: if add_agent {
+            CredentialDecision::NotNeeded
+        } else {
+            credential_decision(
+                input.credential_in_env,
+                input.release_has_real_model,
+                input.interactive,
+            )
+        },
         actions,
-        skipped_cluster_up: input.release_at_target,
+        skipped_cluster_up,
+        path,
+        agent: input.agent.clone(),
+        release: input.release.clone(),
     })
 }
 
-fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIntakeOpts {
-    FactoryIntakeOpts {
-        common: CommonOpts {
-            namespace: input.namespace.clone(),
-            release: input.release.clone(),
-            dry_run: false,
-        },
-        chart: input.chart.clone(),
-        repos: input.repos.clone(),
-        label: None,
-        mention: None,
-        card_base_url: None,
-        webhook_secret: None,
-        github_api_egress: Vec::new(),
-        disable: false,
-        timeout_seconds: None,
-        app_id: input.app_id.clone(),
-        private_key_file: input.private_key_file.as_ref().map(PathBuf::from),
-        org: input.org.clone(),
-        intake: Some(POLL_INTAKE.into()),
-        runner_binding: None,
+/// The intake line's runner clause: the published layer, an operator bundle's
+/// locked image, or the platform runner (#4362 decision 9.2).
+fn intake_runner_clause(opts: &FactoryIntakeOpts) -> String {
+    match &opts.runner_binding {
+        Some(binding) if binding.image == github::PUBLISHED_RUNNER_PENDING => {
+            "the same helm upgrade binds the dark factory runner image".to_string()
+        }
+        Some(binding) => format!(
+            "the same helm upgrade binds runner image {} for {}",
+            binding.image, binding.agent
+        ),
+        None => format!(
+            "no runner image is bound, so {} runs the platform runner",
+            opts.forge_egress.join(",")
+        ),
     }
 }
 
 pub fn describe(planned: &Planned) -> Vec<String> {
-    let toolchain = if planned
-        .actions
-        .iter()
-        .any(|action| matches!(action, Action::Intake(_)))
+    let add_agent = planned.path == QuickstartPath::AddAgent;
+    let toolchain = if add_agent
+        || planned
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Intake(_)))
     {
         crate::factory_toolchain::PLAN_NOTE
     } else {
         crate::factory_toolchain::SKIPPED_NOTE
     };
     let mut lines = vec![toolchain.into(), planned.context_reason.clone()];
+    if add_agent {
+        lines.push(format!(
+            "add agent {} to the factory install on release {}: skip cluster up, App registration, and intake",
+            planned.agent, planned.release
+        ));
+    }
     match &planned.credential {
         CredentialDecision::UseEnv => {
             lines.push("model credential: use CURIE_CREDENTIALS (no prompt)".to_string());
@@ -726,6 +1296,12 @@ pub fn describe(planned: &Planned) -> Vec<String> {
         CredentialDecision::RefuseNonInteractive => {
             lines.push(
                 "model credential: refuse because CURIE_CREDENTIALS is unset, the release has no real model, and stdin is not a terminal"
+                    .to_string(),
+            );
+        }
+        CredentialDecision::NotNeeded => {
+            lines.push(
+                "model credential: not needed; the release keeps the model it records (no prompt)"
                     .to_string(),
             );
         }
@@ -750,6 +1326,7 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 namespace,
                 release,
                 model,
+                rerun_flags,
             } => {
                 let org_note = org
                     .as_ref()
@@ -759,29 +1336,43 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                     "print the GitHub App registration link{org_note} and the rerun steps for {}; apply no intake",
                     repos_prose(repos)
                 ));
-                lines.extend(registration_steps(&RerunTarget {
+                let mut steps = registration_steps(&RerunTarget {
                     repos,
                     context,
                     namespace,
                     release,
                     model,
                     org: org.as_deref(),
-                }));
+                });
+                github::carry_rerun_flags(&mut steps, rerun_flags);
+                lines.extend(steps);
             }
             Action::Intake(opts) => {
-                let values = intake_values(opts, &[]);
+                let values = intake_values(opts);
                 let intake = values
-                    .pointer("/api/githubFactoryIntake")
+                    .pointer("/factory/intake")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 lines.push(format!(
-                    "configure factory intake api.githubFactoryIntake={intake} for {} with --app-id {} --private-key-file {} and no webhook secret; the same helm upgrade binds the dark factory runner image",
+                    "configure factory intake factory.intake={intake} for {} with --app-id {} --private-key-file {} and no webhook secret; {}",
                     opts.repos.join(","),
                     opts.app_id.as_deref().unwrap_or(""),
                     opts.private_key_file
                         .as_ref()
                         .map(|p| p.display().to_string())
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    intake_runner_clause(opts)
+                ));
+            }
+            Action::ForgeEgress { agent } => {
+                lines.push(format!(
+                    "enroll {agent} for forge egress: helm upgrade --reset-then-reuse-values --set factory.sandboxEgress.{agent}=true unless the release already records it; the API does not roll"
+                ));
+            }
+            Action::TriggerLabel { label, repos } => {
+                lines.push(format!(
+                    "create the trigger label {label} on {} where it is missing",
+                    repos_prose(repos)
                 ));
             }
             Action::Deploy {
@@ -791,27 +1382,67 @@ pub fn describe(planned: &Planned) -> Vec<String> {
                 repos,
                 deadline_seconds,
                 budget_usd,
+                agent,
+                label,
+                bundle,
+                runner_image,
+                bound,
             } => {
-                lines.push(format!(
-                    "render the dark factory and deploy the published {} image",
-                    crate::examples::DARK_FACTORY_RUNNER_REPOSITORY
-                ));
-                for args in deploy_args(context, namespace, release, repos) {
+                let dir = match bundle {
+                    None => {
+                        lines.push(format!(
+                            "render the dark factory and deploy the published {} image",
+                            crate::examples::DARK_FACTORY_RUNNER_REPOSITORY
+                        ));
+                        bundle_dir(namespace, release, agent)
+                    }
+                    Some(dir) => {
+                        lines.push(match runner_image {
+                            Some(image) => format!(
+                                "deploy the operator bundle {} as given with its locked runner image {image}",
+                                dir.display()
+                            ),
+                            None => format!(
+                                "deploy the operator bundle {} as given on the platform runner: it declares no runner layer",
+                                dir.display()
+                            ),
+                        });
+                        dir.clone()
+                    }
+                };
+                for args in deploy_args(
+                    context,
+                    namespace,
+                    release,
+                    repos,
+                    agent,
+                    label.as_deref(),
+                    &dir,
+                    bound,
+                ) {
                     lines.push(format!("curie {}", args.join(" ")));
                 }
+                for repo in bound {
+                    lines.push(skip_bound_line(agent, repo));
+                }
                 lines.push(format!(
-                    "curie cluster overrides {AGENT_NAME} --context {context} --namespace {namespace} --release {release} --execution-deadline {deadline_seconds}"
+                    "curie cluster overrides {agent} --context {context} --namespace {namespace} --release {release} --execution-deadline {deadline_seconds}"
                 ));
                 lines.push(format!(
-                    "curie cluster publication-policy {AGENT_NAME} --context {context} --namespace {namespace} --release {release} --policy auto"
+                    "curie cluster publication-policy {agent} --context {context} --namespace {namespace} --release {release} --policy auto"
                 ));
                 lines.push(format!(
-                    "curie cluster budget {AGENT_NAME} --context {context} --namespace {namespace} --release {release} --limit {budget_usd}"
+                    "curie cluster budget {agent} --context {context} --namespace {namespace} --release {release} --limit {budget_usd}"
                 ));
             }
         }
     }
     lines
+}
+
+/// The plan line for a repository whose binding is already in place.
+pub fn skip_bound_line(agent: &str, repo: &str) -> String {
+    format!("skip binding github={repo}: agent {agent} already holds it under the requested label")
 }
 
 pub fn plan_touches_forbidden_tool(lines: &[String]) -> Option<String> {
@@ -966,132 +1597,12 @@ async fn release_matches_quickstart_target(
     Ok((matches, model.to_string()))
 }
 
+/// Runs the quickstart for the selected forge. Only GitHub is installed; the
+/// selection is checked again here so a caller that skipped [`select_forge`]
+/// still cannot run the GitHub flow for another kind.
 pub async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
-    // Reject a bad repository list before any prerequisite check, network
-    // preflight, or kube context pin.
-    validate_repos(&opts.repos)?;
-    let current = if opts.context.is_some() {
-        None
-    } else {
-        crate::kube_context::current_context_name()
-    };
-    check_prerequisites(
-        opts.context.as_deref(),
-        current.as_deref(),
-        crate::ops::on_path,
-    )?;
-    // The finishing pass discovers repository needs before pinning a kube
-    // context or reading Helm. Dry-run describes these reads without making
-    // them, and the first pass has no installation credential yet.
-    if !opts.dry_run {
-        match (&opts.app_id, &opts.private_key_file) {
-            (Some(id), Some(file)) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => {
-                crate::factory_toolchain::preflight(id, file, &opts.repos).await?;
-            }
-            (None, None) => {}
-            _ => {
-                return Err(CliError::usage(
-                    "pass a numeric --app-id and --private-key-file together",
-                )
-                .into())
-            }
-        }
-    }
-    // Confirm before pin or helm. A non-terminal refusal here never reads the
-    // release, and a declined prompt never installs.
-    let real_interactive = std::io::stdin().is_terminal();
-    if !opts.dry_run {
-        if let Some(name) = unconfirmed_remote_context(opts.context.as_deref(), current.as_deref())
-        {
-            confirm_remote_context(name, real_interactive)?;
-        }
-    }
-    let existing = if opts.context.is_none() && current.is_none() {
-        match kind_clusters().await {
-            Ok(clusters) => clusters,
-            Err(err) if opts.dry_run => {
-                crate::ui::ui().note(&format!("kind was not queried: {err:#}"));
-                Vec::new()
-            }
-            Err(err) => return Err(err),
-        }
-    } else {
-        Vec::new()
-    };
-    let credential_in_env = crate::ops::model_credential_env()?.is_some();
-    let targeted = opts.context.clone().or_else(|| current.clone());
-    if let Some(context) = &targeted {
-        if !opts.dry_run {
-            // Helm value reads have no context flag. Pin first so a rerun
-            // against --context sees that release, not the ambient one.
-            crate::kube_context::pin_for_cluster_command(Some(context))?;
-        }
-    }
-    let release_has_real_model = if opts.dry_run || targeted.is_none() {
-        false
-    } else {
-        release_model_recorded(&opts).await?
-    };
-    let effective_credential = credit_check_key(
-        crate::ops::explicit_model_credential_env(),
-        crate::ops::saved_model_credential(),
-        release_has_real_model,
-    );
-    let model = quickstart_model(opts.model.as_deref(), effective_credential.as_deref());
-    let (release_at_target, model) = match &targeted {
-        Some(context) if !opts.dry_run => {
-            release_matches_quickstart_target(
-                &opts,
-                &model,
-                opts.model.is_none() && effective_credential.is_none() && release_has_real_model,
-                is_kind_context(context),
-            )
-            .await?
-        }
-        _ => (false, model),
-    };
-    let planned = quickstart_plan(&PlanInput {
-        repos: opts.repos.clone(),
-        app_id: opts.app_id.clone(),
-        private_key_file: opts
-            .private_key_file
-            .as_ref()
-            .map(|p| p.display().to_string()),
-        explicit_context: opts.context.clone(),
-        current_context: current,
-        kind_name: opts.kind_name.clone(),
-        existing_kind_clusters: existing,
-        namespace: opts.namespace.clone(),
-        release: opts.release.clone(),
-        model,
-        org: opts.org.clone(),
-        execution_deadline_seconds: opts.execution_deadline_seconds,
-        budget_usd: opts.budget_usd,
-        chart: opts.chart.clone(),
-        credential_in_env,
-        release_has_real_model,
-        // Dry-run reports a non-kind current context instead of refusing it.
-        interactive: opts.dry_run || real_interactive,
-        release_at_target,
-    })?;
-    if opts.dry_run {
-        let mut planned = planned;
-        planned.credential =
-            credential_decision(credential_in_env, release_has_real_model, real_interactive);
-        return Ok(QuickstartOutput::DryRun(DryRunPlan {
-            lines: describe(&planned),
-        }));
-    }
-    if planned.credential == CredentialDecision::RefuseNonInteractive {
-        return Err(
-            CliError::usage("model credential needed and stdin is not a terminal")
-                .with_fix(
-                    "set CURIE_CREDENTIALS to an Anthropic API key starting with sk-ant- or an OpenRouter key starting with sk-or- and rerun",
-                )
-                .into(),
-        );
-    }
-    execute(&planned, &opts, release_has_real_model).await
+    select_forge(&opts.forge)?;
+    github::quickstart(opts).await
 }
 
 async fn release_model_recorded(opts: &QuickstartOpts) -> Result<bool> {
@@ -1106,353 +1617,6 @@ async fn release_model_recorded(opts: &QuickstartOpts) -> Result<bool> {
         Some(values) => release_has_real_model(&values),
         None => false,
     })
-}
-
-async fn execute(
-    planned: &Planned,
-    opts: &QuickstartOpts,
-    mut release_has_real_model: bool,
-) -> Result<QuickstartOutput> {
-    crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
-    if planned.skipped_cluster_up {
-        crate::ui::ui().note("release already at the target chart and values; skipping cluster up");
-    }
-    let mut prompted = false;
-    let mut prompted_model = None;
-    let mut intake_json = serde_json::Value::Null;
-    let mut rendered_image: Option<String> = None;
-    let mut credit_remaining_usd = None;
-    for action in &planned.actions {
-        if matches!(action, Action::Deploy { .. }) {
-            credit_remaining_usd = check_credit(release_has_real_model).await;
-        }
-        if matches!(action, Action::Cluster { .. }) && !prompted {
-            prompted = true;
-            if planned.kind_cluster.is_some() {
-                // The plan could not read the release: the context did not
-                // exist yet. Read it now, before `cluster up` records a key.
-                // It only picks the key the credit check reads, so a failed
-                // read never stops the install; it skips the saved key instead.
-                release_has_real_model =
-                    crate::kube_context::pin_for_cluster_command(Some(&planned.context)).is_err()
-                        || release_model_recorded(opts).await.unwrap_or(true);
-            }
-            ensure_credential(&planned.credential)?;
-            if planned.credential == CredentialDecision::PromptOnce {
-                let credential = crate::ops::model_credential_env()?;
-                prompted_model = Some(quickstart_model(
-                    opts.model.as_deref(),
-                    credential.as_deref(),
-                ));
-            }
-        }
-        match action {
-            Action::External { program, args } => {
-                let step = if program == "kind" {
-                    "Creating kind cluster"
-                } else {
-                    "Scaling CoreDNS"
-                };
-                run_program(program, args, step).await?;
-            }
-            Action::Cluster { args } => {
-                // Prompted credentials become available only immediately before
-                // this action. Resolve again so an omitted model follows that key.
-                let mut args = args.clone();
-                if let Some(model) = &prompted_model {
-                    let model_index = args
-                        .iter()
-                        .position(|arg| arg == "--model")
-                        .expect("quickstart cluster up always specifies its model");
-                    args[model_index + 1] = model.clone();
-                }
-                run_self(&args, "Installing Curie").await?;
-            }
-            Action::Register {
-                org,
-                repos,
-                context,
-                namespace,
-                release,
-                model,
-            } => {
-                let model = prompted_model.as_ref().unwrap_or(model);
-                let name = crate::factory_app::random_app_name();
-                let url = crate::factory_app::registration_url(org.as_deref(), &name);
-                let steps = registration_steps(&RerunTarget {
-                    repos,
-                    context,
-                    namespace,
-                    release,
-                    model,
-                    org: org.as_deref(),
-                });
-                return Ok(QuickstartOutput::Registration {
-                    context: planned.context.clone(),
-                    url,
-                    steps,
-                    kind_cluster: planned.kind_cluster.clone(),
-                });
-            }
-            Action::Intake(intake) => {
-                crate::ui::ui().note("Rendering factory bundle");
-                let image =
-                    render_published_bundle(&intake.common.namespace, &intake.common.release)
-                        .await
-                        .map_err(|error| {
-                            let (_, fix) = crate::exit::classify(&error);
-                            step_error(
-                                Path::new("curie"),
-                                &[
-                                    "--plugin-dir".into(),
-                                    bundle_dir(&intake.common.namespace, &intake.common.release)
-                                        .display()
-                                        .to_string(),
-                                ],
-                                "Rendering factory bundle",
-                                error,
-                                fix.as_deref(),
-                            )
-                        })?;
-                rendered_image = Some(image.clone());
-                // ADR 0173 decision 5: refuse a layer built on another runner
-                // before this upgrade binds `agentSandbox.runnerImages`.
-                // `cluster deploy` repeats the check; it must not be the first
-                // time the release learns the image.
-                let bundle = bundle_dir(&intake.common.namespace, &intake.common.release);
-                if let Err(error) =
-                    crate::cluster_secrets::check_layered_runner_base(&intake.common, &bundle).await
-                {
-                    let (_, fix) = crate::exit::classify(&error);
-                    return Err(step_error(
-                        Path::new("curie"),
-                        &["--plugin-dir".into(), bundle.display().to_string()],
-                        "Checking the runner base",
-                        error,
-                        fix.as_deref(),
-                    ));
-                }
-                let args = intake_args(&planned.context, intake, &image);
-                intake_json = run_self(&args, "Configuring factory intake").await?;
-                if intake_json.get("github_app").is_none() {
-                    return Err(step_error(
-                        Path::new("curie"),
-                        &args,
-                        "Configuring factory intake",
-                        CliError::failure(
-                            "factory intake did not record the App; nothing further was deployed",
-                        )
-                        .into(),
-                        None,
-                    ));
-                }
-            }
-            Action::Deploy {
-                context,
-                namespace,
-                release,
-                repos,
-                deadline_seconds,
-                budget_usd,
-            } => {
-                let dir = bundle_dir(namespace, release);
-                let image = match rendered_image.clone() {
-                    Some(image) => image,
-                    None => {
-                        crate::ui::ui().note("Rendering factory bundle");
-                        render_published_bundle(namespace, release)
-                            .await
-                            .map_err(|error| {
-                                let (_, fix) = crate::exit::classify(&error);
-                                step_error(
-                                    Path::new("curie"),
-                                    &["--plugin-dir".into(), dir.display().to_string()],
-                                    "Rendering factory bundle",
-                                    error,
-                                    fix.as_deref(),
-                                )
-                            })?
-                    }
-                };
-                // `deploy_args` puts the deploy first, then one binding per repository.
-                for (index, args) in deploy_args(context, namespace, release, repos)
-                    .into_iter()
-                    .enumerate()
-                {
-                    let step = if index == 0 {
-                        "Deploying dark factory"
-                    } else {
-                        "Binding GitHub repository"
-                    };
-                    run_self(&args, step).await?;
-                }
-                run_self(
-                    &cluster_agent(
-                        "overrides",
-                        context,
-                        namespace,
-                        release,
-                        &["--execution-deadline".into(), deadline_seconds.to_string()],
-                    ),
-                    "Setting execution deadline",
-                )
-                .await?;
-                run_self(
-                    &cluster_agent(
-                        "publication-policy",
-                        context,
-                        namespace,
-                        release,
-                        &["--policy".into(), "auto".into()],
-                    ),
-                    "Setting publication policy",
-                )
-                .await?;
-                run_self(
-                    &cluster_agent(
-                        "budget",
-                        context,
-                        namespace,
-                        release,
-                        &["--limit".into(), budget_display(*budget_usd)],
-                    ),
-                    "Setting factory budget",
-                )
-                .await?;
-                let app = intake_json
-                    .get("github_app")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                return Ok(QuickstartOutput::Ready {
-                    context: context.clone(),
-                    repo: repos.join(","),
-                    intake: POLL_INTAKE.into(),
-                    app_id: app
-                        .get("app_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    slug: app
-                        .get("slug")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    mention: app
-                        .get("mention")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    mention_inferred: app
-                        .get("mention_inferred")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    repos: app
-                        .get("repos")
-                        .and_then(|v| v.as_array())
-                        .map(|list| {
-                            list.iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    label: app
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    label_inferred: app
-                        .get("label_inferred")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    runner_image: image,
-                    agent: AGENT_NAME.into(),
-                    deadline_seconds: *deadline_seconds,
-                    budget_usd: *budget_usd,
-                    credit_remaining_usd,
-                });
-            }
-        }
-    }
-    Err(CliError::failure("quickstart plan produced no result").into())
-}
-
-/// The `cluster factory` argv quickstart runs for intake. That command's
-/// `--repo` is repeatable and not comma split, so each repository gets its own
-/// flag.
-pub fn intake_args(context: &str, intake: &FactoryIntakeOpts, image: &str) -> Vec<String> {
-    let mut args: Vec<String> = vec![
-        "cluster".into(),
-        "factory".into(),
-        "--context".into(),
-        context.into(),
-        "--namespace".into(),
-        intake.common.namespace.clone(),
-        "--release".into(),
-        intake.common.release.clone(),
-        "--chart".into(),
-        intake.chart.clone(),
-    ];
-    for repo in &intake.repos {
-        args.extend(["--repo".into(), repo.clone()]);
-    }
-    args.extend([
-        "--intake".into(),
-        POLL_INTAKE.into(),
-        "--app-id".into(),
-        intake.app_id.clone().unwrap_or_default(),
-        "--private-key-file".into(),
-        intake
-            .private_key_file
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_default(),
-    ]);
-    if let Some(org) = &intake.org {
-        args.extend(["--org".into(), org.clone()]);
-    }
-    args.push("--runner-image".into());
-    args.push(format!("{AGENT_NAME}={image}"));
-    args
-}
-
-/// The deploy argvs, in order: `cluster deploy` with the first repository as
-/// the agent's git-flow repository, then one GitHub surface binding per
-/// repository so the one agent serves each.
-pub fn deploy_args(
-    context: &str,
-    namespace: &str,
-    release: &str,
-    repos: &[String],
-) -> Vec<Vec<String>> {
-    let first = repos.first().cloned().unwrap_or_default();
-    let mut argvs = vec![vec![
-        "cluster".into(),
-        "deploy".into(),
-        "--context".into(),
-        context.into(),
-        "--namespace".into(),
-        namespace.into(),
-        "--release".into(),
-        release.into(),
-        "--plugin-dir".into(),
-        bundle_dir(namespace, release).display().to_string(),
-        "--agent".into(),
-        AGENT_NAME.into(),
-        "--env".into(),
-        "prod".into(),
-        "--repo".into(),
-        first,
-    ]];
-    for repo in repos {
-        argvs.push(cluster_agent(
-            "surfaces",
-            context,
-            namespace,
-            release,
-            &["--add".into(), format!("github={repo}")],
-        ));
-    }
-    argvs
 }
 
 /// The key whose OpenRouter credit to check. An explicit key wins because
@@ -1523,6 +1687,7 @@ fn budget_display(value: f64) -> String {
 
 fn cluster_agent(
     verb: &str,
+    agent: &str,
     context: &str,
     namespace: &str,
     release: &str,
@@ -1531,7 +1696,7 @@ fn cluster_agent(
     let mut args = vec![
         "cluster".into(),
         verb.into(),
-        AGENT_NAME.into(),
+        agent.into(),
         "--context".into(),
         context.into(),
         "--namespace".into(),
@@ -1550,7 +1715,7 @@ fn ensure_credential(decision: &CredentialDecision) -> Result<()> {
             validate_model_credential(&key)?;
             Ok(())
         }
-        CredentialDecision::PreserveRecorded => Ok(()),
+        CredentialDecision::PreserveRecorded | CredentialDecision::NotNeeded => Ok(()),
         CredentialDecision::PromptOnce => {
             if !std::io::stdin().is_terminal() {
                 return Err(CliError::usage(
@@ -1601,38 +1766,6 @@ async fn kind_clusters() -> Result<Vec<String>> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect())
-}
-
-async fn render_published_bundle(namespace: &str, release: &str) -> Result<String> {
-    let dir = bundle_dir(namespace, release);
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir).map_err(|err| {
-            CliError::failure(format!(
-                "could not replace the previous dark factory render at {}: {err}",
-                dir.display()
-            ))
-        })?;
-    }
-    if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            CliError::failure(format!("could not create {}: {err}", parent.display()))
-        })?;
-    }
-    let rendered =
-        crate::examples::render_dark_factory(crate::examples::DarkFactoryRenderOpts { out: dir })
-            .await?;
-    match rendered.runner_image {
-        Some(image) => Ok(image),
-        None => Err(CliError::failure(
-            rendered.runner_note.unwrap_or_else(|| {
-                "no published dark factory runner image is available to deploy".into()
-            }),
-        )
-        .with_fix(
-            "install a released curie, which deploys ghcr.io/curie-eng/curie-dark-factory-runner for its version",
-        )
-        .into()),
-    }
 }
 
 async fn run_self(args: &[String], step: &str) -> Result<serde_json::Value> {
@@ -1823,6 +1956,13 @@ mod tests {
             release_has_real_model: false,
             interactive: true,
             release_at_target: false,
+            agent: DEFAULT_AGENT.into(),
+            label: None,
+            plugin_dir: None,
+            model_explicit: false,
+            recorded: None,
+            bindings: Vec::new(),
+            runner_image: None,
         }
     }
 
@@ -2051,7 +2191,7 @@ mod tests {
         )));
         let lines = describe(&planned);
         let text = lines.join("\n");
-        assert!(text.contains("api.githubFactoryIntake=poll"), "{text}");
+        assert!(text.contains("factory.intake=poll"), "{text}");
         assert!(text.contains("no webhook secret"), "{text}");
         assert!(
             text.contains("ghcr.io/curie-eng/curie-dark-factory-runner"),
@@ -2215,7 +2355,7 @@ mod tests {
         assert!(surfaces[0].ends_with("--add github=a/x"), "{}", surfaces[0]);
         assert!(surfaces[1].ends_with("--add github=b/y"), "{}", surfaces[1]);
         assert!(
-            text.contains("factory intake api.githubFactoryIntake=poll for a/x,b/y with"),
+            text.contains("factory intake factory.intake=poll for a/x,b/y with"),
             "{text}"
         );
     }
@@ -2228,7 +2368,7 @@ mod tests {
         input.explicit_context = Some("kind-curie-factory".into());
         input.credential_in_env = true;
         let lines = describe(&quickstart_plan(&input).unwrap());
-        let dir = bundle_dir("curie", "curie");
+        let dir = bundle_dir("curie", "curie", DEFAULT_AGENT);
         // The complete ordered single-repository plan, retaining the stable deadline fix.
         let expected: Vec<String> = vec![
             crate::factory_toolchain::PLAN_NOTE.to_string(),
@@ -2236,7 +2376,7 @@ mod tests {
             "model credential: use CURIE_CREDENTIALS (no prompt)".to_string(),
             "kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1".to_string(),
             "curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off".to_string(),
-            "configure factory intake api.githubFactoryIntake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
+            "configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
             format!("curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
             "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),
@@ -2256,8 +2396,10 @@ mod tests {
             repos: vec!["acme/widgets".to_string()],
             label: "factory".into(),
             label_inferred: true,
-            runner_image: "runner:dev".into(),
-            agent: AGENT_NAME.into(),
+            runner_image: Some("runner:dev".into()),
+            agent: DEFAULT_AGENT.into(),
+            trigger_label: None,
+            effective_label: "factory".into(),
             deadline_seconds: DEFAULT_DEADLINE_SECONDS,
             budget_usd: DEFAULT_BUDGET_USD,
             credit_remaining_usd: None,
@@ -2348,7 +2490,16 @@ mod tests {
     #[test]
     fn quickstart_multi_repo_deploy_binds_every_repository_and_deploys_the_first() {
         let repos = vec!["a/x".to_string(), "b/y".to_string()];
-        let argvs = deploy_args("ctx", "ns", "rel", &repos);
+        let argvs = deploy_args(
+            "ctx",
+            "ns",
+            "rel",
+            &repos,
+            DEFAULT_AGENT,
+            None,
+            &bundle_dir("ns", "rel", DEFAULT_AGENT),
+            &[],
+        );
         assert_eq!(argvs.len(), 3, "{argvs:?}");
         assert_eq!(&argvs[0][..2], ["cluster", "deploy"]);
         let repo_flags: Vec<&str> = argvs[0]
@@ -2366,6 +2517,7 @@ mod tests {
         let expected = |repo: &str| {
             cluster_agent(
                 "surfaces",
+                DEFAULT_AGENT,
                 "ctx",
                 "ns",
                 "rel",
@@ -2391,7 +2543,20 @@ mod tests {
             ]
         );
         // One repository keeps one deploy and one surfaces argv.
-        assert_eq!(deploy_args("ctx", "ns", "rel", &repos[..1]).len(), 2);
+        assert_eq!(
+            deploy_args(
+                "ctx",
+                "ns",
+                "rel",
+                &repos[..1],
+                DEFAULT_AGENT,
+                None,
+                &bundle_dir("ns", "rel", DEFAULT_AGENT),
+                &[]
+            )
+            .len(),
+            2
+        );
     }
 
     #[test]
@@ -2427,5 +2592,655 @@ mod tests {
         let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
         assert!(text.contains("--repo a/x,b/y --context"), "{text}");
         assert!(text.contains("a/x and b/y"), "{text}");
+    }
+
+    // #4397 AC 6: the egress-write helper shared by the per-forge modules. An
+    // IP or CIDR passes through; a hostname resolves on this machine to one
+    // host route per address, with the hostname recorded beside it.
+    fn egress_json(entries: &[EgressEntry]) -> serde_json::Value {
+        serde_json::to_value(entries).expect("egress entries serialize to chart values")
+    }
+
+    #[test]
+    fn forge_egress_entries_resolves_a_hostname_to_host_routes_and_records_the_host() {
+        let resolve = |host: &str| -> Result<Vec<std::net::IpAddr>> {
+            assert_eq!(host, "git.internal.example");
+            Ok(vec![
+                "10.20.0.5".parse().unwrap(),
+                "10.20.0.6".parse().unwrap(),
+                "fd12:3456::7".parse().unwrap(),
+            ])
+        };
+        let entries = forge_egress_entries("git.internal.example", &[8443, 22], resolve)
+            .expect("a resolving hostname gives host routes");
+        let ports = serde_json::json!([
+            {"protocol": "TCP", "port": 8443},
+            {"protocol": "TCP", "port": 22}
+        ]);
+        assert_eq!(
+            egress_json(&entries),
+            serde_json::json!([
+                {"cidr": "10.20.0.5/32", "ports": ports, "host": "git.internal.example"},
+                {"cidr": "10.20.0.6/32", "ports": ports, "host": "git.internal.example"},
+                {"cidr": "fd12:3456::7/128", "ports": ports, "host": "git.internal.example"},
+            ])
+        );
+    }
+
+    #[test]
+    fn forge_egress_entries_passes_an_ip_and_a_cidr_through() {
+        let never = |host: &str| -> Result<Vec<std::net::IpAddr>> {
+            panic!("an address must not be resolved, got {host}")
+        };
+        let ports = serde_json::json!([{"protocol": "TCP", "port": 443}]);
+        for (target, cidr) in [
+            ("10.20.0.5", "10.20.0.5/32"),
+            ("192.168.40.0/24", "192.168.40.0/24"),
+            ("2001:db8::9", "2001:db8::9/128"),
+            ("2001:db8:1::/48", "2001:db8:1::/48"),
+        ] {
+            let entries = forge_egress_entries(target, &[443], never)
+                .unwrap_or_else(|error| panic!("{target}: {error:#}"));
+            assert_eq!(
+                egress_json(&entries),
+                serde_json::json!([{"cidr": cidr, "ports": ports}]),
+                "{target} passes through with no host recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn forge_egress_entries_refuses_a_name_that_resolves_to_nothing() {
+        let nothing = |_: &str| -> Result<Vec<std::net::IpAddr>> { Ok(Vec::new()) };
+        let error = forge_egress_entries("gone.internal.example", &[443], nothing)
+            .expect_err("a hostname with no address must be refused");
+        assert!(
+            format!("{error:#}").contains("gone.internal.example"),
+            "the refusal names the hostname: {error:#}"
+        );
+        let failing =
+            |_: &str| -> Result<Vec<std::net::IpAddr>> { Err(anyhow::anyhow!("NXDOMAIN")) };
+        let error = forge_egress_entries("gone.internal.example", &[443], failing)
+            .expect_err("a resolver failure must be refused");
+        assert!(
+            format!("{error:#}").contains("gone.internal.example"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn the_finishing_intake_enrolls_the_deployed_agent_for_forge_egress() {
+        // The quickstart writes factory.sandboxEgress.<agent> for the agent it
+        // deploys and no CIDR list: GitHub egress is the chart's built-in set.
+        let mut input = base();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.explicit_context = Some("kind-curie-factory".into());
+        let planned = quickstart_plan(&input).unwrap();
+        let intake = planned
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Intake(opts) => Some(opts),
+                _ => None,
+            })
+            .expect("the finishing pass has an intake action");
+        assert_eq!(intake.forge_egress, vec![DEFAULT_AGENT.to_string()]);
+        let values = intake_values(intake);
+        assert_eq!(
+            values["factory"]["sandboxEgress"],
+            serde_json::json!({ (DEFAULT_AGENT): true }),
+            "{values}"
+        );
+        let args = intake_args("kind-curie-factory", intake, "ghcr.io/x/runner:1");
+        let flag = args
+            .iter()
+            .position(|a| a == "--forge-egress")
+            .unwrap_or_else(|| panic!("the intake subprocess must pass --forge-egress: {args:?}"));
+        assert_eq!(args[flag + 1], DEFAULT_AGENT, "{args:?}");
+        assert!(!args.iter().any(|a| a == "--github-api-egress"), "{args:?}");
+    }
+
+    // ---- #4362: a second agent through the quickstart ----
+
+    fn recorded() -> RecordedIntake {
+        RecordedIntake {
+            app_id: "12345".into(),
+            install_label: "curie-factory".into(),
+            repo_allowlist: vec!["acme/widgets".into()],
+            pem_secret: "factory-app".into(),
+            pem_secret_key: "private-key.pem".into(),
+        }
+    }
+
+    fn binding(agent: &str, repo: &str, label: Option<&str>) -> AgentBinding {
+        AgentBinding {
+            agent: agent.into(),
+            repo: repo.into(),
+            trigger_label: label.map(str::to_string),
+        }
+    }
+
+    /// A release that records factory intake, no App flags: the add agent path.
+    fn add_input() -> PlanInput {
+        let mut input = base();
+        input.explicit_context = Some("k8".into());
+        input.namespace = "factory-ns".into();
+        input.release = "factory".into();
+        input.credential_in_env = true;
+        input.agent = "dark-factory-fast".into();
+        input.label = Some("curie-factory-fast".into());
+        input.recorded = Some(recorded());
+        input
+    }
+
+    fn plan_text(input: &PlanInput) -> String {
+        describe(&quickstart_plan(input).unwrap()).join("\n")
+    }
+
+    fn refusal(input: &PlanInput) -> String {
+        format!("{:#}", quickstart_plan(input).unwrap_err())
+    }
+
+    #[test]
+    fn agent_add_path_plans_no_kind_coredns_cluster_up_registration_or_intake() {
+        let mut input = add_input();
+        input.plugin_dir = Some("/ops/fast-bundle".into());
+        let planned = quickstart_plan(&input).unwrap();
+        assert!(planned.kind_cluster.is_none());
+        assert!(!planned.actions.iter().any(|action| matches!(
+            action,
+            Action::External { .. }
+                | Action::Cluster { .. }
+                | Action::Register { .. }
+                | Action::Intake(_)
+        )));
+        let text = describe(&planned).join("\n");
+        assert!(
+            text.contains("add agent dark-factory-fast to the factory install on release factory: skip cluster up, App registration, and intake"),
+            "{text}"
+        );
+        for banned in [
+            "kind create",
+            "coredns",
+            "curie cluster up",
+            "registration link",
+            "factory.intake=",
+        ] {
+            assert!(!text.contains(banned), "{banned}: {text}");
+        }
+        let order: Vec<usize> = [
+            "cluster deploy",
+            "cluster surfaces dark-factory-fast",
+            "cluster overrides dark-factory-fast",
+            "cluster publication-policy dark-factory-fast",
+            "cluster budget dark-factory-fast",
+        ]
+        .iter()
+        .map(|needle| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {text}"))
+        })
+        .collect();
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+        assert!(text.contains("--agent dark-factory-fast"), "{text}");
+        assert!(text.contains("--plugin-dir /ops/fast-bundle"), "{text}");
+        assert!(
+            text.contains("--add github=acme/widgets --label curie-factory-fast"),
+            "{text}"
+        );
+        // Liveness: the same input without recorded intake is the register path.
+        let mut register = add_input();
+        register.recorded = None;
+        let planned = quickstart_plan(&register).unwrap();
+        assert!(planned
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Register { .. })));
+        // The add path also applies to the default agent name.
+        let mut default = add_input();
+        default.agent = DEFAULT_AGENT.into();
+        default.label = None;
+        let text = plan_text(&default);
+        assert!(
+            text.contains("add agent dark-factory to the factory install"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn agent_same_effective_label_on_another_agent_is_refused_naming_it() {
+        let mut input = add_input();
+        input.bindings = vec![binding(
+            "dark-factory-fast",
+            "acme/widgets",
+            Some("curie-factory-fast"),
+        )];
+        input.agent = "dark-factory-dup".into();
+        let error = refusal(&input);
+        assert!(error.contains("dark-factory-fast"), "{error}");
+        assert!(error.contains("--label"), "{error}");
+        // Liveness: a different label on the same repository plans.
+        input.label = Some("curie-factory-dup".into());
+        quickstart_plan(&input).unwrap();
+        // Liveness: the same label on another repository plans.
+        input.label = Some("curie-factory-fast".into());
+        input.bindings = vec![binding(
+            "dark-factory-fast",
+            "acme/other",
+            Some("curie-factory-fast"),
+        )];
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_explicit_label_equal_to_install_label_beside_null_binding_is_refused() {
+        let mut input = add_input();
+        input.bindings = vec![binding("dark-factory", "acme/widgets", None)];
+        input.label = Some("curie-factory".into());
+        let error = refusal(&input);
+        assert!(error.contains("dark-factory"), "{error}");
+        // The omitted label is the install label too.
+        input.label = None;
+        let error = refusal(&input);
+        assert!(error.contains("dark-factory"), "{error}");
+        // Liveness: a distinct label beside the null binding plans.
+        input.label = Some("curie-factory-fast".into());
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_own_binding_same_label_plans() {
+        let mut input = add_input();
+        input.bindings = vec![binding(
+            "dark-factory-fast",
+            "acme/widgets",
+            Some("curie-factory-fast"),
+        )];
+        let skip = skip_bound_line("dark-factory-fast", "acme/widgets");
+        let text = plan_text(&input);
+        assert!(!text.contains("--add github=acme/widgets"), "{text}");
+        assert!(text.contains(&skip), "{text}");
+        // An own null binding equals an explicit install label: the plan
+        // still deploys and never POSTs the label the API would refuse.
+        input.bindings = vec![binding("dark-factory-fast", "acme/widgets", None)];
+        input.label = Some("curie-factory".into());
+        let planned = quickstart_plan(&input).unwrap();
+        let Some(Action::Deploy {
+            context,
+            namespace,
+            release,
+            repos,
+            agent,
+            label,
+            bound,
+            ..
+        }) = planned
+            .actions
+            .iter()
+            .find(|action| matches!(action, Action::Deploy { .. }))
+        else {
+            panic!("no deploy action: {:?}", planned.actions);
+        };
+        assert_eq!(bound, &["acme/widgets".to_string()]);
+        let argvs = deploy_args(
+            context,
+            namespace,
+            release,
+            repos,
+            agent,
+            label.as_deref(),
+            Path::new("/bundle"),
+            bound,
+        );
+        assert_eq!(argvs.len(), 1, "{argvs:?}");
+        assert_eq!(&argvs[0][..2], ["cluster", "deploy"]);
+        let text = describe(&planned).join("\n");
+        assert!(text.contains("cluster deploy"), "{text}");
+        assert!(
+            !text.contains("cluster surfaces dark-factory-fast"),
+            "{text}"
+        );
+        assert!(text.contains(&skip), "{text}");
+        input.label = None;
+        let text = plan_text(&input);
+        assert!(!text.contains("--add github=acme/widgets"), "{text}");
+        assert!(text.contains(&skip), "{text}");
+        // Liveness: only the held repository is skipped; a new one still binds.
+        let mut wider = add_input();
+        wider.repos = vec!["acme/widgets".into(), "acme/other".into()];
+        wider.recorded.as_mut().unwrap().repo_allowlist = wider.repos.clone();
+        wider.bindings = vec![binding(
+            "dark-factory-fast",
+            "acme/widgets",
+            Some("curie-factory-fast"),
+        )];
+        let text = plan_text(&wider);
+        assert!(!text.contains("--add github=acme/widgets"), "{text}");
+        assert!(
+            text.contains("--add github=acme/other --label curie-factory-fast"),
+            "{text}"
+        );
+        assert!(text.contains(&skip), "{text}");
+    }
+
+    #[test]
+    fn install_path_rerun_skips_the_binding_the_agent_already_holds() {
+        let mut input = add_input();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.bindings = vec![binding("dark-factory-fast", "acme/widgets", None)];
+        input.label = Some("curie-factory".into());
+        let planned = quickstart_plan(&input).unwrap();
+        assert_eq!(planned.path, QuickstartPath::Install);
+        let skip = skip_bound_line("dark-factory-fast", "acme/widgets");
+        let text = describe(&planned).join("\n");
+        assert!(!text.contains("--add github=acme/widgets"), "{text}");
+        assert!(text.contains(&skip), "{text}");
+        // Liveness: a fresh install with no bindings still binds.
+        input.bindings = Vec::new();
+        let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
+        assert!(text.contains("--add github=acme/widgets"), "{text}");
+        assert!(!text.contains(&skip), "{text}");
+    }
+
+    #[test]
+    fn agent_own_binding_other_label_is_refused_naming_surfaces_remove() {
+        let mut input = add_input();
+        input.bindings = vec![binding(
+            "dark-factory-fast",
+            "acme/widgets",
+            Some("old-label"),
+        )];
+        let error = refusal(&input);
+        assert!(
+            error.contains("curie cluster surfaces dark-factory-fast --remove github=acme/widgets"),
+            "{error}"
+        );
+        // Null binding against a distinct requested label is the same refusal.
+        input.bindings = vec![binding("dark-factory-fast", "acme/widgets", None)];
+        let error = refusal(&input);
+        assert!(error.contains("--remove github=acme/widgets"), "{error}");
+        // Liveness: after the remove (no binding) it plans.
+        input.bindings = Vec::new();
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_repo_outside_recorded_allowlist_is_refused() {
+        let mut input = add_input();
+        input.repos = vec!["acme/widgets".into(), "acme/gadgets".into()];
+        let error = refusal(&input);
+        assert!(
+            error.contains("curie cluster factory --repo acme/widgets,acme/gadgets"),
+            "{error}"
+        );
+        // Liveness: an owner wildcard admits it.
+        input.recorded.as_mut().unwrap().repo_allowlist = vec!["acme/*".into()];
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_install_path_dropping_a_recorded_allowlist_entry_is_refused() {
+        let mut input = add_input();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.recorded.as_mut().unwrap().repo_allowlist =
+            vec!["acme/widgets".into(), "acme/gadgets".into()];
+        let error = refusal(&input);
+        assert!(error.contains("acme/gadgets"), "{error}");
+        // Liveness: listing every recorded entry plans an intake.
+        input.repos = vec!["acme/widgets".into(), "acme/gadgets".into()];
+        let planned = quickstart_plan(&input).unwrap();
+        assert!(planned
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Intake(_))));
+    }
+
+    #[test]
+    fn agent_invalid_name_self_and_labels_are_refused() {
+        let long = "a".repeat(41);
+        for name in ["Bad_Name", "self", "", long.as_str(), "-lead"] {
+            let mut input = add_input();
+            input.agent = name.into();
+            let error = refusal(&input);
+            assert!(error.contains("agent"), "{name:?}: {error}");
+        }
+        let too_long = "l".repeat(51);
+        for label in [
+            "has space",
+            "",
+            too_long.as_str(),
+            "curie-factory:x",
+            "base:main",
+            "repo:acme",
+        ] {
+            let mut input = add_input();
+            input.label = Some(label.into());
+            let error = refusal(&input);
+            assert!(error.contains("--label"), "{label:?}: {error}");
+        }
+        // The name check runs on the register path as well.
+        let mut input = base();
+        input.agent = "self".into();
+        assert!(quickstart_plan(&input).is_err());
+        // Liveness: a valid 40 character name and a 50 character label plan.
+        let mut input = add_input();
+        input.agent = "a".repeat(40);
+        input.label = Some("l".repeat(50));
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_model_and_org_are_refused_on_add_path() {
+        let mut input = add_input();
+        input.model_explicit = true;
+        let error = refusal(&input);
+        assert!(error.contains("curie cluster up --model"), "{error}");
+        let mut input = add_input();
+        input.org = Some("acme".into());
+        let error = refusal(&input);
+        assert!(error.contains("curie cluster github-app"), "{error}");
+        // Liveness: the register path still accepts both.
+        let mut input = base();
+        input.model_explicit = true;
+        input.org = Some("acme".into());
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_locked_runner_yields_runner_image_flag() {
+        let mut input = base();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.explicit_context = Some("kind-curie-factory".into());
+        input.agent = "dark-factory-fast".into();
+        input.plugin_dir = Some("/ops/fast-bundle".into());
+        input.runner_image = Some("registry.example/fast-runner@sha256:abc".into());
+        let planned = quickstart_plan(&input).unwrap();
+        let intake = planned
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Intake(opts) => Some(opts),
+                _ => None,
+            })
+            .expect("the install path has an intake");
+        assert_eq!(intake.forge_egress, vec!["dark-factory-fast".to_string()]);
+        assert_eq!(
+            intake.runner_binding,
+            Some(crate::factory_intake::RunnerImageBinding {
+                agent: "dark-factory-fast".into(),
+                image: "registry.example/fast-runner@sha256:abc".into(),
+            })
+        );
+        let args = intake_args(
+            "kind-curie-factory",
+            intake,
+            "registry.example/fast-runner@sha256:abc",
+        );
+        let flag = args.iter().position(|a| a == "--runner-image").unwrap();
+        assert_eq!(
+            args[flag + 1],
+            "dark-factory-fast=registry.example/fast-runner@sha256:abc"
+        );
+        let text = describe(&planned).join("\n");
+        assert!(
+            text.contains("registry.example/fast-runner@sha256:abc"),
+            "{text}"
+        );
+        // Liveness: a bundle with no runner passes no --runner-image and says
+        // the platform runner serves the agent.
+        input.runner_image = None;
+        let planned = quickstart_plan(&input).unwrap();
+        let intake = planned
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Intake(opts) => Some(opts),
+                _ => None,
+            })
+            .unwrap();
+        assert!(intake.runner_binding.is_none());
+        let text = describe(&planned).join("\n");
+        assert!(text.contains("platform runner"), "{text}");
+        assert!(!text.contains("curie-dark-factory-runner"), "{text}");
+    }
+
+    #[test]
+    fn agent_bundle_without_runner_yields_platform_runner_line() {
+        let mut input = add_input();
+        input.plugin_dir = Some("/ops/fast-bundle".into());
+        let text = plan_text(&input);
+        assert!(text.contains("platform runner"), "{text}");
+        assert!(!text.contains("--runner-image"), "{text}");
+        // Liveness: a locked image names itself instead of the platform runner.
+        input.runner_image = Some("registry.example/fast-runner@sha256:abc".into());
+        let text = plan_text(&input);
+        assert!(
+            text.contains("registry.example/fast-runner@sha256:abc"),
+            "{text}"
+        );
+        assert!(!text.contains("platform runner"), "{text}");
+    }
+
+    #[test]
+    fn agent_bundle_dir_differs_per_agent_and_is_unchanged_for_default() {
+        let default = bundle_dir("ns", "rel", DEFAULT_AGENT);
+        let fast = bundle_dir("ns", "rel", "dark-factory-fast");
+        assert_ne!(default, fast);
+        assert_eq!(
+            default,
+            std::env::temp_dir()
+                .join("curie-factory-quickstart-ns-rel")
+                .join("dark-factory")
+        );
+        assert_eq!(fast.parent(), default.parent());
+        assert_eq!(fast.file_name().unwrap(), "dark-factory-fast");
+    }
+
+    #[test]
+    fn agent_register_rerun_line_carries_non_default_flags() {
+        let mut input = base();
+        input.explicit_context = Some("remote-cluster".into());
+        input.agent = "dark-factory-fast".into();
+        input.label = Some("curie-factory-fast".into());
+        input.plugin_dir = Some("/ops/fast-bundle".into());
+        let text = plan_text(&input);
+        let rerun = text.lines().find(|l| l.starts_with("Rerun:")).unwrap();
+        for flag in [
+            "--agent dark-factory-fast",
+            "--label curie-factory-fast",
+            "--plugin-dir /ops/fast-bundle",
+        ] {
+            assert!(rerun.contains(flag), "{flag}: {rerun}");
+        }
+        // Liveness: defaults add none of the three flags.
+        let mut input = base();
+        input.explicit_context = Some("remote-cluster".into());
+        let text = plan_text(&input);
+        let rerun = text.lines().find(|l| l.starts_with("Rerun:")).unwrap();
+        for flag in ["--agent", "--label", "--plugin-dir"] {
+            assert!(!rerun.contains(flag), "{flag}: {rerun}");
+        }
+    }
+
+    #[test]
+    fn agent_add_path_binds_forge_egress_before_deploy() {
+        let text = plan_text(&add_input());
+        let egress = text
+            .lines()
+            .position(|l| l.contains("factory.sandboxEgress.dark-factory-fast"))
+            .unwrap_or_else(|| panic!("no forge egress line: {text}"));
+        let deploy = text
+            .lines()
+            .position(|l| l.contains("cluster deploy"))
+            .unwrap();
+        assert!(egress < deploy, "{text}");
+        // The install path enrolls through the intake instead and plans no
+        // separate bind.
+        let mut input = base();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.explicit_context = Some("kind-curie-factory".into());
+        let text = plan_text(&input);
+        assert!(
+            !text.contains("factory.sandboxEgress.dark-factory "),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn agent_recorded_intake_reads_the_factory_block() {
+        let values = serde_json::json!({
+            "factory": {
+                "enabled": true,
+                "intake": "poll",
+                "trackers": [{"kind": "github", "label": "curie-factory"}],
+                "codeHosts": [{"kind": "github", "credential": {
+                    "appId": "12345",
+                    "existingSecret": "factory-app",
+                    "existingSecretKey": "private-key.pem"
+                }}]
+            },
+            "api": {"githubRepoAllowlist": ["acme/widgets"]}
+        });
+        assert_eq!(recorded_intake(&values), Some(recorded()));
+        // Liveness: each missing piece is "not recorded".
+        for pointer in [
+            "/factory/enabled",
+            "/factory/intake",
+            "/factory/trackers/0/label",
+            "/factory/codeHosts/0/credential/appId",
+            "/factory/codeHosts/0/credential/existingSecret",
+        ] {
+            let mut broken = values.clone();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            let slot = broken.pointer_mut(parent).unwrap();
+            if let Some(list) = slot.as_array_mut() {
+                list.clear();
+            } else {
+                slot.as_object_mut().unwrap().remove(key);
+            }
+            assert_eq!(recorded_intake(&broken), None, "{pointer}");
+        }
+        // The removed api.* factory keys are not the record. Their names come
+        // from the chart's guard file, the only place allowed to spell them.
+        let mut api = serde_json::json!({
+            "githubAppId": "12345",
+            "githubAppExistingSecret": "factory-app"
+        });
+        let removed: Vec<&str> =
+            include_str!("../../../charts/curie/files/legacy-factory-keys.yaml")
+                .lines()
+                .filter_map(|line| line.trim().strip_prefix("- api."))
+                .collect();
+        assert!(removed.len() >= 3, "{removed:?}");
+        for key in removed {
+            api[key] = serde_json::json!(true);
+        }
+        let legacy = serde_json::json!({ "api": api });
+        assert_eq!(recorded_intake(&legacy), None);
     }
 }

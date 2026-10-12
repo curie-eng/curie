@@ -49,7 +49,17 @@ from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER
 from curie_api.workitem_reconciler import WorkItemReconciler
 from curie_test_support.valkey import VALKEY_HOST, VALKEY_PORT, VALKEY_PW
-from forge_fakes.github import LABEL, REPO, REPO_ID, _issue_event, _post
+from forge_fakes.github import (
+    LABEL,
+    REPO,
+    REPO_ID,
+    _issue_event,
+    _post,
+    factory_env,
+    forges_document,
+    forges_env_json,
+    github_repository_binding,
+)
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     HEAD_A,
     HEAD_B,
@@ -86,20 +96,23 @@ MARKER_RE = re.compile(r"^Curie wait_ci round ([23]) of 3: ")
 _PRS = iter(range(701, 799))
 
 
-@pytest.fixture
-def _metadata_ci(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    monkeypatch.setenv(
-        "GITHUB_FACTORY_METADATA_CI",
-        json.dumps(
-            {
-                REPO: {
-                    "checks": ["Publication description guard"],
-                    "statuses": [],
-                }
-            }
-        ),
+def _set_metadata_ci(
+    monkeypatch: pytest.MonkeyPatch, key_dir: Path, metadata_rerun_keys: list[str]
+) -> None:
+    """Bind ``REPO`` with the given metadata rerun keys on the running fixture's
+    GitHub host; the per-repository CI policy lives on the binding (#4397)."""
+
+    document = forges_document(
+        api_url=get_settings().github_api_url,
+        bindings=[github_repository_binding(ci={"metadata_rerun_keys": metadata_rerun_keys})],
     )
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, key_dir))
     get_settings.cache_clear()
+
+
+@pytest.fixture
+def _metadata_ci(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
+    _set_metadata_ci(monkeypatch, tmp_path / "metadata-ci", ["Publication description guard"])
     yield
     get_settings.cache_clear()
 
@@ -817,8 +830,6 @@ def test_body_only_fix_revision_repolls_checks_on_the_same_head(
 def test_body_only_fix_without_a_metadata_policy_ends_unverified(
     admitted: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("GITHUB_FACTORY_METADATA_CI", raising=False)
-    get_settings.cache_clear()
     client, github, sink = admitted
     number = 9792
     sink.ci_scripts = {
@@ -891,18 +902,13 @@ def test_body_only_fix_waits_for_fresh_checks_then_ends_unverified(
 
 
 def test_body_only_fix_reports_only_a_fresh_unrelated_failure(
-    admitted: Any, _metadata_ci: None, monkeypatch: pytest.MonkeyPatch
+    admitted: Any, _metadata_ci: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setenv(
-        "GITHUB_FACTORY_METADATA_CI",
-        json.dumps(
-            {REPO: {
-                "checks": ["Publication description guard"],
-                "statuses": ["ci/publication-description"],
-            }}
-        ),
+    _set_metadata_ci(
+        monkeypatch,
+        tmp_path / "metadata-ci-statuses",
+        ["Publication description guard", "status:ci/publication-description"],
     )
-    get_settings.cache_clear()
     client, github, sink = admitted
     number = 9791
     old_time = "2020-01-01T00:00:00Z"
@@ -2174,38 +2180,31 @@ def recorded_github(
     )
     try:
         stub.start()
+        python_ci = {
+            "required": {
+                "key": "Python (ruff + mypy + pytest)",
+                "paths": ["apps/api"],
+                "pending_key_prefix": "Python pytest (shard ",
+            }
+        }
         environment = {
-            "GITHUB_API_URL": stub.base_url,
+            **factory_env(
+                tmp_path / "forges",
+                intake="webhook",
+                api_url=stub.base_url,
+                label=LABEL,
+                mention="curie",
+                private_key=app_key,
+                bindings=[github_repository_binding(ci=python_ci)],
+            ),
             # The code host's repository credential is the clone credential,
             # which only travels to the configured clone origin.
             "GITHUB_CLONE_BASE": stub.base_url,
             "SSL_CERT_FILE": str(stub.ca_file),
-            "GITHUB_APP_ID": "51",
             "GITHUB_APP_PRIVATE_KEY": app_key,
-            "GITHUB_WEBHOOK_SECRET": "example-factory-hmac-secret",
-            "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
-            "GITHUB_TOKEN": "",
-            "GITHUB_FACTORY_INGRESS_ENABLED": "true",
-            "GITHUB_FACTORY_INTAKE": "webhook",
-            "GITHUB_FACTORY_LABEL": LABEL,
-            "GITHUB_FACTORY_MENTION": "curie",
-            "GITHUB_REVIEW_INGRESS_ENABLED": "false",
-            "GITHUB_FACTORY_CI_WAIT_S": "3600",
-            "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
-            "RESUME_RECONCILER_ENABLED": "false",
-            "APPROVAL_SWEEP_INTERVAL_S": "0",
-            "DEAD_LETTER_WATCH_INTERVAL_S": "0",
+            "FACTORY_CI_WAIT_S": "3600",
             "RUNS_STREAM": stream,
             "INTERNAL_WORKER_TOKEN": "factory-terminus-worker",
-            "GITHUB_FACTORY_PYTHON_CI": json.dumps(
-                {
-                    REPO: {
-                        "check": "Python (ruff + mypy + pytest)",
-                        "paths": ["apps/api"],
-                        "pendingCheckPrefix": "Python pytest (shard ",
-                    }
-                }
-            ),
         }
         for key, value in environment.items():
             monkeypatch.setenv(key, value)

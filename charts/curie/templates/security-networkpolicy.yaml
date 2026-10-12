@@ -821,17 +821,20 @@ spec:
   egress:
     {{- include "curie.egress.ipBlockRules" (dict "entries" $np.allowedEgress "root" $) | trim | nindent 4 }}
 {{- end }}
-{{- /* Per-agent egress: connectorEgress (connector hosts) and registryEgress
-       (package registries such as npm or PyPI, #3083). Both are closed unless
-       an agent is declared, and each declaring agent gets its own policy. */}}
-{{- range $kind := list (dict "key" "connectorEgress" "suffix" "allow-egress") (dict "key" "registryEgress" "suffix" "allow-registry-egress") }}
-{{- $perAgent := index $.Values.agentSandbox $kind.key | default dict }}
+{{- /* Per-agent egress: connectorEgress (connector hosts), registryEgress
+       (package registries such as npm or PyPI, #3083) and forges (#4397).
+       All are closed unless an agent is declared, and each declaring agent
+       gets its own policy. */}}
+{{- $forge := dict }}
+{{- range include "curie.factory.sandboxAgents" . | fromJsonArray }}{{ $_ := set $forge . (include "curie.factory.egress" (dict "root" $ "sandbox" true) | fromJsonArray) }}{{ end }}
+{{- range $kind := list (dict "key" "connectorEgress" "suffix" "allow-egress") (dict "key" "registryEgress" "suffix" "allow-registry-egress") (dict "key" "forge" "suffix" "allow-forge-egress" "agents" $forge) }}
+{{- $perAgent := $kind.agents | default (index $.Values.agentSandbox $kind.key) | default dict }}
 {{- range $agent := keys $perAgent | sortAlpha }}
 {{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) }}
 {{- fail (printf "agentSandbox.%s.%s has an invalid agent name" $kind.key $agent) }}
 {{- end }}
 {{- $entries := index $perAgent $agent }}
-{{- range $entries }}
+{{- range ternary list $entries (hasKey $kind "agents") }}
 {{- include "curie.objectStore.egressEntry" (dict "key" (printf "agentSandbox.%s.%s" $kind.key $agent) "entry" .) }}
 {{- end }}
 {{- if $entries }}

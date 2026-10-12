@@ -30,19 +30,33 @@ from . import factory_base, workitem_dispatch
 from .config import Settings
 from .factory_base import BaseRefusal
 from .factory_notices import mark_status_comment_stale
-from .forges.errors import Unavailable
-from .forges.github.binding import github_reply_route, resolve_binding
+from .forges.errors import ForgeError, Unavailable
+from .forges.github.binding import (
+    agent_binding,
+    bound_labels,
+    github_reply_route,
+    resolve_binding,
+)
 from .forges.github.comments import static_token
 from .forges.github.identity import delivery_uuid
-from .forges.github.tracker import GitHubTracker, last_label_event
-from .forges.hosts import code_host_for, github_issue_ref, repository_ref
+from .forges.github.tracker import GitHubTracker, IssueFacts, last_label_event
+from .forges.hosts import (
+    factory_code_host,
+    factory_code_host_entry,
+    factory_credentials,
+    factory_repository,
+    factory_tracker,
+)
 from .forges.identity import issue_lock_keys
 from .forges.ports import CodeHost
-from .forges.types import RepositoryRef, TrackerIssueRef
-from .github_app import GitHubAppError, GitHubInstallationRefused, credentials_for
+from .forges.registry import ForgeRegistry, forges_registry
+from .forges.surfaces import effective_trigger_label
+from .forges.types import GITHUB, ReplyTarget, RepositoryRef, TrackerIssueRef
+from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import (
     FactoryNotice,
     FactoryRefused,
+    event_repository,
     parse_factory_event,
 )
 from .github_review_audit import claim_review_delivery, settle_review_delivery
@@ -85,7 +99,14 @@ IGNORED = {
     "base_not_allowed",
     "base_missing",
     "base_label_recorded",
+    "label_not_admitting",
+    "work_item_other_agent",
+    "label_conflict",
 }
+
+# The one label refusal comment per issue (#4361 decision 9), edited, never
+# duplicated, like the `base:` refusal.
+LABEL_REFUSAL_MARKER = "curie-factory-label-refusal"
 
 
 @dataclass(frozen=True)
@@ -109,13 +130,13 @@ def ignored(code: str) -> WebhookResult:
 
 
 async def _tracker(
-    notice: FactoryNotice, *, settings: Settings, client: httpx.AsyncClient
+    notice: FactoryNotice, *, registry: ForgeRegistry, client: httpx.AsyncClient
 ) -> GitHubTracker:
     """The notice's repository tracker, under the token for its installation."""
 
     try:
         token = await run_in_threadpool(
-            credentials_for(settings).token_for_verified_installation,
+            factory_credentials(registry).token_for_verified_installation,
             notice.repo_full_name,
             notice.installation_id,
         )
@@ -123,8 +144,7 @@ async def _tracker(
         raise FactoryRefused("installation_unverified") from None
     except GitHubAppError:
         raise FeedbackUnavailable("installation_unavailable") from None
-    return GitHubTracker.from_settings(
-        settings,
+    return factory_tracker(registry).for_repository(
         client,
         repo_full_name=notice.repo_full_name,
         repository_id=notice.repository_id,
@@ -138,29 +158,62 @@ async def verify_current(
     settings: Settings,
     client: httpx.AsyncClient,
 ) -> VerifiedIssue:
-    tracker = await _tracker(notice, settings=settings, client=client)
+    registry = forges_registry(settings)
+    tracker = await _tracker(notice, registry=registry, client=client)
     facts = await tracker.verify_notice(notice)
+    return _verified(notice, registry, client, tracker, facts)
+
+
+async def verify_polled(
+    notice: FactoryNotice,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+    tracker: GitHubTracker,
+    repository: Any,
+) -> VerifiedIssue:
+    """`verify_current` for a notice a poll pass built.
+
+    The pass already minted its repository's installation token and read the
+    repository once (#4361 decision 14), so the notice is confirmed with that
+    ``tracker`` and against that ``repository`` object; only the issue is
+    re-read, for the labels admission and cancellation judge.
+    """
+
+    registry = forges_registry(settings)
+    facts = await tracker.verify_issue(notice, repository)
+    return _verified(notice, registry, client, tracker, facts)
+
+
+def _verified(
+    notice: FactoryNotice,
+    registry: ForgeRegistry,
+    client: httpx.AsyncClient,
+    tracker: GitHubTracker,
+    facts: IssueFacts,
+) -> VerifiedIssue:
     return VerifiedIssue(
         labels=facts.labels,
         default_branch=facts.default_branch,
         tracker=tracker,
-        code_host=code_host_for(settings, client),
-        repository=notice_repository(notice, settings),
+        code_host=factory_code_host(registry, client),
+        repository=notice_repository(notice, registry),
     )
 
 
-def notice_issue(notice: FactoryNotice, settings: Settings) -> TrackerIssueRef:
-    """The tracker issue a GitHub notice names."""
+def notice_issue(notice: FactoryNotice, registry: ForgeRegistry) -> TrackerIssueRef:
+    """The tracker issue a GitHub notice names, on the GitHub tracker's host."""
 
-    return github_issue_ref(
-        settings, repository_id=notice.repository_id, issue_number=notice.issue_number
-    )
+    host = factory_tracker(registry).config.host
+    return TrackerIssueRef(GITHUB, host, str(notice.repository_id), str(notice.issue_number))
 
 
-def notice_repository(notice: FactoryNotice, settings: Settings) -> RepositoryRef:
+def notice_repository(notice: FactoryNotice, registry: ForgeRegistry) -> RepositoryRef:
     """The repository a GitHub notice's issue lives on: its own (ADR 0197 rule 3)."""
 
-    return repository_ref(settings, path=notice.repo_full_name, project_id=notice.repository_id)
+    return factory_repository(
+        registry, path=notice.repo_full_name, project_id=notice.repository_id
+    )
 
 
 async def lock_issue(session: AsyncSession, issue: TrackerIssueRef) -> None:
@@ -179,8 +232,14 @@ async def lock_issue(session: AsyncSession, issue: TrackerIssueRef) -> None:
     )
 
 
-def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> Admission:
-    base = settings.github_clone_base.rstrip("/")
+def _facts(notice: FactoryNotice, binding: AgentChannel, registry: ForgeRegistry) -> Admission:
+    """The admission facts of a verified notice on its resolved surface.
+
+    A label admission carries the surface's effective trigger label, which the
+    WorkItem stores (#4361 decision 10); a mention starts nothing by label.
+    """
+
+    base = factory_code_host_entry(registry).html_base.rstrip("/")
     objective = f"{base}/{notice.repo_full_name}/issues/{notice.issue_number}"
     if notice.disposition == "mention":
         objective = f"{objective}#issuecomment-{notice.comment_id}"
@@ -192,12 +251,15 @@ def _facts(notice: FactoryNotice, binding: AgentChannel, settings: Settings) -> 
         kind=kind,
         address=address,
         reply_conversation_id=reply_conversation_id,
-        issue=notice_issue(notice, settings),
-        repository=notice_repository(notice, settings),
+        issue=notice_issue(notice, registry),
+        repository=notice_repository(notice, registry),
         code_host_installation_id=notice.installation_id,
         objective=objective,
         requester=f"github:{notice.sender_id}:{notice.sender_login}",
         request_id=notice.request_id,
+        trigger_label=(
+            effective_trigger_label(binding, registry) if notice.disposition == "admit" else None
+        ),
     )
 
 
@@ -247,7 +309,7 @@ async def _record_label(
         return
     ignored = factory_base.label_disagreement(
         verified.labels,
-        factory_base.bases_for(settings, item.repository_path),
+        factory_base.bases_for(forges_registry(settings), item.repository_path),
         verified.default_branch,
         item.base_branch,
     )
@@ -266,7 +328,7 @@ async def _fresh_base(
 
     tracker = verified.tracker
     resolved = await factory_base.resolve_base(
-        settings=settings,
+        registry=forges_registry(settings),
         repo_full_name=notice.repo_full_name,
         labels=verified.labels,
         default_branch=verified.default_branch,
@@ -281,19 +343,141 @@ async def _fresh_base(
     return resolved
 
 
+def admitting_label(registry: ForgeRegistry, item: WorkItem) -> str | None:
+    """The label whose removal cancels ``item`` (#4361 decision 10).
+
+    The label stored when it was admitted or last readmitted. A WorkItem with
+    no stored label predates the column, when the configured GitHub tracker
+    label was the only install label, so it compares with that alone. Never
+    consults a binding: a removed or moved surface cannot change what cancels
+    the run (ADR 0161).
+    """
+
+    if item.trigger_label is not None:
+        return item.trigger_label
+    tracker = registry.github_tracker()
+    return None if tracker is None else tracker.config.label
+
+
+def _label_span(label: str | None) -> str:
+    return f"`{label}`" if label is not None else "its original label"
+
+
+async def _comment_label_refusal(tracker: GitHubTracker, number: int, body: str) -> None:
+    try:
+        await tracker.marked_comments.upsert_marked(
+            ReplyTarget.on_issue(tracker.issue(number)), LABEL_REFUSAL_MARKER, body
+        )
+    except ForgeError:
+        raise FeedbackUnavailable("label_refusal_unavailable") from None
+
+
+async def _refuse_label_admission(
+    session: AsyncSession,
+    registry: ForgeRegistry,
+    notice: FactoryNotice,
+    verified: VerifiedIssue,
+    existing: WorkItem | None,
+    binding: AgentChannel,
+) -> frozenset[str]:
+    """Refuse a label admission another label owns, with a marked comment
+    (#4361 decision 9). Deterministic: it reads the labels present now.
+    Returns the labels the repository's surfaces serve.
+
+    1. ``work_item_other_agent``: the issue's WorkItem, cancelled or not,
+       belongs to another agent, whether or not that agent still serves the
+       repository; its conversation and PR lineage stay there.
+    2. ``label_conflict``: the issue carries two or more labels bound on the
+       repository. A run already admitted is not touched.
+    """
+
+    if existing is not None and existing.agent_id != binding.agent_id:
+        owner = admitting_label(registry, existing)
+        await _comment_label_refusal(
+            verified.tracker,
+            notice.issue_number,
+            f"Curie did not start this issue under {_label_span(notice.label)}: it belongs to the "
+            f"run the {_label_span(owner)} label started, which is another agent's. Open a new "
+            f"issue to run it under {_label_span(notice.label)}.",
+        )
+        raise FactoryRefused("work_item_other_agent")
+    bound = await bound_labels(session, registry, notice.repo_full_name)
+    present = sorted(label for label in bound if label in verified.labels)
+    if len(present) > 1:
+        await _comment_label_refusal(
+            verified.tracker,
+            notice.issue_number,
+            "Curie did not start this issue: it carries "
+            f"{', '.join(_label_span(label) for label in present)}, which start different "
+            "agents on this repository. Keep exactly one of them; Curie will pick the issue "
+            "up on its next pass.",
+        )
+        raise FactoryRefused("label_conflict")
+    return frozenset(bound)
+
+
+async def _settle_label_refusal(
+    tracker: GitHubTracker, number: int, label: str | None, served: frozenset[str]
+) -> None:
+    """Edit a standing label refusal once the issue is admitted, so it does not
+    read as current. Best effort: the admission already stands.
+
+    A refusal can stand only if another served label was ever put on the
+    issue, so the issue's label timeline is read first and the comments only
+    when it shows one.
+    """
+
+    others = served - {label}
+    if not others:
+        return
+    target = ReplyTarget.on_issue(tracker.issue(number))
+    try:
+        events = await tracker.issue_events(number)
+        if not any(
+            isinstance(event, dict)
+            and event.get("event") == "labeled"
+            and isinstance(event.get("label"), dict)
+            and event["label"].get("name") in others
+            for event in events
+        ):
+            return
+        if await tracker.marked_comments.find_marked(target, LABEL_REFUSAL_MARKER) is None:
+            return
+        await tracker.marked_comments.upsert_marked(
+            target,
+            LABEL_REFUSAL_MARKER,
+            f"Curie started this issue under {_label_span(label)}; the earlier label refusal no "
+            "longer applies.",
+        )
+    except ForgeError:
+        logger.info("factory label refusal on issue %d left unedited", number)
+
+
 async def admit_notice(
     session: AsyncSession,
     notice: FactoryNotice,
     settings: Settings,
     verified: VerifiedIssue,
 ) -> WebhookResult:
-    binding = await resolve_binding(session, notice)
+    registry = forges_registry(settings)
     # Under the issue lock: the WorkItem decides whether the base is resolved
     # again (a fresh admission) or kept (ADR 0186 decision 5).
-    existing = await work_item_for(session, notice_issue(notice, settings))
-    if notice.disposition == "mention" and existing is None:
-        raise FactoryRefused("not_admitted")
-    facts = _facts(notice, binding, settings)
+    existing = await work_item_for(session, notice_issue(notice, registry))
+    served: frozenset[str] = frozenset()
+    if notice.disposition == "mention":
+        if existing is None:
+            raise FactoryRefused("not_admitted")
+        # A mention routes to the WorkItem's agent's surface (#4361 decision 11).
+        found = await agent_binding(session, existing.agent_id, notice.repo_full_name)
+        if found is None:
+            raise FactoryRefused("binding_missing")
+        binding = found
+    else:
+        binding = await resolve_binding(session, registry, notice)
+        served = await _refuse_label_admission(
+            session, registry, notice, verified, existing, binding
+        )
+    facts = _facts(notice, binding, registry)
     if existing is not None and (
         notice.disposition == "mention" or await _has_open_pr(session, existing)
     ):
@@ -318,7 +502,14 @@ async def admit_notice(
             result = await workitem_dispatch.admit_revision(admission, facts)
         else:
             result = await workitem_dispatch.readmit(admission, facts)
-        return admission_result(result, facts.request_id)
+        outcome = admission_result(result, facts.request_id)
+    # A label refusal can stand only where several labels are served, so a
+    # single-label repository pays no read for it.
+    if existing is None and len(served) > 1 and outcome.status == "factory_admitted":
+        await _settle_label_refusal(
+            verified.tracker, notice.issue_number, facts.trigger_label, served
+        )
+    return outcome
 
 
 async def record_base_label_notice(
@@ -326,18 +517,19 @@ async def record_base_label_notice(
 ) -> WebhookResult:
     """A ``base:`` label changed: record whether it now disagrees (ADR 0186)."""
 
-    item = await work_item_for(session, notice_issue(notice, settings))
+    registry = forges_registry(settings)
+    item = await work_item_for(session, notice_issue(notice, registry))
     if item is None:
         raise FactoryRefused("work_item_absent")
-    if not _same_notice_identity(item, notice, settings):
+    if not _same_notice_identity(item, notice, registry):
         raise FactoryRefused("identity_mismatch")
     await _record_label(session, item, verified, settings)
     return ignored("base_label_recorded")
 
 
-def _same_notice_identity(item: WorkItem, notice: FactoryNotice, settings: Settings) -> bool:
+def _same_notice_identity(item: WorkItem, notice: FactoryNotice, registry: ForgeRegistry) -> bool:
     return item.code_host_installation_id == notice.installation_id and same_repository(
-        item.repository, notice_repository(notice, settings)
+        item.repository, notice_repository(notice, registry)
     )
 
 
@@ -346,11 +538,16 @@ async def cancel_notice(
 ) -> WebhookResult:
     """Cancel one verified close or unlabel. Callers commit the session."""
 
-    item = await work_item_for(session, notice_issue(notice, settings))
+    registry = forges_registry(settings)
+    item = await work_item_for(session, notice_issue(notice, registry))
     if item is None:
         raise FactoryRefused("work_item_absent")
-    if not _same_notice_identity(item, notice, settings):
+    if not _same_notice_identity(item, notice, registry):
         raise FactoryRefused("identity_mismatch")
+    # Closing cancels whatever label admitted it; removing a label cancels
+    # only when it is the label that admitted it (#4361 decision 10).
+    if notice.action == "unlabeled" and notice.label != admitting_label(registry, item):
+        return ignored("label_not_admitting")
     result = await workitem_dispatch.cancel(
         session, work_item_id=item.id, expected_version=item.version
     )
@@ -385,8 +582,8 @@ async def _with_label_event(
     webhook header.
     """
 
-    tracker = await _tracker(notice, settings=settings, client=client)
-    label = notice.label or settings.github_factory_label
+    tracker = await _tracker(notice, registry=forges_registry(settings), client=client)
+    label = notice.label or tracker.label
     try:
         events = await tracker.issue_events(notice.issue_number)
     except Unavailable:
@@ -433,16 +630,29 @@ async def handle_factory_delivery(
         await session.commit()
         return ignored(audit.reason)
     try:
+        registry = forges_registry(settings)
+        intake = factory_tracker(registry).config
+        # A label event is judged against the labels bound on its repository
+        # (#4361 decision 15), so a repository outside the allowlist is
+        # refused before its surfaces are read.
+        repository = event_repository(payload)
+        if repository is not None and not repository_is_allowed(
+            repository, settings.github_repo_allowlist
+        ):
+            raise FactoryRefused("repository_not_allowed")
+        labels = (
+            frozenset()
+            if repository is None
+            else frozenset(await bound_labels(session, registry, repository))
+        )
         notice = parse_factory_event(
             event,
             payload,
             delivery_id,
-            label=settings.github_factory_label,
-            mention=settings.github_factory_mention,
+            labels=labels,
+            mention=intake.mention,
         )
-        if not repository_is_allowed(notice.repo_full_name, settings.github_repo_allowlist):
-            raise FactoryRefused("repository_not_allowed")
-        await lock_issue(session, notice_issue(notice, settings))
+        await lock_issue(session, notice_issue(notice, registry))
         verified = await verify_current(notice, settings=settings, client=client)
         if notice.disposition == "admit":
             notice = await _with_label_event(notice, settings=settings, client=client)

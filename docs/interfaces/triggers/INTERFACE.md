@@ -57,8 +57,8 @@ another handler that mints a `QueuedTurn` with the right `source`. The eight tha
   `x_github_event`; a `"push"` event is handed to `process_push(...)`, a `"ping"`
   is answered `"pong"`, review events follow the review ingress when
   `github_review_ingress_enabled` is on, and `issues` events plus plain issue
-  comments follow signed factory intake when `github_factory_ingress_enabled`
-  is on. Every other event is `"ignored"`.
+  comments follow signed factory intake when `factory_enabled`
+  (`factory.enabled`) is on. Every other event is `"ignored"`.
 - **GitHub review feedback**: `apps/api/src/curie_api/routers/github.py::github_webhook`
   accepts actionable `issue_comment`, `pull_request_review_comment`, and
   `pull_request_review` deliveries after HMAC verification. Plain issue comments
@@ -67,7 +67,7 @@ another handler that mints a `QueuedTurn` with the right `source`. The eight tha
   worker-only provider truth and lineage checks through
   `apps/api/src/curie_api/routers/github_reviews.py`.
 
-- **Signed factory issue intake**: when `github_factory_ingress_enabled` is on,
+- **Signed factory issue intake**: when `factory_enabled` (`factory.enabled`) is on,
   `apps/api/src/curie_api/routers/github.py::github_webhook` hands an `issues`
   delivery, or a plain issue comment, to
   `apps/api/src/curie_api/github_factory.py::handle_factory_delivery` after HMAC
@@ -78,24 +78,24 @@ another handler that mints a `QueuedTurn` with the right `source`. The eight tha
   (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._publish_execute_wakes`).
 - **Factory poll intake** (ADR-0187):
   `apps/api/src/curie_api/factory_poll_intake.py::poll_once` is the default factory
-  door. `github_factory_intake` is `"poll"` unless an operator sets `"webhook"`. One
+  door. `factory_intake` (`factory.intake`) is `"poll"` unless an operator sets `"webhook"`. One
   pass lists labeled issues, mentions, and review feedback for each bound repository
   with the installation credential and admits through the same verification the
   webhook uses, without writing a delivery receipt. Cursors live in
   `curie.factory_poll_cursors`, and one API replica polls at a time under a Postgres
   advisory lock. It runs as a step of the API's WorkItem reconciler loop
   (`apps/api/src/curie_api/workitem_reconciler.py::WorkItemReconciler._reconcile_missed_labels`),
-  every `github_factory_poll_interval_s` (45 seconds by default), and only when
+  every `poll_interval_s` of the GitHub tracker in `CURIE_FORGES` (45 seconds by default), and only when
   factory ingress is on. In poll mode no webhook secret is needed to boot.
 - **Factory missed-label reconciliation** (webhook mode only):
   `apps/api/src/curie_api/factory_label_reconcile.py::reconcile_missed_labels` lists
   open issues carrying the factory label on every bound repository and admits any with
   no WorkItem, through the same verification as the webhook, once the label is older
-  than `github_factory_reconcile_grace_s`. GitHub does not redeliver a failed webhook,
+  than `factory_reconcile_grace_s`. GitHub does not redeliver a failed webhook,
   so without it a label is lost. It runs in the same step of the API's WorkItem
   reconciler loop in place of `poll_once`, at most every
-  `github_factory_reconcile_interval_s` (300 seconds by default, 0 disables it), and
-  only when factory ingress is on and `github_factory_intake` is `"webhook"`. In that
+  `factory_reconcile_interval_s` (300 seconds by default, 0 disables it), and
+  only when factory ingress is on and `factory_intake` is `"webhook"`. In that
   mode the signed webhook remains the immediate intake path and reconciliation
   recovers labels whose delivery was missed. In poll mode this function does not run.
 - **Commit poll** — `apps/api/src/curie_api/commitpoller.py::CommitPoller.run_forever`:

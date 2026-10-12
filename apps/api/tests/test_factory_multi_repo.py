@@ -25,7 +25,6 @@ Machine fixtures drive the events. They are not human-authored GitHub proof.
 from __future__ import annotations
 
 import asyncio
-import importlib
 import sys
 import uuid
 from collections.abc import Iterator
@@ -36,7 +35,7 @@ from typing import Any, Protocol
 
 import httpx
 import pytest
-from curie_api.config import Settings, get_settings
+from curie_api.config import get_settings
 from curie_api.factory_label_reconcile import bound_repositories, reconcile_missed_labels
 from curie_api.factory_poll_intake import poll_once
 from curie_api.github_app import GitHubInstallationRefused
@@ -48,13 +47,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from forge_fakes.github import (  # noqa: E402
-    _ENV,
     INSTALLATION_ID,
     LABEL,
     REPO,
     REPO_ID,
     _issue_event,
     _post,
+    factory_env,
+    fake_installation_tokens,
 )
 from test_factory_poll_intake import PollGitHub  # noqa: E402
 from test_github_factory_ingress import _code, _rows  # noqa: E402
@@ -82,16 +82,6 @@ _BOUND = (REPO, SECOND_REPO)
 
 _ISSUE_NUMBERS = iter(range(9900, 10900))
 _PULL_NUMBERS = iter(range(510, 1510))
-
-_CREDENTIAL_MODULES = (
-    "curie_api.factory_label_reconcile",
-    "curie_api.factory_notices",
-    "curie_api.factory_poll_intake",
-    "curie_api.github_factory",
-    "curie_api.github_factory_review",
-    "curie_api.github_review_truth",
-    "curie_api.repository_auth",
-)
 
 
 class _RepoFake(Protocol):
@@ -178,23 +168,14 @@ class _TwoRepoCredentials:
 
 def _patch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     credentials = _TwoRepoCredentials()
-
-    def credentials_for(_settings: Settings) -> _TwoRepoCredentials:
-        return credentials
-
-    for name in _CREDENTIAL_MODULES:
-        try:
-            module = importlib.import_module(name)
-        except ImportError:
-            continue
-        monkeypatch.setattr(module, "credentials_for", credentials_for, raising=False)
+    fake_installation_tokens(monkeypatch, credentials)
 
 
 @pytest.fixture
 def forge_app(
-    monkeypatch: pytest.MonkeyPatch, clean_db: None
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None
 ) -> Iterator[tuple[TestClient, _Forge]]:
-    for key, value in _ENV.items():
+    for key, value in factory_env(tmp_path).items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
     _patch_credentials(monkeypatch)
@@ -571,49 +552,86 @@ def test_multi_repo_review_feedback_routes_for_each_repository(
         )
 
 
-def _route(adapter: str) -> dict[str, Any]:
-    return {
+def _route(adapter: str, trigger_label: str | None = None) -> dict[str, Any]:
+    channel: dict[str, Any] = {
         "kind": "github",
         "address": REPO,
         "adapter": adapter,
         "endpoint": f"http://{adapter}.test/reply",
     }
+    if trigger_label is not None:
+        channel["trigger_label"] = trigger_label
+    return channel
 
 
 @pytest.mark.parametrize("layout", ["across_agents", "one_agent"])
-def test_multi_repo_two_bindings_on_one_repository_still_refuse_binding_missing(
+def test_multi_repo_label_routing_same_effective_label_on_one_repository_refuses(
     forge_app: tuple[TestClient, _Forge], layout: str
 ) -> None:
-    """Two routes on one repository never pick one: the delivery is refused.
+    """#4346 decision 4 as #4361 amends it: two bindings on one repository with
+    the same effective label are refused, on one agent or across agents, even
+    under distinct adapters. The refusal moved from the delivery (binding_missing)
+    to the write (409), so the one binding left admits the label alone.
 
-    No agent's repo_full_name is the repository, so after #4346 the refusal can
-    only come from the binding count. On the old join it is refused too (no row
-    survives the join), so this passes on both sources by design: it pins that
-    the refusal stays when the join goes. The liveness neighbour, one binding
-    admitting, is test_multi_repo_agent_admits_a_labelled_issue_in_each_bound_repository.
+    The runtime twin, two bindings that come to share a label when the tracker
+    label changes, is test_factory_label_routing's
+    test_label_routing_install_label_changed_to_collide_admits_nothing.
     """
 
     client, forge = forge_app
+    first = _create_agent(client, "acme-corp/factory-home-a", _route("factory-a"))
     if layout == "across_agents":
-        _create_agent(client, "acme-corp/factory-home-a", _route("factory-a"))
-        _create_agent(client, "acme-corp/factory-home-b", _route("factory-b"))
+        refused = client.post(
+            "/agents",
+            headers=_headers(),
+            json={
+                "name": f"acme-factory-{uuid.uuid4().hex[:8]}",
+                "repo_full_name": "acme-corp/factory-home-b",
+                "channel": _route("factory-b"),
+            },
+        )
     else:
-        agent_id = _create_agent(client, AGENT_REPO, _route("factory-a"))
-        _bind(client, agent_id, _route("factory-b"))
+        refused = client.post(
+            f"/agents/{first}/channels", headers=_headers(), json=_route("factory-b")
+        )
+
+    assert refused.status_code == 409, refused.text
     bound = _rows(
         "SELECT agent_id FROM curie.agent_channels WHERE kind = 'github' AND address = :repo",
         {"repo": REPO},
     )
-    assert len(bound) == 2
-    assert len({row["agent_id"] for row in bound}) == (2 if layout == "across_agents" else 1)
+    assert [str(row["agent_id"]) for row in bound] == [first]
 
-    number, response = _deliver_label(client, forge, REPO)
+    number, _first_number_row = _admit(client, forge, REPO)
+    assert str(_work(REPO, number)[0]["agent_id"]) == first
 
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "factory_ignored", response.text
-    assert _code(response) == "binding_missing"
-    assert _work(REPO, number) == []
-    assert _rows("SELECT id FROM curie.execution_requests") == []
+
+def test_multi_repo_label_routing_different_labels_on_one_repository_admit(
+    forge_app: tuple[TestClient, _Forge],
+) -> None:
+    """The other half of the amended rule: two agents on one repository under
+    different labels both bind, and the install label admits on its binding
+    instead of being refused binding_missing for the binding count."""
+
+    client, forge = forge_app
+    full = _create_agent(client, "acme-corp/factory-home-a", {"kind": "github", "address": REPO})
+    fast = _create_agent(
+        client,
+        "acme-corp/factory-home-b",
+        {"kind": "github", "address": REPO, "trigger_label": f"{LABEL}-fast"},
+    )
+    bound = _rows(
+        "SELECT agent_id FROM curie.agent_channels WHERE kind = 'github' AND address = :repo",
+        {"repo": REPO},
+    )
+    assert sorted(str(row["agent_id"]) for row in bound) == sorted([full, fast])
+
+    number, row = _admit(client, forge, REPO)
+
+    assert str(row["agent_id"]) == full
+    assert row["status"] == "waiting"
+    assert _rows("SELECT agent_id FROM curie.work_items") == [{"agent_id": uuid.UUID(full)}]
+    assert number > 0
 
 
 def test_multi_repo_bound_repositories_lists_every_binding_address(

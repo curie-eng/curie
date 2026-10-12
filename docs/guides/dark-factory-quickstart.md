@@ -9,7 +9,7 @@ identity. The command never opens a browser or runs `gh`.
 
 For planning, reserve **about 190 minutes for configured waiting windows**,
 plus variable time for Helm, image downloads, cluster creation, and App setup.
-That rounded allowance comprises [180 minutes of factory execution](../../cli/src/factory_quickstart.rs),
+That rounded allowance comprises [180 minutes of factory execution](../../cli/src/factory_quickstart/mod.rs),
 [5 minutes of initial post-Helm convergence](../../cli/src/ops/convergence.rs),
 [3 minutes of API rollout after factory configuration](../../cli/src/github_app.rs),
 and [45 seconds for an intake polling interval](../../charts/curie/values.yaml).
@@ -294,7 +294,7 @@ The second run configures these values:
 | Mention | The App slug, so a revision comment can mention `@<slug>`. |
 | Allowlist | The repositories you passed, checked against the App installation. |
 | Label | `curie-factory`, created on each repository when it is missing. |
-| Intake | Polling (`api.githubFactoryIntake=poll`). No webhook secret. |
+| Intake | Polling (`factory.intake=poll`). No webhook secret. |
 | Agent | `dark-factory`, from the published runner image, environment `prod`. |
 | GitHub surface | `github=<owner>/<name>`, one per repository |
 | Execution deadline | 10800 seconds |
@@ -303,6 +303,53 @@ The second run configures these values:
 
 The card image stays a text checklist unless you later set a public
 `--card-base-url` on the cluster factory command. Polling does not need one.
+
+## Forge flags and chart values
+
+Quickstart writes the factory's forge settings for you. These flags select them:
+
+1. `--code-host <kind>` and `--tracker <kind>` choose where the factory publishes
+   and where it takes issues. Both default to `github`. The kinds `gitlab`,
+   `jira-cloud`, `bitbucket-cloud` and `bitbucket-dc` are named but not installed
+   in this build, and the command refuses them.
+2. `--forge-url`, `--token-file`, `--ca-file` and `--review-account` (repeatable)
+   describe a non-GitHub forge: its base URL, a file holding its access token,
+   a CA bundle for a private certificate, and the accounts whose reviews count.
+   The token stays in the file and never enters argv. Each is refused for
+   `github`, which authenticates with the App.
+
+The chart holds the result in one top-level `factory:` block, which the API
+reads as a single forge configuration document:
+
+1. `factory.codeHosts` and `factory.trackers` list the connections. Each entry
+   has a `name`, `kind`, `host` and `apiUrl`, and a `credential`. A tracker also
+   carries its `label`, `mention` and `pollIntervalSeconds`.
+2. A `credential` never holds key material. It names an existing Secret with
+   `existingSecret` and `existingSecretKey`, and the chart mounts that Secret
+   read-only. The chart refuses a credential missing either field.
+3. `factory.bindings` join a tracker to repositories. Each entry under
+   `repos` has an `alias`, a `codeHost`, a `projectId`, a `path`, optional
+   `bases` and `defaultBase`, and an optional `ci` policy (`required` with
+   `key`, `paths` and `pendingKeyPrefix`, and `metadataRerunKeys`).
+4. `factory.codeHosts[].egress` and `factory.trackers[].egress` list the CIDRs
+   and ports the entry needs. A GitHub entry with none gets the chart's built-in
+   GitHub set. `factory.sandboxEgress.<agent>: true` enrolls an agent in that
+   egress policy.
+5. `factory.enabled`, `factory.intake` (`poll` or `webhook`),
+   `factory.cardBaseUrl` and `factory.ciWaitSeconds` replace the matching
+   `api.*` settings.
+
+The old `api.githubFactory*` keys are removed. A release that still sets one
+fails at render with a message naming `factory.*` and `curie cluster factory`.
+Move the values into `factory:` and rerun. See
+[factory settings](../operations.md#admitting-a-labelled-github-issue).
+
+`curie cluster status` and `curie doctor` print one line per forge credential,
+for example `credential tracker github (github_app): none`. The expiry reads
+`known <date>`, `unknown` or `none`. A GitHub App credential is re-minted, so it
+reads `none`. A static token with a recorded expiry reads `known`, and the line
+adds a rotation warning once the date is past or within 14 days. A token with no
+recorded expiry reads `unknown`.
 
 ## Label an issue
 
@@ -336,6 +383,38 @@ A cancelled run removes all four. Curie never changes your `curie-factory` label
    See [Repository toolchain in the managed sandbox](repository-toolchain-in-the-managed-sandbox.md).
 3. The run ends when the agent's turn ends. A command left in the background
    does not keep the run alive.
+
+## Add another factory agent
+
+One install can host several factory agents, each with its own bundle and its
+own trigger label. On a release that already records factory intake, run
+quickstart with a new agent name and no App flags:
+
+```bash
+curie factory quickstart --agent <name> --label <label> [--plugin-dir <dir>]
+```
+
+For example, `--agent fast --label dark-factory-fast` deploys an agent named
+`fast` that starts work only when an issue carries `dark-factory-fast`. The
+command adds the agent to the install without running `cluster up`, App
+registration or intake again. Without `--plugin-dir` it deploys the published
+dark factory bundle. With it, the bundle in that directory is deployed as given,
+using its locked runner image or the platform runner. The execution deadline
+defaults to `DEFAULT_DEADLINE_SECONDS`, the same as the first agent. Without
+`--label`, the agent's GitHub bindings use the install label.
+
+Two agents may serve the same repository, for example `acme/widgets`, as long
+as their effective labels differ. The effective label is the one you passed, or
+the tracker's configured label (`curie-factory` by default) when you passed none. The API
+refuses a surface whose tracker location and effective label match another
+surface's, and it refuses a second surface for the same agent on one location.
+The effective label is compared, so an explicit label equal to the tracker's label also collides with an unlabelled surface. Fix
+it by giving the new agent a distinct label such as `curie-factory-fast`.
+
+Reference: the same binding is made by hand with
+`curie cluster surfaces <agent> --add github=<owner/name> --label <label>`.
+`--label` applies only when a surface is added, and the overlap rule above
+applies to it as well.
 
 ## Troubleshooting
 

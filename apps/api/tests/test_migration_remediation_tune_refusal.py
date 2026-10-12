@@ -30,8 +30,8 @@ from sqlalchemy.exc import IntegrityError
 
 BELOW = "0095"
 REVISION = "0096"
-# The tracker identity cutover (0103) is the single head.
-HEAD = "0103"
+# The trigger label expansion (0105, #4361) is the single head.
+HEAD = "0105"
 TUNE_REFUSAL = "tune_execution_not_automated"
 REFUSAL_CHECK = "remediation_nominations_refusal_ck"
 

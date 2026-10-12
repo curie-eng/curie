@@ -34,12 +34,15 @@ from curie_api.crud import agents as crud_agents
 from curie_api.crud import channels as crud_channels
 from curie_api.crud import deployments as crud_deployments
 from curie_api.crud import versions as crud_versions
+from curie_api.forges.registry import ForgeRegistry, forges_registry
+from curie_api.forges.surfaces import TRACKER_SURFACE_KINDS, SurfaceUnconfigured, resolve_surface
 from curie_api.schemas.action_executions import DIGEST_PATTERN
 from curie_api.schemas.agents import AgentCreate, AgentOut, AgentUpdate, enforce_behavior_packs_size
 from curie_api.schemas.channels import (
     ChannelBindingPatch,
     ChannelBindingWrite,
     ChannelCallersWrite,
+    ChannelRouteWrite,
     validate_allowed_callers,
 )
 from curie_api.schemas.deployments import ConnectorManifests
@@ -154,11 +157,12 @@ _UNIQUE_CONSTRAINT_MESSAGES = {
         "agent per route (move or delete the other agent, or pick another "
         "address)"
     ),
-    # Migration 0070's key: the route is the triple (ADR-0168 decision 3).
+    # Migration 0070's key: the route is the triple (ADR-0168 decision 3),
+    # widened by the trigger label in 0105 (#4361).
     "agent_channels_route_key": (
         "another agent is already bound to that channel kind and address under that "
-        "identity; one agent per route (bind another identity, move or delete the "
-        "other agent, or pick another address)"
+        "identity and trigger label; one agent per route (bind another identity or "
+        "label, move or delete the other agent, or pick another address)"
     ),
     # No entry for `agent_channels_agent_id_key`: migration 0030 drops that
     # constraint (ADR-0118), so its message can never fire again, and it said
@@ -208,6 +212,21 @@ def classify_integrity_error(exc: IntegrityError) -> tuple[int, str] | None:
     return status.HTTP_409_CONFLICT, message
 
 
+def _resolve_surface_or_422(registry: ForgeRegistry, kind: str, address: str) -> None:
+    """Refuse a tracker surface no configured tracker serves (#4397 decision 3).
+
+    A ``gitlab`` or ``jira`` location must be configured before it is bound; a
+    ``github`` surface always resolves. Every other kind passes untouched.
+    """
+
+    if kind not in TRACKER_SURFACE_KINDS:
+        return
+    try:
+        resolve_surface(registry, kind, address)
+    except SurfaceUnconfigured as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+
 @router.post("", response_model=AgentOut, status_code=status.HTTP_201_CREATED)
 async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
     # Reject oversized behavior packs (#936) before we touch the DB.
@@ -217,12 +236,19 @@ async def create_agent(data: AgentCreate, session: SessionDep) -> AgentOut:
     # not a server fault: catch the DB IntegrityError and map it, rather than
     # letting it bubble as an opaque 500. A non-unique violation (NOT NULL, FK)
     # is a genuine server fault -- re-raise it so it surfaces as a 500.
+    channel = data.channel
+    registry = forges_registry(get_settings())
+    _resolve_surface_or_422(registry, channel.kind, channel.address)
     try:
         await crud_channels.refuse_routeless_pair_sharing(
-            session, None, data.channel.kind, data.channel.address, data.channel.adapter
+            session, None, channel.kind, channel.address, channel.adapter
+        )
+        # Under the pair lock, in the transaction the create commits (#4361).
+        await crud_channels.refuse_label_overlap(
+            session, registry, None, channel.kind, channel.address, channel.trigger_label
         )
         agent = await crud_agents.create_agent(session, data)
-    except crud_channels.RoutelessPairShared as exc:
+    except (crud_channels.RoutelessPairShared, crud_channels.LabelOverlap) as exc:
         await session.rollback()
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except IntegrityError as exc:
@@ -592,7 +618,7 @@ async def _deadlock_as_conflict() -> AsyncIterator[None]:
 
 
 async def _raise_binding_conflict(
-    exc: IntegrityError, session: AsyncSession, agent_id: uuid.UUID, channel: ChannelBindingWrite
+    exc: IntegrityError, session: AsyncSession, agent_id: uuid.UUID, channel: ChannelRouteWrite
 ) -> NoReturn:
     """Turn a binding write's `IntegrityError` into an owner-accurate 409.
 
@@ -624,27 +650,41 @@ async def add_agent_channel(
 ) -> AgentOut:
     """Bind this agent to one more channel. Appends; never moves."""
 
+    registry = forges_registry(get_settings())
     async with _deadlock_as_conflict():
         agent = await _agent_or_404(session, agent_id)
+        _resolve_surface_or_422(registry, data.kind, data.address)
         # Taken before the insert even though nothing is read from the set: it
         # serializes this add against a concurrent move or delete of the same
         # agent's bindings, which is what keeps the last-binding guard sound.
         bindings = await crud_channels.lock_agent_bindings(session, agent_id)
+        tracker_surface = data.kind in TRACKER_SURFACE_KINDS
+        if tracker_surface:
+            # After the agent's rows and before the idempotence check, so a
+            # concurrent add, move or create onto this location by any agent
+            # is decided by one order (#4361 decision 5).
+            await crud_channels.lock_pair(session, data.kind, data.address)
         # A re-POST of a route this agent already holds is an idempotent
         # success that changes nothing. `crud.channels.matching_bindings` is the same
         # rule `_binding_for` selects by, so "the same binding" means the same
         # thing to add, move and delete. A POST naming another identity or
         # adapter on a pair this agent holds is a second route
-        # (`agent_channels_route_key` is the triple), and is inserted.
-        if crud_channels.matching_bindings(bindings, data.kind, data.address, data.adapter):
+        # (`agent_channels_route_key` is the triple), and is inserted. A
+        # tracker surface is the same binding only under the same trigger
+        # label; under another one `refuse_label_overlap` answers 409 below.
+        held = crud_channels.matching_bindings(bindings, data.kind, data.address, data.adapter)
+        if any(not tracker_surface or row.trigger_label == data.trigger_label for row in held):
             return AgentOut.model_validate(await crud_agents.refresh_with_channels(session, agent))
         try:
+            await crud_channels.refuse_label_overlap(
+                session, registry, agent_id, data.kind, data.address, data.trigger_label
+            )
             async with session.begin_nested():  # SAVEPOINT
                 await crud_channels.add_channel_binding(session, agent_id, data)
                 await crud_channels.refuse_routeless_pair_sharing(
                     session, agent_id, data.kind, data.address, data.adapter
                 )
-        except crud_channels.RoutelessPairShared as exc:
+        except (crud_channels.RoutelessPairShared, crud_channels.LabelOverlap) as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IntegrityError as exc:
             if classify_integrity_error(exc) is None:
@@ -689,8 +729,10 @@ async def move_agent_channel(
     rebind it never saw.
     """
 
+    registry = forges_registry(get_settings())
     async with _deadlock_as_conflict():
         agent = await _agent_or_404(session, agent_id)
+        _resolve_surface_or_422(registry, data.kind, data.address)
         bindings = await crud_channels.lock_agent_bindings(session, agent_id)
         binding = _binding_for(bindings, kind, address, adapter)
         if expected_generation is not None and expected_generation != binding.generation:
@@ -712,7 +754,27 @@ async def move_agent_channel(
                 "(allowed_callers: null) first, then move the binding and set a "
                 "new list.",
             )
+        if binding.trigger_label is not None and data.kind not in TRACKER_SURFACE_KINDS:
+            # #4361 decision 7: a move keeps the stored label, and only a
+            # tracker surface may carry one.
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"{kind}:{address} carries trigger label {binding.trigger_label!r}, which "
+                f"only a tracker surface may carry, so it cannot move to a {data.kind} "
+                "surface. Remove it and add the new surface instead.",
+            )
         try:
+            # The destination is judged with the label the row keeps, never
+            # counting the row against itself (#4361 decision 7).
+            await crud_channels.refuse_label_overlap(
+                session,
+                registry,
+                agent_id,
+                data.kind,
+                data.address,
+                binding.trigger_label,
+                exclude_binding_id=binding.id,
+            )
             async with session.begin_nested():  # SAVEPOINT
                 await crud_channels.update_channel_binding(session, binding, data)
                 # The moved row's route, not the request's: an omitted route
@@ -720,7 +782,7 @@ async def move_agent_channel(
                 await crud_channels.refuse_routeless_pair_sharing(
                     session, agent_id, binding.kind, binding.address, binding.adapter
                 )
-        except crud_channels.RoutelessPairShared as exc:
+        except (crud_channels.RoutelessPairShared, crud_channels.LabelOverlap) as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except IntegrityError as exc:
             # The same recovery as the add: a move onto a route another agent (or

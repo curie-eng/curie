@@ -146,6 +146,7 @@ api:
   CURIE_E2E_SOURCE_HOSTS: e2eConnector.sourceHosts
   CURIE_E2E_TTL_SECONDS: e2eConnector.ttlSeconds
   CURIE_E2E_WORKER_CLUSTER_ROLE: e2eConnector.workerClusterRole
+  CURIE_FORGES: factory.codeHosts / factory.trackers / factory.bindings
   CURIE_INSTALLATION_ID: the release-managed installation identity (remove this override)
   CURIE_INTERNAL_WORKER_TOKEN: worker.internalWorkerToken
   CURIE_PUBLICATION_PATCH_MAX_BYTES: worker.publication.patchMaxBytes
@@ -161,20 +162,13 @@ api:
   DATABASE_URL: postgres.host / postgres.port / postgres.auth / postgres.sslMode
   DB_SCHEMA: the chart-managed database schema (remove this override)
   ENVIRONMENT: api.environment
+  FACTORY_CI_WAIT_S: factory.ciWaitSeconds
+  FACTORY_ENABLED: factory.enabled
+  FACTORY_INTAKE: factory.intake
   GITHUB_API_URL: api.githubApiUrl
   GITHUB_APP_ID: api.githubAppId
   GITHUB_APP_PRIVATE_KEY: api.githubAppExistingSecret
   GITHUB_CLONE_BASE: api.githubCloneBase
-  GITHUB_FACTORY_CARD_BASE_URL: api.githubFactoryCardBaseUrl
-  GITHUB_FACTORY_CI_WAIT_S: api.githubFactoryCiWaitSeconds
-  GITHUB_FACTORY_PYTHON_CI: api.githubFactoryPythonCi
-  GITHUB_FACTORY_BASES: api.githubFactoryBases
-  GITHUB_FACTORY_METADATA_CI: api.githubFactoryMetadataCi
-  GITHUB_FACTORY_INGRESS_ENABLED: api.githubFactoryIngressEnabled
-  GITHUB_FACTORY_INTAKE: api.githubFactoryIntake
-  GITHUB_FACTORY_LABEL: api.githubFactoryLabel
-  GITHUB_FACTORY_MENTION: api.githubFactoryMention
-  GITHUB_FACTORY_POLL_INTERVAL_S: api.githubFactoryPollIntervalSeconds
   GITHUB_REPO_ALLOWLIST: api.githubRepoAllowlist
   GITHUB_REVIEW_INGRESS_ENABLED: api.githubReviewIngressEnabled
   GITHUB_REVIEW_RECONCILER_INTERVAL_S: api.githubReviewReconcilerIntervalSeconds

@@ -6,6 +6,7 @@ repository names. A parsed notice is not authorization.
 
 import re
 import uuid
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -114,15 +115,34 @@ def _repository(data: dict[str, Any]) -> tuple[int, str, int]:
     return installation_id, repo, repository_id
 
 
+def event_repository(payload: Any) -> str | None:
+    """The normalized repository a factory event names, or None when it names
+    none readable. The trigger labels bound on it are what `parse_factory_event`
+    judges a label event against; a malformed payload is refused there."""
+
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return _repository(payload)[1]
+    except FeedbackIgnored:
+        return None
+
+
 def parse_factory_event(
     event: str,
     payload: Any,
     delivery_id: str,
     *,
-    label: str,
+    labels: Collection[str],
     mention: str,
 ) -> FactoryNotice:
     """Keep an admission, cancellation, or explicit mention. Refuse everything else.
+
+    ``labels`` are the effective trigger labels bound on the event's repository
+    (#4361 decision 15). Adding one of them is an admission. Removing any label
+    that is not a ``base:`` label is a cancellation candidate, whether or not a
+    surface still binds it: whether it admitted the issue's WorkItem is the
+    WorkItem's stored label to decide (decision 10, ADR 0161), never a binding.
 
     Actions and fields follow GitHub's webhook catalog:
     https://docs.github.com/en/webhooks/webhook-events-and-payloads
@@ -146,11 +166,13 @@ def parse_factory_event(
             name = label_obj.get("name")
             if not isinstance(name, str):
                 raise FactoryRefused("unrelated_label")
-            if name == label:
-                disposition = "admit" if action == "labeled" else "cancel"
-            elif name.startswith(BASE_LABEL_PREFIX):
+            if name.startswith(BASE_LABEL_PREFIX):
                 # A base label change only records disagreement (ADR 0186).
                 disposition = "base_label"
+            elif action == "unlabeled":
+                disposition = "cancel"
+            elif name in labels:
+                disposition = "admit"
             else:
                 raise FactoryRefused("unrelated_label")
             return FactoryNotice(

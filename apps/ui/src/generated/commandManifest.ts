@@ -3627,6 +3627,14 @@ export const commandManifest = {
             },
             {
               "global": false,
+              "help": "The label that starts factory work through the added tracker surface (github, gitlab or jira), so two agents can share one location. Without it the surface serves the configured tracker label. Set only when a surface is added",
+              "id": "label",
+              "long": "label",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Remove this surface, as KIND=ADDRESS. The API refuses to remove an agent's final surface",
               "id": "remove",
               "long": "remove",
@@ -5419,9 +5427,9 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Give this agent egress to the GitHub API ranges published at <api>/meta (port 443). Repeatable",
-              "id": "github_api_egress",
-              "long": "github-api-egress",
+              "help": "Give this agent's sandboxes egress to the configured code hosts and trackers (factory.sandboxEgress.<AGENT>). Repeatable",
+              "id": "forge_egress",
+              "long": "forge-egress",
               "positional": false,
               "required": false
             },
@@ -6590,6 +6598,14 @@ export const commandManifest = {
               "help": "Identity for a Slack surface (default: default), or the worker credential selector for a non-Slack adapter",
               "id": "adapter",
               "long": "adapter",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The label that starts factory work through the added tracker surface (github, gitlab or jira), so two agents can share one location. Without it the surface serves the configured tracker label. Set only when a surface is added",
+              "id": "label",
+              "long": "label",
               "positional": false,
               "required": false
             },
@@ -9322,6 +9338,33 @@ export const commandManifest = {
               "required": false
             },
             {
+              "default_values": [
+                "dark-factory"
+              ],
+              "global": false,
+              "help": "Agent to deploy. On a release that already records factory intake and with no App flags, the agent is added to that install: no cluster up, App registration, or intake",
+              "id": "agent",
+              "long": "agent",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Trigger label for this agent's GitHub bindings. Default: none, so the install label serves them",
+              "id": "label",
+              "long": "label",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Operator bundle to deploy as given, with its locked runner image or the platform runner. Default: the published dark factory bundle",
+              "id": "plugin_dir",
+              "long": "plugin-dir",
+              "positional": false,
+              "required": false
+            },
+            {
               "global": false,
               "help": "Helm chart. Default: the version pinned chart on release builds; local charts/curie on dev builds",
               "id": "chart",
@@ -9339,6 +9382,71 @@ export const commandManifest = {
                 "true",
                 "false"
               ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "github"
+              ],
+              "global": false,
+              "help": "Code host the factory publishes to. Only github is installed in this build",
+              "id": "code_host",
+              "long": "code-host",
+              "positional": false,
+              "possible_values": [
+                "github",
+                "gitlab",
+                "bitbucket-cloud",
+                "bitbucket-dc"
+              ],
+              "required": false
+            },
+            {
+              "default_values": [
+                "github"
+              ],
+              "global": false,
+              "help": "Tracker the factory takes issues from. Only github is installed in this build",
+              "id": "tracker",
+              "long": "tracker",
+              "positional": false,
+              "possible_values": [
+                "github",
+                "gitlab",
+                "jira-cloud"
+              ],
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Base URL of a non-GitHub forge. Refused for github",
+              "id": "forge_url",
+              "long": "forge-url",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "File holding a non-GitHub forge's access token. The path is passed through; the token never enters argv. Refused for github",
+              "id": "token_file",
+              "long": "token-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "CA bundle for a non-GitHub forge with a private certificate. Refused for github",
+              "id": "ca_file",
+              "long": "ca-file",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Account whose reviews a non-GitHub forge counts (repeatable). Refused for github",
+              "id": "review_accounts",
+              "long": "review-account",
+              "positional": false,
               "required": false
             }
           ],

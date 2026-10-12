@@ -68,6 +68,7 @@ def test_the_read_side_names_the_identity_and_never_the_endpoint() -> None:
         "address": "C0EXAMPLE1",
         "adapter": "default",
         "allowed_callers": None,
+        "trigger_label": None,
     }
 
 

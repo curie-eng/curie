@@ -267,8 +267,12 @@ def test_tls_values_point_github_at_the_stub_service_over_https() -> None:
     assert api["githubCloneBase"] == f"https://{STUB_HOST}:8443"
     assert api["githubRepoAllowlist"] == ["acme-corp/acme-bot"]
     assert api["githubAppId"] == "51"
-    assert api["githubFactoryIntake"] == "poll"
-    assert api["githubFactoryIngressEnabled"] is True
+    factory = _tls()["factory"]
+    assert factory["enabled"] is True
+    assert factory["intake"] == "poll"
+    assert {entry["apiUrl"] for entry in factory["codeHosts"] + factory["trackers"]} == {
+        f"https://{STUB_HOST}:8443/api/v3"
+    }
 
 
 def test_tls_values_port_flows_to_urls_and_egress() -> None:
@@ -286,6 +290,15 @@ def test_tls_values_egress_is_exactly_the_stub_and_the_model_provider() -> None:
         assert {"cidr": cidr, "ports": [{"protocol": "TCP", "port": 443}]} in egress
     # No GitHub /meta ranges: nothing beyond the stub and the model provider.
     assert {entry["cidr"] for entry in egress} == {f"{STUB_IP}/32", *MODEL_CIDRS}
+
+
+def test_tls_values_publication_egress_is_the_stub_code_host_entry() -> None:
+    values = _tls(port=9443)
+    (code_host,) = values["factory"]["codeHosts"]
+    assert code_host["egress"] == [
+        {"cidr": f"{STUB_IP}/32", "ports": [{"protocol": "TCP", "port": 9443}]}
+    ]
+    assert "githubHttpsCidrs" not in (values.get("worker") or {}).get("publication", {})
 
 
 def test_tls_values_drop_github_meta_ranges_a_base_carried() -> None:

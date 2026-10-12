@@ -280,6 +280,14 @@ def test_namespace_is_owned_and_rfc1123() -> None:
     assert fe.validate_namespace("test-factory-x1") == "test-factory-x1"
 
 
+def _github_entry(values: dict[str, Any], section: str) -> dict[str, Any]:
+    """The one ``factory.<section>`` entry named ``github``."""
+
+    entries = [entry for entry in values["factory"][section] if entry["name"] == "github"]
+    assert len(entries) == 1, values["factory"][section]
+    return entries[0]
+
+
 def test_install_values_pin_every_image_and_enable_factory_ingress(tmp_path: Path) -> None:
     config = fe.load_config(_env(_app_dir(tmp_path)), context=None, gh_token=_no_gh)
     values = fe.install_values(
@@ -293,10 +301,26 @@ def test_install_values_pin_every_image_and_enable_factory_ingress(tmp_path: Pat
         assert values[component]["image"]["tag"] == tag
     assert values["agentSandbox"]["runner"]["tag"] == tag
     assert values["agentSandbox"]["controller"]["deploy"] is False
+    factory = values["factory"]
+    assert factory["enabled"] is True
+    assert factory["intake"] == "poll"
+    credential = {
+        "type": "github_app",
+        "appId": "42",
+        "existingSecret": "factory-app",
+        "existingSecretKey": "privateKey",
+    }
+    code_host = _github_entry(values, "codeHosts")
+    assert code_host["kind"] == "github"
+    assert code_host["host"] == "github.com"
+    assert code_host["credential"] == credential
+    tracker = _github_entry(values, "trackers")
+    assert tracker["kind"] == "github"
+    assert tracker["host"] == "github.com"
+    assert tracker["credential"] == credential
+    assert tracker["label"] == "curie-factory"
+    assert tracker["mention"] == "example-factory"
     api = values["api"]
-    assert api["githubFactoryIngressEnabled"] is True
-    assert api["githubFactoryLabel"] == "curie-factory"
-    assert api["githubFactoryMention"] == "example-factory"
     assert api["githubAppId"] == "42"
     assert api["githubAppExistingSecret"] == "factory-app"
     assert api["githubRepoAllowlist"] == ["acme/fixture"]
@@ -315,12 +339,12 @@ def test_install_values_point_the_status_card_at_the_public_webhook_base(
         consumer_controller=True,
         card_base_url=base,
     )
-    assert values["api"]["githubFactoryCardBaseUrl"] == base
+    assert values["factory"]["cardBaseUrl"] == base
     # Before the tunnel exists there is no public base, so the value stays unset.
     unset = fe.install_values(
         config, candidate="c" * 40, app_key_secret="factory-app", consumer_controller=True
     )
-    assert "githubFactoryCardBaseUrl" not in unset["api"]
+    assert "cardBaseUrl" not in unset["factory"]
 
 
 def test_namespace_undo_is_registered_before_the_create_call(
@@ -504,8 +528,8 @@ def test_install_values_with_a_model_key_run_the_real_model(tmp_path: Path) -> N
     for component in ("api", "worker", "dispatcher", "mailAdapter", "ui"):
         assert values[component]["image"]["tag"] == tag
     assert values["agentSandbox"]["runner"]["tag"] == tag
+    assert values["factory"]["enabled"] is True
     api = values["api"]
-    assert api["githubFactoryIngressEnabled"] is True
     assert api["githubAppId"] == "42"
     assert api["githubAppExistingSecret"] == "factory-app"
     assert api["githubRepoAllowlist"] == ["acme/fixture"]
@@ -850,9 +874,10 @@ def test_terminus_matcher_ignores_a_live_status_comment_without_the_final_marker
         body="- [ ] **Plan** (in progress)\nStatus: RUNNING\n"
         f"<!-- curie-execution-request:{_RID} -->\n",
     )
-    assert fe.match_terminus_comments(
-        [live], mention="factory", app_id="42", request_ids=[str(_RID)]
-    ) == []
+    assert (
+        fe.match_terminus_comments([live], mention="factory", app_id="42", request_ids=[str(_RID)])
+        == []
+    )
     final = _notice("runner_failed")
     matched = fe.match_terminus_comments(
         [live, final], mention="factory", app_id="42", request_ids=[str(_RID)]
@@ -1369,9 +1394,7 @@ def test_evaluation_report_rejects_a_skipped_pull_request_check() -> None:
     assert any("hidden_tests" in item for item in fe.evaluation_report_failures(report))
     report = _evaluation_report()
     report["passes"][1]["cases"][0]["configured_model"] = "z-ai/glm-5.3"
-    assert any(
-        "configured_model" in item for item in fe.evaluation_report_failures(report)
-    )
+    assert any("configured_model" in item for item in fe.evaluation_report_failures(report))
 
 
 def test_helm_upgrade_reuses_values_so_the_agent_pool_survives() -> None:
@@ -1466,9 +1489,7 @@ def test_runner_escalation_without_a_pull_request_is_a_refusal() -> None:
         agent_final_reply=None,
     )
     assert (
-        fe.judge_outcome(
-            ending, "comment", expect_causes={"no_pull_request", "runner_escalated"}
-        )
+        fe.judge_outcome(ending, "comment", expect_causes={"no_pull_request", "runner_escalated"})
         == []
     )
     assert fe.judge_outcome(ending, "comment")
@@ -2612,8 +2633,7 @@ def test_the_final_reply_falls_back_to_the_transcript_without_a_comment_block() 
 # --- quiesce scenario (#3198) ---
 
 _QUIESCING_LINE = (
-    '{"state":"quiescing","since":"2026-09-27T10:00:00+00:00",'
-    '"revision":3,"ttl_seconds":28}'
+    '{"state":"quiescing","since":"2026-09-27T10:00:00+00:00","revision":3,"ttl_seconds":28}'
 )
 
 
@@ -2649,8 +2669,7 @@ def test_paused_for_upgrade_line_matches_the_api_constant() -> None:
     value = None
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "_PAUSED_FOR_UPGRADE_LINE"
-            for t in node.targets
+            isinstance(t, ast.Name) and t.id == "_PAUSED_FOR_UPGRADE_LINE" for t in node.targets
         ):
             value = ast.literal_eval(node.value)
     assert value is not None
@@ -2914,3 +2933,46 @@ def test_an_install_consumes_a_sandbox_controller_only_when_one_is_running() -> 
     # them: this install must deploy its own or no claim ever binds.
     assert fe.sandbox_controller_serves(crd=crd, controller_pods="") is False
     assert fe.sandbox_controller_serves(crd="", controller_pods="") is False
+
+
+# #4397 AC 6: egress has one source. The sandbox reaches GitHub through
+# factory.sandboxEgress.<agent> (the chart's built-in GitHub set on the github
+# code host and tracker); only model egress stays in allowedEgress.
+def test_install_values_enroll_the_factory_agent_for_forge_egress(tmp_path: Path) -> None:
+    values = _values(_config(tmp_path))
+    assert values["factory"]["sandboxEgress"] == {fe.FACTORY_AGENT: True}
+    for section in ("codeHosts", "trackers"):
+        (entry,) = values["factory"][section]
+        assert entry["kind"] == "github"
+        assert "egress" not in entry, f"a github {section} entry uses the built-in set"
+    assert "connectorEgress" not in values["agentSandbox"]
+
+
+def test_egress_cidrs_reads_no_github_meta(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_http(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"egress_cidrs must not call the GitHub API: {args}")
+
+    monkeypatch.setattr(fe, "http_json", no_http)
+    preflight = _preflight(tmp_path)
+    assert preflight.egress_cidrs() == []
+
+
+def test_egress_cidrs_keeps_only_model_egress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_http(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError(f"egress_cidrs must not call the GitHub API: {args}")
+
+    def resolve(host: str, port: int, *args: Any) -> list[Any]:
+        assert (host, port) == (fe.OPENROUTER_HOST, 443)
+        return [
+            (None, None, None, "", ("104.18.2.9", 443)),
+            (None, None, None, "", ("104.18.3.9", 443)),
+        ]
+
+    monkeypatch.setattr(fe, "http_json", no_http)
+    monkeypatch.setattr(fe.socket, "getaddrinfo", resolve)
+    env = _env(_app_dir(tmp_path))
+    env["CURIE_FACTORY_MODEL_API_KEY"] = "model-key-value"
+    preflight = _preflight(tmp_path, env)
+    assert preflight.egress_cidrs() == ["104.18.2.9/32", "104.18.3.9/32"]

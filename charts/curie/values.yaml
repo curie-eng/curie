@@ -1275,6 +1275,18 @@ codeHostTrust:
       name: ""
       key: ca.crt
 # ---------------------------------------------------------------------------
+# The factory (#4397) as CURIE_FORGES; `curie cluster factory` writes it.
+# A credential names its Secret: existingSecret, existingSecretKey.
+factory:
+  enabled: false
+  intake: poll  # or webhook
+  cardBaseUrl: ""
+  ciWaitSeconds: 1200
+  codeHosts: []
+  trackers: []
+  bindings: []
+  sandboxEgress: {}
+# ---------------------------------------------------------------------------
 api:
   deploy: true
   # Runner sandbox egress to an external API endpoint (#2317, #2367). Rail 1
@@ -1376,44 +1388,6 @@ api:
   # positive reconciliation interval.
   githubReviewIngressEnabled: false
   githubReviewReconcilerIntervalSeconds: 5
-  # Signed factory issue intake is opt-in and separate from review feedback.
-  # Polling is the default. A blank webhook secret disables signed deliveries.
-  # A configured secret permits signed deliveries in either mode. The published
-  # development secret is refused whenever factory intake is enabled.
-  # Sealed installs generate and retain a real secret unless one is configured.
-  # Webhook mode requires a real secret and keeps the missed label backstop.
-  # Either mode still requires the App id and private key, a label, a mention
-  # login, and a repo allowlist.
-  githubFactoryIngressEnabled: false
-  githubFactoryIntake: poll
-  githubFactoryPollIntervalSeconds: 45
-  githubFactoryLabel: ""
-  githubFactoryMention: ""
-  # Public https origin GitHub's image proxy fetches the live factory status card
-  # from (#3077). Set, the card replaces the phase checklist (#3125); empty omits
-  # the card and the comment shows the checklist instead.
-  githubFactoryCardBaseUrl: ""
-  # Seconds a published factory run waits on its pull request's CI, from the
-  # push (#3162). The run's execution deadline still caps it. 1 to 10800.
-  githubFactoryCiWaitSeconds: 1200
-  # Required Python CI per repository (#3617), keyed by owner/name (matched
-  # case-insensitively): {check, paths, pendingCheckPrefix}. A factory Python
-  # change must fall under `paths` and pass the `check` Actions check; shard
-  # jobs named with `pendingCheckPrefix` keep the run waiting for it. A
-  # repository without an entry is judged on its own checks. Rendered as JSON
-  # into GITHUB_FACTORY_PYTHON_CI; see docs/operations.md for curie-eng/curie.
-  githubFactoryPythonCi: {}
-  # Bases a factory ticket may start from and target (#3095, ADR 0186), keyed
-  # by owner/name: {bases: [branch, ...], default_base: branch}. A ticket picks
-  # one with a `base:<branch>` label; with none it uses default_base, or the
-  # repository default branch when default_base is unset. A repository without
-  # an entry may only use its default branch. Rendered as JSON into
-  # GITHUB_FACTORY_BASES.
-  githubFactoryBases: {}
-  # Checks and commit statuses that rerun after a pull request metadata edit,
-  # keyed by owner/name: {checks: [name, ...], statuses: [name, ...]}.
-  # Rendered as JSON into GITHUB_FACTORY_METADATA_CI.
-  githubFactoryMetadataCi: {}
   # GitHub credential the API uses OUTBOUND: posting the eval commit status, and
   # authenticating the git-flow bundle clone. Without it git-flow can only deploy
   # a PUBLIC repository -- a private one is rejected with git.archive_failed
@@ -2132,55 +2106,6 @@ worker:
     # Opt in to new third-party dependency names in manifests and lockfiles.
     # Applies to every publication in this install, including factory work.
     allowDependencyAdditions: false
-    # GitHub publishes these address sets from https://api.github.com/meta.
-    # Override for GitHub Enterprise or refresh when GitHub changes the set.
-    githubHttpsCidrs:
-      - 192.30.252.0/22
-      - 185.199.108.0/22
-      - 140.82.112.0/20
-      - 143.55.64.0/20
-      - 2a0a:a440::/29
-      - 2606:50c0::/32
-      - 20.201.28.151/32
-      - 20.201.28.148/32
-      - 20.205.243.166/32
-      - 20.205.243.168/32
-      - 20.87.245.0/32
-      - 20.87.245.6/32
-      - 4.237.22.38/32
-      - 4.237.22.34/32
-      - 4.228.31.150/32
-      - 4.228.31.149/32
-      - 20.207.73.82/32
-      - 20.207.73.85/32
-      - 20.27.177.113/32
-      - 20.27.177.116/32
-      - 20.200.245.247/32
-      - 20.200.245.245/32
-      - 20.175.192.147/32
-      - 20.175.192.149/32
-      - 20.233.83.145/32
-      - 20.233.83.146/32
-      - 20.29.134.23/32
-      - 20.29.134.17/32
-      - 20.199.39.232/32
-      - 20.199.39.228/32
-      - 20.217.135.5/32
-      - 20.217.135.0/32
-      - 4.225.11.194/32
-      - 4.225.11.201/32
-      - 4.208.26.197/32
-      - 4.208.26.200/32
-      - 20.26.156.215/32
-      - 20.26.156.210/32
-      - 172.182.252.133/32
-      - 172.182.252.137/32
-      - 4.249.131.164/32
-      - 4.249.131.166/32
-      - 48.202.248.40/32
-      - 48.202.248.39/32
-      - 48.204.201.5/32
-      - 48.204.201.2/32
     # Empty derives release-scoped `<fullname>-publication` names.
     serviceAccountName: ""
     ownerName: ""

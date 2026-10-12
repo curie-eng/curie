@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.curietech.ai/cli/cluster-status/v1.4.json",
+  "$id": "https://schemas.curietech.ai/cli/cluster-status/v1.5.json",
   "title": "curie cluster status --json",
-  "description": "The agent-facing payload of `curie cluster status`: the dry-run plan, or the release's revision, pod readiness roll-up (with per-pod rows and the unhealthy names), discovered service URLs (a degraded surface carries a `note` and a null `url`), any `warnings` (diagnoses that could not be made, which never affect `healthy`), completion-delivery health, an overall `healthy` verdict, and the current upgrade phase plus last known-good version.",
+  "description": "The agent-facing payload of `curie cluster status`: the dry-run plan, or the release's revision, pod readiness roll-up (with per-pod rows and the unhealthy names), discovered service URLs (a degraded surface carries a `note` and a null `url`), any `warnings` (diagnoses that could not be made, which never affect `healthy`), completion-delivery health, an overall `healthy` verdict, the current upgrade phase plus last known-good version, and each recorded forge credential's expiry.",
   "$defs": {
     "dryRun": {
       "type": "object",
@@ -191,6 +191,56 @@
         },
         "healthy": {
           "type": "boolean"
+        },
+        "credentials": {
+          "description": "Each forge credential recorded under the release's factory.codeHosts and factory.trackers (#4397), with its expiry: `known` (with `expires_at`), `unknown` (the type can expire but none was recorded) or `none`. `warning` is set when a known expiry is past or at most 14 days away, and the same text is in `warnings`. Empty with no factory block.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "section": {
+                "enum": [
+                  "code_host",
+                  "tracker"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string"
+              },
+              "expiry": {
+                "enum": [
+                  "known",
+                  "unknown",
+                  "none"
+                ]
+              },
+              "expires_at": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time"
+              },
+              "warning": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "section",
+              "name",
+              "type",
+              "expiry",
+              "expires_at",
+              "warning"
+            ]
+          }
         },
         "upgrade": {
           "type": "object",

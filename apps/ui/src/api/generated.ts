@@ -4710,6 +4710,9 @@ export interface components {
          *     `allowed_callers` (ADR 0175) is shown as stored: null for everyone, else the
          *     exact ids that may start a turn through this binding. It is written only by
          *     `PUT /agents/{agent_id}/channels/callers`, never by a binding write.
+         *
+         *     `trigger_label` (#4361) is shown as stored: null for a surface that serves
+         *     the configured tracker label, else its own label.
          */
         ChannelBindingOut: {
             /** Adapter */
@@ -4720,6 +4723,8 @@ export interface components {
             allowed_callers?: string[] | null;
             /** Kind */
             kind: string;
+            /** Trigger Label */
+            trigger_label?: string | null;
         };
         /**
          * ChannelBindingPatch
@@ -4728,7 +4733,9 @@ export interface components {
          *     `kind` and `address` always describe the replacement routing key. Omitting
          *     both route fields preserves their stored values because callers cannot read
          *     them back. Supplying both fields replaces them, including the explicit
-         *     `null` pair that clears the route.
+         *     `null` pair that clears the route. It carries no `trigger_label` (#4361
+         *     decision 7): a move keeps the stored label, and a body naming one is
+         *     refused as an unknown field.
          */
         ChannelBindingPatch: {
             /** Adapter */
@@ -4742,49 +4749,14 @@ export interface components {
         };
         /**
          * ChannelBindingWrite
-         * @description The WRITE side of a binding: the public pair plus its reply ROUTE.
+         * @description The WRITE side of a binding: the route plus its optional trigger label.
          *
-         *     A separate model from `ChannelBinding` because `ChannelBindingOut`, not this
-         *     one, is the element type of `AgentOut.channels` in RESPONSES (ADR-0096 phase
-         *     2, EB-A18 as relocated; widened to `{kind, address, adapter}` by ADR-0168
-         *     decision 3). `endpoint` is a server-controlled fact an operator configures
-         *     at bind time -- where this kind's replies go back through -- so it is
-         *     durable on the row and ABSENT from every read; `adapter` is now part of the
-         *     route's identity rather than only a credential, so it is present on both
-         *     sides. A write-side policy on the shared model would 422 valid reads and
-         *     leak a write rule into a read contract.
-         *
-         *     The rules, stated here because this is the write path every caller (UI,
-         *     API, CLI) passes through; `agent_channels_route_ck` states the first two
-         *     at the database for out-of-band writers:
-         *
-         *     - **A Slack route names its identity**, `default` when omitted, and has no
-         *       endpoint (ADR-0168 decision 3): its replies go through the worker's
-         *       configured Slack origin, so an endpoint is refused by field name.
-         *     - **Any other kind is both or neither.** A half-configured route is an
-         *       operator error that would otherwise surface as a fail-closed escalation
-         *       mid-turn, in the worker, far from the request that caused it.
-         *     - **Both absent is legal** for a non-Slack kind: the cutover binds the
-         *       agent first and PATCHes the route in later. The gate for an unroutable
-         *       binding is `POST /channels/token`, which refuses (409) to mint for a
-         *       non-`slack` binding with no route.
-         *     - **`adapter` is a lowercase slug**, on the same pattern as `kind`, because
-         *       it is a CONFIG-MAP KEY on the worker
-         *       (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a
-         *       space or a `:` is a config-injection shape, not a name.
-         *     - **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The
-         *       worker POSTs the platform's AUTHENTICATED reply to this value, so an empty
-         *       string or a nonsense URL is a binding that mints tokens and passes ingress
-         *       and then fails closed mid-turn in the worker -- the same E17 failure the
-         *       route pair exists to foreclose, arriving one layer later. Userinfo
-         *       (`https://user:pass@host/`) is refused separately: a credential in the
-         *       stored URL is one git-grep, one log line and one error message away from
-         *       disclosure, and the `adapter` field is where a credential belongs.
-         *
-         *     Neither the value nor any part of it appears in the messages below. An
-         *     endpoint can carry a token in its path or query, so error text -- which is
-         *     returned to the caller and written to logs -- names the FIELD and states the
-         *     rule instead of echoing what was sent.
+         *     The `AgentCreate.channel` value and the `POST /agents/{id}/channels` body.
+         *     `trigger_label` (#4361, #4397 decision 10) is the label that starts factory
+         *     work through a tracker surface (`github`, `gitlab`, `jira`); omitted, the
+         *     surface serves the configured tracker label. It is set only when a binding
+         *     is added: `ChannelBindingPatch` has no such field, so a move keeps the
+         *     stored label and changing it is a remove and an add.
          */
         ChannelBindingWrite: {
             /** Adapter */
@@ -4795,6 +4767,8 @@ export interface components {
             endpoint?: string | null;
             /** Kind */
             kind: string;
+            /** Trigger Label */
+            trigger_label?: string | null;
         };
         /**
          * ChannelCallersWrite

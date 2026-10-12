@@ -18,6 +18,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -28,6 +29,7 @@ from curie_api.config import get_settings
 from curie_api.github_app import _RESOLVERS
 from curie_api.routers import work_item_issue
 from fastapi.testclient import TestClient
+from forge_fakes.github import forges_document, forges_env_json
 
 from apps.api.tests.test_publications import REPO, WORKER_HEADERS, _execute, _rows
 from apps.api.tests.test_publications import publication_stack as publication_stack
@@ -120,29 +122,41 @@ def _insert_execution(
 
 
 @pytest.fixture
+def factory_code_host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The GitHub code host entry the issue read mints with (#4397 S14).
+
+    Set before ``publication_stack`` boots the app, so the forge registry built
+    at startup carries the App. The install's own settings keep only the
+    publication PAT: a read that minted from settings would send that PAT and
+    never reach the App token endpoints this case answers.
+    """
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    document = forges_document(app_id="51", private_key=pem)
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, tmp_path))
+    get_settings.cache_clear()
+
+
+@pytest.fixture
 def issue_case(
     clean_db: None,
+    factory_code_host: None,
     publication_stack: tuple[TestClient, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[dict[str, Any]]:
     client, _ = publication_stack
+    assert get_settings().forges.code_hosts, "the forge config must exist before the app boots"
     agent_id = uuid.uuid4()
     _execute(
         "INSERT INTO curie.agents (id, name) VALUES (:id, :name)",
         {"id": agent_id, "name": f"factory-{agent_id.hex[:8]}"},
     )
     work_item_id, request_id = _insert_execution(agent_id)
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    monkeypatch.setenv("GITHUB_APP_ID", "51")
-    monkeypatch.setenv(
-        "GITHUB_APP_PRIVATE_KEY",
-        key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        ).decode(),
-    )
-    get_settings.cache_clear()
     calls: list[httpx.Request] = []
     minted: list[str] = []
     issue_path = f"/repositories/{REPOSITORY_ID}/issues/{ISSUE_NUMBER}"

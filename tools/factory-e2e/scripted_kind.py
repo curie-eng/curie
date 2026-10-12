@@ -105,11 +105,11 @@ def scripted_values(
         consumer_controller=False,
         local_images=True,
     )
-    values["api"].update(
-        githubApiUrl=github_api,
-        githubCloneBase=clone_base,
-        githubFactoryPollIntervalSeconds=5,
-    )
+    values["api"].update(githubApiUrl=github_api, githubCloneBase=clone_base)
+    # The factory reads the stub through its own code host and tracker entries.
+    for entry in (*values["factory"]["codeHosts"], *values["factory"]["trackers"]):
+        entry["apiUrl"] = github_api
+    values["factory"]["trackers"][0]["pollIntervalSeconds"] = 5
     values["codeHostTrust"] = {
         "caBundle": {"configMapRef": {"name": ca_configmap, "key": "ca.pem"}}
     }

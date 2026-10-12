@@ -110,7 +110,13 @@ def _slack_out(address: str) -> dict[str, str | None]:
     and reads back the default identity by name (ADR-0168 decision 3), with no
     caller restriction by default."""
 
-    return {"kind": "slack", "address": address, "adapter": "default", "allowed_callers": None}
+    return {
+        "kind": "slack",
+        "address": address,
+        "adapter": "default",
+        "allowed_callers": None,
+        "trigger_label": None,
+    }
 
 
 def _create(client: TestClient, headers: dict[str, str], **fields: Any) -> Any:
@@ -349,7 +355,13 @@ def test_patching_a_binding_moves_that_row_and_bumps_generation(
     assert _row(agent_id, "slack", "C0EXAMPLE1") == sibling
     assert _channels(client, auth_headers, agent_id) == [
         _slack_out("C0EXAMPLE1"),
-        {"kind": "webhook", "address": "moved-here", "adapter": None, "allowed_callers": None},
+        {
+            "kind": "webhook",
+            "address": "moved-here",
+            "adapter": None,
+            "allowed_callers": None,
+            "trigger_label": None,
+        },
     ]
 
 

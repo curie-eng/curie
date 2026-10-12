@@ -142,6 +142,7 @@ def test_patch_without_field_leaves_it_unchanged(
             "address": moved,
             "adapter": "default",
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
     assert body[field] == seed

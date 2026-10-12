@@ -402,6 +402,7 @@ def _facts(
         "objective": OBJECTIVE,
         "requester": REQUESTER,
         "request_id": uuid.uuid4(),
+        "trigger_label": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)

@@ -22,7 +22,6 @@ from curie_api.config import Settings
 from curie_api.forges import types
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Support, validate_declaration
 from curie_api.forges.errors import Ambiguous, NotFound, Unauthorized, Unavailable
-from curie_api.forges.github import ci
 from curie_api.forges.github import code_host as code_host_module
 from curie_api.forges.github.code_host import GitHubCodeHost
 from curie_api.forges.hosts import github_host, repository_ref, resolve_stored
@@ -36,6 +35,7 @@ from curie_api.forges.types import (
     PullRequestState,
     RollupState,
 )
+from curie_api.github_app import GitHubAuth, GitHubCredentials
 from curie_api.publication_pulls import (
     PullRequestContract,
     PullRequestRefused,
@@ -63,10 +63,36 @@ def _settings(**overrides: Any) -> Settings:
 
 @pytest.fixture(autouse=True)
 def _git_credential(monkeypatch: pytest.MonkeyPatch) -> None:
-    def resolve(repo_full_name: str, settings: Settings) -> tuple[str, str]:
-        return f"{settings.github_html_base}/{repo_full_name}.git", GIT_HEADER
+    def resolve(repo_full_name: str, *, html_base: str, credentials: Any) -> tuple[str, str]:
+        return f"{html_base}/{repo_full_name}.git", GIT_HEADER
 
     monkeypatch.setattr(code_host_module, "resolve_repository_credential", resolve)
+
+
+def _code_host(
+    client: httpx.AsyncClient,
+    settings: Settings | None = None,
+    *,
+    credentials: Any = None,
+    installations: dict[str, int] | None = None,
+) -> GitHubCodeHost:
+    """The adapter as an install's GitHub code host builds it (#4397): its API,
+    HTML base and timeout, minting through ``credentials`` (the install's App
+    credential unless a test supplies a fake)."""
+
+    settings = settings or _settings()
+    return GitHubCodeHost(
+        client,
+        api_url=settings.github_api_url,
+        html_base=settings.github_html_base,
+        timeout_s=settings.github_app_timeout_seconds,
+        credentials=(
+            credentials
+            if credentials is not None
+            else GitHubCredentials(auth=GitHubAuth.from_settings(settings))
+        ),
+        installations=installations,
+    )
 
 
 def _with_host[T](
@@ -74,12 +100,21 @@ def _with_host[T](
     body: Callable[[GitHubCodeHost], Coroutine[Any, Any, T]],
     *,
     settings: Settings | None = None,
+    credentials: Any = None,
 ) -> T:
     async def run() -> T:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            return await body(GitHubCodeHost(settings or _settings(), client))
+            return await body(_code_host(client, settings, credentials=credentials))
 
     return asyncio.run(run())
+
+
+def _with_ci_host[T](
+    credentials: Any,
+    handler: Handler,
+    body: Callable[[GitHubCodeHost], Coroutine[Any, Any, T]],
+) -> T:
+    return _with_host(handler, body, credentials=credentials)
 
 
 def _repository(settings: Settings | None = None) -> types.RepositoryRef:
@@ -655,17 +690,20 @@ def _run(name: str, conclusion: str | None, **extra: Any) -> dict[str, Any]:
 
 
 @pytest.fixture
-def ci_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ci, "credentials_for", lambda _settings: _CiCredentials())
+def ci_credentials() -> _CiCredentials:
+    return _CiCredentials()
 
 
-@pytest.mark.usefixtures("ci_credentials")
-def test_observe_ci_keys_check_runs_by_name_and_statuses_by_context() -> None:
+def test_observe_ci_keys_check_runs_by_name_and_statuses_by_context(
+    ci_credentials: _CiCredentials,
+) -> None:
     runs = [_run("unit", "success"), _run("status:lint", "success", id=9002)]
     statuses = [{"context": "lint", "state": "failure", "target_url": "https://ci.example/1"}]
 
-    rollup = _with_host(
-        _ci_handler(runs, statuses), lambda host: host.observe_ci(_repository(), REVISION_HEAD)
+    rollup = _with_ci_host(
+        ci_credentials,
+        _ci_handler(runs, statuses),
+        lambda host: host.observe_ci(_repository(), REVISION_HEAD),
     )
 
     assert {check.key: check.state for check in rollup.checks} == {
@@ -676,12 +714,13 @@ def test_observe_ci_keys_check_runs_by_name_and_statuses_by_context() -> None:
     assert rollup.state is RollupState.FAILURE
 
 
-@pytest.mark.usefixtures("ci_credentials")
-def test_observe_ci_drops_a_check_reported_for_another_head() -> None:
+def test_observe_ci_drops_a_check_reported_for_another_head(ci_credentials: _CiCredentials) -> None:
     runs = [_run("unit", "failure", head_sha=PRIOR_HEAD), _run("lint", "success", id=9002)]
 
-    rollup = _with_host(
-        _ci_handler(runs), lambda host: host.observe_ci(_repository(), REVISION_HEAD)
+    rollup = _with_ci_host(
+        ci_credentials,
+        _ci_handler(runs),
+        lambda host: host.observe_ci(_repository(), REVISION_HEAD),
     )
 
     assert [check.key for check in rollup.checks] == ["lint"]
@@ -717,9 +756,7 @@ def test_a_refused_call_logs_github_diagnostics_but_raises_only_a_reason(
     assert message[:201] not in logged
 
 
-def test_a_ci_read_mints_only_for_the_installation_stored_for_the_repository(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_a_ci_read_mints_only_for_the_installation_stored_for_the_repository() -> None:
     expected: list[int | None] = []
 
     class Recording(_CiCredentials):
@@ -729,14 +766,14 @@ def test_a_ci_read_mints_only_for_the_installation_stored_for_the_repository(
             expected.append(expected_installation_id)
             return super().fresh_installation_token(repo_full_name, expected_installation_id)
 
-    monkeypatch.setattr(ci, "credentials_for", lambda _settings: Recording())
+    recording = Recording()
 
     async def run() -> None:
         handler = _ci_handler([_run("unit", "success")])
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            stored = GitHubCodeHost(_settings(), client, installations={REPO.upper(): 41})
+            stored = _code_host(client, credentials=recording, installations={REPO.upper(): 41})
             await stored.observe_ci(_repository(), REVISION_HEAD)
-            unknown = GitHubCodeHost(_settings(), client)
+            unknown = _code_host(client, credentials=recording)
             await unknown.observe_ci(_repository(), REVISION_HEAD)
 
     asyncio.run(run())
@@ -773,7 +810,7 @@ def test_read_pull_request_reports_a_conflict_only_for_a_dirty_unmergeable_head(
 
 
 def _observe_with_pull(
-    handler: Handler, *, pull_request: bool = True
+    credentials: Any, handler: Handler, *, pull_request: bool = True
 ) -> tuple[factory_ci.CiView, list[httpx.Request]]:
     seen: list[httpx.Request] = []
 
@@ -791,11 +828,12 @@ def _observe_with_pull(
             pull_request=PullRequestRef(repository, "123") if pull_request else None,
         )
 
-    return _with_host(record, body), seen
+    return _with_host(record, body, credentials=credentials), seen
 
 
-@pytest.mark.usefixtures("ci_credentials")
-def test_the_gate_observation_reads_a_dirty_pull_request_beside_its_checks() -> None:
+def test_the_gate_observation_reads_a_dirty_pull_request_beside_its_checks(
+    ci_credentials: _CiCredentials,
+) -> None:
     checks = _ci_handler([_run("unit", "success")])
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -805,7 +843,7 @@ def test_the_gate_observation_reads_a_dirty_pull_request_beside_its_checks() -> 
             )
         return checks(request)
 
-    view, seen = _observe_with_pull(handler)
+    view, seen = _observe_with_pull(ci_credentials, handler)
 
     assert view.reason is None
     assert (view.conflicted, view.merged) == (True, False)
@@ -814,9 +852,9 @@ def test_the_gate_observation_reads_a_dirty_pull_request_beside_its_checks() -> 
 
 
 @pytest.mark.parametrize("failure", ["404", "500", "timeout", "malformed", "non_object"])
-@pytest.mark.usefixtures("ci_credentials")
 def test_an_unreadable_pull_request_leaves_mergeability_unknown_and_keeps_the_checks(
     failure: str,
+    ci_credentials: _CiCredentials,
 ) -> None:
     checks = _ci_handler([_run("unit", "failure")])
 
@@ -831,16 +869,19 @@ def test_an_unreadable_pull_request_leaves_mergeability_unknown_and_keeps_the_ch
             return httpx.Response(int(failure), json={"message": "fixture refusal"})
         return checks(request)
 
-    view, _seen = _observe_with_pull(handler)
+    view, _seen = _observe_with_pull(ci_credentials, handler)
 
     assert view.reason is None
     assert (view.conflicted, view.merged) == (None, None)
     assert [check.key for check in view.checks] == ["unit"]
 
 
-@pytest.mark.usefixtures("ci_credentials")
-def test_an_observation_without_a_pull_request_reads_no_pull() -> None:
-    view, seen = _observe_with_pull(_ci_handler([_run("unit", "success")]), pull_request=False)
+def test_an_observation_without_a_pull_request_reads_no_pull(
+    ci_credentials: _CiCredentials,
+) -> None:
+    view, seen = _observe_with_pull(
+        ci_credentials, _ci_handler([_run("unit", "success")]), pull_request=False
+    )
 
     assert (view.conflicted, view.merged) == (None, None)
     assert not any("/pulls/" in request.url.path for request in seen)
@@ -855,38 +896,42 @@ def test_an_observation_without_a_pull_request_reads_no_pull() -> None:
         (502, Unavailable, "github_error"),
     ],
 )
-@pytest.mark.usefixtures("ci_credentials")
 def test_observe_ci_failures_carry_a_fixed_reason(
-    status: int, error: type[Exception], reason: str
+    status: int,
+    error: type[Exception],
+    reason: str,
+    ci_credentials: _CiCredentials,
 ) -> None:
     with pytest.raises(error, match=f"^{reason}$"):
-        _with_host(
+        _with_ci_host(
+            ci_credentials,
             lambda _request: httpx.Response(status, text="BODYTEXT ghs_secret"),
             lambda host: host.observe_ci(_repository(), REVISION_HEAD),
         )
 
 
-def test_observe_ci_without_an_app_is_unauthorized(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_observe_ci_without_an_app_is_unauthorized() -> None:
     class _NoApp:
         app_configured = False
-
-    monkeypatch.setattr(ci, "credentials_for", lambda _settings: _NoApp())
 
     with pytest.raises(Unauthorized, match="app_not_configured"):
         _with_host(
             lambda _request: httpx.Response(500),
             lambda host: host.observe_ci(_repository(), REVISION_HEAD),
+            credentials=_NoApp(),
         )
 
 
-@pytest.mark.usefixtures("ci_credentials")
-def test_ci_diagnostics_carry_output_and_annotations_for_failing_checks() -> None:
+def test_ci_diagnostics_carry_output_and_annotations_for_failing_checks(
+    ci_credentials: _CiCredentials,
+) -> None:
     runs = [
         _run("unit", "failure", output={"title": "Tests failed", "summary": "1 failed"}),
         _run("lint", "success", id=9002),
     ]
 
-    report = _with_host(
+    report = _with_ci_host(
+        ci_credentials,
         _ci_handler(runs),
         lambda host: host.ci_diagnostics(_repository(), REVISION_HEAD, base_ref=None),
     )
@@ -899,8 +944,9 @@ def test_ci_diagnostics_carry_output_and_annotations_for_failing_checks() -> Non
     assert "src/app.py:7: assert 1 == 2" in diagnostics[0].excerpt
 
 
-@pytest.mark.usefixtures("ci_credentials")
-def test_rerun_failed_reruns_each_failing_actions_workflow_once() -> None:
+def test_rerun_failed_reruns_each_failing_actions_workflow_once(
+    ci_credentials: _CiCredentials,
+) -> None:
     actions = {"slug": "github-actions"}
     run_url = f"https://github.com/{REPO}/actions/runs/77/job/9001"
     runs = [
@@ -916,7 +962,7 @@ def test_rerun_failed_reruns_each_failing_actions_workflow_once() -> None:
         assert [job.check_id for job in jobs] == ["9001", "9002"]
         return await host.rerun_failed(_repository(), jobs)
 
-    record = _with_host(_ci_handler(runs, seen=seen), rerun)
+    record = _with_ci_host(ci_credentials, _ci_handler(runs, seen=seen), rerun)
 
     assert record.attempts == (types.RerunAttempt("77", types.RerunOutcome.ACCEPTED),)
     assert [job.unit for job in record.jobs] == ["77", "77"]
@@ -928,13 +974,13 @@ def test_rerun_failed_reruns_each_failing_actions_workflow_once() -> None:
     assert posts[0].headers["Authorization"] == "Bearer fixture-ci-token"
 
 
-@pytest.mark.usefixtures("ci_credentials")
-def test_a_refused_rerun_records_its_reason() -> None:
+def test_a_refused_rerun_records_its_reason(ci_credentials: _CiCredentials) -> None:
     job = types.RerunJob(
         "9001", "unit", f"https://github.com/{REPO}/actions/runs/77/job/9001"
     )
 
-    record = _with_host(
+    record = _with_ci_host(
+        ci_credentials,
         _ci_handler([], rerun_status=403),
         lambda host: host.rerun_failed(_repository(), [job]),
     )
@@ -944,8 +990,9 @@ def test_a_refused_rerun_records_its_reason() -> None:
     )
 
 
-@pytest.mark.usefixtures("ci_credentials")
-def test_a_rerun_asks_for_its_workflow_run_when_the_url_does_not_name_it() -> None:
+def test_a_rerun_asks_for_its_workflow_run_when_the_url_does_not_name_it(
+    ci_credentials: _CiCredentials,
+) -> None:
     seen: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -955,7 +1002,9 @@ def test_a_rerun_asks_for_its_workflow_run_when_the_url_does_not_name_it() -> No
         return httpx.Response(201)
 
     job = types.RerunJob("9001", "unit", f"https://github.com/{REPO}/runs/9001")
-    record = _with_host(handler, lambda host: host.rerun_failed(_repository(), [job]))
+    record = _with_ci_host(
+        ci_credentials, handler, lambda host: host.rerun_failed(_repository(), [job])
+    )
 
     assert [job.unit for job in record.jobs] == ["88"]
     assert [(request.method, request.url.path) for request in seen] == [
@@ -964,8 +1013,9 @@ def test_a_rerun_asks_for_its_workflow_run_when_the_url_does_not_name_it() -> No
     ]
 
 
-@pytest.mark.usefixtures("ci_credentials")
-def test_a_lost_rerun_answer_is_unconfirmed_and_ends_the_pass() -> None:
+def test_a_lost_rerun_answer_is_unconfirmed_and_ends_the_pass(
+    ci_credentials: _CiCredentials,
+) -> None:
     posts: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -976,7 +1026,9 @@ def test_a_lost_rerun_answer_is_unconfirmed_and_ends_the_pass() -> None:
         types.RerunJob("1", "a", f"https://github.com/{REPO}/actions/runs/11/job/1"),
         types.RerunJob("2", "b", f"https://github.com/{REPO}/actions/runs/12/job/2"),
     ]
-    record = _with_host(handler, lambda host: host.rerun_failed(_repository(), jobs))
+    record = _with_ci_host(
+        ci_credentials, handler, lambda host: host.rerun_failed(_repository(), jobs)
+    )
 
     assert record.attempts == (
         types.RerunAttempt("11", types.RerunOutcome.UNCONFIRMED, "timeout"),

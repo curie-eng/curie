@@ -26,7 +26,8 @@ from curie_api.schemas.deployments import WebhookResult
 from . import workitem_dispatch
 from .config import Settings
 from .factory_reply_target import feedback_url
-from .forges.hosts import github_host
+from .forges.hosts import factory_code_host_entry, factory_tracker, github_host
+from .forges.registry import forges_registry
 from .forges.types import GITHUB, PullRequestRef, ReplyTarget
 from .github_factory import lock_issue
 from .github_factory_events import mentions_login
@@ -38,7 +39,12 @@ from .github_review_events import (
     parse_feedback,
 )
 from .github_review_store import feedback_provenance
-from .github_review_truth import BoundReviewLineage, verify_feedback_truth
+from .github_review_truth import (
+    BoundReviewLineage,
+    VerifiedRepository,
+    verify_feedback_in_repository,
+    verify_feedback_truth,
+)
 from .models import ThreadPublicationLineage, WorkItem
 from .workitem_dispatch import Admission
 from .workspace_policy import repository_is_allowed
@@ -181,8 +187,17 @@ async def admit_parsed_feedback(
     *,
     settings: Settings,
     client: httpx.AsyncClient,
+    verified: VerifiedRepository | None,
 ) -> WebhookResult:
-    if not mentions_login(feedback.body, settings.github_factory_mention):
+    """Admit one piece of review feedback.
+
+    ``verified`` is the poll pass's repository read with its freshly verified
+    installation token, reused for every piece of feedback in that pass; a
+    webhook delivery passes None and verifies its own.
+    """
+
+    registry = forges_registry(settings)
+    if not mentions_login(feedback.body, factory_tracker(registry).config.mention):
         raise FeedbackIgnored("ordinary_comment")
     if not repository_is_allowed(feedback.repo_full_name, settings.github_repo_allowlist):
         raise FeedbackIgnored("repository_not_allowed")
@@ -206,7 +221,20 @@ async def admit_parsed_feedback(
         or feedback.installation_id != bound.installation_id
     ):
         raise FeedbackIgnored("installation_mismatch")
-    await verify_feedback_truth(feedback, bound, settings=settings, client=client)
+    if verified is None:
+        code_host = factory_code_host_entry(registry)
+        await verify_feedback_truth(
+            feedback,
+            bound,
+            settings=settings,
+            client=client,
+            credentials=code_host.credentials.credentials,
+            api_url=code_host.config.api_url,
+        )
+    else:
+        await verify_feedback_in_repository(
+            feedback, bound, verified, settings=settings, client=client
+        )
     # Provider verification can overlap another WorkItem or lineage writer.
     # Keep both current rows locked through admission and reject changed proof.
     current_item = await session.scalar(
@@ -289,7 +317,7 @@ async def handle_factory_review_delivery(
             event, payload, delivery_id, github_html_base=settings.github_html_base
         )
         outcome = await admit_parsed_feedback(
-            session, feedback, settings=settings, client=client
+            session, feedback, settings=settings, client=client, verified=None
         )
     except FeedbackUnavailable as exc:
         settle_review_delivery(audit, "retryable", exc.code)

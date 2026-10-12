@@ -30,7 +30,6 @@ import httpx
 from curie_telemetry.redact import redact_text
 from starlette.concurrency import run_in_threadpool
 
-from curie_api.config import Settings
 from curie_api.forges import types
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
 from curie_api.forges.errors import Ambiguous, ForgeError, NotFound, Unauthorized, Unavailable
@@ -290,6 +289,7 @@ def _human(item: Mapping[str, Any]) -> Actor | None:
 
 logger = logging.getLogger(__name__)
 
+
 def _log_refusal(method: str, response: httpx.Response) -> None:
     """Keep GitHub's diagnostics for an operator (#4159) without carrying them
     across the port: the status, request id and a clipped ``message``.
@@ -333,9 +333,12 @@ class GitHubCodeHost:
 
     def __init__(
         self,
-        settings: Settings,
         client: httpx.AsyncClient,
         *,
+        api_url: str,
+        html_base: str,
+        timeout_s: float,
+        credentials: Any,
         marked_comments: MarkedComments | None = None,
         repository_paths: Mapping[str, str] | None = None,
         installations: Mapping[str, int] | None = None,
@@ -343,10 +346,13 @@ class GitHubCodeHost:
     ) -> None:
         if page_size < 1:
             raise ValueError("page_size must be positive")
-        self._settings = settings
         self._client = client
-        self._api = settings.github_api_url.rstrip("/")
-        self._html = settings.github_html_base.rstrip("/")
+        self._api = api_url.rstrip("/")
+        self._html = html_base.rstrip("/")
+        self._timeout = timeout_s
+        # The code host's `GitHubCredentials`: every token this adapter mints
+        # is minted with it, never with the install's own settings (#4397).
+        self._credentials = credentials
         self.host = urlsplit(self._html).netloc.lower() or "github.com"
         self.capabilities: Mapping[Operation, Support] = dict.fromkeys(
             CODE_HOST_OPERATIONS, Support.SUPPORTED
@@ -369,6 +375,11 @@ class GitHubCodeHost:
             raise RuntimeError("GitHubCodeHost was built without its marked comments")
         return self._marked_comments
 
+    def _resolve_credential(self, path: str) -> tuple[str, str]:
+        return resolve_repository_credential(
+            path, html_base=self._html, credentials=self._credentials
+        )
+
     # Transport -------------------------------------------------------------
 
     def _repo(self, path: str) -> str:
@@ -386,7 +397,7 @@ class GitHubCodeHost:
         """
 
         try:
-            _, header = await run_in_threadpool(resolve_repository_credential, path, self._settings)
+            _, header = await run_in_threadpool(self._resolve_credential, path)
         except (GitHubAppError, ValueError):
             raise Unauthorized("credential_unresolved") from None
         return header
@@ -412,7 +423,7 @@ class GitHubCodeHost:
                     "Authorization": token,
                     "X-GitHub-Api-Version": "2022-11-28",
                 },
-                timeout=self._settings.github_app_timeout_seconds,
+                timeout=self._timeout,
                 follow_redirects=False,
             )
         except httpx.TimeoutException:
@@ -502,9 +513,7 @@ class GitHubCodeHost:
         """
 
         try:
-            clone_url, header = await run_in_threadpool(
-                resolve_repository_credential, repository.path, self._settings
-            )
+            clone_url, header = await run_in_threadpool(self._resolve_credential, repository.path)
         except GitHubAppError:
             raise Unavailable("credential_unresolved") from None
         except ValueError:
@@ -711,8 +720,10 @@ class GitHubCodeHost:
         try:
             detail = await asyncio.wait_for(
                 ci.read_ci_detail(
-                    self._settings,
                     self._client,
+                    api_url=self._api,
+                    timeout_s=self._timeout,
+                    credentials=self._credentials,
                     repo_full_name=repository.path,
                     installation_id=self._installations.get(repository.path.casefold()),
                     head_sha=head_sha,
@@ -773,7 +784,7 @@ class GitHubCodeHost:
             return record
         base = f"{self._api}{self._repo(repository.path)}"
         token, refused = await ci.mint_repository_token(
-            self._settings, repository.path, None, None
+            self._credentials, repository.path, None, None
         )
         if refused is not None:
             reason = refused.reason or "github_error"
@@ -784,7 +795,7 @@ class GitHubCodeHost:
         assert token is not None
         headers = ci.rerun_headers(token)
         del token
-        timeout = self._settings.github_app_timeout_seconds
+        timeout = self._timeout
         try:
             resolved: list[RerunJob] = []
             for job in jobs:

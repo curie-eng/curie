@@ -63,6 +63,8 @@ async def create_agent(session: AsyncSession, data: AgentCreate) -> Agent:
                 address=data.channel.address,
                 endpoint=data.channel.endpoint,
                 adapter=data.channel.adapter,
+                # A tracker surface's label is set when it is bound (#4361).
+                trigger_label=data.channel.trigger_label,
             )
         ],
         repo_full_name=data.repo_full_name,

@@ -956,6 +956,9 @@ pub struct ClusterStatus {
     pub urls: Vec<ServiceUrl>,
     pub delivery: crate::completion_outbox::Report,
     pub upgrade: super::upgrade::UpgradeStatusView,
+    /// Each recorded forge credential's expiry (#4397), from the computed
+    /// values; a warning is also in `warnings`.
+    pub credentials: Vec<crate::forge_expiry::ExpiryLine>,
 }
 
 impl crate::ui::CliOutput for ClusterStatusOutput {
@@ -983,6 +986,7 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                     "delivery": serde_json::to_value(&s.delivery).expect("delivery serializes"),
                     "healthy": healthy,
                     "upgrade": s.upgrade.to_json(),
+                    "credentials": serde_json::to_value(&s.credentials).expect("credentials serialize"),
                 })
             }
         }
@@ -1008,6 +1012,9 @@ impl crate::ui::CliOutput for ClusterStatusOutput {
                 }
                 for url in &s.urls {
                     url.render(ui);
+                }
+                for line in &s.credentials {
+                    ui.payload(&line.summary());
                 }
                 ui.payload(&format!(
                     "upgrade {} · phase {} · known-good {}",
@@ -1247,6 +1254,16 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         None => crate::completion_outbox::Report::unknown(),
     };
 
+    let credentials = match &computed {
+        Ok(Some(values)) => crate::forge_expiry::report(values, time::OffsetDateTime::now_utc()),
+        _ => Vec::new(),
+    };
+    for line in &credentials {
+        if let Some(warning) = &line.warning {
+            warnings.push(format!("{}: {warning}", line.summary()));
+        }
+    }
+
     if upgrade.known_good_version.is_none() && helm_ok {
         upgrade.known_good_version =
             Some(field("CHART:", "")).filter(|version| !version.trim().is_empty());
@@ -1273,6 +1290,7 @@ pub async fn status(opts: CommonOpts, context_resolved: bool) -> Result<ClusterS
         urls,
         delivery,
         upgrade,
+        credentials,
     }));
     let json = crate::ui::CliOutput::to_json(&output);
     if let Some(error) = context_error {
@@ -4487,7 +4505,11 @@ async fn read_release_secret(namespace: &str, release: &str, data_key: &str) -> 
 /// an operator-managed Secret elsewhere in the namespace. Decoded server-side by
 /// kubectl's `base64decode` so the plaintext never lands in argv (#524). `None`
 /// when the Secret, the key, or the cluster is unreachable.
-async fn read_secret_key(namespace: &str, secret_name: &str, data_key: &str) -> Option<String> {
+pub(crate) async fn read_secret_key(
+    namespace: &str,
+    secret_name: &str,
+    data_key: &str,
+) -> Option<String> {
     let cmd = OpsCommand::new(
         "kubectl",
         vec![

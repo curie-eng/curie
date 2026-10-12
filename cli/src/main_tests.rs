@@ -56,6 +56,38 @@ fn cluster_factory_has_no_webhook_secret_value_flag() {
     );
 }
 
+// #4397 AC 6: forge egress is one flag with no alias for the removed
+// GitHub /meta flag.
+#[test]
+fn cluster_factory_takes_forge_egress_and_not_the_github_api_flag() {
+    assert!(
+        try_parse_from([
+            "curie",
+            "cluster",
+            "factory",
+            "--forge-egress",
+            "dark-factory",
+            "--forge-egress",
+            "dark-factory-fast",
+            "--dry-run",
+        ])
+        .is_ok(),
+        "--forge-egress <AGENT> is repeatable"
+    );
+    let error = match try_parse_from([
+        "curie",
+        "cluster",
+        "factory",
+        "--github-api-egress",
+        "dark-factory",
+        "--dry-run",
+    ]) {
+        Ok(_) => panic!("--github-api-egress must no longer parse"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+}
+
 /// clap's derived parser is deep enough that debug bin tests overflow the
 /// default thread stack once apply/diff/doctor grew `--context`. The
 /// released binary still parses on the process stack; only the test
@@ -1709,9 +1741,15 @@ async fn resolve_cluster_conn_prefers_explicit_over_discovery() {
         namespace: "curie".into(),
         release: "curie".into(),
     };
-    let (url, key, port_forward) = resolve_cluster_conn(conn, false)
-        .await
-        .expect("explicit conn resolves");
+    let (url, key, port_forward) = curie::commands::resolve_cluster_conn(
+        conn.api_url,
+        conn.api_key,
+        &conn.namespace,
+        &conn.release,
+        false,
+    )
+    .await
+    .expect("explicit conn resolves");
     assert_eq!(url, "https://api.example.test");
     assert_eq!(key, "real-release-key");
     assert!(port_forward.is_none());

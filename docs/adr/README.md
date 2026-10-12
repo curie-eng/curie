@@ -235,4 +235,5 @@ read verbatim from its `Status:` line. **Do not hand-edit it.** Run
 | 0210 | [A bundle may declare a secret optional](0210-a-bundle-may-declare-a-secret-optional.md) | Accepted |
 | 0212 | [A work item owner rides through a store outage and stops its turn when it cannot](0212-a-work-item-owner-rides-through-a-store-outage-and-stops-its-turn-when-it-cannot.md) | Draft |
 | 0214 | [One factory agent serves every GitHub repository bound to it](0214-one-factory-agent-serves-every-github-repository-bound-to-it.md) | Accepted |
+| 0215 | [Each tracker surface starts factory work under its own trigger label](0215-each-tracker-surface-starts-factory-work-under-its-own-trigger-label.md) | Accepted |
 <!-- END GENERATED: adr-index -->

@@ -934,7 +934,9 @@
     {
       "output": "CallersOutput",
       "struct": "ChannelBinding",
-      "omissions": []
+      "omissions": [
+        {"field": "trigger_label", "why": "The callers verb reports who may start a turn through one surface; its trigger label is shown by the surfaces verb."}
+      ]
     },
     {
       "output": "VersionsOutput",

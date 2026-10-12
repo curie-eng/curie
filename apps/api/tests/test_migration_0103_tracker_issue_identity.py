@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -27,11 +28,13 @@ from alembic import command
 from curie_api import github_factory, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.forges.identity import issue_lock_keys, notice_request_id
+from curie_api.forges.registry import forges_registry
 from curie_api.forges.types import GITHUB, Actor, Disposition, MarkedNotice
 from curie_api.github_factory_events import FactoryNotice
 from curie_api.models import AgentChannel, ExecutionRequest, WorkItem
 from curie_api.threadkeys import route_thread_key
 from curie_api.workitems.lifecycle import WorkItemOutcome
+from forge_fakes.github import forges_document, forges_env_json
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
@@ -226,7 +229,7 @@ def _replay_label_notice() -> tuple[str, int, int]:
                     select(AgentChannel).where(AgentChannel.address == REPO)
                 )
                 assert binding is not None
-                facts = github_factory._facts(notice, binding, settings)
+                facts = github_factory._facts(notice, binding, forges_registry(settings))
                 result = await workitem_dispatch.readmit(session, facts)
                 assert isinstance(result, WorkItemOutcome), result
                 await session.commit()
@@ -242,10 +245,12 @@ def _replay_label_notice() -> tuple[str, int, int]:
 
 
 @pytest.fixture
-def factory_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+def factory_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("GITHUB_REPO_ALLOWLIST", '["acme-corp/*"]')
     monkeypatch.delenv("CURIE_MIGRATION_GITHUB_HOST", raising=False)
     monkeypatch.delenv("GITHUB_API_URL", raising=False)
+    # The admission facts read the GitHub code host from the forge registry (#4397).
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(forges_document(), tmp_path))
     get_settings.cache_clear()
 
 
@@ -343,6 +348,10 @@ def test_0103_keeps_ids_backfills_the_tracker_identity_and_a_replay_dedupes(
                 "etags": {"issues": "W/1"},
             }
         ]
+
+        # The ORM reads the head's columns (0105's trigger label, #4361), so the
+        # typed reads and the replay below run on the head schema.
+        command.upgrade(config, "0105")
 
         # The typed derivations over the migrated row are the legacy values.
         async def migrated_issue() -> Any:

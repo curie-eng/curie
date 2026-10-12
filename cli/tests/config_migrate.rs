@@ -339,191 +339,6 @@ fn already_versioned_v0_9_is_a_no_op_stamp() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// #4322: the v0.12.1/v0.12.2 guide told operators to set the factory metadata
-// CI policy as `api.extraEnv` GITHUB_FACTORY_METADATA_CI. v0.12.3 made the name
-// chart owned (`api.githubFactoryMetadataCi`), so migration must move it.
-// ---------------------------------------------------------------------------
-
-const METADATA_CI_ENV: &str = "GITHUB_FACTORY_METADATA_CI";
-const METADATA_CI_KEY: &str = "api.githubFactoryMetadataCi";
-
-/// A substring of the operator's JSON value. No refusal or plan line may
-/// carry it: change lines name variables and keys, never values.
-const METADATA_CI_SENTINEL: &str = "sentinel-4322-do-not-print";
-
-/// A realistic metadata CI policy that satisfies the chart's
-/// `api.githubFactoryMetadataCi` schema: owner/name keys, each with
-/// non-empty `checks` and `statuses` string arrays.
-fn metadata_ci_policy() -> Value {
-    json!({
-        "acme/widgets": {
-            "checks": ["pr-body", METADATA_CI_SENTINEL],
-            "statuses": ["ci/lint"]
-        },
-        "acme/gadgets": {"checks": ["Validate PR title"]}
-    })
-}
-
-/// The value as an operator wrote it in extraEnv: a JSON document in a string,
-/// pretty printed the way the guide's example was.
-fn metadata_ci_extra_env_value() -> String {
-    serde_json::to_string_pretty(&metadata_ci_policy()).unwrap()
-}
-
-fn legacy_metadata_ci_values(entry: Value) -> Value {
-    json!({
-        "config": {"schemaVersion": "0.9.0"},
-        "api": {
-            "extraEnv": [
-                {"name": "PROVIDER_BASE_URL", "value": "https://provider.example.com/v1"},
-                entry,
-                {"name": "LOG_FORMAT", "value": "json"}
-            ]
-        }
-    })
-}
-
-fn assert_metadata_ci_refusal(values: Value, case: &str) {
-    let err = migrate_installed_config(values, Some("curie-0.12.2"))
-        .err()
-        .unwrap_or_else(|| panic!("{case}: legacy {METADATA_CI_ENV} must refuse to migrate"));
-    let message = format!("{err:#}");
-    assert!(
-        message.contains(METADATA_CI_ENV),
-        "{case}: refusal must name the variable: {message}"
-    );
-    assert!(
-        message.contains(METADATA_CI_KEY),
-        "{case}: refusal must name the successor key: {message}"
-    );
-    assert!(
-        !message.contains(METADATA_CI_SENTINEL),
-        "{case}: refusal must not print the value: {message}"
-    );
-}
-
-/// AC1.
-#[test]
-fn metadata_ci_extra_env_migrates_to_object_key() {
-    let values = legacy_metadata_ci_values(json!({
-        "name": METADATA_CI_ENV,
-        "value": metadata_ci_extra_env_value()
-    }));
-    let outcome = migrate_installed_config(values, Some("curie-0.12.2"))
-        .unwrap_or_else(|err| panic!("legacy metadata CI must migrate: {err:#}"));
-    assert_eq!(
-        extra_env_names(&outcome.values, &["api", "extraEnv"]),
-        vec!["PROVIDER_BASE_URL".to_string(), "LOG_FORMAT".to_string()],
-        "the legacy entry must go and every other entry must keep its order: {}",
-        outcome.values
-    );
-    assert_eq!(
-        outcome.values.pointer("/api/githubFactoryMetadataCi"),
-        Some(&metadata_ci_policy()),
-        "the successor must hold the parsed object, not the JSON string: {}",
-        outcome.values
-    );
-    let plan = redacted_upgrade_plan(&outcome);
-    assert!(
-        plan.iter()
-            .any(|line| line == &format!("extraEnv {METADATA_CI_ENV} -> {METADATA_CI_KEY}")),
-        "the plan must record the move: {plan:?}"
-    );
-    assert!(
-        plan.iter().all(|line| !line.contains(METADATA_CI_SENTINEL)),
-        "no plan line may carry the value: {plan:?}"
-    );
-}
-
-/// AC2: a string that parses but is not an object.
-#[test]
-fn metadata_ci_extra_env_non_object_json_refuses() {
-    let value = serde_json::to_string(&json!([METADATA_CI_SENTINEL])).unwrap();
-    assert_metadata_ci_refusal(
-        legacy_metadata_ci_values(json!({"name": METADATA_CI_ENV, "value": value})),
-        "JSON array",
-    );
-}
-
-/// AC2: a string that is not JSON at all. serde's own error can quote input, so
-/// this pins that the refusal never echoes it.
-#[test]
-fn metadata_ci_extra_env_non_json_refuses() {
-    let value = format!("not json {METADATA_CI_SENTINEL}");
-    assert_metadata_ci_refusal(
-        legacy_metadata_ci_values(json!({"name": METADATA_CI_ENV, "value": value})),
-        "non-JSON string",
-    );
-}
-
-/// AC2: valueFrom cannot be migrated to an inline object.
-#[test]
-fn metadata_ci_extra_env_value_from_refuses() {
-    let values = legacy_metadata_ci_values(json!({
-        "name": METADATA_CI_ENV,
-        "valueFrom": {"configMapKeyRef": {"name": METADATA_CI_SENTINEL, "key": "policy"}}
-    }));
-    let err = migrate_installed_config(values.clone(), Some("curie-0.12.2"))
-        .err()
-        .unwrap_or_else(|| panic!("valueFrom {METADATA_CI_ENV} must refuse"));
-    assert!(format!("{err:#}").contains("valueFrom"), "{err:#}");
-    assert_metadata_ci_refusal(values, "valueFrom");
-}
-
-/// AC2: an existing successor that disagrees is ambiguous.
-#[test]
-fn metadata_ci_extra_env_conflicting_key_refuses() {
-    let mut values = legacy_metadata_ci_values(json!({
-        "name": METADATA_CI_ENV,
-        "value": metadata_ci_extra_env_value()
-    }));
-    values["api"]["githubFactoryMetadataCi"] =
-        json!({"acme/widgets": {"checks": ["sentinel-4322-existing"]}});
-    let err = migrate_installed_config(values.clone(), Some("curie-0.12.2"))
-        .err()
-        .unwrap_or_else(|| panic!("a conflicting {METADATA_CI_KEY} must refuse"));
-    let message = format!("{err:#}");
-    assert!(message.contains("conflicts"), "{message}");
-    assert!(
-        !message.contains("sentinel-4322-existing"),
-        "the existing value must not be printed either: {message}"
-    );
-    assert_metadata_ci_refusal(values, "conflicting key");
-}
-
-/// AC2: an existing successor equal to the parsed value drops the entry.
-#[test]
-fn metadata_ci_extra_env_equal_key_is_dropped() {
-    let mut values = legacy_metadata_ci_values(json!({
-        "name": METADATA_CI_ENV,
-        "value": metadata_ci_extra_env_value()
-    }));
-    values["api"]["githubFactoryMetadataCi"] = metadata_ci_policy();
-    let outcome = migrate_installed_config(values, Some("curie-0.12.2"))
-        .unwrap_or_else(|err| panic!("an equal successor must not refuse: {err:#}"));
-    assert_eq!(
-        extra_env_names(&outcome.values, &["api", "extraEnv"]),
-        vec!["PROVIDER_BASE_URL".to_string(), "LOG_FORMAT".to_string()],
-        "{}",
-        outcome.values
-    );
-    assert_eq!(
-        outcome.values.pointer("/api/githubFactoryMetadataCi"),
-        Some(&metadata_ci_policy())
-    );
-    let plan = redacted_upgrade_plan(&outcome);
-    assert!(
-        plan.iter().any(|line| line
-            == &format!("extraEnv {METADATA_CI_ENV} dropped; matches {METADATA_CI_KEY}")),
-        "{plan:?}"
-    );
-    assert!(
-        plan.iter().all(|line| !line.contains(METADATA_CI_SENTINEL)),
-        "{plan:?}"
-    );
-}
-
 fn chart_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../charts/curie"))
 }
@@ -556,86 +371,35 @@ fn helm_template_with_values(values: &Value) -> std::process::Output {
         .expect("run helm template")
 }
 
-/// The rendered `GITHUB_FACTORY_METADATA_CI` value of the api Deployment's
-/// container. A line read, not a YAML parse of the whole render: the render
-/// carries duplicate label keys that strict parsers reject (see
-/// `chart_fullname_parity.rs`). The scalar itself is parsed as YAML.
-fn rendered_api_metadata_ci(render: &str) -> String {
-    let api = render
-        .split("\n---\n")
-        .filter(|doc| {
-            doc.contains("# Source: curie/templates/api.yaml") && doc.contains("\nkind: Deployment")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(api.len(), 1, "expected one api Deployment in the render");
-    let lines: Vec<&str> = api[0].lines().collect();
-    let found: Vec<String> = lines
-        .windows(2)
-        .filter(|pair| pair[0].trim() == format!("- name: {METADATA_CI_ENV}"))
-        .map(|pair| {
-            let scalar = pair[1]
-                .trim()
-                .strip_prefix("value: ")
-                .unwrap_or_else(|| panic!("{METADATA_CI_ENV} must be a plain value: {}", pair[1]));
-            serde_norway::from_str::<String>(scalar).expect("env value is a YAML string")
-        })
-        .collect();
-    assert_eq!(
-        found.len(),
-        1,
-        "expected exactly one {METADATA_CI_ENV} in the api Deployment: {found:?}"
-    );
-    found.into_iter().next().unwrap()
-}
-
-/// AC5: the chart renders the migrated overlay, and the api container's env
-/// equals the operator's original JSON.
+/// #4397: the factory reads no `GITHUB_FACTORY_*` environment, so a v0.12.x
+/// install that still sets the metadata CI policy through `api.extraEnv` is
+/// refused by the chart, naming its `factory.*` successor, instead of
+/// upgrading with the policy silently dropped.
 #[test]
-fn migrated_metadata_ci_renders_into_the_api_container() {
+fn removed_metadata_ci_extra_env_is_refused_by_the_chart() {
     if helm_is_absent() {
         return;
     }
-    let values = legacy_metadata_ci_values(json!({
-        "name": METADATA_CI_ENV,
-        "value": metadata_ci_extra_env_value()
-    }));
-    let outcome = migrate_installed_config(values, Some("curie-0.12.2"))
-        .unwrap_or_else(|err| panic!("legacy metadata CI must migrate: {err:#}"));
-    let output = helm_template_with_values(&outcome.values);
-    assert!(
-        output.status.success(),
-        "the chart must render the migrated overlay: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let rendered = rendered_api_metadata_ci(&String::from_utf8(output.stdout).unwrap());
-    let parsed: Value = serde_json::from_str(&rendered)
-        .unwrap_or_else(|err| panic!("{METADATA_CI_ENV} must be JSON ({err}): {rendered}"));
-    assert_eq!(parsed, metadata_ci_policy());
-}
-
-/// AC5 control: the unmigrated overlay is exactly what the chart refuses, so
-/// the positive render above is not passing on a chart that ignores extraEnv.
-#[test]
-fn unmigrated_metadata_ci_extra_env_is_refused_by_the_chart() {
-    if helm_is_absent() {
-        return;
-    }
-    let values = legacy_metadata_ci_values(json!({
-        "name": METADATA_CI_ENV,
-        "value": metadata_ci_extra_env_value()
-    }));
+    let values = json!({
+        "api": {
+            "extraEnv": [{
+                "name": "GITHUB_FACTORY_METADATA_CI",
+                "value": "{\"acme/widgets\":{\"checks\":[\"sentinel-4397-do-not-print\"]}}"
+            }]
+        }
+    });
     let output = helm_template_with_values(&values);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !output.status.success(),
-        "the chart must refuse the legacy entry"
+        "the chart must refuse the removed entry"
     );
     assert!(
-        stderr.contains(&format!(
-            "api.extraEnv contains chart-owned environment variable {METADATA_CI_ENV}"
-        )) && stderr.contains(METADATA_CI_KEY),
-        "the refusal must be the chart-owned reservation: {stderr}"
+        stderr.contains("api.extraEnv GITHUB_FACTORY_METADATA_CI is no longer read")
+            && stderr.contains("factory.bindings"),
+        "the refusal must name the entry and its successor: {stderr}"
     );
+    assert!(!stderr.contains("sentinel-4397-do-not-print"), "{stderr}");
 }
 
 /// Reserved names that map to a single Helm key yet need no extraEnv
@@ -769,19 +533,14 @@ const RESERVED_WITHOUT_MIGRATION: &[&str] = &[
     "CURIE_WORKSPACE_UPLOAD_TIMEOUT_SECONDS",
     "CURIE_WORK_ITEM_MAX_TURNS",
     "ENVIRONMENT",
+    // The factory settings arrived with #4397 as chart values, never extraEnv.
+    "FACTORY_CI_WAIT_S",
+    "FACTORY_ENABLED",
+    "FACTORY_INTAKE",
     "GITHUB_API_URL",
     "GITHUB_APP_ID",
     "GITHUB_APP_PRIVATE_KEY",
     "GITHUB_CLONE_BASE",
-    "GITHUB_FACTORY_BASES",
-    "GITHUB_FACTORY_CARD_BASE_URL",
-    "GITHUB_FACTORY_CI_WAIT_S",
-    "GITHUB_FACTORY_INGRESS_ENABLED",
-    "GITHUB_FACTORY_INTAKE",
-    "GITHUB_FACTORY_LABEL",
-    "GITHUB_FACTORY_MENTION",
-    "GITHUB_FACTORY_POLL_INTERVAL_S",
-    "GITHUB_FACTORY_PYTHON_CI",
     "GITHUB_REPO_ALLOWLIST",
     "GITHUB_REVIEW_INGRESS_ENABLED",
     "GITHUB_REVIEW_RECONCILER_INTERVAL_S",

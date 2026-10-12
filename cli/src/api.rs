@@ -253,6 +253,11 @@ pub struct ChannelBinding {
     pub adapter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_callers: Option<Vec<String>>,
+    /// The label that starts factory work through a tracker surface (#4361).
+    /// `None` serves the configured tracker label, and is what a platform that
+    /// predates the field reads as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_label: Option<String>,
 }
 
 /// The identity every Slack binding had before ADR-0168: the installation's one
@@ -2000,6 +2005,7 @@ fn agent_create_body(
             address: slack_channel.to_string(),
             endpoint: None,
             kind: "slack".to_string(),
+            trigger_label: None,
         },
         name: name.to_string(),
         repo_full_name: repo_full_name.map(str::to_string),
@@ -2079,17 +2085,22 @@ fn agent_update_body(repo_full_name: Option<&str>) -> AgentUpdate {
 /// refuses a Slack `endpoint`, and a non-Slack `adapter` with no `endpoint`,
 /// before this function ever sees the arguments, and clap's `--endpoint`
 /// `requires` `--adapter` covers the other direction.
+///
+/// `trigger_label` travels only when named (#4361); `ChannelChange::resolve`
+/// has already refused it on any kind but a tracker surface.
 fn add_channel_body(
     kind: &str,
     address: &str,
     endpoint: Option<&str>,
     adapter: Option<&str>,
+    trigger_label: Option<&str>,
 ) -> ChannelBindingWrite {
     ChannelBindingWrite {
         adapter: adapter.map(str::to_string),
         address: address.to_string(),
         endpoint: endpoint.map(str::to_string),
         kind: kind.to_string(),
+        trigger_label: trigger_label.map(str::to_string),
     }
 }
 
@@ -2667,7 +2678,7 @@ impl ApiClient {
     /// agent, when a concurrent deploy won the race to add the same route. This
     /// is ensure-bound, a statement about the END STATE, so the conflict is
     /// rechecked against a fresh read and answered as success only when this
-    /// agent now owns the route.
+    /// agent now owns the route, under the same trigger label.
     pub async fn add_agent_channel(
         &self,
         agent_id: &str,
@@ -2675,13 +2686,20 @@ impl ApiClient {
         address: &str,
         endpoint: Option<&str>,
         adapter: Option<&str>,
+        trigger_label: Option<&str>,
     ) -> Result<Agent> {
         let wanted = named_identity(kind, adapter);
         let resp = self
             .http
             .post(format!("{}/agents/{agent_id}/channels", self.base_url))
             .header("X-API-Key", &self.api_key)
-            .json::<ChannelBindingWrite>(&add_channel_body(kind, address, endpoint, adapter))
+            .json::<ChannelBindingWrite>(&add_channel_body(
+                kind,
+                address,
+                endpoint,
+                adapter,
+                trigger_label,
+            ))
             .send()
             .await
             .context("POST /agents/{id}/channels")?;
@@ -2696,11 +2714,12 @@ impl ApiClient {
                 .await
                 .expect_err("a 409 is never a success");
             let agent = self.get_agent(agent_id).await?;
-            if agent
-                .channels
-                .iter()
-                .any(|b| b.kind == kind && b.address == address && b.named_adapter() == wanted)
-            {
+            if agent.channels.iter().any(|b| {
+                b.kind == kind
+                    && b.address == address
+                    && b.named_adapter() == wanted
+                    && b.trigger_label.as_deref() == trigger_label
+            }) {
                 return Ok(agent);
             }
             return Err(conflict);
@@ -2936,7 +2955,7 @@ impl ApiClient {
                 // with no channel does not.
                 let agent = match channel_add {
                     Some(address) => {
-                        self.add_agent_channel(&agent.id, "slack", address, None, identity)
+                        self.add_agent_channel(&agent.id, "slack", address, None, identity, None)
                             .await?
                     }
                     None => agent,
@@ -5157,13 +5176,19 @@ mod tests {
         // the assertion, so a stray `agent_id` echoed back into the body, or a
         // bare address string standing in for the pair, both fail.
         assert_eq!(
-            wire(&add_channel_body("slack", "C0EXAMPLE1", None, None)),
+            wire(&add_channel_body("slack", "C0EXAMPLE1", None, None, None)),
             serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1"})
         );
         // The kind is never inferred: a non-Slack ingress passes through
         // verbatim, which is the whole point of a channel-neutral binding.
         assert_eq!(
-            wire(&add_channel_body("email", "ops@example.com", None, None)),
+            wire(&add_channel_body(
+                "email",
+                "ops@example.com",
+                None,
+                None,
+                None
+            )),
             serde_json::json!({"kind": "email", "address": "ops@example.com"})
         );
     }
@@ -5178,7 +5203,8 @@ mod tests {
                 "slack",
                 "C0EXAMPLE1",
                 None,
-                Some("default")
+                Some("default"),
+                None,
             )),
             serde_json::json!({"kind": "slack", "address": "C0EXAMPLE1", "adapter": "default"})
         );
@@ -5193,6 +5219,7 @@ mod tests {
                 "111111111111111111",
                 Some("https://discord-adapter.example.com/replies"),
                 Some("discord-main"),
+                None,
             )),
             serde_json::json!({
                 "kind": "discord",
@@ -5238,6 +5265,7 @@ mod tests {
             address: "C0EXAMPLE1".into(),
             adapter: adapter.map(str::to_string),
             allowed_callers: None,
+            trigger_label: None,
         };
         assert_eq!(binding("slack", Some("default")).named_adapter(), None);
         assert_eq!(

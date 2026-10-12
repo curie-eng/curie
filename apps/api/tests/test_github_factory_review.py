@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import importlib
 import itertools
 import sys
 import uuid
@@ -33,8 +32,10 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import jwt
 import pytest
 import redis.asyncio as redis
+from curie_api import github_app
 from curie_api.config import get_settings
 from curie_api.main import create_app
 from curie_api.workitem_reconciler import WorkItemReconciler
@@ -46,7 +47,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from forge_fakes.github import (  # noqa: E402
-    _ENV,
     INSTALLATION_ID,
     LABEL,
     MENTION,
@@ -55,10 +55,11 @@ from forge_fakes.github import (  # noqa: E402
     SENDER,
     SENDER_ID,
     GitHubAPI,
-    _Credentials,
     _issue_event,
     _post,
     _sender,
+    factory_env,
+    fake_installation_tokens,
 )
 from test_github_factory_ingress import _code, _mark_running, _rows  # noqa: E402
 
@@ -194,28 +195,13 @@ def _feedback_event(
     return payload, fid
 
 
-def _patch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (
-        "curie_api.github_factory",
-        "curie_api.github_review_truth",
-        "curie_api.github_factory_review",
-        "curie_api.factory_notices",
-        "curie_api.repository_auth",
-    ):
-        try:
-            module = importlib.import_module(name)
-        except ImportError:
-            continue
-        monkeypatch.setattr(
-            module, "credentials_for", lambda _settings: _Credentials(), raising=False
-        )
-
-
-def _boot(monkeypatch: pytest.MonkeyPatch, api: ReviewGitHubAPI, env: dict[str, str]) -> Any:
-    for key, value in {**_ENV, **env}.items():
+def _boot(
+    monkeypatch: pytest.MonkeyPatch, api: ReviewGitHubAPI, env: dict[str, str], key_dir: Path
+) -> Any:
+    for key, value in {**factory_env(key_dir), **env}.items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
-    _patch_credentials(monkeypatch)
+    fake_installation_tokens(monkeypatch)
     return api
 
 
@@ -243,8 +229,13 @@ def _client_with_agent(api: ReviewGitHubAPI) -> Any:
 
 
 @pytest.fixture
-def factory(monkeypatch: pytest.MonkeyPatch, clean_db: None, review_api: ReviewGitHubAPI) -> Any:
-    _boot(monkeypatch, review_api, {})
+def factory(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_db: None,
+    review_api: ReviewGitHubAPI,
+    tmp_path: Path,
+) -> Any:
+    _boot(monkeypatch, review_api, {}, tmp_path)
     client_cm, client, external = _client_with_agent(review_api)
     try:
         yield client, review_api
@@ -723,11 +714,26 @@ def test_review_admission_survives_work_item_version_change_during_verification(
     verify = github_factory_review.verify_feedback_truth
     bumped = False
 
-    async def verify_with_version_change(*args: Any, **kwargs: Any) -> None:
+    async def verify_with_version_change(
+        feedback: Any,
+        lineage: Any,
+        *,
+        settings: Any,
+        client: httpx.AsyncClient,
+        credentials: github_app.GitHubCredentials,
+        api_url: str,
+    ) -> str:
         nonlocal bumped
-        await verify(*args, **kwargs)
+        head = await verify(
+            feedback,
+            lineage,
+            settings=settings,
+            client=client,
+            credentials=credentials,
+            api_url=api_url,
+        )
         if bumped:
-            return
+            return head
         bumped = True
         engine = create_async_engine(get_settings().database_url)
         try:
@@ -741,6 +747,7 @@ def test_review_admission_survives_work_item_version_change_during_verification(
                 )
         finally:
             await engine.dispose()
+        return head
 
     monkeypatch.setattr(
         github_factory_review, "verify_feedback_truth", verify_with_version_change
@@ -822,8 +829,7 @@ def test_closed_lineage_cancels_queued_review_revision_after_live_run_ends(
     assert _requests(number)[1]["status"] == "cancelled"
 
 
-@pytest.fixture
-def review_key() -> str:
+def _rsa_pem() -> str:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
 
@@ -835,11 +841,17 @@ def review_key() -> str:
     ).decode()
 
 
+@pytest.fixture
+def review_key() -> str:
+    return _rsa_pem()
+
+
 def test_review_ingress_still_owns_pull_requests_no_work_item_owns(
     monkeypatch: pytest.MonkeyPatch,
     clean_db: None,
     review_api: ReviewGitHubAPI,
     review_key: str,
+    tmp_path: Path,
 ) -> None:
     stream = f"test:curie:factory-review:{uuid.uuid4().hex}"
     _boot(
@@ -852,6 +864,7 @@ def test_review_ingress_still_owns_pull_requests_no_work_item_owns(
             "RUNS_STREAM": stream,
             "KEY_PREFIX": f"{stream}:worker",
         },
+        tmp_path,
     )
     client_cm, client, external = _client_with_agent(review_api)
     try:
@@ -869,4 +882,71 @@ def test_review_ingress_still_owns_pull_requests_no_work_item_owns(
     finally:
         client.portal.call(external.aclose)
         client_cm.__exit__(None, None, None)
+        get_settings.cache_clear()
+
+
+def test_factory_review_truth_mints_with_the_code_host_credential(
+    monkeypatch: pytest.MonkeyPatch,
+    clean_db: None,
+    review_api: ReviewGitHubAPI,
+    tmp_path: Path,
+) -> None:
+    """#4397 R2 finding 2: factory review truth mints with the code host
+    entry's App, never the non-factory settings App."""
+
+    env = {
+        **factory_env(tmp_path, app_id="2222", private_key=_rsa_pem()),
+        "GITHUB_APP_ID": "1111",
+        "GITHUB_APP_PRIVATE_KEY": _rsa_pem(),
+    }
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    get_settings.cache_clear()
+
+    issuers: list[str] = []
+    installation_path = f"/repos/{REPO}/installation"
+    token_path = f"/app/installations/{INSTALLATION_ID}/access_tokens"
+
+    def github_app_endpoints(request: httpx.Request) -> httpx.Response:
+        # https://docs.github.com/en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
+        # https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
+        authorization = request.headers.get("authorization", "")
+        if authorization.startswith("Bearer "):
+            app_jwt = authorization.removeprefix("Bearer ")
+            issuers.append(jwt.decode(app_jwt, options={"verify_signature": False})["iss"])
+        if request.method == "GET" and request.url.path == installation_path:
+            return httpx.Response(200, json={"id": INSTALLATION_ID})
+        if request.method == "POST" and request.url.path == token_path:
+            return httpx.Response(
+                201,
+                json={"token": "ghs_code_host_fixture", "expires_at": "2099-01-01T00:00:00Z"},
+            )
+        return httpx.Response(404, json={"message": "missing fixture"})
+
+    transport = httpx.MockTransport(github_app_endpoints)
+    real_client = httpx.Client
+
+    def stub_client(**kwargs: Any) -> httpx.Client:
+        kwargs.pop("verify", None)
+        return real_client(transport=transport, **kwargs)
+
+    github_app._RESOLVERS.clear()
+    client_cm, client, external = _client_with_agent(review_api)
+    try:
+        monkeypatch.setattr("curie_api.github_app.httpx.Client", stub_client)
+        number, pr, first = _owned(client, review_api)
+        payload, _ = _feedback_event(review_api, "issue_comment", pr, _mention())
+
+        response = _post(client, "issue_comment", payload)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "factory_admitted", response.text
+        rows = _requests(number)
+        assert [row["sequence"] for row in rows] == [1, 2]
+        assert rows[1]["work_item_id"] == first["work_item_id"]
+        assert set(issuers) == {"2222"}
+    finally:
+        client.portal.call(external.aclose)
+        client_cm.__exit__(None, None, None)
+        github_app._RESOLVERS.clear()
         get_settings.cache_clear()

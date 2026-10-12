@@ -83,7 +83,7 @@ async def github_webhook(
         "pull_request_review_comment",
         "pull_request_review",
     }
-    factory_enabled = settings.github_factory_ingress_enabled
+    factory_enabled = settings.factory_enabled
     # Disabled factory intake must keep ignoring issue events before JSON parsing.
     # test_unrelated_event_remains_ignored_without_parsing posts a non-JSON body.
     if x_github_event == "issues" and not factory_enabled:

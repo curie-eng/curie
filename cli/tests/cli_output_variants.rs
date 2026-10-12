@@ -338,6 +338,7 @@ fn cluster_status() -> Box<ClusterStatus> {
         urls: Vec::new(),
         upgrade: curie::ops::UpgradeStatusView::idle(None),
         delivery: curie::completion_outbox::Report::unknown(),
+        credentials: Vec::new(),
     })
 }
 
@@ -413,6 +414,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     address: "C0EXAMPLE1".to_string(),
                     adapter: Some("default".to_string()),
                     allowed_callers: Some(vec!["U0EXAMPLE1".to_string()]),
+                    trigger_label: None,
                 },
                 changed: true,
             },
@@ -433,6 +435,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                         address: "#legacy-alerts".to_string(),
                         adapter: None,
                         allowed_callers: None,
+                        trigger_label: None,
                     },
                     // A named, non-default identity (ADR-0168 decision 3)
                     // alongside the default-identity row above, so the schema
@@ -442,6 +445,23 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                         address: "C0EXAMPLE1".to_string(),
                         adapter: Some("ops-secondary".to_string()),
                         allowed_callers: None,
+                        trigger_label: None,
+                    },
+                    // Tracker bindings carry `trigger_label`: a named one, and
+                    // null where the install label serves the binding (#4361).
+                    ChannelBinding {
+                        kind: "github".to_string(),
+                        address: "acme/widgets".to_string(),
+                        adapter: None,
+                        allowed_callers: None,
+                        trigger_label: Some("curie-factory-fast".to_string()),
+                    },
+                    ChannelBinding {
+                        kind: "github".to_string(),
+                        address: "acme/other".to_string(),
+                        adapter: None,
+                        allowed_callers: None,
+                        trigger_label: None,
                     },
                 ],
                 changed: true,
@@ -748,11 +768,25 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                 repos: vec!["acme/widgets".to_string()],
                 label: "curie-factory".to_string(),
                 label_inferred: true,
-                runner_image: "ghcr.io/curie-eng/curie-dark-factory-runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                runner_image: Some("ghcr.io/curie-eng/curie-dark-factory-runner@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()),
                 agent: "dark-factory".to_string(),
+                trigger_label: None,
+                effective_label: "curie-factory".to_string(),
                 deadline_seconds: 3600,
                 budget_usd: 5.0,
                 credit_remaining_usd: Some(73.49),
+            },
+            "AgentAdded" => QuickstartOutput::AgentAdded {
+                context: "example-context".to_string(),
+                agent: "dark-factory-fast".to_string(),
+                repos: vec!["acme/widgets".to_string()],
+                trigger_label: Some("curie-factory-fast".to_string()),
+                effective_label: "curie-factory-fast".to_string(),
+                bundle: "/ops/fast-bundle".to_string(),
+                runner_image: None,
+                deadline_seconds: 3600,
+                budget_usd: 1.0,
+                credit_remaining_usd: None,
             },
         ],
     );

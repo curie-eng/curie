@@ -26,7 +26,7 @@ use crate::ops::{plain, require_on_path, run_step, CmdArg, CommonOpts, OpsComman
 pub const CLUSTER_SECRET_PLACEHOLDER: &str = "secretKeyRef";
 
 /// Chart agent names match templates/agent-sandbox.yaml.
-fn validate_agent_resource_name(agent: &str) -> Result<()> {
+pub fn validate_agent_resource_name(agent: &str) -> Result<()> {
     // `self` is reserved for `admits` (ADR-0168 decision 7), where it means
     // the agent this bundle is deployed as. A real agent named `self` would
     // be indistinguishable from that sentinel wherever `admits` is resolved.
@@ -582,6 +582,55 @@ fn runner_image_update(runner_image: Option<&str>, changed: bool) -> RunnerImage
         (None, true) => RunnerImageUpdate::Clear,
         (_, false) => RunnerImageUpdate::Keep,
     }
+}
+
+/// Enroll `agent`'s sandboxes for forge egress (`factory.sandboxEgress`,
+/// #4397) on an agent added with no intake run. The serving revision's values
+/// decide: an agent already recorded `true` is left alone and `chart` is never
+/// awaited. Otherwise one `helm upgrade --reset-then-reuse-values` sets that
+/// one key. The API does not read it, so nothing is rolled. Returns whether
+/// the release was upgraded.
+pub async fn bind_forge_egress<F>(common: CommonOpts, agent: String, chart: F) -> Result<bool>
+where
+    F: std::future::Future<Output = Result<String>>,
+{
+    validate_agent_resource_name(&agent)?;
+    let values = read_release_values(&common).await?;
+    let enrolled = values
+        .as_ref()
+        .and_then(|v| v.pointer("/factory/sandboxEgress"))
+        .and_then(|all| all.get(&agent))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if enrolled {
+        return Ok(false);
+    }
+    let chart = chart.await?;
+    let cmd = OpsCommand::new(
+        "helm",
+        vec![
+            plain("upgrade"),
+            plain(&common.release),
+            plain(&chart),
+            plain("-n"),
+            plain(&common.namespace),
+            plain("--reset-then-reuse-values"),
+            plain("--set"),
+            plain(format!("factory.sandboxEgress.{agent}=true")),
+        ],
+    );
+    let ui = crate::ui::ui();
+    run_step(
+        &ui.checklist(),
+        &format!(
+            "enrolling agent {agent} for forge egress on release {}",
+            common.release
+        ),
+        "enrolled",
+        &cmd,
+    )
+    .await?;
+    Ok(true)
 }
 
 pub async fn bind(opts: BindOpts) -> Result<()> {
@@ -1905,5 +1954,86 @@ esac
         assert_eq!(need, BindNeed::Current);
         assert_eq!(helm.revision(), 7);
         assert!(!helm.dir.path().join("kubectl.log").exists());
+    }
+
+    // #4397 AC 6 / #4362: an added agent is enrolled for forge egress with no
+    // intake run. The serving revision's values decide; a rerun is a no-op.
+    #[tokio::test]
+    async fn bind_forge_egress_is_a_noop_when_recorded() {
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({"factory": {
+            "sandboxEgress": {"dark-factory": true, "dark-factory-fast": true}
+        }}));
+        bind_forge_egress(common(), "dark-factory-fast".into(), async {
+            panic!("an enrolled agent must not resolve a chart")
+        })
+        .await
+        .expect("a recorded enrolment is current");
+        assert_eq!(helm.revision(), 7, "the release was upgraded for a no-op");
+        assert_eq!(helm.helm_log(), "");
+        assert!(helm.kubectl_log().is_none(), "nothing rolls for a no-op");
+    }
+
+    #[tokio::test]
+    async fn bind_forge_egress_sets_one_agent_with_reset_then_reuse_values() {
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({"factory": {
+            "sandboxEgress": {"dark-factory": true, "dark-factory-off": false}
+        }}));
+        bind_forge_egress(common(), "dark-factory-fast".into(), async {
+            Ok("charts/curie".to_string())
+        })
+        .await
+        .expect("an unenrolled agent is bound");
+        assert_eq!(helm.revision(), 8, "exactly one helm upgrade");
+        let log = helm.helm_log();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(log.contains("--reset-then-reuse-values"), "{log}");
+        assert!(
+            log.contains("factory.sandboxEgress.dark-factory-fast=true"),
+            "{log}"
+        );
+        assert!(
+            !log.contains("sandboxEgress.dark-factory="),
+            "another agent's enrolment must not be rewritten: {log}"
+        );
+        assert!(log.contains("charts/curie"), "{log}");
+        // The API does not read sandboxEgress, so it is not rolled.
+        let kubectl = helm.kubectl_log().unwrap_or_default();
+        assert!(!kubectl.contains("rollout restart"), "{kubectl}");
+    }
+
+    #[tokio::test]
+    async fn bind_forge_egress_binds_an_agent_recorded_false() {
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({"factory": {
+            "sandboxEgress": {"dark-factory-off": false}
+        }}));
+        bind_forge_egress(common(), "dark-factory-off".into(), async {
+            Ok("charts/curie".to_string())
+        })
+        .await
+        .expect("a false enrolment is bound");
+        assert_eq!(helm.revision(), 8);
+        assert!(
+            helm.helm_log()
+                .contains("factory.sandboxEgress.dark-factory-off=true"),
+            "{}",
+            helm.helm_log()
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_forge_egress_refuses_an_invalid_agent_name_before_helm() {
+        let _env = crate::PROCESS_ENV_LOCK.lock().await;
+        let helm = StubbedHelm::install(&serde_json::json!({}));
+        let error = bind_forge_egress(common(), "Dark_Factory".into(), async {
+            panic!("an invalid name must not resolve a chart")
+        })
+        .await
+        .expect_err("an agent name that is not a DNS label is refused");
+        assert!(format!("{error:#}").contains("Dark_Factory"), "{error:#}");
+        assert_eq!(helm.revision(), 7);
+        assert_eq!(helm.helm_log(), "");
     }
 }

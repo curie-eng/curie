@@ -64,7 +64,10 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from curie_api.forges.registry import forges_registry
 from forge_fakes.github import REPO as FACTORY_REPO
+from forge_fakes.github import REPO_ID as FACTORY_REPO_ID
+from forge_fakes.github import forges_document, forges_env_json, github_repository_binding
 from forge_fakes.github_comments import _rows as _factory_rows
 from forge_fakes.github_comments import admitted, comments  # noqa: F401
 from test_factory_terminus import (  # noqa: F401
@@ -1138,7 +1141,7 @@ def test_publication_credential_resolution_does_not_block_the_event_loop(
     resolver_started = threading.Event()
     loop_progressed = threading.Event()
 
-    def blocking_resolver(_: str, __: Any) -> tuple[str, str]:
+    def blocking_resolver(_: str, *, html_base: str, credentials: Any) -> tuple[str, str]:
         resolver_started.set()
         # A blocked loop never sets the event, however long this waits, so the
         # budget only has to outlast thread wakeups on a contended runner: 0.5s
@@ -6983,24 +6986,45 @@ def _factory_publication_case(
 
 CONVERSION_PYTHON_CI_CHECK = "Unit conversion suite"
 CONVERSION_PYTHON_CI_POLICY = {
-    "check": CONVERSION_PYTHON_CI_CHECK,
+    "key": CONVERSION_PYTHON_CI_CHECK,
     "paths": ["unitconv", "tests"],
-    "pendingCheckPrefix": "Conversion batch ",
+    "pending_key_prefix": "Conversion batch ",
 }
 
 
-def _configure_python_ci(monkeypatch: pytest.MonkeyPatch, policies: Mapping[str, Any]) -> None:
-    """Set GITHUB_FACTORY_PYTHON_CI as an operator would (#3617)."""
+def _configure_python_ci(
+    monkeypatch: pytest.MonkeyPatch,
+    key_dir: Path,
+    client: TestClient,
+    policies: Mapping[str, Any],
+) -> None:
+    """Bind each repository's required Python check as an operator would (#3617):
+    on its forge binding (#4397). The running app gets the new registry too."""
 
-    monkeypatch.setenv("GITHUB_FACTORY_PYTHON_CI", json.dumps(dict(policies)))
+    bindings = [
+        github_repository_binding(
+            repo=repo,
+            repo_id=FACTORY_REPO_ID if repo.lower() == FACTORY_REPO else 9300 + index,
+            ci={"required": dict(required)},
+        )
+        for index, (repo, required) in enumerate(policies.items())
+    ]
+    document = forges_document(api_url=get_settings().github_api_url, bindings=bindings)
+    monkeypatch.setenv("CURIE_FORGES", forges_env_json(document, key_dir))
     get_settings.cache_clear()
+    client.app.state.forges = forges_registry(get_settings())
 
 
 @pytest.fixture
-def _conversion_python_ci(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def _conversion_python_ci(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, admitted: Any  # noqa: F811
+) -> Iterator[None]:
     """Configure the foreign unit conversion repository's own CI layout."""
 
-    _configure_python_ci(monkeypatch, {FACTORY_REPO: CONVERSION_PYTHON_CI_POLICY})
+    client, _github, _comments = admitted
+    _configure_python_ci(
+        monkeypatch, tmp_path, client, {FACTORY_REPO: CONVERSION_PYTHON_CI_POLICY}
+    )
     yield
     get_settings.cache_clear()
 
@@ -7483,10 +7507,16 @@ def test_outside_python_layout_without_a_policy_accepts_any_python_path(
 
 def test_policy_for_another_repository_does_not_apply(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
-    _configure_python_ci(monkeypatch, {"acme-corp/another-repository": CONVERSION_PYTHON_CI_POLICY})
     client, request_id, payload = _factory_publication_case
+    _configure_python_ci(
+        monkeypatch,
+        tmp_path,
+        client,
+        {"acme-corp/another-repository": CONVERSION_PYTHON_CI_POLICY},
+    )
     payload["changed_paths"] = ["unitconv/convert.py"]
     recorded = _record_factory_verification(client, request_id, outcome="not_declared")
     assert recorded.status_code == 201, recorded.text
@@ -7499,13 +7529,16 @@ def test_policy_for_another_repository_does_not_apply(
 
 def test_custom_policy_names_its_check_in_the_pending_proof_stamp(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
+    client, request_id, payload = _factory_publication_case
     _configure_python_ci(
         monkeypatch,
-        {FACTORY_REPO.upper(): {"check": "Unit tests", "paths": ["src"]}},
+        tmp_path,
+        client,
+        {FACTORY_REPO.upper(): {"key": "Unit tests", "paths": ["src"]}},
     )
-    client, request_id, payload = _factory_publication_case
     payload["changed_paths"] = ["src/widget.py"]
     recorded = _record_factory_verification(client, request_id, outcome="not_declared")
     assert recorded.status_code == 201, recorded.text
@@ -7526,10 +7559,13 @@ def test_custom_policy_names_its_check_in_the_pending_proof_stamp(
 
 def test_custom_policy_refuses_a_path_outside_its_selection(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     _factory_publication_case: tuple[TestClient, uuid.UUID, dict[str, Any]],
 ) -> None:
-    _configure_python_ci(monkeypatch, {FACTORY_REPO: {"check": "Unit tests", "paths": ["src"]}})
     client, request_id, payload = _factory_publication_case
+    _configure_python_ci(
+        monkeypatch, tmp_path, client, {FACTORY_REPO: {"key": "Unit tests", "paths": ["src"]}}
+    )
     # Selected by the conversion policy, outside this custom policy's layout.
     payload["changed_paths"] = ["unitconv/convert.py"]
     recorded = _record_factory_verification(client, request_id)

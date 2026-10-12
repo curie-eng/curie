@@ -16,6 +16,9 @@ pub enum ChannelChange {
         address: String,
         endpoint: Option<String>,
         adapter: Option<String>,
+        /// The label that starts factory work through this tracker surface
+        /// (#4361). `None` serves the configured tracker label.
+        trigger_label: Option<String>,
     },
     Remove {
         kind: String,
@@ -41,18 +44,31 @@ impl ChannelChange {
     ///     on `--add` (with no `--endpoint`) or the identity to drop on
     ///     `--remove` (ADR-0168 decision 3). Meaningless with neither, since
     ///     there is no write and no removal selector for it to name.
+    ///   label: `--label`, valid only with `--add` (clap's `requires`) on a
+    ///     tracker surface kind (#4361, #4397 decision 10).
     ///
     /// Returns:
-    ///   The intent, or a usage error when the pair is malformed.
+    ///   The intent, or a usage error when the pair or the label is malformed.
     pub fn resolve(
         add: Option<String>,
         remove: Option<String>,
         endpoint: Option<String>,
         adapter: Option<String>,
+        label: Option<String>,
     ) -> Result<Self> {
         match (add, remove) {
             (Some(spec), _) => {
                 let (kind, address) = parse_channel_pair(&spec)?;
+                if let Some(label) = &label {
+                    if !TRIGGER_LABEL_KINDS.contains(&kind.as_str()) {
+                        return Err(crate::exit::usage(format!(
+                            "--label on a {kind} surface: a trigger label starts factory work \
+                             through a tracker surface ({}), and a {kind} surface starts none",
+                            TRIGGER_LABEL_KINDS.join(", ")
+                        )));
+                    }
+                    valid_trigger_label(label)?;
+                }
                 if kind == "slack" && endpoint.is_some() {
                     return Err(crate::exit::usage(
                         "--endpoint on a Slack binding: a Slack route names its identity with \
@@ -76,6 +92,7 @@ impl ChannelChange {
                     address,
                     endpoint,
                     adapter,
+                    trigger_label: label,
                 })
             }
             (None, Some(spec)) => {
@@ -96,6 +113,45 @@ impl ChannelChange {
             }
         }
     }
+}
+
+/// The surface kinds a trigger label may sit on: every tracker surface
+/// (#4361, #4397 decision 10). The API states the same set.
+pub(crate) const TRIGGER_LABEL_KINDS: [&str; 3] = ["github", "gitlab", "jira"];
+
+/// The label families a trigger label may not start with: the factory's state
+/// labels, `base:` labels and `repo:` labels, which the API also refuses.
+const RESERVED_LABEL_PREFIXES: [&str; 3] = ["curie-factory:", "base:", "repo:"];
+
+/// The longest trigger label the API stores.
+const MAX_TRIGGER_LABEL_CHARS: usize = 50;
+
+/// Check one `--label` value before any request, mirroring the API's rule
+/// (convention: validate at the API, mirror in the CLI): 1 to 50 characters,
+/// no whitespace, and none of the reserved label prefixes.
+///
+/// Returns:
+///   `Ok(())`, or a usage error naming `--label` and the rule it breaks.
+pub(crate) fn valid_trigger_label(label: &str) -> Result<()> {
+    if label.is_empty()
+        || label.chars().count() > MAX_TRIGGER_LABEL_CHARS
+        || label.chars().any(char::is_whitespace)
+    {
+        return Err(crate::exit::usage(format!(
+            "--label {label:?} must be 1 to {MAX_TRIGGER_LABEL_CHARS} characters with no \
+             whitespace"
+        )));
+    }
+    if let Some(prefix) = RESERVED_LABEL_PREFIXES
+        .iter()
+        .find(|prefix| label.starts_with(**prefix))
+    {
+        return Err(crate::exit::usage(format!(
+            "--label {label:?} starts with {prefix:?}, a label family the factory owns; \
+             pick a label that does not"
+        )));
+    }
+    Ok(())
 }
 
 /// Split `KIND=ADDRESS` on the FIRST `=` only. A kind may not contain one; an
@@ -143,6 +199,10 @@ pub(super) struct ChannelBindingPresentation<'a> {
     address: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     adapter: Option<&'a str>,
+    /// Present on every tracker binding (`TRIGGER_LABEL_KINDS`), where `null`
+    /// is a binding the install label serves; absent on any other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_label: Option<Option<&'a str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<&'static str>,
 }
@@ -166,6 +226,9 @@ pub(super) fn channel_binding_presentation(
         kind: &binding.kind,
         address: &binding.address,
         adapter: channel_binding_named_identity(binding),
+        trigger_label: TRIGGER_LABEL_KINDS
+            .contains(&binding.kind.as_str())
+            .then_some(binding.trigger_label.as_deref()),
         warning: channel_binding_never_resolves(&binding.kind, &binding.address)
             .then_some(CHANNEL_BINDING_NEVER_RESOLVES_WARNING),
     }
@@ -211,9 +274,15 @@ impl crate::ui::CliOutput for ChannelsOutput {
                 } else {
                     channels
                         .iter()
-                        .map(|c| match channel_binding_named_identity(c) {
-                            Some(identity) => format!("{}:{} ({identity})", c.kind, c.address),
-                            None => format!("{}:{}", c.kind, c.address),
+                        .map(|c| {
+                            let route = match channel_binding_named_identity(c) {
+                                Some(identity) => format!("{}:{} ({identity})", c.kind, c.address),
+                                None => format!("{}:{}", c.kind, c.address),
+                            };
+                            match &c.trigger_label {
+                                Some(label) => format!("{route} [label {label}]"),
+                                None => route,
+                            }
                         })
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -267,6 +336,7 @@ pub async fn channel_bindings(
                 address,
                 endpoint,
                 adapter,
+                trigger_label,
             } => {
                 // Three reply-route shapes (ADR-0168 decision 3): a
                 // non-Slack route (endpoint + adapter together), a named
@@ -279,8 +349,12 @@ pub async fn channel_bindings(
                 } else {
                     "implicit".to_string()
                 };
+                let label = match trigger_label {
+                    Some(label) => format!(",\"trigger_label\":\"{label}\""),
+                    None => String::new(),
+                };
                 format!(
-                        "POST {}/agents/<id>/channels  {{\"kind\":\"{kind}\",\"address\":\"{address}\"}}  \
+                        "POST {}/agents/<id>/channels  {{\"kind\":\"{kind}\",\"address\":\"{address}\"{label}}}  \
                          (would resolve agent {:?} first; reply route: {reply_route})",
                         opts.api_url, opts.agent,
                     )
@@ -327,14 +401,21 @@ pub async fn channel_bindings(
         name = agent.name
     ));
     let saved = if adding {
-        let (endpoint, adapter) = match &change {
+        let (endpoint, adapter, trigger_label) = match &change {
             ChannelChange::Add {
-                endpoint, adapter, ..
-            } => (endpoint.as_deref(), adapter.as_deref()),
-            _ => (None, None),
+                endpoint,
+                adapter,
+                trigger_label,
+                ..
+            } => (
+                endpoint.as_deref(),
+                adapter.as_deref(),
+                trigger_label.as_deref(),
+            ),
+            _ => (None, None, None),
         };
         client
-            .add_agent_channel(&agent.id, kind, address, endpoint, adapter)
+            .add_agent_channel(&agent.id, kind, address, endpoint, adapter, trigger_label)
             .await
     } else {
         // The DELETE answers 204 with no body, so the remaining set comes from
@@ -623,7 +704,8 @@ mod channels_tests {
         // Splitting on the last `=`, or rejecting the second one, would make
         // those addresses unbindable through the CLI.
         let change =
-            ChannelChange::resolve(Some("slack=C0EXAMPLE1".into()), None, None, None).unwrap();
+            ChannelChange::resolve(Some("slack=C0EXAMPLE1".into()), None, None, None, None)
+                .unwrap();
         assert_eq!(
             change,
             ChannelChange::Add {
@@ -631,12 +713,18 @@ mod channels_tests {
                 address: "C0EXAMPLE1".into(),
                 endpoint: None,
                 adapter: None,
+                trigger_label: None,
             }
         );
 
-        let odd =
-            ChannelChange::resolve(Some("email=ops+a=b@example.com".into()), None, None, None)
-                .unwrap();
+        let odd = ChannelChange::resolve(
+            Some("email=ops+a=b@example.com".into()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             odd,
             ChannelChange::Add {
@@ -644,13 +732,15 @@ mod channels_tests {
                 address: "ops+a=b@example.com".into(),
                 endpoint: None,
                 adapter: None,
+                trigger_label: None,
             },
             "everything after the first `=` is the address, `=` included"
         );
 
         // The same rule on the remove side: one parser, both flags.
         let removed =
-            ChannelChange::resolve(None, Some("slack=C0EXAMPLE2".into()), None, None).unwrap();
+            ChannelChange::resolve(None, Some("slack=C0EXAMPLE2".into()), None, None, None)
+                .unwrap();
         assert_eq!(
             removed,
             ChannelChange::Remove {
@@ -662,7 +752,7 @@ mod channels_tests {
 
         // Neither flag is an inspect, not an error: `channels <agent>` lists.
         assert_eq!(
-            ChannelChange::resolve(None, None, None, None).unwrap(),
+            ChannelChange::resolve(None, None, None, None, None).unwrap(),
             ChannelChange::List
         );
     }
@@ -677,6 +767,7 @@ mod channels_tests {
             None,
             None,
             Some("default".into()),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -686,6 +777,7 @@ mod channels_tests {
                 address: "C0EXAMPLE1".into(),
                 endpoint: None,
                 adapter: Some("default".into()),
+                trigger_label: None,
             }
         );
 
@@ -694,6 +786,7 @@ mod channels_tests {
             Some("slack=C0EXAMPLE1".into()),
             None,
             Some("default".into()),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -712,7 +805,8 @@ mod channels_tests {
         // is no write for it to name an identity on, and no removal for it to
         // select. It refuses before any I/O rather than reading as the
         // read-only `List`, which would drop the flag without a word.
-        let err = ChannelChange::resolve(None, None, None, Some("default".into())).unwrap_err();
+        let err =
+            ChannelChange::resolve(None, None, None, Some("default".into()), None).unwrap_err();
         let (class, _fix) = crate::exit::classify(&err);
         assert_eq!(class, crate::exit::ExitClass::Usage);
         assert!(err.to_string().contains("--adapter"), "{err}");
@@ -721,7 +815,7 @@ mod channels_tests {
 
         // Plain `List` (no adapter at all) is unaffected.
         assert_eq!(
-            ChannelChange::resolve(None, None, None, None).unwrap(),
+            ChannelChange::resolve(None, None, None, None, None).unwrap(),
             ChannelChange::List
         );
     }
@@ -738,6 +832,7 @@ mod channels_tests {
             None,
             None,
             Some("discord-main".into()),
+            None,
         )
         .unwrap_err();
         let (class, _fix) = crate::exit::classify(&err);
@@ -750,7 +845,8 @@ mod channels_tests {
             Some("slack=C0EXAMPLE1".into()),
             None,
             None,
-            Some("second-bot".into())
+            Some("second-bot".into()),
+            None
         )
         .is_ok());
 
@@ -761,6 +857,7 @@ mod channels_tests {
             None,
             Some("https://discord-adapter.example.com/replies".into()),
             Some("discord-main".into()),
+            None,
         )
         .is_ok());
     }
@@ -773,6 +870,7 @@ mod channels_tests {
             None,
             Some("http://127.0.0.1:1".into()),
             Some("proof-offline".into()),
+            None,
         )
         .unwrap_err();
         let (class, _fix) = crate::exit::classify(&err);
@@ -786,7 +884,8 @@ mod channels_tests {
         // to "slack" would be the silent-wrong-thing: the operator learns the
         // kind is optional, and the first non-Slack ingress binds to the wrong
         // one. The error must exit USAGE, before any network call.
-        let err = ChannelChange::resolve(Some("C0EXAMPLE1".into()), None, None, None).unwrap_err();
+        let err =
+            ChannelChange::resolve(Some("C0EXAMPLE1".into()), None, None, None, None).unwrap_err();
         let (class, _fix) = crate::exit::classify(&err);
         assert_eq!(class, crate::exit::ExitClass::Usage);
         assert!(err.to_string().contains("KIND=ADDRESS"), "{err}");
@@ -795,7 +894,7 @@ mod channels_tests {
         // separator, and must not slip through as a half-empty pair.
         for bad in ["=C0EXAMPLE1", "slack=", "="] {
             assert!(
-                ChannelChange::resolve(Some(bad.into()), None, None, None).is_err(),
+                ChannelChange::resolve(Some(bad.into()), None, None, None, None).is_err(),
                 "{bad:?} must not resolve to a binding"
             );
         }

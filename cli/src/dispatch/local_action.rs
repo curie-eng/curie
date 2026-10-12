@@ -595,11 +595,12 @@ pub(super) async fn run(action: LocalAction) -> Result<()> {
             add,
             endpoint,
             adapter,
+            label,
             remove,
         } => emit(
             commands::channel_bindings(
                 target.into(),
-                commands::ChannelChange::resolve(add, remove, endpoint, adapter)?,
+                commands::ChannelChange::resolve(add, remove, endpoint, adapter, label)?,
             )
             .await?,
         ),

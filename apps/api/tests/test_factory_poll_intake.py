@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import importlib
 import itertools
 import json
 import sys
@@ -49,7 +48,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from forge_fakes.github import (  # noqa: E402
-    _ENV,
     INSTALLATION_ID,
     LABEL,
     MENTION,
@@ -60,6 +58,10 @@ from forge_fakes.github import (  # noqa: E402
     _comment_event,
     _issue_event,
     _post,
+    factory_env,
+    fake_installation_tokens,
+    forges_document,
+    github_repository_binding,
 )
 from test_github_factory_ingress import _rows  # noqa: E402
 from test_github_factory_review import (  # noqa: E402
@@ -76,15 +78,6 @@ _PULLS = itertools.count(410)
 _MAIN_SHA = "1" * 40
 _NEXT_SHA = "2" * 40
 _POLL_LOCK = (3745, 187)
-_CREDENTIAL_MODULES = (
-    "curie_api.factory_label_reconcile",
-    "curie_api.github_factory",
-    "curie_api.github_review_truth",
-    "curie_api.github_factory_review",
-    "curie_api.factory_notices",
-    "curie_api.factory_poll_intake",
-    "curie_api.repository_auth",
-)
 
 
 def _iso(moment: datetime) -> str:
@@ -132,6 +125,8 @@ class _PlantedIssue:
     event_id: int
     closed_event_id: int | None = None
     base_labels: tuple[str, ...] = ()
+    label: str = LABEL
+    unlabeled_event_id: int | None = None
 
 
 @dataclass
@@ -152,9 +147,7 @@ class PollGitHub:
     listed_pulls: set[int] = field(default_factory=set)
     permission: str = "write"
     default_branch: str = "main"
-    branches: dict[str, str] = field(
-        default_factory=lambda: {"main": _MAIN_SHA, "next": _NEXT_SHA}
-    )
+    branches: dict[str, str] = field(default_factory=lambda: {"main": _MAIN_SHA, "next": _NEXT_SHA})
     _comment_ids: Iterator[int] = field(default_factory=lambda: itertools.count(880000))
     _etags: dict[str, str] = field(
         default_factory=lambda: {
@@ -171,6 +164,7 @@ class PollGitHub:
         *,
         age: timedelta = timedelta(seconds=5),
         base_labels: tuple[str, ...] = (),
+        label: str = LABEL,
     ) -> int:
         number = next(_ISSUES)
         self.issues[number] = _PlantedIssue(
@@ -180,8 +174,14 @@ class PollGitHub:
             labeled_at=datetime.now(UTC) - age,
             event_id=810000 + number,
             base_labels=base_labels,
+            label=label,
         )
         return number
+
+    def unlabel_issue(self, number: int) -> None:
+        issue = self.issues[number]
+        issue.labeled = False
+        issue.unlabeled_event_id = 830000 + number
 
     def close_issue(self, number: int) -> None:
         issue = self.issues[number]
@@ -306,12 +306,23 @@ class PollGitHub:
             {
                 "id": issue.event_id,
                 "event": "labeled",
-                "label": {"name": LABEL},
+                "label": {"name": issue.label},
                 "actor": human,
                 "performed_via_github_app": None,
                 "created_at": _iso(issue.labeled_at),
             }
         ]
+        if issue.unlabeled_event_id is not None:
+            events.append(
+                {
+                    "id": issue.unlabeled_event_id,
+                    "event": "unlabeled",
+                    "label": {"name": issue.label},
+                    "actor": human,
+                    "performed_via_github_app": None,
+                    "created_at": _iso(datetime.now(UTC)),
+                }
+            )
         if issue.closed_event_id is not None:
             events.append(
                 {
@@ -330,7 +341,7 @@ class PollGitHub:
             "state": issue.state,
             "labels": [
                 {"name": name}
-                for name in ((LABEL,) if issue.labeled else ()) + issue.base_labels
+                for name in ((issue.label,) if issue.labeled else ()) + issue.base_labels
             ],
             "user": _user(),
         }
@@ -358,10 +369,11 @@ class PollGitHub:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json={"ref": f"refs/heads/{branch}", "object": {"sha": sha}})
         if path == f"{root}/issues":
+            wanted = request.url.params.get("labels")
             listed = [
                 self._issue_body(issue)
                 for issue in self.issues.values()
-                if issue.state == "open" and issue.labeled
+                if issue.state == "open" and issue.labeled and wanted in (None, issue.label)
             ]
             for number in sorted(self.listed_pulls):
                 listed.append(
@@ -505,16 +517,7 @@ class _Credentials:
 
 def _patch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     creds = _Credentials()
-
-    def credentials_for(_settings: Settings) -> _Credentials:
-        return creds
-
-    for name in _CREDENTIAL_MODULES:
-        try:
-            module = importlib.import_module(name)
-        except ImportError:
-            continue
-        monkeypatch.setattr(module, "credentials_for", credentials_for, raising=False)
+    fake_installation_tokens(monkeypatch, creds)
 
 
 def _client_type(github: PollGitHub) -> type[httpx.AsyncClient]:
@@ -528,27 +531,36 @@ def _client_type(github: PollGitHub) -> type[httpx.AsyncClient]:
     return _Client
 
 
-def _poll_env(intake: str) -> dict[str, str]:
-    env = dict(_ENV)
-    env["GITHUB_FACTORY_INTAKE"] = intake
-    env["GITHUB_FACTORY_BASES"] = "{}"
+def _poll_env(key_dir: Path, intake: str, **forges: Any) -> dict[str, str]:
     if intake == "poll":
-        env["GITHUB_FACTORY_POLL_INTERVAL_S"] = "30"
-    return env
+        forges.setdefault("poll_interval_s", 30.0)
+    return factory_env(key_dir, intake=intake, **forges)
+
+
+def _reconfigure(monkeypatch: pytest.MonkeyPatch, key_dir: Path, **forges: Any) -> None:
+    """Re-point the running poll factory at a changed GitHub forge config."""
+
+    for key, value in _poll_env(key_dir, "poll", **forges).items():
+        monkeypatch.setenv(key, value)
+    get_settings.cache_clear()
 
 
 @pytest.fixture
-def poll_factory(monkeypatch: pytest.MonkeyPatch, clean_db: None, valkey: object) -> Any:
-    yield from _factory(monkeypatch, "poll")
+def poll_factory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None, valkey: object
+) -> Any:
+    yield from _factory(monkeypatch, tmp_path, "poll")
 
 
 @pytest.fixture
-def webhook_factory(monkeypatch: pytest.MonkeyPatch, clean_db: None, valkey: object) -> Any:
-    yield from _factory(monkeypatch, "webhook")
+def webhook_factory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, clean_db: None, valkey: object
+) -> Any:
+    yield from _factory(monkeypatch, tmp_path, "webhook")
 
 
-def _factory(monkeypatch: pytest.MonkeyPatch, intake: str) -> Any:
-    for key, value in _poll_env(intake).items():
+def _factory(monkeypatch: pytest.MonkeyPatch, key_dir: Path, intake: str) -> Any:
+    for key, value in _poll_env(key_dir, intake).items():
         monkeypatch.setenv(key, value)
     get_settings.cache_clear()
     _patch_credentials(monkeypatch)
@@ -674,6 +686,7 @@ def test_poll_admits_a_young_labeled_issue_once(
 def test_poll_records_the_verified_selected_base(
     poll_factory: tuple[TestClient, PollGitHub],
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     entry: dict[str, Any] | None,
     labels: tuple[str, ...],
     branch: str,
@@ -682,8 +695,7 @@ def test_poll_records_the_verified_selected_base(
 ) -> None:
     _client, github = poll_factory
     if entry is not None:
-        monkeypatch.setenv("GITHUB_FACTORY_BASES", json.dumps({REPO: entry}))
-        get_settings.cache_clear()
+        _reconfigure(monkeypatch, tmp_path, bindings=[github_repository_binding(**entry)])
     number = github.plant_issue(base_labels=labels)
 
     _run_once(github)
@@ -714,16 +726,17 @@ def test_poll_records_the_verified_selected_base(
 def test_poll_refuses_an_invalid_base_and_admits_after_correction(
     poll_factory: tuple[TestClient, PollGitHub],
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     labels: tuple[str, ...],
     allowed: list[str],
     reason: str,
 ) -> None:
     _client, github = poll_factory
-    monkeypatch.setenv(
-        "GITHUB_FACTORY_BASES",
-        json.dumps({REPO: {"bases": allowed, "default_base": "main"}}),
+    _reconfigure(
+        monkeypatch,
+        tmp_path,
+        bindings=[github_repository_binding(bases=allowed, default_base="main")],
     )
-    get_settings.cache_clear()
     number = github.plant_issue(base_labels=labels)
 
     _run_once(github)
@@ -738,14 +751,17 @@ def test_poll_refuses_an_invalid_base_and_admits_after_correction(
     _run_once(github)
     assert _requests(number) == []
     assert list(github.comments.values()) == comments
-    assert len(
-        [
-            request
-            for request in github.calls
-            if request.method == "POST"
-            and request.url.path == f"/repos/{REPO}/issues/{number}/comments"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                request
+                for request in github.calls
+                if request.method == "POST"
+                and request.url.path == f"/repos/{REPO}/issues/{number}/comments"
+            ]
+        )
+        == 1
+    )
 
     github.issues[number].base_labels = ()
     github._etags["issues"] = f'"corrected-base-{number}"'
@@ -761,14 +777,14 @@ def test_poll_refuses_an_invalid_base_and_admits_after_correction(
 
 
 def test_poll_records_later_base_labels_without_readmitting_or_moving_the_base(
-    poll_factory: tuple[TestClient, PollGitHub], monkeypatch: pytest.MonkeyPatch
+    poll_factory: tuple[TestClient, PollGitHub], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _client, github = poll_factory
-    monkeypatch.setenv(
-        "GITHUB_FACTORY_BASES",
-        json.dumps({REPO: {"bases": ["main", "next"], "default_base": "main"}}),
+    _reconfigure(
+        monkeypatch,
+        tmp_path,
+        bindings=[github_repository_binding(bases=["main", "next"], default_base="main")],
     )
-    get_settings.cache_clear()
     number = github.plant_issue(base_labels=("base:next",))
     _run_once(github)
     first = _requests(number)
@@ -896,9 +912,7 @@ def test_poll_retries_a_new_label_after_event_read_failure_without_blocking_othe
 
     _run_once(github)
 
-    listings = [
-        request for request in github.calls if request.url.path == f"/repos/{REPO}/issues"
-    ]
+    listings = [request for request in github.calls if request.url.path == f"/repos/{REPO}/issues"]
     assert len(listings) == 1
     assert "if-none-match" not in listings[0].headers
     recovered = _requests(unavailable)
@@ -1077,13 +1091,21 @@ def test_stale_issue_conditional_read_still_cancels_after_an_issue_changes(
 
 
 def test_stale_issue_cache_does_not_cross_a_configured_label_change(
-    poll_factory: tuple[TestClient, PollGitHub], monkeypatch: pytest.MonkeyPatch
+    poll_factory: tuple[TestClient, PollGitHub], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """A WorkItem keeps the label that admitted it (#4361 decision 10).
+
+    After the tracker label changes, removing the old label still cancels the
+    WorkItem it admitted, and the new label admits new issues.
+    """
+
     client, github = poll_factory
     number, _row = _admit_label(client, github)
     _run_once(github)
-    monkeypatch.setenv("GITHUB_FACTORY_LABEL", f"{LABEL}-changed")
-    get_settings.cache_clear()
+    changed = f"{LABEL}-changed"
+    _reconfigure(monkeypatch, tmp_path, label=changed)
+    github.unlabel_issue(number)
+    fresh = github.plant_issue(label=changed)
     github.calls.clear()
 
     _run_once(github)
@@ -1091,11 +1113,26 @@ def test_stale_issue_cache_does_not_cross_a_configured_label_change(
     reads = [
         request for request in github.calls if request.url.path == f"/repos/{REPO}/issues/{number}"
     ]
+    # The cache is keyed on the stored label, so the configured change does not
+    # reset it; the conditional read still sees the removal.
     assert reads
-    assert all("if-none-match" not in request.headers for request in reads)
-    # The changed label has no authoritative unlabeled event, so a fresh read
-    # alone must not infer cancellation.
-    assert _requests(number)[0]["cancelled_at"] is None
+    assert any("if-none-match" in request.headers for request in reads)
+    cancelled = _requests(number)
+    assert cancelled[0]["cancelled_at"] is not None
+    assert _stored_labels(number) == [LABEL]
+    admitted = _requests(fresh)
+    assert len(admitted) == 1
+    assert admitted[0]["cancelled_at"] is None
+    assert _stored_labels(fresh) == [changed]
+
+
+def _stored_labels(number: int) -> list[str | None]:
+    rows = _rows(
+        "SELECT trigger_label FROM curie.work_items "
+        "WHERE tracker_scope_id = :repo AND tracker_issue_id = :number",
+        {"repo": str(REPO_ID), "number": str(number)},
+    )
+    return [row["trigger_label"] for row in rows]
 
 
 def test_poll_admits_a_mention_once(poll_factory: tuple[TestClient, PollGitHub]) -> None:
@@ -1351,14 +1388,13 @@ def _prod_settings(**overrides: Any) -> Settings:
         "approval_chat_attester_secret": "a-real-chat-attester-secret",
         "internal_worker_token": "a-real-worker-token",
         "github_webhook_secret": "",
-        "github_factory_ingress_enabled": True,
-        "github_factory_label": LABEL,
-        "github_factory_mention": MENTION,
+        "factory_enabled": True,
+        "forges": forges_document(label=LABEL, mention=MENTION),
         "github_review_ingress_enabled": False,
         "github_app_id": "51",
         "github_app_private_key": "example-private-key",
         "github_repo_allowlist": ("acme-corp/*",),
-        "github_factory_intake": "poll",
+        "factory_intake": "poll",
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)
@@ -1367,14 +1403,14 @@ def _prod_settings(**overrides: Any) -> Settings:
 def test_prod_poll_intake_boots_with_an_empty_webhook_secret() -> None:
     settings = _prod_settings()
 
-    assert settings.github_factory_ingress_enabled is True
+    assert settings.factory_enabled is True
     assert settings.github_webhook_secret == ""
     assert settings.github_review_ingress_enabled is False
 
 
 def test_prod_webhook_intake_refuses_an_empty_webhook_secret() -> None:
     with pytest.raises(ValueError, match="GITHUB_WEBHOOK_SECRET"):
-        _prod_settings(github_factory_intake="webhook")
+        _prod_settings(factory_intake="webhook")
 
 
 def test_poll_intake_with_review_ingress_still_requires_a_webhook_secret() -> None:
@@ -1401,7 +1437,7 @@ def test_empty_webhook_secret_rejects_its_own_hmac(
     monkeypatch: pytest.MonkeyPatch, clean_db: None, valkey: object
 ) -> None:
     monkeypatch.setenv("ENVIRONMENT", "dev")
-    monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("FACTORY_ENABLED", "false")
     monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "")
     monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")
@@ -1422,7 +1458,7 @@ def test_configured_webhook_secret_accepts_a_valid_signature(
     monkeypatch: pytest.MonkeyPatch, clean_db: None, valkey: object
 ) -> None:
     monkeypatch.setenv("ENVIRONMENT", "dev")
-    monkeypatch.setenv("GITHUB_FACTORY_INGRESS_ENABLED", "false")
+    monkeypatch.setenv("FACTORY_ENABLED", "false")
     monkeypatch.setenv("GITHUB_REVIEW_INGRESS_ENABLED", "false")
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "example-factory-hmac-secret")
     monkeypatch.setenv("CURIE_WORK_ITEM_RECONCILER_ENABLED", "false")

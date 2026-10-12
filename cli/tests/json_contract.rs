@@ -2682,6 +2682,7 @@ fn cluster_status_output_validates_both_variants() {
         urls: vec![],
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
+        credentials: Vec::new(),
     };
     let out = ClusterStatusOutput::Status(Box::new(status));
     assert_valid("cluster-status.schema.json", &out.to_json());
@@ -2719,6 +2720,7 @@ fn cluster_status_output_validates_both_variants() {
         urls: vec![],
         upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
         delivery: curie::completion_outbox::Report::unknown(),
+        credentials: Vec::new(),
     };
     let with_mail = ClusterStatusOutput::Status(Box::new(with_mail)).to_json();
     assert_eq!(
@@ -2731,6 +2733,74 @@ fn cluster_status_output_validates_both_variants() {
         lines: vec!["helm status".to_string()],
     });
     assert_valid("cluster-status.schema.json", &dry.to_json());
+}
+
+// #4397 AC 7: each configured forge credential is listed in status JSON with
+// its expiry, and the list is part of the published schema.
+#[test]
+fn cluster_status_lists_forge_credentials_in_the_schema() {
+    let now = time::OffsetDateTime::parse(
+        "2026-10-25T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let values = serde_json::json!({"factory": {
+        "codeHosts": [{"name": "github", "kind": "github",
+            "credential": {"type": "github_app", "appId": "7001"}}],
+        "trackers": [{"name": "corp-gitlab", "kind": "gitlab",
+            "credential": {"type": "static_token", "expiresAt": "2026-11-01T00:00:00Z"}}]
+    }});
+    let credentials = curie::forge_expiry::report(&values, now);
+    let status = ClusterStatus {
+        namespace: "curie".to_string(),
+        revision: "3".to_string(),
+        release_state: "deployed".to_string(),
+        release_found: true,
+        release_missing_note: None,
+        pods: vec![],
+        ready: 0,
+        total: 0,
+        unhealthy: vec![],
+        warnings: vec![],
+        pods_listed: true,
+        urls: vec![],
+        upgrade: curie::ops::UpgradeStatusView::idle(Some("0.8.6".into())),
+        delivery: curie::completion_outbox::Report::unknown(),
+        credentials,
+    };
+    let value = ClusterStatusOutput::Status(Box::new(status)).to_json();
+    assert_valid("cluster-status.schema.json", &value);
+    let listed = value["credentials"]
+        .as_array()
+        .expect("credentials is a list");
+    assert_eq!(listed.len(), 2, "{value}");
+    for entry in listed {
+        let keys: std::collections::BTreeSet<&str> = entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["expires_at", "expiry", "name", "section", "type", "warning"]
+                .into_iter()
+                .collect(),
+            "{entry}"
+        );
+    }
+    assert_eq!(listed[0]["expiry"], "none", "{value}");
+    assert_eq!(listed[1]["expiry"], "known", "{value}");
+    assert!(listed[1]["warning"]
+        .as_str()
+        .is_some_and(|w| w.contains("7 days left")));
+    let schema = load_schema("cluster-status.schema.json");
+    let mut invalid = value.clone();
+    invalid["credentials"][0]["expiry"] = serde_json::json!("soon");
+    assert!(
+        !validator(&schema).is_valid(&invalid),
+        "the schema must restrict expiry to known, unknown and none"
+    );
 }
 
 #[test]

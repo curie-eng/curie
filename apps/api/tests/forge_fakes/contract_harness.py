@@ -23,7 +23,6 @@ from curie_api.forges.capabilities import (
     Operation,
     Support,
 )
-from curie_api.forges.github import ci as github_ci
 from curie_api.forges.github import code_host as github_code_host
 from curie_api.forges.github.code_host import GitHubCodeHost
 from curie_api.forges.github.comments import GitHubMarkedComments, static_token
@@ -265,9 +264,8 @@ class GitHubHarness:
         monkeypatch.setattr(
             github_code_host,
             "resolve_repository_credential",
-            lambda path, settings: (f"{settings.github_html_base}/{path}.git", _GIT_HEADER),
+            lambda path, *, html_base, credentials: (f"{html_base}/{path}.git", _GIT_HEADER),
         )
-        monkeypatch.setattr(github_ci, "credentials_for", lambda _settings: _AppCredentials())
         self.fake = GitHubRepositoryFake()
         client = httpx.AsyncClient(transport=httpx.MockTransport(self.fake.handle))
         token = static_token("fixture-installation-token")
@@ -285,8 +283,11 @@ class GitHubHarness:
         )
         settings = Settings(github_api_url="https://api.github.com")
         self._code_host = GitHubCodeHost(
-            settings,
             client,
+            api_url=settings.github_api_url,
+            html_base="https://github.com",
+            timeout_s=settings.github_app_timeout_seconds,
+            credentials=_AppCredentials(),
             marked_comments=GitHubMarkedComments(
                 client,
                 api="https://api.github.com",

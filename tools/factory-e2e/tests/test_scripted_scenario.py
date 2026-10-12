@@ -73,6 +73,11 @@ def test_scripted_values_put_the_proxy_on_the_worker() -> None:
         "extraEnv"
     ]
     assert "githubStubCaConfigMap" not in values["api"]
+    factory = values["factory"]
+    assert {entry["apiUrl"] for entry in factory["codeHosts"] + factory["trackers"]} == {
+        "https://10.9.9.9:8443/api/v3"
+    }
+    assert factory["trackers"][0]["pollIntervalSeconds"] == 5
     assert values["codeHostTrust"]["caBundle"]["configMapRef"] == {
         "name": "github-stub-ca", "key": "ca.pem"
     }

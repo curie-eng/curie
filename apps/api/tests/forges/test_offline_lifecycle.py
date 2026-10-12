@@ -17,11 +17,13 @@ The ``jira_cloud+github`` pair uses the in-memory adapters in
 ``github`` InMemoryCodeHost. Admission goes through the forge-neutral dispatch
 functions on ``TrackerIssueRef`` and ``RepositoryRef``, the real reconciler and
 CI gate read the in-memory code host, and status replies go through
-``comments_for``. Until the adapter registry (#4397) lands, three production
-seams are GitHub-only, so this pair replaces them at test level:
+``comments_for``. The adapter registry (#4397) installs no ``jira_cloud`` kind
+yet, so the install boots with only a GitHub code host entry and the factory
+off, and three production seams that would reach GitHub are replaced at test
+level:
 
-1. ``code_host_for`` (``curie_api.forges.hosts``) always builds the GitHub
-   adapter. It is replaced in every module that imported it.
+1. ``factory_code_host`` and ``code_host_for`` (``curie_api.forges.hosts``)
+   build the GitHub adapter. Each is replaced in every module that imported it.
 2. ``factory_ci._issue_url`` links the ticket through ``forges.hosts.issue_url``,
    which raises ``NotFound("tracker")`` for any tracker but GitHub, so a red CI
    round could not be continued. ``factory_ci.issue_url`` is replaced with the
@@ -49,6 +51,7 @@ import re
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
@@ -73,6 +76,7 @@ from curie_api.forges.hosts import github_host
 from curie_api.forges.identity import issue_lock_keys, notice_request_id, revision_request_id
 from curie_api.forges.memory import InMemoryCodeHost, InMemoryTracker, all_supported
 from curie_api.forges.ports import comments_for
+from curie_api.forges.registry import forges_registry
 from curie_api.forges.types import (
     Actor,
     CheckState,
@@ -97,6 +101,8 @@ from forge_fakes.github import (
     _issue_event,
     _post,
     _sender,
+    forges_document,
+    forges_env_json,
 )
 from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     HEAD_A,
@@ -104,7 +110,6 @@ from forge_fakes.github_comments import (  # noqa: F401  (fixtures)
     HEAD_C,
     _clear_ci_keys,
     _CommentServer,
-    _Credentials,
     _rows,
     ci_failing,
     ci_green,
@@ -612,9 +617,6 @@ def _github_pair(monkeypatch: pytest.MonkeyPatch, sink: _CommentServer) -> Itera
     sink.by_path = True
     # An unscripted head reads as pending, so only an explicit green completes.
     sink.ci_script = [ci_pending()]
-    monkeypatch.setattr(
-        "curie_api.github_review_truth.credentials_for", lambda _settings: _Credentials()
-    )
     api = _ReviewGitHubAPI()
     with TestClient(create_app()) as client:
         external = httpx.AsyncClient(transport=httpx.MockTransport(api.handle))
@@ -683,17 +685,18 @@ class _JiraPair:
         def host(*_args: Any, **_kwargs: Any) -> InMemoryCodeHost:
             return self.code_host
 
-        for module in (
-            "curie_api.forges.hosts",
-            "curie_api.factory_ci",
-            "curie_api.lineage_reconciler",
-            "curie_api.repository_access",
-            "curie_api.github_factory",
-            "curie_api.routers.publications",
-            "curie_api.routers.work_item_outcomes",
-            "curie_api.routers.publication_code_host",
+        for module, seams in (
+            ("curie_api.forges.hosts", ("code_host_for", "factory_code_host")),
+            ("curie_api.factory_ci", ("factory_code_host",)),
+            ("curie_api.lineage_reconciler", ("factory_code_host",)),
+            ("curie_api.repository_access", ("code_host_for",)),
+            ("curie_api.github_factory", ("factory_code_host",)),
+            ("curie_api.routers.publications", ("code_host_for",)),
+            ("curie_api.routers.work_item_outcomes", ("factory_code_host",)),
+            ("curie_api.routers.publication_code_host", ("code_host_for",)),
         ):
-            monkeypatch.setattr(f"{module}.code_host_for", host)
+            for seam in seams:
+                monkeypatch.setattr(f"{module}.{seam}", host)
         monkeypatch.setattr(
             "curie_api.factory_ci.issue_url",
             lambda _settings, issue, _repository: self.tracker.issue_url(issue),
@@ -771,9 +774,8 @@ class _JiraPair:
             assert actor == notice.actor == MARKING_USER
             assert await may_start_with(WriteCheck(), self.issue, actor, tracker=self.tracker)
             self.cursor = page.cursor
-            settings = get_settings()
             base = await factory_base.resolve_base(
-                settings=settings,
+                registry=forges_registry(get_settings()),
                 repo_full_name=REPO,
                 labels=set(),
                 default_branch="main",
@@ -930,7 +932,7 @@ class _JiraPair:
         assert _notice(revision)["applied_label"] == "curie-factory:pr-open"
 
 
-def _jira_pair(monkeypatch: pytest.MonkeyPatch) -> Iterator[Pair]:
+def _jira_pair(monkeypatch: pytest.MonkeyPatch, key_dir: Path) -> Iterator[Pair]:
     for key, value in {
         "CURIE_WORK_ITEM_WAIT_BUDGET_SECONDS": "30",
         "CURIE_WORK_ITEM_RECONCILER_ENABLED": "false",
@@ -938,7 +940,8 @@ def _jira_pair(monkeypatch: pytest.MonkeyPatch) -> Iterator[Pair]:
         "APPROVAL_SWEEP_INTERVAL_S": "0",
         "DEAD_LETTER_WATCH_INTERVAL_S": "0",
         # No GitHub intake: the reconciler must not poll a GitHub tracker.
-        "GITHUB_FACTORY_INGRESS_ENABLED": "false",
+        "FACTORY_ENABLED": "false",
+        "CURIE_FORGES": forges_env_json(forges_document(), key_dir),
         "GITHUB_REVIEW_INGRESS_ENABLED": "false",
         "GITHUB_REPO_ALLOWLIST": '["acme-corp/*"]',
         "GITHUB_TOKEN": "",
@@ -973,7 +976,7 @@ def pair(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Ite
     if request.param == "github":
         yield from _github_pair(monkeypatch, request.getfixturevalue("comments"))
     else:
-        yield from _jira_pair(monkeypatch)
+        yield from _jira_pair(monkeypatch, request.getfixturevalue("tmp_path"))
 
 
 def test_the_factory_lifecycle_runs_offline_for_each_pairing(pair: Pair) -> None:

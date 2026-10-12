@@ -24,6 +24,7 @@ from .. import transcripts
 from ..config import get_settings
 from ..factory_reply_target import is_issue_follow_up, is_relabel_objective
 from ..forges.github.binding import github_reply_route
+from ..forges.registry import forges_registry
 from ..forges.types import RepositoryRef, TrackerIssueRef
 from ..models import (
     DEFAULT_EXECUTION_DEADLINE_SECONDS,
@@ -517,13 +518,16 @@ async def create_or_get_work_item(
     agent_id: uuid.UUID,
     conversation_id: str,
     base: ResolvedBase | None = None,
+    trigger_label: str | None,
 ) -> WorkItemResult:
     """Insert the WorkItem, or return the existing one for the same issue.
 
     The issue is the key (ADR 0197). The repository and installation are
     frozen on insert; a replay must name the same ones. The base fields (ADR
     0186) are written on insert only. A replay does not compare them: the base
-    an existing WorkItem recorded is the one it keeps.
+    an existing WorkItem recorded is the one it keeps. ``trigger_label`` is the
+    label that admitted it (#4361 decision 10), None for an admission no label
+    started; it follows the base fields' rule.
     """
 
     new_id = uuid.uuid4()
@@ -538,6 +542,7 @@ async def create_or_get_work_item(
             base_branch=None if base is None else base.branch,
             base_source=None if base is None else base.source,
             base_commit=None if base is None else base.commit,
+            trigger_label=trigger_label,
             version=1,
             next_sequence=1,
         )
@@ -809,7 +814,12 @@ async def _unchanged_follow_up(
 
     if detail is None or not detail.strip().startswith("No changes needed:"):
         return False
-    clone_base = get_settings().github_clone_base
+    # The objective links the issue under the factory code host's web base
+    # (github_factory._facts), so the comparison reads the same base.
+    code_host = forges_registry(get_settings()).github_code_host()
+    if code_host is None:
+        return False
+    clone_base = code_host.html_base
     repo, issue = work_item.repository_path, int(work_item.tracker_issue_id)
     follow_up = request.reply_target_kind != "issue" or is_issue_follow_up(
         request.objective, repo_full_name=repo, issue_number=issue, clone_base=clone_base
@@ -1804,6 +1814,7 @@ async def readmit(
     objective: str,
     requester: str,
     base: ResolvedBase | None = None,
+    trigger_label: str | None,
 ) -> WorkItemResult:
     """Start a new run on an existing WorkItem because the label was added again.
 
@@ -1812,6 +1823,9 @@ async def readmit(
     request reaches a terminus; the returned request is then the old one. A
     freshly resolved base is recorded with the request that runs on it: now,
     or stored beside the deferred relabel so the stopping run keeps its own.
+    ``trigger_label``, the label that readmitted it, replaces the stored one at
+    once either way (#4361 decision 10): removing it is what cancels the
+    relabel, deferred or not.
     """
 
     work_item = await lock_work_item(session, work_item_id)
@@ -1865,6 +1879,7 @@ async def readmit(
                 readmit_base_branch=None if base is None else base.branch,
                 readmit_base_source=None if base is None else base.source,
                 readmit_base_commit=None if base is None else base.commit,
+                trigger_label=trigger_label,
                 version=WorkItem.version + 1,
                 updated_at=func.clock_timestamp(),
             )
@@ -1901,6 +1916,7 @@ async def readmit(
             cancelled_at=None,
             **_NO_READMIT,
             **_base_values(base),
+            trigger_label=trigger_label,
             version=WorkItem.version + 1,
             updated_at=func.clock_timestamp(),
         )

@@ -20,7 +20,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from curie_api.config import Settings
-from curie_api.github_app import GitHubAppError, GitHubCredentials
+from curie_api.github_app import GitHubAppError, GitHubAuth, GitHubCredentials
 
 REPO = "octo/agent-bot"
 
@@ -84,12 +84,14 @@ def github(monkeypatch: pytest.MonkeyPatch) -> Recorder:
 # Which credential
 # --------------------------------------------------------------------------- #
 def test_the_app_is_preferred_over_a_token(private_key: str, github: Recorder) -> None:
-    creds = GitHubCredentials(settings=app_settings(private_key, github_token="ghp_the_pat"))
+    creds = GitHubCredentials(
+        auth=GitHubAuth.from_settings(app_settings(private_key, github_token="ghp_the_pat"))
+    )
     assert creds.token_for(REPO) == "ghs_minted_1"
 
 
 def test_the_token_is_used_when_no_app_is_configured(github: Recorder) -> None:
-    creds = GitHubCredentials(settings=Settings(github_token="ghp_the_pat"))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(Settings(github_token="ghp_the_pat")))
     assert creds.token_for(REPO) == "ghp_the_pat"
     assert github.calls == [], "no App configured means GitHub is never called"
 
@@ -97,7 +99,7 @@ def test_the_token_is_used_when_no_app_is_configured(github: Recorder) -> None:
 def test_no_credential_configured_is_not_an_error() -> None:
     # A public repository clones with no header at all, and refusing to boot
     # would break every installation that never deploys from a private repo.
-    creds = GitHubCredentials(settings=Settings(github_token=""))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(Settings(github_token="")))
     assert creds.token_for(REPO) == ""
 
 
@@ -105,7 +107,9 @@ def test_a_half_configured_app_falls_back_rather_than_breaking(github: Recorder)
     # An id with no key cannot sign anything. Falling back beats failing every
     # clone with a signing error.
     creds = GitHubCredentials(
-        settings=Settings(github_app_id="12345", github_app_private_key="", github_token="ghp_x")
+        auth=GitHubAuth.from_settings(
+            Settings(github_app_id="12345", github_app_private_key="", github_token="ghp_x")
+        )
     )
     assert creds.token_for(REPO) == "ghp_x"
 
@@ -120,12 +124,14 @@ def test_a_half_configured_app_falls_back_rather_than_breaking(github: Recorder)
 def test_describe_names_the_path_and_never_a_secret(
     settings_kwargs: dict[str, Any], expected: str
 ) -> None:
-    creds = GitHubCredentials(settings=Settings(**settings_kwargs))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(Settings(**settings_kwargs)))
     assert creds.describe() == expected
 
 
 def test_describe_does_not_leak_the_private_key(private_key: str) -> None:
-    described = GitHubCredentials(settings=app_settings(private_key)).describe()
+    described = GitHubCredentials(
+        auth=GitHubAuth.from_settings(app_settings(private_key))
+    ).describe()
     assert "PRIVATE KEY" not in described
     assert private_key[:40] not in described
 
@@ -138,7 +144,7 @@ def test_the_minted_token_is_scoped_to_the_one_repository(
 ) -> None:
     # An installation may cover the whole org. Narrowing to the repository being
     # cloned is what makes a leaked token useless against the others.
-    GitHubCredentials(settings=app_settings(private_key)).token_for(REPO)
+    GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key))).token_for(REPO)
     mint = [c for c in github.calls if c[1].endswith("/access_tokens")][0]
     assert mint[2] == {"repositories": ["agent-bot"]}
 
@@ -146,7 +152,7 @@ def test_the_minted_token_is_scoped_to_the_one_repository(
 def test_the_installation_is_discovered_not_configured(private_key: str, github: Recorder) -> None:
     # No installation id in settings anywhere: onboarding a repo is a checkbox
     # in GitHub, not a values change.
-    GitHubCredentials(settings=app_settings(private_key)).token_for(REPO)
+    GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key))).token_for(REPO)
     assert any(c[1].endswith(f"/repos/{REPO}/installation") for c in github.calls)
     assert "github_app_installation_id" not in Settings.model_fields
 
@@ -156,7 +162,7 @@ def test_a_valid_repository_is_preserved_in_app_lookup_and_token_scope(
 ) -> None:
     repo = "Octo-Corp/repo.name_with-parts"
 
-    GitHubCredentials(settings=app_settings(private_key)).token_for(repo)
+    GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key))).token_for(repo)
 
     lookup = [call for call in github.calls if call[1].endswith("/installation")]
     mint = [call for call in github.calls if call[1].endswith("/access_tokens")]
@@ -169,7 +175,7 @@ def test_invalid_repo_full_name_never_reaches_github_app_http(
 ) -> None:
     recorder = Recorder()
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
 
     with pytest.raises(GitHubAppError):
         creds.token_for("octo/../escape?token=x")
@@ -181,7 +187,7 @@ def test_invalid_repo_full_name_never_reaches_github_app_http(
 # Caching
 # --------------------------------------------------------------------------- #
 def test_a_second_push_reuses_the_cached_token(private_key: str, github: Recorder) -> None:
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     first, second = creds.token_for(REPO), creds.token_for(REPO)
     assert first == second
     assert github.minted == 1, "a burst of pushes must not cost a token exchange each"
@@ -202,7 +208,7 @@ def test_a_near_expiry_token_is_reminted(private_key: str, monkeypatch) -> None:
     soon = datetime.now(UTC) + timedelta(seconds=_TOKEN_REFRESH_MARGIN_SECONDS / 2)
     recorder = Recorder(expires_at=soon.strftime("%Y-%m-%dT%H:%M:%SZ"))
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     creds.token_for(REPO)
     creds.token_for(REPO)
     assert recorder.minted == 2
@@ -220,7 +226,7 @@ def test_a_token_comfortably_outside_the_margin_is_reused(private_key: str, monk
     later = datetime.now(UTC) + timedelta(seconds=_TOKEN_REFRESH_MARGIN_SECONDS * 4)
     recorder = Recorder(expires_at=later.strftime("%Y-%m-%dT%H:%M:%SZ"))
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     creds.token_for(REPO)
     creds.token_for(REPO)
     assert recorder.minted == 1
@@ -236,7 +242,7 @@ def test_an_unparseable_expiry_is_not_treated_as_immortal(private_key: str, monk
 
     recorder = Recorder(expires_at="not-a-timestamp")
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     creds.token_for(REPO)
     cached = creds._tokens[REPO]
     assumed = cached.expires_at - time.time()
@@ -248,7 +254,7 @@ def test_repository_keyed_app_caches_are_bounded(
 ) -> None:
     from curie_api.github_app import _REPOSITORY_CACHE_LIMIT
 
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     monkeypatch.setattr(
         creds,
         "_mint_installation_token",
@@ -280,7 +286,7 @@ def _decode(token: str, private_key: str) -> dict[str, Any]:
 def test_the_jwt_names_this_app_as_the_issuer(private_key: str) -> None:
     # `iss` is how GitHub knows which App is calling. Replacing it with "0"
     # survived every test (#1263); the symptom is a 401 naming nothing.
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     assert _decode(creds._app_jwt(), private_key)["iss"] == "12345"
 
 
@@ -293,7 +299,7 @@ def test_the_jwt_is_backdated_and_not_yet_expired(private_key: str) -> None:
     both produce a 401 that says nothing about time.
     """
 
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     now = time.time()
     claims = _decode(creds._app_jwt(), private_key)
     assert claims["iat"] < now, "iat must be backdated for clock skew"
@@ -327,7 +333,7 @@ def test_rotating_the_private_key_gets_a_new_resolver(private_key: str) -> None:
 
 
 def test_two_repositories_do_not_share_a_token(private_key: str, github: Recorder) -> None:
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     assert creds.token_for(REPO) != creds.token_for("octo/other-bot")
 
 
@@ -340,14 +346,16 @@ def test_a_repository_the_app_cannot_see_says_so(private_key: str, monkeypatch) 
     monkeypatch.setattr(
         "curie_api.github_app.httpx.Client", serve(lambda r: httpx.Response(404, json={}))
     )
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     with pytest.raises(GitHubAppError, match="not installed on that repository"):
         creds.token_for(REPO)
 
 
 def test_a_malformed_private_key_is_reported_as_a_config_error() -> None:
     creds = GitHubCredentials(
-        settings=Settings(github_app_id="1", github_app_private_key="not-a-pem")
+        auth=GitHubAuth.from_settings(
+            Settings(github_app_id="1", github_app_private_key="not-a-pem")
+        )
     )
     with pytest.raises(GitHubAppError, match="full PEM private key"):
         creds.token_for(REPO)
@@ -362,7 +370,7 @@ def test_an_unreachable_github_is_not_silently_a_missing_credential(
         raise httpx.ConnectError("no route to host")
 
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(boom))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     with pytest.raises(GitHubAppError, match="could not reach GitHub"):
         creds.token_for(REPO)
 
@@ -505,7 +513,7 @@ def test_a_reinstalled_app_recovers_without_restarting_the_api(private_key, monk
 
     recorder = ReinstallRecorder()
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
 
     assert creds.token_for(REPO) == "ghs_from_4242"
     discoveries_before = recorder.discoveries
@@ -524,7 +532,7 @@ def test_the_re_discovered_installation_is_cached_again(private_key, monkeypatch
     # installation cache stops being a cache.
     recorder = ReinstallRecorder()
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
 
     creds.token_for(REPO)
     recorder.installation_id = 8484
@@ -548,7 +556,7 @@ def test_a_freshly_discovered_installation_is_not_re_discovered(private_key, mon
 
     recorder = ReinstallRecorder(valid_ids=set())
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
 
     with pytest.raises(GitHubAppError):
         creds.token_for(REPO)
@@ -572,7 +580,7 @@ def test_a_fresh_installation_404_never_tells_the_operator_to_install_the_app(
 
     recorder = ReinstallRecorder(valid_ids=set())
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
 
     with pytest.raises(GitHubAppError) as raised:
         creds.token_for(REPO)
@@ -597,7 +605,7 @@ def test_a_stale_installation_404_says_the_cached_one_was_re_discovered(
 
     recorder = ReinstallRecorder()
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(recorder.handle))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
 
     creds.token_for(REPO)  # caches installation 4242
 
@@ -639,7 +647,7 @@ def test_concurrent_pushes_to_one_repo_mint_exactly_one_token(private_key, monke
         return inner(request)
 
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(slow))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
 
     seen: list[str] = []
     guard = threading.Lock()
@@ -694,7 +702,7 @@ def test_two_repositories_do_not_serialize_on_one_lock(private_key, monkeypatch)
         return inner(request)
 
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(handle))
-    creds = GitHubCredentials(settings=app_settings(private_key))
+    creds = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
 
     fast_finished = threading.Event()
 
@@ -768,7 +776,7 @@ def test_fresh_installation_cannot_change_during_token_mint(
         )
 
     monkeypatch.setattr("curie_api.github_app.httpx.Client", serve(handle))
-    credentials = GitHubCredentials(settings=app_settings(private_key))
+    credentials = GitHubCredentials(auth=GitHubAuth.from_settings(app_settings(private_key)))
     with pytest.raises(GitHubAppError):
         credentials.token_for_verified_installation(REPO, 4242)
     assert calls == [f"/repos/{REPO}/installation", "/app/installations/4242/access_tokens"]

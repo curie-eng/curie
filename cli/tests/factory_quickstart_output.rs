@@ -40,6 +40,7 @@ with (root / 'calls').open('a') as log:
     log.write(json.dumps([tool, *args]) + '\n')
 ns = os.environ.get('QUICKSTART_NAMESPACE', 'curie')
 release = os.environ.get('QUICKSTART_RELEASE', 'curie')
+values_file = root / ('values' if release == 'curie' else 'values-' + release)
 def emit(value):
     print(json.dumps(value)); sys.exit(0)
 def deep_merge(dst, src):
@@ -64,7 +65,7 @@ def apply_set(doc, expression):
         cursor[parts[-1]] = {'true': True, 'false': False, 'null': None}.get(raw, raw)
 def record_upgrade(args):
     try:
-        doc = json.loads((root / 'values').read_text())
+        doc = json.loads(values_file.read_text())
     except Exception:
         doc = {}
     if not isinstance(doc, dict):
@@ -85,7 +86,7 @@ def record_upgrade(args):
             index += 2
             continue
         index += 1
-    (root / 'values').write_text(json.dumps(doc))
+    values_file.write_text(json.dumps(doc))
 def absent(kind, name):
     print('Error from server (NotFound): ' + kind + ' "' + name + '" not found', file=sys.stderr)
     sys.exit(1)
@@ -108,7 +109,9 @@ if tool == 'helm':
     if args[:2] == ['get','values']:
         if os.environ.get('QUICKSTART_REMOVE_KEY_AFTER_PREFLIGHT') == '1':
             (root / 'app.pem').unlink(missing_ok=True)
-        print((root / 'values').read_text()); sys.exit(0)
+        if not values_file.exists():
+            print('Error: release: not found', file=sys.stderr); sys.exit(1)
+        print(values_file.read_text()); sys.exit(0)
     if args[:2] == ['get','hooks']: sys.exit(0)
     if args[:2] == ['get','metadata']: emit({'appVersion':os.environ['QUICKSTART_VERSION'],'version':os.environ['QUICKSTART_VERSION'],'chart':'curie-'+os.environ['QUICKSTART_VERSION']})
     if args[:2] == ['get','manifest']: emit(deployment)
@@ -171,6 +174,7 @@ if tool == 'kubectl':
             items = [{'apiVersion':'v1','kind':'ConfigMap','metadata':{'name':'acme-settings','namespace':ns},'data':{'setting':'value'}}] if os.environ.get('QUICKSTART_NON_DEFAULT_OBJECTS') == '1' else []
             emit({'apiVersion':'v1','kind':'List','items':items})
         if kind == 'serviceaccounts': emit({'apiVersion':'v1','kind':'List','items':[]})
+        if kind in ['secret','secrets'] and name and name == os.environ.get('QUICKSTART_APP_SECRET'): print((root / 'app.pem').read_text()); sys.exit(0)
         if kind in ['secret','secrets']: absent(kind, name)
         if kind in ['priorityclass','priorityclasses'] and name not in ['-o','--output']: emit(owned('PriorityClass',name))
         if kind in ['deployment','deployments'] and name == 'agent-sandbox-controller': emit(owned('Deployment',name))
@@ -353,6 +357,9 @@ impl Fixture {
                     Response::json(200, r#"{"name":"curie-factory"}"#)
                 }
                 ("GET", "/meta") => Response::json(200, r#"{"api":["192.0.2.0/24"]}"#),
+                ("POST", "/repos/acme/widgets/labels") => {
+                    Response::json(201, r#"{"name":"curie-factory-fast"}"#)
+                }
                 _ => Response::json(404, r#"{"message":"Not Found"}"#),
             }
         });
@@ -649,7 +656,7 @@ fn intake_documents(fixture: &Fixture) -> Vec<Value> {
         .filter_map(|line| {
             let document: String = serde_json::from_str(line).ok()?;
             let values: Value = serde_json::from_str(&document).ok()?;
-            (values.pointer("/api/githubFactoryIntake") == Some(&json!("poll"))).then_some(values)
+            (values.pointer("/factory/intake") == Some(&json!("poll"))).then_some(values)
         })
         .collect()
 }
@@ -1072,6 +1079,111 @@ fn a_different_runner_base_is_refused_before_the_binding_upgrade() {
     );
 }
 
+/// A release that records factory intake on the fixture, so a run with no
+/// App flags takes the add agent path, its runner digest set to `digest`.
+fn record_factory_intake(fixture: &Fixture, digest: Option<&str>) {
+    let mut values: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.dir.path().join("values")).unwrap())
+            .unwrap();
+    values["factory"] = json!({
+        "enabled": true,
+        "intake": "poll",
+        "trackers": [{"kind": "github", "label": "curie-factory"}],
+        "codeHosts": [{"kind": "github", "credential": {
+            "appId": "1234567",
+            "existingSecret": "factory-app",
+            "existingSecretKey": "private-key.pem"
+        }}]
+    });
+    values["api"]["githubRepoAllowlist"] = json!(["acme/widgets"]);
+    if let Some(digest) = digest {
+        values["agentSandbox"]["runner"]["digest"] = json!(digest);
+    }
+    fixture.record_values(values);
+}
+
+/// Every write the add agent path can make: a Helm upgrade (the egress
+/// bind), a namespace write, a GitHub write (the trigger label), and a
+/// platform write (deploy, surfaces, overrides, budget).
+fn add_agent_writes(fixture: &Fixture) -> (usize, usize, usize, usize) {
+    let writes = |server: &MockServer| {
+        server
+            .recorded()
+            .iter()
+            .filter(|request| request.method != "GET")
+            .count()
+    };
+    (
+        helm_upgrade_calls(fixture).len(),
+        namespace_mutations(fixture).len(),
+        writes(&fixture.github),
+        writes(&fixture.platform),
+    )
+}
+
+#[test]
+fn an_add_agent_runner_base_mismatch_is_refused_before_any_mutation() {
+    let add = [
+        "--color",
+        "never",
+        "--agent",
+        "dark-factory-fast",
+        "--label",
+        "curie-factory-fast",
+    ];
+    // Liveness: on a matching base the same run reaches the mutations, so
+    // the refusal below is the check running first, not a fixture gap.
+    let fixture = Fixture::new();
+    let (code, shown) = fixture.run(false, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    record_factory_intake(&fixture, None);
+    let before = add_agent_writes(&fixture);
+    let output = fixture
+        .command(false, &add)
+        .env("QUICKSTART_APP_SECRET", "factory-app")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = add_agent_writes(&fixture);
+    assert!(after.0 > before.0, "the egress bind never ran: {shown}");
+    assert!(
+        after.2 > before.2,
+        "the trigger label was never created: {shown}"
+    );
+
+    let fixture = Fixture::new();
+    let (code, shown) = fixture.run(false, &["--color", "never"]);
+    assert_eq!(code, 0, "{shown}");
+    record_factory_intake(
+        &fixture,
+        Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"),
+    );
+    let before = add_agent_writes(&fixture);
+    let output = fixture
+        .command(false, &add)
+        .env("QUICKSTART_APP_SECRET", "factory-app")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{shown}");
+    assert!(shown.contains("Checking the runner base failed"), "{shown}");
+    assert_eq!(
+        add_agent_writes(&fixture),
+        before,
+        "the add agent path mutated before its runner base check: {shown}"
+    );
+}
+
 #[test]
 fn both_passes_use_separate_complete_lines_in_a_real_terminal() {
     let fixture = Fixture::new();
@@ -1208,7 +1320,7 @@ fn poll_quickstart_ignores_an_exported_webhook_secret() {
         .find_map(|line| {
             let document: String = serde_json::from_str(line).unwrap();
             let values: Value = serde_norway::from_str(&document).unwrap();
-            (values.pointer("/api/githubFactoryIntake") == Some(&json!("poll"))).then_some(values)
+            (values.pointer("/factory/intake") == Some(&json!("poll"))).then_some(values)
         })
         .expect("the actual poll intake values document was passed to Helm");
     assert!(

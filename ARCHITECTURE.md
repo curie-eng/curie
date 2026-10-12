@@ -824,7 +824,9 @@ one `WorkItem` per repository and issue and one bounded `ExecutionRequest` per
 attempt
 ([`apps/api/src/curie_api/models.py::WorkItem`](apps/api/src/curie_api/models.py),
 [`apps/api/src/curie_api/models.py::ExecutionRequest`](apps/api/src/curie_api/models.py)).
-Intake is off unless `GITHUB_FACTORY_INGRESS_ENABLED` is set. The reference
+Intake is off unless `factory.enabled` is true (`FACTORY_ENABLED`). The factory's code
+hosts, trackers, and bindings are one `CURIE_FORGES` document, which the chart renders
+from the `factory.*` values. The reference
 bundle is [`examples/dark-factory`](examples/dark-factory).
 
 The governing decisions are
@@ -1010,7 +1012,7 @@ snapshot is `next` commit `bac88c6ea`, read on 2026-10-02.
 | 0157 | `owner_lost` failure requires a termination observation | ENFORCED | `execution_requests_state_shape_ck`. |
 | 0157 | No publication for a cancelled WorkItem or stale runtime epoch | ENFORCED | `_refuse_fenced_work_item` in `crud.create_publication`. |
 | 0157 | D5: `delivered` and `awaiting-approval` record `completed` | DIVERGED | Approval holds the request; delivered without a publication fails (#3128); a publication completes only through the CI gate (#3097). |
-| 0161 | Factory intake is off by default | ENFORCED | `Settings.github_factory_ingress_enabled` defaults to false. |
+| 0161 | Factory intake is off by default | ENFORCED | `Settings.factory_enabled` (`factory.enabled`) defaults to false. |
 | 0161 | Admission requires installation, allowlist, and write or admin permission | ENFORCED | `github_factory.verify_current`, on webhook and poll paths. |
 | 0161 | App and bot senders never admit work | ENFORCED | Both paths drop `Bot` actors. |
 | 0161 | Reply binding is one `github` channel, no Slack | ENFORCED | Refused when no or several `github` bindings match the repository. |
@@ -1025,7 +1027,7 @@ snapshot is `next` commit `bac88c6ea`, read on 2026-10-02.
 | 0174 | `ppc` authorizes only the metadata comparison | ENFORCED | `require_publication_precheck`; no other route accepts it. |
 | 0174 | Precheck limits: 10 s and 5 per turn; 20 per lineage per 5 minutes | ENFORCED | [`runner/src/curie_runner/publication_precheck.py`](runner/src/curie_runner/publication_precheck.py) and [`apps/api/src/curie_api/routers/publication_precheck.py`](apps/api/src/curie_api/routers/publication_precheck.py). |
 | 0174 | An empty snapshot is refused without pending approval | ENFORCED | Runner refusals `body_required`, `stale_context`, `rate_limited`, `no_change`. |
-| 0186 (Draft) | Base is one `base:` label or the default, from an allowlist | ENFORCED | `GITHUB_FACTORY_BASES` and `factory_base.resolve_base`. |
+| 0186 (Draft) | Base is one `base:` label or the default, from an allowlist | ENFORCED | The `bases` and `default_base` of each `CURIE_FORGES` repository binding, and `factory_base.resolve_base`. |
 | 0186 (Draft) | A bad base is refused with a comment, never substituted | ENFORCED | `factory_base.comment_refusal` before any WorkItem is written. |
 | 0186 (Draft) | The base is frozen on the WorkItem | ENFORCED | `work_items_base_ck`; a later `base:` label is recorded in `base_label_ignored`, not followed. |
 | 0187 | Polling is the default, one replica, conditional reads | ENFORCED | `poll_once` holds `pg_try_advisory_lock` and stores ETags and cursors. |

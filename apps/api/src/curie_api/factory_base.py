@@ -1,6 +1,7 @@
 """Resolve the base branch a factory ticket starts from and targets (#3095, ADR 0186).
 
-The deployment allows bases per repository (``GITHUB_FACTORY_BASES``). A ticket
+The deployment allows bases per repository (the ``bases`` of its forge binding,
+``factory.bindings[].repos[]``). A ticket
 picks one with a single ``base:<branch>`` label; with none it gets the
 deployment default, or the repository default branch. Two distinct labels, an
 unallowed branch, or a branch the repository does not have are refused with
@@ -13,16 +14,16 @@ The branch read and the comment go through the forge ports: the code host's
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal
 
-from .config import Settings
 from .factory_notices import code_span
+from .forges.config import RepositoryBindingConfig
 from .forges.errors import ForgeError
 from .forges.ports import CodeHost, MarkedComments
+from .forges.registry import ForgeRegistry
 from .forges.types import ReplyTarget, RepositoryRef, TrackerIssueRef
 from .github_factory_events import BASE_LABEL_PREFIX
 from .github_review_events import FeedbackUnavailable
-from .repo_full_name import entry_for_repo
 
 # The core-owned marker; the tracker's comment adapter decides how to embed it.
 REFUSAL_MARKER = "curie-factory-base-refusal"
@@ -49,24 +50,27 @@ class BaseRefusal:
     reason: str
 
 
-def bases_for(settings: Settings, repo_full_name: str) -> dict[str, Any] | None:
-    """The deployment's entry for one repository, matched case-insensitively."""
+def bases_for(registry: ForgeRegistry, repo_full_name: str) -> RepositoryBindingConfig | None:
+    """The GitHub repository's binding entry when it allows bases, matched
+    case-insensitively. A repository with no binding, or one whose binding
+    lists no bases, may only use its default branch."""
 
-    return entry_for_repo(settings.github_factory_bases, repo_full_name)
+    entry = registry.github_repository_policy(repo_full_name)
+    return entry if entry is not None and entry.bases else None
 
 
 def _named(labels: set[str]) -> set[str]:
     return {name[len(BASE_LABEL_PREFIX) :] for name in labels if name.startswith(BASE_LABEL_PREFIX)}
 
 
-def _default(entry: dict[str, Any] | None, default_branch: str | None) -> str | None:
-    if entry is not None and entry.get("default_base") is not None:
-        return str(entry["default_base"])
+def _default(entry: RepositoryBindingConfig | None, default_branch: str | None) -> str | None:
+    if entry is not None and entry.default_base is not None:
+        return entry.default_base
     return default_branch
 
 
 def _single_base(
-    named: set[str], entry: dict[str, Any] | None, default_branch: str | None
+    named: set[str], entry: RepositoryBindingConfig | None, default_branch: str | None
 ) -> str | None:
     """The one labelled branch, else the default. ``named`` has at most one."""
 
@@ -74,7 +78,7 @@ def _single_base(
 
 
 def choose_base(
-    labels: set[str], entry: dict[str, Any] | None, default_branch: str | None
+    labels: set[str], entry: RepositoryBindingConfig | None, default_branch: str | None
 ) -> BaseChoice | BaseRefusal:
     """Apply the precedence: one label, else the default. Reads nothing."""
 
@@ -87,7 +91,7 @@ def choose_base(
         # The repository read carried no default branch; ask again later.
         raise FeedbackUnavailable("repository_unavailable")
     choice = BaseChoice(branch, "label" if named else "default")
-    allowed = entry["bases"] if entry is not None else [default_branch]
+    allowed = entry.bases if entry is not None else (default_branch,)
     if choice.branch not in allowed:
         return BaseRefusal(
             "base_not_allowed",
@@ -98,7 +102,7 @@ def choose_base(
 
 def label_disagreement(
     labels: set[str],
-    entry: dict[str, Any] | None,
+    entry: RepositoryBindingConfig | None,
     default_branch: str | None,
     recorded: str,
 ) -> str | None:
@@ -117,7 +121,7 @@ def label_disagreement(
 
 async def resolve_base(
     *,
-    settings: Settings,
+    registry: ForgeRegistry,
     repo_full_name: str,
     labels: set[str],
     default_branch: str | None,
@@ -130,7 +134,7 @@ async def resolve_base(
     has no such branch, and raises a `ForgeError` when it cannot answer now.
     """
 
-    choice = choose_base(labels, bases_for(settings, repo_full_name), default_branch)
+    choice = choose_base(labels, bases_for(registry, repo_full_name), default_branch)
     if isinstance(choice, BaseRefusal):
         return choice
     try:

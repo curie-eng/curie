@@ -1,11 +1,13 @@
 """Resolve the agent route a GitHub repository and issue are bound to."""
 
 import logging
+import uuid
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from curie_api.crud import channels as crud_channels
+from curie_api.forges.registry import ForgeRegistry
+from curie_api.forges.surfaces import effective_trigger_label
 from curie_api.github_factory_events import FactoryNotice, FactoryRefused
 from curie_api.models import AgentChannel
 
@@ -22,40 +24,84 @@ def github_reply_route(repo_full_name: str, issue_number: int) -> tuple[str, str
     return GITHUB_CHANNEL_KIND, repo_full_name, f"issue-{issue_number}"
 
 
-_CHANNEL_KIND = GITHUB_CHANNEL_KIND
+async def bound_labels(
+    session: AsyncSession, registry: ForgeRegistry, repo_full_name: str
+) -> dict[str, list[AgentChannel]]:
+    """The repository's GitHub surfaces, grouped by effective trigger label
+    (#4361 decision 14).
 
+    A label that maps to two surfaces is a run time collision (the tracker
+    label was changed to equal an explicit label): it is still one label to
+    list, and admission under it refuses.
+    """
 
-async def resolve_binding(session: AsyncSession, notice: FactoryNotice) -> AgentChannel:
-    # A GitHub binding alone makes its agent serve the repository (ADR 0214
-    # decision 1). `Agent.repo_full_name` is the git-flow bundle source
-    # (ADR 0091) and is not consulted here. A notice whose repository changed
-    # under it is refused by the repository id check `verify_current`
-    # performs, and the allowlist bounds what can be served (decision 3).
-    # `agent_channels_route_key` (migration 0070)
-    # lets one repository hold several routes, so the query can return more
-    # than one row; more than one route on the repository, on one agent or
-    # several, still refuses binding_missing (decision 4). `_CHANNEL_KIND` is
-    # `GITHUB_CHANNEL_KIND`, never Slack, and this notice names no adapter, so
-    # `crud.channels.matching_bindings` with `adapter=None` keeps every row --
-    # shared with every other reader of a route rather than a fourth copy of
-    # the same rule.
-    rows = list(
-        await session.scalars(
-            select(AgentChannel).where(
-                AgentChannel.kind == _CHANNEL_KIND,
-                AgentChannel.address == notice.repo_full_name,
-            )
+    rows = await session.scalars(
+        select(AgentChannel)
+        .where(
+            AgentChannel.kind == GITHUB_CHANNEL_KIND,
+            AgentChannel.address == repo_full_name,
         )
+        .order_by(AgentChannel.agent_id)
     )
-    matches = crud_channels.matching_bindings(rows, _CHANNEL_KIND, notice.repo_full_name, None)
+    grouped: dict[str, list[AgentChannel]] = {}
+    for row in rows:
+        label = effective_trigger_label(row, registry)
+        if label is not None:
+            grouped.setdefault(label, []).append(row)
+    return grouped
+
+
+async def agent_binding(
+    session: AsyncSession, agent_id: uuid.UUID, repo_full_name: str
+) -> AgentChannel | None:
+    """The agent's GitHub surface on the repository, if it still holds one.
+
+    One at most: `crud.channels.refuse_label_overlap` keeps an agent to one
+    surface per repository.
+    """
+
+    found: AgentChannel | None = await session.scalar(
+        select(AgentChannel)
+        .where(
+            AgentChannel.agent_id == agent_id,
+            AgentChannel.kind == GITHUB_CHANNEL_KIND,
+            AgentChannel.address == repo_full_name,
+        )
+        .limit(1)
+    )
+    return found
+
+
+async def resolve_binding(
+    session: AsyncSession, registry: ForgeRegistry, notice: FactoryNotice
+) -> AgentChannel:
+    """The surface whose effective trigger label is the notice's label.
+
+    A GitHub surface alone makes its agent serve the repository (ADR 0214
+    decision 1); `Agent.repo_full_name` is the git-flow bundle source (ADR 0091)
+    and is not consulted here. A notice whose repository changed under it is
+    refused by the repository id check `verify_current` performs, and the
+    allowlist bounds what can be served.
+
+    Two agents may serve one repository under different labels (#4361 decision
+    8), so the label picks the surface. No surface for the label refuses
+    ``binding_missing``; two surfaces resolving to one label (the tracker label
+    was changed to equal an explicit one) also refuse ``binding_missing`` and
+    log both agents, never picking one.
+    """
+
+    if notice.label is None:
+        raise FactoryRefused("binding_missing")
+    grouped = await bound_labels(session, registry, notice.repo_full_name)
+    matches = grouped.get(notice.label, [])
     if not matches:
         raise FactoryRefused("binding_missing")
     if len(matches) > 1:
-        # Two routes on one repository under this repo's agents: never pick one.
         logger.warning(
-            "github factory refused %s: %d routes are bound to it",
+            "github factory refused %s label %r: agents %s all serve it",
             notice.repo_full_name,
-            len(matches),
+            notice.label,
+            ", ".join(str(row.agent_id) for row in matches),
         )
         raise FactoryRefused("binding_missing")
     return matches[0]

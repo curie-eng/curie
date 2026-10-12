@@ -9,7 +9,7 @@ pure ``decide``:
 - green, or no checks after the grace period when no required check applies,
   completes the request;
 - Python changes require valid preflight evidence; when the repository has a
-  required Python CI policy (``GITHUB_FACTORY_PYTHON_CI``, #3617), they must
+  required Python CI policy (its binding's ``ci.required``, #3617), they must
   also fall under its paths and pass that check, run by the code host's own CI;
 - a declared check that could not run in the sandbox and delegates its proof
   to a named required check (``delegated_to``, #3873) holds the request until
@@ -65,10 +65,11 @@ from curie_api.workitems import lifecycle
 from . import factory_progress
 from .config import Settings
 from .forges.capabilities import Operation, Support, supports
-from .forges.config import CiPolicyConfig, RequiredCheckConfig
+from .forges.config import CiPolicyConfig
 from .forges.errors import ForgeError
-from .forges.hosts import code_host_for, issue_url, repository_ref
+from .forges.hosts import factory_code_host, issue_url, repository_ref
 from .forges.ports import CodeHost
+from .forges.registry import ForgeRegistry, forges_registry
 from .forges.types import (
     STATUS_KEY_PREFIX,
     CheckSource,
@@ -81,11 +82,9 @@ from .forges.types import (
     RerunJob,
     RerunOutcome,
     RerunRecord,
-    check_run_key,
     status_key,
 )
 from .models import ExecutionRequest, Publication, ThreadPublicationLineage, WorkItem
-from .repo_full_name import entry_for_repo
 
 CI_GRACE_SECONDS = 120
 CI_POLL_SECONDS = 20
@@ -386,49 +385,24 @@ def ci_policies(config: CiPolicyConfig) -> tuple[PythonCiPolicy | None, Metadata
     return python_ci, (MetadataCiPolicy.from_keys(keys) if keys else None)
 
 
-def ci_policy_config(settings: Settings, repo_full_name: str) -> CiPolicyConfig:
-    """Today's per-repository settings as key-based CI config.
+def ci_policy_config(registry: ForgeRegistry, repo_full_name: str) -> CiPolicyConfig:
+    """The CI policy of ``owner/name``'s forge binding, matched case-insensitively;
+    empty for a repository with no binding."""
 
-    ``GITHUB_FACTORY_PYTHON_CI`` and ``GITHUB_FACTORY_METADATA_CI`` name check
-    runs and commit status contexts; this is the one place they become keys.
-    """
-
-    python = entry_for_repo(settings.github_factory_python_ci, repo_full_name)
-    metadata = entry_for_repo(settings.github_factory_metadata_ci, repo_full_name)
-    prefix = python.get("pendingCheckPrefix") if python is not None else None
-    return CiPolicyConfig(
-        required=(
-            RequiredCheckConfig(
-                key=check_run_key(python["check"]),
-                paths=tuple(python["paths"]),
-                pending_key_prefix=check_run_key(prefix) if prefix is not None else None,
-            )
-            if python is not None
-            else None
-        ),
-        metadata_rerun_keys=(
-            tuple(
-                dict.fromkeys(
-                    [check_run_key(name) for name in metadata["checks"]]
-                    + [status_key(context) for context in metadata["statuses"]]
-                )
-            )
-            if metadata is not None
-            else ()
-        ),
-    )
+    entry = registry.github_repository_policy(repo_full_name)
+    return entry.ci if entry is not None else CiPolicyConfig()
 
 
-def python_ci_policy(settings: Settings, repo_full_name: str) -> PythonCiPolicy | None:
+def python_ci_policy(registry: ForgeRegistry, repo_full_name: str) -> PythonCiPolicy | None:
     """The configured policy for ``owner/name``, matched case-insensitively."""
 
-    return ci_policies(ci_policy_config(settings, repo_full_name))[0]
+    return ci_policies(ci_policy_config(registry, repo_full_name))[0]
 
 
-def metadata_ci_policy(settings: Settings, repo_full_name: str) -> MetadataCiPolicy | None:
+def metadata_ci_policy(registry: ForgeRegistry, repo_full_name: str) -> MetadataCiPolicy | None:
     """The configured metadata policy, matched case insensitively."""
 
-    return ci_policies(ci_policy_config(settings, repo_full_name))[1]
+    return ci_policies(ci_policy_config(registry, repo_full_name))[1]
 
 
 @dataclass(frozen=True)
@@ -1073,8 +1047,9 @@ async def gate(
     if facts is None:
         return "waiting"
     request, work_item, lineage = facts.request, facts.work_item, facts.lineage
-    code_host = code_host_for(
-        settings, client, installations=stored_installation(lineage, work_item)
+    registry = forges_registry(settings)
+    code_host = factory_code_host(
+        registry, client, installations=stored_installation(lineage, work_item)
     )
     capabilities = ci_capabilities(code_host.capabilities)
     assert request.execution_deadline is not None
@@ -1090,9 +1065,9 @@ async def gate(
     observed_sha = lineage.head_sha
     changed_paths = _publication_changed_paths(facts.publications)
     changed_python_paths = python_paths(changed_paths)
-    python_ci = python_ci_policy(settings, lineage.repo_full_name or work_item.repository_path)
+    python_ci = python_ci_policy(registry, lineage.repo_full_name or work_item.repository_path)
     metadata_ci = metadata_ci_policy(
-        settings, lineage.repo_full_name or work_item.repository_path
+        registry, lineage.repo_full_name or work_item.repository_path
     )
     unselected_path = unselected_python_path(changed_paths, python_ci)
     preflight_verdict: Verdict | None = None
@@ -1177,7 +1152,7 @@ async def gate(
                 now=now,
                 published_at=facts.published_at,
                 execution_deadline=request.execution_deadline,
-                ci_wait_seconds=settings.github_factory_ci_wait_s,
+                ci_wait_seconds=settings.factory_ci_wait_s,
                 changed_paths=changed_paths,
                 python_ci=python_ci,
                 metadata_ci=metadata_ci,
@@ -1288,7 +1263,7 @@ return 0
 def _ci_deadline(published_at: datetime, request: ExecutionRequest, settings: Settings) -> datetime:
     assert request.execution_deadline is not None
     return min(
-        published_at + timedelta(seconds=settings.github_factory_ci_wait_s),
+        published_at + timedelta(seconds=settings.factory_ci_wait_s),
         request.execution_deadline,
     )
 

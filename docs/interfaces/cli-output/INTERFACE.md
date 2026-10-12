@@ -109,7 +109,7 @@ This is the catalog's first **Rust** seam. It is listed here because the agent-f
   module is a deliberate leaf and never bypasses `CliOutput`.
 - **Other module outputs** in `cli/src/channel_token.rs` (`ChannelTokenOutput`),
   `cli/src/comms.rs` (`CommsOutput`), `cli/src/doctor.rs`
-  (`DoctorOutput`), `cli/src/factory_intake.rs` (`FactoryIntakeOutput`), `cli/src/factory_app.rs` (`FactoryAppRegistrationOutput`, `FactoryAppSetupOutput`), `cli/src/factory_quickstart.rs` (`QuickstartOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
+  (`DoctorOutput`), `cli/src/factory_intake.rs` (`FactoryIntakeOutput`), `cli/src/factory_app.rs` (`FactoryAppRegistrationOutput`, `FactoryAppSetupOutput`), `cli/src/factory_quickstart/mod.rs` and `cli/src/factory_quickstart/github.rs` (`QuickstartOutput`), `cli/src/github_app.rs` (`GithubAppOutput`), `cli/src/guide.rs`
   (`GuideOutput`), `cli/src/migrate_store.rs` (`MigrateStoreOutput`),
   `cli/src/release_accept.rs` (`ReleaseAcceptOutput`), `cli/src/seal.rs`
   (`SealOutput`), and `cli/src/secrets.rs` (`SecretsListOutput`).
@@ -137,7 +137,7 @@ That set is not hand-maintained prose: `cli/schema/index.json` carries one
   longer schema-free: there are 72 committed schemas under `cli/schema/` with an
   index (`cli/schema/index.json`), a `syn`-based inventory gate over every `impl
   CliOutput`, and per-family output validation — result families are validated
-  against real `to_json()` output across 82 tests in `cli/tests/json_contract.rs`.
+  against real `to_json()` output across 83 tests in `cli/tests/json_contract.rs`.
   The dark factory render receipt uses schema version 2. Its `runner_image`
   and `runner_note` fields are required and accept a string or `null`; the
   binary render tests validate the actual receipt against the committed schema.

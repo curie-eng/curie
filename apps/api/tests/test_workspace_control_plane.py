@@ -563,7 +563,7 @@ def test_workspace_credential_resolution_does_not_block_the_event_loop(
     resolver_started = threading.Event()
     loop_progressed = threading.Event()
 
-    def blocking_resolver(_: str, __: Any) -> tuple[str, str]:
+    def blocking_resolver(_: str, *, html_base: str, credentials: Any) -> tuple[str, str]:
         resolver_started.set()
         if not loop_progressed.wait(timeout=0.5):
             raise AssertionError("credential resolver blocked the event loop")
