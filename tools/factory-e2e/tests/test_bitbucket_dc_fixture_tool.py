@@ -39,6 +39,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -49,7 +50,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -270,6 +271,11 @@ class FakeDocker:
         self.state_at_first_openssl: dict[str, Any] | None = None
         self.compose_text_at_create: str | None = None
         self.create_env: dict[str, str] | None = None
+        # A fake time every command spends: ``now`` advances by ``tick`` per call.
+        self.now = 0.0
+        self.tick = 0.0
+        # Commands that hang until killed: the call raises TimeoutExpired.
+        self.hangs: Callable[[list[str]], bool] = lambda argv: False
 
     # -- helpers ------------------------------------------------------------
 
@@ -349,8 +355,18 @@ class FakeDocker:
         cwd: str | os.PathLike[str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         argv = [str(a) for a in argv]
-        call: dict[str, Any] = {"argv": argv, "env": dict(env or {}), "input": input, "cwd": cwd}
+        call: dict[str, Any] = {
+            "argv": argv,
+            "env": dict(env or {}),
+            "input": input,
+            "cwd": cwd,
+            "timeout": timeout,
+            "now": self.now,
+        }
         self.calls.append(call)
+        self.now += self.tick
+        if self.hangs(argv):
+            raise subprocess.TimeoutExpired(argv, timeout or 0.0)
         tool = Path(argv[0]).name
         if tool == "docker":
             if "compose" in argv[1:3]:
@@ -851,7 +867,87 @@ def test_up_succeeds_when_seeding_finishes_inside_the_budget(
 
 
 # --------------------------------------------------------------------------
+# up: every command is bounded by the budget too
+
+
+def test_every_command_up_runs_is_capped_by_the_budget_left(
+    run: Run, docker: FakeDocker, state_dir: Path, free_port: int
+) -> None:
+    # Each command spends 50 s, so the budget left shrinks under every cap.
+    docker.tick = 50.0
+    run.seams["clock"] = lambda: docker.now
+    assert up(run, state_dir, free_port) == 0, run.err
+    assert docker.calls
+    for call in docker.calls:
+        timeout, left = call["timeout"], READY_TIMEOUT - call["now"]
+        assert timeout is not None and math.isfinite(timeout), call["argv"][:4]
+        assert 0 < timeout <= left, (call["argv"][:4], timeout, left)
+    # Image pulls are bounded by the budget alone, so its cap is what is left.
+    create = next(c for c in docker.calls if c.get("compose") == "create")
+    assert create["timeout"] == READY_TIMEOUT - create["now"]
+    tools = {Path(c["argv"][0]).name for c in docker.calls}
+    assert tools == {"docker", "openssl", "git"}
+
+
+def test_up_refuses_a_command_once_the_budget_is_spent(
+    run: Run, docker: FakeDocker, state_dir: Path, free_port: int
+) -> None:
+    # The two certificate commands take the whole budget; nothing runs after.
+    docker.tick = 0.0
+    run.seams["clock"] = lambda: docker.now
+
+    def spend_on_openssl(argv: list[str]) -> bool:
+        if Path(argv[0]).name == "openssl":
+            docker.now += READY_TIMEOUT / 2
+        return False
+
+    docker.hangs = spend_on_openssl
+    assert up(run, state_dir, free_port) != 0
+    assert "create" not in docker.compose_subcommands()
+    assert "900 s budget" in run.err
+    assert not state_dir.exists()
+
+
+@pytest.mark.parametrize(
+    "hanging",
+    [
+        pytest.param(lambda a: Path(a[0]).name == "openssl" and "leaf" in a, id="certificate"),
+        pytest.param(lambda a: "compose" in a and a[-1] == "start", id="compose-start"),
+        pytest.param(lambda a: Path(a[0]).name == "git" and "push" in a, id="seed-push"),
+    ],
+)
+def test_a_command_that_times_out_fails_up_and_tears_down(
+    run: Run,
+    docker: FakeDocker,
+    state_dir: Path,
+    free_port: int,
+    hanging: Callable[[list[str]], bool],
+) -> None:
+    docker.hangs = hanging
+    assert up(run, state_dir, free_port) != 0
+    assert "timed out after" in run.err
+    assert "Traceback" not in run.err
+    assert any(hanging(c["argv"]) for c in docker.calls)
+    assert docker.everything() == set()
+    assert not state_dir.exists()
+    assert run("down", "--state-dir", str(state_dir)) == 0, run.err
+
+
+# --------------------------------------------------------------------------
 # down (decision 14.9)
+
+
+def test_every_command_down_runs_is_bounded(
+    run: Run, docker: FakeDocker, state_dir: Path, free_port: int
+) -> None:
+    assert up(run, state_dir, free_port) == 0, run.err
+    docker.leave_on_down = {"containers", "volumes", "networks"}
+    docker.calls.clear()
+    assert run("down", "--state-dir", str(state_dir)) == 0, run.err
+    assert {c.get("compose") for c in docker.calls} >= {"down", None}
+    for call in docker.calls:
+        timeout = call["timeout"]
+        assert timeout is not None and 0 < timeout <= 300, call["argv"][:4]
 
 
 def test_down_removes_containers_volumes_network_and_state_dir(

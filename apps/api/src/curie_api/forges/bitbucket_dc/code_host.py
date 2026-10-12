@@ -509,6 +509,7 @@ class BitbucketDcCodeHost:
     async def ci_diagnostics(
         self, repository: RepositoryRef, head_sha: str, *, base_ref: str | None
     ) -> CiReport:
+        await self.ensure_version(Operation.CI_DIAGNOSTICS)
         raise Unsupported(Operation.CI_DIAGNOSTICS)
 
     async def rerun_failed(
@@ -519,11 +520,13 @@ class BitbucketDcCodeHost:
         settled: Collection[str] = (),
         on_attempt: RerunObserver | None = None,
     ) -> RerunRecord:
+        await self.ensure_version(Operation.RERUN_FAILED)
         raise Unsupported(Operation.RERUN_FAILED)
 
     async def user_can_write(self, repository: RepositoryRef, actor: Actor) -> bool:
         # Data Center reports a user's effective permission only to an admin,
         # and omits inherited grants even then (decision 11).
+        await self.ensure_version(Operation.USER_CAN_WRITE)
         raise Unsupported(Operation.USER_CAN_WRITE)
 
     # Review feedback ---------------------------------------------------------

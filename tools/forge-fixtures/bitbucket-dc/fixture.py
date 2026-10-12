@@ -46,6 +46,16 @@ DEFAULT_PORT = 27443
 READY_TIMEOUT = 900.0
 # The longest one seeding request may take; less when the deadline is nearer.
 SEED_REQUEST_TIMEOUT = 30.0
+# The longest each kind of command may take. Under ``up`` the budget's
+# remainder caps it further; ``down`` and ``self-test`` use these as they are.
+QUICK_COMMAND_TIMEOUT = 30.0
+OPENSSL_TIMEOUT = 60.0
+COMPOSE_CP_TIMEOUT = 60.0
+COMPOSE_START_TIMEOUT = 300.0
+COMPOSE_DOWN_TIMEOUT = 300.0
+DOCKER_REMOVE_TIMEOUT = 120.0
+GIT_NETWORK_TIMEOUT = 120.0
+LOGS_TIMEOUT = 60.0
 LICENSE_PAGE = (
     "https://developer.atlassian.com/platform/marketplace/"
     "timebomb-licenses-for-testing-server-apps/"
@@ -140,6 +150,48 @@ def run_command(
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(list(argv), 124, "", f"timed out after {timeout}s\n")
+
+
+def _invoke(
+    runner: Runner,
+    argv: Sequence[str],
+    what: str,
+    *,
+    timeout: float,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """One bounded command; an injected runner's timeout is a fixture failure."""
+    try:
+        return runner(argv, env=env, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise FixtureError(f"{what} timed out after {timeout:.0f} s") from None
+
+
+class Budget:
+    """``up``'s deadline. Every command under it is capped by what is left."""
+
+    def __init__(self, runner: Runner, deadline: float, clock: Callable[[], float]) -> None:
+        self.runner = runner
+        self.deadline = deadline
+        self.clock = clock
+
+    def remaining(self) -> float:
+        left = self.deadline - self.clock()
+        if left <= 0:
+            raise FixtureError(f"up ran past its {int(READY_TIMEOUT)} s budget")
+        return left
+
+    def run(
+        self,
+        argv: Sequence[str],
+        what: str,
+        *,
+        cap: float,
+        env: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        # Refuses to start once the deadline has passed.
+        timeout = min(cap, self.remaining())
+        return _invoke(self.runner, argv, what, timeout=timeout, env=env)
 
 
 def log(message: str) -> None:
@@ -260,14 +312,18 @@ class Http:
 # up
 
 
-def _repository_root(runner: Runner) -> Path | None:
-    done = runner(["git", "-C", str(HERE), "rev-parse", "--show-toplevel"])
+def _repository_root(budget: Budget) -> Path | None:
+    done = budget.run(
+        ["git", "-C", str(HERE), "rev-parse", "--show-toplevel"],
+        "git rev-parse --show-toplevel",
+        cap=QUICK_COMMAND_TIMEOUT,
+    )
     if done.returncode != 0 or not done.stdout.strip():
         return None
     return Path(done.stdout.strip()).resolve()
 
 
-def _refuse_taken_port(port: int, runner: Runner) -> None:
+def _refuse_taken_port(port: int, budget: Budget) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         # A listener still refuses the bind; TIME_WAIT left by the last
         # fixture's clients on this port does not.
@@ -276,8 +332,13 @@ def _refuse_taken_port(port: int, runner: Runner) -> None:
             probe.bind(("0.0.0.0", port))
         except OSError as error:
             raise FixtureError(f"port {port} is already in use on this machine: {error}") from None
-    done = runner(["docker", "ps", "-a", "--filter", f"publish={port}", "--format", "{{.Names}}"])
-    _check(done, f"asking the Docker daemon who publishes port {port}")
+    what = f"asking the Docker daemon who publishes port {port}"
+    done = budget.run(
+        ["docker", "ps", "-a", "--filter", f"publish={port}", "--format", "{{.Names}}"],
+        what,
+        cap=QUICK_COMMAND_TIMEOUT,
+    )
+    _check(done, what)
     if done.stdout.strip():
         holders = ", ".join(done.stdout.split())
         raise FixtureError(f"port {port} is already published on the Docker daemon by {holders}")
@@ -309,7 +370,7 @@ def _read_license(urlopen: Opener) -> str:
     return text
 
 
-def _make_certs(state_dir: Path, advertise_host: str, runner: Runner) -> None:
+def _make_certs(state_dir: Path, advertise_host: str, budget: Budget) -> None:
     sans = ["DNS:localhost", "IP:127.0.0.1"]
     try:
         address = ipaddress.ip_address(advertise_host)
@@ -325,20 +386,20 @@ def _make_certs(state_dir: Path, advertise_host: str, runner: Runner) -> None:
     common += ["-days", "7", "-config", str(config)]
     ca, ca_key = state_dir / "ca.pem", state_dir / "ca-key.pem"
     tls, tls_key = state_dir / "tls.pem", state_dir / "tls-key.pem"
-    _check(
-        runner(
+    steps = [
+        (
             [*common, "-extensions", "ca", "-subj", "/CN=Curie forge fixture test CA"]
-            + ["-keyout", str(ca_key), "-out", str(ca)]
+            + ["-keyout", str(ca_key), "-out", str(ca)],
+            "openssl (test CA)",
         ),
-        "openssl (test CA)",
-    )
-    _check(
-        runner(
+        (
             [*common, "-extensions", "leaf", "-subj", "/CN=localhost"]
-            + ["-CA", str(ca), "-CAkey", str(ca_key), "-keyout", str(tls_key), "-out", str(tls)]
+            + ["-CA", str(ca), "-CAkey", str(ca_key), "-keyout", str(tls_key), "-out", str(tls)],
+            "openssl (server certificate)",
         ),
-        "openssl (server certificate)",
-    )
+    ]
+    for argv, what in steps:
+        _check(budget.run(argv, what, cap=OPENSSL_TIMEOUT), what)
     for path in (ca, ca_key, tls, tls_key):
         os.chmod(path, 0o600)
     ca_key.unlink()
@@ -357,23 +418,22 @@ def _render(name: str, values: Mapping[str, str]) -> str:
 class Up:
     def __init__(
         self,
-        runner: Runner,
+        budget: Budget,
         urlopen: Opener,
         state_dir: Path,
         project: str,
         port: int,
         advertise_host: str,
-        deadline: float,
-        clock: Callable[[], float],
     ) -> None:
-        self.runner = runner
+        self.budget = budget
+        self.runner = budget.runner
         self.urlopen = urlopen
         self.state_dir = state_dir
         self.project = project
         self.port = port
         self.advertise_host = advertise_host
-        self.deadline = deadline
-        self.clock = clock
+        self.deadline = budget.deadline
+        self.clock = budget.clock
         self.compose_file = state_dir / "compose.yaml"
         self.ca_file = state_dir / "ca.pem"
         self.base_url = f"https://localhost:{port}"
@@ -382,18 +442,17 @@ class Up:
         self.db_password = secrets.token_urlsafe(24)
 
     def remaining(self) -> float:
-        left = self.deadline - self.clock()
-        if left <= 0:
-            raise FixtureError(f"up ran past its {int(READY_TIMEOUT)} s budget")
-        return left
+        return self.budget.remaining()
 
-    def compose(self, *args: str, env: Mapping[str, str] | None = None) -> str:
-        done = self.runner(
+    def compose(self, *args: str, cap: float, env: Mapping[str, str] | None = None) -> str:
+        what = f"docker compose {args[0]}"
+        done = self.budget.run(
             _compose(self.project, self.compose_file, *args),
+            what,
+            cap=cap,
             env=None if env is None else {**os.environ, **env},
-            timeout=self.remaining(),
         )
-        return _check(done, f"docker compose {args[0]}")
+        return _check(done, what)
 
     def run(self) -> None:
         _fail_at("license")
@@ -401,7 +460,7 @@ class Up:
         license_text = _read_license(self.urlopen)
 
         _fail_at("certs")
-        _make_certs(self.state_dir, self.advertise_host, self.runner)
+        _make_certs(self.state_dir, self.advertise_host, self.budget)
 
         _fail_at("create")
         values = {"PORT": str(self.port), "HOST": self.advertise_host}
@@ -409,8 +468,10 @@ class Up:
         _write_private(self.compose_file, _render("compose.yaml.tmpl", values))
         _write_private(self.state_dir / "nginx.conf", _render("nginx.conf.tmpl", values))
         log(f"creating Compose project {self.project} (pulls images on first use)")
+        # Pulls the images on first use, so only the budget bounds it.
         self.compose(
             "create",
+            cap=READY_TIMEOUT,
             env={
                 "CURIE_BBDC_LICENSE": license_text,
                 "CURIE_BBDC_ADMIN_PASSWORD": self.passwords[ADMIN],
@@ -418,10 +479,12 @@ class Up:
             },
         )
         for name, target in TLS_IN_NGINX.items():
-            self.compose("cp", str(self.state_dir / name), f"nginx:{target}")
+            self.compose(
+                "cp", str(self.state_dir / name), f"nginx:{target}", cap=COMPOSE_CP_TIMEOUT
+            )
 
         _fail_at("start")
-        self.compose("start")
+        self.compose("start", cap=COMPOSE_START_TIMEOUT)
 
         _fail_at("ready")
         self.wait_ready()
@@ -459,10 +522,13 @@ class Up:
         )
 
     def fail_with_logs(self, reason: str) -> None:
-        done = self.runner(
+        # Diagnostics for a failure, often one past the deadline: a fixed bound.
+        done = _invoke(
+            self.runner,
             _compose(self.project, self.compose_file, "logs", "--no-color", "--tail", "100")
             + ["bitbucket"],
-            timeout=60,
+            "docker compose logs",
+            timeout=LOGS_TIMEOUT,
         )
         raise FixtureError(f"{reason}\nlast 100 Bitbucket log lines:\n{done.stdout}{done.stderr}")
 
@@ -556,17 +622,25 @@ class Up:
             git = ["git", "-C", str(work)]
             env = {**os.environ, **_git_env(str(self.ca_file), admin_auth)}
             clone_url = f"{self.base_url}/scm/{PROJECT_KEY.lower()}/{REPO_SLUG}.git"
-            steps: list[tuple[list[str], str]] = [
-                (["git", "init", "-q", "-b", DEFAULT_BRANCH, str(work)], "git init"),
-                ([*git, "add", "README.md"], "git add"),
-                ([*git, *GIT_IDENTITY, "commit", "-q", "-m", "Seed the fixture"], "git commit"),
-                ([*git, "push", "-q", clone_url, f"HEAD:refs/heads/{DEFAULT_BRANCH}"], "git push"),
+            quick = QUICK_COMMAND_TIMEOUT
+            steps: list[tuple[list[str], str, float]] = [
+                (["git", "init", "-q", "-b", DEFAULT_BRANCH, str(work)], "git init", quick),
+                ([*git, "add", "README.md"], "git add", quick),
+                (
+                    [*git, *GIT_IDENTITY, "commit", "-q", "-m", "Seed the fixture"],
+                    "git commit",
+                    quick,
+                ),
+                (
+                    [*git, "push", "-q", clone_url, f"HEAD:refs/heads/{DEFAULT_BRANCH}"],
+                    "git push",
+                    GIT_NETWORK_TIMEOUT,
+                ),
             ]
-            for argv, what in steps:
-                _check(self.runner(argv, env=env, timeout=min(120.0, self.remaining())), what)
-            return _check(
-                self.runner([*git, "rev-parse", "HEAD"], env=env), "git rev-parse"
-            ).strip()
+            for argv, what, cap in steps:
+                _check(self.budget.run(argv, what, cap=cap, env=env), what)
+            done = self.budget.run([*git, "rev-parse", "HEAD"], "git rev-parse", cap=quick, env=env)
+            return _check(done, "git rev-parse").strip()
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
@@ -624,7 +698,8 @@ def up(
     if missing:
         raise FixtureError(f"required tool not on PATH: {', '.join(missing)}")
     state_dir = Path(args.state_dir).resolve()
-    root = _repository_root(runner)
+    budget = Budget(runner, started + READY_TIMEOUT, clock)
+    root = _repository_root(budget)
     if root is not None and state_dir.is_relative_to(root):
         raise FixtureError(
             f"the state directory {state_dir} is inside the repository {root}; "
@@ -636,15 +711,14 @@ def up(
     if not HOST_RE.match(advertise_host):
         raise FixtureError(f"--advertise-host {advertise_host!r} is not a host name or IPv4")
     port = args.port if args.port is not None else DEFAULT_PORT
-    _refuse_taken_port(port, runner)
+    _refuse_taken_port(port, budget)
 
     state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(state_dir, 0o700)
     project = f"curie-forge-bbdc-{secrets.token_hex(4)}"
     # Written first, so `down` can always find what to remove.
     _write_state(state_dir, {"schema": SCHEMA, "project": project})
-    deadline = started + READY_TIMEOUT
-    fixture = Up(runner, urlopen, state_dir, project, port, advertise_host, deadline, clock)
+    fixture = Up(budget, urlopen, state_dir, project, port, advertise_host)
     try:
         fixture.run()
     except BaseException:
@@ -672,16 +746,20 @@ LISTINGS = (
 
 
 def _leftovers(listing: list[str], project: str, kind: str, runner: Runner) -> list[str]:
-    done = runner([*listing, "--filter", f"label=com.docker.compose.project={project}", "-q"])
-    out = _check(done, f"listing the project's {kind}")
+    what = f"listing the project's {kind}"
+    argv = [*listing, "--filter", f"label=com.docker.compose.project={project}", "-q"]
+    out = _check(_invoke(runner, argv, what, timeout=QUICK_COMMAND_TIMEOUT), what)
     return out.split()
 
 
 def teardown(state_dir: Path, project: str, runner: Runner) -> None:
     compose_file = state_dir / "compose.yaml"
     if compose_file.is_file():
-        done = runner(
-            _compose(project, compose_file, "down", "-v", "--remove-orphans"), timeout=300
+        done = _invoke(
+            runner,
+            _compose(project, compose_file, "down", "-v", "--remove-orphans"),
+            "docker compose down",
+            timeout=COMPOSE_DOWN_TIMEOUT,
         )
         if done.returncode != 0:
             log(f"docker compose down exited {done.returncode}; removing by label instead")
@@ -690,7 +768,9 @@ def teardown(state_dir: Path, project: str, runner: Runner) -> None:
         if ids:
             log(f"removing leftover {kind}: {' '.join(ids)}")
             for ident in ids:
-                runner([*remove, ident], timeout=120)
+                _invoke(
+                    runner, [*remove, ident], f"removing {ident}", timeout=DOCKER_REMOVE_TIMEOUT
+                )
             still = _leftovers(listing, project, kind, runner)
             if still:
                 raise FixtureError(f"could not remove {kind} {' '.join(still)}")
@@ -738,7 +818,11 @@ def self_test(args: argparse.Namespace, runner: Runner, urlopen: Opener) -> int:
     if http.call("GET", "/status").get("state") != "RUNNING":
         raise FixtureError(f"{base}/status is not RUNNING")
     try:
-        urlopen(urllib.request.Request(base + "/status"), context=ssl.create_default_context())
+        urlopen(
+            urllib.request.Request(base + "/status"),
+            context=ssl.create_default_context(),
+            timeout=SEED_REQUEST_TIMEOUT,
+        )
     except urllib.error.URLError as error:
         if not isinstance(error.reason, ssl.SSLCertVerificationError):
             raise FixtureError(f"TLS without the CA failed for another reason: {error}") from None
@@ -759,15 +843,20 @@ def self_test(args: argparse.Namespace, runner: Runner, urlopen: Opener) -> int:
         clone_url = f"{base}/scm/{state['project_key'].lower()}/{state['repo_slug']}.git"
         checkout = work / "repo"
         git = ["git", "-C", str(checkout)]
-        _check(runner(["git", "clone", "-q", clone_url, str(checkout)], env=env), "git clone")
+
+        def git_step(argv: list[str], what: str, timeout: float) -> str:
+            return _check(_invoke(runner, argv, what, timeout=timeout, env=env), what)
+
+        quick, network = QUICK_COMMAND_TIMEOUT, GIT_NETWORK_TIMEOUT
+        git_step(["git", "clone", "-q", clone_url, str(checkout)], "git clone", network)
         if token in (checkout / ".git" / "config").read_text():
             raise FixtureError("the token landed in .git/config")
         (checkout / "SELF_TEST.md").write_text(f"{branch}\n")
-        _check(runner([*git, "checkout", "-q", "-b", branch], env=env), "git checkout")
-        _check(runner([*git, "add", "SELF_TEST.md"], env=env), "git add")
-        _check(runner([*git, *GIT_IDENTITY, "commit", "-q", "-m", branch], env=env), "git commit")
-        _check(runner([*git, "push", "-q", "origin", branch], env=env), "git push")
-        sha = _check(runner([*git, "rev-parse", "HEAD"], env=env), "git rev-parse").strip()
+        git_step([*git, "checkout", "-q", "-b", branch], "git checkout", quick)
+        git_step([*git, "add", "SELF_TEST.md"], "git add", quick)
+        git_step([*git, *GIT_IDENTITY, "commit", "-q", "-m", branch], "git commit", quick)
+        git_step([*git, "push", "-q", "origin", branch], "git push", network)
+        sha = git_step([*git, "rev-parse", "HEAD"], "git rev-parse", quick).strip()
         log(f"ok: clone and push of {sha[:12]} with the Bearer token")
 
         # 3. A build status on the pushed commit reads back.
@@ -785,7 +874,7 @@ def self_test(args: argparse.Namespace, runner: Runner, urlopen: Opener) -> int:
         if (build.get("key"), build.get("state")) != (key, "SUCCESSFUL"):
             raise FixtureError(f"the posted build status did not read back: {build}")
         log("ok: build status posted and read back")
-        _check(runner([*git, "push", "-q", "origin", "--delete", branch], env=env), "git push")
+        git_step([*git, "push", "-q", "origin", "--delete", branch], "git push --delete", network)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

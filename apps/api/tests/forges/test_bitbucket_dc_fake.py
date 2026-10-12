@@ -122,6 +122,10 @@ def _port_calls(
         Operation.VERIFY_FEEDBACK: lambda: adapter.verify_feedback(feedback),
         Operation.FIND_MARKED: lambda: comments.find_marked(target, MARKER),
         Operation.UPSERT_MARKED: lambda: comments.upsert_marked(target, MARKER, "status"),
+        # Unsupported on every version, but an old server is refused first.
+        Operation.CI_DIAGNOSTICS: lambda: adapter.ci_diagnostics(repo, sha, base_ref=None),
+        Operation.RERUN_FAILED: lambda: adapter.rerun_failed(repo, ()),
+        Operation.USER_CAN_WRITE: lambda: adapter.user_can_write(repo, REVIEWER),
     }
 
 
@@ -137,16 +141,6 @@ async def test_bitbucket_dc_version_below_9_4_0_refuses_every_call(version: str)
             await call()
         assert refused.value.operation is operation
         assert str(refused.value) == TOO_OLD.format(version), operation
-    # Unsupported optional operations refuse too, still naming their operation.
-    repo = fake.repository()
-    for operation, optional in (
-        (Operation.CI_DIAGNOSTICS, adapter.ci_diagnostics(repo, "a" * 40, base_ref=None)),
-        (Operation.RERUN_FAILED, adapter.rerun_failed(repo, ())),
-        (Operation.USER_CAN_WRITE, adapter.user_can_write(repo, REVIEWER)),
-    ):
-        with pytest.raises(Unsupported) as refused:
-            await optional
-        assert refused.value.operation is operation
 
     # The version is read once and cached; nothing else was asked or written.
     assert [r.path for r in fake.requests] == [f"{CONTEXT}/rest/api/latest/application-properties"]
@@ -886,6 +880,8 @@ async def test_bitbucket_dc_unsupported_operations_raise_and_write_nothing(
         with pytest.raises(Unsupported) as refused:
             await call
         assert refused.value.operation is operation
+        # On a 9.4 server the refusal is the operation's own, not the version floor.
+        assert "older than the minimum" not in str(refused.value), operation
     assert fake.writes == writes
 
 
