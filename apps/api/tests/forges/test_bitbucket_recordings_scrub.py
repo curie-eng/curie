@@ -151,6 +151,8 @@ def test_bitbucket_recordings_scrub_leaves_nothing_real(
     text = json.dumps(clean)
     assert f"{PLACEHOLDER_WORKSPACE}/{PLACEHOLDER_SLUG}" in text
     assert f"bitbucket.org/workspaces/{PLACEHOLDER_WORKSPACE}/avatar/" in text
+    assert f"bitbucket.org/account/{PLACEHOLDER_WORKSPACE}/avatar/" in text
+    assert f'"username": "{PLACEHOLDER_WORKSPACE}"' in text
     assert f"bitbucket.org/{PLACEHOLDER_WORKSPACE}/workspace/projects/" in text
     assert "placeholder-account-1" in text
     assert clean["meta"]["repo_uuid"].startswith("{00000000-0000-4000-8000-")

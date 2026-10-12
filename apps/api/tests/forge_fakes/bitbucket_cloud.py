@@ -403,14 +403,17 @@ class BitbucketCloudFake:
             "is_private": True,
             "scm": "git",
             "mainbranch": {"type": "branch", "name": self.mainbranch},
-            # Shape observed on a team workspace on 2026-10-12: the owner display name
-            # equals the workspace slug; the workspace avatar is under /workspaces/<slug>/avatar/;
-            # the project links are under /<slug>/workspace/projects/<KEY>.
+            # Shape observed on a team workspace on 2026-10-12: the owner's display name
+            # and username are the workspace slug, its avatar is under
+            # /account/<slug>/avatar/; the workspace avatar is under
+            # /workspaces/<slug>/avatar/; the project links are under
+            # /<slug>/workspace/projects/<KEY>.
             "owner": {
                 "type": "team",
                 "display_name": self.workspace,
+                "username": self.workspace,
                 "uuid": WORKSPACE_UUID,
-                "links": {"avatar": {"href": avatar}},
+                "links": {"avatar": {"href": f"{HTML_BASE}/account/{self.workspace}/avatar/"}},
             },
             "workspace": {
                 "type": "workspace",
