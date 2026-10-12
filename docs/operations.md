@@ -513,7 +513,9 @@ up` observes it, not assumed.
 `--json` reports the current phase, the last known-good version, whether
 the previous version is still serving, and at most one fail-forward
 command. Success is refused unless convergence is exact and the canary
-passed. After a normal command failure, run the same command to resume only
+passed. Every failed phase exits 1, and `--json` preserves the full upgrade
+report, including convergence and the fail-forward command. After a normal
+command failure, run the same command to resume only
 when cleanup successfully released ownership.
 
 This composes configuration migration (issue 2299) with a `drain_preflight`

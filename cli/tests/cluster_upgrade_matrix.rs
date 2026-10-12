@@ -87,6 +87,10 @@ fn cluster_upgrade_matrix_self_test_refuses_soak_unknown_scenario_and_path_curie
         "self-test must pin cluster upgrade as the mutator\n{text}"
     );
     assert!(
+        text.contains("verified named kind context reaches kubectl helm and cluster upgrade"),
+        "self-test must execute all three clients with the verified task-owned kind context\n{text}"
+    );
+    assert!(
         text.contains("restore_n resumes leftover in_progress 0.10.0"),
         "self-test must pin restore_n resuming leftover in_progress 0.10.0\n{text}"
     );

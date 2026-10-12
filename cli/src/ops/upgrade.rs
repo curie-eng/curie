@@ -1366,22 +1366,35 @@ fn truncate_reason(detail: &str) -> String {
 }
 
 fn fail_forward_for(opts: &UpgradeOpts, previous_serving: bool, reason: &str) -> FailForward {
-    if previous_serving {
-        FailForward {
-            command: format!(
-                "curie cluster rollback --yes --release {} --namespace {}",
-                opts.common.release, opts.common.namespace
-            ),
-            reason: reason.to_string(),
-        }
+    let mut args = if previous_serving {
+        vec![plain("cluster"), plain("rollback"), plain("--yes")]
     } else {
-        FailForward {
-            command: format!(
-                "curie cluster upgrade --to {} --release {} --namespace {}",
-                opts.to, opts.common.release, opts.common.namespace
-            ),
-            reason: reason.to_string(),
+        vec![
+            plain("cluster"),
+            plain("upgrade"),
+            plain("--to"),
+            plain(&opts.to),
+        ]
+    };
+    args.extend([
+        plain("--release"),
+        plain(&opts.common.release),
+        plain("--namespace"),
+        plain(&opts.common.namespace),
+    ]);
+    if let Ok(context) = std::env::var("HELM_KUBECONTEXT") {
+        if !context.trim().is_empty() {
+            args.push(plain("--context"));
+            args.push(plain(context));
         }
+    }
+    if !previous_serving && opts.chart.pending_release().is_none() {
+        args.push(plain("--chart"));
+        args.push(plain(opts.chart.operand()));
+    }
+    FailForward {
+        command: OpsCommand::new("curie", args).display(),
+        reason: reason.to_string(),
     }
 }
 
@@ -3900,12 +3913,12 @@ pub async fn upgrade(opts: UpgradeOpts) -> Result<ClusterUpgradeOutput> {
         Err(error) => Err(error),
     };
     let result = wrap_schema_refusal(&live, result);
-    // Apply failures stay a non-zero exit. The checkpoint is already the
+    // Every failed phase exits nonzero. The checkpoint is already the
     // terminal failed record, and ownership is released first (#3849).
-    refuse_failed_apply(finish_owned_upgrade(&mut live, result))
+    refuse_failed_upgrade(finish_owned_upgrade(&mut live, result))
 }
 
-fn refuse_failed_apply(result: Result<ClusterUpgradeOutput>) -> Result<ClusterUpgradeOutput> {
+fn refuse_failed_upgrade(result: Result<ClusterUpgradeOutput>) -> Result<ClusterUpgradeOutput> {
     match result {
         Ok(output) => match &output {
             ClusterUpgradeOutput::Completed {
@@ -3913,11 +3926,11 @@ fn refuse_failed_apply(result: Result<ClusterUpgradeOutput>) -> Result<ClusterUp
                 phase,
                 fail_forward,
                 ..
-            } if status == "failed" && phase == "apply" => {
+            } if status == "failed" => {
                 let reason = fail_forward
                     .as_ref()
                     .map(|item| item.reason.clone())
-                    .unwrap_or_else(|| "upgrade failed during apply".to_string());
+                    .unwrap_or_else(|| format!("upgrade failed during {phase}"));
                 Err(crate::ui::ui().failed_report(&output, anyhow::anyhow!(reason)))
             }
             _ => Ok(output),
