@@ -143,6 +143,8 @@ def _token_ref(claim: str, key: str) -> dict[str, Any]:
 def _without_runner_env(spec: dict[str, Any]) -> dict[str, Any]:
     stripped = copy.deepcopy(spec)
     _runner_container(stripped).pop("env")
+    # The per-claim pod label differs per claim by design; tests assert it directly.
+    stripped["podTemplate"]["metadata"]["labels"].pop("curietech.ai/sandbox-claim", None)
     return stripped
 
 
@@ -379,6 +381,10 @@ def test_substrate_executor_claim_runs_from_the_stripped_template(
     # but the runner env (NetworkPolicy-relevant pod labels included) is equal.
     assert _without_runner_env(exec_spec) == _without_runner_env(turn_spec)
     assert _without_runner_env(exec_spec) == _without_runner_env(pristine)
+    # Each sandbox pod carries its own claim name for per-run NetworkPolicy selection.
+    pod_label = "curietech.ai/sandbox-claim"
+    assert exec_spec["podTemplate"]["metadata"]["labels"][pod_label] == executor.claim_name
+    assert turn_spec["podTemplate"]["metadata"]["labels"][pod_label] == ordinary.claim_name
     # Labels: the same keys, the same agent and managed-by values.
     exec_labels = claims[executor.claim_name]["metadata"]["labels"]
     turn_labels = claims[ordinary.claim_name]["metadata"]["labels"]
