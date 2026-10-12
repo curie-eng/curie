@@ -171,6 +171,125 @@ grep -qx 'value=fixed' runner/Dockerfile
 "#;
 
 #[test]
+fn unknown_chart_provisioning_token_refuses_before_selector_or_infrastructure() {
+    let fixture = Fixture::new("charts/curie/ci/assert-pin.sh", CHART_OLD);
+    let change = fixture.commit(
+        &[
+            ("runner/Dockerfile", "value=fixed\n"),
+            (
+                "charts/curie/ci/assert-pin.sh",
+                "#!/bin/sh\n# fix-pin-provision: unknown-stack\nset -eu\nprintf 'selector\\n' >> \"$VERIFY_PROVISION_LOG\"\ngrep -qx 'value=fixed' runner/Dockerfile\n",
+            ),
+        ],
+        "Fix chart with unsupported provisioning",
+    );
+    let run_log = fixture.external_path("provision.log");
+    for tool in ["cargo", "docker", "kind", "kubectl", "helm"] {
+        test_executable::install_in(
+            &fixture.tools,
+            tool,
+            "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$VERIFY_PROVISION_LOG\"\nexit 78\n",
+        );
+    }
+
+    let output = fixture
+        .command(&change, "charts/curie/ci/assert-pin.sh")
+        .env("VERIFY_PROVISION_LOG", &run_log)
+        .output()
+        .expect("run verify fix pin");
+    let shown = output_text(&output);
+    assert!(
+        !output.status.success(),
+        "an unknown provisioning token must fail\n{shown}"
+    );
+    assert!(
+        shown.contains("unknown-stack") && shown.to_lowercase().contains("provision"),
+        "the refusal must identify the unknown provisioning token\n{shown}"
+    );
+    assert!(
+        !run_log.exists(),
+        "the selector and infrastructure tools must not run"
+    );
+    assert!(!stdout_has_result(&output, "PINNED"));
+    assert!(!stdout_has_result(&output, "UNPINNED"));
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
+fn known_chart_provisioning_tokens_enter_setup_before_the_selector() {
+    for token in ["kind-calico", "candidate-stack"] {
+        let fixture = Fixture::new("charts/curie/ci/assert-pin.sh", CHART_OLD);
+        let assertion = format!(
+            "#!/bin/sh\n# fix-pin-provision: {token}\nset -eu\nprintf 'selector\\n' >> \"$VERIFY_PROVISION_LOG\"\ngrep -qx 'value=fixed' runner/Dockerfile\n"
+        );
+        let change = fixture.commit(
+            &[
+                ("runner/Dockerfile", "value=fixed\n"),
+                ("charts/curie/ci/assert-pin.sh", &assertion),
+            ],
+            "Fix chart with declared provisioning",
+        );
+        let run_log = fixture.external_path("provision.log");
+        // A controlled external-tool failure makes this boundary test offline
+        // and proves setup precedes selector execution for both known tokens.
+        for tool in ["cargo", "docker", "kind", "kubectl", "helm"] {
+            test_executable::install_in(
+                &fixture.tools,
+                tool,
+                "#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$VERIFY_PROVISION_LOG\"\nexit 78\n",
+            );
+        }
+        let output = fixture
+            .command(&change, "charts/curie/ci/assert-pin.sh")
+            .env("VERIFY_PROVISION_LOG", &run_log)
+            .output()
+            .expect("run verify fix pin");
+        let shown = output_text(&output);
+        assert!(
+            !output.status.success(),
+            "a provisioning failure must fail verification: {token}\n{shown}"
+        );
+        let calls = fs::read_to_string(&run_log).expect("provisioning must reach an external tool");
+        assert!(
+            calls.lines().any(|line| !line.starts_with("selector")),
+            "the known token must enter provisioning: {token}\n{calls}"
+        );
+        assert!(
+            !calls.lines().any(|line| line == "selector"),
+            "a provisioning failure must prevent the selector: {token}\n{calls}"
+        );
+        assert!(!stdout_has_result(&output, "PINNED"));
+        fixture.assert_clean_and_single_worktree();
+    }
+}
+
+#[test]
+fn chart_provisioning_header_after_line_twenty_keeps_the_existing_route() {
+    let fixture = Fixture::new("charts/curie/ci/assert-pin.sh", CHART_OLD);
+    let assertion = format!(
+        "#!/bin/sh\n{}# fix-pin-provision: unknown-stack\nset -eu\ngrep -qx 'value=fixed' runner/Dockerfile\n",
+        "# introductory comment\n".repeat(19)
+    );
+    let change = fixture.commit(
+        &[
+            ("runner/Dockerfile", "value=fixed\n"),
+            ("charts/curie/ci/assert-pin.sh", &assertion),
+        ],
+        "Fix chart assertion without an early provisioning declaration",
+    );
+    let output = fixture
+        .command(&change, "charts/curie/ci/assert-pin.sh")
+        .output()
+        .expect("run verify fix pin");
+    assert!(
+        output.status.success() && stdout_has_result(&output, "PINNED"),
+        "a header after the declaration window must preserve the existing route\n{}",
+        output_text(&output)
+    );
+    fixture.assert_clean_and_single_worktree();
+}
+
+#[test]
 fn commit_is_pinned_only_when_reversing_product_code_breaks_the_changed_chart_assertion() {
     let fixture = Fixture::new("charts/curie/ci/assert-pin.sh", CHART_OLD);
     let change = fixture.commit(

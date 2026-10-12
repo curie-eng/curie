@@ -2582,11 +2582,9 @@ jobs:
           if-no-files-found: warn
 
   # CHART RUNTIME REGRESSIONS, in parallel with the cluster rung. Most
-  # regression proofs that need an enforcing Calico cluster but neither the
-  # curie binary nor the product images use this job's cluster. The workspace
-  # regression builds its own CLI and product images from source and owns a
-  # separate disposable kind cluster. This job does not wait on the Rust build
-  # and is selected by the same cluster tier
+  # regression proofs use this job's enforcing Calico cluster. The workspace
+  # regression also uses the release CLI and candidate product images built
+  # by the upstream jobs. This job is selected by the same cluster tier
   # (every charts/ change), and `E2E required` needs it: the Langfuse readiness
   # assertion and the connector readiness probe are registered runtime
   # assertions (#3391), and a failure here reddens the required verdict exactly
@@ -2594,7 +2592,7 @@ jobs:
   e2e-cluster-chart-regressions:
     name: E2E chart runtime regressions (kind, Calico)
     runs-on: ubuntu-latest
-    needs: [changes, ci-images]
+    needs: [rust-build, changes, ci-images]
     if: ${{ needs.changes.outputs.cluster == 'true' }}
     steps:
       - uses: actions/checkout@v7
@@ -2785,8 +2783,35 @@ jobs:
         run: |
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
+      - name: Download the workspace diagnostic CLI
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: curie-x86_64-linux-${{ github.sha }}
+          path: cli/target/release
+      - name: Load the workspace diagnostic candidate images
+        uses: ./.github/actions/load-ci-images
+        with:
+          images: "{api,worker,runner}"
+      - name: Stage the workspace diagnostic images in kind
+        run: |
+          set -euo pipefail
+          chmod +x cli/target/release/curie
+          docker tag curie-ci/api:candidate curie-api:wsdiag-${{ github.sha }}
+          docker tag curie-ci/worker:candidate curie-worker:wsdiag-${{ github.sha }}
+          docker tag curie-ci/runner:candidate curie-runner:wsdiag-${{ github.sha }}
+          kind load docker-image \
+            curie-api:wsdiag-${{ github.sha }} \
+            curie-worker:wsdiag-${{ github.sha }} \
+            curie-runner:wsdiag-${{ github.sha }} --name curie-e2e
       - name: Workspace dependency failure reaches the terminal diagnostic
         timeout-minutes: 30
+        env:
+          CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
+          CURIE_SCENARIO_CONTEXT: kind-curie-e2e
+          CURIE_SCENARIO_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+          CURIE_SCENARIO_API_IMAGE: curie-api:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_WORKER_IMAGE: curie-worker:wsdiag-${{ github.sha }}
+          CURIE_SCENARIO_RUNNER_IMAGE: curie-runner:wsdiag-${{ github.sha }}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
