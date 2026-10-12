@@ -443,8 +443,8 @@ else
     fi
     # With --json the refusal is the JSON error object on stdout; without it,
     # the same text is on stderr. Read both.
-    if (( ! AGENT_OWNED )) || ! cat "$WORKDIR/deploy1.json" "$WORKDIR/deploy1.err" \
-        | grep -qF "$ROUTE"; then
+    if (( ! AGENT_OWNED )) || ! grep -qF -- "$ROUTE" \
+        "$WORKDIR/deploy1.json" "$WORKDIR/deploy1.err"; then
         tail -n 40 "$WORKDIR/deploy1.json" "$WORKDIR/deploy1.err" >&2
         fail "first deploy failed for a reason other than the unbound route $ROUTE"
     fi
