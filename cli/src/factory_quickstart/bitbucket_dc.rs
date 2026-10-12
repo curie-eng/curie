@@ -6,13 +6,13 @@
 
 use std::net::IpAddr;
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::{EgressEntry, ForgeFlags, TrackerKind};
+use super::{http_client, read_token, EgressEntry, ForgeFlags, TrackerKind};
 use crate::exit::CliError;
+use crate::oci_registry::is_loopback_host;
 
 /// The oldest Data Center release the adapter supports.
 const MINIMUM_VERSION: [u64; 3] = [9, 4, 0];
@@ -68,7 +68,7 @@ fn base_url(forge_url: &str) -> Result<reqwest::Url> {
     }
     match url.scheme() {
         "https" => Ok(url),
-        "http" if matches!(host, "localhost" | "127.0.0.1" | "[::1]") => Ok(url),
+        "http" if is_loopback_host(host) => Ok(url),
         "http" => Err(refuse("uses plain http to a remote host; use https")),
         _ => Err(refuse("is not an http or https URL")),
     }
@@ -123,48 +123,6 @@ pub(super) fn parse_repo(repo: &str) -> Result<RepoPath> {
     }
 }
 
-/// Reads the access token from `token_file`, trimmed. The value is never
-/// put into an error.
-fn read_token(token_file: &Path) -> Result<String> {
-    let raw = std::fs::read_to_string(token_file).map_err(|error| {
-        CliError::failure(format!(
-            "could not read the token file {}: {error}",
-            token_file.display()
-        ))
-    })?;
-    let token = raw.trim();
-    if token.is_empty() {
-        return Err(
-            CliError::usage(format!("the token file {} is empty", token_file.display())).into(),
-        );
-    }
-    Ok(token.to_string())
-}
-
-fn http_client(ca_file: Option<&Path>) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15));
-    if let Some(ca_file) = ca_file {
-        let pem = std::fs::read(ca_file).map_err(|error| {
-            CliError::failure(format!(
-                "could not read --ca-file {}: {error}",
-                ca_file.display()
-            ))
-        })?;
-        let certificate = reqwest::Certificate::from_pem(&pem).map_err(|error| {
-            CliError::usage(format!(
-                "--ca-file {} is not a PEM certificate: {error}",
-                ca_file.display()
-            ))
-        })?;
-        builder = builder.add_root_certificate(certificate);
-    }
-    builder.build().map_err(|error| {
-        CliError::failure(format!("could not build an HTTP client: {error}")).into()
-    })
-}
-
 /// The first three numeric parts of a version such as `9.4.24`; a missing
 /// part reads 0 and a suffix after the digits is ignored.
 fn version_parts(version: &str) -> Option<[u64; 3]> {
@@ -192,32 +150,23 @@ async fn get_json(
         .await
         .map_err(|error| CliError::failure(format!("reading {what} failed: {error}")))?;
     let status = response.status().as_u16();
-    match status {
-        200 => {}
-        401 => {
-            return Err(CliError::failure(format!(
+    if status != 200 {
+        return Err(match status {
+            401 => CliError::failure(format!(
                 "the token in {} was refused (401)",
                 token_file.display()
             ))
-            .with_fix("replace it with a current Bitbucket Data Center HTTP access token")
-            .into())
-        }
-        403 => {
-            return Err(CliError::failure(format!(
+            .with_fix("replace it with a current Bitbucket Data Center HTTP access token"),
+            403 => CliError::failure(format!(
                 "the token in {} cannot read {what} (403); it needs REPO_WRITE on the repository",
                 token_file.display()
             ))
-            .with_fix("create an HTTP access token with the REPO_WRITE permission")
-            .into())
+            .with_fix("create an HTTP access token with the REPO_WRITE permission"),
+            404 => CliError::failure(format!("{what} was not found (404)"))
+                .with_fix("check --forge-url, including any context path, and --repo"),
+            _ => CliError::failure(format!("reading {what} answered HTTP {status}")),
         }
-        404 => {
-            return Err(CliError::failure(format!("{what} was not found (404)"))
-                .with_fix("check --forge-url, including any context path, and --repo")
-                .into())
-        }
-        _ => {
-            return Err(CliError::failure(format!("reading {what} answered HTTP {status}")).into())
-        }
+        .into());
     }
     response
         .json()
@@ -253,10 +202,12 @@ pub(super) async fn probe(
         CliError::failure(format!("{base} reported an unreadable version {version:?}"))
     })?;
     if parts < MINIMUM_VERSION {
+        let [major, minor, patch] = MINIMUM_VERSION;
+        let minimum = format!("{major}.{minor}.{patch}");
         return Err(CliError::failure(format!(
-            "Bitbucket Data Center {version} is older than the minimum 9.4.0"
+            "Bitbucket Data Center {version} is older than the minimum {minimum}"
         ))
-        .with_fix("upgrade the server to 9.4.0 or later")
+        .with_fix(format!("upgrade the server to {minimum} or later"))
         .into());
     }
     let path = format!("{}/{}", repo.project_key, repo.slug);

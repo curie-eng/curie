@@ -38,6 +38,7 @@ class ServerTooOld(Unsupported):
 
     def __init__(self, operation: Operation, version: str) -> None:
         self.operation = operation
+        minimum = ".".join(map(str, MINIMUM))
         ForgeError.__init__(
-            self, f"Bitbucket Data Center {version} is older than the minimum 9.4.0"
+            self, f"Bitbucket Data Center {version} is older than the minimum {minimum}"
         )

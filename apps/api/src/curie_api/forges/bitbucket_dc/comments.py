@@ -13,7 +13,6 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from curie_api.forges import types
-from curie_api.forges.bitbucket_dc.transport import object_of
 from curie_api.forges.capabilities import MARKED_COMMENT_OPERATIONS, Operation, Support
 from curie_api.forges.errors import NotFound, Unavailable
 from curie_api.forges.types import MarkedComment, PullRequestRef, ReplyTarget, UpsertResult
@@ -101,25 +100,18 @@ class BitbucketDcMarkedComments:
             return UpsertResult(MarkedComment(found.id, target, found.text), written=False)
         comments = f"{code_host.pull_path(pull_request)}/comments"
         if found is not None:
-            response = await code_host.transport.request(
-                "PUT",
+            stored = await code_host.transport.put_versioned(
                 f"{comments}/{found.id}",
                 what="comment",
                 json={"text": text, "version": found.version},
-                allow=(409,),
             )
-            if response.status_code == 409:
-                raise Unavailable("stale_version")
         else:
             posted: dict[str, object] = {"text": text}
             if target.thread_id is not None:
                 if not target.thread_id.isdigit():
                     raise NotFound("thread")
                 posted["parent"] = {"id": int(target.thread_id)}
-            response = await code_host.transport.request(
-                "POST", comments, what="comment", json=posted
-            )
-        stored = object_of(response, "comment")
+            stored = await code_host.transport.json("POST", comments, what="comment", json=posted)
         cid = stored.get("id")
         if type(cid) is not int:
             raise Unavailable("comment")

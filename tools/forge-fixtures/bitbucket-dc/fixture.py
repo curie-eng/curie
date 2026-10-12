@@ -221,6 +221,11 @@ class Budget:
             raise FixtureError(f"up ran past its {int(READY_TIMEOUT)} s budget")
         return left
 
+    def timeout(self, cap: float) -> float:
+        """``cap``, or less when the deadline is nearer. Refuses once it has passed."""
+
+        return min(cap, self.remaining())
+
     def run(
         self,
         argv: Sequence[str],
@@ -229,9 +234,7 @@ class Budget:
         cap: float,
         env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        # Refuses to start once the deadline has passed.
-        timeout = min(cap, self.remaining())
-        return _invoke(self.runner, argv, what, timeout=timeout, env=env)
+        return _invoke(self.runner, argv, what, timeout=self.timeout(cap), env=env)
 
 
 def log(message: str) -> None:
@@ -466,23 +469,17 @@ class Up:
         advertise_host: str,
     ) -> None:
         self.budget = budget
-        self.runner = budget.runner
         self.urlopen = urlopen
         self.state_dir = state_dir
         self.project = project
         self.port = port
         self.advertise_host = advertise_host
-        self.deadline = budget.deadline
-        self.clock = budget.clock
         self.compose_file = state_dir / "compose.yaml"
         self.ca_file = state_dir / "ca.pem"
         self.base_url = f"https://localhost:{port}"
         self.advertised_url = f"https://{advertise_host}:{port}"
         self.passwords = {name: secrets.token_urlsafe(24) for name in (ADMIN, *USERS)}
         self.db_password = secrets.token_urlsafe(24)
-
-    def remaining(self) -> float:
-        return self.budget.remaining()
 
     def compose(self, *args: str, cap: float, env: Mapping[str, str] | None = None) -> str:
         what = f"docker compose {args[0]}"
@@ -534,17 +531,18 @@ class Up:
 
         _fail_at("state")
         # Seeding may end past the deadline; such a fixture is a failure, not up.
-        self.remaining()
+        self.budget.remaining()
         self.write_state(seeded)
 
     def wait_ready(self) -> None:
         log(f"waiting for {self.base_url}/status to report RUNNING")
         http = Http(self.urlopen, self.base_url, self.ca_file)
         last = "no answer yet"
-        next_note = self.clock() + 60
-        while self.clock() < self.deadline:
+        budget = self.budget
+        next_note = budget.clock() + 60
+        while budget.clock() < budget.deadline:
             try:
-                state = http.call("GET", "/status", timeout=10).get("state")
+                state = http.call("GET", "/status", timeout=budget.timeout(10)).get("state")
             except FixtureError as error:
                 last = str(error)
             else:
@@ -553,7 +551,7 @@ class Up:
                 last = f"state {state}"
                 if state == "ERROR":
                     self.fail_with_logs(f"Bitbucket reported state ERROR at {self.base_url}/status")
-            if self.clock() >= next_note:
+            if budget.clock() >= next_note:
                 log(f"still waiting: {last}")
                 next_note += 60
             time.sleep(5)
@@ -564,7 +562,7 @@ class Up:
     def fail_with_logs(self, reason: str) -> None:
         # Diagnostics for a failure, often one past the deadline: a fixed bound.
         done = _invoke(
-            self.runner,
+            self.budget.runner,
             _compose(self.project, self.compose_file, "logs", "--no-color", "--tail", "100")
             + ["bitbucket"],
             "docker compose logs",
@@ -576,9 +574,9 @@ class Up:
         http = Http(self.urlopen, self.base_url, self.ca_file)
 
         def call(method: str, path: str, **kwargs: Any) -> Any:
-            # Refuses to start once the deadline has passed.
-            timeout = min(SEED_REQUEST_TIMEOUT, self.remaining())
-            return http.call(method, path, timeout=timeout, **kwargs)
+            return http.call(
+                method, path, timeout=self.budget.timeout(SEED_REQUEST_TIMEOUT), **kwargs
+            )
 
         admin = _basic(ADMIN, self.passwords[ADMIN])
         api = "/rest/api/latest"

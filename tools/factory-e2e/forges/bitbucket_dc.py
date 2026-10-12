@@ -104,12 +104,9 @@ def _opener(context: ssl.SSLContext) -> urllib.request.OpenerDirector:
 
 
 def _secret(path: str, what: str) -> str:
-    try:
-        value = Path(path).read_text().strip()
-    except OSError as exc:
-        raise fe.ConfigError(f"{FIXTURE_VAR}: cannot read the {what}: {exc.strerror}") from None
-    if not value:
-        raise fe.ConfigError(f"{FIXTURE_VAR}: the {what} file is empty")
+    value = fe._read_secret_file(Path(path))
+    if value is None:
+        raise fe.ConfigError(f"{FIXTURE_VAR}: the {what} file is unreadable or empty")
     return value
 
 
@@ -158,6 +155,7 @@ class BitbucketDcDriver:
             self.context = ssl.create_default_context(cafile=ca_file)
         except (OSError, ssl.SSLError) as exc:
             raise fe.ConfigError(f"{FIXTURE_VAR}: cannot load the fixture CA: {exc}") from None
+        self._opener = _opener(self.context)
         self.token_auth = f"Bearer {_secret(token_file, 'factory token')}"
         self.admin_auth = _basic(self.admin_user, _secret(admin_password_file, "admin password"))
         self.reviewer_auth = _basic(REVIEWER, _secret(reviewer_password_file, "reviewer password"))
@@ -179,9 +177,16 @@ class BitbucketDcDriver:
         auth: str | None = None,
         timeout: float = HTTP_TIMEOUT_SECONDS,
     ) -> tuple[int, Any]:
-        """(status, JSON body) for one request; status 0 when nothing answered."""
+        """(status, JSON body) for one request; status 0 when nothing answered.
 
-        url = url if url.startswith("https://") else self.rest + url
+        A URL off the fixture's origin is refused before it is requested, so a
+        credential never leaves the fixture.
+        """
+
+        url = url if urllib.parse.urlsplit(url).scheme else self.rest + url
+        origin, there = urllib.parse.urlsplit(self.base_url), urllib.parse.urlsplit(url)
+        if (there.scheme, there.netloc) != (origin.scheme, origin.netloc):
+            raise fe.PreflightFailed(f"refused a request off {origin.scheme}://{origin.netloc}")
         request = urllib.request.Request(
             url,
             method=method,
@@ -195,7 +200,7 @@ class BitbucketDcDriver:
             },
         )
         try:
-            with _opener(self.context).open(request, timeout=timeout) as response:
+            with self._opener.open(request, timeout=timeout) as response:
                 status, data = int(response.status), response.read()
         except urllib.error.HTTPError as exc:
             status, data = exc.code, exc.read()
@@ -361,10 +366,8 @@ class BitbucketDcDriver:
 
     # --- review and merge --------------------------------------------------
 
-    def _request_count(self, work_item_id: str) -> int | None:
-        detail = self.p.work_item_detail(work_item_id)
-        if detail is None:
-            return None
+    @staticmethod
+    def _request_count(detail: Mapping[str, Any]) -> int:
         return len([r for r in detail.get("requests") or [] if isinstance(r, dict)])
 
     def post_review(self, change: fe.ChangeRef, text: str) -> dict[str, Any]:
@@ -376,9 +379,10 @@ class BitbucketDcDriver:
         """
 
         work_item_id = str(self.p.evidence["work_item_id"])
-        before = self._request_count(work_item_id)
-        if before is None:
+        detail = self.p.work_item_detail(work_item_id)
+        if detail is None:
             raise fe.PreflightFailed("reading the WorkItem before the review failed")
+        before = self._request_count(detail)
         body = fe.revision_comment_text(text, self.p.config.mention)
         status, comment = self._call(
             "POST",
@@ -391,8 +395,9 @@ class BitbucketDcDriver:
 
         def admitted() -> dict[str, Any] | None:
             detail = self.p.work_item_detail(work_item_id)
-            requests = [r for r in (detail or {}).get("requests") or [] if isinstance(r, dict)]
-            return fe._latest_request(detail or {}) if len(requests) > before else None
+            if detail is None or self._request_count(detail) <= before:
+                return None
+            return fe._latest_request(detail)
 
         request = fe._wait(
             f"the factory to admit review comment {comment['id']}",
@@ -447,7 +452,10 @@ class BitbucketDcDriver:
         return sorted(numbers)
 
     def default_branch_head(self) -> str:
-        ref = urllib.parse.quote(f"refs/heads/{self.default_branch}", safe="")
+        return self._branch_head(self.default_branch)
+
+    def _branch_head(self, branch: str) -> str:
+        ref = urllib.parse.quote(f"refs/heads/{branch}", safe="")
         status, page = self._call("GET", f"/commits?until={ref}&limit=1")
         values = page.get("values") if status == 200 and isinstance(page, dict) else None
         sha = values[0].get("id") if isinstance(values, list) and values else None
@@ -494,17 +502,18 @@ class BitbucketDcDriver:
 
         if self._base_sha:
             return
-        self._base_sha = self.default_branch_head()
+        branch = self.default_branch
+        self._base_sha = self._branch_head(branch)
 
         def restore() -> dict[str, Any]:
-            if self.default_branch_head() != self._base_sha:
-                self._git_restore(self._base_sha)
-            return {"restored": self.default_branch_head() == self._base_sha}
+            if self._branch_head(branch) == self._base_sha:
+                return {"restored": True}
+            self._git_restore(branch, self._base_sha)
+            return {"restored": self._branch_head(branch) == self._base_sha}
 
         self.p.teardown.push("restore fixture default branch", restore)
 
-    def _git_restore(self, sha: str) -> None:
-        branch = self.default_branch
+    def _git_restore(self, branch: str, sha: str) -> None:
         # The credential travels in the environment, never in argv.
         env = {
             **os.environ,

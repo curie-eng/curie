@@ -104,6 +104,16 @@ class DcTransport:
         response = await self.request(method, path, what=what, params=params, json=json, api=api)
         return object_of(response, what)
 
+    async def put_versioned(self, path: str, *, what: str, json: Any) -> dict[str, Any]:
+        """PUT ``json``, which carries the version the caller read. A version
+        someone else moved on answers 409, raised as ``Unavailable("stale_version")``
+        so the caller retries with a fresh read."""
+
+        response = await self.request("PUT", path, what=what, json=json, allow=(409,))
+        if response.status_code == 409:
+            raise Unavailable("stale_version")
+        return object_of(response, what)
+
     async def pages(
         self,
         path: str,

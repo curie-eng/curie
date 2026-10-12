@@ -71,8 +71,8 @@ HTTP_TIMEOUT_SECONDS = 30
 WATCH_INTERVAL_SECONDS = 5.0
 WATCH_LIFETIME_SECONDS = float(fe.EXECUTION_BOUND_SECONDS + fe.PUBLICATION_ALLOWANCE_SECONDS)
 # Each watcher request is bounded by this. One iteration makes at most three
-# (the pull request read, the short hash's commit read and the green post), so
-# stopping waits longer than one whole iteration, and a watcher still running
+# (the pull request read, the short hash's commit read, made once per head, and
+# the green post), so stopping waits longer than one whole iteration, and a watcher still running
 # after that is a failure.
 WATCH_HTTP_TIMEOUT_SECONDS = 10.0
 WATCH_JOIN_SECONDS = WATCH_HTTP_TIMEOUT_SECONDS * 4
@@ -114,13 +114,9 @@ def _opener() -> urllib.request.OpenerDirector:
 
 
 def _token(var: str) -> str:
-    path = os.environ[var]
-    try:
-        token = Path(path).read_text().strip()
-    except OSError as exc:
-        raise fe.ConfigError(f"{var}: cannot read the token file: {exc.strerror}") from None
-    if not token:
-        raise fe.ConfigError(f"{var}: the token file is empty")
+    token = fe._read_secret_file(Path(os.environ[var]))
+    if token is None:
+        raise fe.ConfigError(f"{var}: the token file is unreadable or empty")
     return token
 
 
@@ -145,6 +141,9 @@ class BitbucketCloudDriver:
         self.api = f"{API_URL}/repositories/{workspace}/{slug}"
         self.factory_token = _token(TOKEN_FILE_VAR)
         self.reviewer_token = _token(REVIEWER_TOKEN_FILE_VAR)
+        self._opener = _opener()
+        # Abbreviated hash -> full hash; a commit never changes.
+        self._hashes: dict[str, str] = {}
         self._jira: Any = None
         self._change: fe.ChangeRef | None = None
         self._watch_stop: threading.Event | None = None
@@ -163,10 +162,17 @@ class BitbucketCloudDriver:
         as_reviewer: bool = False,
         timeout: float = HTTP_TIMEOUT_SECONDS,
     ) -> tuple[int, Any]:
-        """(status, JSON body) for one request; status 0 when nothing answered."""
+        """(status, JSON body) for one request; status 0 when nothing answered.
 
+        A URL off the API origin, such as a ``next`` page link, is refused
+        before it is requested, so the token never leaves Bitbucket.
+        """
+
+        url = url if urllib.parse.urlsplit(url).scheme else self.api + url
+        origin, there = urllib.parse.urlsplit(API_URL), urllib.parse.urlsplit(url)
+        if (there.scheme, there.netloc) != (origin.scheme, origin.netloc):
+            raise fe.PreflightFailed(f"refused a request off {origin.scheme}://{origin.netloc}")
         token = self.reviewer_token if as_reviewer else self.factory_token
-        url = url if url.startswith("https://") else self.api + url
         request = urllib.request.Request(
             url,
             method=method,
@@ -178,7 +184,7 @@ class BitbucketCloudDriver:
             },
         )
         try:
-            with _opener().open(request, timeout=timeout) as response:
+            with self._opener.open(request, timeout=timeout) as response:
                 status, data = int(response.status), response.read()
         except urllib.error.HTTPError as exc:
             status, data = exc.code, exc.read()
@@ -190,13 +196,8 @@ class BitbucketCloudDriver:
             return status, None
 
     def _paged(self, path: str) -> list[dict[str, Any]] | None:
-        """Every ``values`` item across ``next`` pages; None when a page is unreadable.
+        """Every ``values`` item across ``next`` pages; None when a page is unreadable."""
 
-        A ``next`` link off the API origin is refused before it is requested,
-        so the token never leaves Bitbucket.
-        """
-
-        origin = urllib.parse.urlsplit(API_URL)
         items: list[dict[str, Any]] = []
         url: str | None = path
         while url:
@@ -205,12 +206,6 @@ class BitbucketCloudDriver:
                 return None
             items.extend(item for item in page.get("values") or [] if isinstance(item, dict))
             url = page.get("next") if isinstance(page.get("next"), str) else None
-            if url:
-                there = urllib.parse.urlsplit(url)
-                if (there.scheme, there.netloc) != (origin.scheme, origin.netloc):
-                    raise fe.PreflightFailed(
-                        f"refused a next page link off {origin.scheme}://{origin.netloc}"
-                    )
         return items
 
     # --- tickets (Jira Cloud) -------------------------------------------
@@ -228,16 +223,29 @@ class BitbucketCloudDriver:
     def _full_hash(self, sha: str, timeout: float = HTTP_TIMEOUT_SECONDS) -> str | None:
         if len(sha) == 40:
             return sha
+        if sha in self._hashes:
+            return self._hashes[sha]
         status, commit = self._call("GET", f"/commit/{sha}", timeout=timeout)
         full = commit.get("hash") if status == 200 and isinstance(commit, dict) else None
-        return full if isinstance(full, str) else None
+        if not isinstance(full, str):
+            return None
+        self._hashes[sha] = full
+        return full
 
-    def _head(self, change: fe.ChangeRef, timeout: float = HTTP_TIMEOUT_SECONDS) -> str | None:
+    def _short_head(
+        self, change: fe.ChangeRef, timeout: float = HTTP_TIMEOUT_SECONDS
+    ) -> str | None:
+        """The pull request's head as Bitbucket Cloud lists it, abbreviated."""
+
         status, pr = self._call("GET", f"/pullrequests/{change.number}", timeout=timeout)
         if status != 200 or not isinstance(pr, dict):
             return None
         short = ((pr.get("source") or {}).get("commit") or {}).get("hash")
-        return self._full_hash(short, timeout) if isinstance(short, str) and short else None
+        return short if isinstance(short, str) and short else None
+
+    def _head(self, change: fe.ChangeRef, timeout: float = HTTP_TIMEOUT_SECONDS) -> str | None:
+        short = self._short_head(change, timeout)
+        return self._full_hash(short, timeout) if short else None
 
     def change_head(self, change: fe.ChangeRef) -> tuple[str | None, int | None]:
         # The change the green watcher follows once its first head is set red.
@@ -288,7 +296,11 @@ class BitbucketCloudDriver:
 
         def watch() -> None:
             while not stop.wait(interval) and time.monotonic() < deadline:
-                head = self._head(change, WATCH_HTTP_TIMEOUT_SECONDS)
+                short = self._short_head(change, WATCH_HTTP_TIMEOUT_SECONDS)
+                # Still the red head: no need to expand it.
+                if not short or red.startswith(short):
+                    continue
+                head = self._full_hash(short, WATCH_HTTP_TIMEOUT_SECONDS)
                 if not head or head == red:
                     continue
                 # A stop that came during the read: write nothing after it.
@@ -340,10 +352,8 @@ class BitbucketCloudDriver:
 
     # --- review and merge --------------------------------------------------
 
-    def _request_count(self, work_item_id: str) -> int | None:
-        detail = self.p.work_item_detail(work_item_id)
-        if detail is None:
-            return None
+    @staticmethod
+    def _request_count(detail: Mapping[str, Any]) -> int:
         return len([r for r in detail.get("requests") or [] if isinstance(r, dict)])
 
     def post_review(self, change: fe.ChangeRef, text: str) -> dict[str, Any]:
@@ -355,9 +365,10 @@ class BitbucketCloudDriver:
         """
 
         work_item_id = str(self.p.evidence["work_item_id"])
-        before = self._request_count(work_item_id)
-        if before is None:
+        detail = self.p.work_item_detail(work_item_id)
+        if detail is None:
             raise fe.PreflightFailed("reading the WorkItem before the review failed")
+        before = self._request_count(detail)
         body = fe.revision_comment_text(text, self.p.config.mention)
         status, comment = self._call(
             "POST",
@@ -371,8 +382,9 @@ class BitbucketCloudDriver:
 
         def admitted() -> dict[str, Any] | None:
             detail = self.p.work_item_detail(work_item_id)
-            requests = [r for r in (detail or {}).get("requests") or [] if isinstance(r, dict)]
-            return fe._latest_request(detail or {}) if len(requests) > before else None
+            if detail is None or self._request_count(detail) <= before:
+                return None
+            return fe._latest_request(detail)
 
         request = fe._wait(
             f"the factory to admit review comment {comment['id']}",
@@ -447,7 +459,9 @@ class BitbucketCloudDriver:
         return name
 
     def default_branch_head(self) -> str:
-        name = self._default_branch()
+        return self._branch_head(self._default_branch())
+
+    def _branch_head(self, name: str) -> str:
         ref = urllib.parse.quote(name, safe="")
         status, branch = self._call("GET", f"/refs/branches/{ref}")
         sha = (branch.get("target") or {}).get("hash") if isinstance(branch, dict) else None
@@ -490,12 +504,14 @@ class BitbucketCloudDriver:
 
         if self._base_sha:
             return
-        self._base_sha = self.default_branch_head()
+        branch = self._default_branch()
+        self._base_sha = self._branch_head(branch)
 
         def restore() -> dict[str, Any]:
-            if self.default_branch_head() != self._base_sha:
-                self._git_restore(self._default_branch(), self._base_sha)
-            return {"restored": self.default_branch_head() == self._base_sha}
+            if self._branch_head(branch) == self._base_sha:
+                return {"restored": True}
+            self._git_restore(branch, self._base_sha)
+            return {"restored": self._branch_head(branch) == self._base_sha}
 
         self.p.teardown.push("restore fixture default branch", restore)
 

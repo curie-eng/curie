@@ -5,12 +5,11 @@
 //! Jira tracker half and the combined run are #4358 and #4400.
 
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::{EgressEntry, EgressPort, ForgeFlags, TrackerKind};
+use super::{http_client, read_token, EgressEntry, ForgeFlags, TrackerKind};
 use crate::exit::CliError;
 
 /// The Bitbucket Cloud REST API every Cloud workspace is served from.
@@ -95,48 +94,6 @@ pub(super) fn parse_repo(repo: &str) -> Result<RepoPath> {
     }
 }
 
-/// Reads the access token from `token_file`, trimmed. The value is never
-/// put into an error.
-fn read_token(token_file: &Path) -> Result<String> {
-    let raw = std::fs::read_to_string(token_file).map_err(|error| {
-        CliError::failure(format!(
-            "could not read the token file {}: {error}",
-            token_file.display()
-        ))
-    })?;
-    let token = raw.trim();
-    if token.is_empty() {
-        return Err(
-            CliError::usage(format!("the token file {} is empty", token_file.display())).into(),
-        );
-    }
-    Ok(token.to_string())
-}
-
-fn http_client(ca_file: Option<&Path>) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15));
-    if let Some(ca_file) = ca_file {
-        let pem = std::fs::read(ca_file).map_err(|error| {
-            CliError::failure(format!(
-                "could not read --ca-file {}: {error}",
-                ca_file.display()
-            ))
-        })?;
-        let certificate = reqwest::Certificate::from_pem(&pem).map_err(|error| {
-            CliError::usage(format!(
-                "--ca-file {} is not a PEM certificate: {error}",
-                ca_file.display()
-            ))
-        })?;
-        builder = builder.add_root_certificate(certificate);
-    }
-    builder.build().map_err(|error| {
-        CliError::failure(format!("could not build an HTTP client: {error}")).into()
-    })
-}
-
 /// Probes the token by reading the repository at `api_base`
 /// (`https://api.bitbucket.org/2.0` outside tests). A 401 names the token
 /// file and a 403 names the scopes the token lacks.
@@ -162,37 +119,27 @@ pub(super) async fn probe(
             ))
         })?;
     let status = response.status().as_u16();
-    match status {
-        200 => {}
-        401 => {
-            return Err(CliError::failure(format!(
+    if status != 200 {
+        return Err(match status {
+            401 => CliError::failure(format!(
                 "the token in {} was refused (401)",
                 token_file.display()
             ))
-            .with_fix("replace it with a current Bitbucket Cloud repository access token")
-            .into())
-        }
-        403 => {
-            return Err(CliError::failure(format!(
+            .with_fix("replace it with a current Bitbucket Cloud repository access token"),
+            403 => CliError::failure(format!(
                 "the token in {} cannot read {path} (403); it needs repository:write and pullrequest:write",
                 token_file.display()
             ))
-            .with_fix("create a repository access token with the repository:write and pullrequest:write scopes")
-            .into())
-        }
-        404 => {
-            return Err(CliError::failure(format!(
+            .with_fix("create a repository access token with the repository:write and pullrequest:write scopes"),
+            404 => CliError::failure(format!(
                 "Bitbucket Cloud repository {path} was not found (404)"
             ))
-            .with_fix("check --repo, and that the token belongs to this repository")
-            .into())
-        }
-        _ => {
-            return Err(CliError::failure(format!(
+            .with_fix("check --repo, and that the token belongs to this repository"),
+            _ => CliError::failure(format!(
                 "reading Bitbucket Cloud repository {path} answered HTTP {status}"
-            ))
-            .into())
+            )),
         }
+        .into());
     }
     let body: Value = response.json().await.map_err(|error| {
         CliError::failure(format!(
@@ -263,14 +210,14 @@ pub(super) fn cloud_egress(doc: &Value) -> Result<Vec<EgressEntry>> {
         .iter()
         .filter(|item| has(item, "product", "bitbucket") && has(item, "direction", "ingress"))
         .filter_map(|item| item["cidr"].as_str())
-        .map(|cidr| EgressEntry {
-            cidr: cidr.to_string(),
-            ports: vec![EgressPort {
-                protocol: "TCP",
-                port: 443,
-            }],
-            host: None,
+        .map(|cidr| {
+            super::forge_egress_entries(cidr, &[443], |_| {
+                Err(anyhow::anyhow!("a published range is never a hostname"))
+            })
         })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect())
 }
 

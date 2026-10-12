@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from curie_api.code_host_trust import verify_for_bundle
+from curie_api.forges.bitbucket_dc.transport import TIMEOUT_S
 from curie_api.forges.config import CodeHostConfig, StaticTokenCredentialConfig
 from curie_api.forges.credential_providers import StaticTokenProvider
 from curie_api.forges.types import CredentialHeader
@@ -54,7 +55,7 @@ class BitbucketDcConnection:
         """A client trusting the configured CA bundle, with the 15 second timeout."""
 
         return httpx.AsyncClient(
-            verify=verify_for_bundle(self._ca_bundle), timeout=httpx.Timeout(15.0)
+            verify=verify_for_bundle(self._ca_bundle), timeout=httpx.Timeout(TIMEOUT_S)
         )
 
     def adapter(

@@ -31,6 +31,7 @@ from curie_api.forges.bitbucket_cloud.transport import CloudTransport
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
 from curie_api.forges.credential_providers import StaticTokenProvider
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
+from curie_api.forges.paths import valid_repository_path
 from curie_api.forges.types import (
     Actor,
     CheckSource,
@@ -196,7 +197,6 @@ class BitbucketCloudCodeHost:
         credentials: StaticTokenProvider,
         page_size: int = 100,
     ) -> None:
-        self._api_url = api_url.rstrip("/")
         self._http = CloudTransport(client, api_url=api_url, token=token)
         self._credentials = credentials
         self._page_size = page_size
@@ -207,7 +207,7 @@ class BitbucketCloudCodeHost:
         self._comments = BitbucketCloudMarkedComments(self)
 
     def __repr__(self) -> str:
-        return f"BitbucketCloudCodeHost(api_url={self._api_url!r})"
+        return f"BitbucketCloudCodeHost(api_url={self._http.root!r})"
 
     @property
     def marked_comments(self) -> BitbucketCloudMarkedComments:
@@ -224,11 +224,13 @@ class BitbucketCloudCodeHost:
 
         if repository.kind != self.kind or repository.host != self.host:
             raise NotFound("repository")
+        if not valid_repository_path(self.kind, repository.path):
+            raise NotFound("repository")
         parts = repository.path.split("/")
-        if len(parts) != 2 or not all(parts):
+        if len(parts) != 2:
             raise NotFound("repository")
         workspace, slug = parts
-        return f"{self._api_url}/repositories/{quote(workspace, safe='')}/{quote(slug, safe='')}"
+        return f"{self._http.root}/repositories/{quote(workspace, safe='')}/{quote(slug, safe='')}"
 
     def pull_url(self, pull_request: PullRequestRef) -> str:
         if not pull_request.number.isdigit():
@@ -241,7 +243,7 @@ class BitbucketCloudCodeHost:
     # Repositories ------------------------------------------------------------
 
     async def resolve_repository(self, project_id: str) -> RepositoryRef:
-        url = f"{self._api_url}/repositories/{quote('{}', safe='')}/{quote(project_id, safe='')}"
+        url = f"{self._http.root}/repositories/{quote('{}', safe='')}/{quote(project_id, safe='')}"
         payload = await self._http.json("GET", url, what="repository")
         uuid, full_name = payload.get("uuid"), payload.get("full_name")
         if not isinstance(uuid, str) or not isinstance(full_name, str):

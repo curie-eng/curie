@@ -35,6 +35,7 @@ from curie_api.forges.bitbucket_dc.version import MINIMUM, ServerTooOld, parse_v
 from curie_api.forges.capabilities import CODE_HOST_OPERATIONS, Operation, Support
 from curie_api.forges.credential_providers import StaticTokenProvider
 from curie_api.forges.errors import Ambiguous, NotFound, Unavailable, Unsupported
+from curie_api.forges.paths import valid_repository_path
 from curie_api.forges.types import (
     Actor,
     CheckSource,
@@ -220,15 +221,15 @@ class BitbucketDcCodeHost:
         page_size: int = 100,
     ) -> None:
         self.host = host
-        self._api_url = api_url.rstrip("/")
         self._http = DcTransport(client, api_url=api_url, token=token)
         self._credentials = credentials
         self._page_size = page_size
-        self._version: str | None = None
+        # The server's version as it reported it, and parsed.
+        self._version: tuple[str, tuple[int, int, int]] | None = None
         self._comments = BitbucketDcMarkedComments(self)
 
     def __repr__(self) -> str:
-        return f"BitbucketDcCodeHost(host={self.host!r}, api_url={self._api_url!r})"
+        return f"BitbucketDcCodeHost(host={self.host!r}, api_url={self._http.root!r})"
 
     @property
     def marked_comments(self) -> BitbucketDcMarkedComments:
@@ -242,21 +243,23 @@ class BitbucketDcCodeHost:
 
         if self._version is None:
             payload = await self._http.json("GET", "/application-properties", what="version")
-            version = payload.get("version")
-            if not isinstance(version, str) or parse_version(version) is None:
+            reported = payload.get("version")
+            if not isinstance(reported, str) or (parsed := parse_version(reported)) is None:
                 raise Unavailable("version")
-            self._version = version
-        parsed = parse_version(self._version)
-        if parsed is None or parsed < MINIMUM:
-            raise ServerTooOld(operation, self._version)
+            self._version = (reported, parsed)
+        text, parsed = self._version
+        if parsed < MINIMUM:
+            raise ServerTooOld(operation, text)
 
     def repo_path(self, repository: RepositoryRef) -> str:
         """``/projects/{KEY}/repos/{slug}`` of a repository on this server."""
 
         if repository.kind != self.kind or repository.host != self.host:
             raise NotFound("repository")
+        if not valid_repository_path(self.kind, repository.path):
+            raise NotFound("repository")
         parts = repository.path.split("/")
-        if len(parts) != 2 or not all(parts):
+        if len(parts) != 2:
             raise NotFound("repository")
         key, slug = parts
         return f"/projects/{quote(key, safe='')}/repos/{quote(slug, safe='')}"
@@ -270,10 +273,6 @@ class BitbucketDcCodeHost:
     def transport(self) -> DcTransport:
         return self._http
 
-    @property
-    def page_size(self) -> int:
-        return self._page_size
-
     # Repositories ------------------------------------------------------------
 
     async def resolve_repository(self, project_id: str) -> RepositoryRef:
@@ -281,6 +280,12 @@ class BitbucketDcCodeHost:
         return await self._resolve(project_id)
 
     async def _resolve(self, project_id: str) -> RepositoryRef:
+        ref = RepositoryRef(self.kind, self.host, project_id, await self._path_of(project_id))
+        return replace(ref, default_branch=await self._default_branch(self.repo_path(ref)))
+
+    async def _path_of(self, project_id: str) -> str:
+        """The current ``KEY/slug`` of the repository with id ``project_id``."""
+
         found: dict[str, Any] | None = None
         async for page in self._http.iter_pages("/repos", what="repository", limit=self._page_size):
             found = next((r for r in page if str(r.get("id")) == project_id), None)
@@ -293,10 +298,7 @@ class BitbucketDcCodeHost:
         slug = found.get("slug")
         if not isinstance(key, str) or not isinstance(slug, str):
             raise Unavailable("repository")
-        path = f"{key}/{slug}"
-        ref = types.RepositoryRef(self.kind, self.host, project_id, path)
-        default = await self._default_branch(self.repo_path(ref))
-        return types.RepositoryRef(self.kind, self.host, project_id, path, default_branch=default)
+        return f"{key}/{slug}"
 
     async def _default_branch(self, repo: str) -> str | None:
         try:
@@ -312,8 +314,7 @@ class BitbucketDcCodeHost:
 
         await self.ensure_version(Operation.CREDENTIAL)
         self.repo_path(repository)
-        current = await self._resolve(repository.project_id)
-        if current.path != repository.path:
+        if await self._path_of(repository.project_id) != repository.path:
             raise NotFound("repository_renamed")
         return await self._credentials.get(scope)
 
@@ -460,12 +461,10 @@ class BitbucketDcCodeHost:
             change["title"] = title
         if body is not None:
             change["description"] = body
-        response = await self._http.request(
-            "PUT", self.pull_path(pull_request), what="pull_request", json=change, allow=(409,)
+        updated = await self._http.put_versioned(
+            self.pull_path(pull_request), what="pull_request", json=change
         )
-        if response.status_code == 409:
-            raise Unavailable("stale_version")
-        return await self._pull(pull_request.repository, object_of(response, "pull_request"))
+        return await self._pull(pull_request.repository, updated)
 
     async def read_pull_request(self, pull_request: PullRequestRef) -> PullRequest:
         await self.ensure_version(Operation.READ_PULL_REQUEST)
