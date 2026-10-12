@@ -95,13 +95,18 @@ from .turn_progress import TURN_PROGRESS_TOOL
 
 logger = logging.getLogger(__name__)
 
-# Best-effort only (#712): NOT authoritative, NOT used for any gating
-# decision -- only to decide whether a bare operator gate name is worth a
-# "did you mean mcp__<server>__<tool>?" warning. The SDK does not export an
-# enumerable built-in tool list, and this set may drift from a future SDK
-# version; a name missing from here is not an error, just an unwarned pass,
-# and a name present here that isn't actually offered in a given session is
-# similarly harmless (it just arms nothing, same as today).
+# The authority for bare operator gate names (#4424, ADR-0050): a bare
+# (non-mcp__) entry in CURIE_APPROVAL_REQUIRED_TOOLS is accepted only when it
+# is in this set, and any other bare name refuses boot from
+# build_approval_gate with ApprovalPolicyError -- a bare name never matches
+# an MCP tool, so an unknown one would arm a literal the SDK's can_use_tool
+# callback can never match (the silent fail-open #712 built a warning to
+# surface; #4424 made the warning a refusal). A real built-in missing from
+# here is fixed by ADDING it under the provenance procedure below, never by
+# restoring the warning: a missing name is a boot refusal an operator can
+# see and fix, not a silent no-op. A name present here that a given session
+# does not actually offer still just arms nothing (harmless: the gate
+# matches no call to block).
 #
 # Provenance (#736): the names below are read out of the CLI the SDK actually
 # ships, not guessed. runner/pyproject.toml pins claude-agent-sdk>=0.2.115; that
@@ -139,9 +144,9 @@ logger = logging.getLogger(__name__)
 # the SDK-reported tool name by exact equality, and the SDK reports the CANONICAL
 # name. So an operator gating an alias (``ListMcpResources``, canonical
 # ``ListMcpResourcesTool``) arms a literal that never matches: the gate silently
-# arms nothing. For this gate an alias name IS a probable no-op, so its warning
-# is a TRUE positive, not the false positive #736 set out to fix, and suppressing
-# it would be exactly the silent fail-open #712 built the warning to surface.
+# arms nothing. For this gate an alias name IS a probable no-op, so its boot
+# refusal is a TRUE positive, not the false positive #736 set out to fix, and
+# admitting it here would restore exactly the silent fail-open #4424 refuses.
 # ``Task``, ``BashOutput``, and ``KillShell`` were in the historical pre-#736 set
 # and are dropped for this reason (they are alias keys for ``Agent``,
 # ``TaskOutput``, and ``TaskStop``); the canonical names stay.
@@ -1964,32 +1969,36 @@ def build_approval_gate(
                 " server name collide, so the gate resolves to two different live tool"
                 " names with no principled winner; rename one of them"
             )
-        # A bare (non-mcp__) name is armed VERBATIM as a built-in tool name,
-        # never rewritten or checked (#712): `effective_operator_gates` has no
-        # way to tell a real built-in ("Bash") from an operator's mistaken bare
-        # MCP tool name ("resolve_leak" meant as shorthand for an in-bundle MCP
-        # tool). That second case silently arms a literal the SDK's
-        # `can_use_tool` callback can never match -- a fail-open on a
-        # security-relevant control, with no signal anywhere that the gate is
-        # a no-op. We cannot fail closed here (no authoritative built-in tool
-        # list is importable from this frozen-adjacent path, and a legitimate
-        # built-in gate must keep working), but we can stop it being SILENT:
-        # warn when the name isn't among the well-known Claude Code built-ins,
-        # naming the mcp__<server>__<tool> form the operator likely meant.
+        # A bare (non-mcp__) name is a built-in tool name and nothing else
+        # (#4424, ADR-0050): a bare name never matches an MCP tool (the SDK
+        # reports MCP tools as `mcp__...`), so a bare name that is not in
+        # `_KNOWN_BUILTIN_TOOLS` -- the authority for bare gate names -- would
+        # arm a literal the SDK's `can_use_tool` callback can never match, a
+        # fail-open on a security-relevant control. #712's warning could only
+        # surface that, not stop it, so the gate now fails closed exactly like
+        # the unresolvable-`mcp__` case above: a declared gate that cannot be
+        # armed as declared refuses boot. The alias keys are excluded from the
+        # set on purpose (the SDK reports canonical names), so an alias gate
+        # is refused here too. A real built-in missing from the set is fixed
+        # by adding it under the set's provenance procedure, never by
+        # restoring the warning.
         if (
             effective == frozenset({name})
             and not name.startswith("mcp__")
             and name not in _KNOWN_BUILTIN_TOOLS
         ):
-            logger.warning(
-                "operator approval gate %r does not match any well-known Claude Code"
-                " built-in tool name. It will be armed VERBATIM and will silently"
-                " gate nothing if it was meant as shorthand for an in-bundle MCP"
-                " tool -- use the mcp__<server>__<tool> form instead (declared"
-                " servers: %s). If %r really is a built-in tool, ignore this warning.",
-                name,
-                mcp_servers,
-                name,
+            raise ApprovalPolicyError(
+                f"operator approval gate {name!r} is a bare name that is not a"
+                " Claude Code built-in tool, so it would arm nothing (MCP tools"
+                " are reported as mcp__... and a bare name matches no MCP tool);"
+                " refusing to boot with a gate that would arm nothing. Namespace"
+                " it to its live mcp__plugin_<bundle>_<server>__<tool> name (or,"
+                " for a connectors.yaml connector, mcp__<connector>__<tool>), or"
+                " check the bundle declares that server or connector (declared"
+                f" MCP servers: {mcp_servers}, declared connectors:"
+                f" {connector_servers}). A CLI alias name (Task, BashOutput,"
+                " KillShell, ListMcpResources, ...) also arms nothing -- the SDK"
+                " reports canonical names -- and is refused the same way"
             )
         # One gate name can resolve to MORE than one live tool name when a declared
         # connector and a declared MCP server both match it and nothing says which

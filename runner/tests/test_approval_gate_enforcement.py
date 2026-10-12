@@ -292,6 +292,32 @@ def test_boot_accepts_the_same_bundle_once_the_entry_is_removed(tmp_path: Path) 
     assert runner is not None
 
 
+def test_boot_refuses_a_bare_non_builtin_operator_gate(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # revert: restore the bare-name warning (arm verbatim, boot anyway) -> this
+    # fails. #4424 (ADR-0050): a bare operator gate name that is not a Claude
+    # Code built-in matches no live tool call (MCP tools are reported as
+    # mcp__...), so boot must refuse it exactly as it already refuses an
+    # unresolvable mcp__ shorthand, instead of arming a silent no-op gate.
+    plugin_dir = _bundle(tmp_path)
+
+    with caplog.at_level(logging.ERROR, logger="curie_runner"):
+        with pytest.raises(ApprovalPolicyError) as exc:
+            build_runner(
+                _config(plugin_dir, CURIE_APPROVAL_REQUIRED_TOOLS="upgrade_platform"),
+                fake_model=True,
+            )
+
+    assert "upgrade_platform" in str(exc.value)
+    # __main__'s fatal-boot path: log then re-raise, so an operator triages the
+    # refusal from pod logs instead of a bare traceback.
+    refusal = next(
+        record for record in caplog.records if "approval policy unusable" in record.getMessage()
+    )
+    assert "error_class=ApprovalPolicyError" in refusal.getMessage()
+
+
 # --- B. an operator gate armed AFTER deployment (AC6) ---------------------------
 
 
