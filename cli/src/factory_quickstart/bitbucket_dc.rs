@@ -1,12 +1,345 @@
-//! The Bitbucket Data Center code host for `curie factory quickstart` (#4397). Reserved: this
-//! build has no adapter for it, so a quickstart naming `bitbucket-dc` stops here.
+//! The Bitbucket Data Center code host half of `curie factory quickstart` (#4401).
+//! It validates the shared forge flags, parses `--repo`, probes the server version
+//! and the access token, and emits the `codeHosts` entry, the repository binding,
+//! the review allowlist and the egress routes to the server's addresses. The Jira
+//! tracker half and the combined run are #4358 and #4400.
+
+use std::net::IpAddr;
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Result;
+use serde_json::{json, Value};
 
-use super::{forge_not_installed, ForgeFlags};
+use super::{EgressEntry, ForgeFlags, TrackerKind};
+use crate::exit::CliError;
 
-pub(super) fn check(_forge: &ForgeFlags) -> Result<()> {
-    Err(forge_not_installed("bitbucket-dc"))
+/// The oldest Data Center release the adapter supports.
+const MINIMUM_VERSION: [u64; 3] = [9, 4, 0];
+const REPO_SHAPE: &str = "<PROJECT KEY>/<repo slug>";
+
+/// Refuses Bitbucket Data Center flags this build cannot run. Pure: it reads
+/// no file or network. Bitbucket pairs only with the Jira Cloud tracker, so a
+/// valid flag set hands over to that half.
+pub(super) fn check(forge: &ForgeFlags) -> Result<()> {
+    if forge.tracker != TrackerKind::JiraCloud {
+        return Err(CliError::unsupported(
+            "code host 'bitbucket-dc' pairs only with --tracker jira-cloud; forge kind 'jira-cloud' is not installed in this build",
+        )
+        .with_fix("rerun with --code-host github, or wait for the jira-cloud tracker")
+        .into());
+    }
+    let Some(forge_url) = forge.forge_url.as_deref() else {
+        return Err(CliError::usage(
+            "--code-host bitbucket-dc needs --forge-url, the server's base URL",
+        )
+        .with_fix("pass --forge-url https://<host>[:<port>][/<context path>]")
+        .into());
+    };
+    base_url(forge_url)?;
+    if forge.token_file.is_none() {
+        return Err(CliError::usage(
+            "--code-host bitbucket-dc needs --token-file, an HTTP access token with REPO_WRITE on the repository",
+        )
+        .with_fix("pass --token-file <path>")
+        .into());
+    }
+    if forge.review_accounts.is_empty() {
+        return Err(CliError::usage(
+            "--code-host bitbucket-dc needs at least one --review-account, the numeric Bitbucket user id whose review comments the factory acts on",
+        )
+        .with_fix("pass --review-account <user id>")
+        .into());
+    }
+    super::jira_cloud::check(forge)
+}
+
+/// Parses `--forge-url`: https, or plain http only to this machine.
+fn base_url(forge_url: &str) -> Result<reqwest::Url> {
+    let refuse = |why: &str| -> anyhow::Error {
+        CliError::usage(format!("--forge-url {forge_url:?} {why}"))
+            .with_fix("pass the server's base URL, as in https://bitbucket.example.com or https://host:8443/bitbucket")
+            .into()
+    };
+    let url = reqwest::Url::parse(forge_url).map_err(|_| refuse("is not a URL"))?;
+    let host = url.host_str().unwrap_or_default();
+    if host.is_empty() {
+        return Err(refuse("has no host"));
+    }
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if matches!(host, "localhost" | "127.0.0.1" | "[::1]") => Ok(url),
+        "http" => Err(refuse("uses plain http to a remote host; use https")),
+        _ => Err(refuse("is not an http or https URL")),
+    }
+}
+
+/// A Bitbucket Data Center repository named by `--repo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
+pub(super) struct RepoPath {
+    pub project_key: String,
+    pub slug: String,
+}
+
+/// What the version and token probe learned about the server and repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
+pub(super) struct Probed {
+    /// The numeric repository id, as text.
+    pub project_id: String,
+    /// `<PROJECT KEY>/<repo slug>`.
+    pub path: String,
+    /// The server version from `application-properties`.
+    pub version: String,
+}
+
+fn is_project_key(segment: &str) -> bool {
+    let mut bytes = segment.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_uppercase())
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn is_slug(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
+        })
+}
+
+/// Parses `--repo` as `<PROJECT KEY>/<repo slug>`.
+#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
+pub(super) fn parse_repo(repo: &str) -> Result<RepoPath> {
+    match repo.split('/').collect::<Vec<_>>()[..] {
+        [key, slug] if is_project_key(key) && is_slug(slug) => Ok(RepoPath {
+            project_key: key.to_string(),
+            slug: slug.to_string(),
+        }),
+        _ => Err(CliError::usage(format!(
+            "--repo {repo:?} is not a Bitbucket Data Center repository; expected {REPO_SHAPE}, a project key such as FAC and a lowercase repository slug"
+        ))
+        .with_fix(format!("pass --repo {REPO_SHAPE}, as in /projects/<KEY>/repos/<slug>"))
+        .into()),
+    }
+}
+
+/// Reads the access token from `token_file`, trimmed. The value is never
+/// put into an error.
+fn read_token(token_file: &Path) -> Result<String> {
+    let raw = std::fs::read_to_string(token_file).map_err(|error| {
+        CliError::failure(format!(
+            "could not read the token file {}: {error}",
+            token_file.display()
+        ))
+    })?;
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(
+            CliError::usage(format!("the token file {} is empty", token_file.display())).into(),
+        );
+    }
+    Ok(token.to_string())
+}
+
+fn http_client(ca_file: Option<&Path>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15));
+    if let Some(ca_file) = ca_file {
+        let pem = std::fs::read(ca_file).map_err(|error| {
+            CliError::failure(format!(
+                "could not read --ca-file {}: {error}",
+                ca_file.display()
+            ))
+        })?;
+        let certificate = reqwest::Certificate::from_pem(&pem).map_err(|error| {
+            CliError::usage(format!(
+                "--ca-file {} is not a PEM certificate: {error}",
+                ca_file.display()
+            ))
+        })?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    builder.build().map_err(|error| {
+        CliError::failure(format!("could not build an HTTP client: {error}")).into()
+    })
+}
+
+/// The first three numeric parts of a version such as `9.4.24`; a missing
+/// part reads 0 and a suffix after the digits is ignored.
+fn version_parts(version: &str) -> Option<[u64; 3]> {
+    let mut parts = [0u64; 3];
+    for (slot, part) in parts.iter_mut().zip(version.split('.')) {
+        let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+        *slot = digits.parse().ok()?;
+    }
+    Some(parts)
+}
+
+/// GETs `url` with the token and returns the JSON body of a 200. A 401 names
+/// the token file and a 403 names the permission the token lacks.
+async fn get_json(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    token_file: &Path,
+    what: &str,
+) -> Result<Value> {
+    let response = client
+        .get(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| CliError::failure(format!("reading {what} failed: {error}")))?;
+    let status = response.status().as_u16();
+    match status {
+        200 => {}
+        401 => {
+            return Err(CliError::failure(format!(
+                "the token in {} was refused (401)",
+                token_file.display()
+            ))
+            .with_fix("replace it with a current Bitbucket Data Center HTTP access token")
+            .into())
+        }
+        403 => {
+            return Err(CliError::failure(format!(
+                "the token in {} cannot read {what} (403); it needs REPO_WRITE on the repository",
+                token_file.display()
+            ))
+            .with_fix("create an HTTP access token with the REPO_WRITE permission")
+            .into())
+        }
+        404 => {
+            return Err(CliError::failure(format!("{what} was not found (404)"))
+                .with_fix("check --forge-url, including any context path, and --repo")
+                .into())
+        }
+        _ => {
+            return Err(CliError::failure(format!("reading {what} answered HTTP {status}")).into())
+        }
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| CliError::failure(format!("{what} was not JSON: {error}")).into())
+}
+
+/// Probes the server at `base` (the `--forge-url`, context path included):
+/// its version first, refusing one older than 9.4.0, then the token by
+/// reading the repository.
+#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
+pub(super) async fn probe(
+    base: &str,
+    token_file: &Path,
+    ca_file: Option<&Path>,
+    repo: &RepoPath,
+) -> Result<Probed> {
+    let token = read_token(token_file)?;
+    let client = http_client(ca_file)?;
+    let api = format!("{}/rest/api/latest", base.trim_end_matches('/'));
+    let props = get_json(
+        &client,
+        &format!("{api}/application-properties"),
+        &token,
+        token_file,
+        "the Bitbucket Data Center version",
+    )
+    .await?;
+    let version = props["version"].as_str().ok_or_else(|| {
+        CliError::failure(format!("{base} reported no Bitbucket Data Center version"))
+    })?;
+    let parts = version_parts(version).ok_or_else(|| {
+        CliError::failure(format!("{base} reported an unreadable version {version:?}"))
+    })?;
+    if parts < MINIMUM_VERSION {
+        return Err(CliError::failure(format!(
+            "Bitbucket Data Center {version} is older than the minimum 9.4.0"
+        ))
+        .with_fix("upgrade the server to 9.4.0 or later")
+        .into());
+    }
+    let path = format!("{}/{}", repo.project_key, repo.slug);
+    let body = get_json(
+        &client,
+        &format!("{api}/projects/{}/repos/{}", repo.project_key, repo.slug),
+        &token,
+        token_file,
+        &format!("Bitbucket Data Center repository {path}"),
+    )
+    .await?;
+    let id = body["id"].as_u64().ok_or_else(|| {
+        CliError::failure(format!(
+            "Bitbucket Data Center repository {path} has no numeric id"
+        ))
+    })?;
+    Ok(Probed {
+        project_id: id.to_string(),
+        path,
+        version: version.to_string(),
+    })
+}
+
+/// The values fragment for one Bitbucket Data Center code host named `name`:
+/// the `codeHosts` entry, the repository binding (alias = repository slug) and
+/// the review allowlist under the code host's name.
+#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
+pub(super) fn values(
+    name: &str,
+    probed: &Probed,
+    base: &str,
+    host: &str,
+    review_accounts: &[String],
+    egress: &[EgressEntry],
+) -> Value {
+    let alias = probed.path.rsplit('/').next().unwrap_or(&probed.path);
+    json!({
+        "codeHosts": [{
+            "name": name,
+            "kind": "bitbucket_dc",
+            "host": host,
+            "apiUrl": base,
+            "credential": {
+                "type": "static_token",
+                "existingSecret": format!("curie-{name}-token"),
+                "existingSecretKey": "token",
+            },
+            "egress": egress,
+        }],
+        "repo": {
+            "alias": alias,
+            "codeHost": name,
+            "projectId": probed.project_id,
+            "path": probed.path,
+        },
+        "reviewFeedbackAllowlist": { name: review_accounts },
+    })
+}
+
+/// The egress entries for the server at `base`: the addresses its host
+/// resolves to now, or the address itself, on the URL's port (443 when the
+/// https URL names none).
+#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
+pub(super) fn dc_egress(
+    base: &str,
+    resolve: impl Fn(&str) -> Result<Vec<IpAddr>>,
+) -> Result<Vec<EgressEntry>> {
+    let url = base_url(base)?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    // An IPv6 literal keeps its URL brackets in `host_str`.
+    let host = url
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    super::forge_egress_entries(host, &[port], resolve)
+}
+
+/// The credential expiry line: a Data Center HTTP access token's expiry is
+/// not readable with the token itself.
+#[allow(dead_code, reason = "called by the combined Jira quickstart in #4400")]
+pub(super) fn expiry_line(name: &str) -> String {
+    format!("credential code host {name} (static_token): unknown")
 }
 
 #[cfg(test)]
