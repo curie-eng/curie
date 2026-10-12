@@ -1048,9 +1048,10 @@ def test_ci_keeps_the_required_python_status_and_keeps_the_fix_pin_gate_off_it()
 
     job, required_steps = _python_job(document)
     assert job.get("name") == "Python (ruff + mypy + pytest)"
-    # The suite runs in the python-pytest shards; the required job only waits
-    # for them to aggregate their results, and always() keeps it from skipping.
-    assert job.get("needs") == ["changes", "python-pytest"]
+    # The suite runs in the python-pytest shards and the static gates in
+    # python-static; the required job only waits for them to aggregate their
+    # results, and always() keeps it from skipping.
+    assert job.get("needs") == ["changes", "python-pytest", "python-static"]
     assert job.get("if") == "always()", "the required Python check must not be skippable"
     shard_job, steps = _python_job(document, "python-pytest")
     # #3858: the shards wait for the `changes` selection and run only when it

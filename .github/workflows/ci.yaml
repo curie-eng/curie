@@ -105,9 +105,9 @@ jobs:
           PY
 
   # The suite runs as parallel shards, each on its own runner with its own dev
-  # stack; the required `Python (ruff + mypy + pytest)` job below runs the static
-  # gates and then aggregates the shard results. One -n 4 job was 13.5 minutes
-  # on the critical path of every required run.
+  # stack; the static gates run in `python-static` beside them, and the required
+  # `Python (ruff + mypy + pytest)` job below aggregates both. One -n 4 job was
+  # 13.5 minutes on the critical path of every required run.
   python-pytest:
     name: Python pytest (shard ${{ matrix.shard }}/3)
     # Job-level gate (#3858): an unselected run (docs-only or version-only)
@@ -257,20 +257,13 @@ jobs:
         if: ${{ failure() && steps.python-runtime.outputs.pytest == 'true' }}
         run: docker compose -f compose.dev.yaml logs --no-color --tail=200
 
-  python:
-    name: Python (ruff + mypy + pytest)
-    # `needs` orders this job after the shards; `always()` keeps it
-    # running (and so reporting the required check) whatever the shards did.
-    # A failed or cancelled shard fails the aggregate step below, and so does a
-    # skipped shard job unless this job also selected no pytest (#3858). It also
-    # needs `changes` so a failed or disagreeing selection cannot pass as a
-    # legitimate skip.
-    needs: [changes, python-pytest]
-    if: always()
+  # The cheap static gates run beside the pytest shards so a lint, type or docs
+  # failure surfaces in about 2 minutes instead of after the slowest shard. The
+  # required `python` job below requires this job's success.
+  python-static:
+    name: Python static gates
+    needs: [changes]
     runs-on: ubuntu-latest
-    # A job-level block REPLACES the workflow-level one, so `contents: read` is
-    # repeated here. The Issues scope that used to sit alongside it followed the
-    # fix pin gate into its own job; the suite never read issue labels.
     permissions:
       contents: read
     steps:
@@ -341,7 +334,7 @@ jobs:
       # command named in the agent verification contract (docs/agents.md)
       # against cli/command-manifest.json (#1041), then lint every citation
       # under docs/ (excluding docs/adr/). A cheap, cluster-free gate, so it
-      # runs right after ruff/mypy and before the dev stack boots.
+      # runs right after ruff/mypy.
       - name: Docs gate (catalog drift + agent contract + citations)
         run: bash scripts/check-docs.sh
       # _AciModel tolerant-decode gate (#625, following #492): every direct
@@ -353,12 +346,81 @@ jobs:
       # The platform-upgrade Job runs examples/sre-bot/platform-upgrade/upgrade.sh
       # as its body. That script had no test and no CI; a helm upgrade the bot
       # can start must be shellchecked on every PR, cheap and cluster-free, so
-      # this sits with the other static gates before the dev stack boots.
+      # this sits with the other static gates.
       - name: Shellcheck sre-bot platform-upgrade script
         run: shellcheck --severity=warning examples/sre-bot/platform-upgrade/upgrade.sh
-      # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock above. Reuse
-      # ignored_prefixes from .github/e2e-selection.yaml so a guides edit does
-      # not boot postgres; packages/, apps/, runner/, examples/tests/, cli,
+      # The shards run release/tests whenever pytest is selected. When the
+      # `changes` selection skipped pytest (a docs-only or version-only diff),
+      # run them here so a release bump still proves the tag gate and release
+      # tooling on the new commit (#3858). The required `python` job already
+      # fails if that selection disagrees with its own, so `changes` is the
+      # trusted selection.
+      - name: Release tests
+        if: needs.changes.outputs.pytest == 'false'
+        run: uv run pytest -q release/tests
+      # The committed-lock test only proves the lock matches the current wire; it
+      # passes even if the lock was regenerated without a version bump. Compare
+      # against the BASE branch's lock so an unbumped wire change actually fails
+      # CI. Refresh that remote ref before reading it; a missing or empty base
+      # lock (base predates the lock) skips cleanly (exit 0), and only a genuine
+      # unbumped wire change vs an existing base lock exits 1.
+      - name: ACI wire-lock base gate
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
+          git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
+          uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
+
+  python:
+    name: Python (ruff + mypy + pytest)
+    # `needs` orders this job after the shards; `always()` keeps it
+    # running (and so reporting the required check) whatever the shards did.
+    # A failed or cancelled shard fails the aggregate step below, and so does a
+    # skipped shard job unless this job also selected no pytest (#3858). It also
+    # needs `changes` so a failed or disagreeing selection cannot pass as a
+    # legitimate skip. It also waits on `python-static` and requires it to
+    # succeed.
+    needs: [changes, python-pytest, python-static]
+    if: always()
+    runs-on: ubuntu-latest
+    # A job-level block REPLACES the workflow-level one, so `contents: read` is
+    # repeated here. The Issues scope that used to sit alongside it followed the
+    # fix pin gate into its own job; the suite never read issue labels.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Retry eligibility (#1106): only a step whose whole job is to ACQUIRE a
+      # third-party dependency (a tool binary, an image, a registry session, a
+      # build artifact) may be wrapped. Such a step can fail only on a network
+      # or registry error, never on a non-zero exit from this repository's own
+      # build, test, or gate, so a retry there cannot hide a defect in our
+      # code. Never wrap a step that builds, tests, or gates that code.
+      # Enforced by tools/ci-retry-gate/tests/test_retry_eligibility.py.
+      - name: Install uv
+        id: install_uv
+        continue-on-error: true
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Back off before retrying Install uv
+        if: steps.install_uv.outcome == 'failure'
+        run: |
+          echo "Install uv failed on attempt 1 of 2, retrying in 15 seconds"
+          sleep 15
+      - name: Install uv (retry)
+        if: steps.install_uv.outcome == 'failure'
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - name: Sync workspace
+        run: uv sync
+      # Docs-only diffs still run ruff/mypy/docs/alembic/wire-lock in
+      # `python-static`. Reuse ignored_prefixes from .github/e2e-selection.yaml
+      # so a guides edit does not boot postgres; packages/, apps/, runner/,
+      # examples/tests/, cli,
       # uv.lock, and pyproject.toml still select pytest, except on a
       # version-only release bump, which reuses the proof its base already has
       # (#3858). Every event other than a pull request selects everything, as
@@ -381,23 +443,18 @@ jobs:
               --base "origin/$base" \
               --head HEAD
           fi
-      # The shards run release/tests whenever pytest is selected. When it is
-      # not (a docs-only or version-only diff), run them here so a release bump
-      # still proves the tag gate and release tooling on the new commit (#3858).
-      - name: Release tests
-        if: steps.python-runtime.outputs.pytest == 'false'
-        run: uv run pytest -q release/tests
-      # The committed-lock test only proves the lock matches the current wire; it
-      # passes even if the lock was regenerated without a version bump. Compare
-      # against the BASE branch's lock so an unbumped wire change actually fails
-      # CI. Refresh that remote ref before reading it; a missing or empty base
-      # lock (base predates the lock) skips cleanly (exit 0), and only a genuine
-      # unbumped wire change vs an existing base lock exits 1.
-      - name: ACI wire-lock base gate
+      # always() above keeps this job reporting the required check whatever the
+      # static job did, so require its success explicitly; a failed, skipped or
+      # cancelled static job must not pass the required check.
+      - name: Require static gates to pass
+        env:
+          STATIC_RESULT: ${{ needs.python-static.result }}
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
-          git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
-          uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
+          if [[ "$STATIC_RESULT" != "success" ]]; then
+            echo "Python static gates finished ${STATIC_RESULT:-<empty>}" >&2
+            exit 1
+          fi
+          echo "Python static gates passed"
       - name: Download shard results
         if: steps.python-runtime.outputs.pytest == 'true'
         uses: actions/download-artifact@v8
