@@ -9,10 +9,12 @@ kind does not import them.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from starlette.concurrency import run_in_threadpool
 
 from curie_api.forges.config import (
     CodeHostConfig,
@@ -21,6 +23,8 @@ from curie_api.forges.config import (
     TrackerConfig,
 )
 from curie_api.forges.credential_providers import GitHubAppProvider, github_app_provider
+from curie_api.forges.errors import Unavailable
+from curie_api.forges.types import RepositoryRef
 
 if TYPE_CHECKING:
     from curie_api.forges.github.code_host import GitHubCodeHost
@@ -89,6 +93,57 @@ class GitHubCodeHostConnection:
     @property
     def credentials(self) -> GitHubAppProvider:
         return self._provider
+
+    async def installation_for(self, repository: RepositoryRef) -> int | None:
+        """The installation this App has on ``repository`` now (#4358 plan D14 item 2).
+
+        Rediscovered with the App JWT on every call, as a WorkItem's fence must
+        be. A repository the App is not installed on, or an answer that cannot
+        be read, is ``Unavailable("installation")``.
+        """
+
+        from curie_api.github_app import GitHubAppError
+
+        try:
+            installation_id, _token = await run_in_threadpool(
+                self._provider.credentials.fresh_installation_token, repository.path, None
+            )
+        except (GitHubAppError, ValueError):
+            raise Unavailable("installation") from None
+        return installation_id
+
+    async def installation_token(
+        self,
+        repository: RepositoryRef,
+        installation_id: int,
+        *,
+        timeout_s: float | None = None,
+    ) -> str:
+        """A token for ``repository`` minted only for the recorded ``installation_id``
+        (#4358 plan D14 item 2a).
+
+        `GitHubCredentials.token_for_verified_installation` rediscovers the
+        installation and refuses a different one, the fence the issue read has
+        always kept. ``timeout_s`` caps the provider's own timeout on a resolver
+        of its own, so the shared resolver keeps its timeout. A refusal is
+        ``Unavailable("installation")`` with no id or token in it.
+        """
+
+        from curie_api.github_app import GitHubAppError, GitHubCredentials
+
+        resolver = self._provider.credentials
+        if timeout_s is not None:
+            auth = resolver.auth
+            resolver = GitHubCredentials(
+                auth=replace(auth, timeout_s=min(auth.timeout_s, timeout_s))
+            )
+        try:
+            token: str = await run_in_threadpool(
+                resolver.token_for_verified_installation, repository.path, installation_id
+            )
+        except (GitHubAppError, ValueError):
+            raise Unavailable("installation") from None
+        return token
 
     def adapter(
         self,

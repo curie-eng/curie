@@ -31,6 +31,7 @@ from curie_api.forges.types import (
     RerunObserver,
     RerunRecord,
     ReviewFeedback,
+    TicketLabels,
     TrackerIssueRef,
     UpsertResult,
 )
@@ -114,6 +115,12 @@ class Tracker(Protocol):
 
     async def read_ticket(self, issue: TrackerIssueRef) -> str:
         """The ticket as markdown for the sandbox. Nothing is stored."""
+        ...
+
+    async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
+        """The issue's current labels and component names; admission reads them
+        for ``base:``, ``repo:`` and label conflicts (ADR 0197 identity 3).
+        Nothing is stored."""
         ...
 
     async def set_state_label(

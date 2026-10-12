@@ -25,7 +25,9 @@ from curie_api.forges.config import (
     RepositoryBindingConfig,
     TrackerConfig,
 )
+from curie_api.forges.connections import BindingTrackerConnection
 from curie_api.forges.credential_providers import ExpiryReport, expiry_for
+from curie_api.forges.errors import Unavailable
 
 if TYPE_CHECKING:
     from curie_api.config import Settings
@@ -140,8 +142,37 @@ class ForgeRegistry:
     def tracker(self, name: str) -> TrackerConnection:
         return self._trackers[name]
 
+    def binding_tracker(self, name: str) -> BindingTrackerConnection:
+        """The tracker ``name`` when one binding scopes it (Jira Cloud, #4358 plan D13).
+
+        A repository-scoped tracker (GitHub) is refused with
+        ``Unavailable("tracker_not_binding_scoped")``: its trackers come from
+        ``for_repository``.
+        """
+
+        connection = self._trackers[name]
+        if not isinstance(connection, BindingTrackerConnection):
+            raise Unavailable("tracker_not_binding_scoped")
+        return connection
+
     def code_host(self, name: str) -> CodeHostConnection:
         return self._code_hosts[name]
+
+    def code_host_for(self, kind: str, host: str) -> CodeHostConnection:
+        """The code host entry of ``kind`` on ``host``, the pair a stored
+        repository records (#4358 plan D14 item 1).
+
+        `_single_github` makes the GitHub answer unique; with none configured
+        the lookup is ``Unavailable("code_host_unconfigured")``.
+        """
+
+        found = next(
+            (entry for entry in self.config.code_hosts if (entry.kind, entry.host) == (kind, host)),
+            None,
+        )
+        if found is None:
+            raise Unavailable("code_host_unconfigured")
+        return self.code_host(found.name)
 
     def binding(self, name: str) -> BindingConfig:
         return next(binding for binding in self.config.bindings if binding.name == name)

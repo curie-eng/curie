@@ -61,6 +61,7 @@ from curie_api.forges.types import (
     NoticePage,
     PullRequest,
     RepositoryRef,
+    TicketLabels,
     TrackerIssueRef,
 )
 from curie_api.github_factory_events import FactoryNotice, FactoryRefused, mentions_login
@@ -512,6 +513,17 @@ class GitHubTracker:
         if content.comments_truncated:
             parts.append("_Later comments were not read._")
         return "\n\n".join(parts) + "\n"
+
+    async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
+        """The issue's labels from one issue read; GitHub has no components."""
+
+        found = await self._issue(self._number(issue))
+        if found is None:
+            raise NotFound("issue")
+        names = label_names(found)
+        if names is None:
+            raise Unavailable("labels")
+        return TicketLabels(labels=frozenset(names))
 
     async def set_state_label(
         self, issue: TrackerIssueRef, *, add: str | None, remove: Collection[str]

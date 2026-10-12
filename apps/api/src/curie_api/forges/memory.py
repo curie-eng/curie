@@ -58,6 +58,7 @@ from curie_api.forges.types import (
     RerunOutcome,
     RerunRecord,
     ReviewFeedback,
+    TicketLabels,
     TrackerIssueRef,
     UpsertResult,
 )
@@ -436,6 +437,10 @@ class InMemoryTracker(_Declared):
         self._gate(Operation.READ_TICKET)
         found = self._issue(issue)
         return f"# {found.title}\n\n{found.body}"
+
+    async def ticket_labels(self, issue: TrackerIssueRef) -> TicketLabels:
+        self._gate(Operation.TICKET_LABELS)
+        return TicketLabels(labels=frozenset(self._issue(issue).labels))
 
     async def set_state_label(
         self, issue: TrackerIssueRef, *, add: str | None, remove: Collection[str]

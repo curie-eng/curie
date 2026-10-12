@@ -11,11 +11,11 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
 import pytest
 from curie_api.forges import types
 from curie_api.forges.capabilities import (
     MARKED_COMMENT_OPERATIONS,
+    OPTIONAL_OPERATIONS,
     TRACKER_OPERATIONS,
     CapabilityTier,
     Operation,
@@ -27,8 +27,8 @@ from curie_api.forges.config import ForgesConfig
 from curie_api.forges.connections import BindingTrackerConnection
 from curie_api.forges.errors import Unauthorized
 from curie_api.forges.registry import build_registry
+from forge_fakes.contract_harness import JiraGitHubHarness
 from forge_fakes.jira import (
-    CODE_HOST_NAME,
     SITE_HOST,
     STARTERS,
     TOKEN,
@@ -57,17 +57,24 @@ def test_jira_config_ticket_labels_is_a_mandatory_tracker_operation() -> None:
     assert tier(Operation.TICKET_LABELS) is CapabilityTier.MANDATORY
 
 
-@pytest.mark.anyio
-async def test_jira_config_the_jira_tracker_pairs_with_the_github_code_host() -> None:
-    registry = jira_registry()
-    tracker = jira_tracker(JiraFake())
-    async with httpx.AsyncClient() as client:
-        code_host = registry.code_host(CODE_HOST_NAME).adapter(client)
+def test_jira_config_the_jira_tracker_pairs_with_the_github_code_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The jira-github contract pair: the Jira tracker built through
+    `build_registry` -> `binding_tracker` -> `for_binding`, and the GitHub code
+    host with its marked comments wired as the contract suite builds it."""
 
-        validate_pairing(tracker, code_host)
+    pair = JiraGitHubHarness(monkeypatch)
+    tracker, code_host = pair.tracker, pair.code_host
+
+    required = validate_pairing(tracker, code_host)
 
     assert (tracker.kind, tracker.host) == (types.JIRA_CLOUD, SITE_HOST)
     assert code_host.kind == types.GITHUB
+    assert required.tracker == TRACKER_OPERATIONS - OPTIONAL_OPERATIONS
+    assert Operation.TICKET_LABELS in required.tracker
+    assert all(tracker.capabilities[op] is Support.SUPPORTED for op in required.tracker)
+    assert dict(tracker.capabilities) == _expected_tracker_capabilities()
 
 
 def test_jira_config_capabilities_are_the_declared_set() -> None:
