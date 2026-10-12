@@ -3729,6 +3729,14 @@
             },
             {
               "global": false,
+              "help": "The label that starts factory work through the added tracker surface (github, gitlab or jira), so two agents can share one location. Without it the surface serves the configured tracker label. Set only when a surface is added",
+              "id": "label",
+              "long": "label",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
               "help": "Remove this surface, as KIND=ADDRESS. The API refuses to remove an agent's final surface",
               "id": "remove",
               "long": "remove",
@@ -6731,6 +6739,14 @@
               "help": "Identity for a Slack surface (default: default), or the worker credential selector for a non-Slack adapter",
               "id": "adapter",
               "long": "adapter",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "The label that starts factory work through the added tracker surface (github, gitlab or jira), so two agents can share one location. Without it the surface serves the configured tracker label. Set only when a surface is added",
+              "id": "label",
+              "long": "label",
               "positional": false,
               "required": false
             },

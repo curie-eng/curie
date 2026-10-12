@@ -414,6 +414,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                     address: "C0EXAMPLE1".to_string(),
                     adapter: Some("default".to_string()),
                     allowed_callers: Some(vec!["U0EXAMPLE1".to_string()]),
+                    trigger_label: None,
                 },
                 changed: true,
             },
@@ -434,6 +435,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                         address: "#legacy-alerts".to_string(),
                         adapter: None,
                         allowed_callers: None,
+                        trigger_label: None,
                     },
                     // A named, non-default identity (ADR-0168 decision 3)
                     // alongside the default-identity row above, so the schema
@@ -443,6 +445,7 @@ fn registry() -> BTreeMap<&'static str, Vec<VariantJson>> {
                         address: "C0EXAMPLE1".to_string(),
                         adapter: Some("ops-secondary".to_string()),
                         allowed_callers: None,
+                        trigger_label: None,
                     },
                 ],
                 changed: true,

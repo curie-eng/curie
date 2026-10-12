@@ -105,6 +105,10 @@ class Admission:
     # None is the tracker issue; review feedback sets its pull request target.
     reply_target: ReplyTarget | None = None
     reply_url: str | None = None
+    # The trigger label that admitted this run (#4361 decision 10), stored on
+    # the WorkItem at admission and readmission. None for an admission no label
+    # started (a revision, review feedback, the work-items API).
+    trigger_label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -441,6 +445,7 @@ async def readmit(
         objective=facts.objective,
         requester=facts.requester,
         base=getattr(facts, "base", None),
+        trigger_label=facts.trigger_label,
     )
     if isinstance(readmitted, WorkItemConflict):
         return readmitted
@@ -464,8 +469,10 @@ async def _admit_new(
         code_host_installation_id=facts.code_host_installation_id,
         agent_id=facts.agent_id,
         conversation_id=_facts_conversation(facts, adapter),
-        # Factory admission resolves a base (ADR 0186); other callers do not.
+        # Factory admission resolves a base (ADR 0186) and names the label
+        # that admitted it (#4361); other callers do neither.
         base=getattr(facts, "base", None),
+        trigger_label=facts.trigger_label,
     )
     if isinstance(created, WorkItemConflict):
         return created

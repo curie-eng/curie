@@ -54,8 +54,15 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+def valid_config_name(value: str) -> bool:
+    """Whether ``value`` is a config name: a binding, tracker or code host name,
+    or a repository alias. A ``jira=`` surface names a binding by it."""
+
+    return bool(_NAME.fullmatch(value))
+
+
 def _name(value: str, what: str) -> str:
-    if not _NAME.fullmatch(value):
+    if not valid_config_name(value):
         raise ValueError(
             f"{what} {value!r} must be 1 to 64 lowercase letters, digits, '.', '_' or '-'"
         )

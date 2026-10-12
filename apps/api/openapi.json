@@ -3281,7 +3281,7 @@
       },
       "ChannelBindingOut": {
         "additionalProperties": false,
-        "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe read shape becomes `{kind, address, adapter}` (ADR-0168 decision 3):\n`adapter` is part of the route's identity, not a credential, so it belongs\non the read side; `endpoint` stays write-only, unchanged from before.\n`ChannelBindingWrite`'s docstring still describes `endpoint`'s absence.\n\n`allowed_callers` (ADR 0175) is shown as stored: null for everyone, else the\nexact ids that may start a turn through this binding. It is written only by\n`PUT /agents/{agent_id}/channels/callers`, never by a binding write.",
+        "description": "The READ side of a binding: the stored pair, serialized as it is stored.\n\nDeliberately NOT a subclass of `ChannelBinding`, and that is the whole point.\n`ChannelBinding` carries the address-shape rule three write paths inherit\n(`ChannelBindingWrite`, `ChannelTokenRequest`, `TurnIn`), and it used to be\nthe element type of `AgentOut.channels` as well -- so the rule that guards a\nBIND also ran when an existing row was READ, and one row it rejected failed\nthe whole response for every agent in it (#1914).\n\nAn install reaches that state by upgrading: migration 0021 backfills\n`agent_channels.address` from `agents.slack_channel` verbatim, and that column\nis exactly where a literal `#name` from before the validator lived. So an\ninstall that was merely mis-routed became one whose agent list was\nunavailable, reporting a Pydantic error instead of the bad value.\n\nSerializing a stored row must not re-litigate whether it should have been\nstored. Showing the bad address is also the more useful outcome: an operator\ncannot fix a value the API refuses to tell them.\n\nThe read shape becomes `{kind, address, adapter}` (ADR-0168 decision 3):\n`adapter` is part of the route's identity, not a credential, so it belongs\non the read side; `endpoint` stays write-only, unchanged from before.\n`ChannelBindingWrite`'s docstring still describes `endpoint`'s absence.\n\n`allowed_callers` (ADR 0175) is shown as stored: null for everyone, else the\nexact ids that may start a turn through this binding. It is written only by\n`PUT /agents/{agent_id}/channels/callers`, never by a binding write.\n\n`trigger_label` (#4361) is shown as stored: null for a surface that serves\nthe configured tracker label, else its own label.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -3315,6 +3315,17 @@
           "kind": {
             "title": "Kind",
             "type": "string"
+          },
+          "trigger_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Label"
           }
         },
         "required": [
@@ -3326,7 +3337,7 @@
       },
       "ChannelBindingPatch": {
         "additionalProperties": false,
-        "description": "A binding move with partial semantics for the write only reply route.\n\n`kind` and `address` always describe the replacement routing key. Omitting\nboth route fields preserves their stored values because callers cannot read\nthem back. Supplying both fields replaces them, including the explicit\n`null` pair that clears the route.",
+        "description": "A binding move with partial semantics for the write only reply route.\n\n`kind` and `address` always describe the replacement routing key. Omitting\nboth route fields preserves their stored values because callers cannot read\nthem back. Supplying both fields replaces them, including the explicit\n`null` pair that clears the route. It carries no `trigger_label` (#4361\ndecision 7): a move keeps the stored label, and a body naming one is\nrefused as an unknown field.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -3368,7 +3379,7 @@
       },
       "ChannelBindingWrite": {
         "additionalProperties": false,
-        "description": "The WRITE side of a binding: the public pair plus its reply ROUTE.\n\nA separate model from `ChannelBinding` because `ChannelBindingOut`, not this\none, is the element type of `AgentOut.channels` in RESPONSES (ADR-0096 phase\n2, EB-A18 as relocated; widened to `{kind, address, adapter}` by ADR-0168\ndecision 3). `endpoint` is a server-controlled fact an operator configures\nat bind time -- where this kind's replies go back through -- so it is\ndurable on the row and ABSENT from every read; `adapter` is now part of the\nroute's identity rather than only a credential, so it is present on both\nsides. A write-side policy on the shared model would 422 valid reads and\nleak a write rule into a read contract.\n\nThe rules, stated here because this is the write path every caller (UI,\nAPI, CLI) passes through; `agent_channels_route_ck` states the first two\nat the database for out-of-band writers:\n\n- **A Slack route names its identity**, `default` when omitted, and has no\n  endpoint (ADR-0168 decision 3): its replies go through the worker's\n  configured Slack origin, so an endpoint is refused by field name.\n- **Any other kind is both or neither.** A half-configured route is an\n  operator error that would otherwise surface as a fail-closed escalation\n  mid-turn, in the worker, far from the request that caused it.\n- **Both absent is legal** for a non-Slack kind: the cutover binds the\n  agent first and PATCHes the route in later. The gate for an unroutable\n  binding is `POST /channels/token`, which refuses (409) to mint for a\n  non-`slack` binding with no route.\n- **`adapter` is a lowercase slug**, on the same pattern as `kind`, because\n  it is a CONFIG-MAP KEY on the worker\n  (`config.adapter_credentials[route.adapter]`): a value carrying a quote, a\n  space or a `:` is a config-injection shape, not a name.\n- **`endpoint` is an absolute http(s) URL with a host and NO userinfo.** The\n  worker POSTs the platform's AUTHENTICATED reply to this value, so an empty\n  string or a nonsense URL is a binding that mints tokens and passes ingress\n  and then fails closed mid-turn in the worker -- the same E17 failure the\n  route pair exists to foreclose, arriving one layer later. Userinfo\n  (`https://user:pass@host/`) is refused separately: a credential in the\n  stored URL is one git-grep, one log line and one error message away from\n  disclosure, and the `adapter` field is where a credential belongs.\n\nNeither the value nor any part of it appears in the messages below. An\nendpoint can carry a token in its path or query, so error text -- which is\nreturned to the caller and written to logs -- names the FIELD and states the\nrule instead of echoing what was sent.",
+        "description": "The WRITE side of a binding: the route plus its optional trigger label.\n\nThe `AgentCreate.channel` value and the `POST /agents/{id}/channels` body.\n`trigger_label` (#4361, #4397 decision 10) is the label that starts factory\nwork through a tracker surface (`github`, `gitlab`, `jira`); omitted, the\nsurface serves the configured tracker label. It is set only when a binding\nis added: `ChannelBindingPatch` has no such field, so a move keeps the\nstored label and changing it is a remove and an add.",
         "properties": {
           "adapter": {
             "anyOf": [
@@ -3399,6 +3410,17 @@
           "kind": {
             "title": "Kind",
             "type": "string"
+          },
+          "trigger_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger Label"
           }
         },
         "required": [

@@ -494,7 +494,7 @@ def test_admission_retains_issue_lock_until_caller_commit(
         "issues",
         _issue_event("labeled", number, label={"name": LABEL}),
         str(uuid.uuid4()),
-        label=LABEL,
+        labels={LABEL},
         mention=MENTION,
     )
     classid, objid = issue_lock_keys_for(REPO_ID, number)

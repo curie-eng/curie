@@ -43,6 +43,8 @@ pub struct AgentCreate {
 
 /// One channel binding as written (`ChannelBindingWrite`): the
 /// `AgentCreate.channel` value and the `POST /agents/{id}/channels` body.
+/// `trigger_label` (#4361) is sent only when the operator names one, so an
+/// unlabelled tracker surface keeps serving the configured tracker label.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChannelBindingWrite {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,6 +53,8 @@ pub struct ChannelBindingWrite {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_label: Option<String>,
 }
 
 /// `PATCH /agents/{id}` (`AgentUpdate`). Every field is optional: an omitted

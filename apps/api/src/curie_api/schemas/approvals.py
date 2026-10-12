@@ -23,7 +23,7 @@ from .channels import (
     SLACK_USERGROUP_ID,
     ChannelBinding,
     ChannelBindingOut,
-    ChannelBindingWrite,
+    ChannelRouteWrite,
     normalize_caller_id,
 )
 
@@ -198,7 +198,7 @@ class ApprovalRequestingSurfaceTarget(BaseModel):
     mode: Literal["requesting_surface"]
 
 
-class ApprovalNotificationTarget(ChannelBindingWrite, _StoredWithoutNulls):
+class ApprovalNotificationTarget(ChannelRouteWrite, _StoredWithoutNulls):
     """A visibility-only approval ping target and its server-side transport.
 
     A Slack target names no transport, and may name its identity in
@@ -307,6 +307,10 @@ class ApprovalTargetOut(ChannelBindingOut):
     # not a place a caller starts a turn; excluded for the same reason as
     # `adapter` above, so this read shape stays exactly as it was.
     allowed_callers: list[str] | None = Field(default=None, exclude=True)
+    # A tracker surface's trigger label (#4361), inherited from
+    # `ChannelBindingOut`, starts no work on an approval target; excluded so
+    # this read shape stays exactly as it was.
+    trigger_label: str | None = Field(default=None, exclude=True)
 
 
 class ApprovalApproversOut(BaseModel):

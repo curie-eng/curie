@@ -7,6 +7,9 @@ from urllib.parse import urlsplit
 from aci_protocol.turn import SLACK_KIND, route_identity
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from ..forges.config import MAX_LABEL_LENGTH, valid_config_name
+from ..forges.paths import valid_repository_path
+from ..github_factory_events import BASE_LABEL_PREFIX
 from ..identities import refuse_undeclared
 
 # Slack channel IDs start with C (public/private channel), D (DM), or G (legacy
@@ -60,6 +63,22 @@ def _slack_shape_error(value: str) -> str:
     )
 
 
+def _gitlab_shape_error(value: str) -> str:
+    return (
+        f"gitlab project {value!r} is not a GitLab project path: a gitlab surface names "
+        "the project by its full path, group and project separated by '/', nested to any "
+        "depth (e.g. acme/platform/infra)."
+    )
+
+
+def _jira_shape_error(value: str) -> str:
+    return (
+        f"jira binding {value!r} is not a binding name: a jira surface names the configured "
+        "binding whose Jira site it serves, 1 to 64 lowercase letters, digits, '.', '_' "
+        "or '-' (e.g. acme-jira)."
+    )
+
+
 # Channel kind -> the address shape that kind requires, paired with the message
 # a violation earns (ADR-0096, #1459).
 #
@@ -74,8 +93,16 @@ def _slack_shape_error(value: str) -> str:
 # The message rides WITH the shape rather than in a second lookup: the shape is
 # only half the deliverable (#143), and a kind that gains a rule and no guidance
 # tells an operator their value is wrong without telling them what is right.
-_CHANNEL_ADDRESS_SHAPES: dict[str, tuple[re.Pattern[str], Callable[[str], str]]] = {
-    "slack": (SLACK_CHANNEL_ID, _slack_shape_error),
+#
+# The tracker surfaces that name a configured location get a shape here too
+# (#4397 decision 3): a `gitlab` project path nests to any depth, and a `jira`
+# surface names a configured binding. Whether the location is configured is
+# the forge registry's answer (`forges.surfaces.resolve_surface`), asked by the
+# binding write after the shape passes.
+_CHANNEL_ADDRESS_SHAPES: dict[str, tuple[Callable[[str], bool], Callable[[str], str]]] = {
+    "slack": (lambda address: SLACK_CHANNEL_ID.match(address) is not None, _slack_shape_error),
+    "gitlab": (lambda address: valid_repository_path("gitlab", address), _gitlab_shape_error),
+    "jira": (valid_config_name, _jira_shape_error),
 }
 
 
@@ -131,9 +158,62 @@ def validate_channel_binding(kind: str, address: str) -> str:
             )
         return address
     shape, explain = registered
-    if not shape.match(address):
+    if not shape(address):
         raise ValueError(explain(address))
     return address
+
+
+# The surface kinds a trigger label may sit on: every tracker surface (#4361,
+# #4397 decision 10). `models.TRIGGER_LABEL_CHECK` states the same set at the
+# database.
+TRIGGER_LABEL_KINDS = frozenset({"github", "gitlab", "jira"})
+
+
+def reserved_label_prefixes() -> tuple[str, ...]:
+    """The label families a trigger label may not start with: the factory's
+    state labels, the ``base:`` labels and the ``repo:`` labels.
+
+    Derived from the constants that own each family rather than restated, so a
+    new family is reserved where it is defined. Imported here, not at module
+    load: the state and repository label modules sit above the schemas.
+    """
+
+    from ..factory_notices import STATE_LABELS
+    from ..forges.resolution import REPO_LABEL_PREFIX
+
+    state = sorted({label.split(":", 1)[0] + ":" for label in STATE_LABELS})
+    return (*state, BASE_LABEL_PREFIX, REPO_LABEL_PREFIX)
+
+
+def valid_trigger_label(kind: str, label: str) -> str:
+    """Check one surface's trigger label and return it (#4361 decision 3).
+
+    The label rule the tracker config's ``label`` uses (1 to 50 characters, no
+    whitespace), refused when it starts with a reserved label family, and
+    refused outright on a surface kind that is not a tracker surface.
+
+    Raises:
+        ValueError: naming ``trigger_label`` and the rule it breaks.
+    """
+
+    if kind not in TRIGGER_LABEL_KINDS:
+        kinds = ", ".join(sorted(TRIGGER_LABEL_KINDS))
+        raise ValueError(
+            f"trigger_label is only for a tracker surface ({kinds}); a {kind} surface "
+            "starts no factory work. Remove trigger_label."
+        )
+    if not label or len(label) > MAX_LABEL_LENGTH or _ADDRESS_WHITESPACE.search(label):
+        raise ValueError(
+            f"trigger_label {label!r} must be 1 to {MAX_LABEL_LENGTH} characters with no "
+            "whitespace."
+        )
+    reserved = next((p for p in reserved_label_prefixes() if label.startswith(p)), None)
+    if reserved is not None:
+        raise ValueError(
+            f"trigger_label {label!r} starts with {reserved!r}, a label family the factory "
+            "owns; pick a label that does not."
+        )
+    return label
 
 
 def validate_channel_endpoint(endpoint: str) -> str:
@@ -362,6 +442,9 @@ class ChannelBindingOut(BaseModel):
     `allowed_callers` (ADR 0175) is shown as stored: null for everyone, else the
     exact ids that may start a turn through this binding. It is written only by
     `PUT /agents/{agent_id}/channels/callers`, never by a binding write.
+
+    `trigger_label` (#4361) is shown as stored: null for a surface that serves
+    the configured tracker label, else its own label.
     """
 
     model_config = ConfigDict(extra="forbid", from_attributes=True)
@@ -370,6 +453,7 @@ class ChannelBindingOut(BaseModel):
     address: str
     adapter: str | None = None
     allowed_callers: list[str] | None = None
+    trigger_label: str | None = None
 
     @model_validator(mode="after")
     def _present_route_identity(self) -> "ChannelBindingOut":
@@ -384,8 +468,9 @@ class ChannelBindingOut(BaseModel):
         return self
 
 
-class ChannelBindingWrite(ChannelBinding):
-    """The WRITE side of a binding: the public pair plus its reply ROUTE.
+class ChannelRouteWrite(ChannelBinding):
+    """A written pair plus its reply ROUTE: the rules every binding write and a
+    stored approval notification target share.
 
     A separate model from `ChannelBinding` because `ChannelBindingOut`, not this
     one, is the element type of `AgentOut.channels` in RESPONSES (ADR-0096 phase
@@ -434,7 +519,7 @@ class ChannelBindingWrite(ChannelBinding):
     adapter: str | None = None
 
     @model_validator(mode="after")
-    def _check_route(self) -> "ChannelBindingWrite":
+    def _check_route(self) -> "ChannelRouteWrite":
         # The reserved-relay literal is refused before anything else reads it,
         # so it never gets the chance to read as an undeclared IDENTITY on a
         # Slack route below: "reserved" is the more specific, more actionable
@@ -486,6 +571,26 @@ class ChannelBindingWrite(ChannelBinding):
         return self
 
 
+class ChannelBindingWrite(ChannelRouteWrite):
+    """The WRITE side of a binding: the route plus its optional trigger label.
+
+    The `AgentCreate.channel` value and the `POST /agents/{id}/channels` body.
+    `trigger_label` (#4361, #4397 decision 10) is the label that starts factory
+    work through a tracker surface (`github`, `gitlab`, `jira`); omitted, the
+    surface serves the configured tracker label. It is set only when a binding
+    is added: `ChannelBindingPatch` has no such field, so a move keeps the
+    stored label and changing it is a remove and an add.
+    """
+
+    trigger_label: str | None = None
+
+    @model_validator(mode="after")
+    def _check_trigger_label(self) -> "ChannelBindingWrite":
+        if self.trigger_label is not None:
+            valid_trigger_label(self.kind, self.trigger_label)
+        return self
+
+
 class ClusterMessageReplyAck(BaseModel):
     """Acknowledgement for one idempotently stored relay event."""
 
@@ -504,13 +609,15 @@ class ClusterMessageReplyPage(BaseModel):
     terminal: bool
 
 
-class ChannelBindingPatch(ChannelBindingWrite):
+class ChannelBindingPatch(ChannelRouteWrite):
     """A binding move with partial semantics for the write only reply route.
 
     `kind` and `address` always describe the replacement routing key. Omitting
     both route fields preserves their stored values because callers cannot read
     them back. Supplying both fields replaces them, including the explicit
-    `null` pair that clears the route.
+    `null` pair that clears the route. It carries no `trigger_label` (#4361
+    decision 7): a move keeps the stored label, and a body naming one is
+    refused as an unknown field.
     """
 
     @model_validator(mode="after")

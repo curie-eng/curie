@@ -4,6 +4,13 @@ Polling is the default door. One pass lists labeled issues, mentions, and
 review feedback for each bound repository, then admits through the same
 verification the webhook uses. It does not write a delivery receipt.
 
+A repository may serve several trigger labels, one per surface (#4361 decision
+14). The pass still makes one repository read and mints one installation token
+per repository, then lists open issues once per effective label under the ETag
+key ``issues:<label>``. A repository with open WorkItems and no surface left is
+walked for cancellation only: nothing serves it, so nothing is listed or
+admitted there.
+
 Cursors live in ``curie.factory_poll_cursors``, keyed by tracker scope. ``since`` moves only to the
 newest timestamp on a page that was applied, because GitHub's ``since`` is
 inclusive. An ETag is stored only after that apply. A 304 creates no work.
@@ -34,11 +41,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 from starlette.concurrency import run_in_threadpool
 
-from curie_api.factory_label_reconcile import bound_repositories, parse_time
+from curie_api.factory_label_reconcile import (
+    bound_repositories,
+    open_work_item_repositories,
+    parse_time,
+)
 
 from . import github_factory
 from .config import Settings
 from .forges.errors import Unavailable
+from .forges.github.binding import bound_labels
 from .forges.github.comments import static_token
 from .forges.github.review_polling import (
     Cursor,
@@ -141,16 +153,20 @@ async def _poll_locked(
     client: httpx.AsyncClient,
 ) -> None:
     async with sessionmaker() as session:
-        repositories = await bound_repositories(session)
-    for repository in repositories:
+        bound = await bound_repositories(session)
+        open_items = await open_work_item_repositories(session)
+    served: dict[str, bool] = {}
+    for repository, serves in [*((r, True) for r in bound), *((r, False) for r in open_items)]:
         try:
             repo = normalize_repo_full_name(repository)
         except InvalidRepoFullName:
             continue
+        served[repo] = served.get(repo, False) or serves
+    for repo, serves in served.items():
         if not repository_is_allowed(repo, settings.github_repo_allowlist):
             continue
         try:
-            await _poll_repository(sessionmaker, settings, client, repo)
+            await _poll_repository(sessionmaker, settings, client, repo, serves=serves)
         except (
             Unavailable,
             PollUnavailable,
@@ -167,10 +183,17 @@ async def _poll_repository(
     settings: Settings,
     client: httpx.AsyncClient,
     repo: str,
+    *,
+    serves: bool,
 ) -> None:
+    """One repository's pass. ``serves`` is False for a repository no surface
+    binds any more: it gets the cancellation pass alone."""
+
     now = datetime.now(UTC)
     registry = forges_registry(settings)
     intake = factory_tracker(registry)
+    async with sessionmaker() as session:
+        labels = sorted(await bound_labels(session, registry, repo)) if serves else []
     installation_id, token = await run_in_threadpool(
         factory_credentials(registry).fresh_installation_token, repo, None
     )
@@ -192,14 +215,26 @@ async def _poll_repository(
     # so a rename keeps it (ADR 0197).
     scope = _Scope(tracker.kind, tracker.host, str(repository_id), repo)
     cursor = await _load_cursor(sessionmaker, scope)
-    await _admit_labeled(
-        sessionmaker,
-        settings,
-        client,
-        cursor,
-        tracker,
-        installation_id=installation_id,
-    )
+    # The single-label key a release before #4361 kept, and the keys of labels
+    # no surface binds now, are dropped; the next listing is unconditional.
+    for key in list(cursor.etags):
+        if key == "issues" or (key.startswith("issues:") and key[7:] not in labels):
+            del cursor.etags[key]
+    for label in labels:
+        await _admit_labeled(
+            sessionmaker,
+            settings,
+            client,
+            cursor,
+            intake.for_repository(
+                client,
+                repo_full_name=repo,
+                repository_id=repository_id,
+                token=static_token(token),
+                label=label,
+            ),
+            installation_id=installation_id,
+        )
     await _cancel_stale(
         sessionmaker,
         settings,
@@ -208,6 +243,9 @@ async def _poll_repository(
         tracker,
         installation_id=installation_id,
     )
+    if not serves:
+        await _save_cursor(sessionmaker, scope, cursor)
+        return
     await _admit_mentions(
         sessionmaker,
         settings,
@@ -263,8 +301,9 @@ async def _admit_labeled(
     installation_id: int,
 ) -> None:
     label = tracker.label
+    key = f"issues:{label}"
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
-    listed, etag = await tracker.labeled_open_issues(cursor.etags.get("issues"))
+    listed, etag = await tracker.labeled_open_issues(cursor.etags.get(key))
     if listed is None:
         return
     deferred = False
@@ -306,7 +345,7 @@ async def _admit_labeled(
             deferred = True
             logger.info("factory labeled issue poll for %s issue %s deferred", repo, number)
     if etag and not deferred:
-        cursor.etags["issues"] = etag
+        cursor.etags[key] = etag
 
 
 async def _cancel_stale(
@@ -319,6 +358,7 @@ async def _cancel_stale(
     installation_id: int,
 ) -> None:
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
+    registry = forges_registry(settings)
     async with sessionmaker() as session:
         items = list(
             await session.scalars(
@@ -328,13 +368,17 @@ async def _cancel_stale(
                 )
             )
         )
-        numbers = sorted({int(item.tracker_issue_id) for item in items})
-    label = tracker.label
-    keys = {f"issue:{number}:{label}" for number in numbers}
+        # Each WorkItem against the label that admitted it (#4361 decision 10).
+        admitting: dict[int, str] = {}
+        for item in items:
+            label = await github_factory.admitting_label(session, registry, item)
+            if label is not None:
+                admitting[int(item.tracker_issue_id)] = label
+    keys = {f"issue:{number}:{label}" for number, label in admitting.items()}
     for key in list(cursor.etags):
         if key.startswith("issue:") and key not in keys:
             del cursor.etags[key]
-    for number in numbers:
+    for number, label in sorted(admitting.items()):
         key = f"issue:{number}:{label}"
         try:
             issue, etag = await tracker.conditional_issue(number, cursor.etags.get(key))

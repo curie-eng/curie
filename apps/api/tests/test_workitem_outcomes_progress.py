@@ -167,6 +167,7 @@ def _facts(agent_id: str, issue_number: int) -> SimpleNamespace:
         objective="Implement the admitted work item",
         requester="U0REQUEST1",
         request_id=uuid.uuid4(),
+        trigger_label=None,
     )
 
 

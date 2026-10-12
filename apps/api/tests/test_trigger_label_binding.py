@@ -401,7 +401,7 @@ def test_trigger_label_binding_second_github_binding_for_one_agent_on_one_reposi
     assert _github_channels(client, agent[0]) == [(REPO, None)]
     # Liveness: the same agent may serve another repository.
     assert _add(client, agent[0], _github(OTHER_REPO, FAST)).status_code == 201
-    assert _github_channels(client, agent[0]) == [(OTHER_REPO, FAST), (REPO, None)]
+    assert _github_channels(client, agent[0]) == [(REPO, None), (OTHER_REPO, FAST)]
 
 
 def test_trigger_label_binding_repost_same_label_is_idempotent(

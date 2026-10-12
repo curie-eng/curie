@@ -6486,6 +6486,7 @@ mod tests {
                     address: c.to_string(),
                     adapter: None,
                     allowed_callers: None,
+                    trigger_label: None,
                 })
                 .collect(),
             repo_full_name: None,
@@ -6514,6 +6515,7 @@ mod tests {
                 address: address.to_string(),
                 adapter: adapter.map(str::to_string),
                 allowed_callers: None,
+                trigger_label: None,
             })
             .collect();
         agent
@@ -8085,6 +8087,7 @@ mod tests {
                     address: "C1".into(),
                     adapter: None,
                     allowed_callers: None,
+                    trigger_label: None,
                 }],
                 repo_full_name: None,
                 approval_required_tools: None,
@@ -8111,6 +8114,7 @@ mod tests {
                     address: "C2".into(),
                     adapter: None,
                     allowed_callers: None,
+                    trigger_label: None,
                 }],
                 repo_full_name: None,
                 approval_required_tools: None,

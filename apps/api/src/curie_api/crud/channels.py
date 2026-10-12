@@ -7,6 +7,8 @@ from aci_protocol.turn import SLACK_KIND, matching_routes, route_identity
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.forges.registry import ForgeRegistry
+from curie_api.forges.surfaces import TRACKER_SURFACE_KINDS, effective_trigger_label
 from curie_api.schemas.channels import ChannelBindingPatch, ChannelBindingWrite
 
 from ..models import Agent, AgentChannel
@@ -23,6 +25,16 @@ class RoutelessPairShared(RuntimeError):
     """A route-less non-Slack binding and another agent's route on one pair.
 
     Raised by `refuse_routeless_pair_sharing`; its message is the 409 detail.
+    """
+
+
+class LabelOverlap(RuntimeError):
+    """A tracker surface that would overlap another on its location (#4361
+    decision 5): the agent already holds one there, or another surface there
+    has the same effective trigger label.
+
+    Raised by `refuse_label_overlap`; its message is the 409 detail, naming the
+    other agent.
     """
 
 
@@ -105,6 +117,89 @@ def _pair_lock_keys(kind: str, address: str) -> tuple[int, int]:
     )
 
 
+async def lock_pair(session: AsyncSession, kind: str, address: str) -> None:
+    """Hold the transaction-scoped advisory lock on `(kind, address)`.
+
+    Every write that judges a pair against the rows already on it takes this
+    first, so two writers racing onto one pair serialize and the second reads
+    the first's committed row. Re-taking it in one transaction is harmless.
+    """
+
+    classid, objid = _pair_lock_keys(kind, address)
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(CAST(:classid AS integer), CAST(:objid AS integer))"),
+        {"classid": classid, "objid": objid},
+    )
+
+
+async def refuse_label_overlap(
+    session: AsyncSession,
+    registry: ForgeRegistry,
+    agent_id: uuid.UUID | None,
+    kind: str,
+    address: str,
+    trigger_label: str | None,
+    *,
+    exclude_binding_id: uuid.UUID | None = None,
+) -> None:
+    """Refuse a tracker surface that overlaps another on its location (#4361
+    decision 5, as amended by #4397 decision 10).
+
+    Two rules, both under the pair advisory lock (`lock_pair`), which this takes:
+
+    1. An agent holds at most one surface per tracker location, because the
+       agent-scoped readers (admission, channel read, lineages) resolve one row
+       per agent and location.
+    2. The effective trigger labels (`forges.surfaces.effective_trigger_label`)
+       on one location are pairwise distinct. The route key cannot say this: a
+       NULL label and an explicit label equal to the tracker label are
+       different keys there.
+
+    `agent_id` is None on a create, whose agent does not exist yet.
+    `exclude_binding_id` is the row being moved, so it is not counted against
+    itself. Every other kind passes untouched. Raises `LabelOverlap`.
+    """
+
+    if kind not in TRACKER_SURFACE_KINDS:
+        return
+    await lock_pair(session, kind, address)
+    query = (
+        select(AgentChannel, Agent.name)
+        .join(Agent, Agent.id == AgentChannel.agent_id)
+        .where(AgentChannel.kind == kind, AgentChannel.address == address)
+        .order_by(Agent.name)
+        .execution_options(populate_existing=True)
+    )
+    if exclude_binding_id is not None:
+        query = query.where(AgentChannel.id != exclude_binding_id)
+    rows = (await session.execute(query)).all()
+    for row, name in rows:
+        if row.agent_id == agent_id:
+            raise LabelOverlap(
+                f"agent {name!r} ({row.agent_id}) already holds a {kind} surface on "
+                f"{address}; an agent serves one location through one surface. To change "
+                "its trigger label, remove that surface and add it again"
+            )
+    wanted = effective_trigger_label(_Candidate(kind, address, trigger_label), registry)
+    for row, name in rows:
+        if effective_trigger_label(row, registry) == wanted:
+            label = f"trigger label {wanted!r}" if wanted is not None else "no trigger label"
+            raise LabelOverlap(
+                f"agent {name!r} ({row.agent_id}) already serves {kind}:{address} with "
+                f"{label}; two surfaces on one location need different trigger labels. "
+                "Pick another --label, or remove that agent's surface first"
+            )
+
+
+class _Candidate:
+    """A surface not stored yet, as `effective_trigger_label` reads one."""
+
+    def __init__(self, kind: str, address: str, trigger_label: str | None) -> None:
+        self.kind = kind
+        self.address = address
+        self.trigger_label = trigger_label
+
+
 async def refuse_routeless_pair_sharing(
     session: AsyncSession,
     agent_id: uuid.UUID | None,
@@ -129,15 +224,17 @@ async def refuse_routeless_pair_sharing(
     racing onto one pair from opposite sides serialize and the second sees the
     first's committed row. The caller holds it to its commit. Raises
     `RoutelessPairShared`.
+
+    A tracker surface (`github`, `gitlab`, `jira`) is exempt (#4361 decision
+    6): its work routes by the WorkItem's agent, never by the pair alone, and
+    `refuse_label_overlap`, which every write path runs for it, already
+    refuses two surfaces on one location with the same effective label, the
+    only overlap left.
     """
 
-    if kind == SLACK_KIND:
+    if kind == SLACK_KIND or kind in TRACKER_SURFACE_KINDS:
         return
-    classid, objid = _pair_lock_keys(kind, address)
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(CAST(:classid AS integer), CAST(:objid AS integer))"),
-        {"classid": classid, "objid": objid},
-    )
+    await lock_pair(session, kind, address)
     others = select(AgentChannel.id).where(
         AgentChannel.kind == kind, AgentChannel.address == address
     )
@@ -320,6 +417,7 @@ async def add_channel_binding(
         address=channel.address,
         endpoint=channel.endpoint,
         adapter=channel.adapter,
+        trigger_label=channel.trigger_label,
     )
     session.add(binding)
     await session.flush()

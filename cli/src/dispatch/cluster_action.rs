@@ -1176,6 +1176,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             add,
             endpoint,
             adapter,
+            label,
             remove,
             conn,
             dry_run,
@@ -1184,7 +1185,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
             // the same reason `Overrides` does: a mistyped pair must not
             // cost a cluster lookup, nor be reported as a connection
             // failure instead of the usage error it is.
-            let change = commands::ChannelChange::resolve(add, remove, endpoint, adapter)?;
+            let change = commands::ChannelChange::resolve(add, remove, endpoint, adapter, label)?;
             let (api_url, api_key, _port_forward) = resolve_cluster_conn(conn, dry_run).await?;
             emit(
                 commands::channel_bindings(

@@ -351,6 +351,13 @@ class Agent(Base):
     )
 
 
+# The surface kinds a trigger label may sit on: every tracker surface (#4361,
+# #4397 decision 10). Migration 0104 freezes the same rule.
+TRIGGER_LABEL_KINDS = ("github", "gitlab", "jira")
+TRIGGER_LABEL_CHECK = "trigger_label IS NULL OR kind IN ('github', 'gitlab', 'jira')"
+MAX_TRIGGER_LABEL_LENGTH = 50
+
+
 class AgentChannel(Base):
     """Where one agent listens: a channel KIND and an ADDRESS (ADR-0096, #1459).
 
@@ -391,13 +398,23 @@ class AgentChannel(Base):
         # time. The pair leads so `(kind, address)` lookups keep the index
         # prefix, and NULLS NOT DISTINCT keeps two route-less non-Slack rows
         # colliding on the pair.
+        #
+        # Migration 0104 widens it by `trigger_label` (#4361, #4397 decision
+        # 10): two agents may share a tracker location under different labels.
+        # Two unlabelled rows still collide; an explicit label equal to the
+        # configured tracker label beside an unlabelled row does not collide
+        # here, so `crud.channels.refuse_label_overlap` guards that case under
+        # the pair advisory lock.
         UniqueConstraint(
             "kind",
             "address",
             "adapter",
+            "trigger_label",
             name="agent_channels_route_key",
             postgresql_nulls_not_distinct=True,
         ),
+        # A trigger label belongs only on a tracker surface (migration 0104).
+        CheckConstraint(TRIGGER_LABEL_CHECK, name="agent_channels_trigger_label_ck"),
         CheckConstraint(
             "(kind = 'slack' AND adapter IS NOT NULL AND endpoint IS NULL) "
             "OR (kind <> 'slack' AND (endpoint IS NULL) = (adapter IS NULL))",
@@ -452,6 +469,13 @@ class AgentChannel(Base):
     # JSON value `null`, which is not SQL NULL and fails that CHECK.
     allowed_callers: Mapped[list[str] | None] = mapped_column(
         JSONB(none_as_null=True), default=None
+    )
+    # The label that starts factory work through this tracker surface (#4361,
+    # migration 0104). NULL serves the configured tracker label;
+    # `forges.surfaces.effective_trigger_label` is the only reader. Set only
+    # when the binding is added; a move keeps it.
+    trigger_label: Mapped[str | None] = mapped_column(
+        String(MAX_TRIGGER_LABEL_LENGTH), default=None
     )
 
     agent: Mapped[Agent] = relationship(back_populates="channels")
@@ -869,6 +893,13 @@ class WorkItem(Base):
     )
     cancelled_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), default=None
+    )
+    # The trigger label that admitted (or last readmitted) this WorkItem (#4361
+    # decision 10, migration 0104). Removing exactly this label cancels it; a
+    # replay leaves it alone. NULL on a row admitted before 0104 or by a
+    # non-label admission.
+    trigger_label: Mapped[str | None] = mapped_column(
+        String(MAX_TRIGGER_LABEL_LENGTH), default=None
     )
     # A relabel that arrived while a request was still running. The
     # reconciler admits it once that request reaches a terminus.

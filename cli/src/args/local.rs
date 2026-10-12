@@ -698,6 +698,12 @@ pub(crate) enum LocalAction {
         /// credential selector for a non-Slack adapter.
         #[arg(long)]
         adapter: Option<String>,
+        /// The label that starts factory work through the added tracker
+        /// surface (github, gitlab or jira), so two agents can share one
+        /// location. Without it the surface serves the configured tracker
+        /// label. Set only when a surface is added.
+        #[arg(long, value_name = "LABEL", requires = "add")]
+        label: Option<String>,
         /// Remove this surface, as KIND=ADDRESS. The API refuses to remove an
         /// agent's final surface.
         #[arg(long, value_name = "KIND=ADDRESS", conflicts_with = "add")]

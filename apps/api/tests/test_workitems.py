@@ -78,6 +78,7 @@ async def _item(
         code_host_installation_id=installation,
         agent_id=agent_id,
         conversation_id=conversation,
+        trigger_label=None,
     )
     assert isinstance(result, workitems.WorkItemOutcome), result
     return result
@@ -352,6 +353,7 @@ def test_work_item_identity_replay_and_conflicting_provenance(clean_db: None) ->
             "code_host_installation_id": 202,
             "agent_id": agent_id,
             "conversation_id": CONVERSATION,
+            "trigger_label": None,
         }
         for variant in variants:
             conflict = _conflict(
@@ -396,6 +398,7 @@ def test_concurrent_duplicate_work_item_intake_returns_one_replay(clean_db: None
                     code_host_installation_id=202,
                     agent_id=agent_id,
                     conversation_id=CONVERSATION,
+                    trigger_label=None,
                 )
 
         try:
@@ -3018,6 +3021,7 @@ def test_a_pending_relabel_wins_over_an_owner_lost_successor(clean_db: None) -> 
             wait_deadline=await _now(session) + timedelta(hours=1),
             objective="Fix the flaky retry test, again",
             requester="github:6601:octocat",
+            trigger_label=None,
         )
         assert isinstance(deferred, workitems.WorkItemOutcome), deferred
         assert (

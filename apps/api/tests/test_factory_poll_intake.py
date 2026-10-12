@@ -125,6 +125,8 @@ class _PlantedIssue:
     event_id: int
     closed_event_id: int | None = None
     base_labels: tuple[str, ...] = ()
+    label: str = LABEL
+    unlabeled_event_id: int | None = None
 
 
 @dataclass
@@ -162,6 +164,7 @@ class PollGitHub:
         *,
         age: timedelta = timedelta(seconds=5),
         base_labels: tuple[str, ...] = (),
+        label: str = LABEL,
     ) -> int:
         number = next(_ISSUES)
         self.issues[number] = _PlantedIssue(
@@ -171,8 +174,14 @@ class PollGitHub:
             labeled_at=datetime.now(UTC) - age,
             event_id=810000 + number,
             base_labels=base_labels,
+            label=label,
         )
         return number
+
+    def unlabel_issue(self, number: int) -> None:
+        issue = self.issues[number]
+        issue.labeled = False
+        issue.unlabeled_event_id = 830000 + number
 
     def close_issue(self, number: int) -> None:
         issue = self.issues[number]
@@ -297,12 +306,23 @@ class PollGitHub:
             {
                 "id": issue.event_id,
                 "event": "labeled",
-                "label": {"name": LABEL},
+                "label": {"name": issue.label},
                 "actor": human,
                 "performed_via_github_app": None,
                 "created_at": _iso(issue.labeled_at),
             }
         ]
+        if issue.unlabeled_event_id is not None:
+            events.append(
+                {
+                    "id": issue.unlabeled_event_id,
+                    "event": "unlabeled",
+                    "label": {"name": issue.label},
+                    "actor": human,
+                    "performed_via_github_app": None,
+                    "created_at": _iso(datetime.now(UTC)),
+                }
+            )
         if issue.closed_event_id is not None:
             events.append(
                 {
@@ -320,7 +340,8 @@ class PollGitHub:
             "number": issue.number,
             "state": issue.state,
             "labels": [
-                {"name": name} for name in ((LABEL,) if issue.labeled else ()) + issue.base_labels
+                {"name": name}
+                for name in ((issue.label,) if issue.labeled else ()) + issue.base_labels
             ],
             "user": _user(),
         }
@@ -348,10 +369,11 @@ class PollGitHub:
                 return httpx.Response(404, json={"message": "Not Found"})
             return httpx.Response(200, json={"ref": f"refs/heads/{branch}", "object": {"sha": sha}})
         if path == f"{root}/issues":
+            wanted = request.url.params.get("labels")
             listed = [
                 self._issue_body(issue)
                 for issue in self.issues.values()
-                if issue.state == "open" and issue.labeled
+                if issue.state == "open" and issue.labeled and wanted in (None, issue.label)
             ]
             for number in sorted(self.listed_pulls):
                 listed.append(
@@ -1071,10 +1093,19 @@ def test_stale_issue_conditional_read_still_cancels_after_an_issue_changes(
 def test_stale_issue_cache_does_not_cross_a_configured_label_change(
     poll_factory: tuple[TestClient, PollGitHub], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    """A WorkItem keeps the label that admitted it (#4361 decision 10).
+
+    After the tracker label changes, removing the old label still cancels the
+    WorkItem it admitted, and the new label admits new issues.
+    """
+
     client, github = poll_factory
     number, _row = _admit_label(client, github)
     _run_once(github)
-    _reconfigure(monkeypatch, tmp_path, label=f"{LABEL}-changed")
+    changed = f"{LABEL}-changed"
+    _reconfigure(monkeypatch, tmp_path, label=changed)
+    github.unlabel_issue(number)
+    fresh = github.plant_issue(label=changed)
     github.calls.clear()
 
     _run_once(github)
@@ -1082,11 +1113,26 @@ def test_stale_issue_cache_does_not_cross_a_configured_label_change(
     reads = [
         request for request in github.calls if request.url.path == f"/repos/{REPO}/issues/{number}"
     ]
+    # The cache is keyed on the stored label, so the configured change does not
+    # reset it; the conditional read still sees the removal.
     assert reads
-    assert all("if-none-match" not in request.headers for request in reads)
-    # The changed label has no authoritative unlabeled event, so a fresh read
-    # alone must not infer cancellation.
-    assert _requests(number)[0]["cancelled_at"] is None
+    assert any("if-none-match" in request.headers for request in reads)
+    cancelled = _requests(number)
+    assert cancelled[0]["cancelled_at"] is not None
+    assert _stored_labels(number) == [LABEL]
+    admitted = _requests(fresh)
+    assert len(admitted) == 1
+    assert admitted[0]["cancelled_at"] is None
+    assert _stored_labels(fresh) == [changed]
+
+
+def _stored_labels(number: int) -> list[str | None]:
+    rows = _rows(
+        "SELECT trigger_label FROM curie.work_items "
+        "WHERE tracker_scope_id = :repo AND tracker_issue_id = :number",
+        {"repo": str(REPO_ID), "number": str(number)},
+    )
+    return [row["trigger_label"] for row in rows]
 
 
 def test_poll_admits_a_mention_once(poll_factory: tuple[TestClient, PollGitHub]) -> None:

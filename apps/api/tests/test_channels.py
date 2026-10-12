@@ -1668,7 +1668,13 @@ def test_a_route_less_binding_is_legal_at_rest_and_unmintable(
         # identity, only an unset egress credential.
         read_adapter = "default" if kind == "slack" else None
         assert created.json()["channels"] == [
-            {"kind": kind, "address": address, "adapter": read_adapter, "allowed_callers": None}
+            {
+                "kind": kind,
+                "address": address,
+                "adapter": read_adapter,
+                "allowed_callers": None,
+                "trigger_label": None,
+            }
         ]
 
         row = _binding_row(created.json()["id"])
@@ -1808,6 +1814,7 @@ def test_the_builtin_cluster_message_adapter_is_reserved_on_every_binding_write(
             "address": "ordinary@example.test",
             "adapter": EMAIL_ADAPTER,
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
     row = _binding_row(agent_id)
@@ -1844,6 +1851,7 @@ def test_a_valid_route_stores_the_endpoint_and_reads_back_only_the_identity(
             "address": "routed@example.test",
             "adapter": EMAIL_ADAPTER,
             "allowed_callers": None,
+            "trigger_label": None,
         }
     ]
 
