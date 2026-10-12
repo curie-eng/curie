@@ -1422,6 +1422,13 @@ mod tests {
             release_has_real_model: false,
             interactive: true,
             release_at_target: false,
+            agent: DEFAULT_AGENT.into(),
+            label: None,
+            plugin_dir: None,
+            model_explicit: false,
+            recorded: None,
+            bindings: Vec::new(),
+            runner_image: None,
         }
     }
 
@@ -2133,5 +2140,417 @@ mod tests {
             .unwrap_or_else(|| panic!("the intake subprocess must pass --forge-egress: {args:?}"));
         assert_eq!(args[flag + 1], AGENT_NAME, "{args:?}");
         assert!(!args.iter().any(|a| a == "--github-api-egress"), "{args:?}");
+    }
+
+    // ---- #4362: a second agent through the quickstart ----
+
+    fn recorded() -> RecordedIntake {
+        RecordedIntake {
+            app_id: "12345".into(),
+            install_label: "curie-factory".into(),
+            repo_allowlist: vec!["acme/widgets".into()],
+            pem_secret: "factory-app".into(),
+            pem_secret_key: "private-key.pem".into(),
+        }
+    }
+
+    fn binding(agent: &str, repo: &str, label: Option<&str>) -> AgentBinding {
+        AgentBinding {
+            agent: agent.into(),
+            repo: repo.into(),
+            trigger_label: label.map(str::to_string),
+        }
+    }
+
+    /// A release that records factory intake, no App flags: the add agent path.
+    fn add_input() -> PlanInput {
+        let mut input = base();
+        input.explicit_context = Some("k8".into());
+        input.namespace = "factory-ns".into();
+        input.release = "factory".into();
+        input.credential_in_env = true;
+        input.agent = "dark-factory-fast".into();
+        input.label = Some("curie-factory-fast".into());
+        input.recorded = Some(recorded());
+        input
+    }
+
+    fn plan_text(input: &PlanInput) -> String {
+        describe(&quickstart_plan(input).unwrap()).join("\n")
+    }
+
+    fn refusal(input: &PlanInput) -> String {
+        format!("{:#}", quickstart_plan(input).unwrap_err())
+    }
+
+    #[test]
+    fn agent_add_path_plans_no_kind_coredns_cluster_up_registration_or_intake() {
+        let mut input = add_input();
+        input.plugin_dir = Some("/ops/fast-bundle".into());
+        let planned = quickstart_plan(&input).unwrap();
+        assert!(planned.kind_cluster.is_none());
+        assert!(!planned.actions.iter().any(|action| matches!(
+            action,
+            Action::External { .. }
+                | Action::Cluster { .. }
+                | Action::Register { .. }
+                | Action::Intake(_)
+        )));
+        let text = describe(&planned).join("\n");
+        assert!(
+            text.contains("add agent dark-factory-fast to the factory install on release factory: skip cluster up, App registration, and intake"),
+            "{text}"
+        );
+        for banned in ["kind create", "coredns", "cluster up", "registration link", "factory.intake="] {
+            assert!(!text.contains(banned), "{banned}: {text}");
+        }
+        let order: Vec<usize> = [
+            "cluster deploy",
+            "cluster surfaces dark-factory-fast",
+            "cluster overrides dark-factory-fast",
+            "cluster publication-policy dark-factory-fast",
+            "cluster budget dark-factory-fast",
+        ]
+        .iter()
+        .map(|needle| text.find(needle).unwrap_or_else(|| panic!("{needle}: {text}")))
+        .collect();
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{text}");
+        assert!(text.contains("--agent dark-factory-fast"), "{text}");
+        assert!(text.contains("--plugin-dir /ops/fast-bundle"), "{text}");
+        assert!(
+            text.contains("--add github=acme/widgets --label curie-factory-fast"),
+            "{text}"
+        );
+        // Liveness: the same input without recorded intake is the register path.
+        let mut register = add_input();
+        register.recorded = None;
+        let planned = quickstart_plan(&register).unwrap();
+        assert!(planned
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Register { .. })));
+        // The add path also applies to the default agent name.
+        let mut default = add_input();
+        default.agent = DEFAULT_AGENT.into();
+        default.label = None;
+        let text = plan_text(&default);
+        assert!(text.contains("add agent dark-factory to the factory install"), "{text}");
+    }
+
+    #[test]
+    fn agent_same_effective_label_on_another_agent_is_refused_naming_it() {
+        let mut input = add_input();
+        input.bindings = vec![binding("dark-factory-fast", "acme/widgets", Some("curie-factory-fast"))];
+        input.agent = "dark-factory-dup".into();
+        let error = refusal(&input);
+        assert!(error.contains("dark-factory-fast"), "{error}");
+        assert!(error.contains("--label"), "{error}");
+        // Liveness: a different label on the same repository plans.
+        input.label = Some("curie-factory-dup".into());
+        quickstart_plan(&input).unwrap();
+        // Liveness: the same label on another repository plans.
+        input.label = Some("curie-factory-fast".into());
+        input.bindings = vec![binding("dark-factory-fast", "acme/other", Some("curie-factory-fast"))];
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_explicit_label_equal_to_install_label_beside_null_binding_is_refused() {
+        let mut input = add_input();
+        input.bindings = vec![binding("dark-factory", "acme/widgets", None)];
+        input.label = Some("curie-factory".into());
+        let error = refusal(&input);
+        assert!(error.contains("dark-factory"), "{error}");
+        // The omitted label is the install label too.
+        input.label = None;
+        let error = refusal(&input);
+        assert!(error.contains("dark-factory"), "{error}");
+        // Liveness: a distinct label beside the null binding plans.
+        input.label = Some("curie-factory-fast".into());
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_own_binding_same_label_plans() {
+        let mut input = add_input();
+        input.bindings = vec![binding("dark-factory-fast", "acme/widgets", Some("curie-factory-fast"))];
+        let text = plan_text(&input);
+        assert!(text.contains("--add github=acme/widgets --label curie-factory-fast"), "{text}");
+        // An own null binding equals an explicit install label.
+        input.bindings = vec![binding("dark-factory-fast", "acme/widgets", None)];
+        input.label = Some("curie-factory".into());
+        quickstart_plan(&input).unwrap();
+        input.label = None;
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_own_binding_other_label_is_refused_naming_surfaces_remove() {
+        let mut input = add_input();
+        input.bindings = vec![binding("dark-factory-fast", "acme/widgets", Some("old-label"))];
+        let error = refusal(&input);
+        assert!(
+            error.contains("curie cluster surfaces dark-factory-fast --remove github=acme/widgets"),
+            "{error}"
+        );
+        // Null binding against a distinct requested label is the same refusal.
+        input.bindings = vec![binding("dark-factory-fast", "acme/widgets", None)];
+        let error = refusal(&input);
+        assert!(error.contains("--remove github=acme/widgets"), "{error}");
+        // Liveness: after the remove (no binding) it plans.
+        input.bindings = Vec::new();
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_repo_outside_recorded_allowlist_is_refused() {
+        let mut input = add_input();
+        input.repos = vec!["acme/widgets".into(), "acme/gadgets".into()];
+        let error = refusal(&input);
+        assert!(
+            error.contains("curie cluster factory --repo acme/widgets,acme/gadgets"),
+            "{error}"
+        );
+        // Liveness: an owner wildcard admits it.
+        input.recorded.as_mut().unwrap().repo_allowlist = vec!["acme/*".into()];
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_install_path_dropping_a_recorded_allowlist_entry_is_refused() {
+        let mut input = add_input();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.recorded.as_mut().unwrap().repo_allowlist =
+            vec!["acme/widgets".into(), "acme/gadgets".into()];
+        let error = refusal(&input);
+        assert!(error.contains("acme/gadgets"), "{error}");
+        // Liveness: listing every recorded entry plans an intake.
+        input.repos = vec!["acme/widgets".into(), "acme/gadgets".into()];
+        let planned = quickstart_plan(&input).unwrap();
+        assert!(planned
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::Intake(_))));
+    }
+
+    #[test]
+    fn agent_invalid_name_self_and_labels_are_refused() {
+        let long = "a".repeat(41);
+        for name in ["Bad_Name", "self", "", long.as_str(), "-lead"] {
+            let mut input = add_input();
+            input.agent = name.into();
+            let error = refusal(&input);
+            assert!(error.contains("agent"), "{name:?}: {error}");
+        }
+        let too_long = "l".repeat(51);
+        for label in ["has space", "", too_long.as_str(), "curie-factory:x", "base:main", "repo:acme"] {
+            let mut input = add_input();
+            input.label = Some(label.into());
+            let error = refusal(&input);
+            assert!(error.contains("--label"), "{label:?}: {error}");
+        }
+        // The name check runs on the register path as well.
+        let mut input = base();
+        input.agent = "self".into();
+        assert!(quickstart_plan(&input).is_err());
+        // Liveness: a valid 40 character name and a 50 character label plan.
+        let mut input = add_input();
+        input.agent = "a".repeat(40);
+        input.label = Some("l".repeat(50));
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_model_and_org_are_refused_on_add_path() {
+        let mut input = add_input();
+        input.model_explicit = true;
+        let error = refusal(&input);
+        assert!(error.contains("curie cluster up --model"), "{error}");
+        let mut input = add_input();
+        input.org = Some("acme".into());
+        let error = refusal(&input);
+        assert!(error.contains("curie cluster github-app"), "{error}");
+        // Liveness: the register path still accepts both.
+        let mut input = base();
+        input.model_explicit = true;
+        input.org = Some("acme".into());
+        quickstart_plan(&input).unwrap();
+    }
+
+    #[test]
+    fn agent_locked_runner_yields_runner_image_flag() {
+        let mut input = base();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.explicit_context = Some("kind-curie-factory".into());
+        input.agent = "dark-factory-fast".into();
+        input.plugin_dir = Some("/ops/fast-bundle".into());
+        input.runner_image = Some("registry.example/fast-runner@sha256:abc".into());
+        let planned = quickstart_plan(&input).unwrap();
+        let intake = planned
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Intake(opts) => Some(opts),
+                _ => None,
+            })
+            .expect("the install path has an intake");
+        assert_eq!(intake.forge_egress, vec!["dark-factory-fast".to_string()]);
+        assert_eq!(
+            intake.runner_binding,
+            Some(crate::factory_intake::RunnerImageBinding {
+                agent: "dark-factory-fast".into(),
+                image: "registry.example/fast-runner@sha256:abc".into(),
+            })
+        );
+        let args = intake_args(
+            "kind-curie-factory",
+            intake,
+            "registry.example/fast-runner@sha256:abc",
+        );
+        let flag = args.iter().position(|a| a == "--runner-image").unwrap();
+        assert_eq!(
+            args[flag + 1],
+            "dark-factory-fast=registry.example/fast-runner@sha256:abc"
+        );
+        let text = describe(&planned).join("\n");
+        assert!(text.contains("registry.example/fast-runner@sha256:abc"), "{text}");
+        // Liveness: a bundle with no runner passes no --runner-image and says
+        // the platform runner serves the agent.
+        input.runner_image = None;
+        let planned = quickstart_plan(&input).unwrap();
+        let intake = planned
+            .actions
+            .iter()
+            .find_map(|action| match action {
+                Action::Intake(opts) => Some(opts),
+                _ => None,
+            })
+            .unwrap();
+        assert!(intake.runner_binding.is_none());
+        let text = describe(&planned).join("\n");
+        assert!(text.contains("platform runner"), "{text}");
+        assert!(!text.contains("curie-dark-factory-runner"), "{text}");
+    }
+
+    #[test]
+    fn agent_bundle_without_runner_yields_platform_runner_line() {
+        let mut input = add_input();
+        input.plugin_dir = Some("/ops/fast-bundle".into());
+        let text = plan_text(&input);
+        assert!(text.contains("platform runner"), "{text}");
+        assert!(!text.contains("--runner-image"), "{text}");
+        // Liveness: a locked image names itself instead of the platform runner.
+        input.runner_image = Some("registry.example/fast-runner@sha256:abc".into());
+        let text = plan_text(&input);
+        assert!(text.contains("registry.example/fast-runner@sha256:abc"), "{text}");
+        assert!(!text.contains("platform runner"), "{text}");
+    }
+
+    #[test]
+    fn agent_bundle_dir_differs_per_agent_and_is_unchanged_for_default() {
+        let default = bundle_dir("ns", "rel", DEFAULT_AGENT);
+        let fast = bundle_dir("ns", "rel", "dark-factory-fast");
+        assert_ne!(default, fast);
+        assert_eq!(
+            default,
+            std::env::temp_dir()
+                .join("curie-factory-quickstart-ns-rel")
+                .join("dark-factory")
+        );
+        assert_eq!(fast.parent(), default.parent());
+        assert_eq!(fast.file_name().unwrap(), "dark-factory-fast");
+    }
+
+    #[test]
+    fn agent_register_rerun_line_carries_non_default_flags() {
+        let mut input = base();
+        input.explicit_context = Some("remote-cluster".into());
+        input.agent = "dark-factory-fast".into();
+        input.label = Some("curie-factory-fast".into());
+        input.plugin_dir = Some("/ops/fast-bundle".into());
+        let text = plan_text(&input);
+        let rerun = text.lines().find(|l| l.starts_with("Rerun:")).unwrap();
+        for flag in [
+            "--agent dark-factory-fast",
+            "--label curie-factory-fast",
+            "--plugin-dir /ops/fast-bundle",
+        ] {
+            assert!(rerun.contains(flag), "{flag}: {rerun}");
+        }
+        // Liveness: defaults add none of the three flags.
+        let mut input = base();
+        input.explicit_context = Some("remote-cluster".into());
+        let text = plan_text(&input);
+        let rerun = text.lines().find(|l| l.starts_with("Rerun:")).unwrap();
+        for flag in ["--agent", "--label", "--plugin-dir"] {
+            assert!(!rerun.contains(flag), "{flag}: {rerun}");
+        }
+    }
+
+    #[test]
+    fn agent_add_path_binds_forge_egress_before_deploy() {
+        let text = plan_text(&add_input());
+        let egress = text
+            .lines()
+            .position(|l| l.contains("factory.sandboxEgress.dark-factory-fast"))
+            .unwrap_or_else(|| panic!("no forge egress line: {text}"));
+        let deploy = text
+            .lines()
+            .position(|l| l.contains("cluster deploy"))
+            .unwrap();
+        assert!(egress < deploy, "{text}");
+        // The install path enrolls through the intake instead and plans no
+        // separate bind.
+        let mut input = base();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.explicit_context = Some("kind-curie-factory".into());
+        let text = plan_text(&input);
+        assert!(!text.contains("factory.sandboxEgress.dark-factory "), "{text}");
+    }
+
+    #[test]
+    fn agent_recorded_intake_reads_the_factory_block() {
+        let values = serde_json::json!({
+            "factory": {
+                "enabled": true,
+                "intake": "poll",
+                "trackers": [{"kind": "github", "label": "curie-factory"}],
+                "codeHosts": [{"kind": "github", "credential": {
+                    "appId": "12345",
+                    "existingSecret": "factory-app",
+                    "existingSecretKey": "private-key.pem"
+                }}]
+            },
+            "api": {"githubRepoAllowlist": ["acme/widgets"]}
+        });
+        assert_eq!(recorded_intake(&values), Some(recorded()));
+        // Liveness: each missing piece is "not recorded".
+        for pointer in [
+            "/factory/enabled",
+            "/factory/intake",
+            "/factory/trackers/0/label",
+            "/factory/codeHosts/0/credential/appId",
+            "/factory/codeHosts/0/credential/existingSecret",
+        ] {
+            let mut broken = values.clone();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            let slot = broken.pointer_mut(parent).unwrap();
+            if let Some(list) = slot.as_array_mut() {
+                list.clear();
+            } else {
+                slot.as_object_mut().unwrap().remove(key);
+            }
+            assert_eq!(recorded_intake(&broken), None, "{pointer}");
+        }
+        // The legacy api.github* keys are not the record.
+        let legacy = serde_json::json!({"api": {
+            "githubFactoryIngressEnabled": true, "githubFactoryIntake": "poll",
+            "githubAppId": "12345", "githubFactoryLabel": "curie-factory",
+            "githubAppExistingSecret": "factory-app"
+        }});
+        assert_eq!(recorded_intake(&legacy), None);
     }
 }
