@@ -171,6 +171,22 @@ def test_a_github_tracker_bound_to_another_github_host_is_refused() -> None:
     assert _load(document).code_hosts[0].api_url == "https://ghe.example/api/v3"
 
 
+def test_an_unbound_github_tracker_and_code_host_on_different_hosts_are_refused() -> None:
+    # Intake reads the tracker with the code host's installation token, so the
+    # pairing holds with no binding naming it.
+    document = samples.github_document()
+    document["bindings"] = []
+    document["code_hosts"] = [samples.github_code_host(host="ghe.example")]
+    _refused(
+        document,
+        "tracker 'github-issues' on github.com and code host 'github' on ghe.example: a github"
+        " tracker pairs only with a github code host on github.com",
+    )
+    document["trackers"] = [samples.github_tracker(host="ghe.example")]
+    config = _load(document)
+    assert (config.trackers[0].host, config.code_hosts[0].host) == ("ghe.example",) * 2
+
+
 def test_a_gitlab_tracker_pairs_with_its_own_gitlab() -> None:
     document = {
         "code_hosts": [samples.gitlab_code_host()],

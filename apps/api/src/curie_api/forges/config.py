@@ -492,6 +492,7 @@ class ForgesConfig(_Model):
                 )
             scopes[scope] = binding.name
             _check_binding(binding, tracker, code_hosts)
+        _check_github_pairing(self.trackers, self.code_hosts)
         _check_one_github_app(self.trackers, self.code_hosts)
         return self
 
@@ -500,6 +501,28 @@ class ForgesConfig(_Model):
 
     def code_host(self, name: str) -> CodeHostConfig:
         return next(host for host in self.code_hosts if host.name == name)
+
+
+def _check_github_pairing(
+    trackers: tuple[TrackerConfig, ...], code_hosts: tuple[CodeHostConfig, ...]
+) -> None:
+    """A GitHub tracker pairs only with a GitHub code host on its own host.
+
+    Intake reads a GitHub tracker's issues with the GitHub code host's
+    installation token, whether or not a binding names the pair, so a code host
+    on another host would send that token to the tracker's API.
+    """
+
+    for tracker in trackers:
+        if tracker.kind != types.GITHUB:
+            continue
+        for host in code_hosts:
+            if host.kind == types.GITHUB and host.host != tracker.host:
+                raise ValueError(
+                    f"tracker {tracker.name!r} on {tracker.host} and code host {host.name!r}"
+                    f" on {host.host}: a github tracker pairs only with a github code host"
+                    f" on {tracker.host}"
+                )
 
 
 def _check_one_github_app(

@@ -30,15 +30,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from forge_fakes.github import REPO, REPO_ID  # noqa: E402
 from test_factory_label_routing import (  # noqa: E402
+    _REVIEW_IDS,
     FAST,
     INSTALL,
+    MENTION,
     LabelFactory,
     _cancelled,
     _owner,
+    _requests,
+    _work,
     label_factory,
 )
 from test_github_factory_ingress import _rows  # noqa: E402
-from test_github_factory_review import _execute  # noqa: E402
+from test_github_factory_review import _complete, _execute, _own_pull_request  # noqa: E402
 
 
 @pytest.fixture
@@ -114,17 +118,29 @@ def _count_token_mints(factory: LabelFactory) -> list[str]:
 def test_label_routing_poll_one_pass_reads_the_repository_once_and_lists_each_label(
     factory: LabelFactory,
 ) -> None:
-    """R1 finding 7: with an actionable issue under each label and a run to
-    cancel, the pass still reads the repository once and mints one token; each
-    notice re-reads only its issue."""
+    """R1 finding 7: with an actionable issue under each label, a run to
+    cancel and actionable review feedback on each agent's pull request, the
+    pass still reads the repository once and mints one token; each notice
+    re-reads only its issue, and each review its pull request and its author's
+    permission."""
 
     full, fast = factory.two_agents()
     cancelled = factory.github.open_issue(INSTALL)
+    reviewed = {factory.github.open_issue(INSTALL): full, factory.github.open_issue(FAST): fast}
     factory.poll()
     assert _owner(cancelled) == full
+    assert {number: _owner(number) for number in reviewed} == reviewed
     factory.github.unlabel(cancelled, INSTALL)
     first = factory.github.open_issue(INSTALL)
     second = factory.github.open_issue(FAST)
+    pulls = []
+    for number in reviewed:
+        (request, *_rest) = _work(number)
+        pull = factory.github.plant_pull()
+        _own_pull_request(request["work_item_id"], pull)
+        _complete(request["id"])
+        factory.github.add_review(pull, next(_REVIEW_IDS), f"@{MENTION} rename it")
+        pulls.append(pull)
     _seed_pre_label_cursor()
     factory.github.calls.clear()
     mints = _count_token_mints(factory)
@@ -135,7 +151,15 @@ def test_label_routing_poll_one_pass_reads_the_repository_once_and_lists_each_la
     assert _owner(first) == full
     assert _owner(second) == fast
     assert _cancelled(cancelled)
+    # Each review admitted a revision to its own agent's WorkItem.
+    assert {number: _requests(number) for number in reviewed} == dict.fromkeys(reviewed, 2)
     assert len(_get(github, f"/repos/{REPO}")) == 1, [r.url.path for r in github.calls]
+    # The pass's repository read stands in for each review's; its pull
+    # request and its author's write permission are still read per review.
+    for pull in pulls:
+        assert _get(github, f"/repos/{REPO}/pulls/{pull}"), pull
+    permission_reads = [r for r in github.calls if r.url.path.endswith("/permission")]
+    assert len(permission_reads) >= len(pulls), [r.url.path for r in github.calls]
     # One tracker token for the pass; no notice mints its own. Each fresh
     # admission's base branch read goes through the code host connection and
     # its own credential (`token_for`), which is not the pass's tracker token.

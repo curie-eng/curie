@@ -1169,11 +1169,8 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
         label: input.label.clone(),
         runner_image: bundle.as_ref().and(input.runner_image.clone()),
         bundle,
-        bound: if add_agent {
-            already_bound(input)
-        } else {
-            Vec::new()
-        },
+        // Empty when no release serves yet, so a fresh install still binds.
+        bound: already_bound(input),
     };
     match path {
         QuickstartPath::Install => {
@@ -2925,6 +2922,26 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(&skip), "{text}");
+    }
+
+    #[test]
+    fn install_path_rerun_skips_the_binding_the_agent_already_holds() {
+        let mut input = add_input();
+        input.app_id = Some("12345".into());
+        input.private_key_file = Some("/keys/app.pem".into());
+        input.bindings = vec![binding("dark-factory-fast", "acme/widgets", None)];
+        input.label = Some("curie-factory".into());
+        let planned = quickstart_plan(&input).unwrap();
+        assert_eq!(planned.path, QuickstartPath::Install);
+        let skip = skip_bound_line("dark-factory-fast", "acme/widgets");
+        let text = describe(&planned).join("\n");
+        assert!(!text.contains("--add github=acme/widgets"), "{text}");
+        assert!(text.contains(&skip), "{text}");
+        // Liveness: a fresh install with no bindings still binds.
+        input.bindings = Vec::new();
+        let text = describe(&quickstart_plan(&input).unwrap()).join("\n");
+        assert!(text.contains("--add github=acme/widgets"), "{text}");
+        assert!(!text.contains(&skip), "{text}");
     }
 
     #[test]

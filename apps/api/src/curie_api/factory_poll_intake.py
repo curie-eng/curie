@@ -79,6 +79,7 @@ from .forges.types import TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import FactoryNotice, mentions_login
 from .github_review_events import FeedbackIgnored, FeedbackUnavailable
+from .github_review_truth import VerifiedRepository
 from .models import ExecutionRequest, FactoryPollCursor, WorkItem
 from .repo_full_name import InvalidRepoFullName, normalize_repo_full_name, repo_url_path
 from .workspace_policy import repository_is_allowed
@@ -205,6 +206,9 @@ async def _poll_repository(
         raise Unavailable(repo_path)
     if not isinstance(repository.get("full_name"), str):
         raise Unavailable(repo_path)
+    # Review feedback reuses this pass's installation check and repository
+    # read; each piece still reads its pull request and author permission.
+    verified = VerifiedRepository(api, token, installation_id, repository)
     tracker = intake.for_repository(
         client,
         repo_full_name=repo,
@@ -260,6 +264,7 @@ async def _poll_repository(
         repo_path=repo_path,
         installation_id=installation_id,
         repository=repository,
+        verified=verified,
     )
     owned = await open_pulls(
         sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
@@ -277,6 +282,7 @@ async def _poll_repository(
         repository_id=repository_id,
         installation_id=installation_id,
         owned=owned,
+        verified=verified,
     )
     await admit_reviews(
         sessionmaker,
@@ -290,6 +296,7 @@ async def _poll_repository(
         repository_id=repository_id,
         installation_id=installation_id,
         owned=owned,
+        verified=verified,
     )
     await _save_cursor(sessionmaker, scope, cursor)
 
@@ -462,6 +469,7 @@ async def _admit_mentions(
     repo_path: str,
     installation_id: int,
     repository: dict[str, Any],
+    verified: VerifiedRepository,
 ) -> None:
     repo, repository_id = tracker.repo_full_name, tracker.repository_id
     listed, etag = await tracker.issue_comments_since(
@@ -512,6 +520,7 @@ async def _admit_mentions(
                     },
                     "comment": comment,
                 },
+                verified=verified,
             )
             continue
         if number not in factory_issues or not mentions_login(body, tracker.mention):

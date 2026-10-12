@@ -66,6 +66,60 @@ async def verify_sender_write_permission(
         raise FeedbackIgnored("sender_permission_refused")
 
 
+@dataclass(frozen=True)
+class VerifiedRepository:
+    """A repository read with a token for its freshly rediscovered installation.
+
+    The poll pass builds one per repository and reuses it for every piece of
+    feedback it admits there; webhook ingress builds one per delivery.
+    """
+
+    api: str
+    token: str
+    installation_id: int
+    repository: dict[str, Any]
+
+
+def _check_feedback_lineage(feedback: UnverifiedFeedback, lineage: BoundReviewLineage) -> None:
+    if (
+        feedback.repo_full_name.casefold() != lineage.repo_full_name.casefold()
+        or feedback.pr_number != lineage.pr_number
+        or feedback.repository_id != lineage.repository_id
+        or feedback.installation_id != lineage.installation_id
+    ):
+        raise FeedbackIgnored("lineage_mismatch")
+
+
+async def verify_repository(
+    lineage: BoundReviewLineage,
+    *,
+    client: httpx.AsyncClient,
+    credentials: GitHubCredentials,
+    api_url: str,
+) -> VerifiedRepository:
+    """Rediscover the lineage's installation and read its repository."""
+
+    try:
+        token = await run_in_threadpool(
+            credentials.token_for_verified_installation,
+            lineage.repo_full_name,
+            lineage.installation_id,
+        )
+    except (GitHubInstallationRefused, ValueError):
+        raise FeedbackIgnored("installation_unverified") from None
+    except GitHubAppError:
+        raise FeedbackUnavailable("installation_unavailable") from None
+    api = api_url.rstrip("/")
+    repository = await get_github_json(
+        client,
+        api=api,
+        token=token,
+        path=f"/repos/{repo_url_path(lineage.repo_full_name)}",
+        refusal="repository_unavailable",
+    )
+    return VerifiedRepository(api, token, lineage.installation_id, repository)
+
+
 async def verify_feedback_truth(
     feedback: UnverifiedFeedback,
     lineage: BoundReviewLineage,
@@ -85,34 +139,33 @@ async def verify_feedback_truth(
     REST response URL is fetched, and redirects cannot carry the App token to
     another endpoint. All credential-bearing requests stay inside the API.
     """
-    if (
-        feedback.repo_full_name.casefold() != lineage.repo_full_name.casefold()
-        or feedback.pr_number != lineage.pr_number
-        or feedback.repository_id != lineage.repository_id
-        or feedback.installation_id != lineage.installation_id
-    ):
-        raise FeedbackIgnored("lineage_mismatch")
-    try:
-        token = await run_in_threadpool(
-            credentials.token_for_verified_installation,
-            lineage.repo_full_name,
-            lineage.installation_id,
-        )
-    except (GitHubInstallationRefused, ValueError):
-        raise FeedbackIgnored("installation_unverified") from None
-    except GitHubAppError:
-        raise FeedbackUnavailable("installation_unavailable") from None
-
-    api = api_url.rstrip("/")
-    repo_path = f"/repos/{repo_url_path(lineage.repo_full_name)}"
-
-    repository = await get_github_json(
-        client,
-        api=api,
-        token=token,
-        path=repo_path,
-        refusal="repository_unavailable",
+    _check_feedback_lineage(feedback, lineage)
+    verified = await verify_repository(
+        lineage, client=client, credentials=credentials, api_url=api_url
     )
+    return await verify_feedback_in_repository(
+        feedback, lineage, verified, settings=settings, client=client
+    )
+
+
+async def verify_feedback_in_repository(
+    feedback: UnverifiedFeedback,
+    lineage: BoundReviewLineage,
+    verified: VerifiedRepository,
+    *,
+    settings: Settings,
+    client: httpx.AsyncClient,
+) -> str:
+    """`verify_feedback_truth` against an already verified repository read.
+
+    The pull request, the feedback object and the sender's write permission
+    (ADR 0197 authority 3) are still read fresh for this one piece of feedback.
+    """
+    _check_feedback_lineage(feedback, lineage)
+    if verified.installation_id != lineage.installation_id:
+        raise FeedbackIgnored("installation_unverified")
+    api, token, repository = verified.api, verified.token, verified.repository
+    repo_path = f"/repos/{repo_url_path(lineage.repo_full_name)}"
     if not repository_identity_matches(
         repository,
         repository_id=lineage.repository_id,

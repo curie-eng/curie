@@ -248,6 +248,32 @@ def test_trigger_label_migration_downgrade_drops_both_columns_and_restores_the_k
     assert "trigger_label" in column_names("agent_channels")
 
 
+def test_trigger_label_migration_downgrade_keeps_a_lone_labelled_surface_as_the_route(
+    upgraded: tuple[str, str],
+) -> None:
+    """A lone explicitly labelled surface survives downgrade with its label
+    discarded, so it alone holds the route: the predecessor sends that
+    location's install-label issues to its agent."""
+
+    _revision, down = upgraded
+    fast_agent = _agent()
+    binding_id = _bind(fast_agent, "github", REPO, trigger_label=FAST)
+
+    command.downgrade(alembic_config(), down)
+
+    assert sql_dicts(
+        "SELECT id, agent_id FROM curie.agent_channels WHERE kind = 'github' AND address = :a",
+        {"a": REPO},
+    ) == [{"id": binding_id, "agent_id": fast_agent}]
+    # The route is now held unlabelled: another agent cannot bind it.
+    with pytest.raises(IntegrityError, match=ROUTE_KEY):
+        sql_dicts(
+            "INSERT INTO curie.agent_channels (id, agent_id, kind, address) "
+            "VALUES (:id, :agent, 'github', :address)",
+            {"id": uuid.uuid4(), "agent": _agent(), "address": REPO},
+        )
+
+
 def test_trigger_label_migration_work_item_label_persists_and_rolls_back(
     upgraded: tuple[str, str],
 ) -> None:

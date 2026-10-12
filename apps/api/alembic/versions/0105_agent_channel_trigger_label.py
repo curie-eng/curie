@@ -20,6 +20,13 @@ Downgrade refuses, naming each location, while any ``(kind, address,
 adapter)`` holds two rows, since the narrower key cannot hold them. Otherwise
 it restores the old key and drops the CHECK and both columns.
 
+Two consequences of rolling back. A downgrade keeps a lone explicitly
+labelled surface and discards its label, after which the predecessor routes
+issues carrying the configured tracker label at that location to that
+surface's agent. And an application rolled back without this downgrade runs
+against the widened key, so where labelled surfaces share a location the old
+application may see two rows on one route.
+
 Revision ID: 0105
 Revises: 0103
 Create Date: 2026-10-11

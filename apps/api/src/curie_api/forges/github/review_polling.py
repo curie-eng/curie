@@ -20,6 +20,7 @@ from curie_api.github_review_events import (
     human_sender,
     parse_feedback,
 )
+from curie_api.github_review_truth import VerifiedRepository
 from curie_api.models import ThreadPublicationLineage, WorkItem
 
 _LOOKBACK = timedelta(hours=1)
@@ -117,6 +118,7 @@ async def admit_one_feedback(
     *,
     event: str,
     payload: dict[str, Any],
+    verified: VerifiedRepository,
 ) -> None:
     try:
         feedback = parse_feedback(
@@ -133,7 +135,9 @@ async def admit_one_feedback(
 
     async with sessionmaker() as session:
         try:
-            await admit_parsed_feedback(session, feedback, settings=settings, client=client)
+            await admit_parsed_feedback(
+                session, feedback, settings=settings, client=client, verified=verified
+            )
         except FeedbackUnavailable:
             await session.rollback()
             raise
@@ -157,6 +161,7 @@ async def admit_review_comments(
     repository_id: int,
     installation_id: int,
     owned: list[int],
+    verified: VerifiedRepository,
 ) -> None:
     listed, etag = await list_pages(
         client,
@@ -200,6 +205,7 @@ async def admit_review_comments(
                 "pull_request": pulls[number],
                 "comment": comment,
             },
+            verified=verified,
         )
     cursor.review_comments_since = advance(
         cursor.review_comments_since, listed, "created_at", "updated_at"
@@ -221,6 +227,7 @@ async def admit_reviews(
     repository_id: int,
     installation_id: int,
     owned: list[int],
+    verified: VerifiedRepository,
 ) -> None:
     keys = {f"reviews:{number}" for number in owned}
     for key in list(cursor.etags):
@@ -257,6 +264,7 @@ async def admit_reviews(
                     "pull_request": pull,
                     "review": review,
                 },
+                verified=verified,
             )
         if etag:
             cursor.etags[key] = etag

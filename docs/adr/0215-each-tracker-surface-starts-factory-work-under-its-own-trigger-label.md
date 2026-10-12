@@ -241,6 +241,15 @@ one effective label.**
    work routes by the WorkItem's agent.
 7. Moving an issue's WorkItem between agents is not possible. A new issue is
    needed to run the same work under another label.
+8. A downgrade below 0105 keeps a lone explicitly labelled surface and
+   discards its label. The predecessor then routes issues carrying the
+   install's configured tracker label at that location to that surface's
+   agent, which previously admitted only its own label.
+9. Rolling the application back without downgrading the schema leaves the
+   widened key in place, so where labelled surfaces share a location the old
+   application can find two rows on one route, which it was never written to
+   expect. Remove all but one surface on each such location before rolling
+   back.
 
 ## Alternatives considered
 
