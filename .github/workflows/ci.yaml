@@ -395,8 +395,8 @@ jobs:
       # unbumped wire change vs an existing base lock exits 1.
       - name: ACI wire-lock base gate
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref || 'main' }}" || true
-          git show "origin/${{ github.base_ref || 'main' }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref || github.ref_name }}" || true
+          git show "origin/${{ github.base_ref || github.ref_name }}:packages/aci-protocol/schema/wire.lock" > /tmp/base-wire.lock 2>/dev/null || true
           uv run python -m aci_protocol.wire_lock --check-base /tmp/base-wire.lock
       - name: Download shard results
         if: steps.python-runtime.outputs.pytest == 'true'
