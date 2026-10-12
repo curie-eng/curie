@@ -14,7 +14,9 @@ One script handles every hook event the bundle registers:
     Loading ``dark-factory:implement-issue`` marks the workflow as loaded.
 
 ``PreToolUse`` on ``Edit``/``Write``/``MultiEdit``/``NotebookEdit``
-    No repository edit before the workflow is loaded and the plan reviewer
+    An edit under the workspace's root ``.github`` directory stops the run in
+    every phase, matching the first path component case-insensitively. No
+    repository edit before the workflow is loaded and the plan reviewer
     approved. Right after approval (phase ``failing_test``) only test edits may
     run: an edit to a test file, or an edit that adds a test (an inline Rust
     ``#[test]`` module, a ``def test_`` function, and so on): its inserted text
@@ -50,7 +52,9 @@ One script handles every hook event the bundle registers:
     ``isolation`` and ``model`` are stripped and ``run_in_background`` is forced
     to ``false``. The call is refused out of order: no diff review before the
     plan is approved, and no plan review after it (a diff rejection returns to
-    implement, not to plan). The hook numbers the round itself and writes the
+    implement, not to plan). Before a diff review, a changed or untracked root
+    ``.github`` path stops the run; an unreadable git status lets review proceed.
+    The hook numbers the round itself and writes the
     ``plan_review`` or ``review_diff`` phase line to the pod log. It appends
     the bundle's verification contract to the prompt, the same bytes for both
     reviewers, followed by the bundle's ``verification/checks.json`` when the
@@ -343,6 +347,61 @@ def _git(top: str, deadline: float, *args: str) -> bytes:
         check=True,
     )
     return done.stdout
+
+
+def _github_path(path: str, workspace: str) -> str | None:
+    """A refused workspace-relative path, after lexical normalization."""
+    if not path or not workspace:
+        return None
+    root = os.path.abspath(workspace)
+    target = Path(os.path.abspath(os.path.join(root, path)))
+    try:
+        relative = target.relative_to(root)
+    except ValueError:
+        return None
+    if relative.parts and relative.parts[0].casefold() == ".github":
+        return relative.as_posix()
+    return None
+
+
+def _github_changed_path(workspace: str) -> str | None:
+    """The first refused status path; unreadable or late status permits review."""
+    if not workspace:
+        return None
+    deadline = time.monotonic() + GIT_BUDGET_SECONDS
+    try:
+        status = _git(
+            workspace, deadline, "status", "--porcelain=v1", "-z", "--untracked-files=all"
+        )
+        offset = 0
+        while offset < len(status):
+            if time.monotonic() >= deadline:
+                return None
+            end = status.find(b"\0", offset)
+            if end < 0:
+                return None
+            record = status[offset:end]
+            offset = end + 1
+            paths = [record[3:]]
+            # Porcelain -z puts the destination first, then a separate source
+            # record for a rename or copy. Either end can be refused.
+            if b"R" in record[:2] or b"C" in record[:2]:
+                end = status.find(b"\0", offset)
+                if end < 0:
+                    return None
+                paths.append(status[offset:end])
+                offset = end + 1
+            for raw_path in paths:
+                if time.monotonic() >= deadline:
+                    return None
+                path = _github_path(os.fsdecode(raw_path), workspace)
+                if time.monotonic() >= deadline:
+                    return None
+                if path is not None:
+                    return path
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return None
 
 
 def fingerprint(workspace: str) -> str | None:
@@ -743,6 +802,12 @@ def _stop_text(reason: str) -> str:
     )
 
 
+def _stop_for_github_path(state: dict[str, Any], path: str) -> str:
+    state["stopped"] = f"The factory cannot publish GitHub metadata changes: {path}."
+    emit_gate(state, "github_path_refused", path=path)
+    return _stop_text(state["stopped"])
+
+
 def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
     kind = reviewer_kind(tool_input)
     if kind is None:
@@ -752,6 +817,8 @@ def pre_agent(state: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, An
         )
     if state["stopped"]:
         return _deny(_stop_text(state["stopped"]))
+    if kind == DIFF and (path := _github_changed_path(state["workspace"])) is not None:
+        return _deny(_stop_for_github_path(state, path))
     plan, diff = state["plan"], state["diff"]
     if kind == DIFF and plan["verdict"] != "APPROVE":
         return _deny("The plan reviewer has not approved the plan yet; run the plan review first.")
@@ -806,6 +873,8 @@ def pre_edit(state: dict[str, Any], tool: str, tool_input: dict[str, Any]) -> di
     path = edit_path(tool_input)
     if state["stopped"]:
         reason = _stop_text(state["stopped"])
+    elif (github_path := _github_path(path, state["workspace"])) is not None:
+        reason = _stop_for_github_path(state, github_path)
     elif not state["workflow"]:
         reason = (
             "No repository edit before the workflow is loaded. Call the Skill tool "

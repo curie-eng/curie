@@ -28,7 +28,7 @@ from typing import Any
 import anyio
 import pytest
 import yaml
-from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND
+from channel_protocol.work_item_events import CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS
 from curie_api import factory_ci
 from curie_api.workitem_outcomes import CiDetail
 from curie_runner.__main__ import _format_check_data, format_workspace_preamble
@@ -132,7 +132,8 @@ class Session:
     def pre(self, tool: str, tool_input: dict[str, Any] | None = None) -> dict[str, Any]:
         out = self.fire("PreToolUse", tool_name=tool, tool_input=tool_input or {})
         assert out is not None
-        return out["hookSpecificOutput"]
+        decision: dict[str, Any] = out["hookSpecificOutput"]
+        return decision
 
     def review(self, kind: str, reply: str) -> tuple[dict[str, Any], str]:
         """One full reviewer call: the PreToolUse rewrite, then the reply."""
@@ -727,7 +728,7 @@ def test_the_bundle_ci_marker_follows_the_platform_round_bound(
         statuses=[],
         annotations={},
     )
-    for round_ in range(CI_FIRST_FIX_ROUND, factory_ci.CI_MAX_ROUNDS + 1):
+    for round_ in range(CI_FIRST_FIX_ROUND, CI_MAX_ROUNDS + 1):
         text = factory_ci.continuation_text(
             "https://github.com/acme-corp/acme-bot/issues/9",
             "https://github.com/acme-corp/acme-bot/pull/77",
@@ -2336,7 +2337,7 @@ def _refusal_setup(
         assert [preflight_route(e) for e in summary["checks"]] == ["executable"]
         assert _delegated_checks(observed) == []
         return HooksJsonRuntime(s, bundle=bundle), s, port
-    declaration = {} if case == "undeclared_route" else None
+    declaration: dict[str, Any] | None = {} if case == "undeclared_route" else None
     s, port = _service_session(tmp_path, declaration=declaration)
     summary, observed = _preflight(s, BUNDLE, monkeypatch)
     if case == "undeclared_route":
