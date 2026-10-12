@@ -10066,6 +10066,60 @@ export const commandManifest = {
           "name": "factory-e2e"
         },
         {
+          "about": "Start, self-test, or stop a local forge fixture (#4398, `bash cli/scripts/forge-fixture.sh`). Each fixture is `tools/forge-fixtures/<kind>/fixture.py` and keeps its state under `--state-dir`. A kind whose fixture is not installed fails with a \"not installed\" message and creates no state",
+          "args": [
+            {
+              "global": false,
+              "help": "Forge to run: `gitlab` or `bitbucket-dc`",
+              "id": "kind",
+              "positional": true,
+              "possible_values": [
+                "gitlab",
+                "bitbucket-dc"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "`up` starts the fixture, `self-test` checks a running one, `down` stops it and removes its state",
+              "id": "action",
+              "positional": true,
+              "possible_values": [
+                "up",
+                "self-test",
+                "down"
+              ],
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Directory that holds the fixture's state and connection details",
+              "id": "state_dir",
+              "long": "state-dir",
+              "positional": false,
+              "required": true
+            },
+            {
+              "global": false,
+              "help": "Host name or address the fixture advertises to clients, such as cluster pods that reach it over the network",
+              "id": "advertise_host",
+              "long": "advertise-host",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Port the fixture listens on; the fixture picks one when omitted",
+              "id": "port",
+              "long": "port",
+              "positional": false,
+              "required": false
+            }
+          ],
+          "hidden": false,
+          "name": "forge-fixture"
+        },
+        {
           "about": "Serve or record a scripted Anthropic Messages endpoint (#3814). `serve` replays a transcript and fails on an unexpected request. `record` proxies to a provider and writes the transcript",
           "args": [
             {

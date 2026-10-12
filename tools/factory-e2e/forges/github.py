@@ -1,6 +1,8 @@
-"""The GitHub entry of the forge-neutral factory loop (`github-loop`).
+"""The GitHub entry of the forge-neutral factory loop: GitHubDriver.
 
-Wraps the live Preflight: the ticket is an issue labelled at creation, the
+`run --scenario forge-loop --forge github`, and `github-loop`, which is
+forge-loop with this driver, observe GitHub only through it. It wraps the
+live Preflight: the ticket is an issue labelled at creation, the
 change is the pull request the WorkItem records, CI is GitHub check runs and
 commit statuses, the review is a pull request review, and the merge is the
 pull request merge API, every write made as the test actor on the dedicated
@@ -76,20 +78,20 @@ def match_review_delivery(
     return found
 
 
-class GitHubLoop:
+class GitHubDriver:
+    """ForgeDriver (forges/base.py) for GitHub, every write as the test actor."""
+
     forge = "github"
 
     def __init__(self, p: fe.Preflight) -> None:
         self.p = p
         self.repo = f"/repos/{p.config.repo}"
 
-    def open_ticket(self, title: str, body: str) -> int:
+    def open_and_label_ticket(self, title: str, body: str, since: float) -> str:
+        # The issue is labelled when it is opened; then admission is proved.
         self.p.issue_spec = (title, body)
-        return self.p.open_labelled_issue()
-
-    def mark_ticket(self, ticket: int, since: float) -> str:
-        # The issue is labelled when it is opened; marking is proving admission.
-        self.p.assert_admission(ticket, since)
+        number = self.p.open_labelled_issue()
+        self.p.assert_admission(number, since)
         return str(self.p.evidence["work_item_id"])
 
     def await_change(self, work_item_id: str) -> fe.ChangeRef | None:
@@ -190,5 +192,11 @@ class GitHubLoop:
     def default_branch_head(self) -> str:
         return self.p.default_branch_head()
 
+    def reset_fixture(self) -> dict[str, Any]:
+        return self.p.reset_fixture()
 
-fe.register_forge(fe.ForgeEntry(name="github", scenario="github-loop", driver=GitHubLoop))
+    def pin_fixture_base(self) -> None:
+        self.p.pin_fixture_base()
+
+
+fe.register_forge(fe.ForgeEntry(name="github", driver=GitHubDriver, installed=True))

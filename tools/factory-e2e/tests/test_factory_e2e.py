@@ -2901,3 +2901,16 @@ def test_failed_layer_build_fails_the_preflight(
     )
     with pytest.raises(fe.PreflightFailed, match="push denied"):
         preflight.build_runner_layer(fe.DEFAULT_BUNDLE)
+
+
+# --- sandbox controller ownership ---------------------------------------------
+
+
+def test_an_install_consumes_a_sandbox_controller_only_when_one_is_running() -> None:
+    crd = "customresourcedefinition.apiextensions.k8s.io/sandboxes.agents.x-k8s.io\n"
+    running = "pod/agent-sandbox-controller-7d9f-abcde\n"
+    assert fe.sandbox_controller_serves(crd=crd, controller_pods=running) is True
+    # CRDs left behind by an uninstalled release, with no controller serving
+    # them: this install must deploy its own or no claim ever binds.
+    assert fe.sandbox_controller_serves(crd=crd, controller_pods="") is False
+    assert fe.sandbox_controller_serves(crd="", controller_pods="") is False

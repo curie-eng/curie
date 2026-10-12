@@ -2,6 +2,42 @@
 
 use super::*;
 
+/// Forge kinds `curie dev forge-fixture` can drive (#4398).
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub(crate) enum ForgeFixtureKind {
+    Gitlab,
+    #[value(name = "bitbucket-dc")]
+    BitbucketDc,
+}
+
+impl ForgeFixtureKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Gitlab => "gitlab",
+            Self::BitbucketDc => "bitbucket-dc",
+        }
+    }
+}
+
+/// Lifecycle actions for a forge fixture (#4398).
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub(crate) enum ForgeFixtureAction {
+    Up,
+    #[value(name = "self-test")]
+    SelfTest,
+    Down,
+}
+
+impl ForgeFixtureAction {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::SelfTest => "self-test",
+            Self::Down => "down",
+        }
+    }
+}
+
 #[derive(Subcommand)]
 pub(crate) enum DevAction {
     /// Check the committed change before opening or updating a pull request.
@@ -61,6 +97,30 @@ pub(crate) enum DevAction {
         /// `curie dev factory-e2e -- --help`.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
+    },
+    /// Start, self-test, or stop a local forge fixture (#4398,
+    /// `bash cli/scripts/forge-fixture.sh`). Each fixture is
+    /// `tools/forge-fixtures/<kind>/fixture.py` and keeps its state under
+    /// `--state-dir`. A kind whose fixture is not installed fails with a
+    /// "not installed" message and creates no state.
+    ForgeFixture {
+        /// Forge to run: `gitlab` or `bitbucket-dc`.
+        #[arg(value_enum)]
+        kind: ForgeFixtureKind,
+        /// `up` starts the fixture, `self-test` checks a running one, `down`
+        /// stops it and removes its state.
+        #[arg(value_enum)]
+        action: ForgeFixtureAction,
+        /// Directory that holds the fixture's state and connection details.
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Host name or address the fixture advertises to clients, such as
+        /// cluster pods that reach it over the network.
+        #[arg(long)]
+        advertise_host: Option<String>,
+        /// Port the fixture listens on; the fixture picks one when omitted.
+        #[arg(long)]
+        port: Option<u16>,
     },
     /// Serve or record a scripted Anthropic Messages endpoint (#3814).
     /// `serve` replays a transcript and fails on an unexpected request.
