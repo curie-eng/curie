@@ -16,6 +16,18 @@ spec:
       port: {{ .Values.rustfs.consolePort }}
       targetPort: 9001
 ---
+{{- if .Values.rustfs.persistence.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "curie.fullname" . }}-rustfs-storage-guard
+  labels:
+    {{- include "curie.labels" . | nindent 4 }}
+data:
+  rustfs-storage-guard.sh: |
+{{ .Files.Get "files/rustfs-storage-guard.sh" | indent 4 }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -50,10 +62,40 @@ spec:
       securityContext:
         fsGroup: {{ .Values.rustfs.podSecurityContext.fsGroup }}
         fsGroupChangePolicy: OnRootMismatch
-      {{- if not .Values.rustfs.persistence.enabled }}
       volumes:
+        {{- if .Values.rustfs.persistence.enabled }}
+        - name: storage-guard
+          configMap:
+            name: {{ include "curie.fullname" . }}-rustfs-storage-guard
+            defaultMode: 0444
+        {{- else }}
         - name: data
           emptyDir: {}
+        {{- end }}
+      {{- if .Values.rustfs.persistence.enabled }}
+      {{- /* #4408: RustFS exits fatally on a full volume before its own
+             lifecycle expiry runs, so this frees expired event uploads first.
+             It deletes the same set the rustfs-init lifecycle rule expires. */}}
+      initContainers:
+        - name: storage-guard
+          image: {{ .Values.rustfs.image }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          command: ["/bin/sh", "/storage-guard/rustfs-storage-guard.sh"]
+          env:
+            - name: EVENTS_DIR
+              value: /data/{{ .Values.rustfs.bucket }}/events
+            - name: RETENTION_MINUTES
+              value: {{ mul (int .Values.langfuse.eventUpload.retentionDays) 1440 | quote }}
+          securityContext:
+            {{- toYaml .Values.rustfs.containerSecurityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.rustfs.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: storage-guard
+              mountPath: /storage-guard
+              readOnly: true
       {{- end }}
       containers:
         - name: rustfs
@@ -114,7 +156,7 @@ spec:
         {{- end }}
         resources:
           requests:
-            storage: {{ .Values.rustfs.persistence.size }}
+            storage: {{ include "curie.rustfs.claimSize" (dict "statefulSet" (lookup "apps/v1" "StatefulSet" .Release.Namespace (printf "%s-rustfs" (include "curie.fullname" .))) "default" .Values.rustfs.persistence.size) }}
   {{- end }}
 ---
 {{/* Creates every first-party bucket after RustFS accepts S3 requests. */}}

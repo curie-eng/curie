@@ -377,6 +377,25 @@ http
 {{- include "curie.rustfs.scheme" . }}://{{ include "curie.rustfs.host" . }}:{{ .Values.rustfs.port }}
 {{- end -}}
 
+{{/* Storage request for the RustFS `data` claim template (#4408).
+
+     StatefulSet volumeClaimTemplates are immutable, so rendering a new default
+     size against an existing StatefulSet fails every `helm upgrade` that picks
+     up chart defaults. Given the StatefulSet `lookup` returned (an empty dict
+     on a fresh install or under `helm template`/Argo CD), this returns the
+     storage its `data` claim template already requests, else `default`. A
+     pure function of its arguments, so the CI script drives it with a
+     fixture. */}}
+{{- define "curie.rustfs.claimSize" -}}
+{{- $size := "" -}}
+{{- range (dig "spec" "volumeClaimTemplates" list (.statefulSet | default dict)) -}}
+{{- if and (not $size) (eq (dig "metadata" "name" "" .) "data") -}}
+{{- $size = dig "spec" "resources" "requests" "storage" "" . -}}
+{{- end -}}
+{{- end -}}
+{{- $size | default .default -}}
+{{- end -}}
+
 {{/* Whether the object-store clients (api, worker, and the sandbox
      bundle-fetch init container) present static credentials.
 
