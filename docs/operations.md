@@ -1043,17 +1043,18 @@ built artifact without rebuilding.
 
 ### Admitting a labelled GitHub issue
 
-Factory intake polls GitHub by default. It is off until
-`api.githubFactoryIngressEnabled` is true (environment
-`GITHUB_FACTORY_INGRESS_ENABLED=true`). `api.githubFactoryIntake`
-(`GITHUB_FACTORY_INTAKE`) is `poll` or `webhook`, and `poll` is the default.
+Factory intake polls GitHub by default. It is off until `factory.enabled` is
+true (environment `FACTORY_ENABLED=true`). `factory.intake` (`FACTORY_INTAKE`)
+is `poll` or `webhook`, and `poll` is the default. The `factory:` block replaces
+the removed `api.githubFactory*` keys; a release that still sets one is refused
+at render with a message naming `factory.*` and `curie cluster factory`.
 Poll mode accepts a blank webhook secret, which disables signed deliveries.
 A configured secret permits signed deliveries in either intake mode. The
 published development secret is refused whenever factory intake is enabled.
 The API still refuses to start with the gate on unless the GitHub App id and
 private key are set,
-`api.githubFactoryLabel` (`GITHUB_FACTORY_LABEL`) is a single label name,
-`api.githubFactoryMention` (`GITHUB_FACTORY_MENTION`) is one GitHub login, and
+a `factory.trackers` entry of kind `github` exists whose `label` is a single
+label name and whose `mention` is one GitHub login, and
 `api.githubRepoAllowlist` is nonempty. Webhook mode keeps the signed
 `POST /github/webhook` path and requires a configured secret that is not blank
 or the development default.
@@ -1079,15 +1080,15 @@ waiting work and requests termination of a running execution. Cancellation
 stays requested until the runtime reports that it stopped. An already linked
 pull request stays linked, and later publication is refused.
 
-Polling reads each bound repository every `GITHUB_FACTORY_POLL_INTERVAL_S`
+Polling reads each bound repository every `factory.trackers[].pollIntervalSeconds`
 (default 45 seconds). It admits an open labeled issue with no grace delay,
 admits a mention and review feedback on a factory pull request, and cancels a
 work item whose issue was closed or unlabeled. Those reads do not record a
 webhook delivery. The webhook is optional. In webhook mode the missed-label
-backstop stays: every `GITHUB_FACTORY_RECONCILE_INTERVAL_S` (default 300, 0
+backstop stays: every `FACTORY_RECONCILE_INTERVAL_S` (default 300, 0
 disables) the reconciler lists the open issues carrying the factory label and
 admits any that has no work item, once the label is older than
-`GITHUB_FACTORY_RECONCILE_GRACE_S` (default 300). It applies the same checks as
+`FACTORY_RECONCILE_GRACE_S` (default 300). It applies the same checks as
 a delivery, including the labeling user's current write permission, and it
 never admits an issue that already has a work item, so it does not duplicate a
 delivery that arrived. A manual redelivery of the lost label after that
@@ -1135,7 +1136,7 @@ that it is judged on the repository's
 own checks unless the repository has a required Python CI policy (below).
 Checks still pending when the CI wait (by default 1200 s from the push, or the
 execution deadline if sooner) runs out end as `ci_timeout`. Set the wait with
-`api.githubFactoryCiWaitSeconds` (API env `GITHUB_FACTORY_CI_WAIT_S`, default
+`factory.ciWaitSeconds` (API env `FACTORY_CI_WAIT_S`, default
 1200, 1 to 10800, checked at boot) when the repository's required checks take
 longer than 20 minutes; the wait still ends at the execution deadline if that
 comes first. CI that cannot be verified, including unreadable checks or missing
@@ -1143,58 +1144,66 @@ required evidence, ends as `ci_unverified`, which is never success. The notice's
 Reason line explains why. The pull request stays open. The work item detail route still
 reports CI as `unavailable` / `github_forbidden` without the permission.
 
-Required Python CI is set per repository with `api.githubFactoryPythonCi` (API
-env `GITHUB_FACTORY_PYTHON_CI`, a JSON object, default `{}`, checked at boot).
-Each key is an `owner/name`, matched case-insensitively; each value names the
-Actions `check` a Python change must run and pass, the `paths` prefixes that
-check selects, and an optional `pendingCheckPrefix` for shard jobs that finish
-before the aggregate check appears. With a policy, a Python change outside
-`paths` is refused at publication (`publication.required_python_ci_unselected`)
-and missing, skipped, unrelated, or failed evidence for the check cannot
-complete the run. A repository without an entry is judged on its own checks,
-with no path refusal. This value reproduces Curie's own layout for
-`curie-eng/curie`:
+Per-repository factory settings live under `factory.bindings[].repos[]`. A
+binding joins one tracker (`tracker`) to its repositories, and each `repos`
+entry names a `codeHost`, a `projectId`, a `path` (`owner/name`) and an `alias`.
+Its `ci`, `bases` and `defaultBase` fields replace the removed per-repository
+JSON objects. The checks below are boot-checked with the rest of the
+`factory:` block.
+
+Required Python CI is `ci.required` on the repository entry. `key` names the
+Actions check a Python change must run and pass, `paths` lists the prefixes
+that check selects, and an optional `pendingKeyPrefix` covers shard jobs that
+finish before the aggregate check appears. With a policy, a Python change
+outside `paths` is refused at publication
+(`publication.required_python_ci_unselected`) and missing, skipped, unrelated,
+or failed evidence for the check cannot complete the run. A repository without
+the field is judged on its own checks, with no path refusal. This value
+reproduces Curie's own layout for `curie-eng/curie`:
 
 ```yaml
-api:
-  githubFactoryPythonCi:
-    curie-eng/curie:
-      check: "Python (ruff + mypy + pytest)"
-      paths: [apps, runner, cli, adapters, packages, examples/tests, tools, release]
-      pendingCheckPrefix: "Python pytest (shard "
+factory:
+  bindings:
+    - name: curie
+      tracker: github
+      trackerScopeId: "<repository id>"
+      repos:
+        - alias: curie
+          codeHost: github
+          projectId: "<repository id>"
+          path: curie-eng/curie
+          bases: [main, next]
+          defaultBase: next
+          ci:
+            required:
+              key: "Python (ruff + mypy + pytest)"
+              paths: [apps, runner, cli, adapters, packages, examples/tests, tools, release]
+              pendingKeyPrefix: "Python pytest (shard "
 ```
 
-Checks that must rerun after a pull request metadata edit are configured per
-repository with `api.githubFactoryMetadataCi` (API env
-`GITHUB_FACTORY_METADATA_CI`, a JSON object, default `{}`, checked at boot).
-Each `owner/name` key is matched case insensitively.
-Each value supplies `checks` for check run names and `statuses` for commit
-status contexts. An omitted list is empty, but at least one name is required.
-Every configured guard must appear with a timestamp after the metadata edit;
-stale passing guards and unrelated fresh checks cannot satisfy that requirement.
-Checks on the unchanged commit retain their passing, pending or failing evidence.
-Without a repository policy, a metadata revision ends as `ci_unverified` with
-reason `metadata_ci_not_configured`. Ordinary commit revisions are unaffected.
+Checks that must rerun after a pull request metadata edit are listed in
+`ci.metadataRerunKeys` on the repository entry. Each name is a check run name,
+or `status:<context>` for a commit status context. Every listed guard must
+appear with a timestamp after the metadata edit; stale passing guards and
+unrelated fresh checks cannot satisfy that requirement. Checks on the unchanged
+commit retain their passing, pending or failing evidence. Without the list, a
+metadata revision ends as `ci_unverified` with reason
+`metadata_ci_not_configured`. Ordinary commit revisions are unaffected. For
+Curie's own repository the list is:
 
-Set the chart value with a values file or `--set-json`. The chart reserves the
-environment variable, so it cannot be set through `api.extraEnv`. On an install
-that set it there, `curie cluster upgrade` and `curie cluster up` move the JSON
-object to `api.githubFactoryMetadataCi`, drop the extraEnv entry, and list the
-move in the plan. A value that is not a JSON object, a `valueFrom` entry, or a
-different value already in `api.githubFactoryMetadataCi` stops the upgrade
-before any change. Compose installs set it in the environment.
-For Curie's own repository, the value is:
-
-```json
-{"curie-eng/curie":{"checks":["PR body (real newlines)","Fix pin verification"],"statuses":[]}}
+```yaml
+metadataRerunKeys: ["PR body (real newlines)", "Fix pin verification"]
 ```
 
-The branch a factory ticket starts from and targets is set per repository with
-`api.githubFactoryBases` (API env `GITHUB_FACTORY_BASES`, a JSON object, default
-`{}`, checked at boot). Each key is an `owner/name`, matched case-insensitively;
-each value is `{"bases": [...], "default_base": "..."}`. `bases` is a non-empty
-list of unique allowed branches. `default_base` must be one of them and defaults
-to the repository default branch. A repository without an entry may only use its
+The factory reads no `GITHUB_FACTORY_*` environment. The chart refuses an
+`api.extraEnv` or `worker.extraEnv` entry with one of those names, including the
+`GITHUB_FACTORY_METADATA_CI` entry earlier guides set, so move its policy into
+`metadataRerunKeys` before upgrading.
+
+The branch a factory ticket starts from and targets is `bases` and
+`defaultBase` on the repository entry. `bases` is a non-empty list of unique
+allowed branches. `defaultBase` must be one of them and defaults to the
+repository default branch. A repository entry without `bases` may only use its
 default branch. A ticket picks a base with a `base:<branch>` issue label; with no
 label it uses the default. Two `base:` labels, a base outside `bases`, or a base
 that does not exist are refused with an issue comment, and no other branch is
@@ -1202,14 +1211,6 @@ substituted. The base is frozen when the work item is created: a later label
 change is ignored. The status comment shows it on a `Base:` line, for example
 ``Base: `next` (from label `base:next`)``, or `(deployment default)` when no label
 chose it.
-
-```yaml
-api:
-  githubFactoryBases:
-    curie-eng/curie:
-      bases: [main, next]
-      default_base: next
-```
 
 When a publication request is refused, the issue's `Could not complete:`
 notice (cause `approval_create_failed`) carries the refusal code and message
@@ -1452,7 +1453,7 @@ Curie still never touches any other label, including the factory admission
 label. An older release rolled back onto this schema does not know the new
 names, so it will not remove a `curie-factory:*` label it finds.
 
-Set `api.githubFactoryCardBaseUrl` (`GITHUB_FACTORY_CARD_BASE_URL`) to the
+Set `factory.cardBaseUrl` to the
 API's public `https://` origin to embed a live SVG card in the status comment.
 GitHub's image proxy fetches it from `/v1/factory/cards/<token>.svg`, which
 takes no credential: the 64-hex token in the URL is the capability, and
@@ -1464,7 +1465,7 @@ execution deadline stays fixed from start and covers that wait.
 Review feedback on a factory pull request asks for one more revision of that
 pull request. When a work item owns the PR, an `issue_comment`,
 `pull_request_review_comment` or `pull_request_review` that mentions
-`api.githubFactoryMention` goes to the factory, not to the Slack-bound review
+the tracker's `mention` goes to the factory, not to the Slack-bound review
 path. The sender must have write access now, the PR must still be open at the
 recorded head, and the delivery must come from the work item's installation.
 Each refusal is a `factory_ignored` code (`ordinary_comment`,
@@ -1482,7 +1483,7 @@ request: in the review thread for an inline comment, otherwise as a PR comment
 that links the feedback. If GitHub refuses the thread reply with 422, the
 comment is posted as a linked PR comment. Either way it is edited in place
 until the revision ends. PR review feedback reaches the factory only
-when `api.githubFactoryIngressEnabled` is true. A PR no work item owns keeps
+when `factory.enabled` is true. A PR no work item owns keeps
 the existing review behavior.
 
 A factory run on a `github` binding emits no booting, partial, or final chat
