@@ -335,6 +335,15 @@ def test_python_static_gates_stay_unconditional() -> None:
     assert "scripts/check-docs.sh" in _string(docs, "run")
 
 
+def test_aci_wire_lock_base_gate_compares_against_the_event_branch() -> None:
+    script = _string(_named_steps()["ACI wire-lock base gate"], "run")
+    branch = "${{ github.base_ref || github.ref_name }}"
+    assert script.count(branch) == 2
+    assert f'git fetch --no-tags --depth=1 origin "{branch}"' in script
+    assert f'git show "origin/{branch}:packages/aci-protocol/schema/wire.lock"' in script
+    assert "'main'" not in script
+
+
 def test_dump_logs_do_not_run_when_the_stack_never_started() -> None:
     named = _named_steps("python-pytest")
     dump = named["Dump dev stack logs on failure"]
