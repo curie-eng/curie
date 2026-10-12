@@ -28,7 +28,7 @@ follows:
     A non-2xx answer raises ``urllib.error.HTTPError``.
 
 Other fixed points: the required tools are found with ``shutil.which``; the
-local port probe binds ``("0.0.0.0", port)``; the daemon probe is
+local port probe binds ``("127.0.0.1", port)``; the daemon probe is
 ``docker ps ... --filter publish=<port>``; the license reaches the Bitbucket
 container only through the ``env`` of the ``docker compose ... create`` call
 (the rendered compose file names the variable, never the value).
@@ -512,7 +512,7 @@ def http() -> FakeHttp:
 @pytest.fixture
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("0.0.0.0", 0))
+        s.bind(("127.0.0.1", 0))
         port: int = s.getsockname()[1]
     return port
 
@@ -525,7 +525,7 @@ def state_dir(tmp_path: Path) -> Path:
 @pytest.fixture
 def held_port(free_port: int) -> Iterator[int]:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("0.0.0.0", free_port))
+        s.bind(("127.0.0.1", free_port))
         s.listen(1)
         yield free_port
 
@@ -635,7 +635,7 @@ def test_up_writes_skeleton_state_before_creating_anything(
 def test_up_uses_default_port_27443(run: Run, state_dir: Path) -> None:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
-            s.bind(("0.0.0.0", DEFAULT_PORT))
+            s.bind(("127.0.0.1", DEFAULT_PORT))
         except OSError:
             pytest.skip(f"port {DEFAULT_PORT} is taken on this machine")
     assert up(run, state_dir, None) == 0, run.err

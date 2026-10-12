@@ -372,7 +372,7 @@ def _refuse_taken_port(port: int, budget: Budget) -> None:
         # fixture's clients on this port does not.
         probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            probe.bind(("0.0.0.0", port))
+            probe.bind(("127.0.0.1", port))
         except OSError as error:
             raise FixtureError(f"port {port} is already in use on this machine: {error}") from None
     what = f"asking the Docker daemon who publishes port {port}"
