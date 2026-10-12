@@ -340,7 +340,12 @@ fn insert_runner_image(values: &mut serde_json::Value, agent: &str, image: &str)
         .insert(agent.to_string(), serde_json::json!(image));
 }
 
-fn helm_upgrade(opts: &FactoryIntakeOpts, values_file: &Path, timeout_seconds: u64) -> OpsCommand {
+fn helm_upgrade(
+    common: &CommonOpts,
+    chart: &str,
+    values_file: &Path,
+    timeout_seconds: u64,
+) -> OpsCommand {
     // One chart source (the caller's chart) and one values mode
     // (`--reuse-values -f`). Intake settings and a runner binding share this
     // upgrade so a quickstart finish does not helm-upgrade the release twice.
@@ -348,10 +353,10 @@ fn helm_upgrade(opts: &FactoryIntakeOpts, values_file: &Path, timeout_seconds: u
         "helm",
         vec![
             plain("upgrade"),
-            plain(&opts.common.release),
-            plain(&opts.chart),
+            plain(&common.release),
+            plain(chart),
             plain("-n"),
-            plain(&opts.common.namespace),
+            plain(&common.namespace),
             plain("--reuse-values"),
             plain("--timeout"),
             plain(format!("{timeout_seconds}s")),
@@ -368,12 +373,112 @@ pub fn intake_commands(
     values_file: &Path,
     timeout_seconds: u64,
 ) -> Vec<OpsCommand> {
-    let mut cmds = vec![helm_upgrade(opts, values_file, timeout_seconds)];
+    let mut cmds = vec![helm_upgrade(
+        &opts.common,
+        &opts.chart,
+        values_file,
+        timeout_seconds,
+    )];
     cmds.extend(crate::github_app::rollout_commands(
         &opts.common.namespace,
         &crate::ops::chart_fullname(&opts.common.release),
     ));
     cmds
+}
+
+/// `list` of the recorded `factory` values with the entry named like `entry`
+/// replaced by it, or appended when none is. Every other entry is kept.
+fn replace_named(
+    recorded: &serde_json::Value,
+    list: &str,
+    entry: &serde_json::Value,
+) -> serde_json::Value {
+    let name = entry.get("name");
+    let mut entries: Vec<serde_json::Value> = recorded
+        .pointer(&format!("/factory/{list}"))
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter(|kept| kept.get("name") != name)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.push(entry.clone());
+    serde_json::Value::Array(entries)
+}
+
+/// The values document a Jira quickstart applies with `--reuse-values -f`:
+/// the release's `factory.trackers` and `factory.bindings` with the Jira
+/// entries put in. Helm replaces a list whole, so each is written complete.
+/// The token is not here; it lives only in the Secret the tracker names.
+pub fn forge_entries_values(
+    recorded: &serde_json::Value,
+    plan: &crate::factory_quickstart::JiraPlan,
+) -> serde_json::Value {
+    serde_json::json!({
+        "factory": {
+            "trackers": replace_named(recorded, "trackers", &plan.tracker),
+            "bindings": replace_named(recorded, "bindings", &plan.binding),
+        }
+    })
+}
+
+/// Write the Jira tracker and binding on the release: the same helm upgrade
+/// and api rollout as the intake, over [`forge_entries_values`].
+pub async fn apply_forge_entries(
+    common: &CommonOpts,
+    chart: &str,
+    plan: &crate::factory_quickstart::JiraPlan,
+) -> Result<()> {
+    require_on_path("helm")?;
+    require_on_path("kubectl")?;
+    let recorded = fetch_release_values(common)
+        .await?
+        .unwrap_or(serde_json::Value::Null);
+    let values = forge_entries_values(&recorded, plan);
+    let timeout = effective_helm_timeout(None, release_minimum_helm_timeout(common).await);
+    let ui = crate::ui::ui();
+    let cl = ui.checklist();
+    {
+        let file = crate::ops::SecretValuesFileGuard::private_document(&values)?;
+        let cmd = helm_upgrade(common, chart, file.path(), timeout);
+        ui.plumbing(&format!("+ {}", cmd.display()));
+        let step = cl.step(&format!(
+            "writing the Jira tracker and binding `{}` on release {}",
+            plan.binding_name, common.release
+        ));
+        let (ok, _, stderr) = run_capture(&cmd).await?;
+        if !ok {
+            step.fail("helm upgrade failed");
+            return Err(CliError::failure(format!(
+                "helm upgrade of release {} failed: {}",
+                common.release,
+                stderr.trim()
+            ))
+            .into());
+        }
+        step.done("written");
+    }
+    let fullname = crate::ops::release_fullname(&common.namespace, &common.release).await;
+    for cmd in crate::github_app::rollout_commands(&common.namespace, &fullname) {
+        ui.plumbing(&format!("+ {}", cmd.display()));
+        let step = cl.step(&format!(
+            "rolling {} to pick up the Jira tracker",
+            common.release
+        ));
+        let (ok, _, stderr) = run_capture(&cmd).await?;
+        if !ok {
+            step.fail("failed");
+            return Err(CliError::failure(format!(
+                "api rollout failed after the Jira tracker was written: {}",
+                stderr.trim()
+            ))
+            .into());
+        }
+        step.done("rolled");
+    }
+    Ok(())
 }
 
 /// True for a bare GitHub login: alphanumeric runs joined by single hyphens
@@ -926,7 +1031,7 @@ pub async fn factory_intake(mut opts: FactoryIntakeOpts) -> Result<Box<dyn crate
     }
     {
         let file = crate::ops::SecretValuesFileGuard::private_document(&values)?;
-        let cmd = helm_upgrade(&opts, file.path(), timeout);
+        let cmd = helm_upgrade(&opts.common, &opts.chart, file.path(), timeout);
         ui.plumbing(&format!("+ {}", cmd.display()));
         let step = cl.step(&format!(
             "configuring the factory intake on release {}",

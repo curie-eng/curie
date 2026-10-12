@@ -9406,7 +9406,7 @@ export const commandManifest = {
                 "github"
               ],
               "global": false,
-              "help": "Tracker the factory takes issues from. Only github is installed in this build",
+              "help": "Tracker the factory takes issues from: github, or jira-cloud with --code-host github",
               "id": "tracker",
               "long": "tracker",
               "positional": false,
@@ -9446,6 +9446,30 @@ export const commandManifest = {
               "help": "Account whose reviews a non-GitHub forge counts (repeatable). Refused for github",
               "id": "review_accounts",
               "long": "review-account",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Email of the account a Jira token authenticates as. Refused for github",
+              "id": "forge_username",
+              "long": "forge-username",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Jira accountId allowed to start work (repeatable). Refused for github",
+              "id": "start_accounts",
+              "long": "start-account",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Jira groupId whose members may start work. Refused for github",
+              "id": "start_group",
+              "long": "start-group",
               "positional": false,
               "required": false
             }

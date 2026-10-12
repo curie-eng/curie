@@ -48,6 +48,7 @@ fn plan_input() -> PlanInput {
         recorded: None,
         bindings: Vec::new(),
         runner_image: None,
+        jira: None,
     }
 }
 

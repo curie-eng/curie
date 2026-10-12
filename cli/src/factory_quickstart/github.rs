@@ -268,6 +268,19 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
             }
         }
     }
+    // The Install path's Jira preflight follows its App preflight, before any
+    // cluster call, so a refused token or start authority mutates nothing.
+    // The add agent path runs it once the recorded App is read, below.
+    let jira_tracker = opts.forge.tracker == TrackerKind::JiraCloud;
+    let mut jira = None;
+    let mut jira_reads = Vec::new();
+    if jira_tracker && opts.dry_run {
+        let (described, reads) = jira_cloud::described(&opts.forge, &opts.repos)?;
+        jira = Some(described);
+        jira_reads = reads;
+    } else if let (true, Some(app)) = (jira_tracker, &app) {
+        jira = Some(jira_cloud::preflight(&opts.forge, &opts.repos, app).await?);
+    }
     // Confirm before pin or helm. A non-terminal refusal here never reads the
     // release, and a declined prompt never installs.
     let real_interactive = std::io::stdin().is_terminal();
@@ -368,6 +381,13 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         _ => (false, model),
     };
     let install_label = recorded.as_ref().map(|r| r.install_label.clone());
+    // The add agent path authenticates as the recorded App. A Jira agent
+    // needs it now, for the repository ids its binding records.
+    if let (true, true, None, Some(recorded)) = (jira_tracker, add_agent, &jira, &recorded) {
+        let recorded_app = recorded_app(&common, recorded, &opts.repos).await?;
+        jira = Some(jira_cloud::preflight(&opts.forge, &opts.repos, &recorded_app).await?);
+        app = Some(recorded_app);
+    }
     let planned = quickstart_plan(&PlanInput {
         repos: opts.repos.clone(),
         app_id: opts.app_id.clone(),
@@ -398,6 +418,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         recorded: recorded.clone(),
         bindings,
         runner_image,
+        jira,
     })?;
     if opts.dry_run {
         let mut planned = planned;
@@ -408,6 +429,17 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         let mut lines = describe(&planned);
         if let Some(note) = assumed {
             lines.insert(2, note);
+        }
+        // The Jira reads the preflight would make, ahead of the line that
+        // writes what they find.
+        if let Some(at) = planned.actions.iter().find_map(|action| match action {
+            Action::JiraTracker(jira) => {
+                let line = jira_tracker_line(jira);
+                lines.iter().position(|planned| *planned == line)
+            }
+            _ => None,
+        }) {
+            lines.splice(at..at, jira_reads);
         }
         return Ok(QuickstartOutput::DryRun(DryRunPlan { lines }));
     }
@@ -433,7 +465,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     if let (QuickstartPath::AddAgent, None) = (planned.path, &opts.plugin_dir) {
         rendered_image = Some(render_and_check(&common, &opts.agent).await?);
     }
-    if let (QuickstartPath::AddAgent, Some(recorded)) = (planned.path, &recorded) {
+    if let (QuickstartPath::AddAgent, Some(recorded), None) = (planned.path, &recorded, &app) {
         app = Some(recorded_app(&common, recorded, &opts.repos).await?);
     }
     execute(
@@ -605,6 +637,9 @@ async fn execute(
                     ));
                 }
             }
+            Action::JiraTracker(jira) => {
+                apply_jira_tracker(opts, jira).await?;
+            }
             Action::ForgeEgress { agent } => {
                 let chart = opts.chart.clone();
                 crate::cluster_secrets::bind_forge_egress(
@@ -641,6 +676,7 @@ async fn execute(
                 bundle,
                 runner_image,
                 bound,
+                jira_binding,
             } => {
                 let (dir, image) = match bundle {
                     Some(dir) => (dir.clone(), runner_image.clone()),
@@ -662,7 +698,8 @@ async fn execute(
                         (bundle_dir(namespace, release, agent), Some(image))
                     }
                 };
-                // `deploy_args` puts the deploy first, then one binding per repository.
+                // `deploy_args` puts the deploy first, then the Jira binding or
+                // one GitHub binding per repository.
                 for (index, args) in deploy_args(
                     context,
                     namespace,
@@ -672,6 +709,7 @@ async fn execute(
                     label.as_deref(),
                     &dir,
                     bound,
+                    jira_binding.as_deref(),
                 )
                 .into_iter()
                 .enumerate()
@@ -680,6 +718,8 @@ async fn execute(
                         "Deploying dark factory".to_string()
                     } else if index == 0 {
                         format!("Deploying {agent}")
+                    } else if jira_binding.is_some() {
+                        "Binding the Jira tracker".to_string()
                     } else {
                         "Binding GitHub repository".to_string()
                     };
@@ -828,7 +868,9 @@ pub fn intake_args(context: &str, intake: &FactoryIntakeOpts, image: &str) -> Ve
 /// first repository as its git-flow repository, then one GitHub surface
 /// binding per repository, carrying `--label` when set, so the one agent
 /// serves each. A repository in `bound` already carries this agent's binding
-/// under the requested label and gets no `surfaces --add`.
+/// under the requested label and gets no `surfaces --add`. With
+/// `jira_binding` the agent is bound once through that Jira binding instead,
+/// which names every repository.
 #[allow(clippy::too_many_arguments)]
 pub fn deploy_args(
     context: &str,
@@ -839,6 +881,7 @@ pub fn deploy_args(
     label: Option<&str>,
     bundle: &Path,
     bound: &[String],
+    jira_binding: Option<&str>,
 ) -> Vec<Vec<String>> {
     let first = repos.first().cloned().unwrap_or_default();
     let mut argvs = vec![vec![
@@ -859,8 +902,16 @@ pub fn deploy_args(
         "--repo".into(),
         first,
     ]];
-    for repo in repos.iter().filter(|repo| !bound.contains(repo)) {
-        let mut extra = vec!["--add".into(), format!("github={repo}")];
+    let surfaces: Vec<String> = match jira_binding {
+        Some(binding) => vec![format!("jira={binding}")],
+        None => repos
+            .iter()
+            .filter(|repo| !bound.contains(repo))
+            .map(|repo| format!("github={repo}"))
+            .collect(),
+    };
+    for surface in surfaces {
+        let mut extra = vec!["--add".into(), surface];
         if let Some(label) = label {
             extra.extend(["--label".into(), label.into()]);
         }
@@ -869,6 +920,39 @@ pub fn deploy_args(
         ));
     }
     argvs
+}
+
+/// Apply the Jira token Secret, then write the Jira tracker and binding
+/// entries on the release. The token is read from its file here and goes
+/// only to `kubectl apply` on stdin.
+async fn apply_jira_tracker(opts: &QuickstartOpts, jira: &JiraPlan) -> Result<()> {
+    let common = CommonOpts {
+        namespace: opts.namespace.clone(),
+        release: opts.release.clone(),
+        dry_run: false,
+    };
+    crate::ui::ui().note(&format!("Writing Secret {}", jira.secret_name));
+    let token = jira_cloud::read_token(&jira.token_file)?;
+    let manifest = jira_cloud::secret_manifest(&common.namespace, &token);
+    let body = serde_json::to_vec(&manifest)?;
+    // kubectl's output is dropped: a failed apply can echo the manifest.
+    let (ok, _, _) = crate::ops::run_capture_with_stdin(
+        &crate::factory_app::secret_apply_command(&common.namespace),
+        &body,
+    )
+    .await?;
+    if !ok {
+        return Err(CliError::failure(format!(
+            "writing the Jira token to Secret {} in namespace {} failed; the tracker was not written",
+            jira.secret_name, common.namespace
+        ))
+        .with_fix(format!(
+            "check access with `kubectl -n {} auth can-i create secrets` and rerun",
+            common.namespace
+        ))
+        .into());
+    }
+    crate::factory_intake::apply_forge_entries(&common, &opts.chart, jira).await
 }
 
 async fn render_published_bundle(namespace: &str, release: &str, agent: &str) -> Result<String> {

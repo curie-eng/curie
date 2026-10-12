@@ -1439,8 +1439,8 @@ pub(crate) enum FactoryAction {
         /// this build.
         #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
         code_host: curie::factory_quickstart::CodeHostKind,
-        /// Tracker the factory takes issues from. Only github is installed in
-        /// this build.
+        /// Tracker the factory takes issues from: github, or jira-cloud with
+        /// --code-host github.
         #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
         tracker: curie::factory_quickstart::TrackerKind,
         /// Base URL of a non-GitHub forge. Refused for github.
@@ -1458,6 +1458,17 @@ pub(crate) enum FactoryAction {
         /// Refused for github.
         #[arg(long = "review-account", value_name = "ACCOUNT")]
         review_accounts: Vec<String>,
+        /// Email of the account a Jira token authenticates as. Refused for
+        /// github.
+        #[arg(long, value_name = "EMAIL")]
+        forge_username: Option<String>,
+        /// Jira accountId allowed to start work (repeatable). Refused for
+        /// github.
+        #[arg(long = "start-account", value_name = "ACCOUNT")]
+        start_accounts: Vec<String>,
+        /// Jira groupId whose members may start work. Refused for github.
+        #[arg(long, value_name = "GROUP")]
+        start_group: Option<String>,
     },
 }
 

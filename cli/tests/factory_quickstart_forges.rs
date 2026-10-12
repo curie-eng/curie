@@ -228,13 +228,12 @@ fn factory_quickstart_reserved_code_host_kind_is_not_installed() {
 #[test]
 fn factory_quickstart_reserved_tracker_kind_is_not_installed() {
     // #4358 installs jira-cloud; its refusals live in factory_quickstart_jira.rs.
-    for kind in ["gitlab"] {
-        let run = quickstart(&["--tracker", kind]);
-        let text = run.all();
-        assert_ne!(run.code, 0, "{kind}: {text}");
-        assert!(text.contains("not installed"), "{kind}: {text}");
-        assert!(text.contains(kind), "{kind}: {text}");
-    }
+    let kind = "gitlab";
+    let run = quickstart(&["--tracker", kind]);
+    let text = run.all();
+    assert_ne!(run.code, 0, "{kind}: {text}");
+    assert!(text.contains("not installed"), "{kind}: {text}");
+    assert!(text.contains(kind), "{kind}: {text}");
 }
 
 #[test]
