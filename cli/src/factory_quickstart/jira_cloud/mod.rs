@@ -13,8 +13,10 @@
 //! plan, argv, or any message.
 
 mod api;
+mod recorded;
 
 pub use api::preflight;
+pub(super) use recorded::check_recorded;
 
 use std::path::{Path, PathBuf};
 
@@ -331,89 +333,6 @@ pub(super) fn tracker_value(
         },
         "egress": egress,
     })
-}
-
-/// True when `planned` matches `recorded`. A `<...>` string in the plan is a
-/// `--dry-run` placeholder for a value only the preflight reads, and matches
-/// any recorded value.
-fn matches(planned: &Value, recorded: &Value) -> bool {
-    match (planned, recorded) {
-        (Value::String(text), _) if text.starts_with('<') && text.ends_with('>') => true,
-        (Value::Array(planned), Value::Array(recorded)) => {
-            planned.len() == recorded.len()
-                && planned.iter().zip(recorded).all(|(p, r)| matches(p, r))
-        }
-        (Value::Object(planned), Value::Object(recorded)) => {
-            planned.len() == recorded.len()
-                && planned
-                    .iter()
-                    .all(|(key, p)| recorded.get(key).is_some_and(|r| matches(p, r)))
-        }
-        _ => planned == recorded,
-    }
-}
-
-/// The flags that set each compared field, for the refusal's fix.
-fn field_flags(field: &str) -> &'static str {
-    match field {
-        "host" | "apiUrl" | "trackerScopeId" => "--forge-url",
-        "credential" => "--forge-username",
-        "mention" => "--forge-username and --token-file (the factory account)",
-        "repos" | "defaultRepo" => "--repo",
-        "startAuthority" => "--start-account or --start-group",
-        _ => "the Jira flags",
-    }
-}
-
-/// The add agent path's check of the release's `jira` tracker and binding
-/// against the ones this run would write. They serve every Jira agent on the
-/// release, so a differing one is refused rather than rewritten. Returns
-/// whether to write them: false when both are recorded and match, true when
-/// either is missing. The tracker's egress is not compared: it is resolved
-/// from the site at each preflight, and the recorded one is kept.
-pub(super) fn check_recorded(
-    plan: &JiraPlan,
-    tracker: Option<&Value>,
-    binding: Option<&Value>,
-    release: &str,
-) -> Result<bool> {
-    for (list, planned, recorded) in [
-        ("trackers", &plan.tracker, tracker),
-        ("bindings", &plan.binding, binding),
-    ] {
-        let (Some(planned), Some(recorded)) = (planned.as_object(), recorded) else {
-            continue;
-        };
-        let empty = serde_json::Map::new();
-        let recorded = recorded.as_object().unwrap_or(&empty);
-        let mut fields: Vec<&String> = planned.keys().chain(recorded.keys()).collect();
-        fields.sort();
-        fields.dedup();
-        let differing = fields.into_iter().find(|field| {
-            *field != "egress"
-                && !match (planned.get(*field), recorded.get(*field)) {
-                    (Some(p), Some(r)) => matches(p, r),
-                    (None, None) => true,
-                    _ => false,
-                }
-        });
-        if let Some(field) = differing {
-            let shown =
-                |value: Option<&Value>| value.map_or_else(|| "unset".to_string(), Value::to_string);
-            return Err(CliError::usage(format!(
-                "release {release} already has a Jira {} `{BINDING_NAME}` that other agents serve, and its {field} is {} where this run would write {}",
-                list.trim_end_matches('s'),
-                shown(recorded.get(field)),
-                shown(planned.get(field)),
-            ))
-            .with_fix(format!(
-                "rerun with {} matching factory.{list}[{BINDING_NAME}].{field}, or change that entry on the release with helm for every Jira agent as docs/guides/dark-factory-quickstart.md shows, then rerun",
-                field_flags(field)
-            ))
-            .into());
-        }
-    }
-    Ok(tracker.is_none() || binding.is_none())
 }
 
 /// A `--dry-run` stand-in for the plan: what can be known without a read,

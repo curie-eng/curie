@@ -836,6 +836,43 @@ fn jira_add_agent_refuses_a_tracker_on_a_differing_site() {
 }
 
 #[test]
+fn jira_add_agent_preserves_an_equivalent_recorded_entry() {
+    // The api reads the allowlist as a set and fills the poll interval's
+    // default, so neither order nor an explicit default is a difference.
+    pinned_tmpdir();
+    let mut plan = fixture_plan();
+    plan.binding["startAuthority"] =
+        json!({"type": "allowlist", "accounts": [STARTER, SECOND_STARTER]});
+    let mut input = add_agent_input();
+    input.jira = Some(plan.clone());
+    let mut tracker = plan.tracker.clone();
+    tracker["pollIntervalS"] = json!(45);
+    let mut binding = plan.binding.clone();
+    binding["startAuthority"] = json!({"type": "allowlist", "accounts": [SECOND_STARTER, STARTER]});
+    binding["repos"][0]["projectId"] = json!(REPO_ID);
+    binding["components"] = json!({});
+    let recorded = input.recorded.as_mut().unwrap();
+    recorded.jira_tracker = Some(tracker.clone());
+    recorded.jira_binding = Some(binding.clone());
+    let planned = quickstart_plan(&input).expect("an equivalent jira entry is served as is");
+    assert_eq!(
+        action_names(&planned.actions),
+        ["egress", "label", "deploy"]
+    );
+
+    // A real difference beside them is still refused.
+    tracker["pollIntervalS"] = json!(60);
+    let recorded = input.recorded.as_mut().unwrap();
+    recorded.jira_tracker = Some(tracker);
+    let text = usage_refusal(&input);
+    assert!(text.contains("its pollIntervalS is 60"), "{text}");
+    assert!(
+        text.contains("factory.trackers[jira].pollIntervalS"),
+        "{text}"
+    );
+}
+
+#[test]
 fn jira_install_path_still_writes_over_a_recorded_jira_entry() {
     // Liveness: the install path rewrites the intake whole, Jira included,
     // and a first install with nothing recorded writes the entries.
