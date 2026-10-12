@@ -5387,10 +5387,22 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`",
+              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`. With --app-id, pass at least one --repo or use --all-installed-repos to allow the whole installation",
               "id": "repos",
               "long": "repo",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Allow every repository the GitHub App is installed on. Requires --app-id and cannot be combined with --repo",
+              "id": "all_installed_repos",
+              "long": "all-installed-repos",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             },
             {
@@ -5447,7 +5459,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention, allowlist, and label default from the App",
+              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention and label default from the App. Choose the allowlist with --repo (repeatable) or --all-installed-repos",
               "id": "app_id",
               "long": "app-id",
               "positional": false,

@@ -17,14 +17,17 @@ and to `--evidence` when given.
 
 `--dry-run` lists every step and launches nothing. It fails on an entry with
 an unset step field, and reports "not installed" for an entry whose forge
-drivers are not installed. github+github and jira_cloud+github are installed
-today; the GitLab and Bitbucket entries, and Jira with those code hosts, are
-complete step definitions waiting on their drivers in tools/factory-e2e/forges/.
+drivers are not installed. github+github, jira_cloud+github,
+jira_cloud+bitbucket_cloud and jira_cloud+bitbucket_dc are installed today; the
+GitLab entries are complete step definitions waiting on their drivers in
+tools/factory-e2e/forges/. Bitbucket pairs only with a Jira Cloud tracker.
 
-A Jira tracker entry is driven by the jira_cloud driver (`--forge jira_cloud`),
-which delegates the change, CI, review and merge steps to the code host's
-driver, so it asserts the same loop plus the tracker evidence and the
-"close Jira test issues" teardown.
+The jira_cloud+github entry is driven by the jira_cloud driver (`--forge
+jira_cloud`), which delegates the change, CI, review and merge steps to the
+GitHub driver, so it asserts the same loop plus the tracker evidence. A
+Bitbucket entry is driven by its code host's driver, which delegates the
+ticket to the jira_cloud driver and asserts the loop only. Every Jira entry
+asserts the "close Jira test issues" teardown.
 """
 
 from __future__ import annotations
@@ -123,7 +126,7 @@ _CI_NAMES = {
 }
 
 
-# The step the jira_cloud driver's teardowns() pushes.
+# The step the jira_cloud driver's teardowns() pushes, also on a Bitbucket driver.
 CLOSE_JIRA_STEP = "close Jira test issues"
 # What a passing Jira tracker run records under scenario.tracker.
 _JIRA_TRACKER_ASSERTIONS = (
@@ -132,6 +135,19 @@ _JIRA_TRACKER_ASSERTIONS = (
     ("scenario.tracker.pr_body_has_key", True),
     ("scenario.tracker.bot_label_admitted", False),
 )
+
+
+def _driver(tracker: str, code_host: str) -> str:
+    """The driver the loop runs, which --forge and the evidence forge name.
+
+    A Jira tracker's own driver, which delegates the code host steps, except
+    on Bitbucket, whose drivers delegate the ticket to the Jira driver; else
+    the code host's.
+    """
+
+    if tracker == "jira_cloud" and not code_host.startswith("bitbucket"):
+        return tracker
+    return code_host
 
 
 def _inputs(tracker: str, code_host: str) -> dict[str, str]:
@@ -159,7 +175,7 @@ def _remote(tracker: str, code_host: str) -> tuple[str, ...]:
     change = _CHANGE_NAMES[code_host]
     host = _FORGE_LABELS[code_host]
     tracker_lines: tuple[str, ...] = ()
-    if tracker == "jira_cloud":
+    if _driver(tracker, code_host) == "jira_cloud":
         tracker_lines = (
             "the ticket carries exactly one status comment from the factory account",
             f"the ticket carries exactly one remote link to the {change}",
@@ -204,10 +220,7 @@ def _persisted(
 
 
 def _loop_step(tracker: str, code_host: str) -> Step:
-    # The driver the loop runs: a Jira tracker's own, which delegates the code
-    # host steps; else the code host's. --forge, evidence forge and the
-    # scenario's forge all name it.
-    driver = tracker if tracker == "jira_cloud" else code_host
+    driver = _driver(tracker, code_host)
     if (tracker, code_host) == ("github", "github"):
         scenario = "github-loop"
         command = ["run", "--scenario", scenario]
@@ -222,7 +235,7 @@ def _loop_step(tracker: str, code_host: str) -> Step:
         scenario = "forge-loop"
         command = ["run", "--scenario", scenario, "--forge", driver]
         teardown_steps = (
-            *((CLOSE_JIRA_STEP,) if driver == "jira_cloud" else ()),
+            *((CLOSE_JIRA_STEP,) if tracker == "jira_cloud" else ()),
             "reset fixture repository",
             "restore fixture default branch",
             "delete namespaces",
@@ -249,9 +262,8 @@ PAIRINGS: dict[str, Pairing] = {
         _pairing("jira_cloud", "github", installed=True),
         _pairing("gitlab", "gitlab", installed=False),
         _pairing("jira_cloud", "gitlab", installed=False),
-        _pairing("bitbucket_cloud", "bitbucket_cloud", installed=False),
-        _pairing("jira_cloud", "bitbucket_cloud", installed=False),
-        _pairing("bitbucket_dc", "bitbucket_dc", installed=False),
+        _pairing("jira_cloud", "bitbucket_cloud", installed=True),
+        _pairing("jira_cloud", "bitbucket_dc", installed=True),
     )
 }
 

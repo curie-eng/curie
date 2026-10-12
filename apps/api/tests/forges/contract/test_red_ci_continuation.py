@@ -15,7 +15,8 @@ async def test_a_failing_head_then_a_green_new_head(harness: AdapterHarness) -> 
 
     failing = await harness.code_host.observe_ci(harness.repository, red)
     assert failing.state is RollupState.FAILURE
-    assert {c.key: c.state for c in failing.checks}["unit"] is CheckState.FAILURE
+    states = {c.key: c.state for c in failing.checks}
+    assert states[harness.check_key("unit")] is CheckState.FAILURE
 
     green = harness.push_head(pull.head_ref)
     current = await harness.code_host.read_pull_request(pull.ref)
@@ -49,7 +50,7 @@ async def test_a_commit_status_is_a_check_under_its_status_key(harness: AdapterH
     )
     rollup = await harness.code_host.observe_ci(harness.repository, pull.head_sha)
     assert {c.key: c.state for c in rollup.checks} == {
-        "unit": CheckState.SUCCESS,
-        "status:docs": CheckState.FAILURE,
+        harness.check_key("unit"): CheckState.SUCCESS,
+        harness.check_key("status:docs"): CheckState.FAILURE,
     }
     assert rollup.state is RollupState.FAILURE

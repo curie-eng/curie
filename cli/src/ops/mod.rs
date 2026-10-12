@@ -11,6 +11,7 @@
 
 #![deny(clippy::let_underscore_must_use, clippy::let_underscore_untyped)]
 
+pub(crate) mod capacity;
 mod command;
 mod convergence;
 mod lint_values;

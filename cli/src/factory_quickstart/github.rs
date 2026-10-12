@@ -81,6 +81,7 @@ pub(super) fn finish_intake_opts(input: &PlanInput, _context: &str) -> FactoryIn
         },
         chart: input.chart.clone(),
         repos: input.repos.clone(),
+        all_installed_repos: false,
         label: None,
         mention: None,
         card_base_url: None,
@@ -228,7 +229,7 @@ async fn recorded_app(
         .with_fix("rerun with --app-id and --private-key-file to record the App key again")
         .into());
     }
-    crate::factory_toolchain::preflight_with_pem(&recorded.app_id, pem, repos).await
+    crate::factory_toolchain::preflight_with_pem(&recorded.app_id, pem, repos, false).await
 }
 
 pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
@@ -257,7 +258,8 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     if !opts.dry_run {
         match (&opts.app_id, &opts.private_key_file) {
             (Some(id), Some(file)) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => {
-                app = Some(crate::factory_toolchain::preflight(id, file, &opts.repos).await?);
+                app =
+                    Some(crate::factory_toolchain::preflight(id, file, &opts.repos, false).await?);
             }
             (None, None) => {}
             _ => {

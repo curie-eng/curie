@@ -359,6 +359,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
         ClusterAction::Factory {
             intake,
             repos,
+            all_installed_repos,
             label,
             mention,
             card_base_url,
@@ -401,6 +402,7 @@ pub(super) async fn run(action: ClusterAction, context: Option<String>) -> Resul
                     },
                     chart,
                     repos,
+                    all_installed_repos,
                     label,
                     mention,
                     card_base_url,

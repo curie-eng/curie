@@ -212,6 +212,15 @@ rules; GitLab, Jira and both Bitbucket kinds are.
    token held only by the API, keeps its status comment marker in the
    `curie.factory` comment property, and links each pull request back to the
    issue with a remote link.
+4. **Bitbucket Cloud:** `BitbucketCloudCodeHost` in
+   `apps/api/src/curie_api/forges/bitbucket_cloud/code_host.py`, a code host
+   only, paired with a Jira Cloud tracker. Every mandatory CodeHost and
+   MarkedComments operation is supported; `ci_diagnostics`, `rerun_failed` and
+   `user_can_write` are unsupported. Review feedback counts only from accounts
+   in the binding's review feedback allowlist.
+5. **Bitbucket Data Center:** `BitbucketDcCodeHost` in
+   `apps/api/src/curie_api/forges/bitbucket_dc/code_host.py`, with the same
+   capabilities and allowlist rule, for Data Center 9.4.0 or newer.
 
 ## Known leakage
 

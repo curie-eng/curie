@@ -1,0 +1,9 @@
+{
+  "errors": [
+    {
+      "context": null,
+      "message": "Too many requests. Try again later.",
+      "exceptionName": null
+    }
+  ]
+}

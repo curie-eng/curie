@@ -253,6 +253,17 @@ pub(super) fn check(forge: &ForgeFlags) -> Result<()> {
     flags(forge).map(|_| ())
 }
 
+/// The refusal for the Jira tracker with a non-GitHub code host: this build's
+/// Jira quickstart binds GitHub repositories only, and the combined Bitbucket
+/// quickstart is #4400.
+pub(super) fn code_host_not_installed(code_host: &str) -> anyhow::Error {
+    CliError::unsupported(format!(
+        "--tracker jira-cloud with --code-host {code_host} is not installed in this build"
+    ))
+    .with_fix("rerun with --code-host github, or write the factory values by hand as docs/guides/dark-factory-quickstart.md shows")
+    .into()
+}
+
 /// The binding alias for each repository: its lowercased name, or
 /// `owner-name` when two repositories share a name, at most 64 characters.
 fn aliases(repos: &[String]) -> Vec<String> {

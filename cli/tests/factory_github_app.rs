@@ -39,6 +39,8 @@ const INSTALL_TOKEN: &str = "ghs_fake";
 const WEBHOOK_SECRET: &str = "whsec-factory-test-3746-value";
 /// Exit code for usage errors (cli/src/exit.rs `ExitCode::Usage`).
 const USAGE_EXIT: i32 = 2;
+const SCOPE_ERROR: &str = "--app-id needs a repository scope: pass --repo OWNER/REPO (repeatable) or --all-installed-repos; nothing was applied";
+const SCOPE_FIX: &str = "rerun with --repo <owner>/<name> once per repository the factory may serve, or with --all-installed-repos to allow every repository the GitHub App is installed on";
 
 /// Logs every helm/kubectl invocation to `$SHIM_LOG`.
 /// helm: `get values` prints `$FAKE_VALUES`, `get hooks` prints nothing,
@@ -540,6 +542,7 @@ fn happy_argv(fx: &Fixture) -> Vec<String> {
         APP_ID.into(),
         "--private-key-file".into(),
         fx.path("app.pem"),
+        "--all-installed-repos".into(),
         "--webhook-secret-file".into(),
         fx.path("webhook-secret"),
         "--chart".into(),
@@ -549,6 +552,173 @@ fn happy_argv(fx: &Fixture) -> Vec<String> {
 
 fn strs(v: &[String]) -> Vec<&str> {
     v.iter().map(String::as_str).collect()
+}
+
+#[test]
+fn app_credentials_without_repository_scope_are_refused_before_any_external_call() {
+    for (dry_run, json) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut fx = Fixture::installed();
+        fx.record_existing_app();
+        let mut argv = happy_argv(&fx);
+        argv.retain(|arg| arg != "--all-installed-repos");
+        if dry_run {
+            argv.push("--dry-run".into());
+        }
+        if json {
+            argv.push("--json".into());
+        }
+        let output = fx.run(&strs(&argv));
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(USAGE_EXIT), "{text}");
+        if json {
+            assert_eq!(
+                stdout_json(&output),
+                serde_json::json!({"error": SCOPE_ERROR, "fix": SCOPE_FIX})
+            );
+        } else {
+            assert!(text.contains(SCOPE_ERROR), "{text}");
+            assert!(text.contains(SCOPE_FIX), "{text}");
+        }
+        assert!(fx.github.recorded().is_empty(), "GitHub must not be called");
+        assert!(fx.log().is_empty(), "no external tool call: {}", fx.log());
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn all_installed_repos_conflicts_with_repo_and_requires_an_app_id() {
+    for with_app in [true, false] {
+        let fx = Fixture::installed();
+        let argv = if with_app {
+            let mut argv = happy_argv(&fx);
+            argv.extend(["--repo".into(), "acme/bot".into()]);
+            argv
+        } else {
+            vec![
+                "cluster".into(),
+                "factory".into(),
+                "--all-installed-repos".into(),
+            ]
+        };
+        let output = fx.run(&strs(&argv));
+        let text = combined(&output);
+        assert_eq!(output.status.code(), Some(USAGE_EXIT), "{text}");
+        assert!(text.contains("--all-installed-repos"), "{text}");
+        assert!(
+            text.contains(if with_app { "--repo" } else { "--app-id" }),
+            "{text}"
+        );
+        assert!(!text.contains("unexpected argument"), "{text}");
+        assert!(fx.github.recorded().is_empty());
+        assert!(fx.log().is_empty(), "{}", fx.log());
+        fx.assert_no_mutation();
+    }
+}
+
+#[test]
+fn explicit_repository_scope_only_allowlists_and_labels_the_named_repository() {
+    let mut fx = Fixture::installed();
+    fx.record_existing_app();
+    let mut argv = happy_argv(&fx);
+    argv.retain(|arg| arg != "--all-installed-repos");
+    argv.extend(["--repo".into(), "acme/bot".into(), "--json".into()]);
+    let output = fx.run(&strs(&argv));
+    assert!(output.status.success(), "{}", combined(&output));
+    let value = stdout_json(&output);
+    assert_eq!(
+        value["github_app"]["repos"],
+        serde_json::json!(["acme/bot"])
+    );
+    assert_eq!(value["github_app"]["repos_inferred"], false);
+    assert_eq!(
+        value["github_app"]["labels_created"],
+        serde_json::json!(["acme/bot"])
+    );
+    let values: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("helm values");
+    assert_eq!(
+        values["api"]["githubRepoAllowlist"],
+        serde_json::json!(["acme/bot"])
+    );
+    let requests = fx.github.recorded();
+    assert!(requests.iter().any(|request| {
+        request.method == "POST" && path_only(request) == "/repos/acme/bot/labels"
+    }));
+    assert!(
+        requests
+            .iter()
+            .all(|request| { !path_only(request).starts_with("/repos/acme/web/") }),
+        "the unselected repository must not be read or labelled: {requests:?}"
+    );
+}
+
+#[test]
+fn app_dry_run_previews_each_explicit_repository_scope_without_external_calls() {
+    for (scope, expected) in [
+        (
+            vec!["--repo", "acme/bot", "--repo", "acme/web"],
+            "# allowlist: acme/bot, acme/web (--repo)",
+        ),
+        (
+            vec!["--all-installed-repos"],
+            "# allowlist: every repository the App is installed on (--all-installed-repos)",
+        ),
+    ] {
+        for json in [false, true] {
+            let fx = Fixture::installed();
+            let mut argv = happy_argv(&fx);
+            argv.retain(|arg| arg != "--all-installed-repos");
+            argv.extend(scope.iter().map(|arg| (*arg).to_string()));
+            argv.push("--dry-run".into());
+            if json {
+                argv.push("--json".into());
+            }
+            let output = fx.run(&strs(&argv));
+            assert!(output.status.success(), "{}", combined(&output));
+            let lines: Vec<String> = if json {
+                stdout_json(&output)["plan"]
+                    .as_array()
+                    .expect("dry-run plan")
+                    .iter()
+                    .map(|line| line.as_str().expect("plan line").to_string())
+                    .collect()
+            } else {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            };
+            let labels = lines
+                .iter()
+                .position(|line| {
+                    line.starts_with("# GET/POST ")
+                        && line.ends_with("/labels for each allowlisted repo")
+                })
+                .expect("labels plan line");
+            assert_eq!(lines.get(labels + 1).map(String::as_str), Some(expected));
+            assert!(fx.github.recorded().is_empty());
+            assert!(fx.log().is_empty(), "{}", fx.log());
+            fx.assert_no_mutation();
+        }
+    }
+}
+
+#[test]
+fn disabling_factory_without_app_credentials_keeps_working_without_a_repository_scope() {
+    let fx = Fixture::installed();
+    let output = fx.run(&[
+        "cluster",
+        "factory",
+        "--disable",
+        "--chart",
+        "charts/curie",
+        "--json",
+    ]);
+    assert!(output.status.success(), "{}", combined(&output));
+    assert_eq!(stdout_json(&output)["factory_intake_enabled"], false);
+    let values: serde_json::Value = serde_json::from_str(&fx.values_file()).expect("helm values");
+    assert_eq!(values["factory"], serde_json::json!({"enabled": false}));
+    assert!(values["api"].get("githubRepoAllowlist").is_none());
+    assert!(fx.github.recorded().is_empty());
 }
 
 #[test]
@@ -821,7 +991,7 @@ fn without_an_app_the_registration_link_is_printed_and_nothing_applied() {
         .unwrap_or_else(|| panic!("steps must give the rerun command: {text}"));
     assert_eq!(
         rerun,
-        "curie cluster factory --intake poll --app-id <APP_ID> --private-key-file <PATH.pem>"
+        "curie cluster factory --intake poll --app-id <APP_ID> --private-key-file <PATH.pem> --repo <OWNER/REPO>"
     );
     fx.assert_no_mutation();
 
@@ -1107,6 +1277,10 @@ fn app_id_and_key_infer_mention_allowlist_label_and_store_the_key_in_a_secret() 
         "output must announce the allowlist: {text}"
     );
     assert!(
+        text.contains(" (the App's installed repositories)"),
+        "{text}"
+    );
+    assert!(
         text.contains("curie-factory"),
         "output must announce the label: {text}"
     );
@@ -1223,6 +1397,22 @@ fn app_id_and_key_infer_mention_allowlist_label_and_store_the_key_in_a_secret() 
         !log.contains(WEBHOOK_SECRET),
         "webhook secret leaked into argv: {log}"
     );
+
+    let fx = Fixture::installed();
+    let mut argv = happy_argv(&fx);
+    argv.push("--json".into());
+    let output = fx.run(&strs(&argv));
+    assert!(output.status.success(), "{}", combined(&output));
+    let value = stdout_json(&output);
+    assert_eq!(value["github_app"]["repos_inferred"], true);
+    assert_eq!(
+        value["github_app"]["repos"],
+        serde_json::json!(["acme/bot", "acme/web"])
+    );
+    assert_eq!(
+        value["github_app"]["labels_created"],
+        serde_json::json!(["acme/bot", "acme/web"])
+    );
 }
 
 #[test]
@@ -1237,6 +1427,8 @@ fn printed_poll_completion_configures_intake_without_a_webhook_secret() {
         APP_ID,
         "--private-key-file",
         &fx.path("app.pem"),
+        "--repo",
+        "acme/bot",
         "--chart",
         "charts/curie",
     ]);
@@ -1268,6 +1460,8 @@ fn webhook_completion_without_a_secret_is_refused_before_any_mutation() {
         APP_ID,
         "--private-key-file",
         &fx.path("app.pem"),
+        "--repo",
+        "acme/bot",
         "--chart",
         "charts/curie",
     ]);
@@ -1313,6 +1507,7 @@ fn an_app_that_is_not_installed_is_refused_before_any_mutation() {
 fn a_repo_the_app_is_not_installed_on_is_refused_naming_installed_repos() {
     let fx = Fixture::installed();
     let mut argv = happy_argv(&fx);
+    argv.retain(|arg| arg != "--all-installed-repos");
     argv.extend(["--repo".to_string(), "acme/other".to_string()]);
     let output = fx.run(&strs(&argv));
     let text = combined(&output);
@@ -1362,6 +1557,8 @@ fn app_id_without_a_private_key_file_is_a_usage_error() {
         "factory",
         "--app-id",
         "1",
+        "--repo",
+        "acme/bot",
         "--chart",
         "charts/curie",
     ]);

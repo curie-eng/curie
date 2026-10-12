@@ -6,6 +6,27 @@
 # that classify history (gVisor retry, failed-only discard). Callers answer
 # history in their own helm fake. No earlier mutation/preflight reply or
 # assertion is changed here.
+# Opted-in install fixtures answer the additional advisory reads without
+# replacing fixtures that exercise their own node/pod behavior. Shapes follow
+# https://kubernetes.io/docs/reference/kubernetes-api/cluster-resources/node-v1/
+# and https://kubernetes.io/docs/reference/kubernetes-api/workload-resources/pod-v1/.
+curie_test_capacity_read() {
+    case "${0##*/}:$1:${2:-}" in
+        kubectl:get:nodes)
+            printf '%s\n' '{"apiVersion":"v1","kind":"NodeList","items":[{"metadata":{"name":"acme-capacity-node"},"spec":{},"status":{"allocatable":{"cpu":"64","memory":"128Gi"},"conditions":[{"type":"Ready","status":"True"}]}}]}'
+            exit 0
+            ;;
+        kubectl:get:pods)
+            case " $* " in
+                *" --all-namespaces "*)
+                    printf '%s\n' '{"apiVersion":"v1","kind":"PodList","items":[]}'
+                    exit 0
+                    ;;
+            esac
+            ;;
+    esac
+    return 1
+}
 case "${0##*/}:$1:${2:-}" in
     helm:status:*)
         if [ -f "${0%/*}/convergence-release-failed" ]; then

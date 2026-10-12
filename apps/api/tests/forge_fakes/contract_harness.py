@@ -65,6 +65,12 @@ class AdapterHarness(Protocol):
     base_branch: str
     writer: Actor
     outsider: Actor
+    feedback_kinds: frozenset[FeedbackKind]
+    """The feedback kinds the code host can return; vectors that need another
+    kind skip on this pair."""
+
+    def check_key(self, name: str) -> str:
+        """The key the adapter reports for a check reported under ``name``."""
 
     def seed_issue(self, title: str, body: str) -> TrackerIssueRef: ...
 
@@ -133,6 +139,7 @@ async def open_pull(harness: AdapterHarness, branch: str) -> PullRequest:
 WRITER = Actor(id="6601", login="octo-writer")
 OUTSIDER = Actor(id="6602", login="drive-by")
 LABEL = "factory"
+ALL_FEEDBACK_KINDS = frozenset(FeedbackKind)
 
 
 class InMemoryHarness:
@@ -144,6 +151,7 @@ class InMemoryHarness:
     writer = WRITER
     outsider = OUTSIDER
     label = LABEL
+    feedback_kinds = ALL_FEEDBACK_KINDS
 
     def __init__(self, *, minimal: bool) -> None:
         self.name = "memory-minimal" if minimal else "memory"
@@ -174,6 +182,9 @@ class InMemoryHarness:
         self._code_host.push(self.repository, self.base_branch, "initial")
         self._allowlist: set[str] = set()
         self._minimal = minimal
+
+    def check_key(self, name: str) -> str:
+        return name
 
     def seed_issue(self, title: str, body: str) -> TrackerIssueRef:
         return self._tracker.seed_issue(title, body)
@@ -268,6 +279,7 @@ class GitHubHarness:
     writer = WRITER
     outsider = OUTSIDER
     label = LABEL
+    feedback_kinds = ALL_FEEDBACK_KINDS
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -314,6 +326,9 @@ class GitHubHarness:
         self.repository = RepositoryRef(
             types.GITHUB, self._code_host.host, str(REPO_ID), REPO, default_branch="main"
         )
+
+    def check_key(self, name: str) -> str:
+        return name
 
     def seed_issue(self, title: str, body: str) -> TrackerIssueRef:
         return self._tracker.issue(self.fake.seed_issue(title, body))
@@ -414,6 +429,7 @@ class JiraGitHubHarness:
     writer = WRITER
     outsider = OUTSIDER
     label = LABEL
+    feedback_kinds = ALL_FEEDBACK_KINDS
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._github = GitHubHarness(monkeypatch)
@@ -423,6 +439,9 @@ class JiraGitHubHarness:
         self.tracker: Tracker = jira_fake.jira_tracker(self.jira, label=LABEL)
         self.code_host: CodeHost = self._github.code_host
         self.repository = self._github.repository
+
+    def check_key(self, name: str) -> str:
+        return self._github.check_key(name)
 
     def seed_issue(self, title: str, body: str) -> TrackerIssueRef:
         return self.jira.ref(self.jira.seed_issue(title, body))

@@ -619,7 +619,7 @@ DRIVER_METHODS = (
     "judge_tracker",
     "teardowns",
 )
-NOT_INSTALLED_FORGES = ("gitlab", "bitbucket_cloud", "bitbucket_dc")
+NOT_INSTALLED_FORGES = ("gitlab",)
 
 
 def test_base_defines_the_driver_protocol_without_importing_the_harness(

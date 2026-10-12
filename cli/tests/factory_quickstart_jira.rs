@@ -249,9 +249,15 @@ async fn app(github: &MockServer, dir: &Path, path: AppPath) -> AppPreflight {
     let pem_path = dir.join("app.pem");
     generate_pem(&pem_path);
     match path {
-        AppPath::Install => preflight(APP_ID, &pem_path, &repos()).await,
+        AppPath::Install => preflight(APP_ID, &pem_path, &repos(), false).await,
         AppPath::Recorded => {
-            preflight_with_pem(APP_ID, fs::read_to_string(&pem_path).unwrap(), &repos()).await
+            preflight_with_pem(
+                APP_ID,
+                fs::read_to_string(&pem_path).unwrap(),
+                &repos(),
+                false,
+            )
+            .await
         }
     }
     .expect("the GitHub App preflight succeeds against the stand-in")

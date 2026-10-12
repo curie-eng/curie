@@ -47,11 +47,15 @@ EXPECTED_PAIRINGS = {
     "jira_cloud+github",
     "gitlab+gitlab",
     "jira_cloud+gitlab",
-    "bitbucket_cloud+bitbucket_cloud",
     "jira_cloud+bitbucket_cloud",
-    "bitbucket_dc+bitbucket_dc",
+    "jira_cloud+bitbucket_dc",
 }
-INSTALLED = {"github+github", "jira_cloud+github"}
+INSTALLED = {
+    "github+github",
+    "jira_cloud+github",
+    "jira_cloud+bitbucket_cloud",
+    "jira_cloud+bitbucket_dc",
+}
 NOT_INSTALLED = sorted(EXPECTED_PAIRINGS - INSTALLED)
 NAMESPACE = "test-factory-acceptance"
 
@@ -680,7 +684,13 @@ def test_every_entry_asserts_its_pairing_and_a_jira_tracker_its_tracker_evidence
     persisted = _persisted_map(key)
     tracker, code_host = key.split("+")
     assert persisted["scenario.pairing"] == key
-    if tracker == "jira_cloud":
+    if tracker == "jira_cloud" and code_host.startswith("bitbucket"):
+        # The Bitbucket driver delegates the ticket and its teardown to the
+        # Jira driver and asserts the loop only.
+        assert persisted["forge"] == persisted["scenario.forge"] == code_host
+        assert not [f for f in persisted if f.startswith("scenario.tracker.")]
+        assert CLOSE_JIRA in _teardown_names(key)
+    elif tracker == "jira_cloud":
         assert persisted["forge"] == persisted["scenario.forge"] == "jira_cloud"
         for field, expected in TRACKER_ASSERTIONS.items():
             assert persisted[field] == expected, field

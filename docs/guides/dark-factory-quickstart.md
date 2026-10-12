@@ -311,8 +311,10 @@ Quickstart writes the factory's forge settings for you. These flags select them:
 1. `--code-host <kind>` and `--tracker <kind>` choose where the factory publishes
    and where it takes issues. Both default to `github`. `--tracker jira-cloud`
    with `--code-host github` is installed; see [Jira Cloud](#jira-cloud). The
-   kinds `gitlab`, `bitbucket-cloud` and `bitbucket-dc` are named but not
-   installed in this build, and the command refuses them.
+   kind `gitlab` is named but not installed in this build, and the command
+   refuses it. `bitbucket-cloud` and `bitbucket-dc` need `--tracker
+   jira-cloud`, and the command refuses that pairing until its quickstart
+   lands; see [Bitbucket Cloud and Data Center](#bitbucket-cloud-and-data-center).
 2. `--forge-url`, `--token-file`, `--ca-file` and `--review-account` (repeatable)
    describe a non-GitHub forge: its base URL, a file holding its access token,
    a CA bundle for a private certificate, and the accounts whose reviews count.
@@ -466,6 +468,90 @@ In Jira, add the label `curie-factory` to an issue as a start account. The
 tracker polls every 45 seconds by default. Removing the label, or moving the
 issue to a done status, cancels the run. The factory never changes the
 issue's workflow status.
+
+## Bitbucket Cloud and Data Center
+
+Bitbucket has no issue tracker the factory reads, so a Bitbucket code host
+pairs only with a Jira Cloud tracker. The ticket is a Jira issue, and the pull
+request, its build statuses and its review comments are on Bitbucket. The
+combined quickstart for this pairing is tracked in #4400; until it lands, write
+the `factory:` values below yourself.
+
+Each kind takes a static access token, never a username and password:
+
+1. **Bitbucket Cloud** takes a repository, project or workspace access token
+   with the `repository:write` and `pullrequest:write` scopes. API calls send
+   it as a Bearer token, and git uses it as the password for the user
+   `x-token-auth`. The entry's `host` is `bitbucket.org` and its `apiUrl` is
+   `https://api.bitbucket.org/2.0`. A repository's `projectId` is its UUID,
+   braces included, and its `path` is `<workspace>/<repo slug>`.
+2. **Bitbucket Data Center** 9.4.0 or newer takes a project or repository HTTP
+   access token with `REPO_WRITE`, sent as a Bearer token to the API and to
+   git. An older server is refused. The entry's `host` is the server's
+   hostname and its `apiUrl` is its base URL, including any context path. A
+   repository's `projectId` is its numeric id, and its `path` is
+   `<PROJECT KEY>/<repo slug>`.
+
+A credential that sets `username` is refused for both kinds. A Bitbucket
+access token cannot read whether a person has write access, so review feedback
+on a pull request is acted on only when its author is listed in the binding's
+`reviewFeedbackAllowlist` under the code host's name: Atlassian `account_id`
+values on Cloud, numeric user ids on Data Center. Feedback is comments; an
+approval or a "needs work" status with no text is not feedback. A Data Center
+server with a private certificate needs its CA through `--ca-file`, which
+lands in `codeHostTrust`.
+
+These values use example identifiers only. Replace them with your own:
+
+```yaml
+factory:
+  codeHosts:
+    - name: bitbucket
+      kind: bitbucket_cloud
+      host: bitbucket.org
+      apiUrl: https://api.bitbucket.org/2.0
+      credential:
+        type: static_token
+        existingSecret: factory-bitbucket
+        existingSecretKey: token
+    - name: bitbucket-dc
+      kind: bitbucket_dc
+      host: bitbucket.example.invalid
+      apiUrl: https://bitbucket.example.invalid
+      credential:
+        type: static_token
+        existingSecret: factory-bitbucket-dc
+        existingSecretKey: token
+  bindings:
+    - name: example
+      tracker: jira
+      trackerScopeId: "<Jira site id>"
+      repos:
+        - alias: example-repo
+          codeHost: bitbucket
+          projectId: "{00000000-0000-4000-8000-000000000001}"
+          path: example-workspace/example-repo
+        - alias: demo
+          codeHost: bitbucket-dc
+          projectId: "1"
+          path: FAC/demo
+      defaultRepo: example-repo
+      startAuthority:
+        type: allowlist
+        accounts: ["<Jira account id>"]
+      reviewFeedbackAllowlist:
+        bitbucket: ["<Atlassian account_id>"]
+        bitbucket-dc: ["<numeric user id>"]
+```
+
+A Jira binding must name a `defaultRepo`, the alias a ticket runs against when
+nothing picks another, and a `startAuthority` of type `allowlist` (Jira
+account ids) or `group` (a Jira `groupId`): Jira cannot report repository
+write access, so the default write check is refused. The `jira` tracker entry
+under `factory.trackers` is the Jira Cloud half of the pairing, as
+[Jira Cloud](#jira-cloud) shows it. Each code host also needs its `egress` entries: the Bitbucket
+Cloud ranges from `https://ip-ranges.atlassian.com/` on port 443, or the
+addresses your Data Center host resolves to on its port.
 
 ## Label an issue
 

@@ -369,6 +369,7 @@ if [ -n "${{CURIE_TEST_CALL_LOG:-}}" ]; then
     printf 'KUBECTL_CALL: %s\n' "$*" >> "$CURIE_TEST_CALL_LOG"
 fi
 all="$*"
+curie_test_capacity_read "$@"
 script=""
 previous=""
 for argument in "$@"; do

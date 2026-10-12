@@ -78,6 +78,8 @@ PLACEHOLDER_NAMES = frozenset(
         "company",
         "mycompany",
         "demo",
+        # The Bitbucket recordings' scrubbed workspace (#4401).
+        "example-workspace",
     }
 )
 
@@ -389,6 +391,16 @@ PLANTED: dict[str, tuple[str, str]] = {
         "bitbucket-workspace",
         "https://" + "bitbucket.org/" + _tenant() + "/app.git",
     ),
+    # The placeholder workspace is exempt only exactly; a real repository
+    # under a real workspace, or a name that merely starts with it, is not.
+    "bitbucket-api-real-workspace-example-repo": (
+        "bitbucket-workspace",
+        "https://api.bit" + "bucket.org/2.0/repositories/" + _tenant() + "/example-repo",
+    ),
+    "bitbucket-api-example-workspace-suffixed": (
+        "bitbucket-workspace",
+        "https://api.bit" + "bucket.org/2.0/repositories/example-workspace-" + _tenant() + "/app",
+    ),
     "gitlab-web": ("gitlab-group", "https://" + "gitlab.com/" + _tenant() + "/platform/app"),
     "gitlab-api": (
         "gitlab-group",
@@ -476,6 +488,12 @@ PLACEHOLDERS: dict[str, str] = {
     "atlassian-site-your-domain": "your-domain.atlassian" + ".net",
     "atlassian-site-templated": "https://{site}.atlassian" + ".net",
     "bitbucket-workspace-acme-corp": "https://api.bit" + "bucket.org/2.0/workspaces/" + "acme-corp",
+    "bitbucket-api-example-workspace": "https://api.bit"
+    + "bucket.org/2.0/repositories/"
+    + "example-workspace/example-repo/pullrequests/1",
+    "bitbucket-web-example-workspace": "https://"
+    + "bitbucket.org/"
+    + "example-workspace/example-repo",
     "bitbucket-web-route": "https://" + "bitbucket.org/" + "account/settings",
     "gitlab-group-example": "https://" + "gitlab.com/" + "example/app",
     "gitlab-api-projects": "https://" + "gitlab.com/api/v4/projects/" + "42",

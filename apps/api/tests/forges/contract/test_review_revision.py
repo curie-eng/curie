@@ -13,6 +13,8 @@ from forge_fakes.contract_harness import AdapterHarness, open_pull
 async def test_feedback_by_a_writer_is_listed_and_actionable(
     harness: AdapterHarness, kind: FeedbackKind
 ) -> None:
+    if kind not in harness.feedback_kinds:
+        pytest.skip(f"{harness.name} returns no {kind} feedback")
     harness.set_write_access(harness.writer, True)
     pull = await open_pull(harness, "factory/review")
     harness.add_review_feedback(pull.ref, harness.writer, "Please rename it.", kind)
@@ -54,7 +56,13 @@ async def test_listing_from_the_returned_cursor_yields_only_newer_feedback(
     pull = await open_pull(harness, "factory/review")
     harness.add_review_feedback(pull.ref, harness.writer, "first", FeedbackKind.COMMENT)
     first = await harness.code_host.list_review_feedback(pull.ref, None)
-    harness.add_review_feedback(pull.ref, harness.writer, "second", FeedbackKind.REVIEW)
+    # A review where the pair returns one, so the cursor spans two kinds.
+    second = (
+        FeedbackKind.REVIEW
+        if FeedbackKind.REVIEW in harness.feedback_kinds
+        else FeedbackKind.COMMENT
+    )
+    harness.add_review_feedback(pull.ref, harness.writer, "second", second)
 
     later = await harness.code_host.list_review_feedback(pull.ref, first.cursor)
     assert [item.body for item in later.items] == ["second"]
