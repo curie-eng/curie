@@ -16,6 +16,27 @@
      inconsistent. Refuse it before creating a worker Pod; the worker boot
      validator remains the backstop outside Helm. */}}
 {{- include "curie.worker.validateRunnerBudget" . }}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv "additionalReserved" (merge (dict "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "worker") | fromJson))) -}}
+{{- $checksumRefs := list
+  (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.langfuse)) "key" "langfuseInitProjectSecretKey")
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.sealing.privateKeyExistingSecret "existingSecretKey" $.Values.sealing.privateKeyExistingSecretKey "defaultKey" "sealingPrivateKey") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.sealing.previousPrivateKeyExistingSecret "existingSecretKey" $.Values.sealing.previousPrivateKeyExistingSecretKey "defaultKey" "sealingPreviousPrivateKey") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.worker.adapterCredentialsExistingSecret "existingSecretKey" $.Values.worker.adapterCredentialsExistingSecretKey "defaultKey" "adapterCredentials") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" (get ($.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get ($.Values.connectorCaller | default dict) "signingKeyKey") | default "signingKey") "defaultKey" "connectorCallerSigningKey") | fromYaml)
+-}}
+{{- $checksumHasApiKey := false -}}
+{{- range $.Values.worker.extraEnv -}}
+{{- if eq .name "CURIE_API_KEY" -}}{{- $checksumHasApiKey = true -}}{{- end -}}
+{{- end -}}
+{{- if not $checksumHasApiKey -}}
+{{- $checksumRefs = append $checksumRefs (dict "name" (include "curie.secretName" $) "key" "apiKey") -}}
+{{- end -}}
+{{- if include "curie.rustfs.staticCredentials" $ -}}
+{{- $checksumRefs = append $checksumRefs (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.rustfs)) "key" "rustfsSecretKey") -}}
+{{- end -}}
+{{- if and (or $.Values.agentSandbox.runner.credentials $.Values.agentSandbox.runner.credentialsExistingSecret) (not (and $.Values.agentSandbox.runner.fakeModel (not $.Values.inference.deploy))) -}}
+{{- $checksumRefs = append $checksumRefs (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.agentSandbox.runner.credentialsExistingSecret "existingSecretKey" $.Values.agentSandbox.runner.credentialsExistingSecretKey "defaultKey" "agentCredentials") | fromYaml) -}}
+{{- end -}}
 {{- if .Values.worker.serviceAccount.create }}
 {{/*
 The worker drives the Kubernetes API to claim and manage agent-sandbox custom
@@ -145,6 +166,13 @@ spec:
   template:
     metadata:
       annotations:
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list "internalWorkerToken" "installationId")
+        "refs" $checksumRefs
+        "env" (printf "%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "worker")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.worker.extraEnv)) $checksumExtraEnv))) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
@@ -569,7 +597,7 @@ spec:
               value: /etc/curie/github-stub/ca.pem
             {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" .Values.worker.extraEnv) | nindent 12 }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "worker" "env" .Values.worker.extraEnv "additionalReserved" (merge (dict "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "worker") | fromJson))) | nindent 12 }}
+            {{- $checksumExtraEnv | nindent 12 }}
           # No HTTP port on the worker, so an exec probe checks a heartbeat file
           # the asyncio event loop touches each tick. A wedged loop stops
           # touching it -> the file goes stale -> the probe fails -> restart.

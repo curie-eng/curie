@@ -976,8 +976,9 @@ Secret is memoized separately from its data so callers can reuse generated
 credentials without losing access to the Secret UID used by the legacy-upgrade
 bridge.
 
-Fresh installs always mint a new identity, including adoption of a retained
-Secret. Upgrades reuse the stored identity; the first upgrade from a chart that
+Sealed fresh installs always mint a new identity, including adoption of a
+retained Secret. Dev installs derive an identity from namespace/release for
+reproducible renders; reinstalling that pair in dev reuses the identity. Upgrades reuse the stored identity; the first upgrade from a chart that
 predates installationId adopts the live Secret UID and enables the one-release
 legacy bridge. A client-only upgrade has no lookup result, so it receives one
 memoized placeholder and marks the identity unobserved for the hook to refuse
@@ -992,7 +993,13 @@ before contacting Valkey.
 {{- $observed := true -}}
 {{- $legacy := false -}}
 {{- if .Release.IsInstall -}}
+{{- if eq (toString .Values.security.allowDevDefaults) "true" -}}
+{{- /* #1135, ADR-0144: dev renders are reproducible. Reinstalling the same
+namespace/release in dev reuses its identity; sealed installs remain unique. */ -}}
+{{- $installationId = (list .Release.Namespace .Release.Name | toJson | sha256sum | trunc 32) -}}
+{{- else -}}
 {{- $installationId = randAlphaNum 32 -}}
+{{- end -}}
 {{- else if .Release.IsUpgrade -}}
 {{- $encodedId := get $managedSecretData "installationId" | default "" -}}
 {{- $decodedId := "" -}}
@@ -1013,7 +1020,13 @@ before contacting Valkey.
 {{- end -}}
 {{- end -}}
 {{- else -}}
+{{- if eq (toString .Values.security.allowDevDefaults) "true" -}}
+{{- /* #1135, ADR-0144: dev renders are reproducible. Reinstalling the same
+namespace/release in dev reuses its identity; sealed installs remain unique. */ -}}
+{{- $installationId = (list .Release.Namespace .Release.Name | toJson | sha256sum | trunc 32) -}}
+{{- else -}}
 {{- $installationId = randAlphaNum 32 -}}
+{{- end -}}
 {{- end -}}
 {{- $_ = set . "_curieInstallationId" $installationId -}}
 {{- $_ = set . "_curieInstallationIdObserved" $observed -}}
@@ -1043,8 +1056,8 @@ before contacting Valkey.
      Secret's data), value (.Values.<path>), default (the published dev default),
      hex (true for the 64-hex encryption key, else false).
 
-     The existing Secret's data is looked up ONCE by the caller (secrets.yaml) and
-     passed in as `.existingData` (an always-present dict, empty under `helm
+     The existing Secret's data is looked up ONCE by installationIdentity.init and
+     passed by secretContent.init as `.existingData` (an always-present dict, empty under `helm
      template`/--dry-run/first install), so this helper does no per-key lookup.
 
      A legacy retained values set can omit a key that a newer chart adds. Treat
@@ -1108,6 +1121,101 @@ before contacting Valkey.
 {{- else -}}
 {{- randAlphaNum 32 -}}
 {{- end -}}
+{{- end -}}
+
+{{/* Resolve the full plaintext Secret once per root render (#1135). Every
+consumer checksum and the Secret emission read this same dict, so generated
+credentials and the derived collector header cannot disagree. */}}
+{{- define "curie.secretContent.init" -}}
+{{- if not (hasKey . "_curieSecretContent") -}}
+{{- include "curie.checkDefaultCredentials" . }}
+{{- if eq (toString .Values.api.approvalChatAttesterSecret) (toString .Values.api.apiKey) }}
+{{- fail "api.approvalChatAttesterSecret and api.apiKey must differ. Set the Slack approval attestation credential independently; neither value is printed because both are live credentials." }}
+{{- end }}
+{{- include "curie.installationIdentity.init" . -}}
+{{- $existingSecret := get . "_curieManagedSecret" | default dict -}}
+{{- $existingSecretData := $existingSecret.data | default dict -}}
+{{- include "curie.connectorCallerRefuseKeylessDevExit" (dict "root" . "existingData" $existingSecretData) -}}
+{{- $apiKey := .Values.api.apiKey -}}
+{{- if kindIs "invalid" $apiKey -}}
+{{- $apiKey = "curie-dev-key" -}}
+{{- end -}}
+{{- if eq (trim (toString $apiKey)) "" -}}
+{{- fail "api.apiKey must be nonblank. Set a nonblank API key." -}}
+{{- end -}}
+{{- if and (ne (toString .Values.security.allowDevDefaults) "true") (eq (toString $apiKey) "curie-dev-key") (hasKey $existingSecretData "apiKey") -}}
+{{- if eq (trim (index $existingSecretData "apiKey" | b64dec)) "" -}}
+{{- fail "api.apiKey: retained apiKey in the existing chart managed Secret must be nonblank. Set api.apiKey to a nonblank replacement." -}}
+{{- end -}}
+{{- end -}}
+{{- $langfuseInitProjectSecretKey := include "curie.managedSecret" (dict "root" . "key" "langfuseInitProjectSecretKey" "value" .Values.langfuse.init.projectSecretKey "default" "sk-lf-curie-dev" "hex" false "existingData" $existingSecretData) -}}
+{{- $langfuseInitUserPassword := include "curie.managedSecret" (dict "root" . "key" "langfuseInitUserPassword" "value" .Values.langfuse.init.userPassword "default" "curie-dev-password" "hex" false "existingData" $existingSecretData) -}}
+{{- $content := dict -}}
+{{- $_ := set $content "installationId" ((include "curie.installationId" .) | toString) -}}
+{{- $_ := set $content "postgresPassword" ((include "curie.managedSecret" (dict "root" . "key" "postgresPassword" "value" .Values.postgres.auth.password "default" "postgres" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "valkeyPassword" ((include "curie.managedSecret" (dict "root" . "key" "valkeyPassword" "value" .Values.valkey.password "default" "valkeypass" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "clickhousePassword" ((include "curie.managedSecret" (dict "root" . "key" "clickhousePassword" "value" .Values.clickhouse.auth.password "default" "clickhouse" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "rustfsSecretKey" ((include "curie.managedSecret" (dict "root" . "key" "rustfsSecretKey" "value" .Values.rustfs.auth.secretKey "default" "rustfssecret" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "langfuseSalt" ((include "curie.managedSecret" (dict "root" . "key" "langfuseSalt" "value" .Values.langfuse.salt "default" "dev-salt-change-me" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "langfuseEncryptionKey" ((include "curie.managedSecret" (dict "root" . "key" "langfuseEncryptionKey" "value" .Values.langfuse.encryptionKey "default" "0000000000000000000000000000000000000000000000000000000000000000" "hex" true "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "langfuseNextauthSecret" ((include "curie.managedSecret" (dict "root" . "key" "langfuseNextauthSecret" "value" .Values.langfuse.nextauthSecret "default" "dev-nextauth-secret-change-me" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "langfuseInitProjectSecretKey" (($langfuseInitProjectSecretKey) | toString) -}}
+{{- $_ := set $content "langfuseInitUserPassword" (($langfuseInitUserPassword) | toString) -}}
+{{- if eq (include "curie.otlpAuthHeaderSecretName" .) (include "curie.secretName" .) -}}
+{{- $_ := set $content "otlpAuthHeader" ((.Values.otelCollector.otlpAuthHeader | default (printf "Basic %s" (printf "%s:%s" .Values.langfuse.init.projectPublicKey $langfuseInitProjectSecretKey | b64enc))) | toString) -}}
+{{- end -}}
+{{- $_ := set $content "agentCredentials" ((.Values.agentSandbox.runner.credentials) | toString) -}}
+{{- $_ := set $content "adapterCredentials" ((include "curie.adapterCredentials" .) | toString) -}}
+{{- $_ := set $content "apiKey" ((include "curie.managedSecret" (dict "root" . "key" "apiKey" "value" .Values.api.apiKey "default" "curie-dev-key" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "approvalChatAttesterSecret" ((include "curie.managedSecret" (dict "root" . "key" "approvalChatAttesterSecret" "value" .Values.api.approvalChatAttesterSecret "default" "curie-dev-approval-chat-attester" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "internalWorkerToken" ((include "curie.managedSecret" (dict "root" . "key" "internalWorkerToken" "value" .Values.worker.internalWorkerToken "default" "curie-dev-worker-token" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "githubWebhookSecret" ((include "curie.managedSecret" (dict "root" . "key" "githubWebhookSecret" "value" .Values.api.githubWebhookSecret "default" "dev-webhook-secret" "hex" false "existingData" $existingSecretData)) | toString) -}}
+{{- $_ := set $content "githubToken" ((.Values.api.githubToken | default "") | toString) -}}
+{{- $_ := set $content "githubAppPrivateKey" ((.Values.api.githubAppPrivateKey | default "") | toString) -}}
+{{- $_ := set $content "sealingPrivateKey" ((.Values.sealing.privateKey | default "") | toString) -}}
+{{- $_ := set $content "sealingPreviousPrivateKey" ((.Values.sealing.previousPrivateKey | default "") | toString) -}}
+{{- $_ := set $content "connectorCallerSigningKey" ((include "curie.connectorCallerSigningKey" .) | toString) -}}
+{{- $_ := set $content "connectorCallerVerifyKey" ((include "curie.connectorCallerVerifyKey" .) | toString) -}}
+{{- $_ := set $content "slackAppToken" ((.Values.dispatcher.slack.appToken) | toString) -}}
+{{- $_ := set $content "slackBotToken" ((.Values.dispatcher.slack.botToken) | toString) -}}
+{{- $_ := set $content "slackSigningSecret" ((.Values.dispatcher.slack.signingSecret) | toString) -}}
+{{- if not .Values.mailAdapter.agentmail.apiKeyExistingSecret -}}
+{{- $_ := set $content "mailAgentmailApiKey" ((.Values.mailAdapter.agentmail.apiKey) | toString) -}}
+{{- end -}}
+{{- if not .Values.mailAdapter.channelTokenExistingSecret -}}
+{{- $_ := set $content "mailChannelToken" ((.Values.mailAdapter.channelToken) | toString) -}}
+{{- end -}}
+{{- if not .Values.mailAdapter.egressSecretExistingSecret -}}
+{{- $_ := set $content "mailEgressSecret" ((.Values.mailAdapter.egressSecret) | toString) -}}
+{{- end -}}
+{{- $_ := set . "_curieSecretContent" $content -}}
+{{- end -}}
+{{- end -}}
+
+{{/* Hash only chart-owned keys consumed by this pod. Call with root, keys
+(unconditional chart keys), refs (resolved secretKeyRefs), and env (rendered
+shared/extraEnv fragments). Foreign Secret contents are never looked up here.
+An absent optional key hashes null rather than inventing a credential. */}}
+{{- define "curie.secretChecksum" -}}
+{{- include "curie.secretContent.init" .root -}}
+{{- $secretName := include "curie.secretName" .root -}}
+{{- $content := get .root "_curieSecretContent" -}}
+{{- $refs := .refs | default list -}}
+{{- range (.keys | default list) -}}
+{{- $refs = append $refs (dict "name" $secretName "key" .) -}}
+{{- end -}}
+{{- $env := fromYaml (printf "env:\n%s" ((.env | default "") | indent 2)) -}}
+{{- range ($env.env | default list) -}}
+{{- $ref := get (.valueFrom | default dict) "secretKeyRef" | default dict -}}
+{{- if $ref -}}{{- $refs = append $refs $ref -}}{{- end -}}
+{{- end -}}
+{{- $subset := dict -}}
+{{- range $refs -}}
+{{- if eq .name $secretName -}}
+{{- $_ := set $subset .key (index $content .key) -}}
+{{- end -}}
+{{- end -}}
+{{- if $subset -}}{{- $subset | toJson | sha256sum -}}{{- end -}}
 {{- end -}}
 
 {{/* ---- Shared first-party-app environment fragments ---- */}}

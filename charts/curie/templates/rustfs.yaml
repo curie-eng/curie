@@ -48,9 +48,20 @@ spec:
         {{- end }}
         {{- include "curie.statefulPodLabels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "rustfs") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "data")) }}
+      {{- $placementAnnotations := include "curie.placement.annotations" (dict "root" $ "class" "data") }}
+      {{- $secretChecksum := include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" (list (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.rustfs)) "key" "rustfsSecretKey"))
+        "env" "") }}
+      {{- if or $placementAnnotations $secretChecksum }}
       annotations:
+        {{- with $placementAnnotations }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- with $secretChecksum }}
+        checksum/secret: {{ . }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "data")) }}

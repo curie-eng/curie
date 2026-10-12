@@ -65,9 +65,20 @@ spec:
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "langfuse-web") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
+      {{- $placementAnnotations := include "curie.placement.annotations" (dict "root" $ "class" "platform") }}
+      {{- $secretChecksum := include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" (list (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.langfuse)) "key" "langfuseNextauthSecret") (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.langfuse)) "key" "langfuseInitProjectSecretKey") (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.langfuse)) "key" "langfuseInitUserPassword"))
+        "env" (include "curie.langfuse.env" $)) }}
+      {{- if or $placementAnnotations $secretChecksum }}
       annotations:
+        {{- with $placementAnnotations }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- with $secretChecksum }}
+        checksum/secret: {{ . }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}
@@ -178,9 +189,20 @@ spec:
         {{- end }}
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "langfuse-worker") | nindent 8 }}
-      {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
+      {{- $placementAnnotations := include "curie.placement.annotations" (dict "root" $ "class" "platform") }}
+      {{- $secretChecksum := include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list )
+        "refs" (list)
+        "env" (include "curie.langfuse.env" $)) }}
+      {{- if or $placementAnnotations $secretChecksum }}
       annotations:
+        {{- with $placementAnnotations }}
         {{- . | nindent 8 }}
+        {{- end }}
+        {{- with $secretChecksum }}
+        checksum/secret: {{ . }}
+        {{- end }}
       {{- end }}
     spec:
       {{- with (include "curie.placement.spec" (dict "root" $ "class" "platform")) }}

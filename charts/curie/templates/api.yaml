@@ -4,6 +4,16 @@
 {{- $connectorProxyPullSecrets = append $connectorProxyPullSecrets .name }}
 {{- end }}
 {{- if .Values.api.deploy }}
+{{- $checksumExtraEnv := include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity" "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) -}}
+{{- $checksumRefs := list
+  (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.langfuse)) "key" "langfuseInitProjectSecretKey")
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.api.githubTokenExistingSecret "existingSecretKey" $.Values.api.githubTokenExistingSecretKey "defaultKey" "githubToken") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" $.Values.api.githubAppPrivateKeyExistingSecret "existingSecretKey" $.Values.api.githubAppPrivateKeyExistingSecretKey "defaultKey" "githubAppPrivateKey") | fromYaml)
+  (include "curie.secretRef" (dict "root" $ "existingSecret" (get ($.Values.connectorCaller | default dict) "existingSecret") "existingSecretKey" ((get ($.Values.connectorCaller | default dict) "verifyKeyKey") | default "verifyKey") "defaultKey" "connectorCallerVerifyKey") | fromYaml)
+-}}
+{{- if include "curie.rustfs.staticCredentials" $ -}}
+{{- $checksumRefs = append $checksumRefs (dict "name" (include "curie.storeSecretName" (dict "root" $ "store" $.Values.rustfs)) "key" "rustfsSecretKey") -}}
+{{- end -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -50,6 +60,13 @@ spec:
         {{- include "curie.labels" . | nindent 8 }}
         {{- include "curie.selectorLabels" (dict "root" . "component" "api") | nindent 8 }}
       annotations:
+        {{- with (include "curie.secretChecksum" (dict
+        "root" $
+        "keys" (list "apiKey" "approvalChatAttesterSecret" "internalWorkerToken" "installationId" "githubWebhookSecret")
+        "refs" $checksumRefs
+        "env" (printf "%s\n%s\n%s\n%s\n%s" (include "curie.env.postgres" $) (include "curie.env.valkey" $) (include "curie.env.slack" (dict "root" $ "workload" "api")) (include "curie.env.otel" (dict "root" $ "extraEnv" $.Values.api.extraEnv)) $checksumExtraEnv))) }}
+        checksum/secret: {{ . }}
+        {{- end }}
         {{- with (include "curie.placement.annotations" (dict "root" $ "class" "platform")) }}
         {{- . | nindent 8 }}
         {{- end }}
@@ -403,7 +420,7 @@ spec:
             - name: REQUESTS_CA_BUNDLE
               value: /etc/curie/github-stub/ca.pem
             {{- end }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "api" "env" .Values.api.extraEnv "additionalReserved" (merge (dict "FORWARDED_ALLOW_IPS" "socket peer identity" "S3_REGION" "rustfs.region") (include "curie.slack.reservedEnv" (dict "root" . "workload" "api") | fromJson))) | nindent 12 }}
+            {{- $checksumExtraEnv | nindent 12 }}
           ports:
             - name: http
               containerPort: 8000
