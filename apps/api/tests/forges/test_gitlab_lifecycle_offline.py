@@ -234,12 +234,14 @@ def test_gitlab_lifecycle_label_to_merge_request_ci_review_and_cancel(
     assert minted.status_code == 200, minted.text
     context = minted.json()
     assert context["observed_title"] == publication["title"]
+    gl.outcome_durable(publication["id"])
     revised = gl.publish(
         install,
         deployment_id,
         item,
         request_row,
         title="Fix the widget parser off-by-one",
+        base_sha=head,
         observed={
             "observed_title": context["observed_title"],
             "observed_body_sha256": context["observed_body_sha256"],

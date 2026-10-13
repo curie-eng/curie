@@ -465,8 +465,13 @@ def publish(
     *,
     title: str = "Keep the last field of a line",
     observed: dict[str, Any] | None = None,
+    base_sha: str | None = None,
 ) -> httpx.Response:
-    """The worker's publication for the running request, as the bundle sends it."""
+    """The worker's publication for the running request, as the bundle sends it.
+
+    A first publication is based on the default branch head; a revision on
+    the merge request's current head, which the worker passes as ``base_sha``.
+    """
 
     payload: dict[str, Any] = {
         "deployment_id": deployment_id,
@@ -479,7 +484,7 @@ def publish(
         "reply_channel": request["reply_address"],
         "reply_placeholder": f"gitlab-{item['tracker_issue_id']}",
         "dedupe_key": f"gitlab-publication-{uuid.uuid4().hex}",
-        "base_sha": install.fake.branches[gitlab_fake.DEFAULT_BRANCH],
+        "base_sha": base_sha or install.fake.branches[gitlab_fake.DEFAULT_BRANCH],
         "work_item_request_id": str(request["id"]),
         "work_item_runtime_epoch": request["runtime_epoch"],
         "patch_b64": PATCH_B64,
@@ -498,6 +503,15 @@ def approve(publication_id: str) -> None:
 
     execute(
         "UPDATE curie.publications SET status = 'approved' WHERE id = :id",
+        {"id": uuid.UUID(publication_id)},
+    )
+
+
+def outcome_durable(publication_id: str) -> None:
+    """The worker's publication loop marking the outcome durable in thread history."""
+
+    execute(
+        "UPDATE curie.publications SET outcome_history_ready_at = now() WHERE id = :id",
         {"id": uuid.UUID(publication_id)},
     )
 
