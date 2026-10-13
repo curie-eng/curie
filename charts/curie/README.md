@@ -1294,7 +1294,8 @@ ServiceAccount enforce the shape (Kubernetes 1.30 or newer, rendered with
   `automountServiceAccountToken: false`, no projected token), the chart runner
   ServiceAccount, no privileged container, added capability or host port, and
   only images the chart renders (the runner image, each
-  `agentSandbox.runnerImages` entry, the bundle-fetch images when enabled) plus
+  `agentSandbox.runnerImages` entry, repository runner images from
+  `factory.bindings[].repos[].runner.image`, the bundle-fetch images when enabled) plus
   `agentSandbox.runner.admission.extraImages`.
 - `<fullname>-runner-claim-cleanup` lets the worker delete only SandboxTemplates
   labelled `curietech.ai/sandbox-claim`, never the chart's.
@@ -1306,6 +1307,27 @@ worker, or langfuse ServiceAccount's. It cannot see the role's IAM policy or an
 EKS Pod Identity association, so keep the runner role read-only on the bundle
 bucket. The Docker substrate is unchanged: it has no Secret and still passes
 tokens in the container env.
+
+**Factory repository runner resources (ADR 0216).** Repository `runner`
+declarations under `factory.bindings[].repos[]` add one SandboxTemplate and
+SandboxWarmPool per factory agent and distinct image index digest. Repositories
+sharing a digest share the pair. The runner, workspace-init and attachments-init
+containers use the repository image while preserving the agent's connector
+Secret references, label, workspace limit, placement and security settings.
+The chart prewarms these images and includes them in runner admission.
+
+When repository runners are configured, the current repository-keyed map requires
+exactly one true agent in `factory.sandboxEgress`, `agentSandbox.deploy: true`,
+and the chart-managed `worker.warmPool`. Template names are
+`<fullname>-agent-<agent>-img-<first12-indexhex>-runner`, with `-pool` appended
+for pools. Pool names must fit 63 characters. Conflicting duplicate repository
+declarations, conflicting image identities and digest-prefix or ordinary-agent
+name collisions fail rendering.
+
+The chart produces `CURIE_REPO_RUNNER_POOLS` only when repository runners exist.
+It maps repository paths to pool names, index and platform digests, base digest,
+Docker setting and egress. Worker `extraEnv` cannot set this reserved name.
+Worker repository routing remains deferred.
 
 **Credential access.** A sandbox can inspect credentials injected into its own
 process, including any explicitly configured shared model credential. Operators

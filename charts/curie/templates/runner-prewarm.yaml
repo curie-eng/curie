@@ -113,6 +113,17 @@ spec:
             {{- toYaml $runner.prewarm.resources | nindent 12 }}
         {{- end }}
         {{- end }}
+        {{- range include "curie.factory.repoRunnerDescriptors" . | fromJsonArray }}
+        {{- if not (has .image $seen) }}
+        {{- $seen = append $seen .image }}
+        - name: prewarm-img-{{ .prefix }}
+          image: {{ .image | quote }}
+          imagePullPolicy: {{ $runner.prewarm.imagePullPolicy }}
+          command: ["sleep", "infinity"]
+          resources:
+            {{- toYaml $runner.prewarm.resources | nindent 12 }}
+        {{- end }}
+        {{- end }}
         {{- if $runner.bundleFetch.enabled }}
         # Same values keys as the sandbox init pair in agent-sandbox.yaml -- a
         # hardcoded ref here would drift from the claim path the first time an
