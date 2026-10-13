@@ -12,11 +12,12 @@ updates:
       github-actions:
         patterns: ["*"]
 
-  # Rust crates. Both committed Cargo.lock files are tracked.
+  # Rust crates. All three committed Cargo.lock files are tracked.
   - package-ecosystem: cargo
     directories:
       - /cli
       - /packages/aci-protocol/generated/rust
+      - /apps/docker-daemon
     schedule:
       interval: weekly
     labels: ["dependencies"]
@@ -75,6 +76,7 @@ updates:
     directories:
       - /apps/api
       - /apps/dispatcher
+      - /apps/docker-daemon
       - /apps/mail-adapter
       - /apps/ui
       - /apps/worker

@@ -10,6 +10,8 @@ on:
       - cli/Cargo.toml
       - packages/aci-protocol/generated/rust/Cargo.lock
       - packages/aci-protocol/generated/rust/Cargo.toml
+      - apps/docker-daemon/Cargo.lock
+      - apps/docker-daemon/Cargo.toml
       - uv.lock
       - "**/pyproject.toml"
       - apps/ui/pnpm-lock.yaml
@@ -42,13 +44,16 @@ jobs:
           persist-credentials: false
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      # Both committed Cargo.lock files are audited. cargo-audit reads the
+      # Every committed Cargo.lock file is audited. cargo-audit reads the
       # Cargo.lock in the working directory and fails the job on any advisory.
       - name: Audit cli crate
         working-directory: cli
         run: cargo audit
       - name: Audit generated ACI protocol crate
         working-directory: packages/aci-protocol/generated/rust
+        run: cargo audit
+      - name: Audit Docker authorization plugin crate
+        working-directory: apps/docker-daemon
         run: cargo audit
 
   python-audit:

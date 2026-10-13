@@ -18,6 +18,8 @@ EXPECTED_PATHS = [
     "cli/Cargo.toml",
     "packages/aci-protocol/generated/rust/Cargo.lock",
     "packages/aci-protocol/generated/rust/Cargo.toml",
+    "apps/docker-daemon/Cargo.lock",
+    "apps/docker-daemon/Cargo.toml",
     "uv.lock",
     "**/pyproject.toml",
     "apps/ui/pnpm-lock.yaml",
@@ -81,6 +83,7 @@ def test_every_audited_lockfile_is_covered() -> None:
     assert _audited_lockfiles(workflow) == {
         "cli/Cargo.lock",
         "packages/aci-protocol/generated/rust/Cargo.lock",
+        "apps/docker-daemon/Cargo.lock",
         "uv.lock",
         "apps/ui/pnpm-lock.yaml",
         "tools/contract-codegen/pnpm-lock.yaml",

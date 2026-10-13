@@ -23,6 +23,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 FIRST_PARTY_DOCKERFILES = (
     "apps/api/Dockerfile",
     "apps/dispatcher/Dockerfile",
+    "apps/docker-daemon/Dockerfile",
     "apps/mail-adapter/Dockerfile",
     "apps/ui/Dockerfile",
     "apps/worker/Dockerfile",
