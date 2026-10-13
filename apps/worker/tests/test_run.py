@@ -461,9 +461,7 @@ def test_docker_runner_snapshot_checks_the_claims_code_host_origin(
         },
     )
     assert not any(arg.startswith("CURIE_GITHUB_API_URL=") for arg in calls[0])
-    forwarded = dict(
-        arg.partition("=")[::2] for arg in calls[0] if arg.startswith("CURIE_REPO_")
-    )
+    forwarded = dict(arg.partition("=")[::2] for arg in calls[0] if arg.startswith("CURIE_REPO_"))
     assert forwarded == {"CURIE_REPO_ORIGIN": origin, "CURIE_REPO_PATH": repo_name}
     for args in (
         ("init", "--quiet"),
@@ -474,10 +472,19 @@ def test_docker_runner_snapshot_checks_the_claims_code_host_origin(
     subprocess.run(["git", "add", "."], cwd=tmp_path, check=True, capture_output=True)
     subprocess.run(
         [
-            "git", "-c", "user.name=Curie Test", "-c", "user.email=curie@example.com",
-            "commit", "--quiet", "-m", "Initial fixture",
+            "git",
+            "-c",
+            "user.name=Curie Test",
+            "-c",
+            "user.email=curie@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "Initial fixture",
         ],
-        cwd=tmp_path, check=True, capture_output=True,
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
     )
     (tmp_path / "README.md").write_text("Code host change\n")
 
@@ -1528,6 +1535,53 @@ def test_substrate_config_reads_connector_secret_pools() -> None:
     assert _substrate_config({}).connector_secret_pools == frozenset()
     config = _substrate_config({"CURIE_AGENT_CONNECTOR_SECRET_POOLS": "acme-a, acme-b,"})
     assert config.connector_secret_pools == frozenset({"acme-a", "acme-b"})
+
+
+_RUNNER_DIGEST = "sha256:" + "d" * 64
+_REPO_POOL_ENTRY = {
+    "pool": "acme-api-runner",
+    "digests": ["sha256:" + c * 64 for c in "abc"],
+    "base": _RUNNER_DIGEST,
+    "docker": False,
+}
+
+
+def test_substrate_config_reads_repo_runner_pools() -> None:
+    from curie_worker.repo_runner_pools import RepoRunnerPool
+
+    assert dict(_substrate_config({}).repo_runner_pools) == {}
+    config = _substrate_config(
+        {"CURIE_REPO_RUNNER_POOLS": json.dumps({"acme-corp/api": _REPO_POOL_ENTRY})}
+    )
+    assert dict(config.repo_runner_pools) == {
+        "acme-corp/api": RepoRunnerPool.model_validate(_REPO_POOL_ENTRY)
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ['{"acme-corp/api":', json.dumps({"acme-corp/api": {**_REPO_POOL_ENTRY, "pool": "Bad_Pool"}})],
+    ids=["malformed-json", "bad-entry"],
+)
+def test_substrate_config_refuses_invalid_repo_runner_pools(raw: str) -> None:
+    with pytest.raises(ValueError, match="CURIE_REPO_RUNNER_POOLS"):
+        _substrate_config({"CURIE_REPO_RUNNER_POOLS": raw})
+
+
+@pytest.mark.parametrize(
+    ("image", "expected"),
+    [
+        (f"ghcr.io/x/curie-runner:v1@{_RUNNER_DIGEST}", _RUNNER_DIGEST),
+        ("ghcr.io/x/curie-runner:v1", None),
+    ],
+    ids=["pinned", "tag-only"],
+)
+def test_substrate_config_reads_the_platform_runner_digest(
+    image: str, expected: str | None
+) -> None:
+    assert _substrate_config({}).platform_runner_digest is None
+    config = _substrate_config({"CURIE_RUNNER_IMAGE": image})
+    assert config.platform_runner_digest == expected
 
 
 # -- _supervise: quiet boot while dependencies come up (#3079) ---------------

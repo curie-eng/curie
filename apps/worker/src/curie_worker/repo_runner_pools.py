@@ -1,12 +1,14 @@
-"""Pure schema for the deferred CURIE_REPO_RUNNER_POOLS worker input.
+"""Schema and reader for the CURIE_REPO_RUNNER_POOLS worker input (ADR 0216).
 
-No environment reader or pool selection exists here. Pool names are opaque:
-later chart rendering owns the agent and digest identity behind each name.
+The worker parses this at startup; the sandbox substrate selects a
+repository's pool from it. Pool names are opaque: chart rendering owns the
+agent and digest identity behind each name.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from ipaddress import ip_network
 from typing import Annotated, Any, Literal
 
@@ -19,8 +21,12 @@ from pydantic import (
     StrictInt,
     StrictStr,
     TypeAdapter,
+    ValidationError,
     field_validator,
 )
+
+REPO_RUNNER_POOLS_ENV = "CURIE_REPO_RUNNER_POOLS"
+_IMAGE_DIGEST = re.compile(r"@(sha256:[0-9a-f]{64})$")
 
 Digest = Annotated[StrictStr, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
 RepositoryPath = Annotated[
@@ -72,8 +78,30 @@ class RepoRunnerPools(RootModel[dict[RepositoryPath, RepoRunnerPool]]):
     model_config = ConfigDict(frozen=True)
 
 
+def parse_repo_runner_pools(raw: str | None) -> RepoRunnerPools:
+    """Parse the env value; blank is empty, anything invalid fails closed."""
+
+    if raw is None or not raw.strip():
+        return RepoRunnerPools({})
+    try:
+        return RepoRunnerPools.model_validate_json(raw)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        raise ValueError(
+            f"{REPO_RUNNER_POOLS_ENV} is not a valid repository runner pool map: "
+            f"{exc.error_count()} error(s), first at {first['loc']}: {first['msg']}"
+        ) from None
+
+
+def platform_runner_digest(image: str | None) -> str | None:
+    """The ``sha256:`` digest pinned on a runner image reference, or None."""
+
+    match = _IMAGE_DIGEST.search(image or "")
+    return match.group(1) if match else None
+
+
 def build_schema() -> dict[str, Any]:
-    """Export the pool input without adding a runtime consumer."""
+    """Export the pool input as a JSON Schema document."""
 
     schema = RepoRunnerPools.model_json_schema()
     schema["propertyNames"] = TypeAdapter(RepositoryPath).json_schema()

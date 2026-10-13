@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Protocol
@@ -22,6 +22,8 @@ from aci_protocol.service_config import API_KEY_ENV
 from aci_protocol.slack_identities import SLACK_CREDENTIAL_ENV_PREFIXES
 from curie_internal.keyspace import SANDBOX_KEY_PREFIX_DEFAULT
 from plugin_format import is_reserved_boot_env_name
+
+from ..repo_runner_pools import RepoRunnerPool
 
 # Substrate-neutral labels: every backend tags its managed objects with these
 # (the Kubernetes adapter on claims, the Docker adapter on containers), so they
@@ -68,6 +70,12 @@ def agent_warm_pool_name(base_pool: str, agent_name: str | None) -> str:
     return f"{prefix}-agent-{agent_name}{_GENERIC_POOL_SUFFIX}"
 
 
+def has_connector_secrets(env: Mapping[str, str] | None) -> bool:
+    """Whether ``env`` carries a non-blank ``connector_secret_keys`` marker."""
+
+    return bool((env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip())
+
+
 def claim_warm_pool(
     base_pool: str,
     env: Mapping[str, str] | None,
@@ -92,8 +100,7 @@ def claim_warm_pool(
     if not agent_name:
         return base_pool
     pool = agent_warm_pool_name(base_pool, agent_name)
-    marker = (env or {}).get(BootEnv.env_key("connector_secret_keys"), "").strip()
-    if marker:
+    if has_connector_secrets(env):
         # A non-chart base pool yields no derivable per-agent name.
         if agent_name in connector_secret_pools and pool != base_pool:
             return pool
@@ -101,6 +108,27 @@ def claim_warm_pool(
     if agent_name in agent_pools:
         return pool
     return base_pool
+
+
+def repo_runner_entry(
+    workspace_repo: str | None, pools: Mapping[str, RepoRunnerPool]
+) -> tuple[str, RepoRunnerPool] | None:
+    """The CURIE_REPO_RUNNER_POOLS entry bound to ``workspace_repo``, or None.
+
+    GitHub names compare case-insensitively, as the kernel's repository fence
+    does, so an exact key wins and a casefold match is the fallback.
+    """
+
+    if not workspace_repo or not pools:
+        return None
+    entry = pools.get(workspace_repo)
+    if entry is not None:
+        return workspace_repo, entry
+    wanted = workspace_repo.casefold()
+    for key, candidate in pools.items():
+        if key.casefold() == wanted:
+            return key, candidate
+    return None
 
 
 # The worker's own credentials, which never enter a sandbox. The connector
@@ -144,18 +172,13 @@ def filter_agent_child_env(env: Mapping[str, str] | None) -> dict[str, str]:
     if env is None:
         return {}
     declared_connector_secret_names = {
-        name
-        for name in env.get(BootEnv.env_key("connector_secret_keys"), "").split(",")
-        if name
+        name for name in env.get(BootEnv.env_key("connector_secret_keys"), "").split(",") if name
     }
     return {
         name: value
         for name, value in env.items()
         if not _is_host_application_credential(name)
-        or (
-            name in declared_connector_secret_names
-            and not is_reserved_boot_env_name(name)
-        )
+        or (name in declared_connector_secret_names and not is_reserved_boot_env_name(name))
     }
 
 
@@ -224,6 +247,13 @@ class SandboxHandle:
     # The ``CURIE_BUNDLE_REF`` this runner booted with (ADR 0100), or None on a
     # route written before the field existed. Worker internal, never on ACI.
     bundle_ref: str | None = None
+    # The repository runner image this runner booted from (ADR 0216): the
+    # entry's index, amd64 and arm64 digests and its Docker flag. None and
+    # False for an agent or generic pool, and on a route written before the
+    # fields existed. A retained route whose pair no longer matches its
+    # repository's entry is replaced, not reused.
+    runner_digests: tuple[str, ...] | None = None
+    runner_docker: bool = False
 
     @property
     def sandbox_id(self) -> str:
@@ -252,6 +282,9 @@ class RouteRecord:
     def from_json(cls, raw: str) -> RouteRecord:
         payload = json.loads(raw)
         state = RouteState(payload.pop("state", RouteState.LIVE.value))
+        # JSON has no tuple; equality with a freshly claimed handle needs one.
+        if payload.get("runner_digests") is not None:
+            payload["runner_digests"] = tuple(payload["runner_digests"])
         return cls(handle=SandboxHandle(**payload), state=state)
 
 
@@ -285,6 +318,13 @@ class SubstrateConfig:
     # The subset whose pool template carries connector secrets
     # (agentSandbox.connectorSecrets), from CURIE_AGENT_CONNECTOR_SECRET_POOLS.
     connector_secret_pools: frozenset[str] = frozenset()
+    # Repository runner pools (ADR 0216), from CURIE_REPO_RUNNER_POOLS. A
+    # repository with an entry claims its pool; one without routes as above.
+    # Excluded from the hash: a dict is not hashable.
+    repo_runner_pools: Mapping[str, RepoRunnerPool] = field(default_factory=dict, hash=False)
+    # The digest pinned on CURIE_RUNNER_IMAGE, or None when it is a bare tag.
+    # An entry's runner must have been built on exactly this image.
+    platform_runner_digest: str | None = None
     runner_port: int = 8080
     # How long a live route stays bound with no touch. After expiry the claim
     # is an orphan and reap_orphans() deletes it.
@@ -443,9 +483,7 @@ class SandboxClient(Protocol):
 
         ...
 
-    def get_claim(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> ClaimView | None: ...
+    def get_claim(self, name: str, *, request_timeout_seconds: float) -> ClaimView | None: ...
 
     def delete_claim(self, name: str, *, request_timeout_seconds: float) -> None: ...
 
@@ -461,9 +499,7 @@ class SandboxClient(Protocol):
 
         ...
 
-    def get_sandbox(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> SandboxView | None: ...
+    def get_sandbox(self, name: str, *, request_timeout_seconds: float) -> SandboxView | None: ...
 
     def quota_has_headroom(
         self,
@@ -472,9 +508,7 @@ class SandboxClient(Protocol):
         request_timeout_seconds: float,
     ) -> bool: ...
 
-    def pod_unschedulable(
-        self, name: str, *, request_timeout_seconds: float
-    ) -> str | None:
+    def pod_unschedulable(self, name: str, *, request_timeout_seconds: float) -> str | None:
         """The scheduler's message when pod ``name`` is ``PodScheduled=False``
         with reason ``Unschedulable``; None when it is scheduled, missing, or
         unreadable."""
@@ -527,6 +561,45 @@ class MissingAgentPoolError(SandboxError):
             f"{pool} was not rendered; set agentSandbox.connectorSecrets.{agent_name} "
             "in the release values and upgrade"
         )
+
+
+class RepoRunnerPoolRefused(MissingAgentPoolError):
+    """A repository's bound runner pool cannot serve this installation (ADR 0216).
+
+    ``reason`` is ``missing_pool`` (the SandboxWarmPool was not rendered) or
+    ``stale_base`` (the runner was built on another platform runner image, or
+    this installation's runner image is unpinned). A subclass of
+    MissingAgentPoolError so the kernel answers once and never retries:
+    only a redeploy of the repository's runner fixes either.
+    """
+
+    def __init__(
+        self,
+        *,
+        repo: str,
+        pool: str,
+        reason: Literal["missing_pool", "stale_base"],
+        agent_name: str | None = None,
+        base: str | None = None,
+        platform_digest: str | None = None,
+    ) -> None:
+        self.agent_name = agent_name or ""
+        self.pool = pool
+        self.repo = repo
+        self.reason = reason
+        fix = f"`curie cluster factory --repo {repo}`"
+        if reason == "missing_pool":
+            message = (
+                f"repository {repo} is bound to runner pool {pool}, but SandboxWarmPool "
+                f"{pool} was not rendered (missing_pool); redeploy its runner with {fix}"
+            )
+        else:
+            message = (
+                f"repository {repo} runner image was built on platform runner {base}, "
+                f"not this installation's {platform_digest or 'unpinned runner image'} "
+                f"(stale_base); rebuild it with {fix}"
+            )
+        SandboxError.__init__(self, message)
 
 
 class CapacityExhaustedError(SandboxError):
