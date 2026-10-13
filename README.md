@@ -5,16 +5,16 @@
 [![Latest release](https://img.shields.io/github/v/release/curie-eng/curie)](https://github.com/curie-eng/curie/releases)
 [![Docs](https://img.shields.io/badge/Docs-index-blue.svg)](docs/README.md)
 
-**Turn agents into co-workers. Run them in your infrastructure.**
+**Turn agents into co-workers. Run them in your infrastructure. Start with a Software Factory co-worker**
 
 Curie brings agents into the workspaces your team already uses. Delegate work,
 follow progress, approve restricted actions, and inspect the result. The platform
 is Apache-2.0 and runs in your infrastructure, with shared memory facilities,
 model configuration, and cost visibility.
 
-Start with a **Software Factory** that turns assigned GitHub issues into reviewed
+Start with a **Software Factory co-worker** that turns assigned GitHub issues into reviewed
 pull requests, or an **SRE co-worker** that investigates Kubernetes workloads from
-Slack. Then bring your existing supported skills and tools onto the same platform.
+Slack. Then convert your existing agents into a co-worker with supported skills and tools onto the same platform.
 
 | Start here | First outcome |
 | --- | --- |
@@ -24,7 +24,7 @@ Slack. Then bring your existing supported skills and tools onto the same platfor
 
 ## Quickstart
 
-The factory and SRE trials below run on **local kind clusters**. They use the
+The software factory and SRE co-workers below run on **local kind clusters**. They use the
 same platform you can later install on your own Kubernetes infrastructure.
 
 You need Docker running, kind, kubectl, Helm, and an Anthropic or OpenRouter
@@ -244,3 +244,28 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor setup and checks, and
 
 Curie is released under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE)
 for attribution and [TRADEMARKS.md](TRADEMARKS.md) for use of the Curie name.
+
+See [Releases](https://github.com/curie-eng/curie/releases) for version history.
+
+If Curie is useful to you, especially if you build on it commercially, we'd
+love a link back to [github.com/curie-eng/curie](https://github.com/curie-eng/curie).
+It is a friendly request, not a license condition: nothing in the Apache License
+requires it, and you are free to use Curie whether or not you do.
+
+## Where do I go next?
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md#component-map) -- the component diagram, the
+message-flow and deploy-flow sequence diagrams, and the built/in-progress
+split.
+- [docs/adr/](docs/adr/) -- the load-bearing architecture decisions (Agent
+Sandbox as substrate, stateless-first sessions, Langfuse as the
+observability backbone, the frozen ACI, security rails as chart defaults,
+adopt-not-build boundaries), each with the live-cluster evidence behind it.
+- [docs/agents.md](docs/agents.md): the verification contract for an agent
+driving Curie. The exact commands that prove an outcome, and the rule that a
+file existing or a string appearing in output is never evidence. This is for
+an agent using Curie, not one working in this repo.
+- [`AGENTS.md`](AGENTS.md) -- the operative rules for anyone (human or agent)
+working in this repo: the verify commands, the dev stack, the
+frozen-contract escalation rule, and the build gotchas. Each top-level
+directory also has its own scoped `CLAUDE.md` with rules specific to that area.
