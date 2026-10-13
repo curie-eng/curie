@@ -394,7 +394,7 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         ids,
         [
             "s01", "s02", "s03", "s04", "s05", "s06", "s07", "s08", "s09", "s11", "s13", "s14",
-            "s15", "s16", "s17", "s20",
+            "s15", "s16", "s17", "s19", "s20",
         ],
         "canonical shard ids\n{manifest}"
     );
@@ -406,6 +406,15 @@ fn list_shards_json_covers_every_scenario_and_phase_exactly_once() {
         rollback_shard["scenarios"],
         serde_json::json!([{"name": "rollback-to-serving", "phases": null}]),
         "s17 must run rollback-to-serving"
+    );
+    let terminal_shard = shards
+        .iter()
+        .find(|shard| shard["id"] == "s19")
+        .expect("terminal-pods shard s19");
+    assert_eq!(
+        terminal_shard["scenarios"],
+        serde_json::json!([{"name": "terminal-pods", "phases": null}]),
+        "s19 must run terminal-pods"
     );
 
     let mut unsplit: Vec<String> = Vec::new();
@@ -500,6 +509,9 @@ fn self_test_checks_shard_coverage_and_timing() {
         "adopted named kind cluster prepared private context k8",
         "invalid kind kubeconfig refused before selecting k8",
         "mismatched kind server refused before selecting k8",
+        "terminal-pods runs in setup shard s19",
+        "terminal-pods asserts healthy status with terminal pods, a succeeded upgrade, and the surplus refusal",
+        "shard coverage refused a dropped terminal-pods",
     ] {
         assert!(
             text.contains(needle),
@@ -529,6 +541,7 @@ s14 setup previous-serves
 s15 setup runner-layer-retire
 s16 setup apply-kill-takeover
 s17 setup rollback-to-serving
+s19 setup terminal-pods
 s20 setup rollback-interrupted";
 
 fn assert_override_refused(manifest: &str, what: &str) {
@@ -583,6 +596,14 @@ fn self_test_fails_when_override_drops_runner_layer_retire() {
     assert_override_refused(
         &GOOD_SHARDS.replace("\ns15 setup runner-layer-retire", ""),
         "dropped runner-layer-retire scenario",
+    );
+}
+
+#[test]
+fn self_test_fails_when_override_drops_terminal_pods() {
+    assert_override_refused(
+        &GOOD_SHARDS.replace("\ns19 setup terminal-pods", ""),
+        "dropped terminal-pods scenario",
     );
 }
 
