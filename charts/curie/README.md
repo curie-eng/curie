@@ -1354,8 +1354,10 @@ and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
    `docker.egressAllowlist` gets the class `repo-<first 16 hex of
    sha256(path)>` and only its allowlist, validated like the other one-peer
    egress lists.
-5. With Rail 1 on, `<fullname>-runner-allow-docker-daemon` lets runner
-   sandboxes dial daemon pods on `factory.docker.port` (2376). Daemon ingress
+5. With Rail 1 on, `<fullname>-runner-allow-docker-daemon` lets the factory
+   agent's runner sandboxes (`curietech.ai/agent` set to the one factory agent
+   repository runners belong to) dial daemon pods on `factory.docker.port`
+   (2376). Other agents' sandboxes get no such allow. Daemon ingress
    stays default-deny until the worker's per-run policy admits that run's
    sandbox, so a sandbox reaches only its own daemon.
 6. Three ValidatingAdmissionPolicies with Deny bindings, which need
@@ -1364,8 +1366,8 @@ and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
    `dockerd` container on `factory.docker.daemonImage` (digest required), the
    `--userns-remap=default` and `--authorization-plugin=curie-authz` flags
    immediately after `dockerd`, the
-   claim, managed-by, selector and egress-class labels, privilege only on
-   dockerd, no init or ephemeral containers (it also matches
+   claim, managed-by, selector and egress-class labels, no added
+   capabilities on dockerd, no init or ephemeral containers (it also matches
    `pods/ephemeralcontainers`), no lifecycle hooks or exec probes, mounts only
    at `/var/lib/docker` and `/certs` with no `volumeDevices`, no `env` or
    `envFrom` (a caller environment could point the entrypoint's PATH into a

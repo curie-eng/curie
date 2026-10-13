@@ -149,6 +149,14 @@ affinity:
 {{- default (printf "%s-%s-publication" .Release.Namespace (include "curie.fullname" .)) .Values.worker.publication.namespace | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{/* ADR 0217: the per-run Docker daemon namespace. factory.docker is read
+     through default dict because it is nil under --reuse-values for a release
+     that predates it. */}}
+{{- define "curie.factory.dockerNamespace" -}}
+{{- $docker := get (.Values.factory | default dict) "docker" | default dict -}}
+{{- get $docker "namespace" | default (printf "%s-%s-docker" .Release.Namespace (include "curie.fullname" .)) | toString | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{/* ---- Reserved connector-secret boot-env names (#457, ADR-0009) ----
      The non-CURIE_-prefixed runner credential keys a per-agent connector
      secret must never declare, kept in list-parity with the Python source of

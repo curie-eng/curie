@@ -23,6 +23,8 @@ ADR accepts (decisions 4 and 5). Nothing renders without a Docker repository.
        for a release that predates it. */}}
 {{- $docker := get (.Values.factory | default dict) "docker" | default dict }}
 {{- $fullname := include "curie.fullname" . }}
+{{- $labels := include "curie.labels" . }}
+{{- $daemonSelector := include "curie.selectorLabels" (dict "root" . "component" "docker-daemon") }}
 {{- $workerUser := printf "system:serviceaccount:%s:%s-worker" .Release.Namespace $fullname }}
 {{- $image := get $docker "daemonImage" | default "" | toString }}
 {{- /* Decisions 4 and 5: one digest pins the daemon and the authorization
@@ -42,7 +44,7 @@ ADR accepts (decisions 4 and 5). Nothing renders without a Docker repository.
 {{- if or (lt $port 1) (gt $port 65535) }}
 {{- fail (printf "factory.docker.port must be an integer from 1 through 65535; got %d" $port) }}
 {{- end }}
-{{- $namespace := get $docker "namespace" | default (printf "%s-%s-docker" .Release.Namespace $fullname) | toString | trunc 63 | trimSuffix "-" }}
+{{- $namespace := include "curie.factory.dockerNamespace" . }}
 {{- $createNamespace := true }}
 {{- if hasKey $docker "createNamespace" }}
 {{- $createNamespace = get $docker "createNamespace" }}
@@ -89,7 +91,7 @@ kind: Namespace
 metadata:
   name: {{ $namespace }}
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon-namespace
     {{- /* Decision 4: the daemon container is privileged, so this namespace
            and only this one enforces the privileged Pod Security level. The
@@ -106,7 +108,7 @@ metadata:
   name: {{ $fullname }}-docker-daemon-worker
   namespace: {{ $namespace }}
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 rules:
   - apiGroups: [""]
@@ -131,7 +133,7 @@ metadata:
   name: {{ $fullname }}-docker-daemon-worker
   namespace: {{ $namespace }}
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 roleRef:
   apiGroup: rbac.authorization.k8s.io
@@ -150,7 +152,7 @@ metadata:
   name: {{ $fullname }}-docker-daemon
   namespace: {{ $namespace }}
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   hard:
@@ -162,7 +164,7 @@ metadata:
   name: {{ $fullname }}-docker-daemon
   namespace: {{ $namespace }}
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   limits:
@@ -185,7 +187,7 @@ metadata:
   name: {{ $fullname }}-docker-daemon-default-deny
   namespace: {{ $namespace }}
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   podSelector: {}
@@ -199,12 +201,12 @@ metadata:
   name: {{ $fullname }}-docker-daemon-allow-dns
   namespace: {{ $namespace }}
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   podSelector:
     matchLabels:
-      {{- include "curie.selectorLabels" (dict "root" . "component" "docker-daemon") | nindent 6 }}
+      {{- $daemonSelector | nindent 6 }}
   policyTypes: [Egress]
   egress:
     - to:
@@ -225,12 +227,12 @@ metadata:
   name: {{ $fullname }}-docker-daemon-egress-public
   namespace: {{ $namespace }}
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   podSelector:
     matchLabels:
-      {{- include "curie.selectorLabels" (dict "root" . "component" "docker-daemon") | nindent 6 }}
+      {{- $daemonSelector | nindent 6 }}
       curietech.ai/docker-egress: public
   policyTypes: [Egress]
   egress:
@@ -247,12 +249,12 @@ metadata:
   name: {{ $fullname }}-docker-daemon-egress-{{ .class }}
   namespace: {{ $namespace }}
   labels:
-    {{- include "curie.labels" $ | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   podSelector:
     matchLabels:
-      {{- include "curie.selectorLabels" (dict "root" $ "component" "docker-daemon") | nindent 6 }}
+      {{- $daemonSelector | nindent 6 }}
       curietech.ai/docker-egress: {{ .class }}
   policyTypes: [Egress]
   egress:
@@ -261,22 +263,25 @@ spec:
 {{- if and .Values.agentSandbox.deploy $np.enabled }}
 ---
 {{- /* Rail 1 (decision 7.1): runner sandboxes are default-deny egress, so
-       they need this allow to dial a daemon. It admits any daemon pod in the
-       daemon namespace on the daemon port; it composes with the default-deny
-       ingress there, which only the worker's per-run ingress policy opens,
-       for that run's sandbox alone. So a sandbox reaches only its own daemon. */}}
+       they need this allow to dial a daemon. Only the factory agent's
+       sandboxes get it, since repository runners belong to exactly one factory
+       agent. It admits any daemon pod in the daemon namespace on the daemon
+       port; it composes with the default-deny ingress there, which only the
+       worker's per-run ingress policy opens, for that run's sandbox alone. So
+       a sandbox reaches only its own daemon. */}}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ $fullname }}-runner-allow-docker-daemon
   namespace: {{ .Release.Namespace }}
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: agent-sandbox
 spec:
   podSelector:
     matchLabels:
       {{- include "curie.selectorLabels" (dict "root" . "component" "runner-sandbox") | nindent 6 }}
+      curietech.ai/agent: {{ (first $dockerRepos).agent | quote }}
   policyTypes: [Egress]
   egress:
     - to:
@@ -285,7 +290,7 @@ spec:
               kubernetes.io/metadata.name: {{ $namespace }}
           podSelector:
             matchLabels:
-              {{- include "curie.selectorLabels" (dict "root" . "component" "docker-daemon") | nindent 14 }}
+              {{- $daemonSelector | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ $port }}
@@ -304,14 +309,12 @@ spec:
 {{- end }}
 {{- end }}
 {{- $resourced := printf "has(c.resources) && has(c.resources.requests) && has(c.resources.limits) && %s" (join " && " $positive) }}
-{{- $noCapAdd := "(!has(c.securityContext) || !has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)" }}
-{{- $noHostPort := "(!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))" }}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
   name: {{ $fullname }}-docker-daemon-pods
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   failurePolicy: Fail
@@ -380,7 +383,9 @@ spec:
       message: the dockerd container must not override the image command
     - expression: {{ printf "%s.containers.all(c, !has(c.env) && !has(c.envFrom))" $s | quote }}
       message: the dockerd container must not set env or envFrom, since a caller environment could redirect the entrypoint (PATH into a mounted Secret)
-    # The two flags must sit right after dockerd: a value-taking caller flag such as --label could otherwise consume them; the image entrypoint also injects them first.
+    {{- /* The two flags must sit right after dockerd: a value-taking caller
+           flag such as --label could otherwise consume them; the image
+           entrypoint also injects them first. */}}
     - expression: >-
         {{ $s }}.containers.all(c, has(c.args) && size(c.args) >= 3 &&
         c.args[0] == 'dockerd' &&
@@ -389,9 +394,9 @@ spec:
         c.args.all(a, !a.startsWith('--userns-remap') || a == '--userns-remap=default'))
       message: dockerd must run with --userns-remap=default and --authorization-plugin=curie-authz immediately after dockerd
     - expression: >-
-        {{ $s }}.containers.all(c, {{ $noCapAdd }} &&
-        (c.name == 'dockerd' || !has(c.securityContext) || !has(c.securityContext.privileged) || !c.securityContext.privileged))
-      message: only the dockerd container may be privileged, and no container may add capabilities
+        {{ $s }}.containers.all(c, !has(c.securityContext) || !has(c.securityContext.capabilities) ||
+        !has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)
+      message: the dockerd container must not add capabilities
     - expression: >-
         has({{ $s }}.automountServiceAccountToken) && {{ $s }}.automountServiceAccountToken == false &&
         (!has({{ $s }}.volumes) || {{ $s }}.volumes.all(v, !has(v.projected) ||
@@ -407,7 +412,7 @@ spec:
         (!has({{ $s }}.hostNetwork) || !{{ $s }}.hostNetwork) &&
         (!has({{ $s }}.hostPID) || !{{ $s }}.hostPID) &&
         (!has({{ $s }}.hostIPC) || !{{ $s }}.hostIPC) &&
-        {{ $s }}.containers.all(c, {{ $noHostPort }})
+        {{ $s }}.containers.all(c, (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0)))
       message: daemon pods must not share the host network, PID, or IPC namespace or bind a host port
     - expression: >-
         {{ $s }}.containers.all(c, {{ $resourced }})
@@ -420,7 +425,7 @@ kind: ValidatingAdmissionPolicyBinding
 metadata:
   name: {{ $fullname }}-docker-daemon-pods
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   policyName: {{ $fullname }}-docker-daemon-pods
@@ -435,7 +440,7 @@ kind: ValidatingAdmissionPolicy
 metadata:
   name: {{ $fullname }}-docker-daemon-objects
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   failurePolicy: Fail
@@ -509,7 +514,7 @@ kind: ValidatingAdmissionPolicyBinding
 metadata:
   name: {{ $fullname }}-docker-daemon-objects
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   policyName: {{ $fullname }}-docker-daemon-objects
@@ -523,7 +528,7 @@ kind: ValidatingAdmissionPolicy
 metadata:
   name: {{ $fullname }}-docker-daemon-cleanup
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   failurePolicy: Fail
@@ -550,7 +555,7 @@ kind: ValidatingAdmissionPolicyBinding
 metadata:
   name: {{ $fullname }}-docker-daemon-cleanup
   labels:
-    {{- include "curie.labels" . | nindent 4 }}
+    {{- $labels | nindent 4 }}
     app.kubernetes.io/component: docker-daemon
 spec:
   policyName: {{ $fullname }}-docker-daemon-cleanup

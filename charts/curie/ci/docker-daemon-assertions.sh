@@ -15,7 +15,8 @@
 #       ResourceQuota and LimitRange (max, min, default, defaultRequest) from values, the default-deny, DNS,
 #       public and per-repository NetworkPolicies (exact shapes, class label
 #       repo-<sha256(path)[:16]>), the Rail 1 sandbox-to-daemon allow in the
-#       release namespace, and three ValidatingAdmissionPolicies with Deny
+#       release namespace for the factory agent's sandboxes only (absent with
+#       security.networkPolicy.enabled=false), and three ValidatingAdmissionPolicies with Deny
 #       bindings and failurePolicy Fail. createNamespace=false, a namespace
 #       override, a port override and an allowlist-only fixture are covered.
 #   (c) Structural CEL checks (no CEL evaluator is installed): every pods
@@ -23,7 +24,7 @@
 #       (worker username, labels and egress classes, dockerd name and image
 #       digest literal, no initContainers, no lifecycle hooks or exec probes,
 #       dockerd mounts only at /var/lib/docker and /certs with no '..' and no
-#       volumeDevices, userns and authz plugin flags, privilege and
+#       volumeDevices, userns and authz plugin flags, no added
 #       capabilities, service account token, emptyDir sizeLimit and secret
 #       volumes, host namespaces and ports, positive quantity() resources and
 #       sizeLimit, activeDeadlineSeconds); the objects policy checks every
@@ -33,7 +34,8 @@
 #       the three policies short-circuits with `true ||` or `|| true`; and
 #       every validation has a message. The cluster proof covers CEL behaviour.
 #   (d) templates/runner-resources-admission.yaml renders byte-identical with
-#       and without every docker block and factory.docker.
+#       and without every docker block and factory.docker (its section cut
+#       from the two full renders).
 #   (e) NEGATIVE: missing daemonImage, tag-only daemonImage, a 0.0.0.0/0
 #       allowlist entry, port 0 and 65536, and missing quota.hard,
 #       limitRange or limitRange.min fail render, and stderr names the key. (Kubernetes < 1.30 is
@@ -68,7 +70,8 @@ import yaml
 
 mode, path = sys.argv[1], sys.argv[2]
 args = sys.argv[3:]
-docs = [d for d in yaml.safe_load_all(open(path)) if d]
+Loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+docs = [d for d in yaml.load_all(open(path), Loader=Loader) if d]
 FULL = "t-curie"
 REL_NS = "default"
 WORKER_SA = f"system:serviceaccount:{REL_NS}:{FULL}-worker"
@@ -130,14 +133,19 @@ if mode != "present":
 
 values = json.load(open(args[0]))
 ns, image, port = args[1], args[2], int(args[3])
+if len(args) != 7:
+    fail("usage: present <render> <values.json> <ns> <image> <port> <createNamespace> <rail1> <clusterCidr>")
 create_ns = args[4] == "true"
 rail1 = args[5] == "true"
-cluster_cidr = args[6] if len(args) > 6 else ""
+cluster_cidr = args[6]
 docker_values = values["factory"].get("docker", {})
 repos = [r for b in values["factory"]["bindings"] for r in b["repos"]]
 docker_repos = [r for r in repos if r.get("runner") and r.get("docker", {}).get("enabled")]
 allowlisted = {r["path"]: r["docker"]["egressAllowlist"] for r in docker_repos if r["docker"].get("egressAllowlist")}
 public = any(not r["docker"].get("egressAllowlist") for r in docker_repos)
+factory_agents = [a for a, on in values["factory"]["sandboxEgress"].items() if on]
+if len(factory_agents) != 1:
+    fail(f"fixture needs exactly one factory agent, got {factory_agents}")
 classes = (["public"] if public else []) + [egress_class(p) for p in sorted(allowlisted)]
 non_classes = [egress_class(r["path"]) for r in repos if r["path"] not in allowlisted]
 
@@ -241,9 +249,8 @@ def check_egress_policy(name, cls, entries, exact):
         if exact is not None and excepts != exact.get(entry["cidr"], []):
             fail(f"{name} {entry['cidr']} except {excepts} != {exact.get(entry['cidr'], [])}")
         if entry["cidr"] == "0.0.0.0/0":
-            need = {"169.254.0.0/16", "10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12", "192.168.0.0/16"}
-            if cluster_cidr:
-                need.add(cluster_cidr)  # (f)
+            need = {"169.254.0.0/16", "10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12", "192.168.0.0/16",
+                    cluster_cidr}  # (f)
             if not need <= set(excepts):
                 fail(f"{name} 0.0.0.0/0 except {excepts} lacks {sorted(need - set(excepts))}")
         if entry["cidr"] == "::/0" and not {"fc00::/7", "fe80::/10"} <= set(excepts):
@@ -269,7 +276,7 @@ else:
         fail(f"Rail 1 allow namespace {rail[0]['metadata'].get('namespace')}")
     spec = rail[0]["spec"]
     want_spec = {
-        "podSelector": {"matchLabels": RUNNER_SEL},
+        "podSelector": {"matchLabels": dict(RUNNER_SEL, **{"curietech.ai/agent": factory_agents[0]})},
         "policyTypes": ["Egress"],
         "egress": [{"to": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": ns}},
                             "podSelector": {"matchLabels": DAEMON_SEL}}],
@@ -316,7 +323,7 @@ def policy(suffix, want_rules, want_sa):
     if b["spec"].get("policyName") != name or b["spec"].get("validationActions") != ["Deny"]:
         fail(f"{name} binding {b['spec']}")
     exprs = [" ".join(str(v["expression"]).split()) for v in validations]
-    # F7: a validation that short-circuits to true checks nothing.
+    # A validation that short-circuits to true checks nothing.
     for e in exprs:
         if "true ||" in e or "|| true" in e:
             fail(f"{name} validation short-circuits to true: {e}")
@@ -357,22 +364,21 @@ need = {
     "command override": ["command"],
     "args": ["args", "'--userns-remap=default'", "'--authorization-plugin=curie-authz'",
              "c.args[1] == '--userns-remap=default'", "c.args[2] == '--authorization-plugin=curie-authz'"],
-    "privilege": ["privileged", "capabilities"],
+    "no capability add": ["c.securityContext.capabilities.add", "size(c.securityContext.capabilities.add) == 0"],
     "service account token": ["automountServiceAccountToken", "== false", "serviceAccountToken", "serviceAccountName"],
     "volumes": ["volumes", "emptyDir", "sizeLimit", "secret"],
     "positive sizeLimit": ["emptyDir", "sizeLimit", "quantity(", "isGreaterThan(quantity('0'))"],
     "host access": ["hostNetwork", "hostPID", "hostIPC", "hostPort"],
-    "resources": ["'cpu'", "'memory'", "'ephemeral-storage'", "requests", "limits"],
     "positive resources": ["'cpu'", "'memory'", "'ephemeral-storage'", "requests", "limits",
                            "quantity(", "isGreaterThan(quantity('0'))"],
     "deadline": ["activeDeadlineSeconds"],
-    # Round 2 A: a Secret mounted under /certs plus PATH=/certs:... would
-    # hijack the entrypoint's dockerd-entrypoint.sh call, so no env at all.
+    # A Secret mounted under /certs plus PATH=/certs:... would hijack the
+    # entrypoint's dockerd-entrypoint.sh call, so no env at all.
     "no env or envFrom": ["!has(c.env)", "!has(c.envFrom)"],
 }
 for rule, needles in need.items():
     in_one_validation("pods", pods_validations, rule, needles)
-# F2: init containers are refused outright, so no validation may admit them
+# Init containers are refused outright, so no validation may admit them
 # conditionally or iterate over them.
 for n in ["!has(object.spec.initContainers) ||", "initContainers.all(", "initContainers.exists("]:
     if n in pods_text:
@@ -383,35 +389,30 @@ for c in non_classes:
 objects_need = {
     "claim and managed-by labels": ["curietech.ai/sandbox-claim", "'curie-sandbox-substrate'"],
     "ingress-only per-claim policy": ["['Ingress']", "egress", "podSelector"],
-    # F3: every ingress rule names its peers, each peer is this release's
-    # runner sandbox in the release namespace, never an ipBlock, on the daemon port.
+    # Every ingress rule names its peers, each peer is this release's runner
+    # sandbox in the release namespace, never an ipBlock, on the daemon port.
     "ingress peers": ["ingress", "from", "namespaceSelector", "kubernetes.io/metadata.name", f"'{REL_NS}'",
                       "podSelector", "'runner-sandbox'", "app.kubernetes.io/instance", "ipBlock", "ports",
                       str(port),
-                      # Round 2 B: the peer carries a matchLabels key beyond the
-                      # three release selector keys, not merely three keys.
+                      # The peer carries a matchLabels key beyond the three
+                      # release selector keys, not merely three keys.
                       "matchLabels.exists(", "'app.kubernetes.io/name'", "'app.kubernetes.io/instance'",
                       "'app.kubernetes.io/component'",
-                      # Round 2 C: no port ranges past the daemon port.
+                      # No port ranges past the daemon port.
                       "endPort"],
     "secret type": ["Opaque", "'kubernetes.io/tls'"],
     "service type": ["ClusterIP", "externalIPs"],
 }
 for rule, needles in objects_need.items():
     in_one_validation("objects", objects_validations, rule, needles)
-# Round 2 B: the key-count rule is replaced, since three keys can all be
-# release selector keys (name, instance, component) and select every sandbox.
+# Counting matchLabels keys proves nothing, since three keys can all be release
+# selector keys (name, instance, component) and select every sandbox.
 for e in objects_validations:
     if "ipBlock" in e and "namespaceSelector" in e and ">= 3" in e:
         fail(f"objects policy ingress peers still count matchLabels keys (>= 3): {e[:120]}")
 in_one_validation("cleanup", cleanup_validations, "claim label",
                   ["oldObject.metadata.labels", "'curietech.ai/sandbox-claim'"])
 
-# Every docker object lands in the daemon namespace or is cluster scoped/Rail 1.
-for d in docs:
-    name = d["metadata"]["name"]
-    if name.startswith(f"{FULL}-docker-daemon") and d["kind"] in {"Role", "RoleBinding", "ResourceQuota", "LimitRange", "NetworkPolicy"}:
-        in_ns(d, ns)
 print(f"ok: {mode} ({ns})")
 PY
 
@@ -470,6 +471,10 @@ expected = copy.deepcopy(values)
 expected["factory"]["docker"].update({"quota": {"hard": quota}, "limitRange": limit_range})
 json.dump(expected, open(tmp / "docker-expected.json", "w"))
 
+override = copy.deepcopy(expected)
+override["factory"]["docker"]["quota"]["hard"]["pods"] = "3"
+json.dump(override, open(tmp / "override-expected.json", "w"))
+
 only_allowlist = copy.deepcopy(expected)
 only_allowlist["factory"]["bindings"][0]["repos"][1]["docker"]["enabled"] = False
 json.dump(only_allowlist, open(tmp / "allowlist-only-expected.json", "w"))
@@ -502,12 +507,6 @@ python3 "$CHECKER" present "$TMP/allowlist-only.yaml" "$TMP/allowlist-only-expec
   || fail "(b) allowlist-only render"
 
 # (b) namespace override, createNamespace=false, port override, quota override.
-python3 - "$TMP/docker-expected.json" "$TMP/override-expected.json" <<'PY'
-import json, sys
-v = json.load(open(sys.argv[1]))
-v["factory"]["docker"]["quota"]["hard"]["pods"] = "3"
-json.dump(v, open(sys.argv[2], "w"))
-PY
 render -f "$TMP/docker-values.json" --set-string factory.docker.namespace=acme-docker \
   --set factory.docker.createNamespace=false --set factory.docker.port=2443 \
   --set-string 'factory.docker.quota.hard.pods=3' >"$TMP/override.yaml" || fail "override render"
@@ -516,15 +515,17 @@ python3 "$CHECKER" present "$TMP/override.yaml" "$TMP/override-expected.json" ac
 
 # (b) Rail 1 allow follows the Rail 1 condition.
 render -f "$TMP/docker-values.json" --set security.networkPolicy.enabled=false >"$TMP/no-netpol.yaml" || fail "network policy disabled render"
-python3 - "$TMP/no-netpol.yaml" <<'PY' || fail "(b) Rail 1 allow rendered with network policy disabled"
-import sys, yaml
-names = [d["metadata"]["name"] for d in yaml.safe_load_all(open(sys.argv[1])) if d and d.get("kind") == "NetworkPolicy"]
-sys.exit("t-curie-runner-allow-docker-daemon rendered" if "t-curie-runner-allow-docker-daemon" in names else 0)
-PY
+python3 "$CHECKER" present "$TMP/no-netpol.yaml" "$TMP/docker-expected.json" "$DEFAULT_NS" "$DAEMON_IMAGE" 2376 true false "$CLUSTER_CIDR" \
+  || fail "(b) Rail 1 allow rendered with network policy disabled"
 
 # (d) runner admission is byte-identical with and without docker.
-render -f "$TMP/docker-values.json" -s templates/runner-resources-admission.yaml >"$TMP/admission-docker.yaml" || fail "runner admission docker render"
-render -f "$TMP/no-docker-values.json" -s templates/runner-resources-admission.yaml >"$TMP/admission-plain.yaml" || fail "runner admission plain render"
+cut_source() {
+  # $1: template path under templates/; $2: full render. Prints that template's documents.
+  awk -v src="# Source: curie/templates/$1" '$0 == "---" { on = 0 } $0 == src { on = 1 } on' "$2"
+}
+cut_source runner-resources-admission.yaml "$TMP/docker.yaml" >"$TMP/admission-docker.yaml"
+cut_source runner-resources-admission.yaml "$TMP/no-docker.yaml" >"$TMP/admission-plain.yaml"
+[ -s "$TMP/admission-plain.yaml" ] || fail "(d) runner admission absent from the render without docker"
 cmp -s "$TMP/admission-docker.yaml" "$TMP/admission-plain.yaml" || { diff "$TMP/admission-plain.yaml" "$TMP/admission-docker.yaml" >&2 || true; fail "(d) runner admission changed with docker enabled"; }
 
 # (e) refusals name the key.
