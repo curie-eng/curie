@@ -42,7 +42,7 @@ Deployment pool input is patched, read back after rollout, and restored before
 namespace deletion. No stale namespace sweep or SQL mutation occurs. The judge
 requires the runner's named container spec/imageID, actual Bash tool result,
 boot manifest count, zero model requests or claims on refusal, and retirement
-of X's claim before accepting Y's fresh sandbox and pod UID.
+of X's claim observed after Y completes with a fresh sandbox and pod UID.
 """
 
 from __future__ import annotations
@@ -330,6 +330,11 @@ def judge_repo_runner(observation: object) -> list[str]:
             failures.append(label + "repository path is missing or malformed")
         if not _nonblank(turn.get("thread")):
             failures.append(label + "thread is missing")
+        errors = turn.get("errors")
+        if not isinstance(errors, list):
+            failures.append(label + "scripted model error evidence is missing or malformed")
+        elif errors:
+            failures.extend(label + f"scripted model error: {error}" for error in errors)
         status = turn.get("status")
         if status == "refused":
             reason = turn.get("reason")
@@ -364,6 +369,19 @@ def judge_repo_runner(observation: object) -> list[str]:
             failures.append(label + f"turn did not complete or refuse: {status!r} ({reason!r})")
             continue
         completed.append(turn)
+        if type(turn.get("cli_exit_code")) is not int or turn.get("cli_exit_code") != 0:
+            failures.append(label + "completed turn requires CLI exit code 0")
+        runner_status = turn.get("runner_status")
+        if (
+            not isinstance(runner_status, Mapping)
+            or runner_status.get("status") != "done"
+            or runner_status.get("turn_active") is not False
+        ):
+            failures.append(label + "completed turn has no terminal runner status evidence")
+        if turn.get("observed_repository") != repository:
+            failures.append(label + "captured claim repository does not match the turn")
+        if "capture_error" not in turn or turn["capture_error"] is not None:
+            failures.append(label + "completed turn has no explicit successful capture evidence")
         if type(turn.get("model_requests")) is not int or turn.get("model_requests", 0) < 2:
             failures.append(label + "completion needs both the tool request and its result request")
         for field in ("sandbox", "pod_uid", "image_id", "spec_image", "claim"):
@@ -462,8 +480,8 @@ def load_plan(env: Mapping[str, str]) -> dict[str, Any]:
     if not isinstance(plan, dict) or set(plan) != {"bindings", "turns"}:
         raise fe.ConfigError("repo-runner plan requires exactly bindings and turns")
     bindings = plan["bindings"]
-    if not isinstance(bindings, list) or len(bindings) < 2:
-        raise fe.ConfigError("repo-runner plan needs two native GitHub bindings")
+    if not isinstance(bindings, list) or len(bindings) != 2:
+        raise fe.ConfigError("repo-runner plan needs exactly two native GitHub bindings")
     names: set[str] = set()
     paths: set[str] = set()
     scopes: set[str] = set()
@@ -750,7 +768,7 @@ class RepoRunnerRun:
         self.baseline_pools: dict[str, Any] = {}
         self.fault_active = False
         self.installed_base = ""
-        self.channel = f"C-SIM-FACTORY-TOOLS-{p.run_id.upper()}"
+        self.channel = f"C0EXAMPLE{p.run_id.upper()}"
         self.model: ScriptedManifestModel | None = None
         self.obs: dict[str, Any] = {
             "provenance": "live CLI, scripted endpoint and owned Kubernetes resource observations",
@@ -790,16 +808,16 @@ class RepoRunnerRun:
         if pools is None and not self.fault_active:
             return self._worker_pools()
         expected = self.baseline_pools if pools is None else pools
-        _current, pointer, value, deployment = self._worker_pool_slot()
+        _current, pointer, value, _deployment = self._worker_pool_slot()
         patch = [
-            {"op": "test", "path": "/metadata/resourceVersion",
-             "value": deployment["metadata"]["resourceVersion"]},
+            {"op": "test", "path": pointer.removesuffix("/value") + "/name",
+             "value": "CURIE_REPO_RUNNER_POOLS"},
             {"op": "test", "path": pointer, "value": value},
             {"op": "replace", "path": pointer, "value": json.dumps(expected)},
         ]
         self.fault_active = True
         # The chart reserves this input. Faults change only this execution's
-        # worker Deployment, with a CAS test and a restore registered already.
+        # worker Deployment, with name/value tests and a restore registered already.
         self.p.kubectl(
             "-n", self.p.namespace, "patch", "deployment", f"{self.p.release}-worker",
             "--type=json", "-p", json.dumps(patch),
@@ -862,7 +880,7 @@ class RepoRunnerRun:
             return
         if not bound:
             return
-        turn.pop("capture_error", None)
+        turn["capture_error"] = None
         claim = bound[0]
         sandbox = claim["status"]["sandbox"]["name"]
         turn["claim"] = claim["metadata"]["name"]
@@ -933,7 +951,7 @@ class RepoRunnerRun:
             "repository": planned["repository"], "thread": planned["thread"],
             "status": "failed", "reason": None, "sandbox": None, "claim": None,
             "pod_uid": None, "spec_image": None, "image_id": None, "boot_log": "",
-            "retired_claims": [],
+            "retired_claims": [], "capture_error": None,
         }
         self.obs["turns"].append(turn)
         if planned["expect"] != "completed":
@@ -968,7 +986,7 @@ class RepoRunnerRun:
         }
         process = subprocess.Popen(
             argv, cwd=self.p.workdir, env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True,
+            stderr=subprocess.DEVNULL, text=True,
         )
         self.p.teardown.push(
             f"stop repository turn {index + 1}", lambda: {"stopped": fe._stop(process)}
@@ -987,6 +1005,13 @@ class RepoRunnerRun:
                 break
             time.sleep(1)
         stdout, _stderr = process.communicate(timeout=10)
+        claims = self._claims(planned["thread"])
+        new_claims.update(
+            claim["metadata"]["name"] for claim in claims
+            if claim["metadata"]["name"] not in before_names
+        )
+        turn["runner_status"] = None
+        self._capture_runner(claims, turn)
         outcome: dict[str, Any] = {}
         for line in stdout.splitlines():
             try:
@@ -1009,8 +1034,9 @@ class RepoRunnerRun:
         if outcome.get("failed") and reason:
             turn.update(status="refused", reason=reason)
         else:
-            probe = turn.get("runner_status") or {}
+            probe = turn.get("runner_status")
             if (process.returncode == 0 and outcome.get("finalized") is True
+                and isinstance(probe, Mapping)
                 and probe.get("status") == "done" and probe.get("turn_active") is False
                 and turn.get("observed_repository") == planned["repository"]
                 and not turn.get("capture_error") and not turn["errors"]):
@@ -1065,7 +1091,7 @@ class RepoRunnerRun:
                 )
         if p.candidate_image_mode == "build":
             p.build_candidate_images()
-        self.model = ScriptedManifestModel()
+        self.model = ScriptedManifestModel(host=os.environ["CURIE_LOCAL_STUB_HOST"])
         p.teardown.push("stop repository scripted model", self.model.close)
         self.model.start()
         p.config = dataclasses.replace(
@@ -1073,7 +1099,6 @@ class RepoRunnerRun:
             model_base_url=f"http://{os.environ['CURIE_LOCAL_STUB_HOST']}:{self.model.port}",
         )
         p.create_namespace()
-        p.kubectl("label", "namespace", p.namespace, "owner=factory-tools")
 
         def layer(base: dict[str, Any]) -> dict[str, Any]:
             values = scenario_values(base, self.plan["bindings"])
@@ -1109,10 +1134,6 @@ class RepoRunnerRun:
             self._turn(index, turn)
         self._set_pools(None)
         failures = judge_repo_runner(self.obs)
-        failures.extend(
-            f"turn {index + 1}: {error}" for index, turn in enumerate(self.obs["turns"])
-            for error in turn.get("errors", [])
-        )
         self.obs.update(verdict="failed" if failures else "passed", failures=failures)
         if failures:
             raise fe.PreflightFailed("; ".join(failures))
@@ -1134,10 +1155,11 @@ def main(argv: list[str] | None = None) -> int:
     judge.add_argument("observation", type=Path)
     args = parser.parse_args(argv)
     try:
-        observation = json.loads(args.observation.read_text())
+        evidence = json.loads(args.observation.read_text())
     except (OSError, ValueError) as exc:
         print(f"repo-runner: cannot read observation: {exc}", file=sys.stderr)
         return 1
+    observation = evidence.get("scenario") if isinstance(evidence, Mapping) else None
     failures = judge_repo_runner(observation)
     print(json.dumps({"verdict": "failed" if failures else "passed", "failures": failures}))
     return int(bool(failures))

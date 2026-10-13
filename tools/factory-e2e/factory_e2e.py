@@ -2491,12 +2491,15 @@ class Preflight:
         # applied it, the client lost the answer) is still reconciled, and the
         # run annotation keeps the undo from touching anyone else's namespace.
         self.teardown.push("delete namespaces", self.delete_namespaces)
+        labels = dict([OWNER_LABEL.split("=", 1)])
+        if self.scenario_name == "repo-runner":
+            labels["owner"] = "factory-tools"
         manifest = {
             "apiVersion": "v1",
             "kind": "Namespace",
             "metadata": {
                 "name": self.namespace,
-                "labels": dict([OWNER_LABEL.split("=", 1)]),
+                "labels": labels,
                 "annotations": {
                     RUN_ANNOTATION: self.run_id,
                     HOLDER_ANNOTATION: f"{socket.gethostname()}:{os.getpid()}",
