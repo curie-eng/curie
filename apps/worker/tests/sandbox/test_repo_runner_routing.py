@@ -20,11 +20,18 @@ from dataclasses import replace
 import pytest
 import redis
 from curie_worker import sandbox as sandbox_package
+from curie_worker.binding import CONNECTOR_SECRET_KEYS_ENV, inject_connector_secrets
 from curie_worker.repo_runner_pools import RepoRunnerPool
 from curie_worker.sandbox import SandboxSubstrate, SubstrateConfig
 from curie_worker.sandbox import types as sandbox_types
 from curie_worker.sandbox.affinity import AffinityStore
-from curie_worker.sandbox.types import KubeTransientError, MissingAgentPoolError, RouteRecord
+from curie_worker.sandbox.types import (
+    KubeTransientError,
+    MissingAgentPoolError,
+    RouteRecord,
+    RouteState,
+    SandboxHandle,
+)
 
 from .conftest import PoolProbingFakeSandboxClient
 
@@ -56,6 +63,7 @@ def _substrate(
     *,
     platform: str | None = BASE,
     agent_pools: frozenset[str] = frozenset(),
+    connector_secret_pools: frozenset[str] = frozenset(),
 ) -> SandboxSubstrate:
     return SandboxSubstrate(
         k8s,
@@ -64,6 +72,7 @@ def _substrate(
             config,
             warm_pool=BASE_POOL,
             agent_pools=agent_pools,
+            connector_secret_pools=connector_secret_pools,
             repo_runner_pools=pools,
             platform_runner_digest=platform,
         ),
@@ -226,6 +235,193 @@ def test_refusal_on_a_retained_route_leaves_the_route_untouched(
     assert probing_k8s.created == [first.claim_name]
     stored = affinity.get("T-keep")
     assert stored is not None and stored.handle.claim_name == first.claim_name
+
+
+def _secret_env(agent: str) -> dict[str, str]:
+    env: dict[str, str] = {"CURIE_BUDGET": "{}"}
+    inject_connector_secrets(env, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_secret"}, agent_label=agent)
+    assert CONNECTOR_SECRET_KEYS_ENV in env
+    return env
+
+
+def test_connector_secrets_without_a_secret_pool_are_refused_even_with_a_repo_entry(
+    probing_k8s: PoolProbingFakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+) -> None:
+    # A repository pool's template carries no connector secretKeyRefs for an
+    # agent the chart never rendered a secret pool for, and the values are
+    # stripped from the claim env, so the entry must not swallow the refusal.
+    substrate = _substrate(probing_k8s, affinity, config, {REPO: _entry()})
+    with pytest.raises(MissingAgentPoolError):
+        substrate.claim(
+            "T-secret-refused",
+            env=_secret_env("cli-bot"),
+            workspace_repo=REPO,
+            agent_name="cli-bot",
+        )
+    _assert_nothing_written(probing_k8s, affinity, "T-secret-refused")
+
+
+def test_connector_secrets_with_a_secret_pool_claim_the_repo_entry(
+    probing_k8s: PoolProbingFakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+) -> None:
+    substrate = _substrate(
+        probing_k8s,
+        affinity,
+        config,
+        {REPO: _entry()},
+        agent_pools=frozenset({"factory"}),
+        connector_secret_pools=frozenset({"factory"}),
+    )
+    handle = substrate.claim(
+        "T-secret-ok", env=_secret_env("factory"), workspace_repo=REPO, agent_name="factory"
+    )
+    assert probing_k8s.claims[handle.claim_name].pool == POOL
+    assert handle.runner_digests == DIGESTS
+
+
+def test_refusal_for_another_repository_leaves_the_live_route_untouched(
+    probing_k8s: PoolProbingFakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+) -> None:
+    # The route serves acme-corp/web; the caller now names REPO, whose entry
+    # is refused. The refusal is decided before the web route is retired.
+    probing_k8s.warm_pools = frozenset({BASE_POOL, "acme-web-runner"})
+    pools = {REPO: _entry(), "acme-corp/web": _entry("acme-web-runner")}
+    first = _substrate(probing_k8s, affinity, config, pools).claim(
+        "T-other-refused", workspace_repo="acme-corp/web"
+    )
+    with pytest.raises(sandbox_types.RepoRunnerPoolRefused):
+        _substrate(probing_k8s, affinity, config, pools).claim(
+            "T-other-refused", workspace_repo=REPO
+        )
+    assert first.claim_name in probing_k8s.claims
+    assert probing_k8s.deleted == []
+    assert probing_k8s.created == [first.claim_name]
+    stored = affinity.get("T-other-refused")
+    assert stored is not None
+    assert stored.handle == first
+    assert stored.state is RouteState.LIVE
+
+
+def test_resume_refusal_leaves_the_suspended_route_untouched(
+    probing_k8s: PoolProbingFakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+) -> None:
+    first = _substrate(probing_k8s, affinity, config, {REPO: _entry()}).claim(
+        "T-resume-refused", workspace_repo=REPO
+    )
+    _substrate(probing_k8s, affinity, config, {REPO: _entry()}).suspend(
+        "T-resume-refused", history_ref="h-1"
+    )
+    stale = _substrate(probing_k8s, affinity, config, {REPO: _entry(base=OTHER)})
+    with pytest.raises(sandbox_types.RepoRunnerPoolRefused):
+        stale.resume("T-resume-refused")
+    assert first.claim_name in probing_k8s.claims
+    assert probing_k8s.deleted == []
+    assert probing_k8s.created == [first.claim_name]
+    stored = affinity.get("T-resume-refused")
+    assert stored is not None
+    assert stored.state is RouteState.SUSPENDED
+    assert stored.handle.claim_name == first.claim_name
+
+
+# -- concurrent winner of the route race ---------------------------------------
+
+
+def _lose_race_to(
+    k8s: PoolProbingFakeSandboxClient,
+    affinity: AffinityStore,
+    thread_key: str,
+    *,
+    workspace_repo: str,
+    runner_digests: tuple[str, str, str] | None,
+) -> SandboxHandle:
+    """Record a Running winner route between the caller's create and put."""
+
+    winner = SandboxHandle(
+        thread_key=thread_key,
+        claim_name="claim-winner",
+        sandbox_name="sbx-claim-winner",
+        namespace="test-ns",
+        service_fqdn="sbx-claim-winner.test-ns.svc.cluster.local",
+        port=8080,
+        session_id="sess-w",
+        workspace_repo=workspace_repo,
+        runner_digests=runner_digests,
+        runner_docker=False,
+    )
+    k8s.create_claim("claim-winner", pool=POOL)
+    original_create = k8s.create_claim
+    fired: list[bool] = []
+
+    def create_then_lose(name: str, **kwargs: object) -> None:
+        original_create(name, **kwargs)  # type: ignore[arg-type]
+        if not fired:
+            fired.append(True)
+            affinity.put_if_absent(thread_key, RouteRecord(handle=winner), ttl_seconds=60)
+
+    k8s.create_claim = create_then_lose  # type: ignore[method-assign]
+    return winner
+
+
+@pytest.mark.parametrize(
+    ("winner_repo", "winner_digests"),
+    [
+        pytest.param("acme-corp/web", None, id="other-repo"),
+        pytest.param(REPO, (INDEX, OTHER, ARM64), id="other-digests"),
+        pytest.param(REPO, None, id="no-runner-image"),
+    ],
+)
+def test_mismatched_race_winner_is_not_adopted(
+    probing_k8s: PoolProbingFakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+    winner_repo: str,
+    winner_digests: tuple[str, str, str] | None,
+) -> None:
+    winner = _lose_race_to(
+        probing_k8s,
+        affinity,
+        "T-race",
+        workspace_repo=winner_repo,
+        runner_digests=winner_digests,
+    )
+    substrate = _substrate(probing_k8s, affinity, config, {REPO: _entry()})
+    handle = substrate.claim("T-race", workspace_repo=REPO)
+
+    assert handle.claim_name != winner.claim_name
+    assert handle.workspace_repo == REPO
+    assert handle.runner_digests == DIGESTS
+    assert probing_k8s.claims[handle.claim_name].pool == POOL
+    assert winner.claim_name in probing_k8s.deleted
+    assert winner.claim_name not in probing_k8s.claims
+    stored = affinity.get("T-race")
+    assert stored is not None and stored.handle == handle
+
+
+def test_matching_race_winner_is_adopted(
+    probing_k8s: PoolProbingFakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+) -> None:
+    winner = _lose_race_to(
+        probing_k8s, affinity, "T-race-ok", workspace_repo=REPO, runner_digests=DIGESTS
+    )
+    substrate = _substrate(probing_k8s, affinity, config, {REPO: _entry()})
+    handle = substrate.claim("T-race-ok", workspace_repo=REPO)
+
+    assert handle == winner
+    assert winner.claim_name in probing_k8s.claims
+    assert winner.claim_name not in probing_k8s.deleted
+    loser = [name for name in probing_k8s.created if name != winner.claim_name]
+    assert len(loser) == 1
+    assert probing_k8s.deleted == loser
 
 
 # -- no entry: today's routing ------------------------------------------------
