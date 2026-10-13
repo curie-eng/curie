@@ -2071,6 +2071,8 @@ struct LiveHost {
     opts: UpgradeOpts,
     current: Option<String>,
     known_good: Option<String>,
+    /// A failed apply changed live Deployment images or left them unreadable.
+    target_applied: bool,
     record: Option<UpgradeRecord>,
     fail_at: Option<UpgradePhase>,
     interrupt_after: Option<UpgradePhase>,
@@ -2285,6 +2287,7 @@ impl LiveHost {
             opts: opts.clone(),
             current: None,
             known_good: None,
+            target_applied: false,
             record: None,
             fail_at,
             interrupt_after,
@@ -3470,6 +3473,57 @@ impl LiveHost {
         Ok(())
     }
 
+    fn deployment_images(&self, name: &str) -> Result<BTreeMap<String, String>> {
+        let cmd = OpsCommand::new(
+            "kubectl",
+            vec![
+                plain("get"),
+                plain("deployment"),
+                plain(name),
+                plain("-n"),
+                plain(&self.opts.common.namespace),
+                plain("-o"),
+                plain("json"),
+            ],
+        );
+        let (ok, out, err) = self.run(&cmd)?;
+        if !ok {
+            bail!("could not read Deployment {name}: {}", err.trim());
+        }
+        let deployment: serde_json::Value =
+            serde_json::from_str(&out).context("Deployment image snapshot is malformed")?;
+        let pod_spec = deployment
+            .pointer("/spec/template/spec")
+            .context("Deployment image snapshot has no pod spec")?;
+        let mut images = BTreeMap::new();
+        for field in ["containers", "initContainers"] {
+            let containers = match pod_spec.get(field) {
+                Some(value) => value
+                    .as_array()
+                    .context("Deployment image snapshot has a malformed container list")?,
+                None if field == "initContainers" => continue,
+                None => bail!("Deployment image snapshot has no containers"),
+            };
+            if field == "containers" && containers.is_empty() {
+                bail!("Deployment image snapshot has no containers");
+            }
+            for container in containers {
+                let name = container
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|name| !name.is_empty())
+                    .context("Deployment image snapshot has an unnamed container")?;
+                let image = container
+                    .get("image")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|image| !image.is_empty())
+                    .context("Deployment image snapshot has a container without an image")?;
+                images.insert(format!("{field}/{name}"), image.to_owned());
+            }
+        }
+        Ok(images)
+    }
+
     fn helm_upgrade(&self, to: &str) -> Result<()> {
         let tmp = tempfile::NamedTempFile::new().context("upgrade values tempfile")?;
         let values = match &self.overlay {
@@ -3748,10 +3802,30 @@ impl UpgradeDriver for LiveHost {
         self.live_drain_preflight()
     }
     fn apply_target(&mut self, to: &str) -> Result<()> {
+        let fullname = self.release_fullname();
+        let deployments =
+            ["api", "worker", "ui"].map(|component| format!("{fullname}-{component}"));
+        let before = deployments
+            .each_ref()
+            .map(|name| self.deployment_images(name).ok());
         if let Err(error) = self.helm_upgrade(to) {
+            // Read every workload before comparing: Helm can leave mixed images
+            // while its history still marks the previous revision deployed.
+            let after = deployments
+                .each_ref()
+                .map(|name| self.deployment_images(name).ok());
+            self.target_applied = before
+                .iter()
+                .zip(&after)
+                .any(|(before, after)| after.is_none() || before != after);
             // Helm can fail after it has already moved the deployed revision.
             // Re-read that revision so previous_serving is not the pre-apply cache.
             self.observe_deployed_version();
+            if self.target_applied {
+                let detail = error.to_string();
+                let first_line = detail.lines().next().unwrap_or_default();
+                bail!("target manifests are applied; upgrade failed after apply: {first_line}");
+            }
             return Err(error);
         }
         // R2: what the release reports, not what was requested, is what was
@@ -3838,6 +3912,9 @@ impl UpgradeDriver for LiveHost {
         self.live_canary(expected)
     }
     fn serving_previous(&self) -> bool {
+        if self.target_applied {
+            return false;
+        }
         match (&self.current, &self.known_good) {
             (Some(cur), Some(kg)) => cur == kg,
             (None, _) => true,
