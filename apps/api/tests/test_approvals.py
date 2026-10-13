@@ -357,6 +357,89 @@ def _read_approval_traceparent(approval_id: str) -> str | None:
     return asyncio.run(_run())
 
 
+def _read_reply_route(approval_id: str) -> tuple[str | None, str | None]:
+    async def read() -> tuple[str | None, str | None]:
+        engine = create_async_engine(get_settings().database_url)
+        try:
+            async with engine.connect() as conn:
+                result = await conn.execute(
+                    text(
+                        "SELECT reply_identity, reply_adapter FROM curie.approvals WHERE id = :id"
+                    ),
+                    {"id": uuid.UUID(approval_id)},
+                )
+                row = result.one()
+                return row[0], row[1]
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(read())
+
+
+@pytest.mark.parametrize(
+    ("reply_adapter", "requested_identity", "reply_identity"),
+    [
+        ("curie-cluster-message", "acme-named", "acme-named"),
+        ("curie-cluster-message", None, None),
+        ("curie-cluster-message", "default", None),
+        ("acme-named", "acme-named", None),
+    ],
+)
+@pytest.mark.parametrize("outcome", ["approved", "expired"])
+def test_reply_identity_survives_http_creation_and_resume(
+    approvals_client: TestClient,
+    auth_headers: dict[str, str],
+    clean_db: None,
+    valkey: redis.Redis,
+    runs_stream: str,
+    reply_adapter: str,
+    requested_identity: str | None,
+    reply_identity: str | None,
+    outcome: str,
+) -> None:
+    """A durable pause retains the binding separately from relay delivery."""
+    payload = _payload(
+        reply_adapter=reply_adapter,
+        reply_placeholder=str(uuid.uuid4()),
+        expires_in_seconds=600,
+    )
+    if requested_identity is not None:
+        payload["reply_identity"] = requested_identity
+    response = approvals_client.post("/approvals", json=payload, headers=auth_headers)
+    assert response.status_code == 201, response.text
+    approval_id = response.json()["id"]
+    assert _read_reply_route(approval_id) == (reply_identity, reply_adapter)
+
+    if outcome == "approved":
+        resolved = approvals_client.post(
+            f"/approvals/{approval_id}/resolve",
+            json={"decision": "approved"},
+            headers=_chat_resolve_headers(approval_id, "U9", "C1", base=auth_headers),
+        )
+        assert resolved.status_code == 200, resolved.text
+    else:
+        async def expire() -> int:
+            async with _sweeper_stack(runs_stream) as (sessionmaker, queue, _client):
+                async with sessionmaker() as session:
+                    return await sweep_expired_approvals(session, queue, now=_naive_utc(601))
+
+        assert asyncio.run(expire()) == 1
+
+    entries = valkey.xrange(runs_stream)
+    assert len(entries) == 1
+    turn = QueuedTurn.model_validate(json.loads(entries[0][1]["payload"]))
+    assert turn.event_id == f"approval-{approval_id}-resolved"
+    assert turn.conversation_id == payload["conversation_id"]
+    assert turn.reply_handle.identity == reply_identity
+    assert turn.reply_handle.adapter == reply_adapter
+    assert turn.reply_handle.placeholder == payload["reply_placeholder"]
+    assert turn.reply_handle.endpoint is None
+    stored = approvals_client.get(f"/approvals/{approval_id}", headers=auth_headers)
+    assert stored.status_code == 200, stored.text
+    assert stored.json()["status"] == outcome
+    assert _read_resumed_at(approval_id) is not None
+
+
 def test_resolve_endpoint_stays_200_when_enqueue_fails(
     approvals_client: TestClient,
     auth_headers: dict[str, str],

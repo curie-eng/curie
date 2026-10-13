@@ -8703,6 +8703,12 @@ class Kernel:
                         reply_placeholder=self._target_for(qevent).reply_ref,
                         reply_endpoint=handle.endpoint,
                         reply_adapter=handle.adapter,
+                        reply_identity=(
+                            handle.identity
+                            if handle.adapter == CLUSTER_MESSAGE_ADAPTER
+                            and handle.identity != DEFAULT_IDENTITY
+                            else None
+                        ),
                         dedupe_key=qevent.event_id,
                         base_sha=snapshot.base_sha,
                         patch=snapshot.patch,
@@ -8773,6 +8779,12 @@ class Kernel:
                         reply_placeholder=self._target_for(qevent).reply_ref,
                         reply_endpoint=handle.endpoint,
                         reply_adapter=handle.adapter,
+                        reply_identity=(
+                            handle.identity
+                            if handle.adapter == CLUSTER_MESSAGE_ADAPTER
+                            and handle.identity != DEFAULT_IDENTITY
+                            else None
+                        ),
                         dedupe_key=qevent.event_id,
                         route=route_name,
                         card_channel=card_channel,

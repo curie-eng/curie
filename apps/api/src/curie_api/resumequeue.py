@@ -124,6 +124,7 @@ def _build_turn(approval: Approval, *, author: str, text: str) -> QueuedTurn:
             placeholder=approval.reply_placeholder,
             endpoint=approval.reply_endpoint,
             adapter=approval.reply_adapter,
+            identity=approval.reply_identity,
         ),
         received_at=datetime.now(UTC).isoformat(),
     )

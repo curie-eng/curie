@@ -158,6 +158,7 @@ class PublicationCreateRequest:
     title: str
     body: str
     reply_conversation_id: str | None = None
+    reply_identity: str | None = None
     max_patch_bytes: int = 900_000
     review_origin_key: str | None = None
     route: str | None = None
@@ -194,6 +195,8 @@ class PublicationCreateRequest:
         }
         if self.reply_conversation_id is not None:
             payload["reply_conversation_id"] = self.reply_conversation_id
+        if self.reply_identity is not None:
+            payload["reply_identity"] = self.reply_identity
         if self.review_origin_key is not None:
             payload["review_origin_key"] = self.review_origin_key
         if self.route is not None:

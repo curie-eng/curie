@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 from aci_protocol import ApprovalRequest as ApprovalRequest
 from aci_protocol import EvalReport as EvalReport
 from aci_protocol import PublicationContext as PublicationContext
+from aci_protocol.slack_identities import IDENTITY_NAME_MAX_LENGTH, IDENTITY_NAME_PATTERN
 from aci_protocol.turn import DEFAULT_IDENTITY, SLACK_KIND, route_identity
 from fastapi import HTTPException
 from plugin_format import is_reserved_boot_env_name
@@ -1922,6 +1923,9 @@ class PublicationCreate(BaseModel):
     reply_placeholder: str | None = None
     reply_endpoint: str | None = None
     reply_adapter: str | None = None
+    reply_identity: str | None = Field(
+        default=None, pattern=IDENTITY_NAME_PATTERN, max_length=IDENTITY_NAME_MAX_LENGTH
+    )
     dedupe_key: str = Field(min_length=1)
     review_origin_key: str | None = Field(default=None, min_length=1, max_length=180)
     route: str | None = None
