@@ -727,10 +727,11 @@ these same lines in the plan. A failed history read or refused selection exits
 nonzero. With the schema gate enabled, a dry run also performs the offline
 catalog check on the selected revision: it must carry an application version
 whose schema range this CLI declares. Otherwise the dry run refuses with the
-same message as the real rollback, exits nonzero, and prints no plan. That
-refusal names the newest safe fail-forward version only when you pass
-`--live-schema-revision`, because the dry run does not read the live database
-revision; without it, the refusal tells you to pass one. The live window
+same message as the real rollback, exits nonzero, and prints no plan. For an
+application version with no declared schema range, the refusal names the
+newest safe fail-forward version only when you pass `--live-schema-revision`,
+because the dry run does not read the live database revision; without it, the
+refusal tells you to pass one. The live window
 check stays with the real rollback. The plan lists the live-schema probe, but
 neither that probe nor `helm rollback` runs during a dry run.
 

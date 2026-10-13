@@ -1346,3 +1346,28 @@ fn dry_run_to_a_catalogued_target_still_prints_its_plan() {
         );
     }
 }
+
+/// A malformed `--live-schema-revision` refuses a dry run even to a catalogued
+/// target, as it refuses the real run, and still contacts no cluster.
+#[test]
+fn dry_run_refuses_a_malformed_live_schema_revision() {
+    let history = two_revision_history("0.12.3", "0.12.4");
+    let fixture = RollbackFixture::new(&history, "0093", Err("must not read manifest"));
+    let output = fixture.run(&["--dry-run", "--live-schema-revision", "   "]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let payload = json_payload(&output);
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--live-schema-revision did not contain a database revision"),
+        "{payload}"
+    );
+    assert_eq!(
+        payload["fix"], "pass a revision id such as 0039",
+        "{payload}"
+    );
+    assert!(payload.get("plan").is_none(), "{payload}");
+    assert_eq!(fixture.kubectl_log(), "", "dry run must never run kubectl");
+    fixture.assert_no_mutation();
+}
