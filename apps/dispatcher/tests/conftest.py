@@ -407,3 +407,62 @@ def deliver_frames(client: Any, *frames: dict[str, Any], timeout: float = 5.0) -
         assert done.wait(timeout), f"the SDK did not deliver {last!r} within {timeout}s"
     finally:
         client.message_listeners.remove(_after_the_others)
+
+
+@dataclass
+class IdentityClientBuilds:
+    """What the offline ``build_identity_client`` stub was asked to build."""
+
+    configs: list[Any] = dataclass_field(default_factory=list)
+
+
+@pytest.fixture(autouse=True)
+def offline_identity_client(monkeypatch: pytest.MonkeyPatch) -> IdentityClientBuilds:
+    """Keep every app's principal lookup (#2910) off the network.
+
+    ``build_app``/``register_handlers`` build the production lookup client from
+    config when a test injects none. Its base URL is a real loopback API in
+    most suites (``admission_api``), which has no ``/identity/resolve`` route,
+    so an unpatched lookup would add a stray POST and a WARNING to tests that
+    assert on both. The stub records the call and returns None: no client, no
+    lookup. ``raising=False`` keeps the suite importable before the seam exists.
+    """
+
+    builds = IdentityClientBuilds()
+
+    def _offline_build(config: Any) -> None:
+        builds.configs.append(config)
+        return None
+
+    monkeypatch.setattr(
+        "curie_dispatcher.handlers.build_identity_client", _offline_build, raising=False
+    )
+    return builds
+
+
+@dataclass
+class InstallationReportStarts:
+    """Every ``start_installation_reports`` call ``run.main`` made."""
+
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = dataclass_field(default_factory=list)
+
+
+@pytest.fixture(autouse=True)
+def offline_installation_reports(monkeypatch: pytest.MonkeyPatch) -> InstallationReportStarts:
+    """Keep ``run.main`` from starting the #3039 reporter threads.
+
+    The reporter calls ``auth.test`` with each identity's real token and posts
+    to the platform API; a ``run.main`` test fakes neither. The stub records
+    the call and starts nothing.
+    """
+
+    starts = InstallationReportStarts()
+
+    def _offline_start(*args: Any, **kwargs: Any) -> list[threading.Thread]:
+        starts.calls.append((args, kwargs))
+        return []
+
+    monkeypatch.setattr(
+        "curie_dispatcher.run.start_installation_reports", _offline_start, raising=False
+    )
+    return starts

@@ -141,6 +141,7 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0102",
             "0103",
             "0105",
+            "0107",
         } <= pending
         assert not pending & {"0091", "0092", "0093"}
     else:
@@ -154,8 +155,9 @@ def test_upgrade_from_either_train_applies_the_missing_sibling_and_preserves_row
             "0102",
             "0103",
             "0105",
+            "0107",
         }
-    assert current_revision() == "0105"
+    assert current_revision() == "0107"
     assert sql_rows("SELECT name FROM curie.agents WHERE id=:id", {"id": agent_id}) == [
         ("merge-example",)
     ]
@@ -238,10 +240,12 @@ def test_agent_reads_refuse_the_schema_before_deploy_notification_expand() -> No
     # #2911: the Agent ORM and the resolver read 0101's tenant-scope columns, and
     # factory status replies read 0102's typed reply target and 0103 keys
     # WorkItems by their tracker issue (#3831), and 0105 adds the trigger
-    # label (#4361), so the schemas below it are refused too.
-    for below_tenant_scope in sorted(known - {"0105"}):
+    # label (#4361), so the schemas below it are refused too. Identity links
+    # (0107, #2910) is expand-only and does not raise the floor.
+    for below_tenant_scope in sorted(known - {"0105", "0107"}):
         assert can_serve(below_tenant_scope, window, known) is False
     assert can_serve("0105", window, known) is True
+    assert can_serve("0107", window, known) is True
 
 
 def test_planner_refuses_irreversible_before_mutation() -> None:
