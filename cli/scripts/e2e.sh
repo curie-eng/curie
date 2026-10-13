@@ -20,6 +20,11 @@
 #   CURIE_E2E_PORT      host port (default 7245)
 #   CURIE_E2E_NETWORK   docker network to join (e.g. curie_default)
 #   CURIE_E2E_OTEL      OTLP endpoint (e.g. http://otel-collector:4318)
+#   DOCKER_PUBLISHED_HOST  daemon's published hostname or IP; selects API
+#                         snapshot transfer instead of a client-path bind mount.
+#                         Leave unset for the existing local Docker path.
+#   TMPDIR              put temporary bundles in a daemon-visible directory
+#                         when using bind mounts with a remote Docker transport.
 #   CURIE_E2E_LIVE      1 = real model, requiring a credential in the
 #                         environment (ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN,
 #                         or CURIE_CREDENTIALS); default 0 runs the runner's
@@ -104,16 +109,27 @@ cleanup() {
         fi
         SKILL_MUTATION_PENDING=0
     fi
+    if [[ -n "${BUNDLE_DIR:-}" && -f "$BUNDLE_DIR/.curie/runner.json" ]]; then
+        (cd "$BUNDLE_DIR" && "$BIN" skill down) >/dev/null 2>&1 || true
+    fi
+    # Pin inspect to containers so an absent runner never falls through to
+    # image or volume requests that a daemon authorization policy may forbid.
+    local snapshot_volume=""
+    snapshot_volume="$(docker inspect --type container --format '{{if eq (index .Config.Labels "curietech.ai/managed-by") "curie-cli"}}{{with index .Config.Labels "curietech.ai/snapshot-volume"}}{{.}}{{end}}{{end}}' "$CONTAINER" 2>/dev/null)" || true
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    if [[ -n "$snapshot_volume" ]] && \
+       [[ "$(docker volume inspect --format '{{index .Labels "curietech.ai/managed-by"}} {{index .Labels "curietech.ai/component"}}' "$snapshot_volume" 2>/dev/null)" == "curie-cli skill-snapshot" ]]; then
+        docker volume rm "$snapshot_volume" >/dev/null 2>&1 || true
+    fi
     if [[ "$rc" -ne 0 && -n "${CURIE_E2E_BUNDLE:-}" ]]; then
         # Failure path against a caller-supplied bundle only. `skill up` writes
         # `.curie/runner.json` plus a materialized `.curie/snapshots/<digest>/`
         # inside the bundle directory, and the success path's final `skill down`
         # releases them (and asserts the snapshot root is empty). On a failure
-        # that never reaches it, this removes them directly rather than calling
-        # `skill down`: the container is already force-removed above, so the
-        # only thing left to release is these files, and the failure may well BE
-        # a broken `skill down`. Scoped to the caller-supplied case because the
+        # that never reaches it, the cleanup above first tries `skill down`,
+        # then removes the owned container and volume directly. These files
+        # are the remaining cleanup if `skill down` itself failed. Scoped to
+        # the caller-supplied case because the
         # scaffolded bundle lives inside $WORKDIR, which the `rm -rf` below
         # already takes, and to a non-zero exit so the success path is untouched.
         rm -rf "${CURIE_E2E_BUNDLE}/.curie"
@@ -142,7 +158,7 @@ TRY_RUNNER_CONTAINER="curie-runner-local"
 # `try` uses the product's standard local runner name. Refuse to exercise any
 # try path when it already belongs to somebody else; the EXIT trap only
 # removes the E2E-specific runner, never this shared name.
-if docker inspect "$TRY_RUNNER_CONTAINER" >/dev/null 2>&1; then
+if docker inspect --type container "$TRY_RUNNER_CONTAINER" >/dev/null 2>&1; then
     echo "error: try E2E needs $TRY_RUNNER_CONTAINER to be absent before it starts." >&2
     echo "fix: stop the existing local runner, then rerun this E2E." >&2
     exit 1
@@ -225,7 +241,7 @@ if [[ -n "$(find "$TRY_CREDENTIAL_TMPDIR" -mindepth 1 -maxdepth 1 -print -quit)"
     echo "error: rejected credential run left its disposable scaffold under $TRY_CREDENTIAL_TMPDIR." >&2
     exit 1
 fi
-if docker inspect "$TRY_RUNNER_CONTAINER" >/dev/null 2>&1; then
+if docker inspect --type container "$TRY_RUNNER_CONTAINER" >/dev/null 2>&1; then
     echo "error: rejected credential run left its local runner behind." >&2
     exit 1
 fi
@@ -516,6 +532,36 @@ fi
 echo "initial bundle digest: $DIGEST_1"
 
 echo
+echo "=== confirm immutable mount transport and recorded published endpoint ==="
+PLUGIN_MOUNTS="$(docker inspect --type container --format '{{json .Mounts}}' "$CONTAINER")"
+python3 - "$BUNDLE_DIR/.curie/runner.json" "$PLUGIN_MOUNTS" <<'PY'
+import json, os, sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    state = json.load(handle)
+mounts = [mount for mount in json.loads(sys.argv[2]) if mount["Destination"] == "/plugin"]
+if len(mounts) != 1 or mounts[0].get("RW") is not False:
+    sys.exit("error: the runner must mount exactly one immutable /plugin snapshot")
+mount = mounts[0]
+remote = "DOCKER_PUBLISHED_HOST" in os.environ
+expected_type = "volume" if remote else "bind"
+if mount["Type"] != expected_type:
+    sys.exit(f"error: expected /plugin mount type {expected_type}, got {mount['Type']}")
+if remote and not mount.get("Name"):
+    sys.exit("error: remote snapshot mount has no named volume")
+if not remote and mount["Source"] != state["bundle_snapshot_dir"]:
+    sys.exit("error: local snapshot bind differs from the recorded immutable snapshot")
+host = os.environ.get("DOCKER_PUBLISHED_HOST", "localhost")
+if ":" in host and not host.startswith("["):
+    host = f"[{host}]"
+expected_url = f"http://{host}:{state['port']}"
+if state["base_url"] != expected_url:
+    sys.exit(f"error: recorded endpoint differs from published address {expected_url}")
+print(f"confirmed: readonly {expected_type} snapshot and recorded published endpoint")
+PY
+SNAPSHOT_VOLUME_1="$(docker inspect --type container --format '{{range .Mounts}}{{if eq .Destination "/plugin"}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}{{end}}' "$CONTAINER")"
+
+echo
 echo "=== #1087 AC1: edit the source after boot, confirm the running container keeps the ORIGINAL snapshot ==="
 # Derived from the bundle, not hardcoded to `deal-desk`: a caller-supplied
 # bundle names its skill directory whatever it likes. First match in sorted
@@ -681,6 +727,14 @@ if ! grep -qF "$MARKER" <<<"$MOUNTED_SKILL_MD_2"; then
     exit 1
 fi
 echo "confirmed: the replacement runner's /plugin mount serves the edited snapshot ($SKILL_FILE_REL)"
+if [[ -n "$SNAPSHOT_VOLUME_1" ]]; then
+    REMAINING_VOLUME="$(docker volume ls -q --filter "name=^${SNAPSHOT_VOLUME_1}$")"
+    if [[ -n "$REMAINING_VOLUME" ]]; then
+        echo "error: replacement retained the first runner's snapshot volume." >&2
+        exit 1
+    fi
+fi
+SNAPSHOT_VOLUME_2="$(docker inspect --type container --format '{{range .Mounts}}{{if eq .Destination "/plugin"}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}{{end}}' "$CONTAINER")"
 
 echo
 echo "=== restore the source and tear down the second runner ==="
@@ -689,6 +743,13 @@ cp -p "$SKILL_FILE_BACKUP" "$SKILL_FILE_PATH"
 # restore that never happened (and, on the success path, does not repeat one).
 SKILL_MUTATION_PENDING=0
 "$BIN" skill down
+if [[ -n "$SNAPSHOT_VOLUME_2" ]]; then
+    REMAINING_VOLUME="$(docker volume ls -q --filter "name=^${SNAPSHOT_VOLUME_2}$")"
+    if [[ -n "$REMAINING_VOLUME" ]]; then
+        echo "error: skill down retained its runner's snapshot volume." >&2
+        exit 1
+    fi
+fi
 
 echo
 echo "=== #1087: confirm teardown released the bundle snapshot ==="

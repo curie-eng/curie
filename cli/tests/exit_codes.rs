@@ -156,11 +156,37 @@ case "$1" in
     esac
     exit 0 ;;
   run)
-    printf started > "$CURIE_TEST_DEMO_STATE/started"
+    session_id=""
+    for arg in "$@"; do
+      case "$arg" in
+        CURIE_SESSION_ID=*) session_id="${arg#CURIE_SESSION_ID=}" ;;
+      esac
+    done
+    if [ -z "$session_id" ]; then
+      printf 'runner startup omitted its session identity\n' >&2
+      exit 93
+    fi
+    printf '%s\n' "$session_id" > "$CURIE_TEST_DEMO_STATE/started"
     printf 'fixture-runner-id\n'
     exit 0 ;;
+  container)
+    case "$*" in
+      "container inspect --format {{if eq (index .Config.Labels \"curietech.ai/managed-by\") \"curie-cli\"}}{{with index .Config.Labels \"curietech.ai/snapshot-volume\"}}{{.}}{{end}}{{end}} fixture-runner-id")
+        # This local runner has a snapshot bind, without a volume label.
+        exit 0 ;;
+      *) printf 'unexpected docker command: %s\n' "$*" >&2; exit 93 ;;
+    esac ;;
+  volume)
+    IFS= read -r session_id < "$CURIE_TEST_DEMO_STATE/teardown-attempted"
+    case "$*" in
+      "volume ls -q --filter label=curietech.ai/managed-by=curie-cli --filter label=curietech.ai/component=skill-snapshot --filter label=curietech.ai/snapshot-owner=curie-runner-local:$session_id")
+        # The exact recorded session owns no remote snapshot volumes.
+        exit 0 ;;
+      *) printf 'unexpected docker command: %s\n' "$*" >&2; exit 93 ;;
+    esac ;;
   rm)
-    printf removed > "$CURIE_TEST_DEMO_STATE/teardown-attempted"
+    IFS= read -r session_id < "$CURIE_TEST_DEMO_STATE/started"
+    printf '%s\n' "$session_id" > "$CURIE_TEST_DEMO_STATE/teardown-attempted"
     if [ "$CURIE_TEST_DEMO_MODE" = teardown ]; then
       printf 'fixture teardown failed\n' >&2
       exit 37
@@ -190,7 +216,8 @@ esac
         .env("TMPDIR", &demos)
         .env("CURIE_CONFIG_DIR", scratch.path().join("config"))
         .env("CURIE_TEST_DEMO_STATE", scratch.path())
-        .env("CURIE_TEST_DEMO_MODE", mode);
+        .env("CURIE_TEST_DEMO_MODE", mode)
+        .env_remove("DOCKER_PUBLISHED_HOST");
     for name in curie::commands::MODEL_CREDENTIAL_ENV_NAMES {
         command.env_remove(name);
     }

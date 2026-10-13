@@ -385,6 +385,9 @@ pub(super) async fn boot_eval_runner(
     model: &str,
     secrets: &[String],
 ) -> Result<String> {
+    let published_host = docker::published_host_setting()?;
+    let url = docker::published_endpoint(published_host.as_deref(), port);
+    let client = RunnerClient::new(&url)?;
     // Same name-conflict preflight as `skill up` (#747), with the remedies the
     // sweep actually has: never --replace, since a concurrent sweep's container
     // must not be force-removed out from under it.
@@ -420,7 +423,7 @@ pub(super) async fn boot_eval_runner(
         passthrough_env,
         docker_env,
     );
-    docker::docker_with_env(&spec.run_args(), &spec.docker_env)
+    docker::start_runner(&spec, published_host.as_deref())
         .await
         .with_context(|| format!("booting eval runner for model {model}"))
         // A container created between the preflight and here still loses the
@@ -428,11 +431,7 @@ pub(super) async fn boot_eval_runner(
         .map_err(|err| {
             docker::map_name_conflict(err, name, Some(port), docker::ConflictContext::EvalSweep)
         })?;
-    let url = format!("http://localhost:{port}");
-    if let Err(err) = RunnerClient::new(&url)?
-        .wait_healthy(Duration::from_secs(60))
-        .await
-    {
+    if let Err(err) = client.wait_healthy(Duration::from_secs(60)).await {
         let logs = docker::container_logs(name, 40).await;
         let _ = docker::remove_container(name).await;
         bail!("eval runner for model {model} failed to become healthy: {err}\n{logs}");

@@ -3063,9 +3063,25 @@ json.dump(d, open(p, "w"))' "$(cat "$STUB_STATE/last_plugin_dir")/evals/cases.js
             echo "bundle changed: replacing the recorded runner 'curie-e2e-runner' first"
         fi
         printf '%s' "$(sha_of_bundle "$PWD")" > "$STUB_STATE/skill_digest"
+        rm -rf .curie/snapshots
+        snapshot_dir="$PWD/.curie/snapshots/$(cat "$STUB_STATE/skill_digest")"
+        mkdir -p "$snapshot_dir"
+        python3 - "$snapshot_dir" <<'PYSTATE'
+import json, sys
+with open(".curie/runner.json", "w", encoding="utf-8") as handle:
+    json.dump({
+        "runner": "stub",
+        "bundle_snapshot_dir": sys.argv[1],
+        "port": 7245,
+        "base_url": "http://localhost:7245",
+    }, handle)
+PYSTATE
         skill=$(find "$PWD/skills" -mindepth 2 -maxdepth 2 -name SKILL.md | sort | head -1)
         if [ -n "$skill" ]; then
             cp "$skill" "$STUB_STATE/mounted_skill.md"
+            snapshot_skill="$snapshot_dir/${skill#"$PWD"/}"
+            mkdir -p "$(dirname "$snapshot_skill")"
+            cp "$skill" "$snapshot_skill"
         fi
         echo "stub: runner up"
         # e2e.sh asserts the boot panel NAMES the model path it resolved, and
@@ -3129,6 +3145,7 @@ print(json.dumps({
         ;;
     "skill down")
         rm -f .curie/runner.json
+        rm -rf .curie/snapshots
         echo "stub: runner down"
         ;;
     "skill down --name "*)
@@ -3310,11 +3327,32 @@ case "$*" in
             printf '%s\n' "${STUB_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}"
         fi
         ;;
-    "inspect curie-runner-local")
+    "inspect --type container curie-runner-local")
         # e2e.sh's ownership precondition: the standard interactive runner is
         # absent in this isolated harness unless a control explicitly says
         # otherwise.
         exit 1
+        ;;
+    "inspect --type container --format {{if eq (index .Config.Labels \"curietech.ai/managed-by\") \"curie-cli\"}}{{with index .Config.Labels \"curietech.ai/snapshot-volume\"}}{{.}}{{end}}{{end}} curie-e2e-runner")
+        # This harness's runner uses a local snapshot bind mount, so its
+        # cleanup read must not invent a remote snapshot volume from worker env.
+        ;;
+    "inspect --type container --format {{json .Mounts}} curie-e2e-runner")
+        # Report the actual snapshot directory staged by the skill-up arm.
+        python3 - "$STUB_STATE/skill_digest" <<'PYMOUNTS'
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    digest = handle.read()
+print(json.dumps([{
+    "Type": "bind",
+    "Source": os.path.join(os.getcwd(), ".curie", "snapshots", digest),
+    "Destination": "/plugin",
+    "RW": False,
+}]))
+PYMOUNTS
+        ;;
+    "inspect --type container --format {{range .Mounts}}{{if eq .Destination \"/plugin\"}}{{if eq .Type \"volume\"}}{{.Name}}{{end}}{{end}}{{end}} curie-e2e-runner")
+        # A local bind mount has no Docker volume name at either boot.
         ;;
     "inspect curie-ladder-hermetic-"*)
         # Keep the connector-free negative non-vacuous by giving its runner the
@@ -3626,6 +3664,7 @@ fn run_ladder_script(script: &Path, harness: &Path, envs: &[(&str, &str)]) -> Ou
         .env_remove("CURIE_E2E_PORT")
         .env_remove("CURIE_E2E_NETWORK")
         .env_remove("CURIE_E2E_OTEL")
+        .env_remove("DOCKER_PUBLISHED_HOST")
         .env_remove("CURIE_FAKE_MODEL")
         .env_remove("CURIE_API_KEY")
         .env_remove("CURIE_API_URL")
@@ -4391,6 +4430,7 @@ fn parity_passes_when_every_rung_reports_the_same_identity() {
     write_ladder_stubs(harness.path());
     let api_url = spawn_deployments_stub(&one_active_deployment());
     let digest = weather_bundle_sha256();
+    let docker_log = harness.path().join("docker-invocations.log");
 
     let output = run_ladder(
         harness.path(),
@@ -4398,6 +4438,7 @@ fn parity_passes_when_every_rung_reports_the_same_identity() {
             ("CURIE_E2E_TIERS", "skill,local,cluster"),
             ("CURIE_API_URL", &api_url),
             ("STUB_FAKE_MODEL", "1"),
+            ("STUB_DOCKER_INVOCATION_LOG", docker_log.to_str().unwrap()),
         ],
     );
 
@@ -4421,6 +4462,26 @@ fn parity_passes_when_every_rung_reports_the_same_identity() {
         "the ladder must name the common suite's case ids, so a reader can see \
          WHICH case set every rung shared rather than taking `parity` on \
          trust; transcript:\n{transcript}"
+    );
+    assert!(
+        transcript.contains("confirmed: readonly bind snapshot and recorded published endpoint"),
+        "the skill rung must validate its immutable mount and saved endpoint; transcript:\n{transcript}"
+    );
+    let docker_invocations = fs::read_to_string(docker_log).expect("read Docker invocations");
+    assert!(
+        docker_invocations.lines().any(|command| {
+            command == "inspect --type container --format {{json .Mounts}} curie-e2e-runner"
+        }),
+        "the mount proof must inspect the owned runner's actual Mounts; invocations:\n{docker_invocations}"
+    );
+    let volume_name_read = r#"inspect --type container --format {{range .Mounts}}{{if eq .Destination "/plugin"}}{{if eq .Type "volume"}}{{.Name}}{{end}}{{end}}{{end}} curie-e2e-runner"#;
+    assert_eq!(
+        docker_invocations
+            .lines()
+            .filter(|command| *command == volume_name_read)
+            .count(),
+        2,
+        "the skill rung must capture both original and replacement snapshot mounts; invocations:\n{docker_invocations}"
     );
 }
 
@@ -4467,11 +4528,24 @@ fn skill_up_failure_surfaces_diagnostic_preserves_exit_and_cleans_up() {
         "no subsequent skill, eval, or local action may follow the refused boot; invocations:\n{invocations}"
     );
     let docker_invocations = fs::read_to_string(docker_log).expect("read Docker invocations");
+    let cleanup_inspect = r#"inspect --type container --format {{if eq (index .Config.Labels "curietech.ai/managed-by") "curie-cli"}}{{with index .Config.Labels "curietech.ai/snapshot-volume"}}{{.}}{{end}}{{end}} curie-e2e-runner"#;
+    assert!(
+        docker_invocations
+            .lines()
+            .any(|command| command == cleanup_inspect),
+        "cleanup must read the owned container's snapshot-volume label; invocations:\n{docker_invocations}"
+    );
     assert!(
         docker_invocations
             .lines()
             .any(|command| command == "rm -f curie-e2e-runner"),
         "the failure must still invoke cleanup for the owned runner; invocations:\n{docker_invocations}"
+    );
+    assert!(
+        !docker_invocations.lines().any(|command| {
+            command.starts_with("volume inspect ") || command.starts_with("volume rm ")
+        }),
+        "a bind-mounted runner must not trigger snapshot volume operations; invocations:\n{docker_invocations}"
     );
 }
 

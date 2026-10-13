@@ -159,7 +159,27 @@ pub(super) async fn release_boot_scaffolding(
     let _ = crate::bundle::remove_snapshot(snapshot_dir, plugin_dir);
 }
 
+pub(super) fn refuse_remote_connector_secret_files(
+    decl: &crate::connector_build::ConnectorsFileDecl,
+    published: Option<&str>,
+) -> Result<()> {
+    if docker::remote_mode(published) {
+        if let Some((connector, _)) = decl.connectors.iter().find(|(_, spec)| {
+            spec.url.is_none() && spec.unhosted_url.is_none() && !spec.secret_files.is_empty()
+        }) {
+            return Err(crate::exit::usage(format!(
+                "connector '{connector}' declares secret_files, which skill up cannot mount with \
+                 DOCKER_PUBLISHED_HOST set; use environment secrets or an unhosted connector URL"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub async fn start(opts: StartOpts) -> Result<()> {
+    let published_host = docker::published_host_setting()?;
+    let base_url = docker::published_endpoint(published_host.as_deref(), opts.port);
+    let client = RunnerClient::new(&base_url)?;
     let plugin_dir = opts
         .plugin_dir
         .canonicalize()
@@ -167,6 +187,12 @@ pub async fn start(opts: StartOpts) -> Result<()> {
     // Fail fast on a directory that is not a bundle; the runner would reject
     // it at boot anyway (real-model mode), with a worse error surface.
     let (plugin_name, manifest_version) = read_manifest(&plugin_dir)?;
+    if docker::remote_mode(published_host.as_deref()) {
+        refuse_remote_connector_secret_files(
+            &crate::connector_build::load(&plugin_dir)?,
+            published_host.as_deref(),
+        )?;
+    }
 
     if opts.local_model.is_some() && opts.fake_model {
         return Err(crate::exit::usage(
@@ -618,7 +644,7 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         "starting runner container '{}' from '{}'",
         opts.name, opts.image
     ));
-    let container_id = match docker::docker_with_env(&spec.run_args(), &spec.docker_env).await {
+    let container_id = match docker::start_runner(&spec, published_host.as_deref()).await {
         Ok(id) => id,
         Err(err) => {
             // Nothing recorded the snapshot, so no teardown will ever find it
@@ -644,8 +670,6 @@ pub async fn start(opts: StartOpts) -> Result<()> {
         }
     };
 
-    let base_url = format!("http://localhost:{}", opts.port);
-    let client = RunnerClient::new(&base_url)?;
     let cl = ui.checklist();
     let step = cl.step("waiting for runner");
     if let Err(err) = client.wait_healthy(Duration::from_secs(60)).await {
@@ -1014,9 +1038,29 @@ pub(super) async fn stop_recorded(
         // a live container this bundle never booted.
         RecordedTeardown::Hijacked { message } => {
             ui.warn(&message);
+            if let Err(err) = docker::remove_session_snapshot_volumes(&format!(
+                "{}:{}",
+                saved.container_name, saved.session_id
+            ))
+            .await
+            {
+                ui.warn(&format!(
+                    "could not release the recorded snapshot volume: {err}"
+                ));
+            }
             state::remove(dir)?;
             return Ok(());
         }
+    }
+    if let Err(err) = docker::remove_session_snapshot_volumes(&format!(
+        "{}:{}",
+        saved.container_name, saved.session_id
+    ))
+    .await
+    {
+        ui.warn(&format!(
+            "could not release the recorded snapshot volume: {err}"
+        ));
     }
     if let Some(ollama) = &saved.ollama_container {
         // A sidecar that will not die is a warning, not a failed teardown.
