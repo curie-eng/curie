@@ -464,9 +464,9 @@ async fn execute(
             crate::cluster_secrets::check_layered_runner_base(&common, dir).await?;
             plan.runner_image.clone()
         }
-        None => {
-            Some(crate::factory_quickstart::github::render_and_check(&common, &plan.agent).await?)
-        }
+        None => Some(
+            crate::factory_quickstart::github::render_and_check(&common, &plan.agent, None).await?,
+        ),
     };
     let token = read_token(&plan.token_file)?;
     apply_manifest(

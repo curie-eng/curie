@@ -187,6 +187,45 @@ ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKE
 SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED
 {{- end -}}
 
+{{/* Per-agent literal runner environment. Missing values stay empty on retained
+     releases. Environment names follow plugin_format.reserved_env.SECRET_NAME_RE
+     in the frozen plugin-format package: uppercase letters, digits and
+     underscores, with a letter or underscore first. Credential and telemetry
+     names have their own configuration paths. */}}
+{{- define "curie.agentSandboxRunnerEnv" -}}
+{{- $env := dict -}}
+{{- if hasKey .Values.agentSandbox "runnerEnv" -}}
+{{- $env = get .Values.agentSandbox "runnerEnv" -}}
+{{- if not (kindIs "map" $env) -}}
+{{- fail "agentSandbox.runnerEnv must be a map of agent names to environment maps" -}}
+{{- end -}}
+{{- end -}}
+{{- $reserved := splitList " " (trim (include "curie.reservedConnectorSecretNames" .)) -}}
+{{- range $agent, $entries := $env -}}
+{{- if or (gt (len $agent) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $agent)) -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s has an invalid agent name" $agent) -}}
+{{- end -}}
+{{- if not (kindIs "map" $entries) -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s must be a map of environment names to strings" $agent) -}}
+{{- end -}}
+{{- range $name, $value := $entries -}}
+{{- if not (regexMatch "^[A-Z_][A-Z0-9_]*$" $name) -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s contains invalid environment variable name %q" $agent $name) -}}
+{{- end -}}
+{{- if or (hasPrefix "CURIE_" $name) (has $name $reserved) -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s contains reserved environment variable %s; configure the runner credentials or platform values instead" $agent $name) -}}
+{{- end -}}
+{{- if hasPrefix "OTEL_" $name -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s contains telemetry environment variable %s; configure otelCollector or agentSandbox.runner.extraEnv globally so chart-managed telemetry egress matches the endpoint" $agent $name) -}}
+{{- end -}}
+{{- if not (kindIs "string" $value) -}}
+{{- fail (printf "agentSandbox.runnerEnv.%s.%s must be a string; quote numeric and boolean values" $agent $name) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $env -}}
+{{- end -}}
+
 {{/* ---- Backing-store hosts (in-cluster Service name, or BYO host) ---- */}}
 
 {{- define "curie.postgres.host" -}}
@@ -2337,7 +2376,7 @@ no {{ .key }} in this container's env: nothing to stage. This is expected for a 
 {{/*
 Agents that get a per-agent runner SandboxTemplate and warm pool, as a JSON
 array: every connectorSecrets agent, every registryEgress agent (#3083), and
-every runnerImages agent (ADR-0173), and every workspaceSizeLimits agent (#3523),
+every runnerImages agent (ADR-0173), every runnerEnv agent, and every workspaceSizeLimits agent (#3523),
 every true factory.sandboxEgress, and every string in agentSandbox.poolAgents.
 */}}
 {{- define "curie.agentSandboxPoolAgents" -}}
@@ -2345,7 +2384,7 @@ every true factory.sandboxEgress, and every string in agentSandbox.poolAgents.
 {{- if kindIs "slice" .Values.agentSandbox.poolAgents -}}
 {{- $extra = .Values.agentSandbox.poolAgents -}}
 {{- end -}}
-{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) (include "curie.factory.sandboxAgents" . | fromJsonArray) $extra -}}
+{{- $agents := concat (keys (.Values.agentSandbox.connectorSecrets | default dict)) (keys (.Values.agentSandbox.registryEgress | default dict)) (keys (.Values.agentSandbox.runnerImages | default dict)) (keys (include "curie.agentSandboxRunnerEnv" . | fromJson)) (keys (.Values.agentSandbox.workspaceSizeLimits | default dict)) (include "curie.factory.sandboxAgents" . | fromJsonArray) $extra -}}
 {{- $agents | uniq | sortAlpha | toJson -}}
 {{- end -}}
 

@@ -36,12 +36,13 @@ Measured with the bundled CLI 2.1.281 (2026-10-04):
 from __future__ import annotations
 
 import json
-import re
+import subprocess
 from pathlib import Path
 from typing import Any, Literal
 
 import anyio
 import pytest
+import yaml
 from aci_protocol import ErrorEvent, Event, Final, SessionStatus, parse_ndjson
 from aiohttp import web
 from aiohttp.test_utils import TestServer
@@ -51,10 +52,10 @@ from curie_runner.adapter import ClaudeAgentSession, build_options
 from curie_runner.session import SessionRunner
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_DOCKERFILE = _REPO_ROOT / "examples" / "dark-factory" / "runner.Dockerfile"
+_CHART = _REPO_ROOT / "charts" / "curie"
+_OVERLAY = _REPO_ROOT / "examples" / "dark-factory" / "values.yaml"
 _CEILING_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
-_CEILING_PATTERN = re.compile(rf"^ENV\s+{_CEILING_ENV}=(\d+)\s*$", re.MULTILINE)
-# A verdict needs a few thousand tokens; the plan caps the bundle at 16000.
+# A verdict needs a few thousand tokens; the example overlay caps it at 16000.
 _CEILING_CAP = 16000
 
 _MAIN_MODEL = "claude-sonnet-5"
@@ -80,9 +81,48 @@ _TURN_TIMEOUT_S = 120
 _EPOCH = "acme-epoch-PLACEHOLDER"
 
 
-def _dockerfile_ceiling() -> int | None:
-    found = _CEILING_PATTERN.search(_DOCKERFILE.read_text(encoding="utf-8"))
-    return int(found.group(1)) if found else None
+def _rendered_ceiling() -> int:
+    rendered = subprocess.run(
+        [
+            "helm",
+            "template",
+            "reviewer-credit",
+            str(_CHART),
+            "--values",
+            str(_OVERLAY),
+            "--show-only",
+            "templates/agent-sandbox.yaml",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    templates = {
+        doc["metadata"]["name"]: doc
+        for doc in yaml.safe_load_all(rendered.stdout)
+        if doc and doc.get("kind") == "SandboxTemplate"
+    }
+    factory = templates["reviewer-credit-curie-agent-dark-factory-runner"]
+    generic = templates["reviewer-credit-curie-runner"]
+
+    def runner(template: dict[str, Any]) -> dict[str, Any]:
+        return next(
+            container
+            for container in template["spec"]["podTemplate"]["spec"]["containers"]
+            if container["name"] == "runner"
+        )
+
+    factory_runner, generic_runner = runner(factory), runner(generic)
+    assert factory_runner["image"] == generic_runner["image"], (
+        "the example ceiling must work on the plain platform runner"
+    )
+    entries = [entry for entry in factory_runner["env"] if entry["name"] == _CEILING_ENV]
+    assert len(entries) == 1, f"expected one {_CEILING_ENV} from {_OVERLAY}, got {entries}"
+    assert not any(entry["name"] == _CEILING_ENV for entry in generic_runner["env"])
+    value = entries[0]["value"]
+    assert isinstance(value, str)
+    return int(value)
 
 
 def _sse(event: str, data: dict[str, Any]) -> bytes:
@@ -241,7 +281,7 @@ def _run_turn(
 
     ``ceiling`` is set in ``os.environ``, never in the options env, so it
     travels the runner's own path (``ClaudeAgentSession.connect``) into the CLI
-    the way the bundle image's ``ENV`` line does. Returns the turn's parsed
+    the way the rendered runner container's env does. Returns the turn's parsed
     outbound events and every /v1/messages body the stand-in received.
     """
 
@@ -330,15 +370,10 @@ def _single_final(events: list[Any]) -> Final:
     return finals[0]
 
 
-def test_the_bundle_runner_image_caps_output_tokens() -> None:
-    """AC2: the dark factory image sets a session-wide output ceiling.
+def test_the_bundle_overlay_caps_output_tokens_on_the_platform_runner() -> None:
+    """The example overlay sets the ceiling without a layered runner image."""
 
-    Red today: runner.Dockerfile has no ``ENV CLAUDE_CODE_MAX_OUTPUT_TOKENS``
-    line, so every reviewer request asks OpenRouter to reserve 64000 tokens.
-    """
-
-    ceiling = _dockerfile_ceiling()
-    assert ceiling is not None, f"no ENV {_CEILING_ENV}=<n> in {_DOCKERFILE}"
+    ceiling = _rendered_ceiling()
     assert 0 < ceiling <= _CEILING_CAP
 
 
@@ -347,13 +382,12 @@ def test_every_request_carries_the_bundle_ceiling(
 ) -> None:
     """AC2 on the real path: main and reviewer requests both carry the ceiling.
 
-    Red today because the Dockerfile has no ceiling to read. Once it does, red
-    again if the runner's env path (``cli_parent_env``) starts dropping the
-    variable, or if a CLI upgrade stops applying it to subagent requests.
+    The value comes from the example overlay's Helm-rendered runner env. This
+    fails if the chart or runner's env path (``cli_parent_env``) drops it, or if
+    a CLI upgrade stops applying it to subagent requests.
     """
 
-    ceiling = _dockerfile_ceiling()
-    assert ceiling is not None, f"no ENV {_CEILING_ENV}=<n> in {_DOCKERFILE}"
+    ceiling = _rendered_ceiling()
     _, bodies = _run_turn(tmp_path, monkeypatch, reviewer_reply="402", ceiling=ceiling)
 
     requests = _model_bodies(bodies)
@@ -367,18 +401,17 @@ def test_without_the_ceiling_the_reviewer_asks_above_it(
 ) -> None:
     """Negative control for AC2: the ceiling assertion is not vacuous.
 
-    Green today. With the variable unset the reviewer asks for the CLI default
+    With the variable unset the reviewer asks for the CLI default
     (32000 measured for an unknown subagent model), above the bundle cap. Red if
     the CLI default ever drops under the cap, which would make the ceiling test
-    pass without the image doing anything.
+    pass without the chart environment doing anything.
     """
 
     _, bodies = _run_turn(tmp_path, monkeypatch, reviewer_reply="402", ceiling=None)
 
     reviewer = _reviewer_bodies(bodies)
     assert len(reviewer) == 1, bodies
-    bound = _dockerfile_ceiling() or _CEILING_CAP
-    assert reviewer[0]["max_tokens"] > bound
+    assert reviewer[0]["max_tokens"] > _CEILING_CAP
 
 
 def test_a_reviewer_402_ends_the_turn_out_of_credits(

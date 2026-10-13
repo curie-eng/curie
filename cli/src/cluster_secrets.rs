@@ -633,6 +633,53 @@ where
     Ok(true)
 }
 
+/// Set the factory output ceiling for `agent` without replacing sibling values.
+/// An exact stored string is a no-op and does not resolve the chart. Returns
+/// whether the release was upgraded.
+pub async fn bind_factory_runner_env<F>(common: CommonOpts, agent: String, chart: F) -> Result<bool>
+where
+    F: std::future::Future<Output = Result<String>>,
+{
+    validate_agent_resource_name(&agent)?;
+    let values = read_release_values(&common).await?;
+    let configured = values
+        .as_ref()
+        .and_then(|v| v.pointer("/agentSandbox/runnerEnv"))
+        .and_then(|all| all.get(&agent))
+        .and_then(|env| env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"))
+        .and_then(serde_json::Value::as_str);
+    if configured == Some("16000") {
+        return Ok(false);
+    }
+    let chart = chart.await?;
+    let cmd = OpsCommand::new(
+        "helm",
+        vec![
+            plain("upgrade"),
+            plain(&common.release),
+            plain(&chart),
+            plain("-n"),
+            plain(&common.namespace),
+            plain("--reuse-values"),
+            CmdArg::SecretValuesDocument(serde_json::json!({
+                "agentSandbox": {"runnerEnv": {
+                    &agent: {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "16000"}
+                }}
+            })),
+        ],
+    );
+    let ui = crate::ui::ui();
+    ui.plumbing(&format!("+ {}", cmd.display()));
+    let (ok, stdout, stderr) = crate::ops::run_capture(&cmd).await?;
+    for line in stdout.lines().chain(stderr.lines()) {
+        ui.plumbing(line);
+    }
+    if !ok {
+        bail!("helm upgrade failed: {}", stderr.trim());
+    }
+    Ok(true)
+}
+
 pub async fn bind(opts: BindOpts) -> Result<()> {
     let cmds = bind_commands(&opts)?;
     if cmds.is_empty() {

@@ -88,6 +88,86 @@ fn cluster_factory_takes_forge_egress_and_not_the_github_api_flag() {
     assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
 }
 
+#[test]
+fn cluster_factory_accepts_repeated_repository_runner_and_docker_flags() {
+    assert!(
+        try_parse_from([
+            "curie",
+            "cluster",
+            "factory",
+            "--repo-runner",
+            "acme/bot=bot.yaml",
+            "--repo-runner",
+            "acme/web=web.yaml",
+            "--registry",
+            "registry.example.com/acme",
+            "--repo-docker",
+            "acme/bot",
+            "--repo-docker",
+            "acme/web",
+            "--dry-run",
+        ])
+        .is_ok(),
+        "repository runner and Docker targets must be repeatable"
+    );
+    assert!(
+        try_parse_from([
+            "curie",
+            "cluster",
+            "factory",
+            "--repo-docker",
+            "acme/bot",
+            "--dry-run",
+        ])
+        .is_ok(),
+        "Docker-only changes need no build registry"
+    );
+}
+
+#[test]
+fn cluster_factory_repository_runner_requires_a_registry() {
+    let error = match try_parse_from([
+        "curie",
+        "cluster",
+        "factory",
+        "--repo-runner",
+        "acme/bot=bot.yaml",
+        "--dry-run",
+    ]) {
+        Ok(_) => panic!("repository runner builds must require --registry"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.kind(),
+        clap::error::ErrorKind::MissingRequiredArgument
+    );
+    assert!(error.to_string().contains("--registry"), "{error}");
+}
+
+#[test]
+fn cluster_factory_disable_conflicts_with_repository_changes() {
+    for extra in [
+        vec![
+            "--repo-runner",
+            "acme/bot=bot.yaml",
+            "--registry",
+            "registry.example.com/acme",
+        ],
+        vec!["--repo-docker", "acme/bot"],
+    ] {
+        let flag = extra[0];
+        let mut argv = vec!["curie", "cluster", "factory", "--disable", "--dry-run"];
+        argv.extend(extra);
+        let error = match try_parse_from(argv) {
+            Ok(_) => panic!("--disable must refuse {flag}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let text = error.to_string();
+        assert!(text.contains("--disable") && text.contains(flag), "{text}");
+    }
+}
+
 /// clap's derived parser is deep enough that debug bin tests overflow the
 /// default thread stack once apply/diff/doctor grew `--context`. The
 /// released binary still parses on the process stack; only the test

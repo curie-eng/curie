@@ -5,14 +5,16 @@
 # the first action (the path has no cluster steps), and the agent binds
 # `jira=jira` instead of `github=acme/widgets`. Never regenerated from the
 # implementation.
+# The selected agent's runnerEnv action precedes the existing render and deploy.
 # ---
-infer repository toolchains before Helm from App-authenticated workflows and manifests; warn about tools or versions absent from the fixed runner
+infer repository toolchains before Helm from App-authenticated workflows and manifests; compare requirements with observed tools after selecting the runner image
 Kubernetes context: kind-curie-factory because --context was passed
 add agent jira-factory to the factory install on release curie: skip cluster up, App registration, and intake
 model credential: not needed; the release keeps the model it records (no prompt)
 Write the Jira Cloud tracker and binding `jira` and Secret curie-jira-token
 enroll jira-factory for forge egress: helm upgrade --reset-then-reuse-values --set factory.sandboxEgress.jira-factory=true unless the release already records it; the API does not roll
 create the trigger label curie-factory on acme/widgets where it is missing
+configure agentSandbox.runnerEnv.jira-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values
 render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image
 curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir /tmp/factory-quickstart-golden/curie-factory-quickstart-curie-curie/jira-factory --agent jira-factory --env prod --repo acme/widgets
 curie cluster surfaces jira-factory --context kind-curie-factory --namespace curie --release curie --add jira=jira

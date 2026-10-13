@@ -1456,6 +1456,12 @@ pub(crate) enum FactoryAction {
         /// local charts/curie on dev builds.
         #[arg(long)]
         chart: Option<String>,
+        /// Install published sha images for a full 40 character lowercase hex
+        /// commit, including an unreleased commit from next. Only full commit
+        /// tags are published. Example: --candidate
+        /// 0123456789abcdef0123456789abcdef01234567.
+        #[arg(long, value_name = "COMMIT", value_parser = curie::factory_quickstart::parse_candidate_commit)]
+        candidate: Option<String>,
         /// Print the steps and exit without creating a cluster or applying anything.
         #[arg(long)]
         dry_run: bool,

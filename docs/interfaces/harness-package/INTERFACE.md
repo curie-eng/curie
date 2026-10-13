@@ -108,6 +108,29 @@ keep the contribution, registry, and policy gate free of SDK imports and
 ratchet legacy SDK imports elsewhere in the runner. Only the Claude harness
 package is exempt from that runner ratchet.
 
+### Executable boundary test isolation
+
+`HARNESS-BOUNDARY-ISOLATION-1`: The real `lint-imports` positive and negative
+controls run against a private temporary copy of the workspace source packages
+and the unchanged root import configuration. The copy is outside the source
+checkout, and its source roots take precedence over installed editable packages.
+The authoritative source packages and configuration remain unchanged while
+either probe exists and while either linter control executes. A harmless new
+module passes; a new SDK import outside the Claude harness fails and names both
+the probe module and the SDK. Repository scanners retain their normal failure
+behavior and never encounter a disposable probe in the authoritative checkout.
+
+The existing controls in
+[`runner/tests/test_harness_boundary.py`](../../../runner/tests/test_harness_boundary.py)
+were measured with import-linter 2.15 using:
+
+```bash
+uv run python -m pytest -q runner/tests/test_harness_boundary.py::test_actual_linter_refuses_a_new_sdk_importer_and_accepts_its_control
+```
+
+The harmless module passed and the forbidden SDK import was rejected. Isolation
+changes only where these controls place their synthetic module.
+
 ## Known leakage
 
 The session port still receives SDK message objects, and other runner modules

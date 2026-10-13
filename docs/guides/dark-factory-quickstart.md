@@ -210,12 +210,13 @@ defaults.
 
 Before any Helm call, the second run authenticates with the GitHub App and reads
 the selected repository's workflows and standard manifests at one default-branch
-commit. It announces inferred toolchains and warns when a required tool or
-version is absent from the fixed factory runner. The runner includes Python
-3.13, Node 22.23, and Rust 1.95. Matching minor versions are supported regardless
-of patch; a bare Node 22 declaration also matches. A warning reports the tool,
-version, and declaring file without changing the runner image or installing
-tools. If a workflow names a version file that is missing, the version is
+commit. It compares inferred declarations with the tool manifest of the selected,
+digest-pinned runner image and warns about missing tools or version mismatches.
+If the selected image's inventory cannot be read, it explicitly reports the
+inventory as unknown. The operator's `--repo-runner OWNER/REPO=SPEC` option builds
+and pins an image with the tools specified for an already bound repository.
+Otherwise, inference is advisory and installs no inferred tools. If a workflow
+names a version file that is missing, the version is
 reported as unknown with a warning naming the file, and setup continues.
 Authentication failures and malformed GitHub responses remain errors.
 A repository with no declarations gets a `no toolchain signals` note.

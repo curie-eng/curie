@@ -1301,6 +1301,15 @@ fn factory_quickstart_gitlab_refuses_incomplete_or_malformed_flags() {
             gitlab_args("widgets", &token, &server.base_url),
             vec!["--repo"],
         ),
+        (
+            "--candidate, which only the GitHub quickstart installs",
+            [
+                valid.clone(),
+                vec!["--candidate".to_string(), "a".repeat(40)],
+            ]
+            .concat(),
+            vec!["--candidate"],
+        ),
     ];
     for (case, args, named) in cases {
         let run = dry_run_json(&cli, &args);

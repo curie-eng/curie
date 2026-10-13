@@ -66,8 +66,58 @@ pub struct QuickstartOpts {
     /// `--chart` was passed, so `chart` is the operator's and the deploy
     /// uses it too.
     pub chart_explicit: bool,
+    /// The published full commit image tags to install (`--candidate`).
+    pub candidate: Option<PublishedCandidate>,
     pub dry_run: bool,
     pub forge: ForgeFlags,
+}
+
+/// A candidate whose seven published image tags were all resolved before
+/// dispatch can fetch a chart. Constructed only by [`resolve_candidate`].
+#[derive(Debug, Clone)]
+pub struct PublishedCandidate {
+    commit: String,
+    runner: crate::examples::PublishedStockRunner,
+}
+
+pub async fn resolve_candidate(commit: &str) -> Result<PublishedCandidate> {
+    let commit = parse_candidate_commit(commit).map_err(CliError::usage)?;
+    let runner = github::resolve_candidate_runner(&commit).await?;
+    Ok(PublishedCandidate { commit, runner })
+}
+
+const CANDIDATE_TAG_KEYS: [&str; 6] = [
+    "api.image.tag",
+    "dispatcher.image.tag",
+    "mailAdapter.image.tag",
+    "worker.image.tag",
+    "ui.image.tag",
+    "agentSandbox.runner.tag",
+];
+
+/// Clap validates this before dispatch can fetch a chart or contact a peer.
+pub fn parse_candidate_commit(commit: &str) -> std::result::Result<String, String> {
+    if commit.len() == 40
+        && commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(commit.to_string())
+    } else {
+        Err("--candidate requires a full 40 character lowercase hex commit; only full commit tags are published".into())
+    }
+}
+
+fn candidate_install_settings(commit: &str) -> Vec<String> {
+    CANDIDATE_TAG_KEYS
+        .iter()
+        .flat_map(|key| {
+            [
+                format!("{key}=sha-{commit}"),
+                format!("{}.digest=", key.trim_end_matches(".tag")),
+            ]
+        })
+        .collect()
 }
 
 /// The factory intake a serving release records (#4362 decision 2), read from
@@ -324,6 +374,20 @@ pub(super) fn http_client(ca_file: Option<&Path>) -> Result<reqwest::Client> {
     })
 }
 
+/// Refuses `--candidate` on a GitLab quickstart. Pure, so it runs before the
+/// candidate's published images are resolved: the GitHub path installs those
+/// images, while a GitLab quickstart binds the release's own.
+pub fn check_candidate_forge(forge: &ForgeFlags, candidate: Option<&str>) -> Result<()> {
+    if candidate.is_some() && forge.code_host == CodeHostKind::Gitlab {
+        return Err(CliError::usage(
+            "--candidate installs published images through the GitHub quickstart; --code-host gitlab binds the release's own images",
+        )
+        .with_fix("drop --candidate, or install the candidate with `curie cluster up` before the quickstart")
+        .into());
+    }
+    Ok(())
+}
+
 /// Refuses a forge selection this build cannot run. Pure: it reads no file,
 /// network, or cluster, so the caller runs it before resolving the chart.
 /// GitHub refuses the non-GitHub flags; any other kind is routed to its module.
@@ -451,6 +515,10 @@ pub enum Action {
     JiraTracker(Box<JiraPlan>),
     /// Enroll an added agent for forge egress (`bind_forge_egress`).
     ForgeEgress {
+        agent: String,
+    },
+    /// Configure the selected agent's factory runner environment.
+    RunnerEnv {
         agent: String,
     },
     /// Create the trigger label on each repository that lacks it.
@@ -1352,6 +1420,9 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
                     repos: input.repos.clone(),
                 });
             }
+            actions.push(Action::RunnerEnv {
+                agent: input.agent.clone(),
+            });
             actions.push(deploy);
         }
         QuickstartPath::AddAgent => {
@@ -1366,6 +1437,9 @@ pub fn quickstart_plan(input: &PlanInput) -> Result<Planned> {
                     repos: input.repos.clone(),
                 });
             }
+            actions.push(Action::RunnerEnv {
+                agent: input.agent.clone(),
+            });
             actions.push(deploy);
         }
         QuickstartPath::Register => {
@@ -1498,6 +1572,11 @@ pub fn describe(planned: &Planned) -> Vec<String> {
             }
             Action::ForgeEgress { agent } => {
                 lines.push(forge_egress_line(agent));
+            }
+            Action::RunnerEnv { agent } => {
+                lines.push(format!(
+                    "configure agentSandbox.runnerEnv.{agent}.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values"
+                ));
             }
             Action::TriggerLabel { label, repos } => {
                 lines.push(format!(
@@ -1885,8 +1964,35 @@ async fn release_matches_quickstart_target(
     } else {
         model
     };
-    let matches =
-        quickstart_release_matches(&chart_version, &metadata, &values, model, kind_target);
+    let candidate_matches = match &opts.candidate {
+        Some(candidate) => {
+            let tag = format!("sha-{}", candidate.commit);
+            CANDIDATE_TAG_KEYS.iter().all(|key| {
+                let tag_matches = values
+                    .pointer(&format!("/{}", key.replace('.', "/")))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(tag.as_str());
+                let digest_matches = match values.pointer(&format!(
+                    "/{}/digest",
+                    key.trim_end_matches(".tag").replace('.', "/")
+                )) {
+                    None => false,
+                    Some(serde_json::Value::String(digest)) => {
+                        digest.is_empty()
+                            || (*key == "agentSandbox.runner.tag"
+                                && crate::cluster_secrets::reference_digest(
+                                    &candidate.runner.base_image,
+                                ) == Some(digest.as_str()))
+                    }
+                    _ => false,
+                };
+                tag_matches && digest_matches
+            })
+        }
+        None => true,
+    };
+    let matches = candidate_matches
+        && quickstart_release_matches(&chart_version, &metadata, &values, model, kind_target);
     Ok((matches, model.to_string()))
 }
 
@@ -2677,6 +2783,7 @@ mod tests {
             "kubectl --context kind-curie-factory -n kube-system scale deployment/coredns --replicas=1".to_string(),
             "curie cluster up --context kind-curie-factory --namespace curie --release curie --model z-ai/glm-5.3-flash --chart charts/curie --set security.gvisor.mode=off".to_string(),
             "configure factory intake factory.intake=poll for acme/widgets with --app-id 12345 --private-key-file /keys/app.pem and no webhook secret; the same helm upgrade binds the dark factory runner image".to_string(),
+            "configure agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000 with helm upgrade --reuse-values unless the release already records that string; preserve sibling values".to_string(),
             "render the dark factory and deploy the published ghcr.io/curie-eng/curie-dark-factory-runner image".to_string(),
             format!("curie cluster deploy --context kind-curie-factory --namespace curie --release curie --plugin-dir {} --agent dark-factory --env prod --repo acme/widgets", dir.display()),
             "curie cluster surfaces dark-factory --context kind-curie-factory --namespace curie --release curie --add github=acme/widgets".to_string(),
@@ -3076,6 +3183,7 @@ mod tests {
             assert!(!text.contains(banned), "{banned}: {text}");
         }
         let order: Vec<usize> = [
+            "configure agentSandbox.runnerEnv.dark-factory-fast.CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000",
             "cluster deploy",
             "cluster surfaces dark-factory-fast",
             "cluster overrides dark-factory-fast",
