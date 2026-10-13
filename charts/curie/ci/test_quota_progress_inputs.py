@@ -311,6 +311,7 @@ def test_empty_inventory_advances_to_install_and_cleans_up_failed_install(
         call[0] == "kubectl" and "get" in call for call in calls[:install_index]
     ), calls
     cleanup = calls[install_index + 1 :]
+    namespace = "test-4368-idle-capacity-12345-1"
     claims = [
         call
         for call in cleanup
@@ -324,21 +325,31 @@ def test_empty_inventory_advances_to_install_and_cleans_up_failed_install(
         and "sandboxes" in call
     ]
     uninstalls = [call for call in cleanup if call[0] == "helm" and "uninstall" in call]
+    pods = [
+        call
+        for call in cleanup
+        if call[0] == "kubectl" and "delete" in call and "pods" in call
+    ]
+    namespace_deletions = [
+        call
+        for call in cleanup
+        if call[0] == "kubectl" and "delete" in call
+        and "namespace" in call and namespace in call
+    ]
     assert len(claims) == len(sandboxes) == len(uninstalls) == 1, cleanup
+    assert len(pods) == len(namespace_deletions) == 1, cleanup
     assert cleanup.index(claims[0]) < cleanup.index(sandboxes[0]), cleanup
     assert cleanup.index(sandboxes[0]) < cleanup.index(uninstalls[0]), cleanup
+    assert cleanup.index(uninstalls[0]) < cleanup.index(pods[0]), cleanup
+    assert cleanup.index(pods[0]) < cleanup.index(namespace_deletions[0]), cleanup
     for deletion in (claims[0], sandboxes[0]):
         assert "--all" in deletion and "--wait=true" in deletion, deletion
         assert "--timeout=90s" in deletion, deletion
         assert "-n" in deletion, deletion
         assert "test-4368-idle-capacity-12345-1" in deletion, deletion
-    assert any(
-        call[0] == "kubectl"
-        and "delete" in call
-        and any(argument.endswith("test-4368-idle-capacity-12345-1") for argument in call)
-        for call in cleanup
-    ), cleanup
-    namespace = "test-4368-idle-capacity-12345-1"
+    for flag in ("--all", "--ignore-not-found", "--wait=true", "--timeout=60s"):
+        assert flag in pods[0], pods[0]
+    assert "-n" in pods[0] and namespace in pods[0], pods[0]
     fullname = "idlecap-12345-1-curie"
     publication_namespace = f"{namespace}-{fullname}-publication"[:63].rstrip("-")
     for deleted_namespace in (namespace, "agent-sandbox-system", publication_namespace):
@@ -349,6 +360,7 @@ def test_empty_inventory_advances_to_install_and_cleans_up_failed_install(
             and f"namespace/{deleted_namespace}" in call
         ]
         assert len(waits) == 1, (deleted_namespace, cleanup)
+        assert cleanup.index(namespace_deletions[0]) < cleanup.index(waits[0]), cleanup
         assert "--for=delete" in waits[0] and "--timeout=180s" in waits[0], waits[0]
     for kind in ("validatingadmissionpolicy", "validatingadmissionpolicybinding"):
         assert any(

@@ -164,6 +164,10 @@ PY_DIAGNOSTIC
         helm --kube-context "$CONTEXT" uninstall "$RELEASE" -n "$NAMESPACE" \
             --ignore-not-found --wait --timeout 60s >"$WORKDIR/uninstall.log" 2>&1 \
             || { echo "FAIL: could not uninstall the owned release" >&2; cleanup_status=1; }
+        # Drain owned pods before namespace deletion so the namespace
+        # controller does not defer reconciliation for their termination grace.
+        kc delete pods --all --ignore-not-found --wait=true --timeout=60s >"$WORKDIR/delete-pods.log" 2>&1 \
+            || { echo "FAIL: could not drain pods in the owned namespace" >&2; cleanup_status=1; }
         kc delete namespace "$NAMESPACE" --ignore-not-found --wait=false \
             >"$WORKDIR/delete-namespace.log" 2>&1 \
             || { echo "FAIL: could not delete the owned namespace" >&2; cleanup_status=1; }
