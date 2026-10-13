@@ -2686,7 +2686,10 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
     assert steps.index(staging[1]) < steps.index(staging[2]) < steps.index(workspace)
     assert workspace["if"] == _chart_step_if("workspace-diagnostic")
     for step in staging:
-        assert "if" not in step, step
+        assert step["if"] == (
+            "${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') "
+            "|| contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}"
+        ), step
         assert "continue-on-error" not in step
     download, load, stage = staging
     assert download["uses"].startswith("actions/download-artifact@")
@@ -2709,6 +2712,30 @@ def test_workspace_diagnostic_reuses_the_chart_cluster_and_candidate_artifacts()
     image_load = stage_run[stage_run.index("kind load docker-image") :]
     for component in ("api", "worker", "runner"):
         assert f"curie-{component}:wsdiag-${{{{ github.sha }}}}" in image_load
+
+
+def test_quota_progress_reuses_the_chart_cluster_and_candidate_artifacts() -> None:
+    chart = yaml.safe_load(WORKFLOW.read_text())["jobs"][CHART_JOB]
+    steps = [step for step in chart["steps"] if step.get("name") == "Quota progress regression"]
+    assert len(steps) == 1
+    quota = steps[0]
+    assert quota["if"] == _chart_step_if("quota-progress")
+    assert quota["timeout-minutes"] == 30
+    assert "continue-on-error" not in quota
+    assert quota["env"] == {
+        "CURIE_BIN": "${{ github.workspace }}/cli/target/release/curie",
+        "CURIE_SCENARIO_CONTEXT": "kind-curie-e2e",
+        "CURIE_SCENARIO_RUN_ID": "${{ github.run_id }}-${{ github.run_attempt }}",
+        "CURIE_SCENARIO_API_IMAGE": "curie-api:wsdiag-${{ github.sha }}",
+        "CURIE_SCENARIO_WORKER_IMAGE": "curie-worker:wsdiag-${{ github.sha }}",
+        "CURIE_SCENARIO_RUNNER_IMAGE": "curie-runner:wsdiag-${{ github.sha }}",
+    }
+    commands = quota["run"].replace("\\\n", " ")
+    assert [" ".join(line.split()) for line in commands.splitlines() if line.strip()] == [
+        "set -euo pipefail",
+        "bash tools/runtime-assertion-gate/run.sh "
+        "charts/curie/ci/runtime/idle-capacity-reclamation-runtime.sh",
+    ]
 
 
 # #4016: the approval resume kind scenario runs on pull requests whenever a
