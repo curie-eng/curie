@@ -1716,6 +1716,7 @@ def test_upgrade_matrix_lists_every_shard_on_full_runs_and_one_on_prs(
         "s18",
         "s19",
         "s20",
+        "s21",
     ]
     assert _list_shards(tmp_path, "false") == 'shards=["s01"]\n'
 
