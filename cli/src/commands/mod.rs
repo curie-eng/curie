@@ -162,7 +162,11 @@ fn resolve_url(explicit: Option<String>) -> Result<String> {
     if let Some(saved) = state::load(Path::new("."))? {
         return Ok(saved.base_url);
     }
-    Ok(format!("http://localhost:{DEFAULT_PORT}"))
+    let published_host = docker::published_host_setting()?;
+    Ok(docker::published_endpoint(
+        published_host.as_deref(),
+        DEFAULT_PORT,
+    ))
 }
 
 fn unix_now() -> u64 {

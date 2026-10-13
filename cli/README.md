@@ -368,6 +368,23 @@ optional `evals/trajectory.json` sidecar are the exceptions. `skill eval` reads
 them live from source, so an eval edit needs no restart. `skill down` and a
 replacement `up` release the snapshot along with the container.
 
+For a Docker daemon whose filesystem is separate from the CLI host, set
+`DOCKER_PUBLISHED_HOST` to the hostname or IP where its published ports are
+reachable, without a URL scheme or port. Its presence selects remote snapshot
+transport even when it names `localhost`. The CLI copies the immutable snapshot
+through the Docker API into a private named volume and mounts it read only.
+`skill check`, `skill up`, `skill eval --model`, and `curie try` use this
+transport; runner requests use the configured address, including IPv6 addresses.
+`skill down`, replacement, and failed startup release the volume. Docker's
+connection settings such as `DOCKER_HOST` remain independent. With
+`DOCKER_PUBLISHED_HOST` unset, the existing bind mount and localhost endpoint
+are used.
+
+Hosted connectors that declare `secret_files` need host-path mounts and are
+refused before startup when `DOCKER_PUBLISHED_HOST` is set. Hosted connectors
+with environment secrets remain supported, as do connectors using a remote
+`url` or `unhosted_url`.
+
 #### `local` target
 
 Wraps `compose.dev.yaml` via Docker Compose, so a `message` walks the real
