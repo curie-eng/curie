@@ -656,6 +656,22 @@ async fn execute(
                 )
                 .await?;
             }
+            Action::RunnerEnv { agent } => {
+                let step = "Configuring factory runner environment";
+                crate::ui::ui().note(step);
+                let chart = opts.chart.clone();
+                crate::cluster_secrets::bind_factory_runner_env(
+                    CommonOpts {
+                        namespace: opts.namespace.clone(),
+                        release: opts.release.clone(),
+                        dry_run: false,
+                    },
+                    agent.clone(),
+                    async move { Ok(chart) },
+                )
+                .await
+                .map_err(|error| step_error(Path::new("helm"), &[], step, error, None))?;
+            }
             Action::TriggerLabel { label, repos } => {
                 let app = app.ok_or_else(|| {
                     CliError::failure(

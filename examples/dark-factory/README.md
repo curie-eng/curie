@@ -101,8 +101,13 @@ credential as the main loop. Pin a reviewer model with
 `--clear-reviewer-model` restores the credential default without changing the
 bundle. The local overrides command accepts the same flags.
 
-The runner image caps every model request at 16000 output tokens
-(`CLAUDE_CODE_MAX_OUTPUT_TOKENS` in [`runner.Dockerfile`](runner.Dockerfile)).
+The Helm overlay [`values.yaml`](values.yaml) caps every factory model request
+at 16000 output tokens through
+`agentSandbox.runnerEnv.dark-factory.CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+Apply it to the release before deploying this bundle. `curie factory quickstart`
+sets the same value for its selected agent, including an operator bundle that
+uses the platform runner. The setting belongs to the agent and applies to its
+repository runner templates too.
 Claude Code otherwise asks for up to 64000 output tokens per Opus request, and
 OpenRouter reserves credit for that whole ceiling, so a low balance refused
 every reviewer call. A verdict needs a few thousand tokens. Claude Code has no
@@ -170,6 +175,7 @@ curie cluster up --model z-ai/glm-5.3-flash --allow-egress-host openrouter
 # minimum Helm timeout of 21900 seconds in its annotation.
 helm upgrade curie <chart> -n curie --reuse-values \
   --timeout 21900s \
+  -f ./dark-factory/values.yaml \
   --set worker.deliveryBudgetSeconds=10800 \
   --set worker.runnerTotalTimeoutSeconds=10800
 curie cluster overrides dark-factory --execution-deadline 10800
@@ -206,6 +212,16 @@ curie cluster surfaces dark-factory --add github=acme-corp/acme-bot
 # Optional. Human approval of each pull request stays the default.
 curie cluster publication-policy dark-factory --policy auto
 ```
+
+For a different agent name, change the `dark-factory` key in the rendered
+`values.yaml` before applying it. The overlay contains non-secret environment
+strings; quote every value. Environment names use uppercase letters, digits and
+underscores, starting with a letter or underscore. Agent names use lowercase
+DNS labels. The chart rejects reserved platform and credential
+names and names already supplied by the chart, connector secrets or global
+`agentSandbox.runner.extraEnv`. Agent `OTEL_*` entries are also refused because
+the chart derives telemetry egress from global configuration. Configure
+`otelCollector` or `agentSandbox.runner.extraEnv` for telemetry instead.
 
 `curie cluster factory --disable` turns intake off. See "Admitting a labelled
 GitHub issue" in [`docs/operations.md`](../../docs/operations.md) for what the

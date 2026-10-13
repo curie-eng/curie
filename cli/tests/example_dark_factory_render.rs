@@ -130,8 +130,7 @@ fn a_rendered_bundle_includes_its_runner_environment_overlay() {
     receipt(&render(&out, None, None));
 
     let overlay = std::fs::read(out.join("values.yaml")).expect("render wrote values.yaml");
-    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../examples/dark-factory/values.yaml");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/dark-factory/values.yaml");
     assert_eq!(overlay, std::fs::read(source).unwrap());
     let values: Value = serde_norway::from_slice(&overlay).unwrap();
     assert_eq!(

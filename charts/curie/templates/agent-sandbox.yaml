@@ -161,12 +161,20 @@ roleRef:
 {{- end -}}
 {{- with .root }}
 {{- $runner := .Values.agentSandbox.runner }}
-{{- /* @spec ACTION-EXECUTOR-16: key custody. runner.extraEnv reaches every
-       agent's runner sandbox (outside the connector-secret marker, so
-       unredacted too), and the snapshot sealing key must reach only the hosted
-       connector: fail the render, naming the key and never its value. */}}
+{{- $runnerEnv := include "curie.agentSandboxRunnerEnv" . | fromJson }}
+{{- $extraEnv := $runner.extraEnv | default list }}
+{{- if $agent }}
+{{- $agentEnv := get $runnerEnv $agent | default dict }}
+{{- range $name := keys $agentEnv | sortAlpha }}
+{{- $extraEnv = append $extraEnv (dict "name" $name "value" (get $agentEnv $name)) }}
+{{- end }}
+{{- end }}
+{{- /* @spec ACTION-EXECUTOR-16: key custody. Both runner env sources reach
+       the runner outside the connector-secret marker, so unredacted too.
+       The snapshot sealing key must reach only the hosted connector: fail
+       the render, naming the key and never its value. */}}
 {{- $sealing := splitList " " (trim (include "curie.sealingKeyNames" .)) }}
-{{- range $runner.extraEnv }}
+{{- range $extraEnv }}
 {{- if has .name $sealing }}
 {{- fail (printf "agentSandbox.runner.extraEnv contains %q, a reserved snapshot sealing key: it must reach only the hosted connector, so declare it as a SecretRef (from_secret) on that connector in the bundle, never in the runner environment" .name) }}
 {{- end }}
@@ -962,7 +970,7 @@ spec:
               value: {{ $wf.mountPath | quote }}
             {{- end }}
             {{- include "curie.env.otel" (dict "root" . "extraEnv" $runner.extraEnv) | nindent 12 }}
-            {{- include "curie.extraEnv" (dict "root" . "workload" "agentSandbox.runner" "env" $runner.extraEnv "additionalReserved" $connectorReservedEnv) | nindent 12 }}
+            {{- include "curie.extraEnv" (dict "root" . "workload" "agentSandbox.runner" "env" $extraEnv "additionalReserved" $connectorReservedEnv) | nindent 12 }}
           readinessProbe:
             httpGet:
               path: /healthz

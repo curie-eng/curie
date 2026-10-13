@@ -843,6 +843,10 @@ pub const DARK_FACTORY_BUNDLE_FILES: &[(&str, &[u8])] = &[
         include_bytes!("../../examples/dark-factory/runner.Dockerfile"),
     ),
     (
+        "values.yaml",
+        include_bytes!("../../examples/dark-factory/values.yaml"),
+    ),
+    (
         ".claude-plugin/plugin.json",
         include_bytes!("../../examples/dark-factory/.claude-plugin/plugin.json"),
     ),

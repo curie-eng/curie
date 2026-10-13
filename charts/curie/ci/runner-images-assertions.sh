@@ -101,6 +101,7 @@ def worker_env():
 def assert_runner_env(values):
     configured = values["agentSandbox"]["runnerEnv"]
     custom_names = {name for env in configured.values() for name in env}
+    global_env = {entry["name"]: entry["value"] for entry in values["agentSandbox"].get("runner", {}).get("extraEnv", [])}
     for name, tpl in templates.items():
         pod = tpl["spec"]["podTemplate"]
         agent = pod["metadata"]["labels"].get("curietech.ai/agent", "")
@@ -114,6 +115,9 @@ def assert_runner_env(values):
             want = expected if container["name"] == "runner" else {}
             if actual != want:
                 sys.exit(f"{name}/{container['name']}: runnerEnv {actual!r}, want {want!r}")
+            global_actual = {entry["name"]: entry.get("value") for entry in entries if entry["name"] in global_env}
+            if global_actual != (global_env if container["name"] == "runner" else {}):
+                sys.exit(f"{name}/{container['name']}: global extraEnv was lost or leaked")
 
 
 # Invariant (c): every runner-image container image is prewarmed.
@@ -293,7 +297,7 @@ python3 "$CHECKER" default "$TMP/default.yaml" || fail "(a) default render"
 # (i) Environment alone selects an agent pool, with string values preserved
 # verbatim and no copy on another agent, the generic runner or init containers.
 cat >"$TMP/runner-env-values.json" <<'JSON'
-{"agentSandbox":{"runnerEnv":{"factory":{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"16000","ACME_ZERO":"0","ACME_EMPTY":"","ACME_FALSE":"false","_ACME_TEXT":"first line\nsecond line"},"acme":{"ACME_OTHER":"17"}}},"worker":{"attachments":{"enabled":true}}}
+{"agentSandbox":{"runner":{"extraEnv":[{"name":"ACME_GLOBAL","value":"global"}]},"runnerEnv":{"factory":{"CLAUDE_CODE_MAX_OUTPUT_TOKENS":"16000","ACME_ZERO":"0","ACME_EMPTY":"","ACME_FALSE":"false","_ACME_TEXT":"first line\nsecond line"},"acme":{"ACME_OTHER":"17"}}},"worker":{"attachments":{"enabled":true}}}
 JSON
 render -f "$TMP/runner-env-values.json" >"$TMP/runner-env.yaml" || fail "runnerEnv-only render"
 python3 "$CHECKER" runner-env "$TMP/runner-env.yaml" "$TMP/runner-env-values.json" || fail "(i) runnerEnv-only pools and isolation"
@@ -318,14 +322,17 @@ expect_runner_env_fail "agentSandbox.runnerEnv" --set-json 'agentSandbox.runnerE
 for agent in 'Bad_Name' '-factory' 'factory-' "$(printf 'a%.0s' {1..41})"; do
   expect_runner_env_fail "agentSandbox.runnerEnv" --set-json "agentSandbox.runnerEnv={\"$agent\":{\"ACME_VALUE\":\"1\"}}"
 done
-for name in '1VALUE' 'BAD-NAME' 'BAD.NAME' ''; do
+for name in '1VALUE' 'BAD-NAME' 'BAD.NAME' 'lowercase' 'Mixed_CASE' ''; do
   expect_runner_env_fail "agentSandbox.runnerEnv" --set-json "agentSandbox.runnerEnv={\"factory\":{\"$name\":\"1\"}}"
 done
-for name in CURIE_FUTURE ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS ANTHROPIC_CUSTOM_HEADERS HOME GIT_CONFIG_COUNT OTEL_EXPORTER_OTLP_ENDPOINT OTEL_FUTURE SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED; do
+for name in CURIE_FUTURE ANTHROPIC_BASE_URL ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS ANTHROPIC_CUSTOM_HEADERS OTEL_EXPORTER_OTLP_ENDPOINT OTEL_FUTURE; do
   expect_runner_env_fail "agentSandbox.runnerEnv" --set-string "agentSandbox.runnerEnv.factory.$name=placeholder"
 done
-expect_runner_env_fail "agentSandbox.runnerEnv" --set-string 'agentSandbox.runnerEnv.factory.API_TOKEN=placeholder' --set-string 'agentSandbox.connectorSecrets.factory.API_TOKEN=placeholder'
-expect_runner_env_fail "agentSandbox.runnerEnv" --set-string 'agentSandbox.runnerEnv.factory.ACME_MODE=agent' --set-json 'agentSandbox.runner.extraEnv=[{"name":"ACME_MODE","value":"global"}]'
+for name in HOME GIT_CONFIG_COUNT SNAPSHOT_SEALING_KEY SNAPSHOT_SEALING_KEYS_RETAINED; do
+  expect_runner_env_fail "$name" --set-string "agentSandbox.runnerEnv.factory.$name=placeholder"
+done
+expect_runner_env_fail "API_TOKEN" --set-string 'agentSandbox.runnerEnv.factory.API_TOKEN=placeholder' --set-string 'agentSandbox.connectorSecrets.factory.API_TOKEN=placeholder'
+expect_runner_env_fail "ACME_MODE" --set-string 'agentSandbox.runnerEnv.factory.ACME_MODE=agent' --set-json 'agentSandbox.runner.extraEnv=[{"name":"ACME_MODE","value":"global"}]'
 
 # (b) (c) (d)
 LAYERED=(--set-string "agentSandbox.runnerImages.factory=$DIGEST_A"
