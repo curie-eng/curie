@@ -1,7 +1,8 @@
 """The factory acceptance table: one entry per tracker and code host pairing.
 
-`curie dev factory-e2e acceptance --pairing <tracker>+<code host>` runs one
-entry. Each entry fixes its steps, and each step fixes its inputs, the
+`curie dev factory-e2e acceptance --pairing <tracker>+<code host>[@<target>]`
+runs one entry; a forge with several deployments keys one entry per target.
+Each entry fixes its steps, and each step fixes its inputs, the
 `factory_e2e.py` command it runs, a deadline, what the forge must show
 (remote assertions, observed by the scenario and recorded in its evidence),
 the evidence fields that must hold (persisted assertions, as dotted path and
@@ -17,9 +18,10 @@ and to `--evidence` when given.
 
 `--dry-run` lists every step and launches nothing. It fails on an entry with
 an unset step field, and reports "not installed" for an entry whose forge
-drivers are not installed or whose pairing is refused. github+github and
-jira_cloud+github are installed today; the GitLab entries are complete step
-definitions waiting on their drivers in tools/factory-e2e/forges/. Bitbucket
+drivers are not installed or whose pairing is refused. github+github,
+jira_cloud+github, gitlab+gitlab@fixture and gitlab+gitlab@saas are installed
+today; jira_cloud+gitlab is a complete step definition waiting on its install
+path. Bitbucket
 pairs only with a Jira Cloud tracker, and both Bitbucket entries are refused
 until the combined Jira Cloud and Bitbucket quickstart lands (#4400): their
 drivers are installed but no install path sets up that pairing yet.
@@ -30,6 +32,13 @@ GitHub driver, so it asserts the same loop plus the tracker evidence. A
 Bitbucket entry is driven by its code host's driver, which delegates the
 ticket to the jira_cloud driver and asserts the loop only. Every Jira entry
 asserts the "close Jira test issues" teardown.
+
+The GitLab entries are driven by the gitlab driver with `--forge-target`.
+`@fixture` brings a GitLab CE fixture up for the run on the kube context
+node's address and removes it, and its teardown check reads the fixture's
+state directory as gone; it also asserts that a Reporter's label admits
+nothing. `@saas` reads its gitlab.com test project and token files from the
+environment, and its live run fails before any step when one is unset.
 """
 
 from __future__ import annotations
@@ -72,6 +81,11 @@ LOOP_DEADLINE_SECONDS = (
 )
 
 TEARDOWN_CLEAN = "every teardown step in the evidence is ok (teardown_clean is true)"
+FIXTURE_GONE = (
+    "the GitLab fixture is gone: the evidence names gitlab_fixture.state_dir and that "
+    "directory no longer exists (forge-fixture gitlab down deletes it only once nothing "
+    "labelled with its compose project remains)"
+)
 NAMESPACE_GONE = (
     "the run's namespace is gone: kubectl --context <context> get namespace <namespace> "
     "--ignore-not-found -o name exits 0 and prints nothing"
@@ -102,10 +116,13 @@ class Pairing:
     steps: tuple[Step, ...]
     # Why an entry whose drivers are installed is still not installed.
     refused: str | None = None
+    # The forge deployment the entry drives (`--forge-target`); None for a forge with one.
+    target: str | None = None
 
     @property
     def key(self) -> str:
-        return f"{self.tracker}+{self.code_host}"
+        pair = f"{self.tracker}+{self.code_host}"
+        return f"{pair}@{self.target}" if self.target else pair
 
 
 _FORGE_LABELS = {
@@ -139,6 +156,13 @@ _JIRA_TRACKER_ASSERTIONS = (
     ("scenario.tracker.pr_body_has_key", True),
     ("scenario.tracker.bot_label_admitted", False),
 )
+
+
+def _gitlab() -> Any:
+    """The gitlab forge entry module (forges/gitlab.py)."""
+
+    fe.load_forge_entries()
+    return sys.modules["factory_e2e_forges.gitlab"]
 
 
 def _driver(tracker: str, code_host: str) -> str:
@@ -261,6 +285,95 @@ def _pairing(
     return Pairing(tracker, code_host, installed, (_loop_step(tracker, code_host),), refused)
 
 
+def _gitlab_step(target: str) -> Step:
+    """The forge-loop step of gitlab+gitlab@<target> (#4399 decision 27)."""
+
+    gitlab = _gitlab()
+    key = f"gitlab+gitlab@{target}"
+    inputs = {
+        "tracker": "GitLab (gitlab), issues on the same project",
+        "code_host": "GitLab (gitlab)",
+        "ticket": (
+            "--issue-file, else the default loop ticket (on the fixture: fix add() in widget.sh)"
+        ),
+        "review": "--revision-file, else the default review text (one follow-up change)",
+        "candidate": "--candidate and --candidate-images (build for a pull request head)",
+        "kube_context": "--context, else CURIE_FACTORY_KUBE_CONTEXT",
+    }
+    tracker: tuple[tuple[str, Any], ...] = (
+        ("scenario.tracker.closes_issue", True),
+        ("scenario.tracker.thread_replies", 1),
+    )
+    teardown_steps: tuple[str, ...] = (
+        "reset fixture repository",
+        "restore fixture default branch",
+        "delete namespaces",
+    )
+    if target == "fixture":
+        inputs["credentials"] = (
+            "CURIE_FACTORY_* variables for the cluster, the layer registry and a real model "
+            "(CURIE_FACTORY_MODEL_API_KEY); the GitLab CE fixture is brought up for the run "
+            "with `forge-fixture gitlab up --state-dir <fresh dir> --advertise-host <the "
+            "InternalIP of the kube context node running the Docker daemon>`, and removed "
+            "after it; the factory token is the fixture's service account token"
+        )
+        remote = (
+            "GitLab shows one new issue opened and labelled by developer through Sudo",
+            "a second issue labelled by reporter admits no WorkItem and gets no state label",
+            "GitLab shows exactly one merge request opened by the factory whose description "
+            "carries Closes #<iid>",
+            "the merge request's first head carries a failing external commit status from "
+            "developer (CI red)",
+            "a later head pushed by the factory has passing checks (CI green)",
+            "a diff comment from developer is followed by a new commit on the same merge "
+            "request and exactly one factory thread reply",
+            "root merged the merge request and GitLab reads it merged",
+        )
+        tracker += (
+            ("scenario.tracker.reporter_label_admitted", False),
+            ("scenario.tracker.reporter_state_labels", []),
+        )
+        teardown_steps += (gitlab.FIXTURE_DOWN_STEP,)
+        checks = (TEARDOWN_CLEAN, NAMESPACE_GONE, FIXTURE_GONE)
+    else:
+        project, factory_token, human_token = gitlab.SAAS_VARS
+        inputs["credentials"] = (
+            "CURIE_FACTORY_* variables for the cluster, the layer registry and a real model "
+            f"(CURIE_FACTORY_MODEL_API_KEY); {project} names the gitlab.com test group's "
+            f"subgroup project, {factory_token} the factory's Developer project access "
+            f"token file and {human_token} the human Owner token file that labels, "
+            "reviews, sets CI and merges"
+        )
+        remote = (
+            "gitlab.com shows one new issue opened and labelled by the human Owner",
+            "gitlab.com shows exactly one merge request opened by the factory whose "
+            "description carries Closes #<iid>",
+            "the merge request's first head carries a failing external commit status from "
+            "the human Owner (CI red)",
+            "a later head pushed by the factory has passing checks (CI green)",
+            "a diff comment from the human Owner is followed by a new commit on the same "
+            "merge request and exactly one factory thread reply",
+            "the human Owner merged the merge request and gitlab.com reads it merged",
+        )
+        checks = (TEARDOWN_CLEAN, NAMESPACE_GONE)
+    persisted = _persisted("forge-loop", "gitlab", key, teardown_steps)
+    # The tracker assertions sit with the loop's, before the teardown ones.
+    split = persisted.index(("teardown_clean", True))
+    return Step(
+        name=f"forge-loop {key}",
+        inputs=inputs,
+        command=["run", "--scenario", "forge-loop", "--forge", "gitlab", "--forge-target", target],
+        deadline_seconds=LOOP_DEADLINE_SECONDS,
+        remote_assertions=remote,
+        persisted_assertions=(*persisted[:split], *tracker, *persisted[split:]),
+        teardown_checks=checks,
+    )
+
+
+def _gitlab_pairing(target: str) -> Pairing:
+    return Pairing("gitlab", "gitlab", True, (_gitlab_step(target),), target=target)
+
+
 # The Bitbucket drivers are installed, but nothing installs a Jira Cloud tracker
 # beside a Bitbucket code host until the combined quickstart lands.
 BITBUCKET_REFUSED = "the combined Jira Cloud and Bitbucket quickstart is not in this build (#4400)"
@@ -271,7 +384,8 @@ PAIRINGS: dict[str, Pairing] = {
     for p in (
         _pairing("github", "github", installed=True),
         _pairing("jira_cloud", "github", installed=True),
-        _pairing("gitlab", "gitlab", installed=False),
+        _gitlab_pairing("fixture"),
+        _gitlab_pairing("saas"),
         _pairing("jira_cloud", "gitlab", installed=False),
         _pairing("jira_cloud", "bitbucket_cloud", installed=False, refused=BITBUCKET_REFUSED),
         _pairing("jira_cloud", "bitbucket_dc", installed=False, refused=BITBUCKET_REFUSED),
@@ -321,7 +435,9 @@ def _missing_drivers(pairing: Pairing) -> list[str]:
 def _not_installed(pairing: Pairing) -> str:
     if pairing.refused:
         return f"{pairing.key} is not installed: {pairing.refused}"
-    missing = _missing_drivers(pairing) or [pairing.key]
+    missing = _missing_drivers(pairing)
+    if not missing:
+        return f"{pairing.key} is not installed: no install path sets up this pairing yet"
     if len(missing) == 1:
         return f"{pairing.key} is not installed: the {missing[0]} forge driver is not installed"
     drivers = " and ".join(missing)
@@ -453,6 +569,17 @@ def _namespace_gone(args: Any, evidence: Mapping[str, Any], kubectl: Kubectl) ->
     return None
 
 
+def _fixture_gone(evidence: Mapping[str, Any]) -> str | None:
+    """None when the run's GitLab fixture state directory is gone, else why not."""
+
+    recorded = _get_path(evidence, "gitlab_fixture.state_dir")
+    if not isinstance(recorded, str) or not recorded:
+        return "cannot check the GitLab fixture: the evidence names no gitlab_fixture.state_dir"
+    if Path(recorded).exists():
+        return f"the GitLab fixture state dir {recorded} still exists: the fixture was not removed"
+    return None
+
+
 def _judge_step(
     step: Step, args: Any, code: int, evidence: Mapping[str, Any] | None, kubectl: Kubectl
 ) -> list[str]:
@@ -475,6 +602,10 @@ def _judge_step(
                 failures.append("teardown is not clean")
         elif check == NAMESPACE_GONE:
             reason = _namespace_gone(args, evidence, kubectl)
+            if reason:
+                failures.append(reason)
+        elif check == FIXTURE_GONE:
+            reason = _fixture_gone(evidence)
             if reason:
                 failures.append(reason)
         else:
@@ -504,6 +635,16 @@ def run(args: Any, *, runner: Runner = default_runner, kubectl: Kubectl = defaul
     if args.hold:
         print("factory-e2e: acceptance does not take --hold", file=sys.stderr)
         return fe.EXIT_CONFIG
+    if pairing.code_host == "gitlab" and pairing.target == "saas":
+        missing = _gitlab().missing_saas_env(os.environ)
+        if missing:
+            print(f"factory-e2e: {pairing.key} needs {missing}", file=sys.stderr)
+            return fe.EXIT_CONFIG
+    if pairing.code_host == "gitlab" and pairing.target == "fixture":
+        fixture_var = _gitlab().FIXTURE_VAR
+        if os.environ.pop(fixture_var, None):
+            # The entry proves a fixture it brings up and removes; never a reused one.
+            fe.log(f"acceptance {pairing.key}: ignoring {fixture_var}; the run brings its own")
 
     stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
     base = args.evidence.parent if args.evidence else fe._repo_root() / "target" / "factory-e2e"
