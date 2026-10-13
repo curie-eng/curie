@@ -396,9 +396,12 @@ fi
 grep -q "not in the prewarm set" "$TMP/mut.out" || { cat "$TMP/mut.out" >&2; fail "(f) wrong failure"; }
 
 # (g) Absent and empty repository runner configuration preserve the exact
-# rendered text of the affected workloads. Randomly minted Secret values are
-# outside these workloads, so the comparison does not normalize their output.
-UNCHANGED=(--show-only templates/agent-sandbox.yaml
+# rendered text of the affected workloads, including their Secret checksums.
+# Use reproducible dev credentials: sealed fresh installs deliberately mint
+# distinct Secret content, which now participates in the worker checksum.
+# Keep the full comparison rather than stripping annotations or credentials.
+UNCHANGED=(--set security.allowDevDefaults=true
+           --show-only templates/agent-sandbox.yaml
            --show-only templates/worker.yaml
            --show-only templates/runner-prewarm.yaml
            --show-only templates/runner-resources-admission.yaml
