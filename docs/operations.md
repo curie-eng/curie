@@ -69,6 +69,148 @@ stale kubeconfig current-context cannot send a command at the wrong cluster:
 curie cluster status --context <your-production-context>
 ```
 
+### Google Kubernetes Engine (GKE)
+
+1. **Set up credentials for the child processes.** Install
+   `gke-gcloud-auth-plugin` with the Google Cloud CLI, or install your
+   distribution's package of the same name. Authenticate the service account,
+   then write the cluster's kubeconfig entry:
+
+   ```bash
+   gcloud components install gke-gcloud-auth-plugin
+   gcloud auth activate-service-account --key-file <key.json>
+   gcloud container clusters get-credentials <cluster> \
+     --location <region-or-zone> --project <project>
+   ```
+
+   Every `curie cluster` verb shells out to `kubectl` or `helm`, so the
+   kubeconfig's exec plugin must be on `PATH` for those child processes. A
+   kubeconfig built by hand around a static token from
+   `gcloud auth print-access-token` stops working after one hour, the lifetime
+   of a Google OAuth access token. An install plus first deploy can outlast
+   it. The context name written by `get-credentials` is
+   `gke_<project>_<location>_<cluster>`; pass it explicitly using the
+   [`--context` guidance below](#installing-and-inspecting-the-curie-platform-on-the-cluster).
+
+2. **Size the node pool before installing.** Start a real-model install with
+   at least **3 x e2-standard-4** nodes. **3 x e2-medium is too small**: in a
+   real install, the platform requests plus GKE's own kube-system pods filled
+   91 to 99% of each e2-medium node's allocatable CPU.
+
+   With dispatcher enabled and a real model, the defaults in
+   `charts/curie/values.yaml` request **1625m CPU and 3776Mi memory** across
+   non-hook Deployments and StatefulSets. The agent-sandbox controller has no
+   resource requests. Add **30m CPU and 48Mi memory per node** for the default
+   runner-prewarm DaemonSet, and **50m CPU and 192Mi memory per live runner
+   sandbox**, with a **1 CPU / 768Mi limit** on each runner. Each distinct
+   layered runner digest adds a prewarm container requesting another
+   10m CPU and 16Mi memory per node.
+
+   Requests are a scheduling floor, not resident use. The chart README's
+   [single-node footprint](../charts/curie/README.md#single-node-footprint-measured-on-a-disposable-single-node-k3s-cluster-4-gb--4-core)
+   records RustFS and Langfuse web near 1.1 GB and 950 MB resident and
+   recommends at least 8 vCPU / 16 to 20 GB. Three e2-standard-4 nodes leave
+   room for sandbox bursts after GKE's system reservation.
+
+   Set the node pool autoscaler minimum to its starting node count during
+   installation, and size the pool so the install does not need to scale out:
+
+   ```bash
+   gcloud container clusters update <cluster> --node-pool <pool> \
+     --enable-autoscaling --min-nodes <n> --max-nodes <m> \
+     --location <region-or-zone> --project <project>
+   ```
+
+   On a regional cluster these counts are **per zone**, so use the starting
+   node count per zone. After Helm completes, `cluster up` waits for exact
+   target workload convergence for **300 seconds**, checking every
+   Deployment, StatefulSet and DaemonSet in the release manifest
+   (`cli/src/ops/convergence.rs`). Nodes added or removed during that window
+   change the pods that must pull images and become ready before it ends.
+
+3. **Check whether the GKE gVisor RuntimeClass can schedule.** GKE
+   preinstalls a `gvisor` RuntimeClass, but its presence does not mean a
+   matching GKE Sandbox node pool exists. Read its node selector, then check
+   for nodes matching every selector entry:
+
+   ```bash
+   kubectl get runtimeclass gvisor -o jsonpath='{.scheduling.nodeSelector}' \
+     --context <gke-context>
+   kubectl get nodes -l <key=value,key=value> --context <gke-context>
+   ```
+
+   Convert each printed selector entry to `key=value` and pass the
+   comma-separated list to the second command. No matching node means no pod
+   can run under that class. When the gVisor preflight runs, its pod must
+   schedule under the class within the Job's **120 second deadline** or the
+   install fails (`charts/curie/templates/preflight-gvisor.yaml`).
+
+   Either add a GKE Sandbox node pool, following Google's
+   [GKE Sandbox node pool requirements](https://cloud.google.com/kubernetes-engine/docs/how-to/sandbox-pods):
+
+   ```bash
+   gcloud container node-pools create <pool> --cluster <cluster> \
+     --sandbox type=gvisor --machine-type <supported-machine-type> \
+     --location <region-or-zone> --project <project>
+   ```
+
+   Or install with gVisor explicitly off:
+
+   ```bash
+   curie cluster up --context <gke-context> --set security.gvisor.mode=off
+   ```
+
+   Explicit `off` is accepted in every case, including when the CLI would
+   infer the same setting, so an operator without a sandbox pool can always
+   pass it. As specified in `charts/curie/values.yaml`, `off` never stamps a
+   `runtimeClassName`: runner pods share the node kernel. Default-deny egress,
+   the metadata endpoint block, read-only root filesystem, non-root execution
+   and per-agent secret isolation stay on. With fake-model `auto`, the chart
+   still stamps the class on runner pods when lookup finds it; without a GKE
+   Sandbox node pool those pods cannot schedule either. The same two choices
+   apply to a fake-model install.
+
+4. **Bind a bundle's runner image during the first install.** A bundle with
+   its own runner image normally binds it on the first `cluster deploy`
+   through a full Helm upgrade, which fires upgrade hooks. Adding that image
+   also changes `CURIE_AGENT_SANDBOX_POOLS` on the worker and rolls the worker.
+   To avoid that upgrade, pass the exact string recorded as `runner.image` in
+   the bundle's connectors.lock.yaml file when installing:
+
+   ```bash
+   curie cluster up --context <gke-context> \
+     --set agentSandbox.runnerImages.<agent>=<locked-runner-image>
+   ```
+
+   The `bind_need` check in `cli/src/cluster_secrets.rs` skips the deploy's
+   Helm upgrade only when the release's supplied values already contain
+   that exact string under `agentSandbox.runnerImages.<agent>` and every
+   connector secret being bound already matches
+   `agentSandbox.connectorSecrets.<agent>`. A bundle with no connector
+   secrets satisfies the secret condition. A bundle with connector secrets
+   still upgrades on its first deploy. When both bindings are current, the
+   deploy prints that the connector secrets and runner image are already
+   current and the platform release was not upgraded; it only replaces the
+   agent's sandboxes.
+
+   There are two limits. `cluster up` does not carry
+   `agentSandbox.runnerImages` forward: it is absent from
+   `RETAINED_RUNNER_FAMILIES` in `cli/src/ops/up.rs`. Pass the same `--set` on
+   **every later `cluster up`** or that run drops the binding. Also, the lock's
+   `runner.base` must be the installation's runner digest;
+   `check_layered_runner_base` in `cli/src/cluster_secrets.rs` refuses a
+   bundle with a different base.
+
+5. **Allow capacity and time for prewarm convergence.** The
+   runner-prewarm DaemonSet is part of the 300 second convergence wait, so
+   every node must pull the runner image, about 380 MB, and each layered
+   runner digest within that window. The DaemonSet's desired, updated, ready
+   and current counts must agree, with zero unavailable pods. Its pods are
+   unclassed at priority 0 (`charts/curie/templates/priorityclass.yaml`), so
+   higher-priority pods can preempt them on a crowded node and hold
+   convergence back. Keep the capacity and autoscaler settings above through
+   installation so image pulls and prewarm readiness fit inside the gate.
+
 ## Installing and inspecting the Curie platform on the cluster
 
 Every `curie cluster` verb, and every `curie example sre-bot` verb, takes
