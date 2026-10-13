@@ -7,8 +7,8 @@ configured tools and context, and returns an inspectable result. Its bundle
 specifies the job; the platform supplies versioned deployment, sandbox execution,
 approval facilities, memory, tracing, and operational controls.
 
-Start with the [Software Factory](software-factory.md). For current support on
-v0.12.4 and unreleased `main` changes, consult the
+Start with the [Software Factory](software-factory.md). For current support and
+integration limits, consult the
 [capability reference](capabilities.md). This overview describes the collaboration
 model; it is not a promise that every bundle implements every behavior.
 

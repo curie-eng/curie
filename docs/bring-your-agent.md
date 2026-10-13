@@ -12,7 +12,9 @@ paths, read [Co-workers](co-workers.md) and the
 
 ## What you can reuse
 
-This guide targets **v0.12.4**. Check `curie --version` before following it.
+Install the [latest release](https://github.com/curie-eng/curie/releases/latest)
+and check the [capability reference](capabilities.md) before choosing a runtime
+or workspace integration.
 
 | Existing asset | Reuse path | What changes or remains unsupported |
 |---|---|---|
@@ -28,9 +30,7 @@ See the [bundle format](interfaces/bundle-format/INTERFACE.md),
 [harness package contract](interfaces/harness-package/INTERFACE.md) and
 [model provider contract](interfaces/model-provider/INTERFACE.md) for exact
 compatibility. Changing the model provider does not by itself change the agent
-runtime. Runtime extension work belongs to the existing
-[#25](https://github.com/curie-eng/curie/issues/25) and
-[#30](https://github.com/curie-eng/curie/issues/30) tracks.
+runtime.
 
 ## Minimal conversion: reuse a text analysis engine and its instructions
 
@@ -40,7 +40,7 @@ shows this conversion: existing deterministic analysis code lives in
 text analysis skill directs the model to use them. The model loop and Slack
 handling are supplied by Curie.
 
-From a checkout of the named release, copy that working bundle as your starting
+From a release checkout, copy that working bundle as your starting
 point. This preserves the existing tool implementation and skill rather than
 starting from an empty scaffold:
 
@@ -98,11 +98,9 @@ One channel binds one agent; exactly one release may connect to a given Slack
 app. Send a fresh Slack mention with the same request, inspect the visible
 workspace reply and its tool trace, and record the release and bundle version.
 A terminal reply stub without a connected dispatcher does not prove Slack
-transport. Onboarding automation is tracked separately in
-[#1069](https://github.com/curie-eng/curie/issues/1069).
+transport.
 
-These are verification instructions, not a report of a fresh live run on
-v0.12.4. The example supplies a direct MCP transport probe; the repository
+The example supplies a direct MCP transport probe; the repository
 [test fixtures](../runner/tests/test_mcp_tool_capability.py) exercise MCP
 capability behavior. Neither substitutes for your real model and Slack reply.
 Email adoption is blocked by the adapter's authentication refusal; see the
@@ -118,5 +116,3 @@ Email adoption is blocked by the adapter's authentication refusal; see the
 | Trace and supervise | [Administering co-workers](administering-co-workers.md). Inspect runs, model overrides, budgets and supported stop controls. |
 
 Approval does not grant permissions the tool's underlying credential lacks.
-Reuse the existing [migration implementation](https://github.com/curie-eng/curie/issues/745)
-rather than building a new migration CLI.

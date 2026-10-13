@@ -8,12 +8,10 @@ and [administrator guide](../administering-co-workers.md).
 
 ## Available evidence and its limits
 
-This mapping is source-checked against **v0.12.4**. The outcome and usage API
-routes below are present on that tag, including the completed #3223 recording
-work. Individual executions can still have missing usage or unpriced models.
-Do not assume a console feature described on `main` is in your installed
-release; in particular, #4102 console changes must be checked separately.
-The [capability reference](../capabilities.md) separates release and source status.
+The outcome and usage APIs below provide evidence for a trial. Individual
+executions can still have missing usage or unpriced models. Check the
+[capability reference](../capabilities.md) and the surfaces available in your
+installed release before choosing a measurement method.
 
 | Evidence | Supported surface | What you must still measure |
 |---|---|---|

@@ -16,11 +16,10 @@ For a larger repository or production deployment, use the
 
 ## What you are trying
 
-This overview describes the default factory bundle and platform in **v0.12.4**.
-The canonical quickstart retains its explicit **v0.12.1** installer pin and
-minimum version. Check the [capability reference](capabilities.md) and your
-installed version before relying on later features. A change on `main` or a
-closed implementation ticket alone is not release proof.
+This overview describes the default factory bundle and supported workflow.
+The [quickstart](guides/dark-factory-quickstart.md) uses the latest release by default.
+Check the [capability reference](capabilities.md) for supported integrations and
+their limits.
 
 | Before setup | What to expect |
 |---|---|

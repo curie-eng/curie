@@ -5,11 +5,9 @@ model settings and visibility into work. Start with the
 [Software Factory](software-factory.md), then apply these controls to other
 supported [co-workers](co-workers.md).
 
-The procedures below target **v0.12.4** and were checked against its committed
-CLI manifest and source contracts. They are not a report of a fresh deployment
-or live approval test. See the [capability reference](capabilities.md) for
-release boundaries and the [operations guide](operations.md) for complete
-procedures.
+See the [capability reference](capabilities.md) for supported controls and the
+[operations guide](operations.md) for complete procedures. Check the help for
+your installed CLI before applying a configuration change.
 
 ## Own the installation and its external connections
 
@@ -32,9 +30,9 @@ check each command's help: discovery and explicit `--api-url`/`--api-key` modes
 are distinct. Platform credentials have broad administrative authority and do
 not belong inside an agent bundle or chat.
 
-Installation ownership is not a complete multi-tenant identity or RBAC product.
-[#2917](https://github.com/curie-eng/curie/issues/2917) owns the broader identity
-and tenancy work; do not treat unreleased work as a v0.12.4 guarantee.
+Installation ownership does not establish a complete multi-tenant identity or
+RBAC product. Review the supported access boundaries before sharing an
+installation across teams.
 
 ## Bind workspaces and credentials deliberately
 
@@ -118,8 +116,7 @@ See [the canonical budget caveats](../examples/dark-factory/README.md#deploy-it-
 and [runner accounting](../runner/src/curie_runner/budget.py). Check provider
 billing alongside Curie's trace costs. Use
 [Measuring factory outcomes](guides/measuring-factory-outcomes.md) to relate cost
-to completed work without treating token usage as ROI. Pricing documentation remains owned by
-[#3923](https://github.com/curie-eng/curie/issues/3923).
+to completed work without treating token usage as ROI.
 
 ## Govern what is remembered
 
@@ -146,7 +143,6 @@ for inspection and edit/delete. `curie cluster memory my-agent` reads the legacy
 memory log; do not mistake it for a complete listing of every agent and channel
 fact. New threads pick up changed guidance. Default fact limits and namespace
 caps bound storage and prompt size, not the correctness of remembered content.
-Memory feature work remains in [#28](https://github.com/curie-eng/curie/issues/28).
 
 ## Inspect work and stop it when needed
 
@@ -165,9 +161,8 @@ status and failure causes, and [change receipts](operations.md#what-a-reply-says
 for reported effects. Traces and receipts are observations, not authorization
 or proof of a successful external action. Approval records and authenticated
 resolutions provide the decision trail described in [Approvals](approvals.md).
-The Factory console work in
-[#4102](https://github.com/curie-eng/curie/issues/4102) is fixed on `next`, not a
-released v0.12.4 feature.
+Use the work item commands and API for the supported factory inspection
+workflow; console surfaces depend on the installed release.
 
 For an agent-level stop and subsequent re-enable, use:
 

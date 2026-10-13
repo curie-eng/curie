@@ -5,8 +5,7 @@ existing instructions and tools, start with [Bring your agent](bring-your-agent.
 For the primary developer use case, start with the
 [Software Factory](software-factory.md). Check the
 [capability and release reference](capabilities.md) before choosing a channel.
-This manual Slack setup remains necessary; onboarding automation is tracked in
-[#1069](https://github.com/curie-eng/curie/issues/1069).
+The setup below creates and connects your Slack app.
 
 From nothing to a bot that answers in Slack and redeploys itself when you push.
 
@@ -167,7 +166,7 @@ At cluster deploy time, Curie delivers both connector `secrets` and
 `secret_files` values into the agent's Kubernetes Secret. Those stored values
 must be scoped to the target cluster identity, release, and namespace; a
 mismatch is refused rather than silently reused. Unscoped names remain for
-skill/local credentials. Issue #440 tracks the future per agent delivery path.
+skill/local credentials.
 
 ---
 
@@ -176,7 +175,7 @@ skill/local credentials. Issue #440 tracks the future per agent delivery path.
 1. **Export the credential before `skill up`.** Otherwise the boot succeeds and
    the *next* command fails with `model-credential-rejected`.
 2. **`--repo` binds once and is never re-pointed.** An agent with *no* binding
-   can still be bound by a later `deploy --repo` (#1194) -- but one already
+   can still be bound by a later `deploy --repo` -- but one already
    pointing at a different repository is left alone and only warned about, so
    there the fix really is deleting the agent and starting over. `curie doctor`
    reports which agents are unbound.

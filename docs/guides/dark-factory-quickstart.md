@@ -7,9 +7,8 @@ Software Factory co-worker. `dark-factory` remains its implementation name.
 See the [solution overview](../software-factory.md) for the delegation workflow,
 supported toolchains, review limits, and production differences.
 
-This canonical setup guide explicitly pins v0.12.1 and requires that version
-or later. Later release capabilities are listed separately in the
-[capability reference](../capabilities.md).
+This guide uses the latest released CLI and factory runner by default. See the
+[capability reference](../capabilities.md) for supported integrations and limits.
 
 `curie factory quickstart` installs Curie on a local
 [kind](https://kind.sigs.k8s.io/) cluster or an explicitly selected existing
@@ -49,7 +48,7 @@ builds and other toolchains need the setup described in the
 | [`kind`](https://kind.sigs.k8s.io/docs/user/quick-start/#installation) v0.24 or later | the local cluster, required only when neither `--context` nor a current kubeconfig context is set. kind's network plugin enforces NetworkPolicy from v0.24. |
 | [`kubectl`](https://kubernetes.io/docs/tasks/tools/) | Kubernetes operations, required for every context |
 | [`helm`](https://helm.sh/docs/intro/install/) | Curie installation, required for every context |
-| `curie` v0.12.1 or later | install it with the command below |
+| The released `curie` CLI | install it with the command below |
 | An [Anthropic](https://console.anthropic.com/) API key (`sk-ant-`) or an [OpenRouter](https://openrouter.ai/) API key (`sk-or-`) | Anthropic defaults to `claude-sonnet-5-5` for implementation and `claude-opus-5-5` for review. OpenRouter defaults to `z-ai/glm-5.3-flash` for implementation and `openai/gpt-6.1-sol` for review. Plan on about 5 USD of available OpenRouter credit per run; actual spend varies. The command asks once, or reads `CURIE_CREDENTIALS`. |
 | A GitHub account | your own GitHub App and the trial repository |
 
@@ -65,10 +64,10 @@ version and stops before deploy, naming the release install.
 
 ## Install Curie
 
-Use **v0.12.1 or later** for the behavior in this guide. Run this in Bash:
+Install the latest release. Run this in Bash:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/curie-eng/curie/main/get-curie.sh | CURIE_VERSION=v0.12.1 bash
+curl -fsSL https://raw.githubusercontent.com/curie-eng/curie/main/get-curie.sh | bash
 if [ -w /usr/local/bin ]; then
   export PATH="/usr/local/bin:$PATH"
 else
@@ -81,9 +80,8 @@ curie --version
 The installer selects the asset for your machine, verifies its checksum, and
 installs to `/usr/local/bin` when writable, otherwise `$HOME/.local/bin`. The
 PATH block puts the selected install directory before an older binary.
-The command selects v0.12.1 explicitly. To use a later release, change
-`CURIE_VERSION` in that command to its release tag. Confirm the printed version
-is at least `curie 0.12.1` before continuing. A stale older binary can report
+By default, the installer selects the latest published release. Confirm that `curie --version`
+reports the release you installed before continuing. A stale older binary can report
 `unrecognized subcommand 'factory'`.
 
 Released assets cover Linux x86_64, Linux arm64, and macOS Apple silicon.

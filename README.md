@@ -349,10 +349,8 @@ walks through `skill`, `local`, and `cluster` end to end.
 
 ## Status
 
-The named stable release for this documentation update is
-[v0.12.4](https://github.com/curie-eng/curie/releases/tag/v0.12.4). The `main`
-branch also contains unreleased patches. Use documentation and artifacts from
-the same release when evaluating a deployment. The
+Install from the [latest release](https://github.com/curie-eng/curie/releases/latest)
+and use its documentation when evaluating a deployment. The
 [capability reference](docs/capabilities.md) distinguishes released support,
 current-source behavior, verification, and planned work.
 
