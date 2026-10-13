@@ -37,9 +37,10 @@ BELOW = "0086"
 # revision (task 8), the read executions revision (task 7), the execution code
 # revision (task 11), the remediation approvals revision (task 10) and the rest
 # of the feature train follow the policy one, the OIDC login migration (#2908)
-# follows all of it, #2911's tenant scope (0101) follows that, and #3831's
-# reply target (0102) and tracker identity (0103) revisions are last.
-HEAD = "0103"
+# follows all of it, #2911's tenant scope (0101) follows that, #3831's reply
+# target (0102), tracker identity (0103) and the trigger label (0105) revisions
+# follow that, and the identity-links revision (0107, #2910) is last.
+HEAD = "0107"
 
 POLICY_COLUMNS = {"agent_id", "hook", "generation", "operation_id", "armed", "active", "updated_at"}
 GENERATION_COLUMNS = {

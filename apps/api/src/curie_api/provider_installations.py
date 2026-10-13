@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .models import ProviderInstallation
+from .models import ChannelIdentity, ProviderInstallation
 from .schemas.provider_installations import ProviderInstallationCreate, ProviderInstallationUpdate
 
 # Migration 0051's auto-provisioned tenant.
@@ -136,7 +136,43 @@ async def update_installation(
     installation: ProviderInstallation,
     data: ProviderInstallationUpdate,
 ) -> ProviderInstallation:
+    """Apply a partial update, refusing to retarget an installation in use.
+
+    Changing ``external_account_id`` or ``authority`` while any identity is
+    attached would silently move those identities to another account, and
+    make their recorded ``auth.test`` evidence describe a different row: 409
+    instead. The row is locked FOR UPDATE first, the head of the lock order
+    every writer shares (installation, then identity), so a concurrent Slack
+    identity report either attaches before this check sees it or waits.
+    """
+
     fields = data.model_fields_set
+    locked = await session.scalar(
+        select(ProviderInstallation)
+        .where(ProviderInstallation.id == installation.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if locked is None:
+        await session.rollback()
+        raise InstallationInvalid("the provider installation no longer exists")
+    installation = locked
+    retargets = any(
+        field in fields and getattr(data, field) != getattr(installation, field)
+        for field in ("authority", "external_account_id")
+    )
+    if retargets:
+        attached = await session.scalar(
+            select(ChannelIdentity.id)
+            .where(ChannelIdentity.provider_installation_id == installation.id)
+            .limit(1)
+        )
+        if attached is not None:
+            await session.rollback()
+            raise InstallationConflict(
+                "cannot change external_account_id or authority: one or more channel "
+                "identities are attached to this installation"
+            )
     for field in ("authority", "display_name", "external_account_id"):
         if field in fields:
             setattr(installation, field, getattr(data, field))

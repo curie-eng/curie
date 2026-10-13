@@ -30,8 +30,8 @@ from sqlalchemy.exc import IntegrityError
 
 BELOW = "0095"
 REVISION = "0096"
-# The trigger label expansion (0105, #4361) is the single head.
-HEAD = "0105"
+# The identity-links revision (0107, #2910) is the single head.
+HEAD = "0107"
 TUNE_REFUSAL = "tune_execution_not_automated"
 REFUSAL_CHECK = "remediation_nominations_refusal_ck"
 
