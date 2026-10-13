@@ -65,8 +65,58 @@ pub struct QuickstartOpts {
     /// `--chart` was passed, so `chart` is the operator's and the deploy
     /// uses it too.
     pub chart_explicit: bool,
+    /// The published full commit image tags to install (`--candidate`).
+    pub candidate: Option<PublishedCandidate>,
     pub dry_run: bool,
     pub forge: ForgeFlags,
+}
+
+/// A candidate whose seven published image tags were all resolved before
+/// dispatch can fetch a chart. Constructed only by [`resolve_candidate`].
+#[derive(Debug, Clone)]
+pub struct PublishedCandidate {
+    commit: String,
+    runner: crate::examples::PublishedStockRunner,
+}
+
+pub async fn resolve_candidate(commit: &str) -> Result<PublishedCandidate> {
+    let commit = parse_candidate_commit(commit).map_err(CliError::usage)?;
+    let runner = github::resolve_candidate_runner(&commit).await?;
+    Ok(PublishedCandidate { commit, runner })
+}
+
+const CANDIDATE_TAG_KEYS: [&str; 6] = [
+    "api.image.tag",
+    "dispatcher.image.tag",
+    "mailAdapter.image.tag",
+    "worker.image.tag",
+    "ui.image.tag",
+    "agentSandbox.runner.tag",
+];
+
+/// Clap validates this before dispatch can fetch a chart or contact a peer.
+pub fn parse_candidate_commit(commit: &str) -> std::result::Result<String, String> {
+    if commit.len() == 40
+        && commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(commit.to_string())
+    } else {
+        Err("--candidate requires a full 40 character lowercase hex commit; only full commit tags are published".into())
+    }
+}
+
+fn candidate_install_settings(commit: &str) -> Vec<String> {
+    CANDIDATE_TAG_KEYS
+        .iter()
+        .flat_map(|key| {
+            [
+                format!("{key}=sha-{commit}"),
+                format!("{}.digest=", key.trim_end_matches(".tag")),
+            ]
+        })
+        .collect()
 }
 
 /// The factory intake a serving release records (#4362 decision 2), read from
@@ -1732,8 +1782,35 @@ async fn release_matches_quickstart_target(
     } else {
         model
     };
-    let matches =
-        quickstart_release_matches(&chart_version, &metadata, &values, model, kind_target);
+    let candidate_matches = match &opts.candidate {
+        Some(candidate) => {
+            let tag = format!("sha-{}", candidate.commit);
+            CANDIDATE_TAG_KEYS.iter().all(|key| {
+                let tag_matches = values
+                    .pointer(&format!("/{}", key.replace('.', "/")))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(tag.as_str());
+                let digest_matches = match values.pointer(&format!(
+                    "/{}/digest",
+                    key.trim_end_matches(".tag").replace('.', "/")
+                )) {
+                    None => false,
+                    Some(serde_json::Value::String(digest)) => {
+                        digest.is_empty()
+                            || (*key == "agentSandbox.runner.tag"
+                                && crate::cluster_secrets::reference_digest(
+                                    &candidate.runner.base_image,
+                                ) == Some(digest.as_str()))
+                    }
+                    _ => false,
+                };
+                tag_matches && digest_matches
+            })
+        }
+        None => true,
+    };
+    let matches = candidate_matches
+        && quickstart_release_matches(&chart_version, &metadata, &values, model, kind_target);
     Ok((matches, model.to_string()))
 }
 

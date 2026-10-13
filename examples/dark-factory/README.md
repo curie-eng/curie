@@ -147,6 +147,51 @@ For a laptop trial on a small repository, follow the
 none of the long run sizing below. This section is the production recipe for a
 repository the size of Curie itself.
 
+To try an unreleased commit from `next`, pass `--candidate` to quickstart.
+Replace the illustrative commit below with a published full 40 character
+lowercase hex commit from `next`. Only full commit tags are published, so
+branch names and short commits are refused.
+
+```bash
+curie factory quickstart \
+  --candidate 0123456789abcdef0123456789abcdef01234567 \
+  --repo acme-corp/acme-bot --context <context> \
+  --namespace <namespace> --release <release> \
+  --app-id <app-id> --private-key-file ./app.pem
+```
+
+This works with a released CLI or a CLI built from source. Quickstart resolves
+all seven Curie images at `sha-<commit>` before any kubectl, Helm or GitHub call
+and refuses the install if any image is missing, naming each one. It installs
+those tags for the API, dispatcher, mail adapter, worker, UI and platform
+runner, clearing their chart digest overrides so the tags take effect on
+released charts too. It locks the dark factory runner layer and its base to
+the resolved digests. The chart still comes from the CLI's default or `--chart`.
+Add `--dry-run` to resolve the tags and print the candidate, image overrides
+and runner lock without installing.
+
+The rendered bundle comes from the CLI build; the candidate selects the
+published images. When adding an agent to an existing factory install without
+App flags, use a candidate that matches the images already installed. That
+path runs no `cluster up` and checks the runner base before binding the agent.
+
+Candidate image pins persist in Helm user values. Omitting `--candidate` or
+running `curie cluster upgrade` does not restore release images. Resetting
+only some image settings can leave mixed versions, including the retained
+mail adapter.
+
+For a disposable trial in a namespace created by quickstart, remove the trial
+installation and its data with the command below. Then use a released CLI to
+run quickstart without `--candidate` in a fresh namespace. This teardown is
+not a migration procedure for an installation whose data must be kept.
+
+```bash
+curie cluster down --context <context> --namespace <namespace> --release <release> --yes
+curie factory quickstart --repo acme-corp/acme-bot --context <context> \
+  --namespace <fresh-namespace> --release <release> \
+  --app-id <app-id> --private-key-file ./app.pem
+```
+
 Write the bundle out first. No clone of this repository is needed:
 
 ```bash

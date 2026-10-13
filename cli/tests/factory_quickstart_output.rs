@@ -23,10 +23,68 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use support::oci_registry_stub::{OciRegistryStub, INDEX_MEDIA_TYPE, RUNNER_REPO};
 use support::{serve, MockServer, Request, Response};
 
 const INDEX: &str =
     r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+const CANDIDATE: &str = "0123456789abcdef0123456789abcdef01234567";
+const CANDIDATE_IMAGES: [&str; 7] = [
+    "api",
+    "dispatcher",
+    "mail-adapter",
+    "worker",
+    "ui",
+    "runner",
+    "dark-factory-runner",
+];
+// Registry media type and index envelope:
+// https://github.com/opencontainers/image-spec/blob/v1.1.1/image-index.md
+const CANDIDATE_LAYER_INDEX: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":128,"platform":{"architecture":"amd64","os":"linux"}}]}"#;
+const CANDIDATE_BASE_INDEX: &str = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:2222222222222222222222222222222222222222222222222222222222222222","size":128,"platform":{"architecture":"amd64","os":"linux"}}]}"#;
+
+fn candidate_digest(index: &str) -> String {
+    let hex: String = Sha256::digest(index.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("sha256:{hex}")
+}
+
+fn candidate_registry(missing: &[&str]) -> MockServer {
+    let missing: Vec<String> = missing.iter().map(|name| name.to_string()).collect();
+    serve(move |request| {
+        if request.path.starts_with("/token?") {
+            return Response::json(200, r#"{"token":"fixture"}"#);
+        }
+        for image in CANDIDATE_IMAGES {
+            if request.path == format!("/v2/curie-eng/curie-{image}/manifests/sha-{CANDIDATE}")
+                && !missing.iter().any(|name| name == image)
+            {
+                let index = match image {
+                    "runner" => CANDIDATE_BASE_INDEX,
+                    "dark-factory-runner" => CANDIDATE_LAYER_INDEX,
+                    _ => INDEX,
+                };
+                return Response {
+                    status: 200,
+                    content_type: "application/vnd.oci.image.index.v1+json".into(),
+                    body: index.as_bytes().to_vec(),
+                };
+            }
+        }
+        Response::json(404, r#"{"errors":[{"code":"MANIFEST_UNKNOWN"}]}"#)
+    })
+}
+
+fn candidate_runner_registry() -> OciRegistryStub {
+    OciRegistryStub::start(vec![(
+        RUNNER_REPO.into(),
+        format!("sha-{CANDIDATE}"),
+        INDEX_MEDIA_TYPE.into(),
+        CANDIDATE_BASE_INDEX.as_bytes().to_vec(),
+    )])
+}
 
 // The driver answers explicit external commands and rejects unknown ones.
 // State lives inside the owned temporary fixture, never in a real cluster.
@@ -515,6 +573,495 @@ impl Fixture {
         }
         let code = child.wait().unwrap().code().unwrap_or(1);
         (code, String::from_utf8_lossy(&bytes).replace("\r\n", "\n"))
+    }
+}
+
+#[test]
+fn candidate_invalid_commits_exit_two_before_any_network_or_external_command() {
+    for candidate in [
+        "01234567",
+        "0123456789abcdef0123456789abcdef0123456",
+        "0123456789abcdef0123456789abcdef012345678",
+        "0123456789ABCDEF0123456789abcdef01234567",
+        "next",
+        "0123456789abcdef0123456789abcdef0123456g",
+    ] {
+        let fixture = Fixture::new();
+        let (code, shown) = fixture.run(true, &["--candidate", candidate, "--dry-run"]);
+        assert_eq!(code, 2, "{shown}");
+        assert!(
+            shown.contains("only full commit tags are published"),
+            "{shown}"
+        );
+        assert!(fixture.registry.recorded().is_empty());
+        assert!(fixture.github.recorded().is_empty());
+        assert!(fixture.platform.recorded().is_empty());
+        assert!(!fixture.dir.path().join("calls").exists());
+    }
+}
+
+#[test]
+fn candidate_dry_run_on_source_build_resolves_seven_images_and_pins_tags_and_runner() {
+    let mut fixture = Fixture::new();
+    fixture.registry = candidate_registry(&[]);
+    let output = fixture
+        .command(true, &["--candidate", CANDIDATE, "--dry-run", "--json"])
+        .env("CURIE_TEST_ARTIFACT_CHANNEL", "dev")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let lines: Vec<&str> = plan["plan"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap())
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains(CANDIDATE) && line.contains("all seven images resolved")),
+        "{plan}"
+    );
+    let up = lines
+        .iter()
+        .find(|line| line.starts_with("curie cluster up "))
+        .unwrap();
+    for key in [
+        "api.image.tag",
+        "dispatcher.image.tag",
+        "mailAdapter.image.tag",
+        "worker.image.tag",
+        "ui.image.tag",
+        "agentSandbox.runner.tag",
+    ] {
+        assert!(up.contains(&format!("--set {key}=sha-{CANDIDATE}")), "{up}");
+    }
+    for key in [
+        "api.image.digest",
+        "dispatcher.image.digest",
+        "mailAdapter.image.digest",
+        "worker.image.digest",
+        "ui.image.digest",
+        "agentSandbox.runner.digest",
+    ] {
+        assert!(up.contains(&format!("--set {key}=")), "{up}");
+    }
+    let layer = format!(
+        "ghcr.io/curie-eng/curie-dark-factory-runner@{}",
+        candidate_digest(CANDIDATE_LAYER_INDEX)
+    );
+    let base = format!(
+        "ghcr.io/curie-eng/curie-runner@{}",
+        candidate_digest(CANDIDATE_BASE_INDEX)
+    );
+    assert!(
+        lines.iter().any(|line| line.contains("runner layer lock")
+            && line.contains(&layer)
+            && line.contains(&base)),
+        "{plan}"
+    );
+    let manifests: Vec<String> = fixture
+        .registry
+        .recorded()
+        .into_iter()
+        .filter(|request| request.path.contains("/manifests/"))
+        .map(|request| request.path)
+        .collect();
+    assert_eq!(manifests.len(), 7, "{manifests:?}");
+    for image in CANDIDATE_IMAGES {
+        assert!(
+            manifests.contains(&format!(
+                "/v2/curie-eng/curie-{image}/manifests/sha-{CANDIDATE}"
+            )),
+            "{manifests:?}"
+        );
+    }
+    assert!(fixture.github.recorded().is_empty());
+    assert!(!fixture
+        .dir
+        .path()
+        .join("curie-factory-quickstart-curie-curie")
+        .exists());
+}
+
+#[test]
+fn candidate_missing_images_refuse_before_helm_kubectl_and_github_including_dry_run() {
+    for dry_run in [false, true] {
+        let mut fixture = Fixture::new();
+        fixture.registry = candidate_registry(&["mail-adapter", "runner"]);
+        let mut extra = vec!["--candidate", CANDIDATE, "--context", "acme-cluster"];
+        if dry_run {
+            extra.push("--dry-run");
+        }
+        let (code, shown) = fixture.run(true, &extra);
+        assert_ne!(code, 0, "{shown}");
+        for image in ["mail-adapter", "runner"] {
+            assert!(
+                shown.contains(&format!("ghcr.io/curie-eng/curie-{image}:sha-{CANDIDATE}")),
+                "{shown}"
+            );
+        }
+        assert_eq!(
+            fixture
+                .registry
+                .recorded()
+                .iter()
+                .filter(|request| request.path.contains("/manifests/"))
+                .count(),
+            7
+        );
+        assert!(
+            !fixture.dir.path().join("calls").exists(),
+            "Helm or kubectl was called before candidate resolution finished"
+        );
+        assert!(fixture.github.recorded().is_empty());
+        assert!(fixture.platform.recorded().is_empty());
+    }
+}
+
+#[test]
+fn candidate_missing_tag_on_release_build_precedes_an_uncached_default_chart() {
+    let mut fixture = Fixture::new();
+    fixture.registry = candidate_registry(&["ui"]);
+    let chart_cache = fixture.dir.path().join(".cache/curie");
+    fs::remove_dir_all(&chart_cache).unwrap();
+    let original = fixture.command(
+        true,
+        &["--candidate", CANDIDATE, "--context", "acme-cluster"],
+    );
+    let mut command = Command::new(original.get_program());
+    let mut args = original.get_args();
+    while let Some(arg) = args.next() {
+        if arg == "--chart" {
+            args.next();
+        } else {
+            command.arg(arg);
+        }
+    }
+    for (name, value) in original.get_envs() {
+        match value {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    let output = command.stdin(Stdio::null()).output().unwrap();
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{shown}");
+    assert!(
+        shown.contains(&format!("ghcr.io/curie-eng/curie-ui:sha-{CANDIDATE}")),
+        "{shown}"
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .recorded()
+            .iter()
+            .filter(|request| request.path.contains("/manifests/"))
+            .count(),
+        7
+    );
+    assert!(fixture.github.recorded().is_empty());
+    assert!(!fixture.dir.path().join("calls").exists());
+    assert!(
+        !chart_cache.exists(),
+        "the default chart was materialized before candidate preflight"
+    );
+}
+
+#[test]
+fn candidate_source_build_installs_and_records_the_resolved_runner_lock() {
+    let mut fixture = Fixture::new();
+    fixture.registry = candidate_registry(&[]);
+    let runner_registry = candidate_runner_registry();
+    let path = fixture.dir.path().join("values");
+    let mut values: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    values["agentSandbox"]["runner"]["image"] = json!(runner_registry.image(RUNNER_REPO));
+    values["agentSandbox"]["runner"]["digest"] = json!("");
+    fs::write(&path, values.to_string()).unwrap();
+    let output = fixture
+        .command(
+            true,
+            &[
+                "--candidate",
+                CANDIDATE,
+                "--context",
+                "acme-cluster",
+                "--json",
+            ],
+        )
+        .env("CURIE_TEST_ARTIFACT_CHANNEL", "dev")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        receipt["runner_image"],
+        json!(format!(
+            "ghcr.io/curie-eng/curie-dark-factory-runner@{}",
+            candidate_digest(CANDIDATE_LAYER_INDEX)
+        ))
+    );
+    let rendered = fixture
+        .dir
+        .path()
+        .join("curie-factory-quickstart-curie-curie/dark-factory/connectors.lock.yaml");
+    let lock: Value = serde_norway::from_str(&fs::read_to_string(rendered).unwrap()).unwrap();
+    assert_eq!(lock["runner"]["image"], receipt["runner_image"]);
+    assert_eq!(
+        lock["runner"]["base"],
+        json!(format!(
+            "ghcr.io/curie-eng/curie-runner@{}",
+            candidate_digest(CANDIDATE_BASE_INDEX)
+        ))
+    );
+    assert!(
+        runner_registry.saw_authorized_manifest_get(RUNNER_REPO, &format!("sha-{CANDIDATE}")),
+        "the installed runner tag must resolve through the native OCI client: {:?}",
+        runner_registry.recorded()
+    );
+    let applied: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    for pointer in [
+        "/api/image/tag",
+        "/dispatcher/image/tag",
+        "/mailAdapter/image/tag",
+        "/worker/image/tag",
+        "/ui/image/tag",
+        "/agentSandbox/runner/tag",
+    ] {
+        assert_eq!(
+            applied.pointer(pointer),
+            Some(&json!(format!("sha-{CANDIDATE}")))
+        );
+    }
+    for pointer in [
+        "/api/image/digest",
+        "/dispatcher/image/digest",
+        "/mailAdapter/image/digest",
+        "/worker/image/digest",
+        "/ui/image/digest",
+        "/agentSandbox/runner/digest",
+    ] {
+        assert_eq!(applied.pointer(pointer), Some(&json!("")));
+    }
+}
+
+#[test]
+fn candidate_registration_rerun_carries_the_selected_commit() {
+    let mut fixture = Fixture::new();
+    fixture.registry = candidate_registry(&[]);
+    let (code, shown) = fixture.run(false, &["--candidate", CANDIDATE, "--dry-run"]);
+    assert_eq!(code, 0, "{shown}");
+    let rerun = shown.lines().find(|line| line.contains("Rerun:")).unwrap();
+    assert!(
+        rerun.contains(&format!("--candidate {CANDIDATE}")),
+        "{rerun}"
+    );
+}
+
+fn candidate_installed_values(fixture: &Fixture) -> Value {
+    let mut values: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.dir.path().join("values")).unwrap())
+            .unwrap();
+    for component in ["api", "dispatcher", "mailAdapter", "worker", "ui"] {
+        values[component]["image"]["tag"] = json!(format!("sha-{CANDIDATE}"));
+        values[component]["image"]["digest"] = json!("");
+    }
+    values["agentSandbox"]["runner"]["tag"] = json!(format!("sha-{CANDIDATE}"));
+    values["agentSandbox"]["runner"]["digest"] = json!("");
+    values["agentSandbox"]["runner"]["model"] = json!(curie::factory_quickstart::DEFAULT_MODEL);
+    values
+}
+
+#[test]
+fn candidate_rerun_skips_matching_tags_with_explicit_empty_or_resolved_runner_digests() {
+    for digests in ["empty", "resolved-runner"] {
+        let mut fixture = Fixture::new();
+        fixture.registry = candidate_registry(&[]);
+        let mut values = candidate_installed_values(&fixture);
+        if digests == "resolved-runner" {
+            values["agentSandbox"]["runner"]["digest"] =
+                json!(candidate_digest(CANDIDATE_BASE_INDEX));
+        }
+        fixture.record_values(values);
+        let (code, shown) = fixture.run(
+            false,
+            &[
+                "--candidate",
+                CANDIDATE,
+                "--context",
+                "acme-cluster",
+                "--color",
+                "never",
+            ],
+        );
+        assert_eq!(code, 0, "{digests}: {shown}");
+        assert!(shown.contains("skipping cluster up"), "{digests}: {shown}");
+        assert!(
+            helm_upgrade_calls(&fixture).is_empty(),
+            "{digests}: {shown}"
+        );
+    }
+}
+
+#[test]
+fn candidate_rerun_installs_when_a_tag_or_effective_digest_differs() {
+    for mismatch in [
+        "tag",
+        "service-digest",
+        "runner-digest",
+        "runner-digest-whitespace",
+        "empty-digest-whitespace",
+        "missing-digests",
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.registry = candidate_registry(&[]);
+        let mut values = candidate_installed_values(&fixture);
+        match mismatch {
+            "tag" => {
+                values["worker"]["image"]["tag"] =
+                    json!("sha-ffffffffffffffffffffffffffffffffffffffff")
+            }
+            "service-digest" => values["api"]["image"]["digest"] = json!(candidate_digest(INDEX)),
+            "runner-digest" => {
+                values["agentSandbox"]["runner"]["digest"] = json!(candidate_digest(INDEX))
+            }
+            "runner-digest-whitespace" => {
+                values["agentSandbox"]["runner"]["digest"] =
+                    json!(format!(" {} ", candidate_digest(CANDIDATE_BASE_INDEX)));
+            }
+            "empty-digest-whitespace" => {
+                values["agentSandbox"]["runner"]["digest"] = json!(" ");
+            }
+            "missing-digests" => {
+                for component in ["api", "dispatcher", "mailAdapter", "worker", "ui"] {
+                    values[component]["image"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("digest");
+                }
+                values["agentSandbox"]["runner"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("digest");
+            }
+            _ => unreachable!(),
+        }
+        fixture.record_values(values);
+        let (code, shown) = fixture.run(
+            false,
+            &[
+                "--candidate",
+                CANDIDATE,
+                "--context",
+                "acme-cluster",
+                "--color",
+                "never",
+            ],
+        );
+        assert_eq!(code, 0, "{mismatch}: {shown}");
+        assert!(shown.contains("Installing Curie"), "{mismatch}: {shown}");
+        assert!(
+            !shown.contains("skipping cluster up"),
+            "{mismatch}: {shown}"
+        );
+        let upgrades = helm_upgrade_calls(&fixture);
+        assert!(
+            upgrades
+                .iter()
+                .any(|args| args.iter().any(|arg| arg == "--install")),
+            "{mismatch}: {upgrades:?}"
+        );
+        for key in [
+            "api.image",
+            "dispatcher.image",
+            "mailAdapter.image",
+            "worker.image",
+            "ui.image",
+            "agentSandbox.runner",
+        ] {
+            assert!(
+                upgrades.iter().any(|args| args
+                    .iter()
+                    .any(|arg| arg == &format!("{key}.tag=sha-{CANDIDATE}"))),
+                "{mismatch}: {upgrades:?}"
+            );
+            assert!(
+                upgrades
+                    .iter()
+                    .any(|args| args.iter().any(|arg| arg == &format!("{key}.digest="))),
+                "{mismatch}: {upgrades:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn candidate_release_build_clears_six_prefilled_digests_and_resolves_the_runner_tag() {
+    let mut fixture = Fixture::new();
+    fixture.registry = candidate_registry(&[]);
+    let runner_registry = candidate_runner_registry();
+    let mut values = candidate_installed_values(&fixture);
+    for component in ["api", "dispatcher", "mailAdapter", "worker", "ui"] {
+        values[component]["image"]["digest"] = json!(candidate_digest(INDEX));
+    }
+    values["agentSandbox"]["runner"]["digest"] = json!(candidate_digest(INDEX));
+    values["agentSandbox"]["runner"]["image"] = json!(runner_registry.image(RUNNER_REPO));
+    fixture.record_values(values);
+    let output = fixture
+        .command(
+            true,
+            &[
+                "--candidate",
+                CANDIDATE,
+                "--context",
+                "acme-cluster",
+                "--json",
+            ],
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        runner_registry.saw_authorized_manifest_get(RUNNER_REPO, &format!("sha-{CANDIDATE}")),
+        "{:?}",
+        runner_registry.recorded()
+    );
+    let applied: Value =
+        serde_json::from_str(&fs::read_to_string(fixture.dir.path().join("values")).unwrap())
+            .unwrap();
+    for prefix in [
+        "/api/image",
+        "/dispatcher/image",
+        "/mailAdapter/image",
+        "/worker/image",
+        "/ui/image",
+        "/agentSandbox/runner",
+    ] {
+        assert_eq!(
+            applied.pointer(&format!("{prefix}/tag")),
+            Some(&json!(format!("sha-{CANDIDATE}")))
+        );
+        assert_eq!(
+            applied.pointer(&format!("{prefix}/digest")),
+            Some(&json!(""))
+        );
     }
 }
 

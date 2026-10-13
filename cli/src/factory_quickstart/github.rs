@@ -235,15 +235,58 @@ async fn recorded_app(
     crate::factory_toolchain::preflight_with_pem(&recorded.app_id, pem, repos, false).await
 }
 
+/// Full commit tags must exist for the entire platform before quickstart
+/// reaches Kubernetes, Helm, or the forge, including on a dry run.
+pub(super) async fn resolve_candidate_runner(
+    commit: &str,
+) -> Result<crate::examples::PublishedStockRunner> {
+    let tag = format!("sha-{commit}");
+    let mut missing = Vec::new();
+    let mut published = crate::examples::PublishedStockRunner {
+        layer_image: String::new(),
+        base_image: String::new(),
+    };
+    for component in [
+        "api",
+        "dispatcher",
+        "mail-adapter",
+        "worker",
+        "ui",
+        "runner",
+        "dark-factory-runner",
+    ] {
+        let repository = format!("ghcr.io/curie-eng/curie-{component}");
+        match crate::examples::published_index_digest(&repository, &tag).await? {
+            Some(digest) => match component {
+                "runner" => published.base_image = format!("{repository}@{digest}"),
+                "dark-factory-runner" => {
+                    published.layer_image = format!("{repository}@{digest}");
+                }
+                _ => {}
+            },
+            None => missing.push(format!("{repository}:{tag}")),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(CliError::failure(format!(
+            "candidate {commit} is missing published images: {}",
+            missing.join(", ")
+        ))
+        .into());
+    }
+    Ok(published)
+}
+
 pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput> {
     // Reject a bad repository list, agent, label, or bundle before any
-    // prerequisite check, network preflight, or kube context pin.
+    // prerequisite check, App preflight, or kube context pin.
     validate_repos(&opts.repos)?;
     validate_agent_flags(&opts.agent, opts.label.as_deref())?;
     let runner_image = match &opts.plugin_dir {
         Some(dir) => check_plugin_dir(dir)?,
         None => None,
     };
+    let published_candidate = opts.candidate.as_ref().map(|candidate| &candidate.runner);
     let current = if opts.context.is_some() {
         None
     } else {
@@ -393,7 +436,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         jira = Some(jira_cloud::preflight(&opts.forge, &opts.repos, &recorded_app).await?);
         app = Some(recorded_app);
     }
-    let planned = quickstart_plan(&PlanInput {
+    let mut planned = quickstart_plan(&PlanInput {
         repos: opts.repos.clone(),
         app_id: opts.app_id.clone(),
         private_key_file: opts
@@ -426,6 +469,22 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         runner_image,
         jira,
     })?;
+    if let Some(candidate) = &opts.candidate {
+        let commit = &candidate.commit;
+        for action in &mut planned.actions {
+            match action {
+                Action::Cluster { args } => {
+                    for setting in candidate_install_settings(commit) {
+                        args.extend(["--set".into(), setting]);
+                    }
+                }
+                Action::Register { rerun_flags, .. } => {
+                    rerun_flags.extend(["--candidate".into(), commit.clone()]);
+                }
+                _ => {}
+            }
+        }
+    }
     if opts.dry_run {
         let mut planned = planned;
         if planned.path != QuickstartPath::AddAgent {
@@ -446,6 +505,21 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
             _ => None,
         }) {
             lines.splice(at..at, jira_reads);
+        }
+        if let (Some(candidate), Some(published)) = (&opts.candidate, published_candidate) {
+            lines.insert(
+                0,
+                format!("candidate {}: all seven images resolved", candidate.commit),
+            );
+            if opts.plugin_dir.is_none() {
+                lines.insert(
+                    1,
+                    format!(
+                        "runner layer lock: {} built on {}",
+                        published.layer_image, published.base_image
+                    ),
+                );
+            }
         }
         return Ok(QuickstartOutput::DryRun(DryRunPlan { lines }));
     }
@@ -469,7 +543,7 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
     // path renders inside intake, ahead of that path's first release write.
     let mut rendered_image = None;
     if let (QuickstartPath::AddAgent, None) = (planned.path, &opts.plugin_dir) {
-        rendered_image = Some(render_and_check(&common, &opts.agent).await?);
+        rendered_image = Some(render_and_check(&common, &opts.agent, published_candidate).await?);
     }
     if let (QuickstartPath::AddAgent, Some(recorded), None) = (planned.path, &recorded, &app) {
         app = Some(recorded_app(&common, recorded, &opts.repos).await?);
@@ -481,16 +555,21 @@ pub(super) async fn quickstart(opts: QuickstartOpts) -> Result<QuickstartOutput>
         app.as_ref(),
         install_label,
         rendered_image,
+        published_candidate,
     )
     .await
 }
 
 /// Render the published bundle for `agent` and refuse a layer built on
 /// another runner before anything binds it (ADR 0173 decision 5).
-async fn render_and_check(common: &CommonOpts, agent: &str) -> Result<String> {
+async fn render_and_check(
+    common: &CommonOpts,
+    agent: &str,
+    published: Option<&crate::examples::PublishedStockRunner>,
+) -> Result<String> {
     crate::ui::ui().note("Rendering factory bundle");
     let bundle = bundle_dir(&common.namespace, &common.release, agent);
-    let image = render_published_bundle(&common.namespace, &common.release, agent)
+    let image = render_published_bundle(&common.namespace, &common.release, agent, published)
         .await
         .map_err(|error| {
             let (_, fix) = crate::exit::classify(&error);
@@ -535,6 +614,7 @@ async fn execute(
     app: Option<&crate::factory_toolchain::AppPreflight>,
     install_label: Option<String>,
     mut rendered_image: Option<String>,
+    published_candidate: Option<&crate::examples::PublishedStockRunner>,
 ) -> Result<QuickstartOutput> {
     crate::ui::ui().note(&format!("Kubernetes context: {}", planned.context));
     if planned.skipped_cluster_up {
@@ -621,7 +701,9 @@ async fn execute(
             Action::Intake(intake) => {
                 let image = match &intake.runner_binding {
                     Some(binding) if binding.image == PUBLISHED_RUNNER_PENDING => {
-                        let image = render_and_check(&intake.common, &binding.agent).await?;
+                        let image =
+                            render_and_check(&intake.common, &binding.agent, published_candidate)
+                                .await?;
                         rendered_image = Some(image.clone());
                         image
                     }
@@ -714,6 +796,7 @@ async fn execute(
                                         dry_run: false,
                                     },
                                     agent,
+                                    published_candidate,
                                 )
                                 .await?
                             }
@@ -985,7 +1068,12 @@ async fn apply_jira_tracker(opts: &QuickstartOpts, jira: &JiraPlan) -> Result<()
     crate::factory_intake::apply_forge_entries(&common, &opts.chart, jira).await
 }
 
-async fn render_published_bundle(namespace: &str, release: &str, agent: &str) -> Result<String> {
+async fn render_published_bundle(
+    namespace: &str,
+    release: &str,
+    agent: &str,
+    published: Option<&crate::examples::PublishedStockRunner>,
+) -> Result<String> {
     let dir = bundle_dir(namespace, release, agent);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).map_err(|err| {
@@ -1000,9 +1088,17 @@ async fn render_published_bundle(namespace: &str, release: &str, agent: &str) ->
             CliError::failure(format!("could not create {}: {err}", parent.display()))
         })?;
     }
-    let rendered =
-        crate::examples::render_dark_factory(crate::examples::DarkFactoryRenderOpts { out: dir })
-            .await?;
+    let rendered = match published {
+        Some(published) => {
+            crate::examples::render_dark_factory_with_published_runner(dir, published)?
+        }
+        None => {
+            crate::examples::render_dark_factory(crate::examples::DarkFactoryRenderOpts {
+                out: dir,
+            })
+            .await?
+        }
+    };
     match rendered.runner_image {
         Some(image) => Ok(image),
         None => Err(CliError::failure(
