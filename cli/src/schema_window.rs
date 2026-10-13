@@ -230,18 +230,22 @@ pub fn check_target_schema(
     })
 }
 
+/// Message for an application version that has no static catalog entry. A dry
+/// run without a live revision has this message but no fail-forward fix.
+pub fn missing_target_window_message(target_app: &str) -> String {
+    let target = normalize_app_version(target_app);
+    format!("refusing rollback to application {target}: no declared schema range for that version")
+}
+
 /// Refusal for an application version that has no static catalog entry.
 pub fn missing_target_window_refusal(
     target_app: &str,
     live: &str,
     history_apps: &[String],
 ) -> SchemaRefusal {
-    let target = normalize_app_version(target_app);
     let candidates: Vec<&str> = history_apps.iter().map(String::as_str).collect();
     SchemaRefusal {
-        message: format!(
-            "refusing rollback to application {target}: no declared schema range for that version"
-        ),
+        message: missing_target_window_message(target_app),
         fix: fail_forward_fix(newest_fail_forward(candidates, live), live),
     }
 }
