@@ -2851,6 +2851,9 @@ if previous["status"] != "superseded" or previous["app_version"] != uncatalogued
         >"$EVIDENCE_DIR/rollback-uncatalogued.out" 2>"$EVIDENCE_DIR/rollback-uncatalogued.err" \
         || status=$?
     (( status == 1 )) || die "rollback-uncatalogued rollback exited $status, want 1"
+    grep -qF "refusing rollback to application $U: no declared schema range for that version" \
+        "$EVIDENCE_DIR/rollback-uncatalogued.err" \
+        || die "rollback-uncatalogued rollback did not refuse the uncatalogued target"
     grep -qF "fail forward to application $V" "$EVIDENCE_DIR/rollback-uncatalogued.err" \
         || die "rollback-uncatalogued rollback did not name fail forward to application $V"
     helm_ns history "$RELEASE" -o json >"$EVIDENCE_DIR/rollback-uncatalogued-after.json"
