@@ -365,6 +365,9 @@ need = {
     "positive resources": ["'cpu'", "'memory'", "'ephemeral-storage'", "requests", "limits",
                            "quantity(", "isGreaterThan(quantity('0'))"],
     "deadline": ["activeDeadlineSeconds"],
+    # Round 2 A: a Secret mounted under /certs plus PATH=/certs:... would
+    # hijack the entrypoint's dockerd-entrypoint.sh call, so no env at all.
+    "no env or envFrom": ["!has(c.env)", "!has(c.envFrom)"],
 }
 for rule, needles in need.items():
     in_one_validation("pods", pods_validations, rule, needles)
@@ -383,12 +386,23 @@ objects_need = {
     # runner sandbox in the release namespace, never an ipBlock, on the daemon port.
     "ingress peers": ["ingress", "from", "namespaceSelector", "kubernetes.io/metadata.name", f"'{REL_NS}'",
                       "podSelector", "'runner-sandbox'", "app.kubernetes.io/instance", "ipBlock", "ports",
-                      str(port)],
+                      str(port),
+                      # Round 2 B: the peer carries a matchLabels key beyond the
+                      # three release selector keys, not merely three keys.
+                      "matchLabels.exists(", "'app.kubernetes.io/name'", "'app.kubernetes.io/instance'",
+                      "'app.kubernetes.io/component'",
+                      # Round 2 C: no port ranges past the daemon port.
+                      "endPort"],
     "secret type": ["Opaque", "'kubernetes.io/tls'"],
     "service type": ["ClusterIP", "externalIPs"],
 }
 for rule, needles in objects_need.items():
     in_one_validation("objects", objects_validations, rule, needles)
+# Round 2 B: the key-count rule is replaced, since three keys can all be
+# release selector keys (name, instance, component) and select every sandbox.
+for e in objects_validations:
+    if "ipBlock" in e and "namespaceSelector" in e and ">= 3" in e:
+        fail(f"objects policy ingress peers still count matchLabels keys (>= 3): {e[:120]}")
 in_one_validation("cleanup", cleanup_validations, "claim label",
                   ["oldObject.metadata.labels", "'curietech.ai/sandbox-claim'"])
 
