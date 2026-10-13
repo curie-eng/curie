@@ -3327,11 +3327,16 @@ impl LiveHost {
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 .context("release history has an invalid status")?;
-            if newest.is_none_or(|(previous, _)| revision > previous) {
-                newest = Some((revision, status));
+            let description = row
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if newest.is_none_or(|(previous, _, _)| revision > previous) {
+                newest = Some((revision, status, description));
             }
         }
-        let Some((revision, status)) = newest.filter(|(_, status)| status.starts_with("pending-"))
+        let Some((revision, status, description)) =
+            newest.filter(|(_, status, _)| status.starts_with("pending-"))
         else {
             return Ok(());
         };
@@ -3344,6 +3349,16 @@ impl LiveHost {
         rollback
             .args
             .extend([plain("--wait"), plain("--timeout"), plain("15m")]);
+        let interrupted_target = (status == "pending-rollback")
+            .then(|| super::verbs::interrupted_rollback_target(description))
+            .flatten();
+        if let Some(target) = interrupted_target {
+            bail!(
+                "release {} newest revision {revision} is {status}; serving revision {serving} is version {version}; it is an interrupted rollback to revision {target}; run curie cluster rollback --yes to finish it, or run `{}`, then rerun cluster upgrade",
+                self.opts.common.release,
+                rollback.display()
+            );
+        }
         if self.opts.take_over.is_none() || status != "pending-upgrade" {
             bail!(
                 "release {} newest revision {revision} is {status}; serving revision {serving} is version {version}; run `{}`, then rerun cluster upgrade",

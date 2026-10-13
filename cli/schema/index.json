@@ -73,7 +73,7 @@
       "result": "ClusterRollbackOutput",
       "kind": "CliOutput",
       "schema": "cluster-rollback.schema.json",
-      "version": "1.0"
+      "version": "1.1"
     },
     {
       "result": "ClusterStatusOutput",
