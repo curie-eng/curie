@@ -2,14 +2,16 @@
 
 The suite under ``apps/api/tests/forges/contract`` calls only port methods and
 this harness. Each adapter pair supplies one harness: today the in-memory pair
-in two declarations, and the GitHub tracker and code host over the fake in
-``forge_fakes/github.py``. Each joins the registry in
+in two declarations, the GitHub tracker and code host over the fake in
+``forge_fakes/github.py``, and the Jira Cloud tracker over the fake in
+``forge_fakes/jira.py`` paired with that GitHub code host. Each joins the registry in
 ``apps/api/tests/forges/contract/conftest.py`` without editing any vector.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 from collections.abc import Mapping
 from typing import Any, Protocol
 
@@ -48,6 +50,7 @@ from curie_api.forges.types import (
     TrackerIssueRef,
 )
 
+from forge_fakes import jira as jira_fake
 from forge_fakes.github import CONTRACT_APP_ID, REPO, REPO_ID, GitHubRepositoryFake
 
 
@@ -62,8 +65,17 @@ class AdapterHarness(Protocol):
     base_branch: str
     writer: Actor
     outsider: Actor
+    feedback_kinds: frozenset[FeedbackKind]
+    """The feedback kinds the code host can return; vectors that need another
+    kind skip on this pair."""
+
+    def check_key(self, name: str) -> str:
+        """The key the adapter reports for a check reported under ``name``."""
 
     def seed_issue(self, title: str, body: str) -> TrackerIssueRef: ...
+
+    def issue_link_suffix(self, issue: TrackerIssueRef) -> str:
+        """How the tracker's web link to ``issue`` ends (``Tracker.issue_url``)."""
 
     def apply_label(self, issue: TrackerIssueRef, actor: Actor) -> None:
         """``actor`` applies the factory label."""
@@ -127,6 +139,7 @@ async def open_pull(harness: AdapterHarness, branch: str) -> PullRequest:
 WRITER = Actor(id="6601", login="octo-writer")
 OUTSIDER = Actor(id="6602", login="drive-by")
 LABEL = "factory"
+ALL_FEEDBACK_KINDS = frozenset(FeedbackKind)
 
 
 class InMemoryHarness:
@@ -138,6 +151,7 @@ class InMemoryHarness:
     writer = WRITER
     outsider = OUTSIDER
     label = LABEL
+    feedback_kinds = ALL_FEEDBACK_KINDS
 
     def __init__(self, *, minimal: bool) -> None:
         self.name = "memory-minimal" if minimal else "memory"
@@ -169,8 +183,14 @@ class InMemoryHarness:
         self._allowlist: set[str] = set()
         self._minimal = minimal
 
+    def check_key(self, name: str) -> str:
+        return name
+
     def seed_issue(self, title: str, body: str) -> TrackerIssueRef:
         return self._tracker.seed_issue(title, body)
+
+    def issue_link_suffix(self, issue: TrackerIssueRef) -> str:
+        return f"/issues/{issue.issue_id}"
 
     def apply_label(self, issue: TrackerIssueRef, actor: Actor) -> None:
         self._tracker.apply_label(issue, LABEL, actor)
@@ -259,6 +279,7 @@ class GitHubHarness:
     writer = WRITER
     outsider = OUTSIDER
     label = LABEL
+    feedback_kinds = ALL_FEEDBACK_KINDS
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -306,8 +327,14 @@ class GitHubHarness:
             types.GITHUB, self._code_host.host, str(REPO_ID), REPO, default_branch="main"
         )
 
+    def check_key(self, name: str) -> str:
+        return name
+
     def seed_issue(self, title: str, body: str) -> TrackerIssueRef:
         return self._tracker.issue(self.fake.seed_issue(title, body))
+
+    def issue_link_suffix(self, issue: TrackerIssueRef) -> str:
+        return f"/issues/{issue.issue_id}"
 
     def apply_label(self, issue: TrackerIssueRef, actor: Actor) -> None:
         self.fake.label_event(int(issue.issue_id), "labeled", LABEL, _github_user(actor))
@@ -384,7 +411,109 @@ class GitHubHarness:
         return self.fake.writes
 
 
-def _conforms(harness: InMemoryHarness | GitHubHarness) -> AdapterHarness:
+class JiraGitHubHarness:
+    """The Jira Cloud tracker over `jira_fake.JiraFake`, paired with the GitHub
+    code host of `GitHubHarness` (#4358 AC 1).
+
+    The tracker is built the production way, `build_registry` then
+    ``binding_tracker(...).for_binding``, and reaches the Jira fake over HTTP
+    through ASGI. The fake caps every listing page at two, as Jira may cap a
+    page below the requested ``maxResults``. Start authority is the binding's
+    group ``starters``, so write access on this pairing is that group's
+    membership in Jira plus write permission on the GitHub fake. Issue targets
+    live on Jira; every pull request target is the GitHub harness's.
+    """
+
+    name = "jira-github"
+    base_branch = "main"
+    writer = WRITER
+    outsider = OUTSIDER
+    label = LABEL
+    feedback_kinds = ALL_FEEDBACK_KINDS
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._github = GitHubHarness(monkeypatch)
+        self.jira = jira_fake.JiraFake(page_cap=2)
+        for actor in (WRITER, OUTSIDER):
+            self.jira.user_for(actor)
+        self.tracker: Tracker = jira_fake.jira_tracker(self.jira, label=LABEL)
+        self.code_host: CodeHost = self._github.code_host
+        self.repository = self._github.repository
+
+    def check_key(self, name: str) -> str:
+        return self._github.check_key(name)
+
+    def seed_issue(self, title: str, body: str) -> TrackerIssueRef:
+        return self.jira.ref(self.jira.seed_issue(title, body))
+
+    def issue_link_suffix(self, issue: TrackerIssueRef) -> str:
+        # Decision 18: Jira links browse to the issue's current key.
+        return f"/browse/{issue.display_key}"
+
+    def apply_label(self, issue: TrackerIssueRef, actor: Actor) -> None:
+        self.jira.add_label(issue, LABEL, self.jira.user_for(actor))
+
+    def remove_label(self, issue: TrackerIssueRef, actor: Actor) -> None:
+        self.jira.remove_label(issue, LABEL, self.jira.user_for(actor))
+
+    def set_write_access(self, actor: Actor, allowed: bool) -> None:
+        self.jira.user_for(actor)
+        self.jira.set_group_member(jira_fake.STARTERS, actor.id, allowed)
+        self._github.set_write_access(actor, allowed)
+
+    def feedback_allowlist(self) -> frozenset[str]:
+        return self._github.feedback_allowlist()
+
+    def push_head(self, branch: str) -> str:
+        return self._github.push_head(branch)
+
+    def report_checks(self, sha: str, checks: Mapping[str, CheckState]) -> None:
+        self._github.report_checks(sha, checks)
+
+    def add_review_feedback(
+        self, pull_request: PullRequestRef, author: Actor, body: str, kind: FeedbackKind
+    ) -> None:
+        self._github.add_review_feedback(pull_request, author, body, kind)
+
+    def review_thread(self, pull_request: PullRequestRef) -> str:
+        return self._github.review_thread(pull_request)
+
+    def close_pull_request(self, pull_request: PullRequestRef, *, merged: bool) -> None:
+        self._github.close_pull_request(pull_request, merged=merged)
+
+    def add_foreign_comment(
+        self, target: ReplyTarget, author: Actor, marker: str, body: str
+    ) -> None:
+        if target.issue is None:
+            self._github.add_foreign_comment(target, author, marker, body)
+            return
+        # Embedded exactly as the adapter embeds it (decision 15): the marker
+        # and body digest in the comment's `curie.factory` entity property.
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        self.jira.add_comment(
+            target.issue,
+            self.jira.user_for(author),
+            body,
+            properties={"curie.factory": {"marker": marker, "body_sha256": digest}},
+        )
+
+    def comment_bodies(self, target: ReplyTarget) -> list[tuple[Actor, str]]:
+        if target.issue is None:
+            return self._github.comment_bodies(target)
+        return [
+            (comment.author.actor, jira_fake.flatten(comment.body))
+            for comment in self.jira.issue(target.issue).comments
+        ]
+
+    def fail_next_page(self, *, after: int = 0) -> None:
+        self.jira.fail_next_page(after=after)
+        self._github.fail_next_page(after=after)
+
+    def write_count(self) -> int:
+        return self.jira.writes + self._github.write_count()
+
+
+def _conforms(harness: InMemoryHarness | GitHubHarness | JiraGitHubHarness) -> AdapterHarness:
     """Type-checked proof that each harness satisfies the protocol."""
 
     return harness

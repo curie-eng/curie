@@ -16,24 +16,22 @@ The ``jira_cloud+github`` pair uses the in-memory adapters in
 ``curie_api.forges.memory``: a ``jira_cloud`` InMemoryTracker paired with a
 ``github`` InMemoryCodeHost. Admission goes through the forge-neutral dispatch
 functions on ``TrackerIssueRef`` and ``RepositoryRef``, the real reconciler and
-CI gate read the in-memory code host, and status replies go through
-``comments_for``. The adapter registry (#4397) installs no ``jira_cloud`` kind
-yet, so the install boots with only a GitHub code host entry and the factory
-off, and three production seams that would reach GitHub are replaced at test
-level:
+CI gate read the in-memory code host, and status replies go through the real
+port branch of ``factory_notices._sync_one`` (#4358 plan D6). The install boots
+with only a GitHub code host entry and the factory off, so the seams that
+would build a real adapter are replaced at test level:
 
 1. ``factory_code_host`` and ``code_host_for`` (``curie_api.forges.hosts``)
-   build the GitHub adapter. Each is replaced in every module that imported it.
-2. ``factory_ci._issue_url`` links the ticket through ``forges.hosts.issue_url``,
-   which raises ``NotFound("tracker")`` for any tracker but GitHub, so a red CI
-   round could not be continued. ``factory_ci.issue_url`` is replaced with the
-   tracker port's own ``issue_url``.
-3. ``factory_notices._sync_one`` returns 0 for a non-GitHub tracker. It is
-   wrapped: the real function runs first and must write nothing, then the
-   rendered body goes out through ``comments_for(...).upsert_marked`` and the
-   real ``factory_notices._sync_labels`` sets the state label through the
-   tracker port. The notice row's comment columns are GitHub-shaped, so they
-   stay empty for this pair and the test asserts that.
+   build the GitHub adapter for the paths that still take the install's
+   GitHub. Each is replaced in every module that imported it.
+2. ``curie_api.forges.trackers`` picks the tracker and code host of a WorkItem
+   (#4358 plan D4, D14): ``tracker_for_work_item`` answers the pair's
+   InMemoryTracker, ``code_host_for_repository`` its InMemoryCodeHost, and
+   ``issue_link`` the tracker port's own ``issue_url``. Each is replaced in the
+   module and in every module that imported it by name.
+
+The notice row records the posted comment as the port branch writes it: a
+comment id and post time, and no GitHub comment list.
 
 Both pairs insert publications and fix rounds directly (the approval and
 publication Job path is not offline), with the helpers the factory terminus
@@ -48,6 +46,7 @@ import asyncio
 import copy
 import json
 import re
+import sys
 import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -63,7 +62,7 @@ from curie_api import factory_base, factory_notices, workitem_dispatch
 from curie_api.config import get_settings
 from curie_api.factory_comment_text import marker_for
 from curie_api.factory_notices import FINAL_MARKER
-from curie_api.forges import types
+from curie_api.forges import trackers, types
 from curie_api.forges.authority import feedback_actionable, may_start_with
 from curie_api.forges.capabilities import (
     CODE_HOST_OPERATIONS,
@@ -75,7 +74,6 @@ from curie_api.forges.config import WriteCheck
 from curie_api.forges.hosts import github_host
 from curie_api.forges.identity import issue_lock_keys, notice_request_id, revision_request_id
 from curie_api.forges.memory import InMemoryCodeHost, InMemoryTracker, all_supported
-from curie_api.forges.ports import comments_for
 from curie_api.forges.registry import forges_registry
 from curie_api.forges.types import (
     Actor,
@@ -634,16 +632,28 @@ def _github_pair(monkeypatch: pytest.MonkeyPatch, sink: _CommentServer) -> Itera
 
 @dataclass(frozen=True)
 class _Logged:
-    request_id: uuid.UUID
     target: str
     comment_id: str
     body: str
 
 
+def _replace_everywhere(monkeypatch: pytest.MonkeyPatch, seams: dict[str, Any]) -> None:
+    """Replace each ``curie_api.forges.trackers`` function in that module and in
+    every loaded ``curie_api`` module that imported it by name."""
+
+    originals = {name: getattr(trackers, name) for name in seams}
+    for module_name, module in list(sys.modules.items()):
+        if module is None or not module_name.startswith("curie_api"):
+            continue
+        for name, replacement in seams.items():
+            if getattr(module, name, None) is originals[name]:
+                monkeypatch.setattr(module, name, replacement)
+
+
 class _JiraPair:
     tracker_kind = types.JIRA_CLOUD
-    # factory_notices._sync_one posts nothing for a non-GitHub tracker, and the
-    # notice row's comment columns are GitHub-shaped, so no row is finalized.
+    # The port branch skips an unchanged rendered digest; it does not freeze a
+    # final reply the way the GitHub sink's finalized row does.
     finalizes = False
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -680,58 +690,47 @@ class _JiraPair:
         self._patch(monkeypatch)
 
     def _patch(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The three GitHub-only seams named in the module docstring."""
+        """The seams named in the module docstring."""
 
         def host(*_args: Any, **_kwargs: Any) -> InMemoryCodeHost:
             return self.code_host
 
         for module, seams in (
             ("curie_api.forges.hosts", ("code_host_for", "factory_code_host")),
-            ("curie_api.factory_ci", ("factory_code_host",)),
-            ("curie_api.lineage_reconciler", ("factory_code_host",)),
             ("curie_api.repository_access", ("code_host_for",)),
             ("curie_api.github_factory", ("factory_code_host",)),
             ("curie_api.routers.publications", ("code_host_for",)),
-            ("curie_api.routers.work_item_outcomes", ("factory_code_host",)),
             ("curie_api.routers.publication_code_host", ("code_host_for",)),
         ):
             for seam in seams:
                 monkeypatch.setattr(f"{module}.{seam}", host)
-        monkeypatch.setattr(
-            "curie_api.factory_ci.issue_url",
-            lambda _settings, issue, _repository: self.tracker.issue_url(issue),
+
+        def tracker(*_args: Any, **_kwargs: Any) -> InMemoryTracker:
+            return self.tracker
+
+        def link(_registry: Any, issue: Any, _repository: Any) -> str:
+            return self.tracker.issue_url(issue)
+
+        _replace_everywhere(
+            monkeypatch,
+            {
+                "tracker_for_work_item": tracker,
+                "code_host_for_repository": host,
+                "issue_link": link,
+            },
         )
-        monkeypatch.setattr(factory_notices, "_sync_one", self._sync_one(factory_notices._sync_one))
+        # Every status write either port makes, in order, for `writes`.
+        for side in (self.tracker.marked_comments, self.code_host.marked_comments):
+            monkeypatch.setattr(side, "upsert_marked", self._logged(side.upsert_marked))
 
-    def _sync_one(self, original: Callable[..., Any]) -> Callable[..., Any]:
-        async def sync_one(client: httpx.AsyncClient, settings: Any, claim: Any) -> int:
-            written = await original(client, settings, claim)
-            if claim.tracker_issue.kind == types.GITHUB:
-                return int(written)
-            # The real sink is GitHub-only: it must not have written anything.
-            assert written == 0
-            row = claim.row
-            writes = 0
-            if row.finalized_at is None:
-                side = comments_for(claim.target, self.tracker, self.code_host)
-                result = await side.upsert_marked(
-                    claim.target, f"curie-factory-status:{row.execution_request_id}", claim.body
-                )
-                if result.written:
-                    self.log.append(
-                        _Logged(
-                            row.execution_request_id,
-                            claim.target.kind,
-                            result.comment.id,
-                            claim.body,
-                        )
-                    )
-                    writes += 1
-            if claim.latest and row.refused_at is None:
-                writes += await factory_notices._sync_labels(self.tracker, claim)
-            return writes
+    def _logged(self, upsert: Callable[..., Any]) -> Callable[..., Any]:
+        async def upsert_marked(target: ReplyTarget, marker: str, body: str) -> Any:
+            result = await upsert(target, marker, body)
+            if result.written:
+                self.log.append(_Logged(target.kind, result.comment.id, body))
+            return result
 
-        return sync_one
+        return upsert_marked
 
     @property
     def issue_url(self) -> str:
@@ -775,8 +774,7 @@ class _JiraPair:
             assert await may_start_with(WriteCheck(), self.issue, actor, tracker=self.tracker)
             self.cursor = page.cursor
             base = await factory_base.resolve_base(
-                registry=forges_registry(get_settings()),
-                repo_full_name=REPO,
+                policy=forges_registry(get_settings()).github_repository_policy(REPO),
                 labels=set(),
                 default_branch="main",
                 code_host=self.code_host,
@@ -888,10 +886,11 @@ class _JiraPair:
         return asyncio.run(go())
 
     def writes(self, request_id: uuid.UUID) -> list[Write]:
+        marker = marker_for(request_id)
         seen: set[str] = set()
         found: list[Write] = []
         for entry in self.log:
-            if entry.request_id != request_id:
+            if marker not in entry.body:
                 continue
             found.append(
                 Write("edit" if entry.comment_id in seen else "create", entry.target, entry.body)
@@ -922,12 +921,13 @@ class _JiraPair:
         page = asyncio.run(self.tracker.poll_marked(self.cursor, running=(self.issue,)))
         assert page.notices == ()
         assert LABEL in self.tracker.labels(self.issue)
-        # The notice row's comment columns are GitHub-shaped (an integer id and
-        # an 'issue' or 'review' list), so the port reply leaves them empty;
-        # the label the sink applied is persisted.
+        # The port branch records the posted comment on the notice row, with no
+        # GitHub comment list; the label the sink applied is persisted.
         for request_id in (first, revision):
             row = _notice(request_id)
-            assert row["posted_at"] is None and row["comment_id"] is None, row
+            assert row["posted_at"] is not None and row["comment_id"] is not None, row
+            assert row["comment_list"] is None, row
+            assert row["refused_at"] is None, row
             assert row["terminal_cause"] == "completed"
         assert _notice(revision)["applied_label"] == "curie-factory:pr-open"
 

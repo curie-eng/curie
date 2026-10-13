@@ -1,7 +1,7 @@
 ---
 seam: Forge tracker and code host
 kind: CLEAN
-impls: 1 in-memory pair behind the Tracker and CodeHost ports (GitHub adapter pending)
+impls: in-memory pairs behind the Tracker and CodeHost ports, and the Jira Cloud tracker (JiraTracker)
 grade: not separately graded
 vision_row: null
 epics: ["#3831"]
@@ -13,7 +13,7 @@ order: 26
 > Part of the Curie swappable seam catalog. See the [seam index](../../interfaces.md).
 
 <!-- BEGIN GENERATED: header (curie dev docs-lint) -->
-> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** 1 in-memory pair behind the Tracker and CodeHost ports (GitHub adapter pending) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
+> **Kind:** CLEAN &nbsp;·&nbsp; **Implementations today:** in-memory pairs behind the Tracker and CodeHost ports, and the Jira Cloud tracker (JiraTracker) &nbsp;·&nbsp; **Swap-readiness grade:** not separately graded
 <!-- END GENERATED: header -->
 
 **Kind legend:** CLEAN = a real `Protocol` or typed port class. SOFT = swap through config or wire without a code interface. NONE = not built yet.
@@ -54,9 +54,12 @@ marked and described:
    binding's allowlist or group.
 5. `read_ticket` returns the ticket as markdown for the sandbox. Nothing is
    stored.
-6. `set_state_label` applies the factory state label and drops others.
-7. `closing_reference` produces the text a pull request body carries.
-8. Optional: `link_pull_request` and `dependencies`.
+6. `ticket_labels` returns the issue's current labels and component names,
+   which admission reads for `base:` and `repo:` labels and label conflicts.
+   Nothing is stored.
+7. `set_state_label` applies the factory state label and drops others.
+8. `closing_reference` produces the text a pull request body carries.
+9. Optional: `link_pull_request` and `dependencies`.
 
 ### CodeHost
 
@@ -186,8 +189,11 @@ A new adapter pair adds its adapter modules in a package under
 `apps/api/src/curie_api/forges/`, a harness that satisfies `AdapterHarness`,
 and one entry in `HARNESSES` in
 `apps/api/tests/forges/contract/conftest.py`. The vectors are never edited
-for an adapter. Its kind must already be named in the pairing rules; GitLab,
-Jira and both Bitbucket kinds are.
+for an adapter. The Jira Cloud tracker registered this way as the
+`jira-github` harness
+(`apps/api/tests/forge_fakes/contract_harness.py::JiraGitHubHarness`), paired
+with the GitHub code host. Its kind must already be named in the pairing
+rules; GitLab, Jira and both Bitbucket kinds are.
 
 ## Implementations today
 
@@ -199,6 +205,22 @@ Jira and both Bitbucket kinds are.
    Bitbucket binding has.
 2. **GitHub:** not yet behind the ports. Its code lives in
    `apps/api/src/curie_api/forges/github/` and is called directly.
+3. **Jira Cloud:** `JiraTracker`
+   (`apps/api/src/curie_api/forges/jira_cloud/tracker.py::JiraTracker`) in
+   `apps/api/src/curie_api/forges/jira_cloud/`, a tracker-only kind paired
+   with the GitHub code host. It reaches Jira Cloud REST v3 with a static API
+   token held only by the API, keeps its status comment marker in the
+   `curie.factory` comment property, and links each pull request back to the
+   issue with a remote link.
+4. **Bitbucket Cloud:** `BitbucketCloudCodeHost` in
+   `apps/api/src/curie_api/forges/bitbucket_cloud/code_host.py`, a code host
+   only, paired with a Jira Cloud tracker. Every mandatory CodeHost and
+   MarkedComments operation is supported; `ci_diagnostics`, `rerun_failed` and
+   `user_can_write` are unsupported. Review feedback counts only from accounts
+   in the binding's review feedback allowlist.
+5. **Bitbucket Data Center:** `BitbucketDcCodeHost` in
+   `apps/api/src/curie_api/forges/bitbucket_dc/code_host.py`, with the same
+   capabilities and allowlist rule, for Data Center 9.4.0 or newer.
 
 ## Known leakage
 

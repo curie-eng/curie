@@ -204,10 +204,11 @@ binding's server-controlled endpoint. The built-in cluster-message publication p
 `_ClusterMessageReplyAdapter`
 (`apps/worker/src/curie_worker/reply_sink.py::_ClusterMessageReplyAdapter`) as the third
 `ReplySink` implementation and relays replies to the API. The fourth is
-`GitHubReplySink` (`apps/worker/src/curie_worker/reply_sink.py::GitHubReplySink`),
-selected for `kind == "github"` routes. It only acknowledges: it makes no network
-call and posts no streamed model text. A factory turn bound to a GitHub repository
-answers on GitHub through the factory notice and publication path instead: the API
+`TrackerReplySink` (`apps/worker/src/curie_worker/reply_sink.py::TrackerReplySink`),
+selected for the tracker kinds `github`, `gitlab` and `jira`. It only acknowledges:
+it makes no network call and posts no streamed model text. A factory turn bound to
+a tracker surface answers on its tracker through the factory notice and publication
+path instead: the API
 keeps the one live status comment and its labels
 (`apps/api/src/curie_api/factory_notices.py::sync_status_comments`), and the
 approval-gated pull request is recorded by the API publication control plane

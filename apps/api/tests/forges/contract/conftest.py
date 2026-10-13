@@ -11,7 +11,14 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
-from forge_fakes.contract_harness import AdapterHarness, GitHubHarness, InMemoryHarness
+from forge_fakes.bitbucket_cloud_harness import BitbucketCloudHarness
+from forge_fakes.bitbucket_dc_harness import BitbucketDcHarness
+from forge_fakes.contract_harness import (
+    AdapterHarness,
+    GitHubHarness,
+    InMemoryHarness,
+    JiraGitHubHarness,
+)
 
 # A factory may patch the credential sources its adapter reads, so it is
 # handed the vector's monkeypatch, which undoes them after the vector.
@@ -21,6 +28,9 @@ HARNESSES: list[object] = [
     pytest.param(lambda _patch: InMemoryHarness(minimal=False), id="memory"),
     pytest.param(lambda _patch: InMemoryHarness(minimal=True), id="memory-minimal"),
     pytest.param(GitHubHarness, id="github"),
+    pytest.param(JiraGitHubHarness, id="jira-github"),
+    pytest.param(BitbucketCloudHarness, id="memory-tracker+bitbucket-cloud"),
+    pytest.param(BitbucketDcHarness, id="memory-tracker+bitbucket-dc"),
 ]
 
 

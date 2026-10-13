@@ -615,8 +615,11 @@ DRIVER_METHODS = (
     "default_branch_head",
     "reset_fixture",
     "pin_fixture_base",
+    "tracker_evidence",
+    "judge_tracker",
+    "teardowns",
 )
-NOT_INSTALLED_FORGES = ("gitlab", "jira_cloud", "bitbucket_cloud", "bitbucket_dc")
+NOT_INSTALLED_FORGES = ("gitlab",)
 
 
 def test_base_defines_the_driver_protocol_without_importing_the_harness(
@@ -666,16 +669,41 @@ def test_github_driver_implements_every_protocol_method() -> None:
         assert callable(getattr(gh.GitHubDriver, method, None)), method
 
 
+def test_github_driver_has_no_tracker_evidence_and_no_extra_teardown(tmp_path: Path) -> None:
+    gh = _github_entry()
+    assert gh.GitHubDriver.forge == "github"
+    assert gh.GitHubDriver.pairing == "github+github"
+    driver = gh.GitHubDriver(_preflight(tmp_path))
+    change = fe.ChangeRef(7, "https://github.com/acme/fixture/pull/7")
+    assert driver.tracker_evidence(change, "wi-1") == {}
+    assert driver.tracker_evidence(None, "wi-1") == {}
+    assert driver.judge_tracker({}) == []
+    assert tuple(driver.teardowns()) == ()
+
+
+def test_the_jira_driver_implements_every_protocol_method() -> None:
+    fe.load_forge_entries()
+    jira = sys.modules["factory_e2e_forges.jira_cloud"]
+    assert jira.JiraCloudDriver.forge == "jira_cloud"
+    assert jira.JiraCloudDriver.pairing == "jira_cloud+github"
+    for method in DRIVER_METHODS:
+        assert callable(getattr(jira.JiraCloudDriver, method, None)), method
+
+
 # --- forge registry --------------------------------------------------------------
 
 
 def test_forge_entries_register_github_installed_and_the_rest_not_installed() -> None:
     loaded = fe.load_forge_entries()
-    for name in ("github", *NOT_INSTALLED_FORGES):
+    for name in ("github", "jira_cloud", *NOT_INSTALLED_FORGES):
         assert name in loaded, name
         assert fe.FORGES[name].name == name
     assert fe.FORGES["github"].installed is True
     assert fe.FORGES["github"].driver is _github_entry().GitHubDriver
+    assert fe.FORGES["github"].setup is None
+    assert fe.FORGES["jira_cloud"].installed is True
+    jira = sys.modules["factory_e2e_forges.jira_cloud"]
+    assert fe.FORGES["jira_cloud"].setup is jira.install_jira
     for name in NOT_INSTALLED_FORGES:
         assert fe.FORGES[name].installed is False, name
 
@@ -755,6 +783,7 @@ class _FakeDriver:
     """A ForgeDriver that records each call and serves a complete loop."""
 
     forge = "fakeforge"
+    pairing = "faketracker+fakeforge"
 
     def __init__(self, _p: Any = None) -> None:
         self.calls: list[str] = []
@@ -806,6 +835,17 @@ class _FakeDriver:
 
     def pin_fixture_base(self) -> None:
         self.calls.append("pin_fixture_base")
+
+    def tracker_evidence(self, change: fe.ChangeRef | None, work_item_id: str) -> dict[str, Any]:
+        self.calls.append("tracker_evidence")
+        return {"key": "T-1", "status_comments": 1}
+
+    def judge_tracker(self, evidence: Any) -> list[str]:
+        self.calls.append("judge_tracker")
+        return []
+
+    def teardowns(self) -> tuple[tuple[str, Any], ...]:
+        return (("fake tracker cleanup", lambda: {"cleaned": True}),)
 
 
 def _forbid_github(preflight: fe.Preflight, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -875,10 +915,16 @@ def test_run_loop_observes_and_mutates_the_forge_only_through_the_driver(
 
     assert obs["verdict"] == "passed", obs["failures"]
     assert obs["forge"] == "fakeforge"
+    assert obs["pairing"] == "faketracker+fakeforge"
+    assert obs["tracker"] == {"key": "T-1", "status_comments": 1}
     assert driver.calls[:2] == ["open_and_label_ticket", "pin_fixture_base"]
     for method in ("set_ci_red", "post_review", "merge", "change_merged", "changes_opened"):
         assert method in driver.calls, method
     assert "default_branch_head" in driver.calls
+    # Tracker evidence is read once, after the merge is observed, then judged.
+    assert driver.calls.count("tracker_evidence") == 1
+    assert driver.calls.index("tracker_evidence") > driver.calls.index("changes_opened")
+    assert "judge_tracker" in driver.calls
 
 
 def test_preflight_setup_resets_and_baselines_a_loop_fixture_through_the_driver(
@@ -915,6 +961,66 @@ def test_preflight_setup_resets_and_baselines_a_loop_fixture_through_the_driver(
     assert "reset fixture repository" in names
     reset_step = dict(preflight.teardown._steps)["reset fixture repository"]
     assert reset_step() == {"reset": "fakeforge"}
+    # The driver's own teardowns are pushed right after the fixture reset.
+    assert names[names.index("reset fixture repository") + 1] == "fake tracker cleanup"
+
+
+def _setup_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, setup: Any
+) -> tuple[fe.Preflight, list[str]]:
+    driver = _FakeDriver()
+    monkeypatch.setitem(
+        fe.FORGES,
+        "fakeforge",
+        fe.ForgeEntry(name="fakeforge", driver=lambda _p: driver, installed=True, setup=setup),
+    )
+    preflight = _preflight(tmp_path, scenario_name="forge-loop")
+    preflight.evidence["forge"] = "fakeforge"
+    order: list[str] = []
+    for step in (
+        "check_tools",
+        "check_images",
+        "check_app",
+        "sweep_stale_namespaces",
+        "create_namespace",
+        "install",
+        "port_forward",
+        "bind_agent",
+        "ensure_label",
+        "tunnel",
+        "point_card_at_tunnel",
+        "repoint_webhook",
+    ):
+
+        def stub(*_a: Any, _step: str = step, **_k: Any) -> None:
+            order.append(_step)
+
+        monkeypatch.setattr(preflight, step, stub)
+    monkeypatch.setattr(preflight, "_lock", lambda *_a, **_k: None)
+    preflight.run(lambda _p: {"ok": True})
+    return preflight, order
+
+
+def test_an_entry_setup_runs_after_the_port_forward_instead_of_bind_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[Any] = []
+
+    def setup(p: fe.Preflight) -> None:
+        seen.append(p)
+
+    preflight, order = _setup_run(tmp_path, monkeypatch, setup)
+    assert seen == [preflight]
+    assert "bind_agent" not in order
+    assert order.index("port_forward") < order.index("ensure_label")
+
+
+def test_an_entry_without_setup_binds_the_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _preflight_run, order = _setup_run(tmp_path, monkeypatch, None)
+    assert "bind_agent" in order
+    assert order.index("port_forward") < order.index("bind_agent")
 
 
 # --- main: forge-loop selection happens before any install ------------------------

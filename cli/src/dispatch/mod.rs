@@ -612,12 +612,23 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
         Some(Command::Build {
             tag,
             plugin_dir,
+            repo_runner,
             registry,
             runner_image,
             force,
             platform,
-        }) => match plugin_dir {
-            Some(plugin_dir) => emit(
+        }) => match (repo_runner, plugin_dir) {
+            (Some(spec), _) => emit(
+                commands::build_repo_runner(commands::RepoRunnerBuildOpts {
+                    spec,
+                    registry: registry.ok_or_else(|| {
+                        anyhow::anyhow!("--repo-runner needs --registry <REF> to push to")
+                    })?,
+                    runner_image,
+                })
+                .await?,
+            ),
+            (None, Some(plugin_dir)) => emit(
                 commands::build_connectors(commands::ConnectorBuildOpts {
                     plugin_dir,
                     registry,
@@ -627,7 +638,7 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                 })
                 .await?,
             ),
-            None => commands::build(&tag).await,
+            (None, None) => commands::build(&tag).await,
         },
         Some(Command::Install { update }) => commands::install(update).await,
         Some(Command::Update { image }) => commands::update(image).await,
@@ -688,6 +699,9 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                 token_file,
                 ca_file,
                 review_accounts,
+                forge_username,
+                start_accounts,
+                start_group,
             } => {
                 let forge = curie::factory_quickstart::ForgeFlags {
                     code_host,
@@ -696,9 +710,13 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                     token_file,
                     ca_file,
                     review_accounts,
+                    forge_username,
+                    start_accounts,
+                    start_group,
                 };
                 // Refuse an unusable forge selection before the chart fetch.
                 curie::factory_quickstart::select_forge(&forge)?;
+                let chart_explicit = chart.is_some();
                 let resolved = artifacts::resolve_chart(
                     chart.as_deref(),
                     artifacts::Channel::current(),
@@ -725,6 +743,7 @@ pub(crate) async fn run(command: Option<Command>) -> Result<()> {
                             label,
                             plugin_dir,
                             chart,
+                            chart_explicit,
                             dry_run,
                             forge,
                         },

@@ -1127,20 +1127,44 @@ pub(crate) enum Command {
     /// deploy requires. Without `--registry` it builds the host platform only
     /// into the local Docker daemon and records the local image id, which is
     /// usable at the skill and local tiers and refused at cluster.
+    ///
+    /// With `--repo-runner <PATH> --registry <REF>` it builds a repository runner
+    /// image (ADR 0216) from a YAML or JSON input file naming catalog `tools`, an
+    /// optional `dockerfile` beside the file built on `${CURIE_RUNNER_IMAGE}`, and
+    /// extra `probes`. Both linux/amd64 and linux/arm64 are built in one buildx
+    /// bake, every tool is probed inside the image (a failing probe fails the
+    /// build), the probe manifest lands at /etc/curie/tool-manifest.json, and the
+    /// image is pushed to `<REF>/curie-repo-runner`. It prints the `runner` block
+    /// to paste under `factory.bindings[].repos[].runner`. The multi-platform push
+    /// needs a docker-container builder: select one with `docker buildx use` or
+    /// `BUILDX_BUILDER`.
     Build {
         /// Image tag to build.
         #[arg(long, default_value = docker::RUNNER_IMAGE, conflicts_with = "plugin_dir")]
         tag: String,
         /// Build the connectors this agent bundle declares.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", group = "build_input")]
         plugin_dir: Option<PathBuf>,
+        /// Build a repository runner image from this input file (YAML or JSON;
+        /// requires `--registry`). Needs a docker-container builder
+        /// (`docker buildx use` or `BUILDX_BUILDER`) for the two-platform push.
+        #[arg(
+            long,
+            value_name = "PATH",
+            group = "build_input",
+            requires = "registry",
+            conflicts_with_all = ["tag", "force", "platform"]
+        )]
+        repo_runner: Option<PathBuf>,
         /// Push every declared platform (or the `--platform` subset) to this
-        /// registry (e.g. ghcr.io/acme-corp).
-        #[arg(long, value_name = "REF", requires = "plugin_dir")]
+        /// registry (e.g. ghcr.io/acme-corp). With `--repo-runner`, the registry
+        /// the repository runner image is pushed to.
+        #[arg(long, value_name = "REF", requires = "build_input")]
         registry: Option<String>,
-        /// The platform runner a declared runner layer builds on (default: the
-        /// runner `curie skill up` uses). Resolved to a digest before building.
-        #[arg(long, value_name = "REF", requires = "plugin_dir")]
+        /// The platform runner a declared runner layer or a repository runner
+        /// builds on (default: the runner `curie skill up` uses). Resolved to a
+        /// digest before building.
+        #[arg(long, value_name = "REF", requires = "build_input")]
         runner_image: Option<String>,
         /// Replace a registry lock with a local-daemon one deliberately.
         #[arg(long, requires = "plugin_dir")]
@@ -1439,8 +1463,8 @@ pub(crate) enum FactoryAction {
         /// this build.
         #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
         code_host: curie::factory_quickstart::CodeHostKind,
-        /// Tracker the factory takes issues from. Only github is installed in
-        /// this build.
+        /// Tracker the factory takes issues from: github, or jira-cloud with
+        /// --code-host github.
         #[arg(long, value_enum, value_name = "KIND", default_value = "github")]
         tracker: curie::factory_quickstart::TrackerKind,
         /// Base URL of a non-GitHub forge. Refused for github.
@@ -1458,6 +1482,17 @@ pub(crate) enum FactoryAction {
         /// Refused for github.
         #[arg(long = "review-account", value_name = "ACCOUNT")]
         review_accounts: Vec<String>,
+        /// Email of the account a Jira token authenticates as. Refused for
+        /// github.
+        #[arg(long, value_name = "EMAIL")]
+        forge_username: Option<String>,
+        /// Jira accountId allowed to start work (repeatable). Refused for
+        /// github.
+        #[arg(long = "start-account", value_name = "ACCOUNT")]
+        start_accounts: Vec<String>,
+        /// Jira groupId whose members may start work. Refused for github.
+        #[arg(long, value_name = "GROUP")]
+        start_group: Option<String>,
     },
 }
 

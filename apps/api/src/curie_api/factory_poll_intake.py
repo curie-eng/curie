@@ -45,12 +45,13 @@ from curie_api.factory_label_reconcile import (
     bound_repositories,
     open_work_item_repositories,
     parse_time,
+    tracker_work_item_repositories,
 )
 
 from . import github_factory
 from .config import Settings
 from .forges.errors import Unavailable
-from .forges.github.binding import bound_labels
+from .forges.github.binding import GITHUB_CHANNEL_KIND
 from .forges.github.comments import static_token
 from .forges.github.review_polling import (
     Cursor,
@@ -75,6 +76,7 @@ from .forges.github.tracker import (
 from .forges.github.transport import PollUnavailable
 from .forges.hosts import factory_credentials, factory_tracker, repository_ref
 from .forges.registry import forges_registry
+from .forges.surfaces import bound_labels
 from .forges.types import TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .github_factory_events import FactoryNotice, mentions_login
@@ -135,9 +137,7 @@ async def poll_once(
 
     engine = _engine(sessionmaker)
     async with engine.connect() as connection:
-        locked = (
-            await connection.execute(_LOCK, _LOCK_ARGS)
-        ).scalar()
+        locked = (await connection.execute(_LOCK, _LOCK_ARGS)).scalar()
         await connection.commit()
         if not locked:
             return
@@ -156,6 +156,7 @@ async def _poll_locked(
     async with sessionmaker() as session:
         bound = await bound_repositories(session)
         open_items = await open_work_item_repositories(session)
+        tracker_items = await tracker_work_item_repositories(session)
     served: dict[str, bool] = {}
     for repository, serves in [*((r, True) for r in bound), *((r, False) for r in open_items)]:
         try:
@@ -163,11 +164,28 @@ async def _poll_locked(
         except InvalidRepoFullName:
             continue
         served[repo] = served.get(repo, False) or serves
+    # Repositories that host another tracker's open pull requests are walked
+    # for review feedback (#4358 plan D10); their intake is that tracker's pass.
+    feedback_only: set[str] = set()
+    for repository in tracker_items:
+        try:
+            repo = normalize_repo_full_name(repository)
+        except InvalidRepoFullName:
+            continue
+        feedback_only.add(repo)
+        served.setdefault(repo, False)
     for repo, serves in served.items():
         if not repository_is_allowed(repo, settings.github_repo_allowlist):
             continue
         try:
-            await _poll_repository(sessionmaker, settings, client, repo, serves=serves)
+            await _poll_repository(
+                sessionmaker,
+                settings,
+                client,
+                repo,
+                serves=serves,
+                feedback=serves or repo in feedback_only,
+            )
         except (
             Unavailable,
             PollUnavailable,
@@ -186,15 +204,22 @@ async def _poll_repository(
     repo: str,
     *,
     serves: bool,
+    feedback: bool,
 ) -> None:
     """One repository's pass. ``serves`` is False for a repository no surface
-    binds any more: it gets the cancellation pass alone."""
+    binds any more: it gets the cancellation pass alone, plus the review
+    feedback pass when ``feedback`` (it hosts another tracker's open pull
+    requests, #4358 plan D10)."""
 
     now = datetime.now(UTC)
     registry = forges_registry(settings)
     intake = factory_tracker(registry)
     async with sessionmaker() as session:
-        labels = sorted(await bound_labels(session, registry, repo)) if serves else []
+        labels = (
+            sorted(await bound_labels(session, registry, GITHUB_CHANNEL_KIND, repo))
+            if serves
+            else []
+        )
     installation_id, token = await run_in_threadpool(
         factory_credentials(registry).fresh_installation_token, repo, None
     )
@@ -249,23 +274,24 @@ async def _poll_repository(
         installation_id=installation_id,
         repository=repository,
     )
-    if not serves:
+    if not feedback:
         await _save_cursor(sessionmaker, scope, cursor)
         return
-    await _admit_mentions(
-        sessionmaker,
-        settings,
-        client,
-        cursor,
-        tracker,
-        now=now,
-        api=api,
-        token=token,
-        repo_path=repo_path,
-        installation_id=installation_id,
-        repository=repository,
-        verified=verified,
-    )
+    if serves:
+        await _admit_mentions(
+            sessionmaker,
+            settings,
+            client,
+            cursor,
+            tracker,
+            now=now,
+            api=api,
+            token=token,
+            repo_path=repo_path,
+            installation_id=installation_id,
+            repository=repository,
+            verified=verified,
+        )
     owned = await open_pulls(
         sessionmaker, repository_ref(settings, path=repo, project_id=repository_id)
     )
@@ -450,9 +476,7 @@ async def _issue_numbers(
     sessionmaker: async_sessionmaker[AsyncSession], tracker: GitHubTracker
 ) -> set[int]:
     async with sessionmaker() as session:
-        rows = await session.scalars(
-            select(WorkItem.tracker_issue_id).where(*_in_scope(tracker))
-        )
+        rows = await session.scalars(select(WorkItem.tracker_issue_id).where(*_in_scope(tracker)))
     return {int(number) for number in rows}
 
 

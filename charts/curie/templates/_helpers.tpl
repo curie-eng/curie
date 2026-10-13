@@ -149,6 +149,14 @@ affinity:
 {{- default (printf "%s-%s-publication" .Release.Namespace (include "curie.fullname" .)) .Values.worker.publication.namespace | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{/* ADR 0217: the per-run Docker daemon namespace. factory.docker is read
+     through default dict because it is nil under --reuse-values for a release
+     that predates it. */}}
+{{- define "curie.factory.dockerNamespace" -}}
+{{- $docker := get (.Values.factory | default dict) "docker" | default dict -}}
+{{- get $docker "namespace" | default (printf "%s-%s-docker" .Release.Namespace (include "curie.fullname" .)) | toString | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{/* ---- Reserved connector-secret boot-env names (#457, ADR-0009) ----
      The non-CURIE_-prefixed runner credential keys a per-agent connector
      secret must never declare, kept in list-parity with the Python source of
@@ -2575,6 +2583,94 @@ true
 {{- range $a, $on := get (.Values.factory | default dict) "sandboxEgress" | default dict -}}
 {{- if or (gt (len $a) 40) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $a)) }}{{ fail (printf "factory.sandboxEgress.%s has an invalid agent name" $a) }}{{ end -}}
 {{- if $on }}{{ $out = append $out $a }}{{ end -}}
+{{- end -}}
+{{- toJson $out -}}
+{{- end -}}
+
+{{/* ADR 0216: one descriptor per repository, sharing pools by index digest. */}}
+{{- define "curie.factory.repoRunnerDescriptors" -}}
+{{- $root := . -}}
+{{- $entries := list -}}
+{{- $hasRunners := false -}}
+{{- range $bi, $binding := get (.Values.factory | default dict) "bindings" | default list -}}
+{{- range $ri, $repo := get $binding "repos" | default list -}}
+{{- $entries = append $entries (dict "repo" $repo "key" (printf "factory.bindings[%d].repos[%d]" $bi $ri)) -}}
+{{- if get $repo "runner" }}{{ $hasRunners = true }}{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- $descriptors := dict -}}
+{{- if $hasRunners -}}
+{{- $agents := list -}}
+{{- range $agent, $on := get (.Values.factory | default dict) "sandboxEgress" | default dict -}}
+{{- if not (kindIs "bool" $on) }}{{ fail (printf "factory.sandboxEgress.%s must be a boolean when repository runners are configured" $agent) }}{{ end -}}
+{{- if $on }}{{ $agents = append $agents $agent }}{{ end -}}
+{{- end -}}
+{{- if ne (len $agents) 1 }}{{ fail "repository runners require exactly one true factory agent in factory.sandboxEgress" }}{{ end -}}
+{{- $agent := first $agents -}}
+{{- $poolAgents := include "curie.agentSandboxPoolAgents" . | fromJsonArray -}}
+{{- if not .Values.agentSandbox.deploy }}{{ fail "repository runners require agentSandbox.deploy=true for chart-managed sandbox pools" }}{{ end -}}
+{{- $basePool := printf "%s-runner-pool" (include "curie.fullname" .) -}}
+{{- $warmPool := get (.Values.worker | default dict) "warmPool" | default $basePool -}}
+{{- if ne $warmPool $basePool }}{{ fail "repository runners require worker.warmPool to be empty or the chart-managed runner pool" }}{{ end -}}
+{{- $declarations := dict -}}
+{{- $identities := dict -}}
+{{- $prefixes := dict -}}
+{{- range $entries -}}
+{{- $repo := .repo -}}
+{{- $path := get $repo "path" | default "" | toString -}}
+{{- $declaration := toJson $repo -}}
+{{- if and (hasKey $declarations $path) (ne (get $declarations $path) $declaration) }}{{ fail (printf "conflicting duplicate repository path %q in %s; repository declarations must be identical" $path .key) }}{{ end -}}
+{{- $_ := set $declarations $path $declaration -}}
+{{- $source := printf "%s.runner" .key -}}
+{{- with get $repo "runner" -}}
+{{- if not (regexMatch "^[A-Za-z0-9_][A-Za-z0-9._~-]*(/[A-Za-z0-9_][A-Za-z0-9._~-]*)+$" $path) }}{{ fail (printf "%s path %q is not a repository path" $source $path) }}{{ end -}}
+{{- $image := get . "image" | default "" | toString -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._/:-]*@sha256:[0-9a-f]{64}$" $image) }}{{ fail (printf "%s.image must be a CEL-safe digest image reference" $source) }}{{ end -}}
+{{- $index := last (splitList "@" $image) -}}
+{{- $base := get . "base" | default "" | toString -}}
+{{- $platforms := get . "platformDigests" | default dict -}}
+{{- $amd64 := get $platforms "linux/amd64" | default "" | toString -}}
+{{- $arm64 := get $platforms "linux/arm64" | default "" | toString -}}
+{{- range $digest := list $base $amd64 $arm64 -}}
+{{- if not (regexMatch "^sha256:[0-9a-f]{64}$" $digest) }}{{ fail (printf "%s base and platformDigests must be sha256 digests" $source) }}{{ end -}}
+{{- end -}}
+{{- $identity := toJson (dict "image" $image "base" $base "platformDigests" $platforms) -}}
+{{- if and (hasKey $identities $index) (ne (get $identities $index) $identity) }}{{ fail (printf "conflicting repository runner image identity for index digest %s" $index) }}{{ end -}}
+{{- $_ := set $identities $index $identity -}}
+{{- $prefix := trimPrefix "sha256:" $index | trunc 12 -}}
+{{- if and (hasKey $prefixes $prefix) (ne (get $prefixes $prefix) $index) }}{{ fail (printf "repository runner digest prefix collision for %s" $prefix) }}{{ end -}}
+{{- $_ := set $prefixes $prefix $index -}}
+{{- if has (printf "%s-img-%s" $agent $prefix) $poolAgents }}{{ fail (printf "repository runner name collision with ordinary agent %s-img-%s" $agent $prefix) }}{{ end -}}
+{{- $template := printf "%s-agent-%s-img-%s-runner" (include "curie.fullname" $root) $agent $prefix -}}
+{{- $pool := printf "%s-pool" $template -}}
+{{- if or (gt (len $pool) 63) (not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $pool)) }}{{ fail (printf "repository runner pool name %q must be a DNS label of at most 63 characters" $pool) }}{{ end -}}
+{{- $docker := get $repo "docker" | default dict -}}
+{{- $dockerOn := get $docker "enabled" | default false -}}
+{{- $egress := list -}}
+{{- if $dockerOn -}}
+{{- range get $docker "egressAllowlist" | default list -}}
+{{- $ports := list -}}
+{{- range .ports -}}
+{{- $port := deepCopy . -}}
+{{- if not (hasKey $port "protocol") }}{{ $_ := set $port "protocol" "TCP" }}{{ end -}}
+{{- $ports = append $ports $port -}}
+{{- end -}}
+{{- $egress = append $egress (set (deepCopy .) "ports" $ports) -}}
+{{- end -}}
+{{- end -}}
+{{- $_ := set $descriptors $path (dict "path" $path "agent" $agent "prefix" $prefix "template" $template "pool" $pool "image" $image "digests" (list $index $amd64 $arm64) "base" $base "docker" $dockerOn "egress" $egress "source" $source) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $out := list -}}
+{{- range $path := keys $descriptors | sortAlpha }}{{ $out = append $out (get $descriptors $path) }}{{ end -}}
+{{- toJson $out -}}
+{{- end -}}
+
+{{- define "curie.factory.repoRunnerPoolsJson" -}}
+{{- $out := dict -}}
+{{- range . -}}
+{{- $_ := set $out .path (pick . "pool" "digests" "base" "docker" "egress") -}}
 {{- end -}}
 {{- toJson $out -}}
 {{- end -}}

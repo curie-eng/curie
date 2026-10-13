@@ -45,6 +45,7 @@ mod overrides;
 mod remediation_policy;
 mod remediation_qualification;
 mod remediation_receipts;
+mod repo_runner_build;
 mod skill;
 mod skill_approvals;
 mod skill_unavailable;
@@ -66,6 +67,7 @@ pub use overrides::*;
 pub use remediation_policy::*;
 pub use remediation_qualification::*;
 pub use remediation_receipts::*;
+pub use repo_runner_build::*;
 pub use skill::*;
 pub use skill_approvals::*;
 pub use skill_unavailable::*;
@@ -162,7 +164,11 @@ fn resolve_url(explicit: Option<String>) -> Result<String> {
     if let Some(saved) = state::load(Path::new("."))? {
         return Ok(saved.base_url);
     }
-    Ok(format!("http://localhost:{DEFAULT_PORT}"))
+    let published_host = docker::published_host_setting()?;
+    Ok(docker::published_endpoint(
+        published_host.as_deref(),
+        DEFAULT_PORT,
+    ))
 }
 
 fn unix_now() -> u64 {

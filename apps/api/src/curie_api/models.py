@@ -2986,7 +2986,9 @@ class FactoryPollCursor(Base):
     """One tracker scope's factory poll cursors and conditional-request tags (#3745).
 
     Keyed by the scope a tracker issue id is unique within (ADR 0197): the
-    repository id on GitHub. ``scope_path`` is for display.
+    repository id on GitHub, the site's cloudId on Jira. ``scope_path`` is for
+    display. ``etags`` holds conditional-request tags and, under
+    ``marked:<label>``, the opaque `Tracker.poll_marked` cursors (#4358 plan D2).
     """
 
     __tablename__ = "factory_poll_cursors"

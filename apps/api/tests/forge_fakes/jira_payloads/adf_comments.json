@@ -1,0 +1,56 @@
+[
+  {
+    "author": {
+      "accountId": "5b10a0000000000000000001",
+      "displayName": "Mia Krystof",
+      "accountType": "atlassian"
+    },
+    "created": "2026-03-01T15:15:00.000+0000",
+    "body": {
+      "version": 1,
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "text",
+              "text": "Repro confirmed on staging."
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "author": {
+      "accountId": "712020:00000000-0000-4000-8000-000000000102",
+      "displayName": "Sam Rivera",
+      "accountType": "atlassian"
+    },
+    "created": "2026-03-02T13:00:00.000+0000",
+    "body": {
+      "version": 1,
+      "type": "doc",
+      "content": [
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "mention",
+              "attrs": {
+                "id": "712020:00000000-0000-4000-8000-0000000000b0",
+                "text": "@Curie Factory",
+                "accessLevel": ""
+              }
+            },
+            {
+              "type": "text",
+              "text": " please take this."
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

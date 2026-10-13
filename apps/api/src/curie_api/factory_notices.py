@@ -42,11 +42,12 @@ from starlette.concurrency import run_in_threadpool
 
 from .code_host_trust import code_host_verify
 from .config import Settings
-from .factory_comment_text import marker_for, redact_factory_comment
+from .factory_comment_text import marker_for, redact_factory_comment, status_marker
 from .factory_progress import PhaseView, phase_view, pill_for
 from .factory_reply_target import stored_reply_target
 from .factory_usage import usage_line, work_item_usage
-from .forges.errors import ForgeError
+from .forges.capabilities import Operation, Support
+from .forges.errors import ForgeError, Unauthorized
 from .forges.github.comments import static_token
 from .forges.github.marked_comments import (
     GitHubCalls,
@@ -58,9 +59,10 @@ from .forges.github.marked_comments import (
 )
 from .forges.github.transport import github_headers
 from .forges.hosts import factory_credentials, factory_tracker
-from .forges.ports import Tracker
+from .forges.ports import CodeHost, Tracker, comments_for
 from .forges.registry import forges_registry
-from .forges.types import GITHUB, ReplyTarget, TrackerIssueRef
+from .forges.trackers import code_host_for_repository, tracker_for_work_item
+from .forges.types import GITHUB, PullRequestRef, ReplyTarget, RepositoryRef, TrackerIssueRef
 from .github_app import GitHubAppError, GitHubInstallationRefused
 from .models import (
     ExecutionRequest,
@@ -640,8 +642,12 @@ async def sync_status_comments(
 class _StatusClaim:
     row: FactoryStatusComment
     repository_path: str
+    repository: RepositoryRef
     code_host_installation_id: int | None
     tracker_issue: TrackerIssueRef
+    # The pull request this request opened on the lineage, linked back to the
+    # ticket from this request's comment only (#4358 plan D6); None otherwise.
+    opened_pr: int | None
     work_item_id: uuid.UUID
     status: str
     target: ReplyTarget
@@ -684,6 +690,7 @@ async def _claim_next(
                 WorkItem,
                 ExecutionRequest,
                 ThreadPublicationLineage.pr_url,
+                ThreadPublicationLineage.pr_number,
                 is_latest.label("is_latest"),
             )
             .join(WorkItem, WorkItem.id == FactoryStatusComment.work_item_id)
@@ -715,7 +722,7 @@ async def _claim_next(
     ).one_or_none()
     if selected is None:
         return None
-    row, work_item, request, pr_url, latest = selected
+    row, work_item, request, pr_url, pr_number, latest = selected
     now = await _clock(session)
     await session.execute(
         update(FactoryStatusComment)
@@ -728,6 +735,19 @@ async def _claim_next(
         .execution_options(synchronize_session=False)
     )
     target = stored_reply_target(request, work_item)
+    opened_pr = (
+        pr_number
+        if pr_number is not None
+        and work_item.publication_lineage_id is not None
+        and await session.scalar(
+            select(Publication.execution_request_id)
+            .where(Publication.lineage_id == work_item.publication_lineage_id)
+            .order_by(Publication.created_at, Publication.id)
+            .limit(1)
+        )
+        == request.id
+        else None
+    )
     body = await _render(
         session,
         settings,
@@ -741,8 +761,10 @@ async def _claim_next(
     claim = _StatusClaim(
         row=row,
         repository_path=work_item.repository_path,
+        repository=work_item.repository,
         code_host_installation_id=work_item.code_host_installation_id,
         tracker_issue=work_item.tracker_issue,
+        opened_pr=opened_pr,
         work_item_id=work_item.id,
         status=request.status,
         target=target,
@@ -796,8 +818,9 @@ async def _sync_one(
     claim: _StatusClaim,
 ) -> int:
     row = claim.row
-    if claim.tracker_issue.kind != GITHUB or claim.code_host_installation_id is None:
-        # Only the GitHub tracker posts status comments today.
+    if claim.tracker_issue.kind != GITHUB:
+        return await _sync_through_ports(client, settings, claim)
+    if claim.code_host_installation_id is None:
         return 0
     registry = forges_registry(settings)
     try:
@@ -827,6 +850,93 @@ async def _sync_one(
         )
         writes += await _sync_labels(tracker, claim)
     return writes
+
+
+async def _sync_through_ports(
+    client: httpx.AsyncClient, settings: Settings, claim: _StatusClaim
+) -> int:
+    """A non-GitHub tracker's status comment and state label, through the ports
+    (#4358 plan D6).
+
+    The tracker and code host are the WorkItem's own: its tracker kind and its
+    stored code host entry, never the install's GitHub accessor.
+    """
+
+    row = claim.row
+    registry = forges_registry(settings)
+    installation = claim.code_host_installation_id
+    try:
+        tracker = tracker_for_work_item(
+            registry, client, claim.tracker_issue, claim.repository, installation
+        )
+        code_host = code_host_for_repository(
+            registry,
+            client,
+            claim.repository,
+            installations=None if installation is None else {claim.repository.path: installation},
+        )
+    except ForgeError:
+        return 0
+    writes = 0
+    if row.finalized_at is None:
+        writes += await _sync_port_comment(tracker, code_host, claim)
+    if claim.latest and row.refused_at is None:
+        writes += await _sync_labels(tracker, claim)
+    return writes
+
+
+async def _sync_port_comment(tracker: Tracker, code_host: CodeHost, claim: _StatusClaim) -> int:
+    """Upsert the request's marked comment, then link its pull request once.
+
+    An unchanged rendered body is skipped. The request that opened the
+    lineage's pull request links it back to the ticket after its comment is
+    current, once, when the tracker supports it; ``rendered_digest`` then
+    records the linked number after the body digest, so a later body edit does
+    not link again. A failed link leaves the digest unset, so the next pass
+    retries both. A refused write is recorded as the row's refusal.
+    """
+
+    row, target, body, now = claim.row, claim.target, claim.body, claim.now
+    digest = _digest(body)
+    pr = claim.opened_pr
+    link = pr is not None and (
+        tracker.capabilities.get(Operation.LINK_PULL_REQUEST) == Support.SUPPORTED
+    )
+    linked = f"{digest}:{pr}"
+    stored = row.rendered_digest
+    if stored == (linked if link else digest):
+        return 0
+    already = link and stored is not None and stored.endswith(f":{pr}")
+    try:
+        result = await comments_for(target, tracker, code_host).upsert_marked(
+            target, status_marker(row.execution_request_id), body
+        )
+    except Unauthorized:
+        row.comment_id = None
+        row.posted_at = None
+        row.rendered_digest = None
+        row.refusal = "comment_refused"
+        row.refused_at = now
+        return 0
+    except ForgeError:
+        return 0
+    if row.comment_id is None:
+        row.posted_at = now
+    row.comment_id = int(result.comment.id)
+    row.rendered_digest = None
+    if link and not already:
+        assert pr is not None
+        try:
+            pull_request = await code_host.read_pull_request(
+                PullRequestRef(claim.repository, str(pr))
+            )
+            await tracker.link_pull_request(claim.tracker_issue, pull_request)
+        except ForgeError:
+            return int(result.written)
+    row.rendered_digest = linked if link else digest
+    if FINAL_MARKER in body:
+        row.finalized_at = now
+    return int(result.written)
 
 
 async def _sync_comment(

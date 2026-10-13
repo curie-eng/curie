@@ -1948,6 +1948,7 @@ def test_sql_sets_the_chart_schema_on_the_install_postgres(monkeypatch: pytest.M
     p = object.__new__(fe.Preflight)
     p.config = type("C", (), {"kube_context": "k"})()
     p.namespace = "test-factory-x"
+    p.release = fe.RELEASE
     assert p.sql("SELECT 1") == [["", ""]]
     assert "statefulset/curie-postgres" in seen["argv"]
     assert "-csearch_path=curie" in seen["argv"][-1]

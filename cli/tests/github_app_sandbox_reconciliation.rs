@@ -99,6 +99,32 @@ spec:
     name: acme-platform-runner
 "#;
 
+const REPOSITORY_PAIR_MANIFEST: &str = r#"---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxTemplate
+metadata:
+  name: acme-platform-agent-red-img-aaaaaaaaaaaa-runner
+  labels:
+    app.kubernetes.io/component: agent-sandbox
+    app.kubernetes.io/instance: acme-platform
+    app.kubernetes.io/managed-by: Helm
+spec:
+  service: true
+---
+apiVersion: extensions.agents.x-k8s.io/v1beta1
+kind: SandboxWarmPool
+metadata:
+  name: acme-platform-agent-red-img-aaaaaaaaaaaa-runner-pool
+  labels:
+    app.kubernetes.io/component: agent-sandbox
+    app.kubernetes.io/instance: acme-platform
+    app.kubernetes.io/managed-by: Helm
+spec:
+  replicas: 0
+  sandboxTemplateRef:
+    name: acme-platform-agent-red-img-aaaaaaaaaaaa-runner
+"#;
+
 const INCOMPLETE_MANIFEST: &str = r#"---
 apiVersion: extensions.agents.x-k8s.io/v1beta1
 kind: SandboxTemplate
@@ -193,6 +219,20 @@ objects = {
         "spec": {"replicas": 0, "sandboxTemplateRef": {"name": "acme-platform-agent-red-runner"}},
     },
 }
+
+if scenario in ("repository-runner-omitted", "repository-runners-complete"):
+    for suffix in ("a" * 12, "b" * 12):
+        name = "acme-platform-agent-red-img-" + suffix + "-runner"
+        objects[name] = {
+            "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+            "kind": "SandboxTemplate", "metadata": metadata(name),
+            "spec": {"service": True},
+        }
+        objects[name + "-pool"] = {
+            "apiVersion": "extensions.agents.x-k8s.io/v1beta1",
+            "kind": "SandboxWarmPool", "metadata": metadata(name + "-pool"),
+            "spec": {"replicas": 0, "sandboxTemplateRef": {"name": name}},
+        }
 
 if scenario == "divergent-live":
     objects["acme-platform-agent-red-runner"]["metadata"]["labels"]["app.kubernetes.io/managed-by"] = "external-controller"
@@ -317,6 +357,22 @@ if tool == "helm":
             print(json.dumps({"agentSandbox": {"deploy": False}}))
         elif scenario == "active-agent-omitted":
             print(json.dumps({"agentSandbox": {"deploy": True, "connectorSecrets": {"red": {"EXAMPLE_SETTING": "placeholder"}}}}))
+        elif scenario in ("repository-runner-omitted", "repository-runners-complete"):
+            def runner(digit):
+                return {
+                    "tools": ["uv"],
+                    "image": "registry.example.com/acme/runner@sha256:" + digit * 64,
+                    "base": "sha256:" + "d" * 64,
+                    "platformDigests": {"linux/amd64": "sha256:" + "e" * 64, "linux/arm64": "sha256:" + "f" * 64},
+                }
+            print(json.dumps({
+                "agentSandbox": {"deploy": True, "runnerImages": {"red": "registry.example.com/acme/agent@sha256:" + "c" * 64}},
+                "factory": {"sandboxEgress": {"red": True}, "bindings": [{"repos": [
+                    {"path": "acme-corp/api", "runner": runner("a")},
+                    {"path": "acme-corp/ui", "runner": runner("a")},
+                    {"path": "acme-corp/tools", "runner": runner("b")},
+                ]}]},
+            }))
         else:
             print("{}")
         raise SystemExit(0)
@@ -495,7 +551,17 @@ impl FakeCluster {
         let github = support::serve(|_req: &support::Request| {
             support::Response::json(200, r#"{"id":1234567,"name":"acme-bot"}"#)
         });
-        fs::write(dir.path().join("pre.yaml"), PRE_MANIFEST).expect("write pre manifest");
+        let pre_manifest = match scenario {
+            "repository-runner-omitted" => {
+                format!("{PRE_MANIFEST}{REPOSITORY_PAIR_MANIFEST}")
+            }
+            "repository-runners-complete" => format!(
+                "{PRE_MANIFEST}{REPOSITORY_PAIR_MANIFEST}{}",
+                REPOSITORY_PAIR_MANIFEST.replace("aaaaaaaaaaaa", "bbbbbbbbbbbb")
+            ),
+            _ => PRE_MANIFEST.to_string(),
+        };
+        fs::write(dir.path().join("pre.yaml"), pre_manifest).expect("write pre manifest");
         fs::write(dir.path().join("dropped.yaml"), DROPPED_MANIFEST)
             .expect("write dropped manifest");
         fs::write(dir.path().join("incomplete.yaml"), INCOMPLETE_MANIFEST)
@@ -517,6 +583,20 @@ impl FakeCluster {
                     || !name.contains("agent-red"))
             {
                 fs::write(dir.path().join(format!("live__{name}")), "").expect("seed live object");
+            }
+        }
+        if matches!(
+            scenario,
+            "repository-runner-omitted" | "repository-runners-complete"
+        ) {
+            for name in [
+                "acme-platform-agent-red-img-aaaaaaaaaaaa-runner",
+                "acme-platform-agent-red-img-aaaaaaaaaaaa-runner-pool",
+                "acme-platform-agent-red-img-bbbbbbbbbbbb-runner",
+                "acme-platform-agent-red-img-bbbbbbbbbbbb-runner-pool",
+            ] {
+                fs::write(dir.path().join(format!("live__{name}")), "")
+                    .expect("seed live repository object");
             }
         }
         Self { dir, github }
@@ -1941,6 +2021,72 @@ fn active_connector_agent_missing_from_the_captured_manifest_refuses_before_muta
     assert!(
         value.get("github_app_configured").is_none(),
         "the refused inventory emitted success JSON: {value}"
+    );
+}
+
+#[test]
+fn repository_runner_missing_from_the_captured_manifest_refuses_before_mutation() {
+    let cluster = FakeCluster::new("repository-runner-omitted");
+    let output = cluster.run("repository-runner-omitted", false);
+    let events = cluster.events();
+    assert!(
+        !output.status.success(),
+        "repository values require both distinct image pairs: {}",
+        combined(&output)
+    );
+    assert!(
+        position(&events, "helm:get-values") < position(&events, "helm:get-manifest:pre"),
+        "repository inventory must come from the captured Helm values: {events:?}"
+    );
+    assert_revisioned_pre_manifest_read(&cluster.raw());
+    assert!(
+        !events.iter().any(|event| event == "helm:upgrade"
+            || event.starts_with("helm:rollback:")
+            || event.starts_with("kubectl:create:")
+            || event == "kubectl:rollout-restart"),
+        "missing repository inventory reached a mutation: {events:?}"
+    );
+    let value = stdout_json(&output);
+    let error = value["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("inventory")
+            && error.contains("acme-platform-agent-red-img-bbbbbbbbbbbb-runner")
+            && error.contains("acme-platform-agent-red-img-bbbbbbbbbbbb-runner-pool"),
+        "the refusal must identify the missing repository pair: {value}"
+    );
+    assert!(
+        value.get("github_app_configured").is_none(),
+        "missing repository inventory emitted success: {value}"
+    );
+}
+
+#[test]
+fn complete_repository_runner_inventory_proceeds_with_the_credential_change() {
+    let cluster = FakeCluster::new("repository-runners-complete");
+    let output = cluster.run("repository-runners-complete", false);
+    let events = cluster.events();
+    assert!(
+        output.status.success(),
+        "complete repository runner inventory must be accepted: {}; events: {events:?}",
+        combined(&output)
+    );
+    assert_eq!(
+        stdout_json(&output),
+        serde_json::json!({"github_app_configured": true})
+    );
+    assert_revisioned_pre_manifest_read(&cluster.raw());
+    assert!(
+        position(&events, "helm:get-manifest:pre") < position(&events, "helm:upgrade")
+            && position(&events, "helm:upgrade") < position(&events, "helm:get-manifest:post")
+            && position(&events, "helm:get-manifest:post")
+                < position(&events, "kubectl:rollout-restart"),
+        "complete repository pairs must be checked before mutation and rollout: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.starts_with("kubectl:create:")),
+        "already-live repository pairs must not be overwritten: {events:?}"
     );
 }
 

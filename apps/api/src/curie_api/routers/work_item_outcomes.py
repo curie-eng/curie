@@ -21,8 +21,10 @@ from ..auth import require_api_key
 from ..code_host_trust import code_host_verify
 from ..config import get_settings
 from ..deps import SessionDep
-from ..forges.hosts import factory_code_host
+from ..forges.errors import Unavailable
+from ..forges.ports import CodeHost
 from ..forges.registry import ForgeRegistry
+from ..forges.trackers import code_host_for_repository, stored_repository
 
 router = APIRouter(
     prefix="/work-items",
@@ -66,19 +68,33 @@ async def get_work_item(
         raise HTTPException(status.HTTP_404_NOT_FOUND, _NOT_FOUND)
     view, item, lineage = loaded
     registry: ForgeRegistry = request.app.state.forges
+    # The code host entry the lineage (or the WorkItem alone) recorded, never
+    # the install's GitHub accessor (#4358 plan D14).
+    repository = stored_repository(
+        settings,
+        kind=(lineage.code_host_kind if lineage is not None else None) or item.code_host_kind,
+        host=(lineage.code_host_host if lineage is not None else None) or item.code_host_host,
+        path=(lineage.repo_full_name if lineage is not None else None) or item.repository_path,
+        project_id=(lineage.repository_project_id if lineage is not None else None)
+        or item.repository_project_id,
+    )
     async with httpx.AsyncClient(verify=code_host_verify(settings)) as client:
-        code_host = (
-            factory_code_host(
-                registry, client, installations=factory_ci.stored_installation(lineage, item)
+        code_host: CodeHost | None
+        try:
+            code_host = code_host_for_repository(
+                registry,
+                client,
+                repository,
+                installations=factory_ci.stored_installation(lineage, item),
             )
-            if registry.github_code_host() is not None
-            else None
-        )
+        except Unavailable:
+            code_host = None
         view.ci = await workitem_outcomes.observe_ci(
             code_host,
             settings,
             lineage,
             item,
+            repository=repository,
         )
     return view
 

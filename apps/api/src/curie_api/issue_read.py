@@ -1,33 +1,32 @@
-"""Read one factory WorkItem's issue for its sandbox (ADR 0187).
+"""Read one factory WorkItem's ticket for its sandbox (ADR 0187, ADR 0197).
 
-The bundle holds no GitHub credential. It presents the execution scoped
-``wir`` capability, and the API reads the WorkItem's issue and its comments
-through the GitHub tracker adapter with the App installation token, minted
-fresh on every read so a run longer than the token's one hour lifetime keeps
-reading. Nothing is parsed, modelled or stored: the title, body and comments
-are returned verbatim.
+The bundle holds no tracker credential. It presents the execution scoped
+``wir`` capability, and the API reads the WorkItem's ticket through its
+tracker's `Tracker.read_ticket`, for every tracker kind: a GitHub issue with
+an App installation token minted fresh on every read, only for the
+installation the WorkItem recorded, so a run longer than the token's one hour
+lifetime keeps reading; a Jira issue with the tracker's own credential.
+Nothing is parsed, modelled or stored: the ticket is returned as the
+tracker's markdown.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 
 import httpx
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
 from .forges.errors import ForgeError
-from .forges.github.comments import static_token
-from .forges.github.tracker import IssueContent
-from .forges.hosts import factory_credentials, factory_tracker
 from .forges.registry import forges_registry
-from .forges.types import GITHUB
-from .github_app import GitHubAppError, GitHubCredentials
+from .forges.trackers import tracker_for_work_item
+from .forges.types import GITHUB, RepositoryRef, TrackerIssueRef
+from .github_app import GitHubAppError
 from .models import MAX_EXECUTION_DEADLINE_SECONDS, ExecutionRequest, WorkItem
 
 ISSUE_READ_TIMEOUT_SECONDS = 20.0
@@ -45,17 +44,16 @@ class IssueReadRefused(RuntimeError):
 
 
 class IssueReadUnavailable(RuntimeError):
-    """GitHub could not answer the read."""
+    """The tracker could not answer the read."""
 
 
 @dataclass(frozen=True)
 class IssueReadAuthority:
     work_item_id: uuid.UUID
     execution_request_id: uuid.UUID
-    repo_full_name: str
-    github_repository_id: int
-    github_installation_id: int
-    issue_number: int
+    issue: TrackerIssueRef
+    repository: RepositoryRef
+    code_host_installation_id: int | None
     started_at: datetime | None
     execution_deadline: datetime | None
 
@@ -82,12 +80,9 @@ async def read_issue_authority(
     if row is None:
         raise IssueReadRefused
     item, execution, now = row
-    # The sandbox read goes through the GitHub tracker; another tracker has no
-    # read path yet, so its execution cannot mint one.
-    if (
-        item.cancelled_at is not None
-        or item.tracker_kind != GITHUB
-        or item.code_host_installation_id is None
+    # A GitHub issue is read only with a token for its recorded installation.
+    if item.cancelled_at is not None or (
+        item.tracker_kind == GITHUB and item.code_host_installation_id is None
     ):
         raise IssueReadRefused
     if running:
@@ -107,10 +102,9 @@ async def read_issue_authority(
     return IssueReadAuthority(
         work_item_id=item.id,
         execution_request_id=execution.id,
-        repo_full_name=item.repository_path,
-        github_repository_id=int(item.tracker_scope_id),
-        github_installation_id=item.code_host_installation_id,
-        issue_number=int(item.tracker_issue_id),
+        issue=item.tracker_issue,
+        repository=item.repository,
+        code_host_installation_id=item.code_host_installation_id,
         started_at=execution.started_at,
         execution_deadline=execution.execution_deadline,
     )
@@ -118,33 +112,24 @@ async def read_issue_authority(
 
 async def read_issue(
     authority: IssueReadAuthority, *, settings: Settings, client: httpx.AsyncClient
-) -> IssueContent:
-    """GET the issue and its comments by repository id, with a fresh App token.
+) -> str:
+    """The WorkItem's ticket as markdown, through its own tracker.
 
-    Addressing the repository by its numeric id keeps a rename or a transfer
-    from redirecting the read to a different repository than the WorkItem's.
+    A GitHub issue is addressed by its repository's numeric id, so a rename or
+    a transfer cannot redirect the read, and its token is minted only for the
+    recorded installation with the provider timeout capped for this read.
     """
 
     try:
-        registry = forges_registry(settings)
-        intake = factory_tracker(registry)
-        # The factory code host's App, with the provider timeout capped for this read.
-        auth = factory_credentials(registry).auth
-        resolver = GitHubCredentials(
-            auth=replace(auth, timeout_s=min(auth.timeout_s, _PROVIDER_TIMEOUT_SECONDS))
+        tracker = tracker_for_work_item(
+            forges_registry(settings),
+            client,
+            authority.issue,
+            authority.repository,
+            authority.code_host_installation_id,
+            timeout_s=_PROVIDER_TIMEOUT_SECONDS,
         )
         async with asyncio.timeout(ISSUE_READ_TIMEOUT_SECONDS):
-            token = await run_in_threadpool(
-                resolver.token_for_verified_installation,
-                authority.repo_full_name,
-                authority.github_installation_id,
-            )
-            tracker = intake.for_repository(
-                client,
-                repo_full_name=authority.repo_full_name,
-                repository_id=authority.github_repository_id,
-                token=static_token(token),
-            )
-            return await tracker.read_issue_content(authority.issue_number)
+            return await tracker.read_ticket(authority.issue)
     except (GitHubAppError, ForgeError, ValueError, TimeoutError):
         raise IssueReadUnavailable from None

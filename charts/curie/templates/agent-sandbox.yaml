@@ -150,6 +150,9 @@ roleRef:
 {{- define "curie.sandboxTemplate" -}}
 {{- $agent := .agent -}}
 {{- $secrets := .secrets -}}
+{{- $runnerImageRef := .image -}}
+{{- $templateName := .templateName -}}
+{{- $poolName := .poolName -}}
 {{- $connectorReservedEnv := dict -}}
 {{- if $agent -}}
 {{- range $name := keys $secrets -}}
@@ -166,14 +169,6 @@ roleRef:
 {{- range $runner.extraEnv }}
 {{- if has .name $sealing }}
 {{- fail (printf "agentSandbox.runner.extraEnv contains %q, a reserved snapshot sealing key: it must reach only the hosted connector, so declare it as a SecretRef (from_secret) on that connector in the bundle, never in the runner environment" .name) }}
-{{- end }}
-{{- end }}
-{{- /* An agent whose bundle layers its own runner image (ADR-0173) renders
-       that digest in every container that would run the platform runner. */}}
-{{- $runnerImageRef := include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) }}
-{{- if $agent }}
-{{- with index (.Values.agentSandbox.runnerImages | default dict) $agent }}
-{{- $runnerImageRef = . }}
 {{- end }}
 {{- end }}
 {{- $bf := $runner.bundleFetch }}
@@ -198,12 +193,6 @@ lane ON by itself.
 */}}
 {{- if not .Values.worker.attachments.enabled }}
 {{- $af = set (deepCopy $af) "enabled" false }}
-{{- end }}
-{{- $templateName := printf "%s-runner" (include "curie.fullname" .) }}
-{{- $poolName := printf "%s-runner-pool" (include "curie.fullname" .) }}
-{{- if $agent }}
-{{- $templateName = printf "%s-agent-%s-runner" (include "curie.fullname" .) $agent }}
-{{- $poolName = printf "%s-agent-%s-runner-pool" (include "curie.fullname" .) $agent }}
 {{- end }}
 ---
 apiVersion: extensions.agents.x-k8s.io/v1beta1
@@ -1036,6 +1025,7 @@ spec:
     name: {{ $templateName }}
 {{- end }}
 {{- end }}
+{{- $repoRunners := include "curie.factory.repoRunnerDescriptors" . | fromJsonArray }}
 {{- if .Values.agentSandbox.deploy }}
 {{- $root := . }}
 {{- $connectorSecrets := .Values.agentSandbox.connectorSecrets | default dict }}
@@ -1063,11 +1053,23 @@ spec:
 {{- fail (printf "agentSandbox.workspaceSizeLimits.%s is set but agentSandbox.runner.workspace.enabled is false, so no workspace volume renders" $agent) }}
 {{- end }}
 {{- end }}
-{{ include "curie.sandboxTemplate" (dict "root" $root) | nindent 0 }}
+{{- $runner := .Values.agentSandbox.runner }}
+{{- $platformImage := include "curie.image" (dict "repository" $runner.image "tag" $runner.tag "digest" $runner.digest "defaultTag" .Chart.AppVersion) }}
+{{- $fullname := include "curie.fullname" . }}
+{{ include "curie.sandboxTemplate" (dict "root" $root "agent" "" "secrets" dict "image" $platformImage "templateName" (printf "%s-runner" $fullname) "poolName" (printf "%s-runner-pool" $fullname)) | nindent 0 }}
 {{- /* A registryEgress agent needs pods labeled curietech.ai/agent=<agent> for its
        registry NetworkPolicy to select, so it gets a per-agent template even
        with no connector secrets (#3083). */}}
 {{- range $agent := include "curie.agentSandboxPoolAgents" $root | fromJsonArray }}
-{{ include "curie.sandboxTemplate" (dict "root" $root "agent" $agent "secrets" (index $connectorSecrets $agent | default dict)) | nindent 0 }}
+{{- $template := printf "%s-agent-%s-runner" $fullname $agent }}
+{{- $image := index ($root.Values.agentSandbox.runnerImages | default dict) $agent | default $platformImage }}
+{{ include "curie.sandboxTemplate" (dict "root" $root "agent" $agent "secrets" (index $connectorSecrets $agent | default dict) "image" $image "templateName" $template "poolName" (printf "%s-pool" $template)) | nindent 0 }}
+{{- end }}
+{{- $seen := dict }}
+{{- range $repoRunners }}
+{{- if not (hasKey $seen .pool) }}
+{{- $_ := set $seen .pool true }}
+{{ include "curie.sandboxTemplate" (dict "root" $root "agent" .agent "secrets" (index $connectorSecrets .agent | default dict) "image" .image "templateName" .template "poolName" .pool) | nindent 0 }}
+{{- end }}
 {{- end }}
 {{- end }}

@@ -165,12 +165,14 @@ instructions still apply. Keep the table current from `plan` through every
 Call report_progress with phase `read_issue`.
 
 Your message is the issue link, for example
-`https://github.com/<owner>/<repo>/issues/<number>`. Read it with the
-`mcp__curie__get_issue` tool (`owner`, `repo`, `issue_number`). The platform
-reads the issue for you and returns its title, body and comments verbatim,
+`https://github.com/<owner>/<repo>/issues/<number>` for a GitHub issue or
+`https://<site>.atlassian.net/browse/<KEY>` for a Jira issue. Read it with the
+`mcp__curie__get_issue` tool, which takes no arguments. The platform reads the
+issue for you, from whichever tracker holds it, and returns the ticket as
+markdown (title, description and comments) in `ticket`, its link in `url`,
 along with this execution's `execution_deadline` and `execution_seconds` for
 the time budget above; it reads only this run's issue. That tool is the only
-GitHub tool this bundle has, and the sandbox holds no GitHub credential; the
+tracker tool this bundle has, and the sandbox holds no tracker credential; the
 repository itself is already checked out at `/workspace`.
 
 If the issue cannot be read (the tool is missing, refused, or returns an
@@ -378,7 +380,9 @@ repository's conventions win. Call `mcp__curie__publish_changes` once, with:
 
 - `title`: a short summary that ends with the issue reference, for example
   `Add inch to centimeter conversion (#12)`.
-- `body`: a short summary of the change, then `Closes #<number>`, then a
+- `body`: a short summary of the change, then, for a GitHub issue,
+  `Closes #<number>` (for any other tracker the platform adds the issue
+  reference), then a
   checklist that maps each acceptance criterion to its evidence, then the
   checks you ran with their results, then the verification table with every
   delegated or blocked check, its cause and the evidence the verification

@@ -19,8 +19,9 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from curie_api.factory_admission import ignored
 from curie_api.forges.github.identity import delivery_uuid
-from curie_api.github_factory import IGNORED, admission_result, ignored
+from curie_api.github_factory import IGNORED, admission_result
 from curie_api.schemas.deployments import WebhookResult
 
 from . import workitem_dispatch
@@ -28,6 +29,7 @@ from .config import Settings
 from .factory_reply_target import feedback_url
 from .forges.hosts import factory_code_host_entry, factory_tracker, github_host
 from .forges.registry import forges_registry
+from .forges.trackers import reply_route
 from .forges.types import GITHUB, PullRequestRef, ReplyTarget
 from .github_factory import lock_issue
 from .github_factory_events import mentions_login
@@ -268,11 +270,14 @@ async def admit_parsed_feedback(
     objective = _objective(feedback, url)
     if len(objective) > _MAX_OBJECTIVE:
         raise FeedbackIgnored("feedback_too_large")
+    kind, address, conversation = reply_route(
+        registry, work_item.tracker_issue, work_item.repository_path
+    )
     facts = Admission(
         agent_id=work_item.agent_id,
-        kind="github",
-        address=work_item.repository_path,
-        reply_conversation_id=f"issue-{work_item.tracker_issue_id}",
+        kind=kind,
+        address=address,
+        reply_conversation_id=conversation,
         issue=work_item.tracker_issue,
         repository=work_item.repository,
         code_host_installation_id=work_item.code_host_installation_id,

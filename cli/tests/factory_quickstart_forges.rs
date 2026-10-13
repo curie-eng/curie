@@ -39,6 +39,7 @@ fn base() -> PlanInput {
         chart: "charts/curie".into(),
         credential_in_env: true,
         release_has_real_model: false,
+        chart_explicit: false,
         interactive: true,
         release_at_target: false,
         agent: DEFAULT_AGENT.into(),
@@ -48,6 +49,7 @@ fn base() -> PlanInput {
         recorded: None,
         bindings: Vec::new(),
         runner_image: None,
+        jira: None,
     }
 }
 
@@ -226,13 +228,13 @@ fn factory_quickstart_reserved_code_host_kind_is_not_installed() {
 
 #[test]
 fn factory_quickstart_reserved_tracker_kind_is_not_installed() {
-    for kind in ["gitlab", "jira-cloud"] {
-        let run = quickstart(&["--tracker", kind]);
-        let text = run.all();
-        assert_ne!(run.code, 0, "{kind}: {text}");
-        assert!(text.contains("not installed"), "{kind}: {text}");
-        assert!(text.contains(kind), "{kind}: {text}");
-    }
+    // #4358 installs jira-cloud; its refusals live in factory_quickstart_jira.rs.
+    let kind = "gitlab";
+    let run = quickstart(&["--tracker", kind]);
+    let text = run.all();
+    assert_ne!(run.code, 0, "{kind}: {text}");
+    assert!(text.contains("not installed"), "{kind}: {text}");
+    assert!(text.contains(kind), "{kind}: {text}");
 }
 
 #[test]

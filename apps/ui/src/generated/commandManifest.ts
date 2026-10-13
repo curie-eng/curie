@@ -5387,10 +5387,22 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`",
+              "help": "Allow this GitHub repository (`owner/repo` or `owner/*`). Repeatable. Sets `api.githubRepoAllowlist`. With --app-id, pass at least one --repo or use --all-installed-repos to allow the whole installation",
               "id": "repos",
               "long": "repo",
               "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Allow every repository the GitHub App is installed on. Requires --app-id and cannot be combined with --repo",
+              "id": "all_installed_repos",
+              "long": "all-installed-repos",
+              "positional": false,
+              "possible_values": [
+                "true",
+                "false"
+              ],
               "required": false
             },
             {
@@ -5447,7 +5459,7 @@ export const commandManifest = {
             },
             {
               "global": false,
-              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention, allowlist, and label default from the App",
+              "help": "The factory GitHub App's numeric App ID. Pair with --private-key-file. Without both, and with no App recorded on the release, the command prints the App registration link and applies nothing. Mention and label default from the App. Choose the allowlist with --repo (repeatable) or --all-installed-repos",
               "id": "app_id",
               "long": "app-id",
               "positional": false,
@@ -9406,7 +9418,7 @@ export const commandManifest = {
                 "github"
               ],
               "global": false,
-              "help": "Tracker the factory takes issues from. Only github is installed in this build",
+              "help": "Tracker the factory takes issues from: github, or jira-cloud with --code-host github",
               "id": "tracker",
               "long": "tracker",
               "positional": false,
@@ -9446,6 +9458,30 @@ export const commandManifest = {
               "help": "Account whose reviews a non-GitHub forge counts (repeatable). Refused for github",
               "id": "review_accounts",
               "long": "review-account",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Email of the account a Jira token authenticates as. Refused for github",
+              "id": "forge_username",
+              "long": "forge-username",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Jira accountId allowed to start work (repeatable). Refused for github",
+              "id": "start_accounts",
+              "long": "start-account",
+              "positional": false,
+              "required": false
+            },
+            {
+              "global": false,
+              "help": "Jira groupId whose members may start work. Refused for github",
+              "id": "start_group",
+              "long": "start-group",
               "positional": false,
               "required": false
             }
@@ -9844,7 +9880,15 @@ export const commandManifest = {
         },
         {
           "global": false,
-          "help": "Push every declared platform (or the `--platform` subset) to this registry (e.g. ghcr.io/acme-corp)",
+          "help": "Build a repository runner image from this input file (YAML or JSON; requires `--registry`). Needs a docker-container builder (`docker buildx use` or `BUILDX_BUILDER`) for the two-platform push",
+          "id": "repo_runner",
+          "long": "repo-runner",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Push every declared platform (or the `--platform` subset) to this registry (e.g. ghcr.io/acme-corp). With `--repo-runner`, the registry the repository runner image is pushed to",
           "id": "registry",
           "long": "registry",
           "positional": false,
@@ -9852,7 +9896,7 @@ export const commandManifest = {
         },
         {
           "global": false,
-          "help": "The platform runner a declared runner layer builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
+          "help": "The platform runner a declared runner layer or a repository runner builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
           "id": "runner_image",
           "long": "runner-image",
           "positional": false,
@@ -9880,7 +9924,7 @@ export const commandManifest = {
         }
       ],
       "hidden": false,
-      "long_about": "Build the runner image, or an agent bundle's declared connectors.\n\nWith no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root (source checkout only; a release binary pulls the pinned runner image from GHCR automatically and never needs this).\n\nWith `--plugin-dir <PATH>` it builds every connector that bundle's `connectors.yaml` declares from source and writes `connectors.lock.yaml` beside it. With `--registry <REF>` it builds every declared platform, pushes, and records the registry manifest digest, which is what a cluster deploy requires. Without `--registry` it builds the host platform only into the local Docker daemon and records the local image id, which is usable at the skill and local tiers and refused at cluster.",
+      "long_about": "Build the runner image, or an agent bundle's declared connectors.\n\nWith no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root (source checkout only; a release binary pulls the pinned runner image from GHCR automatically and never needs this).\n\nWith `--plugin-dir <PATH>` it builds every connector that bundle's `connectors.yaml` declares from source and writes `connectors.lock.yaml` beside it. With `--registry <REF>` it builds every declared platform, pushes, and records the registry manifest digest, which is what a cluster deploy requires. Without `--registry` it builds the host platform only into the local Docker daemon and records the local image id, which is usable at the skill and local tiers and refused at cluster.\n\nWith `--repo-runner <PATH> --registry <REF>` it builds a repository runner image (ADR 0216) from a YAML or JSON input file naming catalog `tools`, an optional `dockerfile` beside the file built on `${CURIE_RUNNER_IMAGE}`, and extra `probes`. Both linux/amd64 and linux/arm64 are built in one buildx bake, every tool is probed inside the image (a failing probe fails the build), the probe manifest lands at /etc/curie/tool-manifest.json, and the image is pushed to `<REF>/curie-repo-runner`. It prints the `runner` block to paste under `factory.bindings[].repos[].runner`. The multi-platform push needs a docker-container builder: select one with `docker buildx use` or `BUILDX_BUILDER`.",
       "name": "build"
     },
     {

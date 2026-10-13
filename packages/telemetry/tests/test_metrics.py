@@ -49,6 +49,7 @@ _RECONCILER_STEPS = [
     "settle_overdue_cancellations",
     "readmit_pending",
     "reconcile_missed_labels",
+    "poll_trackers",
     "sync_status_comments",
     "redispatch_lapsed_acquisitions",
     "publish_execute_wakes",
@@ -677,7 +678,7 @@ def test_supervised_restart_metric_declares_closed_operation_domain() -> None:
     assert definition["cardinality_bound"] == 16
 
 
-def test_reconciler_step_metrics_declare_only_the_api_and_eleven_steps() -> None:
+def test_reconciler_step_metrics_declare_only_the_api_and_twelve_steps() -> None:
     manifest = _read(_MANIFEST)["metrics"]
     for name, instrument_type, monotonic in (
         (_RECONCILER_FAILURE_METRIC, "counter", True),
@@ -690,7 +691,7 @@ def test_reconciler_step_metrics_declare_only_the_api_and_eleven_steps() -> None
             "service.name": ["curie-api"],
             "step": _RECONCILER_STEPS,
         }
-        assert definition["cardinality_bound"] == 11
+        assert definition["cardinality_bound"] == 12
 
 
 def test_reconciler_step_metrics_export_failures_and_a_resettable_gauge(

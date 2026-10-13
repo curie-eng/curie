@@ -25,6 +25,9 @@
 {{- range $agent, $ref := .Values.agentSandbox.runnerImages | default dict }}
 {{- $imageSources = append $imageSources (dict "key" (printf "agentSandbox.runnerImages.%s" $agent) "ref" (toString $ref)) }}
 {{- end }}
+{{- range include "curie.factory.repoRunnerDescriptors" . | fromJsonArray }}
+{{- $imageSources = append $imageSources (dict "key" (printf "%s.image" .source) "ref" .image) }}
+{{- end }}
 {{- if $runner.bundleFetch.enabled }}
 {{- $imageSources = append $imageSources (dict "key" "agentSandbox.runner.bundleFetch.fetchImage" "ref" (toString $runner.bundleFetch.fetchImage)) }}
 {{- $imageSources = append $imageSources (dict "key" "agentSandbox.runner.bundleFetch.extractImage" "ref" (toString $runner.bundleFetch.extractImage)) }}

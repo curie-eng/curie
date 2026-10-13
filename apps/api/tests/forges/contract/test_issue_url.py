@@ -22,7 +22,7 @@ def test_an_issue_link_names_the_issue_on_the_tracker_host(harness: AdapterHarne
 
     assert url.startswith("https://")
     assert harness.tracker.host in url
-    assert url.endswith(f"/issues/{issue.issue_id}")
+    assert url.endswith(harness.issue_link_suffix(issue))
     assert harness.tracker.issue_url(issue) == url
     assert harness.write_count() == writes
 

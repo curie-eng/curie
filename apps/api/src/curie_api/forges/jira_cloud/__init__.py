@@ -1,5 +1,10 @@
-"""Jira Cloud as a tracker: reserved, not installed in this build (#4397)."""
+"""Jira Cloud as a tracker (ADR 0197, #4358).
 
-from curie_api.forges.registry import register_not_installed
+A tracker-only kind: it pairs with any code host and admits by its binding's
+account allowlist or group. It has no code host side.
+"""
 
-register_not_installed("jira_cloud")
+from curie_api.forges.jira_cloud.connection import JiraTrackerConnection
+from curie_api.forges.registry import register
+
+register("jira_cloud", tracker=JiraTrackerConnection, code_host=None)

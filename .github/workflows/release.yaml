@@ -7,10 +7,12 @@ name: Release images and binaries
 #                               strip, and attach the curie CLI binaries to a
 #                               GitHub Release with generated notes.
 #
-# IMAGE SCOPE NOTE: all five first-party images are built here -- the runner
-# (runner/Dockerfile) plus the four app services. Every image builds from the
-# repo root: the Python images resolve the uv workspace, and the UI resolves the
-# frozen ACI generated TS its @aci alias points at (outside apps/ui).
+# IMAGE SCOPE NOTE: the first-party images are built here -- the runner
+# (runner/Dockerfile), the app services, the example connectors, and the
+# per-run Docker daemon (apps/docker-daemon). The runner and app services build
+# from the repo root: the Python images resolve the uv workspace, and the UI
+# resolves the frozen ACI generated TS its @aci alias points at (outside
+# apps/ui). The connectors and the Docker daemon build from their own directory.
 #
 # MULTI-ARCH: every published image is a linux/amd64 + linux/arm64 manifest.
 # Each arch builds on its own native GitHub-hosted runner (arm64 runners are free
@@ -114,7 +116,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, github-activity-github]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, github-activity-github, docker-daemon]
         platform: [linux/amd64, linux/arm64]
         include:
           - name: runner
@@ -149,6 +151,11 @@ jobs:
           - name: github-activity-github
             context: examples/github-activity/connectors/github
             dockerfile: examples/github-activity/connectors/github/Dockerfile
+          # The per-run Docker daemon a Docker-enabled factory run reaches: dind
+          # with the curie-authz authorization plugin in front (ADR 0217).
+          - name: docker-daemon
+            context: apps/docker-daemon
+            dockerfile: apps/docker-daemon/Dockerfile
           - platform: linux/amd64
             runner: ubuntu-latest
             arch: amd64
@@ -271,7 +278,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, github-activity-github]
+        name: [runner, api, dispatcher, mail-adapter, worker, ui, sre-bot-tempo, sre-bot-self-upgrade, github-activity-github, docker-daemon]
     steps:
       - name: Download digests
         id: download_digests

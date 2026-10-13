@@ -2,8 +2,9 @@
 
 The kernel holds ONE ``ReplySink`` and never asks what a channel can do (ADR-0096
 D3). Adapter selection lives here, below the seam: ``ReplySinkRouter`` picks
-``SlackReplyAdapter`` for ``kind == "slack"``, ``GitHubReplySink`` for
-``kind == "github"``, and ``HttpReplyAdapter`` for everything else. A ``kind``
+``SlackReplyAdapter`` for ``kind == "slack"``, ``TrackerReplySink`` for each
+tracker kind in ``TRACKER_KINDS``, and ``HttpReplyAdapter`` for everything
+else. A ``kind``
 branch reappearing in ``kernel.py`` is the seam leaking back upward.
 
 ``TargetRoute`` is a worker-local kwarg, never a wire field: a published event
@@ -47,7 +48,8 @@ logger = logging.getLogger(__name__)
 ADAPTER_SECRET_HEADER = "X-Curie-Adapter-Secret"
 
 SLACK_KIND = "slack"
-GITHUB_KIND = "github"
+# Tracker surface kinds: the platform's tracker writer answers them (#4358 plan D9).
+TRACKER_KINDS = ("github", "gitlab", "jira")
 
 # This platform-owned adapter is selected by the disconnected ``cluster
 # message`` reply handle. It is deliberately not configurable: allowing an
@@ -418,15 +420,16 @@ class HttpReplyAdapter:
         return ReplyAck(ref=_ref_from(payload))
 
 
-class GitHubReplySink:
-    """Acks every GitHub-bound event locally and makes no network call.
+class TrackerReplySink:
+    """Acks every tracker-bound event locally and makes no network call.
 
-    A factory turn bound to a GitHub repository answers on GitHub only through
-    the platform's one GitHub writer -- the api factory notice / publication
-    path (#2924/#2798). Streamed model text is therefore acknowledged and not
-    posted. That keeps exactly one GitHub response per request and never
+    A factory turn bound to a tracker surface (a GitHub or GitLab repository, a
+    Jira binding) answers on its tracker only through the platform's one
+    tracker writer -- the api factory notice / publication path
+    (#2924/#2798, #4358). Streamed model text is therefore acknowledged and not
+    posted. That keeps exactly one tracker response per request and never
     fabricates an endpoint. It also keeps the fail-closed rule for every other
-    kind: only ``kind == "github"`` is routed here.
+    kind: only the ``TRACKER_KINDS`` are routed here.
     """
 
     async def emit(
@@ -711,7 +714,7 @@ def build_reply_sink(
                 base_url=config.slack_api_base_url or None,
                 trusted_origins=config.slack_trusted_origins,
             ),
-            GITHUB_KIND: GitHubReplySink(),
+            **{kind: TrackerReplySink() for kind in TRACKER_KINDS},
         },
         default=HttpReplyAdapter(config.adapter_credentials),
         cluster_message=_ClusterMessageReplyAdapter(

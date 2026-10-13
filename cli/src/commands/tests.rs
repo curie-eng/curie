@@ -371,6 +371,56 @@ fn recorded_query<'a>(
 }
 
 #[test]
+fn remote_skill_refuses_hosted_connector_secret_files_as_a_usage_error() {
+    for source in [
+        "image: ghcr.io/example/acme-connector:1",
+        "build:\n      context: connectors/acme\n      platforms: [linux/amd64]",
+    ] {
+        let decl = crate::connector_build::parse_connectors(&format!(
+            "connectors:\n  acme-connector:\n    {source}\n    secret_files:\n      ACME_API_TOKEN: /run/secrets/acme-token\n"
+        ))
+        .expect("a hosted connector with secret files is a valid declaration");
+        let err =
+            super::skill::refuse_remote_connector_secret_files(&decl, Some("docker.example.com"))
+                .expect_err("remote skill startup must refuse client-side secret file binds");
+        assert_eq!(crate::exit::classify(&err).0, crate::exit::ExitClass::Usage);
+        let message = err.to_string();
+        for expected in ["acme-connector", "secret_files", "DOCKER_PUBLISHED_HOST"] {
+            assert!(message.contains(expected), "{message}");
+        }
+        assert!(
+            super::skill::refuse_remote_connector_secret_files(&decl, None).is_ok(),
+            "the same declaration must remain usable with local Docker"
+        );
+    }
+}
+
+#[test]
+fn remote_skill_accepts_hosted_connector_environment_secrets() {
+    let decl = crate::connector_build::parse_connectors(
+        "connectors:\n  acme-connector:\n    image: ghcr.io/example/acme-connector:1\n    env:\n      API_URL: https://api.example.com\n    secrets:\n      - ACME_API_TOKEN\n",
+    )
+    .expect("an env-only hosted connector is a valid declaration");
+    super::skill::refuse_remote_connector_secret_files(&decl, Some("docker.example.com"))
+        .expect("remote Docker must continue to support connector environment secrets");
+}
+
+#[test]
+fn remote_skill_accepts_secret_files_for_connectors_it_does_not_host() {
+    for source in [
+        "url: https://mcp.example.com/sse",
+        "image: ghcr.io/example/acme-connector:1\n    unhosted_url: https://mcp.example.com/sse",
+    ] {
+        let decl = crate::connector_build::parse_connectors(&format!(
+            "connectors:\n  acme-connector:\n    {source}\n    secret_files:\n      ACME_API_TOKEN: /run/secrets/acme-token\n"
+        ))
+        .expect("an existing connector endpoint is a valid declaration");
+        super::skill::refuse_remote_connector_secret_files(&decl, Some("docker.example.com"))
+            .expect("a connector at an existing URL does not require a secret file mount");
+    }
+}
+
+#[test]
 fn replace_clears_a_stale_record_for_the_very_container_it_replaces() {
     // A bundle holding both a stale runner.json and a live container of that
     // name was unrecoverable with --replace: the record refused the boot

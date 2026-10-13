@@ -1,0 +1,143 @@
+{
+  "errors": [
+    {
+      "context": null,
+      "message": "You are attempting to modify a pull request based on out-of-date information.",
+      "exceptionName": "com.atlassian.bitbucket.pull.PullRequestOutOfDateException",
+      "expectedVersion": 0,
+      "pullRequest": {
+        "id": 1,
+        "version": 0,
+        "title": "Demo change",
+        "description": "Closes FAC-1",
+        "state": "OPEN",
+        "open": true,
+        "closed": false,
+        "draft": false,
+        "createdDate": 1760000001000,
+        "updatedDate": 1760000001000,
+        "fromRef": {
+          "id": "refs/heads/curie/demo-change",
+          "displayId": "curie/demo-change",
+          "latestCommit": "7a3f0c9e1d2b4a5f6e7d8c9b0a1f2e3d4c5b6a79",
+          "type": "BRANCH",
+          "repository": {
+            "slug": "demo",
+            "id": 1,
+            "name": "demo",
+            "hierarchyId": "0a1b2c3d4e5f6a7b8c9d",
+            "scmId": "git",
+            "state": "AVAILABLE",
+            "statusMessage": "Available",
+            "forkable": true,
+            "project": {
+              "key": "FAC",
+              "id": 1,
+              "name": "Factory",
+              "public": false,
+              "type": "NORMAL",
+              "links": {
+                "self": [
+                  {
+                    "href": "https://bbdc.example.invalid/projects/FAC"
+                  }
+                ]
+              }
+            },
+            "public": false,
+            "archived": false,
+            "links": {
+              "clone": [
+                {
+                  "href": "https://bbdc.example.invalid/scm/fac/demo.git",
+                  "name": "http"
+                }
+              ],
+              "self": [
+                {
+                  "href": "https://bbdc.example.invalid/projects/FAC/repos/demo/browse"
+                }
+              ]
+            }
+          }
+        },
+        "toRef": {
+          "id": "refs/heads/main",
+          "displayId": "main",
+          "latestCommit": "1f2e3d4c5b6a79807a3f0c9e1d2b4a5f6e7d8c9b",
+          "type": "BRANCH",
+          "repository": {
+            "slug": "demo",
+            "id": 1,
+            "name": "demo",
+            "hierarchyId": "0a1b2c3d4e5f6a7b8c9d",
+            "scmId": "git",
+            "state": "AVAILABLE",
+            "statusMessage": "Available",
+            "forkable": true,
+            "project": {
+              "key": "FAC",
+              "id": 1,
+              "name": "Factory",
+              "public": false,
+              "type": "NORMAL",
+              "links": {
+                "self": [
+                  {
+                    "href": "https://bbdc.example.invalid/projects/FAC"
+                  }
+                ]
+              }
+            },
+            "public": false,
+            "archived": false,
+            "links": {
+              "clone": [
+                {
+                  "href": "https://bbdc.example.invalid/scm/fac/demo.git",
+                  "name": "http"
+                }
+              ],
+              "self": [
+                {
+                  "href": "https://bbdc.example.invalid/projects/FAC/repos/demo/browse"
+                }
+              ]
+            }
+          }
+        },
+        "locked": false,
+        "author": {
+          "user": {
+            "name": "curie-factory-bot",
+            "emailAddress": "curie-factory-bot@example.invalid",
+            "active": true,
+            "displayName": "placeholder-user-101",
+            "id": 101,
+            "slug": "curie-factory-bot",
+            "type": "SERVICE",
+            "links": {
+              "self": [
+                {
+                  "href": "https://bbdc.example.invalid/users/curie-factory-bot"
+                }
+              ]
+            }
+          },
+          "role": "AUTHOR",
+          "approved": false,
+          "status": "UNAPPROVED"
+        },
+        "reviewers": [],
+        "participants": [],
+        "links": {
+          "self": [
+            {
+              "href": "https://bbdc.example.invalid/projects/FAC/repos/demo/pull-requests/1"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

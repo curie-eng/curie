@@ -124,6 +124,19 @@ sandbox claim carried CURIE_REPO_CA_BUNDLE, the publication Job mounted
 and exactly one pull request, the stub saw no unsupported request, and no
 log shows a TLS verification failure.
 
+`repo-runner` (repo_runner.py) installs the operator's repository bindings in
+its own k8 namespace under release `factory-tools`. It uses a local scripted
+Messages endpoint that requests the actual image tool manifest, then drives X
+and Y on the same thread and both refusal faults on fresh threads. Set
+CURIE_FACTORY_REPO_RUNNER_PLAN to the JSON plan documented in that module and
+CURIE_LOCAL_STUB_HOST to an IPv4 reachable from k8. The scenario uses the
+ordinary GitHub fixture/App settings and refuses model credentials or an
+external model URL. Live acceptance is deferred to the w1 runtime wave: the
+current sticky repository selection produces workspace.selection_conflict,
+which fails the scenario. Synthetic observation samples are only judge tests.
+`curie dev factory-e2e judge-repo-runner --observation <file>` runs the offline
+judge with no credentials or cluster contact.
+
 The App, fixture repository, mention author and model credentials come only
 from operator files or environment variables; nothing here names a real one.
 Standard library only, so it runs from a bare source checkout.
@@ -384,8 +397,10 @@ SCENARIOS: dict[str, ScenarioDriver | None] = {
     "forge-loop": None,
     "github-loop": None,
     "tls-code-host": None,  # bound at the bottom from tls_code_host.py
+    "repo-runner": None,  # bound at the bottom from repo_runner.py
 }
 SCENARIO_NAMES = tuple(SCENARIOS)
+WHOLE_FLOW_SCENARIOS = frozenset({"tls-code-host", "repo-runner"})
 
 
 def resolve_scenario(name: str) -> ScenarioDriver:
@@ -410,7 +425,9 @@ def scenario_opens_seed_issue(name: str | None) -> bool:
     through its forge driver.
     """
 
-    return name != "evaluation" and name not in LOOP_SCENARIOS
+    return (
+        name != "evaluation" and name not in LOOP_SCENARIOS and name not in WHOLE_FLOW_SCENARIOS
+    )
 
 
 # --------------------------------------------------------------------------
@@ -2049,6 +2066,7 @@ class Preflight:
         self.repo_root = repo_root
         self.candidate = candidate
         self.namespace = namespace
+        self.release = RELEASE
         self.evidence_path = evidence_path
         self.admission_timeout = admission_timeout
         self.teardown = Teardown()
@@ -2066,7 +2084,7 @@ class Preflight:
             "candidate_image_mode": candidate_images,
             "kube_context": config.kube_context,
             "namespace": namespace,
-            "release": RELEASE,
+            "release": self.release,
             "run_id": "",
             "started_at": dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),
             "steps": [],
@@ -2119,7 +2137,7 @@ class Preflight:
                 self.namespace,
                 "exec",
                 "-i",
-                f"statefulset/{RELEASE}-postgres",
+                f"statefulset/{self.release}-postgres",
                 "--",
                 "sh",
                 "-c",
@@ -2473,12 +2491,15 @@ class Preflight:
         # applied it, the client lost the answer) is still reconciled, and the
         # run annotation keeps the undo from touching anyone else's namespace.
         self.teardown.push("delete namespaces", self.delete_namespaces)
+        labels = dict([OWNER_LABEL.split("=", 1)])
+        if self.scenario_name == "repo-runner":
+            labels["owner"] = "factory-tools"
         manifest = {
             "apiVersion": "v1",
             "kind": "Namespace",
             "metadata": {
                 "name": self.namespace,
-                "labels": dict([OWNER_LABEL.split("=", 1)]),
+                "labels": labels,
                 "annotations": {
                     RUN_ANNOTATION: self.run_id,
                     HOLDER_ANNOTATION: f"{socket.gethostname()}:{os.getpid()}",
@@ -2492,7 +2513,7 @@ class Preflight:
         self.step("namespace created", namespace=self.namespace)
 
     def publication_namespace(self) -> str:
-        return f"{self.namespace}-{RELEASE}-publication"
+        return f"{self.namespace}-{self.release}-publication"
 
     def _owned(self, name: str) -> bool:
         raw = self.kubectl("get", "namespace", name, "--ignore-not-found", "-o", "json")
@@ -2549,7 +2570,7 @@ class Preflight:
                 "--kube-context",
                 self.config.kube_context,
                 "uninstall",
-                RELEASE,
+                self.release,
                 "-n",
                 name,
                 "--no-hooks",
@@ -2567,7 +2588,7 @@ class Preflight:
                 f"{uninstall.stderr.strip()[-500:]}"
             )
         names = [name]
-        publication = f"{name}-{RELEASE}-publication"
+        publication = f"{name}-{self.release}-publication"
         raw = self.kubectl("get", "namespace", publication, "--ignore-not-found", "-o", "json")
         if raw.strip():
             annotations = json.loads(raw)["metadata"].get("annotations") or {}
@@ -2599,7 +2620,7 @@ class Preflight:
                     "--kube-context",
                     self.config.kube_context,
                     "uninstall",
-                    RELEASE,
+                    self.release,
                     "-n",
                     self.namespace,
                     "--no-hooks",
@@ -2737,7 +2758,7 @@ class Preflight:
                 "--kube-context",
                 self.config.kube_context,
                 "install",
-                RELEASE,
+                self.release,
                 str(chart),
                 "-n",
                 self.namespace,
@@ -2797,7 +2818,7 @@ class Preflight:
                 "-n",
                 self.namespace,
                 "port-forward",
-                f"svc/{RELEASE}-api",
+                f"svc/{self.release}-api",
                 f"{port}:8000",
                 "--address",
                 "127.0.0.1",
@@ -2818,7 +2839,9 @@ class Preflight:
 
         _wait("the api through port-forward", 120, healthy)
         secret = json.loads(
-            self.kubectl("-n", self.namespace, "get", "secret", f"{RELEASE}-secrets", "-o", "json")
+            self.kubectl(
+                "-n", self.namespace, "get", "secret", f"{self.release}-secrets", "-o", "json"
+            )
         )
         data = secret["data"]
         self.api_key = base64.b64decode(data["apiKey"]).decode()
@@ -2991,7 +3014,9 @@ class Preflight:
             self.issue_token = token
             self._issue_token_minted = time.time()
         secrets = [token or None, self.api_key, self.config.model_api_key, self.worker_token]
-        common = ["--namespace", self.namespace, "--release", RELEASE, "--api-url", self.api_url]
+        common = [
+            "--namespace", self.namespace, "--release", self.release, "--api-url", self.api_url
+        ]
         log("curie cluster deploy (the default dark-factory bundle)")
         self._curie(
             [
@@ -3338,7 +3363,7 @@ class Preflight:
         run(
             helm_upgrade_command(
                 context=self.config.kube_context,
-                release=RELEASE,
+                release=self.release,
                 chart=str(self.chart_dir),
                 namespace=self.namespace,
                 values_file=str(values_file),
@@ -3366,7 +3391,7 @@ class Preflight:
         it, deploy the bundle again; that is what creates the pool.
         """
 
-        name = agent_warm_pool_name(RELEASE, FACTORY_AGENT)
+        name = agent_warm_pool_name(self.release, FACTORY_AGENT)
         if self._pool_exists(name):
             return
         log(f"sandbox warm pool {name} is missing; deploying the bundle again")
@@ -3643,11 +3668,16 @@ class Preflight:
         return self._loop_driver
 
     def run(self, scenario: ScenarioDriver | None) -> None:
-        if scenario is not None and self.scenario_name == "tls-code-host":
-            # The stub code host owns its whole flow (tls_code_host.py): no App,
-            # tunnel, webhook or fixture repository on real GitHub is touched.
+        if scenario is not None and self.scenario_name in WHOLE_FLOW_SCENARIOS:
+            # Each whole-flow driver owns setup and observation in this teardown.
             self.evidence["scenario"] = scenario(self)
             return
+        # A loop scenario resets and reads its fixture only through its forge
+        # driver; every other scenario uses the GitHub fixture directly. Built
+        # first, so a driver missing its own inputs fails before any install.
+        driver = self.loop_driver() if self.scenario_name in LOOP_SCENARIOS else None
+        entry = FORGES.get(self.evidence.get("forge") or "") if driver is not None else None
+        setup = entry.setup if entry is not None else None
         self.check_tools()
         self._lock(f"app-{self.config.app_id}", "this App and its fixture repository")
         self._lock(f"context-{self.config.kube_context}", "this kube context")
@@ -3659,20 +3689,25 @@ class Preflight:
         self.create_namespace()
         self.install()
         self.port_forward()
-        self.bind_agent()
-        # A loop scenario resets and reads its fixture only through its forge
-        # driver; every other scenario uses the GitHub fixture directly.
-        driver = self.loop_driver() if self.scenario_name in LOOP_SCENARIOS else None
+        if setup is None:
+            self.bind_agent()
         reset = driver.reset_fixture if driver is not None else self.reset_fixture
         # Reset BEFORE the webhook points here, so the closures stay off the
         # install; the after-reset is pushed now so it runs once the webhook
         # is already restored.
         self.step("fixture reset before", **reset())
         self.teardown.push("reset fixture repository", reset)
+        # Pushed before the driver creates anything, so they run on every exit.
+        for name, step in driver.teardowns() if driver is not None else ():
+            self.teardown.push(name, step)
         self.ensure_label()
         self.tunnel()
         self.point_card_at_tunnel()
         self.repoint_webhook()
+        if setup is not None:
+            # After the card upgrade: that upgrade rewrites factory.trackers
+            # whole, which would drop a tracker the setup writes.
+            setup(self)
         if scenario is not None:
             self.record_baseline(
                 driver.default_branch_head if driver is not None else self.default_branch_head
@@ -3753,7 +3788,7 @@ class Preflight:
             "--namespace",
             self.namespace,
             "--release",
-            RELEASE,
+            self.release,
             "--api-url",
             self.api_url,
         ]
@@ -3841,7 +3876,7 @@ class Preflight:
         return {
             "kube_context": self.config.kube_context,
             "namespace": self.namespace,
-            "release": RELEASE,
+            "release": self.release,
             "api_url": self.api_url,
             "tunnel_url": self.tunnel_url,
             "webhook_url": f"{self.tunnel_url}/github/webhook" if self.tunnel_url else "",
@@ -5484,7 +5519,7 @@ def _doctor_claims_line(p: Preflight) -> str | None:
         "--namespace",
         p.namespace,
         "--release",
-        RELEASE,
+        p.release,
     ]
     env = {
         **os.environ,
@@ -5507,7 +5542,7 @@ def _doctor_claims_line(p: Preflight) -> str | None:
 def _helm_popen(p: Preflight, values_file: Path, timeout: str) -> subprocess.Popen[str]:
     argv = helm_upgrade_command(
         context=p.config.kube_context,
-        release=RELEASE,
+        release=p.release,
         chart=str(p.chart_dir),
         namespace=p.namespace,
         values_file=str(values_file),
@@ -5670,7 +5705,7 @@ def quiesce(p: Preflight) -> dict[str, Any]:
         obs["path_a_drain_job_active_after_cancel"] = bool(
             job and int((job.get("status") or {}).get("active") or 0) > 0
         )
-        job_name = ((job or {}).get("metadata") or {}).get("name") or f"{RELEASE}-upgrade-drain"
+        job_name = ((job or {}).get("metadata") or {}).get("name") or f"{p.release}-upgrade-drain"
         obs["doctor_worker_claims_line"] = _doctor_claims_line(p)
         cancelled_at = time.time()
 
@@ -5816,11 +5851,16 @@ DEFAULT_LOOP_REVIEW_TEXT = (
 
 @dataclasses.dataclass(frozen=True)
 class ForgeEntry:
-    """One forge the loop can drive: its driver and whether that driver is written."""
+    """One forge the loop can drive: its driver and whether that driver is written.
+
+    ``setup`` binds the factory agent for this forge in place of
+    ``Preflight.bind_agent`` (the GitHub binding); None keeps bind_agent.
+    """
 
     name: str
     driver: Callable[[Preflight], ForgeDriver]
     installed: bool
+    setup: Callable[[Preflight], None] | None = None
 
 
 # Populated by the entry modules in tools/factory-e2e/forges/, one file per
@@ -6020,6 +6060,7 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
 
     obs = _new_obs(p) if p.issue_number else {"cli": [], "cli_failures": []}
     obs["forge"] = driver.forge
+    obs["pairing"] = driver.pairing
     if not p.issue_number:
         title, body = p.issue_spec or DEFAULT_LOOP_ISSUE
         since = time.time()
@@ -6027,6 +6068,7 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
         driver.open_and_label_ticket(title, body, since)
         obs.update(_new_obs(p))
         obs["forge"] = driver.forge
+        obs["pairing"] = driver.pairing
     work_item_id = str(obs["work_item_id"])
     # The merge moves the default branch; the driver puts it back on teardown.
     driver.pin_fixture_base()
@@ -6034,7 +6076,9 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
     log("loop: waiting for the labelled run to open a pull request")
     change = driver.await_change(work_item_id)
     if change is None:
-        return _finish(p, obs, judge_github_loop(obs))
+        obs["tracker"] = driver.tracker_evidence(None, work_item_id)
+        _timeline(obs, "tracker evidence", **obs["tracker"])
+        return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
     obs["change_number"] = change.number
     obs["change_url"] = change.url
     head, commits = driver.change_head(change)
@@ -6111,8 +6155,10 @@ def run_loop(p: Preflight, driver: ForgeDriver) -> dict[str, Any]:
         obs["cli_failures"].append(f"after merge: work-items exited {exit_code}, expected 0")
     obs["change_numbers"] = driver.changes_opened()
     _timeline(obs, "merge observed", work_item=obs["work_item_pr_status"])
+    obs["tracker"] = driver.tracker_evidence(change, work_item_id)
+    _timeline(obs, "tracker evidence", **obs["tracker"])
     p.cli_not_found_check(obs)
-    return _finish(p, obs, judge_github_loop(obs))
+    return _finish(p, obs, judge_github_loop(obs) + driver.judge_tracker(obs["tracker"]))
 
 
 SCENARIOS["forge-loop"] = forge_loop
@@ -6183,8 +6229,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sub.add_parser(
         "preflight", parents=[common], help="install, deliver one labelled issue, assert admission"
     )
-    scenario = sub.add_parser("run", parents=[common], help="preflight, then one scenario driver")
+    scenario = sub.add_parser(
+        "run", parents=[common], help="preflight, then one scenario driver",
+        description=(
+            "repo-runner: k8 only, release factory-tools, local scripted model. "
+            "Set CURIE_FACTORY_REPO_RUNNER_PLAN (full chart bindings and four turns) "
+            "and CURIE_LOCAL_STUB_HOST. Requires the later w1 runner routing, manifest "
+            "and same-thread repository-switching runtime; current behavior fails closed."
+        ),
+    )
     scenario.add_argument("--scenario", required=True, choices=tuple(SCENARIOS))
+    judge = sub.add_parser("judge-repo-runner", help="judge repository runner observations offline")
+    judge.add_argument("--observation", type=Path, required=True)
     scenario.add_argument(
         "--forge",
         choices=tuple(FORGES),
@@ -6527,9 +6583,7 @@ def run_hidden_tests(case_id: str, checkout: Path) -> dict[str, Any]:
     """Run the case's hidden checks against a checkout the coding run never saw."""
 
     if case_id == "positive":
-        failures = _probe_convert(
-            checkout, [(1, "nmi", "m", 1852), (1, "nmi", "km", 1.852)]
-        )
+        failures = _probe_convert(checkout, [(1, "nmi", "m", 1852), (1, "nmi", "km", 1.852)])
     elif case_id == "failing-test":
         tests = checkout / "unitconv" / "tests" / "test_convert.py"
         text = tests.read_text() if tests.is_file() else ""
@@ -6720,6 +6774,8 @@ def evaluation_exit_code(report: Mapping[str, Any]) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.mode == "judge-repo-runner":
+        return int(load_repo_runner().main(["judge", str(args.observation)]))
     if args.mode == "scripted":
         import importlib.util
 
@@ -6798,9 +6854,14 @@ def main(argv: list[str] | None = None) -> int:
                     if args.issue_file is not None
                     else DEFAULT_CANCEL_RUNNING_ISSUE
                 )
-        if args.mode == "run" and args.scenario == "tls-code-host":
-            # The stub code host run reads only a model key and a context.
-            config = load_tls_code_host().load_tls_config(os.environ, context=args.context)
+        if args.mode == "run" and args.scenario in WHOLE_FLOW_SCENARIOS:
+            if args.scenario == "repo-runner" and args.model_base_url:
+                raise ConfigError("repo-runner refuses an external model endpoint")
+            loaders = {
+                "tls-code-host": load_tls_code_host().load_tls_config,
+                "repo-runner": load_repo_runner().load_repo_runner_config,
+            }
+            config = loaders[args.scenario](os.environ, context=args.context)
         else:
             config = load_config(os.environ, context=args.context)
         if args.model_base_url:
@@ -6938,6 +6999,15 @@ def load_tls_code_host() -> Any:
 
 
 SCENARIOS["tls-code-host"] = load_tls_code_host().drive
+
+
+def load_repo_runner() -> Any:
+    """Load the repository runner scenario and offline judge once."""
+
+    return _load_by_path("repo_runner", Path(__file__).with_name("repo_runner.py"))
+
+
+SCENARIOS["repo-runner"] = load_repo_runner().drive
 
 if __name__ == "__main__":
     sys.exit(main())

@@ -127,7 +127,9 @@ VERSION_ONLY_PROOF_DEPTH = 10
 # it, while the CLI binaries and the GitHub Release -- which hang off
 # `authorize-release` alone -- publish regardless. The release ships binaries
 # whose images have per-arch blobs pushed by digest and no pullable manifest
-# tag anywhere.
+# tag anywhere. The per-run Docker daemon image (`apps/docker-daemon`, ADR
+# 0217) is a `build` matrix row in exactly the same position, so its ci.yaml
+# job, "Docker daemon image (authz plugin + escape test)", is required too.
 #
 # The subset test below cannot see that direction: it asserts every required
 # name is a real job, so ADDING a connector build to ci.yaml and forgetting it
@@ -147,6 +149,7 @@ REQUIRED_CHECK_NAMES = frozenset(
         "Build sre-bot-self-upgrade image (no push)",
         "Build github-activity-github image (no push)",
         "Dispatcher image imports resolve",
+        "Docker daemon image (authz plugin + escape test)",
         "Repository toolchain proof (runner image)",
         "Eval falsifiability gate (fake model, offline)",
         "E2E parity ladder (skill + local, fake model)",

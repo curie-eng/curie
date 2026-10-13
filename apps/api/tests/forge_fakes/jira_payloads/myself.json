@@ -1,0 +1,25 @@
+{
+  "self": "https://acme.atlassian.example/rest/api/3/user?accountId=5b10a0000000000000000001",
+  "accountId": "5b10a0000000000000000001",
+  "accountType": "atlassian",
+  "emailAddress": "mia@example.com",
+  "avatarUrls": {
+    "48x48": "https://avatar-management.example/initials/CF-5.png?size=48",
+    "24x24": "https://avatar-management.example/initials/CF-5.png?size=24",
+    "16x16": "https://avatar-management.example/initials/CF-5.png?size=16",
+    "32x32": "https://avatar-management.example/initials/CF-5.png?size=32"
+  },
+  "displayName": "Mia Krystof",
+  "active": true,
+  "timeZone": "Australia/Sydney",
+  "locale": "en_US",
+  "groups": {
+    "size": 3,
+    "items": []
+  },
+  "applicationRoles": {
+    "size": 1,
+    "items": []
+  },
+  "expand": "groups,applicationRoles"
+}

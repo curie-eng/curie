@@ -1,0 +1,156 @@
+{
+  "$id": "https://curietech.ai/schemas/tool-catalog-entry.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "else": {
+        "properties": {
+          "source_digests": {
+            "not": {
+              "required": [
+                "linux/amd64"
+              ]
+            }
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "platforms": {
+            "contains": {
+              "const": "linux/amd64"
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "source_digests": {
+            "required": [
+              "linux/amd64"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "else": {
+        "properties": {
+          "source_digests": {
+            "not": {
+              "required": [
+                "linux/arm64"
+              ]
+            }
+          }
+        }
+      },
+      "if": {
+        "properties": {
+          "platforms": {
+            "contains": {
+              "const": "linux/arm64"
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "source_digests": {
+            "required": [
+              "linux/arm64"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "description": "Pinned platform layers, writable caches and the catalog version probe.",
+  "properties": {
+    "cache_env": {
+      "patternProperties": {
+        "^[A-Za-z_][A-Za-z0-9_]*$": {
+          "not": {
+            "pattern": "(?:^|/)\\.\\.(?:/|$)"
+          },
+          "pattern": "^/home/runner(?:/[^\\s/]+)*$",
+          "type": "string"
+        }
+      },
+      "title": "Cache Env",
+      "type": "object"
+    },
+    "name": {
+      "enum": [
+        "uv",
+        "rust",
+        "pnpm",
+        "build-essential",
+        "docker-cli"
+      ],
+      "title": "Name",
+      "type": "string"
+    },
+    "platforms": {
+      "items": {
+        "enum": [
+          "linux/amd64",
+          "linux/arm64"
+        ],
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Platforms",
+      "type": "array",
+      "uniqueItems": true
+    },
+    "probe": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "prefixItems": [
+        {
+          "pattern": "\\S",
+          "type": "string"
+        }
+      ],
+      "title": "Probe",
+      "type": "array"
+    },
+    "registry_hosts": {
+      "items": {
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9.-]*(?::[0-9]{1,5})?$",
+        "type": "string"
+      },
+      "title": "Registry Hosts",
+      "type": "array"
+    },
+    "source_digests": {
+      "additionalProperties": {
+        "pattern": "^[^@\\s]+@sha256:[0-9a-f]{64}$",
+        "type": "string"
+      },
+      "minProperties": 1,
+      "propertyNames": {
+        "enum": [
+          "linux/amd64",
+          "linux/arm64"
+        ]
+      },
+      "title": "Source Digests",
+      "type": "object"
+    }
+  },
+  "required": [
+    "name",
+    "platforms",
+    "source_digests",
+    "cache_env",
+    "registry_hosts",
+    "probe"
+  ],
+  "title": "ToolCatalogEntry",
+  "type": "object"
+}

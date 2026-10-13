@@ -39,6 +39,7 @@ fn plan_input() -> PlanInput {
         chart: "charts/curie".into(),
         credential_in_env: false,
         release_has_real_model: false,
+        chart_explicit: false,
         interactive: false,
         release_at_target: false,
         agent: DEFAULT_AGENT.into(),
@@ -48,6 +49,7 @@ fn plan_input() -> PlanInput {
         recorded: None,
         bindings: Vec::new(),
         runner_image: None,
+        jira: None,
     }
 }
 

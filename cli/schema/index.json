@@ -358,6 +358,12 @@
       "version": "1.0"
     },
     {
+      "result": "RepoRunnerBuildOutput",
+      "kind": "CliOutput",
+      "schema": "repo-runner-build.schema.json",
+      "version": "1.0"
+    },
+    {
       "result": "ResetThreadOutput",
       "kind": "CliOutput",
       "schema": "reset-thread.schema.json",

@@ -337,6 +337,8 @@ _NON_BOOT_ALLOWLIST: frozenset[str] = frozenset(
         "CURIE_AGENT_SANDBOX_POOLS",
         # Agents whose per-agent pool carries connector secrets (#2943), substrate only.
         "CURIE_AGENT_CONNECTOR_SECRET_POOLS",
+        # Repository runner pools (ADR 0216): run.py parses it for the substrate only.
+        "CURIE_REPO_RUNNER_POOLS",
         # The runner-facing API base (#678): WorkerConfig reads it from the
         # WORKER's env to MINT CURIE_MEMORY_REF/CURIE_HISTORY_REF (which ARE
         # declared boot keys, rendered from the declaration). It is a worker-side

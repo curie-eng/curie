@@ -31,4 +31,4 @@ async def test_checks_on_the_new_head_are_returned(harness: AdapterHarness) -> N
 
     rollup = await harness.code_host.observe_ci(harness.repository, new)
     assert rollup.state is RollupState.PENDING
-    assert [(c.key, c.head_sha) for c in rollup.checks] == [("unit", new)]
+    assert [(c.key, c.head_sha) for c in rollup.checks] == [(harness.check_key("unit"), new)]

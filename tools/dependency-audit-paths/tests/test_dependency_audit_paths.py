@@ -6,7 +6,7 @@ import copy
 import posixpath
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import yaml
@@ -18,10 +18,14 @@ EXPECTED_PATHS = [
     "cli/Cargo.toml",
     "packages/aci-protocol/generated/rust/Cargo.lock",
     "packages/aci-protocol/generated/rust/Cargo.toml",
+    "apps/docker-daemon/Cargo.lock",
+    "apps/docker-daemon/Cargo.toml",
     "uv.lock",
     "**/pyproject.toml",
     "apps/ui/pnpm-lock.yaml",
     "apps/ui/package.json",
+    "tools/contract-codegen/pnpm-lock.yaml",
+    "tools/contract-codegen/package.json",
     ".github/workflows/dependency-audit.yaml",
 ]
 
@@ -29,7 +33,10 @@ EXPECTED_PATHS = [
 def _workflow() -> dict[str, Any]:
     # BaseLoader preserves GitHub Actions' `on` key instead of treating it as
     # a YAML 1.1 boolean. All values relevant to these tests are strings.
-    return yaml.load(WORKFLOW_PATH.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+    return cast(
+        dict[str, Any],
+        yaml.load(WORKFLOW_PATH.read_text(encoding="utf-8"), Loader=yaml.BaseLoader),
+    )
 
 
 def _audited_lockfiles(workflow: dict[str, Any]) -> set[str]:
@@ -76,10 +83,22 @@ def test_every_audited_lockfile_is_covered() -> None:
     assert _audited_lockfiles(workflow) == {
         "cli/Cargo.lock",
         "packages/aci-protocol/generated/rust/Cargo.lock",
+        "apps/docker-daemon/Cargo.lock",
         "uv.lock",
         "apps/ui/pnpm-lock.yaml",
+        "tools/contract-codegen/pnpm-lock.yaml",
     }
     _assert_lockfiles_covered(workflow)
+
+
+def test_contract_codegen_lockfile_cannot_lose_pull_request_coverage() -> None:
+    workflow = copy.deepcopy(_workflow())
+    lockfile = "tools/contract-codegen/pnpm-lock.yaml"
+    assert lockfile in _audited_lockfiles(workflow)
+    workflow["on"]["pull_request"]["paths"].remove(lockfile)
+
+    with pytest.raises(AssertionError, match=re.escape(lockfile)):
+        _assert_lockfiles_covered(workflow)
 
 
 @pytest.mark.parametrize(
