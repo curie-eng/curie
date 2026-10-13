@@ -1362,7 +1362,8 @@ and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
    Kubernetes 1.30 or newer:
    `<fullname>-docker-daemon-pods` admits only a worker-created pod with one
    `dockerd` container on `factory.docker.daemonImage` (digest required), the
-   `--userns-remap=default` and `--authorization-plugin=curie-authz` flags, the
+   `--userns-remap=default` and `--authorization-plugin=curie-authz` flags
+   immediately after `dockerd`, the
    claim, managed-by, selector and egress-class labels, privilege only on
    dockerd, no init or ephemeral containers (it also matches
    `pods/ephemeralcontainers`), no lifecycle hooks or exec probes, mounts only

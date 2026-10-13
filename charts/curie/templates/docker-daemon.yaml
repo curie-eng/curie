@@ -380,13 +380,14 @@ spec:
       message: the dockerd container must not override the image command
     - expression: {{ printf "%s.containers.all(c, !has(c.env) && !has(c.envFrom))" $s | quote }}
       message: the dockerd container must not set env or envFrom, since a caller environment could redirect the entrypoint (PATH into a mounted Secret)
+    # The two flags must sit right after dockerd: a value-taking caller flag such as --label could otherwise consume them; the image entrypoint also injects them first.
     - expression: >-
-        {{ $s }}.containers.all(c, has(c.args) && size(c.args) > 0 &&
+        {{ $s }}.containers.all(c, has(c.args) && size(c.args) >= 3 &&
         c.args[0] == 'dockerd' &&
-        c.args.exists(a, a == '--userns-remap=default') &&
-        c.args.all(a, !a.startsWith('--userns-remap') || a == '--userns-remap=default') &&
-        c.args.exists(a, a == '--authorization-plugin=curie-authz'))
-      message: dockerd must run with --userns-remap=default and --authorization-plugin=curie-authz
+        c.args[1] == '--userns-remap=default' &&
+        c.args[2] == '--authorization-plugin=curie-authz' &&
+        c.args.all(a, !a.startsWith('--userns-remap') || a == '--userns-remap=default'))
+      message: dockerd must run with --userns-remap=default and --authorization-plugin=curie-authz immediately after dockerd
     - expression: >-
         {{ $s }}.containers.all(c, {{ $noCapAdd }} &&
         (c.name == 'dockerd' || !has(c.securityContext) || !has(c.securityContext.privileged) || !c.securityContext.privileged))
