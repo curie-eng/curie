@@ -814,7 +814,12 @@ else
     exit 1
 fi
 EOF
-        chmod +x "$bindir/kubectl" "$bindir/helm" "$bindir/kind"
+        cat >"$bindir/curie" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$*" >>"$CURIE_SETTLE_LOG"
+printf '%s\n' '{"status":"succeeded"}'
+EOF
+        chmod +x "$bindir/kubectl" "$bindir/helm" "$bindir/kind" "$bindir/curie"
         saved_ns="$NAMESPACE"
         saved_kube="$KUBECONFIG_FILE"
         saved_path="$PATH"
@@ -945,6 +950,23 @@ EOF
             OWNED_KIND=1
             ensure_kind
             (( OWNED_KIND == 0 )) || die "self-test: ensure_kind did not adopt the named cluster"
+            [[ "${KUBECTL_CONTEXT_ARGS[*]}" == "--context kind-$KIND_CLUSTER" \
+                && "${HELM_CONTEXT_ARGS[*]}" == "--kube-context kind-$KIND_CLUSTER" ]] \
+                || die "self-test: ensure_kind did not pin its verified named context"
+            kubectl_ns get pods >/dev/null
+            helm_ns history "$RELEASE" >/dev/null
+            rm -f "$state/lookup_fail"
+            BIN="$bindir/curie"
+            FAIL_AT_HOOK=""
+            INTERRUPT_AFTER_HOOK=""
+            cluster_upgrade "0.9.0" "$probe/chart.tgz"
+            grep -Fq -- "--kubeconfig $KUBECONFIG_FILE --context kind-$KIND_CLUSTER -n $NAMESPACE get pods" "$logf" \
+                || die "self-test: kubectl runtime call omitted the verified kind context"
+            grep -Fq -- "--kubeconfig $KUBECONFIG_FILE --kube-context kind-$KIND_CLUSTER -n $NAMESPACE history $RELEASE" "$logf" \
+                || die "self-test: Helm runtime call omitted the verified kind context"
+            grep -Fq -- "--json cluster upgrade --yes --to 0.9.0 --namespace $NAMESPACE --release $RELEASE --chart $probe/chart.tgz --context kind-$KIND_CLUSTER" "$logf" \
+                || die "self-test: cluster upgrade omitted the verified kind context"
+            log "verified named kind context reaches kubectl helm and cluster upgrade"
             prepare_takeover_context
             [[ "$(cat "$state/current-context")" == k8 ]] || die "self-test: adopted kind context was not renamed"
             [[ "${KUBECTL_CONTEXT_ARGS[*]}" == '--context k8' && "${HELM_CONTEXT_ARGS[*]}" == '--kube-context k8' ]] \
@@ -1335,12 +1357,16 @@ ensure_kind() {
             kubeconfig_is_named_kind \
                 || die "kind cluster $KIND_CLUSTER exists but kubeconfig $KUBECONFIG_FILE is not that cluster; pass --force to recreate this task-owned cluster only"
             OWNED_KIND=0
+            KUBECTL_CONTEXT_ARGS=(--context "kind-$KIND_CLUSTER")
+            HELM_CONTEXT_ARGS=(--kube-context "kind-$KIND_CLUSTER")
             return 0
         fi
     fi
     kind create cluster --name "$KIND_CLUSTER" --kubeconfig "$KUBECONFIG_FILE" --wait 120s
     kubeconfig_is_named_kind || die "created kind cluster $KIND_CLUSTER but kubeconfig does not select it"
     OWNED_KIND=1
+    KUBECTL_CONTEXT_ARGS=(--context "kind-$KIND_CLUSTER")
+    HELM_CONTEXT_ARGS=(--kube-context "kind-$KIND_CLUSTER")
 }
 
 prepare_takeover_context() {
@@ -1716,6 +1742,7 @@ cluster_upgrade() {
     log "cluster upgrade --to $to chart=$chart fail_at=${CURIE_UPGRADE_TEST_FAIL_AT-} interrupt_after=${CURIE_UPGRADE_TEST_INTERRUPT_AFTER-}"
     local cmd=("$BIN" --json cluster upgrade --yes --to "$to"
         --namespace "$NAMESPACE" --release "$RELEASE" --chart "$chart")
+    cmd+=("${KUBECTL_CONTEXT_ARGS[@]}")
     cmd+=("${extra[@]}")
     if [[ -n "$FAIL_AT_HOOK" || -n "$INTERRUPT_AFTER_HOOK" ]]; then
         local envcmd=(/usr/bin/env)
@@ -1835,6 +1862,7 @@ run_fail_every_phase() {
         set -e
         FAIL_AT_HOOK=""
         record_upgrade_json "fail-$phase"
+        [[ "$status" -ne 0 ]] || die "FAIL_AT=$phase exited 0 despite a failed upgrade"
         local st
         st="$(json_field "$EVIDENCE_DIR/last-upgrade.json" "status" || true)"
         [[ "$st" == "failed" ]] || die "FAIL_AT=$phase status='$st' (need structured status=failed)"
@@ -1843,12 +1871,17 @@ run_fail_every_phase() {
     done
     if [[ "$(helm_version)" == "0.10.1" ]]; then
         log "fail-every-phase left helm at 0.10.1; retrying to succeed"
-        cluster_upgrade "0.10.1" "$CHART_0101" || true
+        status=0
+        cluster_upgrade "0.10.1" "$CHART_0101" || status=$?
+        record_upgrade_json "fail-phase-recovery"
+        [[ "$status" -eq 0 ]] || die "fail-every-phase recovery exited $status"
+        assert_upgrade_status "succeeded"
         wait_rollout || true
         cluster_upgrade "0.10.0" "$CHART_0100" || true
         wait_rollout || true
         if [[ "$(helm_version)" == "0.10.1" ]]; then
             "$BIN" --json cluster rollback --yes --namespace "$NAMESPACE" --release "$RELEASE" \
+                "${KUBECTL_CONTEXT_ARGS[@]}" \
                 >"$EVIDENCE_DIR/fail-phase-restore.json" || true
             wait_rollout || true
         fi
@@ -2259,6 +2292,12 @@ run_converge_negative() {
     status=$?
     set -e
     record_upgrade_json "converge-negative"
+    [[ "$status" -ne 0 ]] || die "converge-negative exited 0 despite a failed upgrade"
+    assert_upgrade_phase "converge"
+    local recovery_command
+    recovery_command="$(json_field "$EVIDENCE_DIR/last-upgrade.json" "fail_forward.command")"
+    [[ "$recovery_command" == *"--context "* ]] \
+        || die "converge-negative fail-forward command omitted --context"
     local images manifest
     images="$(json_field "$EVIDENCE_DIR/last-upgrade.json" "convergence.images" || true)"
     manifest="$(json_field "$EVIDENCE_DIR/last-upgrade.json" "convergence.manifest_matches" || true)"
