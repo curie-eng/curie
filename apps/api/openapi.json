@@ -2577,6 +2577,17 @@
             ],
             "title": "Reply Endpoint"
           },
+          "reply_identity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Identity"
+          },
           "reply_kind": {
             "minLength": 1,
             "title": "Reply Kind",
@@ -5763,6 +5774,19 @@
               }
             ],
             "title": "Reply Endpoint"
+          },
+          "reply_identity": {
+            "anyOf": [
+              {
+                "maxLength": 40,
+                "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reply Identity"
           },
           "reply_kind": {
             "minLength": 1,

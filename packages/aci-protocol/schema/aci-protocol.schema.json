@@ -121,6 +121,18 @@
           "default": null,
           "title": "Reply Endpoint"
         },
+        "reply_identity": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reply Identity"
+        },
         "reply_kind": {
           "minLength": 1,
           "title": "Reply Kind",
@@ -1912,6 +1924,6 @@
   },
   "$id": "https://curietech.ai/schemas/aci-protocol.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocolVersion": "0.5.15",
-  "title": "ACI Protocol v0.5.15"
+  "protocolVersion": "0.5.21",
+  "title": "ACI Protocol v0.5.21"
 }
