@@ -751,6 +751,7 @@ jobs:
         run: |
           set -euo pipefail
           bash charts/curie/ci/runner-images-assertions.sh
+          bash charts/curie/ci/docker-daemon-assertions.sh
 
       # Prove the dispatcher is told where the platform API is and how to
       # authenticate to it (issue #442), and that the UI's CURIE_API_TARGET

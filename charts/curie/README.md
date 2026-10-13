@@ -1329,6 +1329,65 @@ It maps repository paths to pool names, index and platform digests, base digest,
 Docker setting and egress. Worker `extraEnv` cannot set this reserved name.
 Worker repository routing remains deferred.
 
+**Factory Docker daemons (ADR 0217).** When a repository runner sets
+`docker.enabled: true` and `worker.deploy` is true,
+`templates/docker-daemon.yaml` renders the fixed boundary for per-run Docker
+daemons. The worker creates each run's daemon pod, Service, certificate Secret
+and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
+
+1. A daemon namespace, `factory.docker.namespace` or
+   `<release-namespace>-<fullname>-docker` by default. The chart creates it
+   with `pod-security.kubernetes.io/enforce: privileged` unless
+   `factory.docker.createNamespace` is false, in which case the operator
+   creates it with that label.
+2. A Role and RoleBinding there for the worker ServiceAccount: create, get,
+   list and delete on pods, services and networkpolicies, get on pods/log,
+   create and delete on secrets.
+3. A ResourceQuota from `factory.docker.quota.hard` and a Container LimitRange
+   from `factory.docker.limitRange` (`max`, `min`, `default`,
+   `defaultRequest`). All are required.
+4. NetworkPolicies in the daemon namespace: default-deny ingress and egress,
+   DNS to `security.networkPolicy.dnsNamespace`, and one egress policy per
+   class. Pods labelled `curietech.ai/docker-egress: public` reach
+   `0.0.0.0/0` and `::/0` on TCP 80 and 443 with the metadata, private and
+   `security.networkPolicy.clusterCidrs` ranges excepted. A repository with
+   `docker.egressAllowlist` gets the class `repo-<first 16 hex of
+   sha256(path)>` and only its allowlist, validated like the other one-peer
+   egress lists.
+5. With Rail 1 on, `<fullname>-runner-allow-docker-daemon` lets the factory
+   agent's runner sandboxes (`curietech.ai/agent` set to the one factory agent
+   repository runners belong to) dial daemon pods on `factory.docker.port`
+   (2376). Other agents' sandboxes get no such allow. Daemon ingress
+   stays default-deny until the worker's per-run policy admits that run's
+   sandbox, so a sandbox reaches only its own daemon.
+6. Three ValidatingAdmissionPolicies with Deny bindings, which need
+   Kubernetes 1.30 or newer:
+   `<fullname>-docker-daemon-pods` admits only a worker-created pod with one
+   `dockerd` container on `factory.docker.daemonImage` (digest required), the
+   `--userns-remap=default` and `--authorization-plugin=curie-authz` flags
+   immediately after `dockerd`, the
+   claim, managed-by, selector and egress-class labels, no added
+   capabilities on dockerd, no init or ephemeral containers (it also matches
+   `pods/ephemeralcontainers`), no lifecycle hooks or exec probes, mounts only
+   at `/var/lib/docker` and `/certs` with no `volumeDevices`, no `env` or
+   `envFrom` (a caller environment could point the entrypoint's PATH into a
+   mounted Secret), no ServiceAccount token, only `emptyDir` volumes with a
+   positive `sizeLimit` or `secret` volumes, no host namespaces or ports,
+   positive cpu, memory and ephemeral-storage requests and limits, and
+   `activeDeadlineSeconds`.
+   `<fullname>-docker-daemon-objects` holds the worker's Services to
+   ClusterIP, its Secrets to Opaque or TLS, and its NetworkPolicies to
+   ingress-only policies selecting their own claim, whose every peer is a
+   runner sandbox of this release in the release namespace selected by a
+   label key outside the release selector keys (`name`, `instance`,
+   `component`), with no `ipBlock`, on TCP `factory.docker.port` with no
+   `endPort` range.
+   `<fullname>-docker-daemon-cleanup` lets the worker delete only
+   NetworkPolicies labelled `curietech.ai/sandbox-claim`, never the chart's.
+
+Opting a repository into Docker widens that repository's egress to what its
+class allows. Runner admission is unchanged.
+
 **Credential access.** A sandbox can inspect credentials injected into its own
 process, including any explicitly configured shared model credential. Operators
 who add credentials, mount a Kubernetes API token, or grant runner RBAC change
