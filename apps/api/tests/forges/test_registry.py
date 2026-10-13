@@ -22,6 +22,7 @@ import jwt
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
+from curie_api.forges import registry as forge_registry
 from curie_api.forges import types
 from curie_api.forges.config import (
     BindingConfig,
@@ -48,8 +49,10 @@ from curie_api.forges.registry import (
 from curie_api.forges.types import CredentialScope
 from forge_fakes import config_samples as samples
 
-INSTALLED_CODE_HOSTS = frozenset({types.GITHUB, types.BITBUCKET_CLOUD, types.BITBUCKET_DC})
-INSTALLED_TRACKERS = frozenset({types.GITHUB, types.JIRA_CLOUD})
+INSTALLED_CODE_HOSTS = frozenset(
+    {types.GITHUB, types.GITLAB, types.BITBUCKET_CLOUD, types.BITBUCKET_DC}
+)
+INSTALLED_TRACKERS = frozenset({types.GITHUB, types.GITLAB, types.JIRA_CLOUD})
 GHE_API = "https://ghe.example.com/api/v3"
 GHE_HOST = "ghe.example.com"
 REPO = "acme-corp/api"
@@ -209,6 +212,10 @@ def test_a_config_without_a_github_entry_has_no_github_adapters() -> None:
 
 
 # Reserved kinds ---------------------------------------------------------------------
+#
+# Since #4399 installed GitLab no configurable kind is reserved, so the refusal
+# itself is proven on gitlab reserved for one test (`reserved_gitlab`); the
+# shipped build's answer is the liveness neighbour below.
 
 
 def _gitlab_tracker(name: str = "corp-gitlab") -> dict[str, Any]:
@@ -229,6 +236,15 @@ RESERVED_ENTRIES: dict[str, tuple[str, dict[str, Any]]] = {
 }
 
 
+@pytest.fixture
+def reserved_gitlab(monkeypatch: pytest.MonkeyPatch) -> None:
+    """gitlab registered not installed for this test only; restored after."""
+
+    monkeypatch.delitem(forge_registry._KINDS, "gitlab")
+    forge_registry.register_not_installed("gitlab")
+
+
+@pytest.mark.usefixtures("reserved_gitlab")
 @pytest.mark.parametrize("case", sorted(RESERVED_ENTRIES))
 def test_registry_refuses_each_reserved_kind_naming_it(case: str) -> None:
     section, entry = RESERVED_ENTRIES[case]
@@ -245,6 +261,7 @@ def test_registry_refuses_each_reserved_kind_naming_it(case: str) -> None:
         assert "not installed" in str(refused)
 
 
+@pytest.mark.usefixtures("reserved_gitlab")
 @pytest.mark.parametrize("case", sorted(RESERVED_ENTRIES))
 def test_a_valid_github_entry_never_hides_a_reserved_one(case: str, private_key: str) -> None:
     section, entry = RESERVED_ENTRIES[case]
@@ -255,33 +272,27 @@ def test_a_valid_github_entry_never_hides_a_reserved_one(case: str, private_key:
         build_registry(_config(document))
 
 
-def test_every_configurable_kind_is_installed_or_refused() -> None:
+def test_every_configurable_kind_is_installed() -> None:
     """Completeness against the config model, not a hand list (edge case 1): a kind
     added to the Literal without a package fails here."""
 
-    reserved_code_hosts = {
-        entry["kind"] for section, entry in RESERVED_ENTRIES.values() if section == "code_hosts"
-    }
-    reserved_trackers = {
-        entry["kind"] for section, entry in RESERVED_ENTRIES.values() if section == "trackers"
-    }
-    assert set(get_args(CodeHostKind)) == INSTALLED_CODE_HOSTS | reserved_code_hosts
-    assert set(get_args(TrackerKind)) == INSTALLED_TRACKERS | reserved_trackers
+    assert set(get_args(CodeHostKind)) == INSTALLED_CODE_HOSTS
+    assert set(get_args(TrackerKind)) == INSTALLED_TRACKERS
 
 
 def test_a_github_only_config_passes_the_installed_check(private_key: str) -> None:
     check_installed(_config(_github_entries(private_key)))
 
 
-@pytest.mark.parametrize("module", ["gitlab"])
-def test_reserved_packages_register_not_installed(module: str) -> None:
-    importlib.import_module(f"curie_api.forges.{module}")
-    kind = module
-    section = "code_hosts"
-    entry = next(e for s, e in RESERVED_ENTRIES.values() if s == section and e["kind"] == kind)
+def test_the_gitlab_package_registers_an_installed_tracker_and_code_host() -> None:
+    """#4399 fills the slot #4397 reserved: the same entries the reserved
+    tests refuse now pass the installed check and build."""
 
-    with pytest.raises(NotInstalled, match=kind):
+    importlib.import_module("curie_api.forges.gitlab")
+    for section, entry in RESERVED_ENTRIES.values():
         check_installed(_config({section: [entry]}))
+    registry = build_registry(_config({"code_hosts": [samples.gitlab_code_host("corp-gitlab")]}))
+    assert registry.code_host("corp-gitlab").config.kind == types.GITLAB
 
 
 BITBUCKET_ENTRIES: dict[str, dict[str, Any]] = {
