@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-import pytest
 from curie_api.forges.types import Actor
 from forge_fakes.gitlab import API, TOKEN, GitLabAPI
 
@@ -34,84 +33,6 @@ RECORDED = (
     "jobs",
     "statuses",
 )
-# Keys the recordings carry that the fake does not send yet, found when the
-# recordings were taken (2026-10-13). The fake is another stream's file, so the
-# gaps are listed here instead of fixed; the test fails strictly once they close.
-KNOWN_GAPS = {
-    "version": ["kas.externalK8sProxyUrl"],
-    "personal_access_tokens_self": ["granular", "last_used_ips"],
-    "issue": [
-        "_links",
-        "author.public_email",
-        "has_tasks",
-        "imported",
-        "imported_from",
-        "moved_to_id",
-        "service_desk_reply_to",
-        "start_date",
-        "subscribed",
-        "task_status",
-        "time_stats",
-    ],
-    "resource_label_events": [
-        "[].label.archived",
-        "[].label.description_html",
-        "[].label.text_color",
-        "[].user.public_email",
-    ],
-    "notes": ["[].author.public_email"],
-    "merge_request": [
-        "author.public_email",
-        "changes_count",
-        "diff_refs",
-        "first_contribution",
-        "first_deployed_to_production_at",
-        "head_pipeline",
-        "imported",
-        "imported_from",
-        "latest_build_finished_at",
-        "latest_build_started_at",
-        "merge_after",
-        "merge_error",
-        "pipeline",
-        "prepared_at",
-        "squash_on_merge",
-        "subscribed",
-        "task_completion_status",
-        "time_stats",
-        "user",
-    ],
-    "discussions": ["[].notes[].author.public_email", "[].resolvable", "[].resolved"],
-    "pipelines": ["[].name"],
-    "jobs": [
-        "[].artifacts[] (the fake listed nothing)",
-        "[].artifacts_expire_at",
-        "[].pipeline.created_at",
-        "[].pipeline.iid",
-        "[].pipeline.source",
-        "[].pipeline.updated_at",
-        "[].pipeline.web_url",
-        "[].runner_manager",
-        "[].user.bio",
-        "[].user.bot",
-        "[].user.created_at",
-        "[].user.discord",
-        "[].user.followers",
-        "[].user.following",
-        "[].user.github",
-        "[].user.job_title",
-        "[].user.linkedin",
-        "[].user.local_time",
-        "[].user.location",
-        "[].user.organization",
-        "[].user.pronouns",
-        "[].user.public_email",
-        "[].user.twitter",
-        "[].user.website_url",
-        "[].user.work_information",
-    ],
-    "statuses": ["[].author.public_email"],
-}
 
 
 def _missing(recorded: Any, faked: Any, where: str) -> list[str]:
@@ -174,24 +95,6 @@ def _fake_answers() -> dict[str, Any]:
     return answers
 
 
-def test_gitlab_fake_gaps_are_the_known_ones() -> None:
-    """The gaps are exactly the listed ones, so a new gap or a fixed one shows."""
-
-    answers = _fake_answers()
-    gaps = {}
-    for name in RECORDED:
-        recorded = json.loads((PAYLOADS / f"{name}.json").read_text())
-        missing = _missing(recorded, answers[name], "")
-        if missing:
-            gaps[name] = missing
-    assert gaps == KNOWN_GAPS
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="the fake lacks recorded keys: "
-    + "; ".join(f"{name}: {', '.join(keys)}" for name, keys in KNOWN_GAPS.items()),
-)
 def test_gitlab_fake_carries_every_recorded_key() -> None:
     answers = _fake_answers()
     gaps = {}

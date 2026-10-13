@@ -8,6 +8,7 @@ are native ``RUN`` checks keyed by name; external commit statuses are
 
 from __future__ import annotations
 
+import httpx
 import pytest
 from curie_api.forges.types import (
     CheckSource,
@@ -139,6 +140,48 @@ async def test_an_external_status_is_a_status_check_and_jobs_are_not_counted_twi
     docs = next(c for c in rollup.checks if c.source is CheckSource.STATUS)
     assert (docs.native, docs.reported_state) == (False, "failed")
     assert rollup.state is RollupState.FAILURE
+
+
+def _pipeline_lands_after(fake: GitLabAPI, head: str, read: str) -> httpx.AsyncClient:
+    """A client whose fake gets a new push pipeline (job ``test`` pending) on
+    ``head`` right after the first answered GET whose path ends with ``read``:
+    a push pipeline GitLab creates while the adapter is between two reads."""
+
+    landed: list[int] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        response = fake.handle(request)
+        if not landed and request.method == "GET" and fake.api_path(request).endswith(read):
+            landed.append(fake.add_pipeline(head, jobs={"test": "pending"}))
+        return response
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handle))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "read", ["/version", "/statuses", "/pipelines", "/merge_requests", "/jobs"]
+)
+async def test_a_push_pipeline_created_mid_read_never_shows_its_job_as_a_status(
+    fake: GitLabAPI, read: str
+) -> None:
+    _, head = _head(fake)
+    fake.report_job(head, "unit", "success")
+    fake.add_status(head, "docs", "success")
+    # GitLab attaches an external status to the commit's push pipeline.
+    assert [s.pipeline for s in fake.statuses] == [
+        next(p.id for p in fake.pipelines.values() if p.sha == head)
+    ]
+
+    client = _pipeline_lands_after(fake, head, read)
+    rollup = await gitlab_code_host(fake, client=client).observe_ci(fake.repository(), head)
+
+    assert len([p for p in fake.pipelines.values() if p.sha == head]) == 2
+    statuses = [c for c in rollup.checks if c.source is CheckSource.STATUS]
+    assert [(c.key, c.state) for c in statuses] == [(status_key("docs"), CheckState.SUCCESS)]
+    assert status_key("test") not in {c.key for c in rollup.checks}
+    # The new job is either not seen yet or seen as the native job it is.
+    assert {c.key for c in rollup.checks} - {"unit", status_key("docs")} <= {"test"}
 
 
 @pytest.mark.anyio

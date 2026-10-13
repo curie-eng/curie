@@ -145,8 +145,20 @@ class GitLabCi:
         return list(counted.values())
 
     async def observe(self, head_sha: str) -> CiRollup:
-        """Decision 18: the normalized checks on exactly ``head_sha``."""
+        """Decision 18: the normalized checks on exactly ``head_sha``.
 
+        Commit statuses are read before pipelines and jobs. Every job is also a
+        commit status, so read the other way round a pipeline created between
+        the two reads would show its own jobs as external checks. Read in this
+        order, any pipeline a listed status belongs to already exists, so the
+        later reads list it and its jobs. GitLab attaches an external status to
+        the newest pipeline on its commit, push pipelines included, so the
+        pipeline's source cannot tell the two apart; the job listing does."""
+
+        statuses = await self._transport.list_all(
+            f"{self._project}/repository/commits/{encode_segment(head_sha)}/statuses",
+            {"all": "true"},
+        )
         jobs: list[dict[str, Any]] = []
         job_ids: set[int] = set()
         job_names: set[tuple[Any, str]] = set()
@@ -161,10 +173,6 @@ class GitLabCi:
                 job_ids.add(job["id"])
                 job_names.add((pipeline["id"], job["name"]))
         checks = [_job_check(job, head_sha) for job in _newest(jobs).values()]
-        statuses = await self._transport.list_all(
-            f"{self._project}/repository/commits/{encode_segment(head_sha)}/statuses",
-            {"all": "true"},
-        )
         external = [
             status
             for status in statuses

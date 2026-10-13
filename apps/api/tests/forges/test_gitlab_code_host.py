@@ -7,9 +7,11 @@ project by its numeric id (decision 4).
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from curie_api.forges import types
-from curie_api.forges.errors import Ambiguous, NotFound, Unauthorized
+from curie_api.forges.errors import Ambiguous, NotFound, Unauthorized, Unavailable
 from curie_api.forges.types import (
     Actor,
     Commit,
@@ -236,6 +238,101 @@ async def test_open_pull_request_posts_the_merge_request(fake: GitLabAPI, draft:
     assert (pull.head_sha, pull.head_ref, pull.base_ref) == (head, "factory/open", "main")
     assert pull.ref.number == str(fake.merge_requests[int(pull.ref.number)].iid)
     assert pull.url == f"{WEB}/{PROJECT_PATH}/-/merge_requests/{pull.ref.number}"
+
+
+_NOT_READY = {"message": {"source_branch": ["does not exist"]}}
+
+
+def _recording_sleep(code_host: Any) -> list[float]:
+    waits: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    code_host.sleep = sleep
+    return waits
+
+
+async def _open(code_host: Any, fake: GitLabAPI, branch: str) -> Any:
+    return await code_host.open_pull_request(
+        fake.repository(), head_ref=branch, base_ref="main", title="Factory change", body="b"
+    )
+
+
+@pytest.mark.anyio
+async def test_a_source_branch_gitlab_has_not_seen_yet_is_retried_once_ready(
+    fake: GitLabAPI,
+) -> None:
+    head = fake.push("factory/fresh")
+    fake.script(400, path=f"{PROJECT}/merge_requests", method="POST", body=_NOT_READY)
+    code_host = gitlab_code_host(fake)
+    waits = _recording_sleep(code_host)
+
+    pull = await _open(code_host, fake, "factory/fresh")
+
+    assert len(fake.calls("POST", f"{PROJECT}/merge_requests")) == 2
+    assert len(waits) == 1 and 0 < waits[0] <= 2
+    assert [m.source_branch for m in fake.merge_requests.values()] == ["factory/fresh"]
+    assert (pull.head_ref, pull.head_sha) == ("factory/fresh", head)
+
+
+@pytest.mark.anyio
+async def test_a_source_branch_that_never_appears_is_source_branch_not_ready(
+    fake: GitLabAPI,
+) -> None:
+    fake.push("factory/stuck")
+    # The body quotes the token, so the error is shown never to repeat it.
+    leaky = {"message": {"source_branch": [f"does not exist (token {TOKEN})"]}}
+    for _ in range(20):
+        fake.script(400, path=f"{PROJECT}/merge_requests", method="POST", body=leaky)
+    code_host = gitlab_code_host(fake)
+    waits = _recording_sleep(code_host)
+
+    with pytest.raises(Unavailable) as raised:
+        await _open(code_host, fake, "factory/stuck")
+
+    assert str(raised.value) == "source_branch_not_ready"
+    assert TOKEN not in repr(raised.value) and "does not exist" not in repr(raised.value)
+    posts = len(fake.calls("POST", f"{PROJECT}/merge_requests"))
+    assert posts == len(waits) + 1 and 2 < posts < 20
+    assert 5 <= sum(waits) <= 12
+    assert fake.merge_requests == {}
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"message": {"target_branch": ["does not exist"]}},
+        {"message": {"source_branch": ["is invalid"]}},
+        {"message": ["You can't use same project/branch for source and target"]},
+        {"error": "title is missing"},
+    ],
+)
+async def test_any_other_400_is_rejected_at_once(fake: GitLabAPI, body: dict[str, Any]) -> None:
+    fake.push("factory/bad")
+    fake.script(400, path=f"{PROJECT}/merge_requests", method="POST", body=body)
+    code_host = gitlab_code_host(fake)
+    waits = _recording_sleep(code_host)
+
+    with pytest.raises(Unavailable) as raised:
+        await _open(code_host, fake, "factory/bad")
+
+    assert str(raised.value) == "rejected"
+    assert (len(fake.calls("POST", f"{PROJECT}/merge_requests")), waits) == (1, [])
+
+
+@pytest.mark.anyio
+async def test_a_ready_source_branch_opens_on_the_first_post_without_waiting(
+    fake: GitLabAPI,
+) -> None:
+    fake.push("factory/ready")
+    code_host = gitlab_code_host(fake)
+    waits = _recording_sleep(code_host)
+
+    await _open(code_host, fake, "factory/ready")
+
+    assert (len(fake.calls("POST", f"{PROJECT}/merge_requests")), waits) == (1, [])
 
 
 @pytest.mark.anyio

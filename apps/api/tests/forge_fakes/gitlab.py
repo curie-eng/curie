@@ -920,9 +920,14 @@ class GitLabAPI:
         return seen
 
     def _external_pipeline(self, sha: str, ref: str) -> _Pipeline:
-        found = next(
-            (p for p in self.pipelines.values() if p.sha == sha and p.source == "external"),
-            None,
+        # GitLab attaches the status to the newest pipeline on the commit and
+        # ref, a push pipeline included, and creates an ``external`` one only
+        # when there is none (Ci::CreateCommitStatusService; the live fixture's
+        # recorded statuses carry the push pipeline's id).
+        found = max(
+            (p for p in self.pipelines.values() if p.sha == sha and p.ref == ref),
+            key=lambda p: p.id,
+            default=None,
         )
         if found is None:
             found = self.pipelines[self.add_pipeline(sha, ref=ref, source="external")]
@@ -963,6 +968,7 @@ class GitLabAPI:
         return {key: user[key] for key in ("id", "username", "name", "state", "locked")} | {
             "avatar_url": user["avatar_url"],
             "web_url": user["web_url"],
+            "public_email": None,
         }
 
     def _user_full(self, uid: int, *, own: bool) -> dict[str, Any]:
@@ -975,6 +981,8 @@ class GitLabAPI:
             "public_email": None,
             "linkedin": "",
             "twitter": "",
+            "discord": "",
+            "github": "",
             "website_url": "",
             "organization": "",
             "job_title": "",
@@ -1037,6 +1045,7 @@ class GitLabAPI:
 
     def _issue(self, issue: _Issue) -> dict[str, Any]:
         # https://docs.gitlab.com/api/issues/#single-project-issue
+        own = f"{self.base_url}/projects/{self.project_id}"
         return {
             "id": issue.id,
             "iid": issue.iid,
@@ -1070,6 +1079,22 @@ class GitLabAPI:
             },
             "severity": "UNKNOWN",
             "task_completion_status": {"count": 0, "completed_count": 0},
+            "has_tasks": "- [" in issue.description,
+            "task_status": "0 of 0 checklist items completed",
+            "time_stats": _TIME_STATS,
+            "imported": False,
+            "imported_from": "none",
+            "moved_to_id": None,
+            "service_desk_reply_to": None,
+            "start_date": None,
+            "subscribed": True,
+            "_links": {
+                "self": f"{own}/issues/{issue.iid}",
+                "notes": f"{own}/issues/{issue.iid}/notes",
+                "award_emoji": f"{own}/issues/{issue.iid}/award_emoji",
+                "project": own,
+                "closed_as_duplicate_of": None,
+            },
         }
 
     def _label_event(self, event: _LabelEvent) -> dict[str, Any]:
@@ -1084,7 +1109,10 @@ class GitLabAPI:
                 "id": self._label_id(event.label),
                 "name": event.label,
                 "color": "#0033CC",
+                "text_color": "#FFFFFF",
                 "description": None,
+                "description_html": "",
+                "archived": False,
             },
             "action": event.action,
         }
@@ -1136,15 +1164,27 @@ class GitLabAPI:
 
     def _discussion_payload(self, discussion: _Discussion) -> dict[str, Any]:
         # https://docs.gitlab.com/api/discussions/#list-project-merge-request-discussion-items
-        return {
+        notes = [self._note_payload(self.notes[n]) for n in discussion.notes]
+        payload: dict[str, Any] = {
             "id": discussion.id,
             "individual_note": discussion.individual_note,
-            "notes": [self._note_payload(self.notes[n]) for n in discussion.notes],
+            "notes": notes,
+            "resolvable": any(note["resolvable"] for note in notes),
         }
+        if payload["resolvable"]:
+            # GitLab sends ``resolved`` only on a resolvable discussion.
+            payload["resolved"] = all(
+                note.get("resolved") is True for note in notes if note["resolvable"]
+            )
+        return payload
 
     def _mr(self, mr: _MergeRequest) -> dict[str, Any]:
         # https://docs.gitlab.com/api/merge_requests/#get-single-mr
         sha = self._mr_sha(mr)
+        target = self.branches.get(mr.target_branch)
+        head_pipeline = next(
+            (p for p in self._mr_pipelines(mr) if sha is not None and p.sha == sha), None
+        )
         draft = bool(re.match(r"^\s*(\[draft\]|\(draft\)|draft:)", mr.title, re.IGNORECASE))
         return {
             "id": mr.id,
@@ -1194,6 +1234,27 @@ class GitLabAPI:
             "squash": False,
             "has_conflicts": mr.has_conflicts,
             "blocking_discussions_resolved": True,
+            "squash_on_merge": False,
+            "subscribed": True,
+            "changes_count": "1",
+            "diff_refs": {"base_sha": target, "head_sha": sha, "start_sha": target},
+            "first_contribution": False,
+            "first_deployed_to_production_at": None,
+            "imported": False,
+            "imported_from": "none",
+            "merge_after": None,
+            "merge_error": None,
+            "prepared_at": iso(mr.created_at),
+            "latest_build_started_at": None,
+            "latest_build_finished_at": None,
+            "pipeline": None if head_pipeline is None else self._pipeline(head_pipeline),
+            "head_pipeline": (
+                None if head_pipeline is None else self._pipeline_detail(head_pipeline)
+            ),
+            "task_completion_status": {"count": 0, "completed_count": 0},
+            "time_stats": _TIME_STATS,
+            # The requesting user's rights on this merge request.
+            "user": {"can_merge": False},
         }
 
     def _commit(self, sha: str) -> dict[str, Any]:
@@ -1225,6 +1286,7 @@ class GitLabAPI:
             "id": pipeline.id,
             "iid": pipeline.iid,
             "project_id": self.project_id,
+            "name": None,
             "sha": pipeline.sha,
             "ref": pipeline.ref,
             "status": self._pipeline_status(pipeline),
@@ -1232,6 +1294,69 @@ class GitLabAPI:
             "created_at": iso(pipeline.created_at),
             "updated_at": iso(pipeline.created_at),
             "web_url": f"{self.web_base}/{self.project_path}/-/pipelines/{pipeline.id}",
+        }
+
+    def _pipeline_detail(self, pipeline: _Pipeline) -> dict[str, Any]:
+        # https://docs.gitlab.com/api/pipelines/#get-a-single-pipeline, as a
+        # merge request's ``head_pipeline`` embeds it.
+        status = self._pipeline_status(pipeline)
+        path = f"/{self.project_path}/-/pipelines/{pipeline.id}"
+        return self._pipeline(pipeline) | {
+            "before_sha": "0" * 40,
+            "tag": False,
+            "yaml_errors": None,
+            "user": self._user_basic(BOT_ID),
+            "started_at": iso(pipeline.created_at),
+            "finished_at": None,
+            "committed_at": None,
+            "duration": 0,
+            "queued_duration": 1,
+            "coverage": None,
+            "archived": False,
+            "detailed_status": {
+                "icon": f"status_{status}",
+                "text": status.capitalize(),
+                "label": status,
+                "group": status,
+                "tooltip": status,
+                "has_details": True,
+                "details_path": path,
+                "illustration": None,
+                "favicon": f"/assets/ci_favicons/favicon_status_{status}.png",
+            },
+        }
+
+    def _runner(self) -> dict[str, Any]:
+        # https://docs.gitlab.com/api/jobs/#get-a-single-job (``runner``)
+        return {
+            "id": 1,
+            "description": "fixture-runner",
+            "ip_address": None,
+            "active": True,
+            "paused": False,
+            "is_shared": True,
+            "runner_type": "instance_type",
+            "name": None,
+            "online": True,
+            "status": "online",
+            "job_execution_status": "idle",
+            "created_at": iso(_START - timedelta(days=30)),
+            "created_by": self._user_basic(ROOT_ID),
+        }
+
+    def _runner_manager(self) -> dict[str, Any]:
+        return {
+            "id": 1,
+            "system_id": "r_placeholder0001",
+            "version": self.version,
+            "revision": "0a1b2c3d",
+            "platform": "linux",
+            "architecture": "amd64",
+            "created_at": iso(_START - timedelta(days=30)),
+            "contacted_at": iso(self.now),
+            "ip_address": "192.0.2.10",
+            "status": "online",
+            "job_execution_status": "idle",
         }
 
     def _pipeline_status(self, pipeline: _Pipeline) -> str:
@@ -1270,19 +1395,25 @@ class GitLabAPI:
             "erased_at": None,
             "duration": 30.0 if finished else None,
             "queued_duration": 1.0,
-            "user": self._user_basic(BOT_ID),
+            "user": self._user_full(BOT_ID, own=False),
             "commit": commit,
-            "pipeline": {
-                "id": pipeline.id,
-                "project_id": self.project_id,
-                "ref": pipeline.ref,
-                "sha": pipeline.sha,
-                "status": self._pipeline_status(pipeline),
-            },
+            "pipeline": self._pipeline(pipeline),
             "web_url": f"{self.web_base}/{self.project_path}/-/jobs/{job.id}",
             "project": {"ci_job_token_scope_enabled": False},
-            "artifacts": [],
-            "runner": None,
+            # A job that ran has a trace artifact and the runner that took it.
+            "artifacts": []
+            if started is None
+            else [
+                {
+                    "file_type": "trace",
+                    "size": len(self.traces.get(job.id, "")),
+                    "filename": "job.log",
+                    "file_format": None,
+                }
+            ],
+            "artifacts_expire_at": None,
+            "runner": None if started is None else self._runner(),
+            "runner_manager": None if started is None else self._runner_manager(),
             "failure_reason": "script_failure" if job.status == "failed" else None,
             "tag_list": [],
             "archived": False,
@@ -1469,7 +1600,12 @@ class GitLabAPI:
                 {
                     "version": self.version,
                     "revision": "0a1b2c3d",
-                    "kas": {"enabled": False, "externalUrl": None, "version": None},
+                    "kas": {
+                        "enabled": False,
+                        "externalUrl": None,
+                        "externalK8sProxyUrl": None,
+                        "version": None,
+                    },
                     "enterprise": False,
                 },
             )
@@ -1505,6 +1641,8 @@ class GitLabAPI:
                 "last_used_at": iso(self.now),
                 "active": record.active,
                 "expires_at": record.expires_at,
+                "granular": False,
+                "last_used_ips": ["192.0.2.10"],
             },
         )
 
@@ -2014,6 +2152,12 @@ class GitLabAPI:
 
 BOT_ID = int(BOT.id)
 ROOT_ID = int(ROOT.id)
+_TIME_STATS = {
+    "time_estimate": 0,
+    "total_time_spent": 0,
+    "human_time_estimate": None,
+    "human_total_time_spent": None,
+}
 
 
 def _labels(value: Any) -> list[str]:

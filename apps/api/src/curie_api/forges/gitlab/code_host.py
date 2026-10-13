@@ -11,8 +11,10 @@ are checked. CI lives in `curie_api.forges.gitlab.ci`, review feedback in
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from typing import Any
 
 from curie_api.forges import types
@@ -22,7 +24,12 @@ from curie_api.forges.errors import Ambiguous, ForgeError, NotFound, Unauthorize
 from curie_api.forges.gitlab import review
 from curie_api.forges.gitlab.ci import GitLabCi
 from curie_api.forges.gitlab.comments import GitLabMarkedComments
-from curie_api.forges.gitlab.transport import GitLabTransport, encode_segment, parse_time
+from curie_api.forges.gitlab.transport import (
+    GitLabTransport,
+    decode,
+    encode_segment,
+    parse_time,
+)
 from curie_api.forges.types import (
     Actor,
     CiReport,
@@ -41,6 +48,8 @@ from curie_api.forges.types import (
     ReviewFeedback,
 )
 
+logger = logging.getLogger(__name__)
+
 CODE_HOST_CAPABILITIES: Mapping[Operation, Support] = dict.fromkeys(
     CODE_HOST_OPERATIONS, Support.SUPPORTED
 )
@@ -53,10 +62,36 @@ _STATES = {
 # The title prefixes GitLab reads as a draft; the factory writes ``Draft: ``.
 _DRAFT_PREFIX = re.compile(r"^\s*(?:draft:|\[draft\]|\(draft\))\s*", re.IGNORECASE)
 DRAFT_PREFIX = "Draft: "
+# GitLab can refuse a merge request for a branch pushed a moment ago with a 400
+# saying the source branch does not exist, until its branch cache catches up.
+# The waits before each retry; about 10 seconds in all.
+SOURCE_BRANCH_BACKOFF_S = (0.5, 1.0, 1.5, 2.0, 2.5, 2.5)
+Sleep = Callable[[float], Awaitable[None]]
 
 
 def _text(value: Any) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _source_branch_missing(response: Any) -> bool:
+    """Whether a 400 says the source branch does not exist: GitLab's
+    ``{"message": {"source_branch": ["does not exist"]}}``, or the same said in
+    a sentence. The text is only matched, never kept."""
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if isinstance(message, dict):
+        texts = message.get("source_branch")
+        texts = texts if isinstance(texts, list) else [texts]
+        return any(isinstance(t, str) and "does not exist" in t.lower() for t in texts)
+    texts = message if isinstance(message, list) else [message]
+    return any(
+        isinstance(t, str) and "source branch" in t.lower() and "does not exist" in t.lower()
+        for t in texts
+    )
 
 
 class GitLabCodeHost:
@@ -73,8 +108,11 @@ class GitLabCodeHost:
         web_base: str,
         credentials: StaticTokenProvider,
         repository: RepositoryRef | None = None,
+        sleep: Sleep = asyncio.sleep,
     ) -> None:
         self._transport = transport
+        # How `open_pull_request` waits between retries; a test replaces it.
+        self.sleep = sleep
         self.host = host
         self._web_base = web_base
         self._credentials = credentials
@@ -216,18 +254,34 @@ class GitLabCodeHost:
         body: str,
         draft: bool = False,
     ) -> PullRequest:
-        created = await self._transport.write(
-            "POST",
-            f"{self._project(repository)}/merge_requests",
-            json={
-                "source_branch": head_ref,
-                "target_branch": base_ref,
-                "title": f"{DRAFT_PREFIX}{title}" if draft else title,
-                "description": body,
-                "remove_source_branch": False,
-            },
-        )
-        return self._pull(repository, created)
+        """A 400 saying the just-pushed source branch does not exist is retried
+        after each `SOURCE_BRANCH_BACKOFF_S` wait, then raises
+        ``Unavailable("source_branch_not_ready")``. Any other 400 is
+        ``Unavailable("rejected")`` at once. Nothing is created on a 400, so
+        asking again cannot open a second merge request."""
+
+        path = f"{self._project(repository)}/merge_requests"
+        payload = {
+            "source_branch": head_ref,
+            "target_branch": base_ref,
+            "title": f"{DRAFT_PREFIX}{title}" if draft else title,
+            "description": body,
+            "remove_source_branch": False,
+        }
+        for wait in (*SOURCE_BRANCH_BACKOFF_S, None):
+            response = await self._transport.request("POST", path, json=payload, allow=(400,))
+            if response.status_code != 400:
+                created = decode(response)
+                if not isinstance(created, dict):
+                    raise Unavailable("malformed")
+                return self._pull(repository, created)
+            if not _source_branch_missing(response):
+                raise Unavailable("rejected")
+            if wait is None:
+                break
+            logger.info("GitLab has not yet seen the source branch; retrying the merge request")
+            await self.sleep(wait)
+        raise Unavailable("source_branch_not_ready")
 
     async def update_pull_request(
         self, pull_request: PullRequestRef, *, title: str | None, body: str | None
