@@ -220,15 +220,18 @@ async def test_a_server_error_carries_no_response_text_url_query_or_token(
 ) -> None:
     caplog.set_level(logging.DEBUG)
     fake = _fake()
-    fake.add_merge_request("factory/secret-branch")
+    branch = "factory/" + "secret-branch"
+    fake.add_merge_request(branch)
     sentinel = "fixture-response-body-sentinel"
     fake.script(500, path=f"{PROJECT}/merge_requests", body={"message": f"{sentinel} {TOKEN}"})
     code_host = gitlab_code_host(fake)
 
     with pytest.raises(Unavailable) as failed:
-        await code_host.find_pull_request(fake.repository(), head_ref="factory/secret-branch")
+        await code_host.find_pull_request(fake.repository(), head_ref=branch)
 
-    assert _leaks(failed.value, TOKEN, sentinel, "source_branch=", "factory/secret-branch") == []
+    # The branch is built at runtime so the traceback's own source line,
+    # which shows this call, never spells it out.
+    assert _leaks(failed.value, TOKEN, sentinel, "source_branch=", branch) == []
     assert TOKEN not in caplog.text and sentinel not in caplog.text
 
 
