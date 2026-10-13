@@ -86,7 +86,7 @@ def main():
         runs = spec["probes"]
         docker_cli = spec["docker_cli"] is True
     except (OSError, ValueError, KeyError, TypeError) as err:
-        print(f"curie: cannot read probes file {sys.argv[1]}: {err}", file=sys.stderr)
+        print(f"repo runner: cannot read probes file {sys.argv[1]}: {err}", file=sys.stderr)
         return 1
     out = sys.argv[2]
     tools = []
@@ -96,7 +96,7 @@ def main():
         if tool is None:
             failed = True
             joined = " ".join(run["command"])
-            print(f"curie: probe {run['name']} ({joined}) failed: {reason}", file=sys.stderr)
+            print(f"repo runner: probe {run['name']} ({joined}) failed: {reason}", file=sys.stderr)
             continue
         tools.append(tool)
     if failed:
