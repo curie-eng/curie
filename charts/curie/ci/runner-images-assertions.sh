@@ -347,6 +347,7 @@ values = {
     },
     "worker": {"attachments": {"enabled": True}},
     "factory": {
+        "docker": {"daemonImage": "registry.example.com/acme/curie-docker-daemon@" + digest("7")},
         "sandboxEgress": {"factory": True, "unused": False},
         "bindings": [{"name": "acme", "repos": [
             {"path": "acme-corp/api", "runner": copy.deepcopy(shared), "docker": {

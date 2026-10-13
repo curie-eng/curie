@@ -254,6 +254,7 @@ python3 - "$WORK/factory.yaml" "$WORK/tools.yaml" <<'PY'
 import sys, yaml
 doc = yaml.safe_load(open(sys.argv[1]))
 doc["factory"]["sandboxEgress"] = {"factory": True}
+doc["factory"]["docker"] = {"daemonImage": "registry.example.com/acme/curie-docker-daemon@sha256:" + "7" * 64}
 doc["agentSandbox"] = {"deploy": True, "controller": {"deploy": False}}
 repo = doc["factory"]["bindings"][0]["repos"][0]
 digest = lambda c: "sha256:" + c * 64
