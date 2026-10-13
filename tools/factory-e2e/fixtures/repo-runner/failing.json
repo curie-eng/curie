@@ -27,6 +27,9 @@
       "sandbox": "fixture-sandbox-x",
       "pod_uid": "00000000-0000-4000-8000-000000000001",
       "image_id": "docker-pullable://registry.example.com/acme-runner-x@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "spec_image": "registry.example.com/acme-runner-x@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "claim": "fixture-claim-x",
+      "retired_claims": [],
       "boot_log": "tool manifest loaded: 2 tools\n",
       "manifest_output": "{\"schema_version\":1,\"tools\":[{\"name\":\"uv\",\"version\":\"0.8.0\",\"path\":\"/usr/local/bin/uv\",\"source\":\"catalog\"},{\"name\":\"rust\",\"version\":\"1.90.0\",\"path\":\"/usr/local/bin/rustc\",\"source\":\"catalog\"}],\"docker_cli\":false}",
       "status": "completed",
@@ -40,6 +43,9 @@
       "sandbox": "fixture-sandbox-y",
       "pod_uid": "00000000-0000-4000-8000-000000000002",
       "image_id": "containerd://sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "spec_image": "registry.example.com/acme-runner-y@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "claim": "fixture-claim-y",
+      "retired_claims": ["fixture-claim-x"],
       "boot_log": "tool manifest loaded: 1 tools\n",
       "manifest_output": "{\"schema_version\":1,\"tools\":[{\"name\":\"pnpm\",\"version\":\"10.0.0\",\"path\":\"/usr/local/bin/pnpm\",\"source\":\"catalog\"}],\"docker_cli\":false}",
       "status": "completed",
@@ -48,7 +54,7 @@
       "new_claims": ["fixture-sandbox-y"]
     },
     {
-      "repository": "acme-corp/repo-missing-pool",
+      "repository": "acme-corp/repo-x",
       "thread": "fixture-missing-pool-thread",
       "sandbox": null,
       "pod_uid": null,
@@ -57,11 +63,12 @@
       "manifest_output": "",
       "status": "refused",
       "reason": "repo_runner_pool_missing",
+      "missing_pool_absent": true,
       "model_requests": 0,
       "new_claims": []
     },
     {
-      "repository": "acme-corp/repo-stale-base",
+      "repository": "acme-corp/repo-x",
       "thread": "fixture-stale-base-thread",
       "sandbox": null,
       "pod_uid": null,
@@ -70,6 +77,8 @@
       "manifest_output": "",
       "status": "refused",
       "reason": "repo_runner_base_mismatch",
+      "installed_base": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "configured_base": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
       "model_requests": 0,
       "new_claims": []
     }
