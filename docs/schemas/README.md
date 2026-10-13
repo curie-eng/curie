@@ -26,7 +26,10 @@ The worker owns the `CURIE_REPO_RUNNER_POOLS` contract in
 `build_schema()` and `render_schema()` in
 `apps/worker/src/curie_worker/repo_runner_pools.py`. It maps each bound repository
 path to one opaque Kubernetes pool name, three digests in index, amd64, arm64
-order, the base digest, the Docker flag and optional egress. Rendering the
-worker environment, naming pools per agent and digest, selecting a pool and
-starting a Docker daemon are later work. No worker environment reader or
-runtime consumer is added by these schemas.
+order, the base digest, the Docker flag and optional egress. The worker reads
+it at startup with `parse_repo_runner_pools()` and fails closed on invalid
+input. The Kubernetes sandbox substrate claims a bound repository's pool,
+refuses a missing pool or a runner built on another platform runner image, and
+replaces a retained runner whose image no longer matches. Rendering the worker
+environment in the chart, naming pools per agent and digest, and starting a
+Docker daemon are later work.

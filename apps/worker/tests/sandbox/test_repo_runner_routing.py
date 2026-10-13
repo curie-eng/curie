@@ -349,6 +349,26 @@ def test_policy_change_retires_the_route_and_claims_fresh(
     assert stored is not None and stored.handle.claim_name == second.claim_name
 
 
+def test_route_for_another_repository_is_never_reused_even_without_entries(
+    probing_k8s: PoolProbingFakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+) -> None:
+    # ADR 0216 decision 6: the repository must match before any reuse, with or
+    # without a pool entry. A caller naming no repository still adopts.
+    probing_k8s.warm_pools = frozenset({BASE_POOL})
+    substrate = _substrate(probing_k8s, affinity, config, {})
+    first = substrate.claim("T-other", workspace_repo=REPO)
+    assert substrate.claim("T-other", workspace_repo=REPO.upper()) == first
+    assert substrate.claim("T-other") == first
+
+    second = substrate.claim("T-other", workspace_repo="acme-corp/web")
+
+    assert second.claim_name != first.claim_name
+    assert first.claim_name in probing_k8s.deleted
+    assert second.workspace_repo == "acme-corp/web"
+
+
 def test_adopt_retires_a_route_whose_image_changed(
     probing_k8s: PoolProbingFakeSandboxClient,
     affinity: AffinityStore,

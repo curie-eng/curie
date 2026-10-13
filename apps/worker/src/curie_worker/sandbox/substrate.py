@@ -45,6 +45,7 @@ from ..binding import (
     SANDBOX_TOKEN_TTL_SECONDS,
     boot_token_facts,
 )
+from ..repo_runner_pools import RepoRunnerPool
 from ..workitem_dispatch import TerminationObservation
 from .affinity import AffinityStore
 from .docker import DockerSandboxClient
@@ -62,6 +63,7 @@ from .types import (
     NoRouteError,
     PressureScanResult,
     QuotaRejection,
+    RepoRunnerPoolRefused,
     RouteChangedError,
     RouteRecord,
     RouteState,
@@ -75,6 +77,7 @@ from .types import (
     agent_warm_pool_name,
     claim_warm_pool,
     is_executor_thread_key,
+    repo_runner_entry,
 )
 
 # The resume overlay writes these into the replacement claim's per-claim env, and
@@ -373,13 +376,23 @@ class SandboxSubstrate:
                         record.handle.sandbox_name,
                         request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
                     )
-                    if sandbox is not None and sandbox.operating_mode == "Running":
+                    # A refusal raised by the policy check propagates with the
+                    # route untouched: a refusal is a decision, not a fault.
+                    if (
+                        sandbox is not None
+                        and sandbox.operating_mode == "Running"
+                        and self._route_matches_runner(
+                            record.handle, workspace_repo, agent_name=agent_name
+                        )
+                    ):
                         if fresh_only:
                             raise RouteChangedError(thread_key)
                         self._affinity.touch(thread_key, self._config.route_ttl_seconds)
                         handle = record.handle
                         outcome = "reused"
                     else:
+                        # A stopped sandbox, or a runner image its repository's
+                        # policy no longer names (ADR 0216).
                         # Never hand back a stale route or let it win the fresh claim.
                         self._evict_stale(thread_key, record)
                 if handle is None:
@@ -543,6 +556,12 @@ class SandboxSubstrate:
             request_timeout_seconds=_CONTROL_REQUEST_TIMEOUT_S,
         )
         if sandbox is None or not sandbox.ready or sandbox.operating_mode != "Running":
+            self._evict_stale(thread_key, record)
+            return None
+
+        # A runner whose image its repository's entry no longer names is
+        # retired, so the caller's fresh claim boots the current one (ADR 0216).
+        if not self._route_matches_runner(record.handle, None):
             self._evict_stale(thread_key, record)
             return None
 
@@ -1419,6 +1438,90 @@ class SandboxSubstrate:
             return None
         return derived if present else None
 
+    def _repo_runner(
+        self, workspace_repo: str | None, *, agent_name: str | None = None
+    ) -> RepoRunnerPool | None:
+        """The repository's runner pool entry, checked usable, or None (ADR 0216).
+
+        None on the Docker substrate (no warm pools) and for a repository
+        without an entry, which keeps today's agent pool routing. An entry
+        built on another platform runner, or whose pool was not rendered,
+        raises RepoRunnerPoolRefused; an unreadable pool is transient.
+        """
+
+        if isinstance(self._k8s, DockerSandboxClient):
+            return None
+        found = repo_runner_entry(workspace_repo, self._config.repo_runner_pools)
+        if found is None:
+            return None
+        repo, entry = found
+        platform = self._config.platform_runner_digest
+        if platform is None or platform != entry.base:
+            raise RepoRunnerPoolRefused(
+                repo=repo,
+                pool=entry.pool,
+                reason="stale_base",
+                agent_name=agent_name,
+                base=entry.base,
+                platform_digest=platform,
+            )
+        probe = getattr(self._k8s, "warm_pool_exists", None)
+        if callable(probe):
+            try:
+                present = bool(probe(entry.pool))
+            except Exception as exc:
+                # Only the class: an API error body can carry object detail.
+                logger.warning(
+                    "could not read SandboxWarmPool %s (%s)", entry.pool, type(exc).__name__
+                )
+                raise KubeTransientError(f"could not read SandboxWarmPool {entry.pool}") from exc
+            if not present:
+                raise RepoRunnerPoolRefused(
+                    repo=repo, pool=entry.pool, reason="missing_pool", agent_name=agent_name
+                )
+        return entry
+
+    def _route_matches_runner(
+        self,
+        handle: SandboxHandle,
+        workspace_repo: str | None,
+        *,
+        agent_name: str | None = None,
+    ) -> bool:
+        """Whether a retained route still runs the image its repository needs.
+
+        A caller naming a repository never adopts a route prepared for another
+        one (or for none). The desired entry is the one for ``workspace_repo``,
+        or the route's own repository when the caller names none. With no
+        entry on either side the image matches, so an installation without
+        repository pools reuses as before. Docker has no repository pools.
+        """
+
+        if isinstance(self._k8s, DockerSandboxClient):
+            return True
+        if workspace_repo is not None and (
+            handle.workspace_repo is None
+            or handle.workspace_repo.casefold() != workspace_repo.casefold()
+        ):
+            return False
+        repo = workspace_repo if workspace_repo is not None else handle.workspace_repo
+        desired = self._repo_runner(repo, agent_name=agent_name)
+        if desired is None and handle.runner_digests is None:
+            return self._retained_runner_healthy(handle)
+        wanted = (None, False) if desired is None else (desired.digests, desired.docker)
+        if (handle.runner_digests, handle.runner_docker) != wanted:
+            return False
+        return self._retained_runner_healthy(handle)
+
+    def _retained_runner_healthy(self, handle: SandboxHandle) -> bool:
+        """Whether a retained repository runner may serve another turn.
+
+        Always True for now. The per-run Docker daemon ping from ADR 0217
+        lands here, so a route whose daemon died is replaced, not reused.
+        """
+
+        return True
+
     def _claim_fresh(
         self,
         thread_key: str,
@@ -1448,8 +1551,14 @@ class SandboxSubstrate:
 
         # Docker has no warm pools and passes connector secrets directly to
         # the runner. The rendered pool check applies only to Kubernetes.
+        # A repository bound to a runner pool (ADR 0216) claims that pool,
+        # checked before any credential is minted so a refusal has no side
+        # effects. A repository without one routes exactly as before.
+        runner = self._repo_runner(workspace_repo, agent_name=agent_name)
         if isinstance(self._k8s, DockerSandboxClient):
             pool = config.warm_pool
+        elif runner is not None:
+            pool = runner.pool
         else:
             pool = claim_warm_pool(
                 config.warm_pool,
@@ -1525,6 +1634,8 @@ class SandboxSubstrate:
             state_credential_id=credential_id,
             state_token_exp=credential_exp,
             bundle_ref=(env or {}).get(BUNDLE_REF_ENV),
+            runner_digests=None if runner is None else runner.digests,
+            runner_docker=False if runner is None else runner.docker,
         )
         if not publish:
             return handle
