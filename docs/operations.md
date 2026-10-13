@@ -391,6 +391,19 @@ rollout reasons. `--json` retains the same report object with `healthy: false`.
 The check compares the installed Helm target with live workload generations,
 replica counts and serving pod images; an `Available` condition alone is insufficient.
 
+Terminal pods do not count as replicas. A kubelet-initiated termination, such
+as a node-pressure eviction or a graceful node shutdown, leaves the pod object
+behind in phase `Succeeded` or `Failed`, and its ReplicaSet does not delete it.
+`cluster upgrade` converge, `cluster up` and `cluster status` treat an install
+whose only extra pods are terminal and not terminating as converged.
+`cluster status` still lists those pods in its pod table but no longer counts
+them, so it exits 0 with `healthy: true` where it used to exit 1, and
+`cluster up` completes its convergence wait instead of failing it. A terminal
+pod that is terminating, or an active surplus pod, still fails the check. The
+CLI does not delete terminal pods; remove them with `kubectl delete pod -n <namespace> <name>`,
+or `kubectl delete pods -n <namespace> --field-selector=status.phase==Failed`
+for the failed ones.
+
 A diagnosis the command could not MAKE is a warning, not a failure. When the
 mail adapter is deployed but its `/statusz` cannot be read -- the pod proxy is
 unreachable, the pod is restarting, the adapter predates that endpoint -- the
