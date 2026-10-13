@@ -57,6 +57,7 @@ pub mod release_accept;
 pub mod remediation;
 pub mod remediation_policy;
 pub mod render;
+pub mod repo_runner;
 pub mod retired;
 pub mod runner;
 pub mod scaffold;

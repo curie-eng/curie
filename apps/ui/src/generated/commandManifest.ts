@@ -9880,7 +9880,15 @@ export const commandManifest = {
         },
         {
           "global": false,
-          "help": "Push every declared platform (or the `--platform` subset) to this registry (e.g. ghcr.io/acme-corp)",
+          "help": "Build a repository runner image from this input file (YAML or JSON; requires `--registry`). Needs a docker-container builder (`docker buildx use` or `BUILDX_BUILDER`) for the two-platform push",
+          "id": "repo_runner",
+          "long": "repo-runner",
+          "positional": false,
+          "required": false
+        },
+        {
+          "global": false,
+          "help": "Push every declared platform (or the `--platform` subset) to this registry (e.g. ghcr.io/acme-corp). With `--repo-runner`, the registry the repository runner image is pushed to",
           "id": "registry",
           "long": "registry",
           "positional": false,
@@ -9888,7 +9896,7 @@ export const commandManifest = {
         },
         {
           "global": false,
-          "help": "The platform runner a declared runner layer builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
+          "help": "The platform runner a declared runner layer or a repository runner builds on (default: the runner `curie skill up` uses). Resolved to a digest before building",
           "id": "runner_image",
           "long": "runner-image",
           "positional": false,
@@ -9916,7 +9924,7 @@ export const commandManifest = {
         }
       ],
       "hidden": false,
-      "long_about": "Build the runner image, or an agent bundle's declared connectors.\n\nWith no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root (source checkout only; a release binary pulls the pinned runner image from GHCR automatically and never needs this).\n\nWith `--plugin-dir <PATH>` it builds every connector that bundle's `connectors.yaml` declares from source and writes `connectors.lock.yaml` beside it. With `--registry <REF>` it builds every declared platform, pushes, and records the registry manifest digest, which is what a cluster deploy requires. Without `--registry` it builds the host platform only into the local Docker daemon and records the local image id, which is usable at the skill and local tiers and refused at cluster.",
+      "long_about": "Build the runner image, or an agent bundle's declared connectors.\n\nWith no flags it runs `docker build -f runner/Dockerfile -t <tag> .` from the repo root (source checkout only; a release binary pulls the pinned runner image from GHCR automatically and never needs this).\n\nWith `--plugin-dir <PATH>` it builds every connector that bundle's `connectors.yaml` declares from source and writes `connectors.lock.yaml` beside it. With `--registry <REF>` it builds every declared platform, pushes, and records the registry manifest digest, which is what a cluster deploy requires. Without `--registry` it builds the host platform only into the local Docker daemon and records the local image id, which is usable at the skill and local tiers and refused at cluster.\n\nWith `--repo-runner <PATH> --registry <REF>` it builds a repository runner image (ADR 0216) from a YAML or JSON input file naming catalog `tools`, an optional `dockerfile` beside the file built on `${CURIE_RUNNER_IMAGE}`, and extra `probes`. Both linux/amd64 and linux/arm64 are built in one buildx bake, every tool is probed inside the image (a failing probe fails the build), the probe manifest lands at /etc/curie/tool-manifest.json, and the image is pushed to `<REF>/curie-repo-runner`. It prints the `runner` block to paste under `factory.bindings[].repos[].runner`. The multi-platform push needs a docker-container builder: select one with `docker buildx use` or `BUILDX_BUILDER`.",
       "name": "build"
     },
     {

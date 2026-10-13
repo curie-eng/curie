@@ -2490,3 +2490,93 @@ fn cluster_upgrade_parses_allow_stock_layer_clear() {
         _ => panic!("expected cluster upgrade"),
     }
 }
+
+#[test]
+fn build_repo_runner_parses_with_registry() {
+    let cli = try_parse_from([
+        "curie",
+        "build",
+        "--repo-runner",
+        "r.yaml",
+        "--registry",
+        "localhost:5000",
+    ])
+    .expect("build --repo-runner --registry should parse");
+    match cli.command {
+        Some(Command::Build {
+            repo_runner,
+            registry,
+            plugin_dir,
+            ..
+        }) => {
+            assert_eq!(repo_runner, Some(std::path::PathBuf::from("r.yaml")));
+            assert_eq!(registry.as_deref(), Some("localhost:5000"));
+            assert!(plugin_dir.is_none());
+        }
+        _ => panic!("expected build command"),
+    }
+    assert!(try_parse_from([
+        "curie",
+        "build",
+        "--repo-runner",
+        "r.yaml",
+        "--registry",
+        "localhost:5000",
+        "--runner-image",
+        "ghcr.io/curie-eng/curie-runner:dev",
+    ])
+    .is_ok());
+}
+
+#[test]
+fn build_repo_runner_requires_registry() {
+    assert!(
+        try_parse_from(["curie", "build", "--repo-runner", "r.yaml"]).is_err(),
+        "--repo-runner without --registry must be refused"
+    );
+}
+
+#[test]
+fn build_repo_runner_conflicts_with_connector_build_flags() {
+    for extra in [
+        &["--plugin-dir", "x"][..],
+        &["--tag", "my-runner:dev"][..],
+        &["--force"][..],
+        &["--platform", "linux/arm64"][..],
+    ] {
+        let mut argv = vec![
+            "curie",
+            "build",
+            "--repo-runner",
+            "r.yaml",
+            "--registry",
+            "r",
+        ];
+        argv.extend_from_slice(extra);
+        assert!(
+            try_parse_from(argv).is_err(),
+            "--repo-runner must refuse {extra:?}"
+        );
+    }
+}
+
+#[test]
+fn build_plugin_dir_registry_still_parses() {
+    let cli = try_parse_from(["curie", "build", "--plugin-dir", "x", "--registry", "r"])
+        .expect("--plugin-dir --registry is unchanged");
+    match cli.command {
+        Some(Command::Build {
+            repo_runner,
+            plugin_dir,
+            ..
+        }) => {
+            assert!(repo_runner.is_none());
+            assert_eq!(plugin_dir, Some(std::path::PathBuf::from("x")));
+        }
+        _ => panic!("expected build command"),
+    }
+    assert!(
+        try_parse_from(["curie", "build", "--registry", "r"]).is_err(),
+        "--registry alone still needs a build input"
+    );
+}

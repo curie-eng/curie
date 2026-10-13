@@ -6,11 +6,12 @@ source for `tool-manifest.schema.json` and `tool-catalog-entry.schema.json`.
 Export them with `manifest_schema()` and `catalog_entry_schema()`, then write
 JSON with sorted keys, two-space indentation and a trailing newline.
 
-The CLI will produce `/etc/curie/tool-manifest.json` during a repository runner <!-- doclint:ignore-line -->
+The CLI produces `/etc/curie/tool-manifest.json` during a repository runner <!-- doclint:ignore-line -->
 image build, and the runner will read it from that image. Catalog entries declare pinned
 platform source images, cache paths under the writable `/home/runner`, registry
-hosts and version probe argv. These contracts do not yet build images or run
-probes, and no pinned catalog entries are supplied here.
+hosts and version probe argv. Catalog v1 lives in `cli/src/tool_catalog_v1.json`,
+and `curie build --repo-runner` builds an image from it, runs the probes and
+writes the manifest.
 
 Repository runner declarations require an index image pin, a platform runner
 base digest and both `linux/amd64` and `linux/arm64` digests. Image pins accept

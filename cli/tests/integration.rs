@@ -145,6 +145,7 @@ mod remediation_policy_cli;
 mod remediation_receipts_cli;
 mod remediation_vectors;
 mod remote_dev_workspace;
+mod repo_runner;
 mod resume_wait;
 mod runner_layer_build;
 mod runner_stream;

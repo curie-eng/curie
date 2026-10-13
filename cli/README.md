@@ -875,6 +875,46 @@ Only product behavior assertions belong in the test body.
 | Command | What it does |
 |---|---|
 | `curie build` | Build the runner image locally from `runner/Dockerfile` at the repo root. Default tag is `curie-runner`; the same image is also tagged `ghcr.io/curie-eng/curie-runner:dev` so a `curie local up --build` stack sees it. `--tag` overrides the primary tag (a custom tag is not also applied as `:dev`). Prints a clear error if Docker is not installed or if run outside a source checkout -- a release binary pulls the pinned runner image from GHCR automatically and never needs to build. |
+| `curie build --repo-runner <PATH> --registry <REF> [--runner-image <REF>]` | Build, probe and push a repository runner image (ADR 0216). Works from a release binary; no source checkout needed. |
+
+#### Repository runner images
+
+`curie build --repo-runner runner.yaml --registry ghcr.io/acme-corp` builds the
+image a factory binding runs a repository's work in. The input file is YAML or
+JSON with three optional keys:
+
+```yaml
+tools: [uv, rust]              # catalog v1: uv, rust, pnpm, build-essential, docker-cli
+dockerfile: ci/Dockerfile.runner
+probes:
+  - name: terraform
+    command: [terraform, version]
+```
+
+`tools` selects pinned catalog entries (`cli/src/tool_catalog_v1.json`).
+`dockerfile` is a path inside the input file's directory, which is also its
+build context; its first `FROM` must be `${CURIE_RUNNER_IMAGE}`, which resolves
+to the platform runner with the catalog tools already layered on. `probes` adds
+version checks for tools the Dockerfile installs. Unknown keys and tools,
+duplicates, and a Dockerfile outside the directory are refused before anything
+builds.
+
+The platform runner (`--runner-image`, default the runner `curie skill up`
+uses) is resolved to a digest first. One `docker buildx bake` then builds
+`linux/amd64` and `linux/arm64`, runs every catalog and declared probe inside
+the image as its own user, and writes the results to
+`/etc/curie/tool-manifest.json`. A missing tool, a nonzero exit or a probe with
+no output fails the build and names the probe. The image is pushed as
+`<REF>/curie-repo-runner:r-<16 hex>`, where the tag is a convenience name
+derived from the inputs; the pushed index digest is the identity the binding
+records. The command prints the `runner` block (`tools`, `image`, `base`,
+`platformDigests`, plus `dockerfile` and `probes` when set) to paste under
+`factory.bindings[].repos[].runner` in the Helm values; `--json` emits it with
+the platform runner reference, catalog version and manifest path.
+
+The two-platform push needs a docker-container builder. Create one with
+`docker buildx create --driver docker-container --use`, or point
+`BUILDX_BUILDER` at an existing one. Docker's default driver refuses the push.
 
 ### Prototyping agents in a source checkout
 
