@@ -12,24 +12,31 @@
 #       acme-corp/web docker without one, acme-corp/ui no docker) render, in
 #       the <release-namespace>-<fullname>-docker namespace: the privileged PSA
 #       Namespace, the worker Role (exact rules) and RoleBinding, the
-#       ResourceQuota and LimitRange from values, the default-deny, DNS,
+#       ResourceQuota and LimitRange (max, min, default, defaultRequest) from values, the default-deny, DNS,
 #       public and per-repository NetworkPolicies (exact shapes, class label
 #       repo-<sha256(path)[:16]>), the Rail 1 sandbox-to-daemon allow in the
 #       release namespace, and three ValidatingAdmissionPolicies with Deny
 #       bindings and failurePolicy Fail. createNamespace=false, a namespace
 #       override, a port override and an allowlist-only fixture are covered.
 #   (c) Structural CEL checks (no CEL evaluator is installed): every pods
-#       policy rule's text is present (worker username, labels and egress
-#       classes, dockerd name and image digest literal, userns and authz
-#       plugin flags, privilege and capabilities, service account token,
-#       emptyDir sizeLimit and secret volumes, host namespaces and ports,
-#       resources, activeDeadlineSeconds) and every validation has a message.
-#       The cluster proof covers CEL behaviour.
+#       policy rule's fragments are present together in ONE validation entry
+#       (worker username, labels and egress classes, dockerd name and image
+#       digest literal, no initContainers, no lifecycle hooks or exec probes,
+#       dockerd mounts only at /var/lib/docker and /certs with no '..' and no
+#       volumeDevices, userns and authz plugin flags, privilege and
+#       capabilities, service account token, emptyDir sizeLimit and secret
+#       volumes, host namespaces and ports, positive quantity() resources and
+#       sizeLimit, activeDeadlineSeconds); the objects policy checks every
+#       per-run ingress peer (namespaceSelector on the release namespace,
+#       runner-sandbox podSelector, no ipBlock, the daemon port); the pods
+#       policy also matches pods/ephemeralcontainers UPDATE; no validation in
+#       the three policies short-circuits with `true ||` or `|| true`; and
+#       every validation has a message. The cluster proof covers CEL behaviour.
 #   (d) templates/runner-resources-admission.yaml renders byte-identical with
 #       and without every docker block and factory.docker.
 #   (e) NEGATIVE: missing daemonImage, tag-only daemonImage, a 0.0.0.0/0
-#       allowlist entry, port 0 and 65536, and missing quota.hard or
-#       limitRange fail render, and stderr names the key. (Kubernetes < 1.30 is
+#       allowlist entry, port 0 and 65536, and missing quota.hard,
+#       limitRange or limitRange.min fail render, and stderr names the key. (Kubernetes < 1.30 is
 #       not asserted here: runner-resources-admission.yaml already refuses it
 #       for every render a docker repository needs.)
 #   (f) A security.networkPolicy.clusterCidrs entry appears in the public
@@ -186,8 +193,8 @@ if strs(quota["spec"].get("hard")) != strs(docker_values["quota"]["hard"]):
 limits = find("LimitRange", f"{FULL}-docker-daemon")
 in_ns(limits, ns)
 lr = docker_values["limitRange"]
-want_item = {"type": "Container", "max": strs(lr["max"]), "default": strs(lr["default"]),
-             "defaultRequest": strs(lr["defaultRequest"])}
+want_item = {"type": "Container", "max": strs(lr["max"]), "min": strs(lr["min"]),
+             "default": strs(lr["default"]), "defaultRequest": strs(lr["defaultRequest"])}
 items = limits["spec"].get("limits", [])
 if len(items) != 1 or {k: (strs(v) if isinstance(v, dict) else v) for k, v in items[0].items()} != want_item:
     fail(f"LimitRange limits {items} != [{want_item}]")
@@ -308,13 +315,29 @@ def policy(suffix, want_rules, want_sa):
     b = find("ValidatingAdmissionPolicyBinding", name)
     if b["spec"].get("policyName") != name or b["spec"].get("validationActions") != ["Deny"]:
         fail(f"{name} binding {b['spec']}")
-    return " ".join(" ".join(v["expression"].split()) for v in validations), validations
+    exprs = [" ".join(str(v["expression"]).split()) for v in validations]
+    # F7: a validation that short-circuits to true checks nothing.
+    for e in exprs:
+        if "true ||" in e or "|| true" in e:
+            fail(f"{name} validation short-circuits to true: {e}")
+    return " ".join(exprs), exprs
 
 
-pods_text, pods_validations = policy("pods", {("", "pods", "CREATE"), ("", "pods", "UPDATE")}, False)
-objects_text, _ = policy("objects", {("", "services", "CREATE"), ("", "secrets", "CREATE"),
-                                     ("networking.k8s.io", "networkpolicies", "CREATE")}, True)
-cleanup_text, _ = policy("cleanup", {("networking.k8s.io", "networkpolicies", "DELETE")}, True)
+def in_one_validation(policy_name, exprs, group, needles):
+    # Every fragment of a rule must sit in the same validation entry, so a
+    # fragment stranded in an unrelated expression cannot satisfy the check.
+    if not any(all(n in e for n in needles) for e in exprs):
+        missing = {e[:80]: [n for n in needles if n not in e] for e in exprs}
+        best = min(missing.items(), key=lambda kv: len(kv[1]))
+        fail(f"{policy_name} policy ({group}): no single validation holds all of {needles}; "
+             f"closest lacks {best[1]}")
+
+
+pods_text, pods_validations = policy("pods", {("", "pods", "CREATE"), ("", "pods", "UPDATE"),
+                                              ("", "pods/ephemeralcontainers", "UPDATE")}, False)
+objects_text, objects_validations = policy("objects", {("", "services", "CREATE"), ("", "secrets", "CREATE"),
+                                                       ("networking.k8s.io", "networkpolicies", "CREATE")}, True)
+cleanup_text, cleanup_validations = policy("cleanup", {("networking.k8s.io", "networkpolicies", "DELETE")}, True)
 
 # (c) structural CEL checks on the pods policy.
 if len(pods_validations) < 10:
@@ -326,30 +349,48 @@ need = {
     "selector labels": ["app.kubernetes.io/component", "'docker-daemon'", "app.kubernetes.io/name",
                         "'curie'", "app.kubernetes.io/instance", "'t'"],
     "egress label": ["curietech.ai/docker-egress"] + [f"'{c}'" for c in classes],
-    "dockerd": ["'dockerd'", f"'{image}'", "initContainers", "ephemeralContainers"],
+    "dockerd": ["'dockerd'", f"'{image}'"],
+    "no ephemeral containers": ["!has(object.spec.ephemeralContainers)"],
+    "no init containers": ["!has(object.spec.initContainers)"],
+    "lifecycle and exec probes": ["lifecycle", "livenessProbe", "readinessProbe", "startupProbe", "exec"],
+    "mounts": ["volumeMounts", "'/var/lib/docker'", "'/certs", "'..'", "volumeDevices"],
     "command override": ["command"],
     "args": ["args", "'--userns-remap=default'", "'--authorization-plugin=curie-authz'"],
     "privilege": ["privileged", "capabilities"],
     "service account token": ["automountServiceAccountToken", "== false", "serviceAccountToken", "serviceAccountName"],
     "volumes": ["volumes", "emptyDir", "sizeLimit", "secret"],
+    "positive sizeLimit": ["emptyDir", "sizeLimit", "quantity(", "isGreaterThan(quantity('0'))"],
     "host access": ["hostNetwork", "hostPID", "hostIPC", "hostPort"],
     "resources": ["'cpu'", "'memory'", "'ephemeral-storage'", "requests", "limits"],
+    "positive resources": ["'cpu'", "'memory'", "'ephemeral-storage'", "requests", "limits",
+                           "quantity(", "isGreaterThan(quantity('0'))"],
     "deadline": ["activeDeadlineSeconds"],
 }
 for rule, needles in need.items():
-    for n in needles:
-        if n not in pods_text:
-            fail(f"pods policy ({rule}) lacks {n!r}")
+    in_one_validation("pods", pods_validations, rule, needles)
+# F2: init containers are refused outright, so no validation may admit them
+# conditionally or iterate over them.
+for n in ["!has(object.spec.initContainers) ||", "initContainers.all(", "initContainers.exists("]:
+    if n in pods_text:
+        fail(f"pods policy still admits init containers conditionally ({n!r})")
 for c in non_classes:
     if c in pods_text:
         fail(f"pods policy admits egress class {c} for a repository without an allowlist")
-for n in ["curietech.ai/sandbox-claim", "'curie-sandbox-substrate'", "['Ingress']", "egress",
-          "podSelector", "Opaque", "'kubernetes.io/tls'", "ClusterIP", "externalIPs"]:
-    if n not in objects_text:
-        fail(f"objects policy lacks {n!r}")
-for n in ["oldObject.metadata.labels", "'curietech.ai/sandbox-claim'"]:
-    if n not in cleanup_text:
-        fail(f"cleanup policy lacks {n!r}")
+objects_need = {
+    "claim and managed-by labels": ["curietech.ai/sandbox-claim", "'curie-sandbox-substrate'"],
+    "ingress-only per-claim policy": ["['Ingress']", "egress", "podSelector"],
+    # F3: every ingress rule names its peers, each peer is this release's
+    # runner sandbox in the release namespace, never an ipBlock, on the daemon port.
+    "ingress peers": ["ingress", "from", "namespaceSelector", "kubernetes.io/metadata.name", f"'{REL_NS}'",
+                      "podSelector", "'runner-sandbox'", "app.kubernetes.io/instance", "ipBlock", "ports",
+                      str(port)],
+    "secret type": ["Opaque", "'kubernetes.io/tls'"],
+    "service type": ["ClusterIP", "externalIPs"],
+}
+for rule, needles in objects_need.items():
+    in_one_validation("objects", objects_validations, rule, needles)
+in_one_validation("cleanup", cleanup_validations, "claim label",
+                  ["oldObject.metadata.labels", "'curietech.ai/sandbox-claim'"])
 
 # Every docker object lands in the daemon namespace or is cluster scoped/Rail 1.
 for d in docs:
@@ -387,6 +428,7 @@ quota = {
 }
 limit_range = {
     "max": {"cpu": "4", "memory": "8Gi", "ephemeral-storage": "40Gi"},
+    "min": {"cpu": "100m", "memory": "256Mi", "ephemeral-storage": "1Gi"},
     "default": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "20Gi"},
     "defaultRequest": {"cpu": "500m", "memory": "1Gi", "ephemeral-storage": "10Gi"},
 }
@@ -480,5 +522,6 @@ expect_fail "factory.docker.port" -f "$TMP/docker-values.json" --set factory.doc
 expect_fail "factory.docker.port" -f "$TMP/docker-values.json" --set factory.docker.port=65536
 expect_fail "factory.docker.quota.hard" -f "$TMP/docker-values.json" --set-json 'factory.docker.quota.hard=null'
 expect_fail "factory.docker.limitRange" -f "$TMP/docker-values.json" --set-json 'factory.docker.limitRange=null'
+expect_fail "factory.docker.limitRange.min" -f "$TMP/docker-values.json" --set-json 'factory.docker.limitRange.min=null'
 
 echo "PASS: docker-daemon assertions"
