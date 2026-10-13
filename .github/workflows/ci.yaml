@@ -845,6 +845,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: cli
+          shared-key: curie-cli-release
       - name: Release build
         run: cargo build --release --locked
       - name: Upload curie binary
@@ -2138,6 +2139,7 @@ jobs:
       local: ${{ steps.filter.outputs.local }}
       local_release: ${{ steps.filter.outputs.local_release }}
       cluster: ${{ steps.filter.outputs.cluster }}
+      chart_scenarios: ${{ steps.filter.outputs.chart_scenarios }}
       released_upgrade: ${{ steps.filter.outputs.released_upgrade }}
       released_upgrade_full: ${{ steps.filter.outputs.released_upgrade_full }}
       skill_local_tiers: ${{ steps.filter.outputs.skill_local_tiers }}
@@ -2641,8 +2643,9 @@ jobs:
   # CHART RUNTIME REGRESSIONS, in parallel with the cluster rung. Most
   # regression proofs use this job's enforcing Calico cluster. The workspace
   # regression also uses the release CLI and candidate product images built
-  # by the upstream jobs. This job is selected by the same cluster tier
-  # (every charts/ change), and `E2E required` needs it: the Langfuse readiness
+  # by the upstream jobs. The selector chooses each proof from its inputs
+  # whenever the cluster tier is selected, and `E2E required` needs the job:
+  # the Langfuse readiness
   # assertion and the connector readiness probe are registered runtime
   # assertions (#3391), and a failure here reddens the required verdict exactly
   # as the rung does. Proofs using this job's cluster each own their namespace.
@@ -2650,7 +2653,7 @@ jobs:
     name: E2E chart runtime regressions (kind, Calico)
     runs-on: ubuntu-latest
     needs: [rust-build, changes, ci-images]
-    if: ${{ needs.changes.outputs.cluster == 'true' }}
+    if: ${{ needs.changes.outputs.chart_scenarios != '[]' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -2756,6 +2759,7 @@ jobs:
           set -euo pipefail
           install -m 600 /home/runner/.kube/config "$KUBECONFIG"
       - name: Installation identity Secret lifecycle
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'installation-identity') }}
         env:
           KUBECONFIG: ${{ runner.temp }}/curie-upgrade-drain-kubeconfig
           CURIE_UPGRADE_DRAIN_KIND_CONTEXT: kind-curie-e2e
@@ -2767,6 +2771,7 @@ jobs:
       # API server of 1.30 or newer, which this kind node image is. The script
       # names every object from RUN_ID and deletes them on exit.
       - name: End to end connector identity is denied outside its scope
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-identity') }}
         env:
           CURIE_E2E_IDENTITY_CONTEXT: kind-curie-e2e
           RUN_ID: ${{ github.run_id }}${{ github.run_attempt }}
@@ -2777,6 +2782,7 @@ jobs:
       # Per-agent runner resources (#3209, #3485). A render assertion that
       # lives under ci/runtime, so it runs here through the receipt runner.
       - name: Per-agent runner resource override renders
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-resources-render') }}
         run: |
           set -euo pipefail
           bash tools/runtime-assertion-gate/run.sh \
@@ -2784,6 +2790,7 @@ jobs:
       - name: Load the Postgres readiness fixture into the kind cluster
         run: kind load docker-image "curie-postgres-readiness:${GITHUB_SHA}" --name curie-e2e
       - name: Langfuse web waits for delayed Postgres without restarting
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'langfuse-postgres-readiness') }}
         env:
           READINESS_NAMESPACE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
           READINESS_RELEASE: curie-1853-${{ github.run_id }}-${{ github.run_attempt }}
@@ -2817,6 +2824,7 @@ jobs:
       # job's kube context is kind-curie-e2e and must be passed explicitly.
       # The namespace is this run's id so a retry does not reuse a leftover.
       - name: Connector that never listens stays not-Ready until it binds
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'connector-readiness') }}
         env:
           CONNECTOR_READINESS_CONTEXT: kind-curie-e2e
           CONNECTOR_READINESS_NAMESPACE: c3338-${{ github.run_id }}-${{ github.run_attempt }}
@@ -2831,12 +2839,14 @@ jobs:
       # adapter check: a non-enforcing CNI FAILS, it does not skip. Own
       # namespace, so it neither reads nor disturbs the release above.
       - name: Runner BYO egress enforces (not just rendered)
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'runner-byo-egress') }}
         run: bash scripts/check-runner-byo-egress.sh charts/curie
       # The actual packaged-chart hooks must judge a no-restart upgrade and
       # still reject an informer RBAC failure (#4197). The scenario owns and
       # tears down its separate kind cluster; render assertions alone cannot
       # prove Helm leaves a serving release deployed.
       - name: Controller preflight accepts a serving upgrade and refuses broken RBAC
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'controller-preflight') }}
         run: |
           set -euo pipefail
           uv run bash charts/curie/ci/scenarios/controller-preflight-kind.sh
@@ -2861,6 +2871,7 @@ jobs:
             curie-worker:wsdiag-${{ github.sha }} \
             curie-runner:wsdiag-${{ github.sha }} --name curie-e2e
       - name: Workspace dependency failure reaches the terminal diagnostic
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'workspace-diagnostic') }}
         timeout-minutes: 30
         env:
           CURIE_BIN: ${{ github.workspace }}/cli/target/release/curie
@@ -2874,6 +2885,7 @@ jobs:
           bash tools/runtime-assertion-gate/run.sh \
             charts/curie/ci/runtime/workspace-dependency-diagnostic-runtime.sh
       - name: Quota progress regression
+        if: ${{ contains(fromJSON(needs.changes.outputs.chart_scenarios), 'quota-progress') }}
         timeout-minutes: 30
         run: |
           set -euo pipefail
@@ -4217,6 +4229,7 @@ jobs:
           LOCAL_SELECTED: ${{ needs.changes.outputs.local }}
           LOCAL_RELEASE_SELECTED: ${{ needs.changes.outputs.local_release }}
           CLUSTER_SELECTED: ${{ needs.changes.outputs.cluster }}
+          CHART_SCENARIOS: ${{ needs.changes.outputs.chart_scenarios }}
           RELEASED_UPGRADE_SELECTED: ${{ needs.changes.outputs.released_upgrade }}
           RELEASED_UPGRADE_FULL: ${{ needs.changes.outputs.released_upgrade_full }}
           APPROVAL_RESUME_SELECTED: ${{ needs.changes.outputs.approval_resume }}
@@ -4239,7 +4252,7 @@ jobs:
             if [[ "$SKILL_LOCAL_RESULT" != "$skill_local_expected" ||
                   "$LOCAL_RELEASE_RESULT" != "$local_release_expected" ||
                   "$CLUSTER_RESULT" != "$cluster_expected" ||
-                  "$CLUSTER_CHART_RESULT" != "$cluster_expected" ||
+                  "$CLUSTER_CHART_RESULT" != "$cluster_chart_expected" ||
                   "$ROLLOUT_RECOVERY_RESULT" != "$rollout_recovery_expected" ||
                   "$APPROVAL_RESUME_RESULT" != "$approval_resume_expected" ||
                   "$FACTORY_RESULT" != "$factory_expected" ||
@@ -4257,6 +4270,8 @@ jobs:
                 ( "$LOCAL_SELECTED" != "true" && "$LOCAL_SELECTED" != "false" ) ||
                 ( "$LOCAL_RELEASE_SELECTED" != "true" && "$LOCAL_RELEASE_SELECTED" != "false" ) ||
                 ( "$CLUSTER_SELECTED" != "true" && "$CLUSTER_SELECTED" != "false" ) ||
+                "$CHART_SCENARIOS" != \[*\] ||
+                ( "$CHART_SCENARIOS" != "[]" && "$CLUSTER_SELECTED" == "false" ) ||
                 ( "$RELEASED_UPGRADE_SELECTED" != "true" && "$RELEASED_UPGRADE_SELECTED" != "false" ) ||
                 ( "$RELEASED_UPGRADE_FULL" != "true" && "$RELEASED_UPGRADE_FULL" != "false" ) ||
                 ( "$APPROVAL_RESUME_SELECTED" != "true" && "$APPROVAL_RESUME_SELECTED" != "false" ) ||
@@ -4277,6 +4292,10 @@ jobs:
           cluster_expected="skipped"
           if [[ "$CLUSTER_SELECTED" == "true" ]]; then
             cluster_expected="success"
+          fi
+          cluster_chart_expected="skipped"
+          if [[ "$CHART_SCENARIOS" != "[]" ]]; then
+            cluster_chart_expected="success"
           fi
           # Mirrors the rollout recovery job's if: pushes and dispatches only.
           rollout_recovery_expected="skipped"

@@ -94,7 +94,7 @@ import urllib.request
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 GITHUB_API = "https://api.github.com"
 GHCR = "https://ghcr.io"
@@ -670,7 +670,7 @@ def load_config(
         model=model,
         model_context_tokens=model_context_tokens,
         bundle_dir=bundle_dir,
-        curie_bin=env.get("CURIE_FACTORY_CURIE_BIN") or "curie",
+        curie_bin=env.get("CURIE_BIN") or "curie",
         layer_registry=layer_registry,
         operator_login=env.get("CURIE_FACTORY_OPERATOR_LOGIN") or None,
         model_base_url=env.get("CURIE_FACTORY_MODEL_BASE_URL") or None,
@@ -1060,8 +1060,8 @@ def quota_hard_pods(listing: Mapping[str, Any]) -> str | None:
     for item in items:
         if not isinstance(item, dict):
             continue
-        spec = item.get("spec") if isinstance(item.get("spec"), dict) else {}
-        hard = spec.get("hard") if isinstance(spec.get("hard"), dict) else {}
+        spec = item["spec"] if isinstance(item.get("spec"), dict) else {}
+        hard = spec["hard"] if isinstance(spec.get("hard"), dict) else {}
         pods = hard.get("pods")
         if isinstance(pods, str) and pods.strip():
             return pods.strip()
@@ -1479,6 +1479,40 @@ def run(argv: list[str], *, check: bool = True, input_text: str | None = None) -
     return result.stdout
 
 
+def resolve_curie_binary(binary: str) -> tuple[str, str]:
+    try:
+        if os.path.dirname(binary):
+            path = Path(binary)
+            resolved = str(path) if path.is_file() and os.access(path, os.X_OK) else None
+        else:
+            resolved = shutil.which(binary)
+        if resolved is None:
+            raise ConfigError(f"CURIE_BIN {binary!r} cannot be resolved to an executable")
+        curie_bin = str(Path(resolved).resolve())
+    except (OSError, RuntimeError):
+        raise ConfigError(f"CURIE_BIN {binary!r} cannot be resolved to an executable") from None
+    try:
+        result = subprocess.run(
+            [curie_bin, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        raise ConfigError(f"CURIE_BIN {curie_bin!r} could not run --version") from None
+    if result.returncode:
+        raise ConfigError(
+            f"CURIE_BIN {curie_bin!r} failed --version (exit {result.returncode})"
+        )
+    lines = result.stdout.splitlines()
+    version = lines[0] if lines else ""
+    if not version.strip():
+        raise ConfigError(f"CURIE_BIN {curie_bin!r} did not report a version")
+    print(f"factory-e2e: curie binary {curie_bin} ({version})", file=sys.stderr, flush=True)
+    return curie_bin, version
+
+
 def http_json(
     method: str,
     url: str,
@@ -1761,7 +1795,6 @@ class Preflight:
             "git",
             "openssl",
             self.config.cloudflared,
-            self.config.curie_bin,
         ]
         absent = [tool for tool in wanted if shutil.which(tool) is None]
         if absent:
@@ -2862,7 +2895,7 @@ class Preflight:
         for pod in listing.get("items") or []:
             if not isinstance(pod, dict):
                 continue
-            status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+            status = pod["status"] if isinstance(pod.get("status"), dict) else {}
             phase = status.get("phase")
             if phase not in ("Running", "Succeeded"):
                 continue
@@ -2871,7 +2904,7 @@ class Preflight:
                 parsed = dt.datetime.fromisoformat(started.replace("Z", "+00:00"))
                 if parsed.timestamp() + 1 < since:
                     continue
-            spec = pod.get("spec") if isinstance(pod.get("spec"), dict) else {}
+            spec = pod["spec"] if isinstance(pod.get("spec"), dict) else {}
             for container in spec.get("containers") or []:
                 if not isinstance(container, dict):
                     continue
@@ -4279,7 +4312,7 @@ def _open_case(p: Preflight, title: str, body: str) -> None:
 
 
 def _hidden_for_case(p: Preflight, case_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
-    prs = result.get("pull_requests") if isinstance(result.get("pull_requests"), list) else []
+    prs = result["pull_requests"] if isinstance(result.get("pull_requests"), list) else []
     if case_id in _PR_CASE_IDS:
         if len(prs) != 1 or not isinstance(prs[0], dict) or not prs[0].get("number"):
             return {"status": "failed", "failures": ["no single pull request to test"]}
@@ -4536,6 +4569,7 @@ def evaluation(p: Preflight) -> dict[str, Any]:
         p.helm_upgrade(quota=CODING_SANDBOX_POD_QUOTA)
     except PreflightFailed as exc:
         quota_error = str(exc)
+    revision_record: dict[str, Any] | None
     if quota_error:
         configured_cases = _failed_pass(configured_model, quota_error)
         revision_record = _blank_revision(quota_error, configured_model)
@@ -5596,6 +5630,7 @@ def evaluation_report_failures(report: Mapping[str, Any]) -> list[str]:
     if roles != ["configured", "reference"]:
         failures.append("passes must contain the configured run and then the reference run")
         return failures
+    passes = cast(list[Any], passes)
     models: list[str] = []
     for index, item in enumerate(passes):
         assert isinstance(item, dict)
@@ -5744,7 +5779,9 @@ def main(argv: list[str] | None = None) -> int:
                     if args.issue_file is not None
                     else DEFAULT_CANCEL_RUNNING_ISSUE
                 )
+        curie_bin, curie_version = resolve_curie_binary(os.environ.get("CURIE_BIN") or "curie")
         config = load_config(os.environ, context=args.context)
+        config = dataclasses.replace(config, curie_bin=curie_bin)
         if args.model_base_url:
             config = dataclasses.replace(config, model_base_url=args.model_base_url)
         if args.mode == "run" and args.scenario in (
@@ -5792,6 +5829,7 @@ def main(argv: list[str] | None = None) -> int:
         scenario_name=args.scenario if args.mode == "run" else None,
         revision_text=revision_text,
     )
+    preflight.evidence.update(curie_bin=curie_bin, curie_version=curie_version)
     if args.mode == "run":
         preflight.evidence["mode"] = f"run:{args.scenario}"
 

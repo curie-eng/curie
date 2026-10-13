@@ -10,6 +10,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SELECTOR = REPO_ROOT / "tools" / "e2e-ci-selection" / "select_tiers.py"
@@ -44,7 +45,14 @@ def _git(repo: Path, *args: str) -> str:
 
 
 def _workflow(jobs: tuple[str, ...] = JOBS) -> str:
+    # Selection reads the candidate chart job even when the changed hunk is
+    # elsewhere. Keep its real steps in these otherwise minimal workflows.
+    chart_job = "e2e-cluster-chart-regressions"
+    chart = yaml.safe_load((REPO_ROOT / WORKFLOW_PATH).read_text())["jobs"][chart_job]
+    chart_text = yaml.safe_dump({chart_job: chart}, sort_keys=False)
     return "name: Example CI\njobs:\n" + "".join(
+        "  " + line for line in chart_text.splitlines(keepends=True)
+    ) + "".join(
         f"  {job}:\n    runs-on: ubuntu-latest\n    steps:\n"
         f"      - run: echo {job}\n"
         for job in jobs
@@ -362,6 +370,9 @@ def test_ordinary_upgrade_code_edit_remains_smoke_only(
 
 
 def test_path_only_workflow_selection_has_no_hunks_to_select(tmp_path: Path) -> None:
+    workflow = tmp_path / WORKFLOW_PATH
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(_workflow(), encoding="utf-8")
     result, output = _invoke_selector(
         tmp_path, tmp_path, "--path", WORKFLOW_PATH.as_posix()
     )
