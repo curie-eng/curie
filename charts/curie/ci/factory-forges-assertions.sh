@@ -110,8 +110,12 @@ env = {e["name"]: e for e in container.get("env", []) or []}
 
 for doc in docs:
     for c in (doc.get("spec", {}).get("template", {}).get("spec", {}) or {}).get("containers", []) or []:
-        if c.get("name") == "worker" and any(e["name"] == "CURIE_REPO_RUNNER_POOLS" for e in c.get("env", []) or []):
-            fail("schema-only repository blocks must not render CURIE_REPO_RUNNER_POOLS")
+        if c.get("name") == "worker":
+            repo_pools = [e for e in c.get("env", []) or [] if e["name"] == "CURIE_REPO_RUNNER_POOLS"]
+            if mode == "tools" and (len(repo_pools) != 1 or not json.loads(repo_pools[0].get("value", "{}"))):
+                fail("repository runner blocks must render CURIE_REPO_RUNNER_POOLS")
+            if mode != "tools" and repo_pools:
+                fail("repositories without runner blocks must not render CURIE_REPO_RUNNER_POOLS")
         stale = [e["name"] for e in c.get("env", []) or [] if e["name"].startswith(OLD_ENV_PREFIX)]
         if stale:
             fail("%s/%s still renders %s" % (doc["metadata"]["name"], c["name"], stale))
@@ -245,10 +249,12 @@ refused() {
 render | check default
 render -f "$WORK/factory.yaml" | check factory
 
-# Repository tool declarations remain data; no pool env or runtime is added.
+# Repository tool declarations select the sole factory agent's runner pools.
 python3 - "$WORK/factory.yaml" "$WORK/tools.yaml" <<'PY'
 import sys, yaml
 doc = yaml.safe_load(open(sys.argv[1]))
+doc["factory"]["sandboxEgress"] = {"factory": True}
+doc["agentSandbox"] = {"deploy": True, "controller": {"deploy": False}}
 repo = doc["factory"]["bindings"][0]["repos"][0]
 digest = lambda c: "sha256:" + c * 64
 repo["runner"] = {

@@ -65,6 +65,7 @@ worker:
   CURIE_PUBLICATION_SERVICE_ACCOUNT_NAME: worker.publication.serviceAccountName
   CURIE_RELEASE: the Helm release name
   CURIE_REMEDIATION_ENABLED: remediation.enabled
+  CURIE_REPO_RUNNER_POOLS: factory.bindings[].repos[].runner
   CURIE_ROUTE_TTL_SECONDS: worker.routeTtlSeconds
   CURIE_RUNNER_IMAGE: agentSandbox.runner.image
   CURIE_RUNNER_PORT: agentSandbox.runner.port
