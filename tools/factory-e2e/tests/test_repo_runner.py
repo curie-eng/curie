@@ -723,6 +723,29 @@ def test_each_refusal_fault_field_is_required(turn: int, field: str) -> None:
     assert repo_runner.judge_repo_runner(observation)
 
 
+@pytest.mark.parametrize("turn", [2, 3], ids=["missing-pool", "stale-base"])
+def test_refusal_repository_must_have_a_completed_success(turn: int) -> None:
+    observation = _passing()
+    observation["turns"][turn]["repository"] = "acme-corp/unobserved-repository"
+    assert repo_runner.judge_repo_runner(observation)
+
+
+@pytest.mark.parametrize(
+    ("turn", "other"), [(2, 0), (3, 2)], ids=["success-thread", "other-refusal-thread"]
+)
+def test_each_refusal_uses_a_fresh_thread(turn: int, other: int) -> None:
+    observation = _passing()
+    observation["turns"][turn]["thread"] = observation["turns"][other]["thread"]
+    assert repo_runner.judge_repo_runner(observation)
+
+
+def test_workspace_selection_conflict_failure_preserves_its_diagnostic_code() -> None:
+    observation = _passing()
+    observation["turns"][0].update(status="failed", reason="workspace.selection_conflict")
+    failures = repo_runner.judge_repo_runner(observation)
+    assert any("workspace.selection_conflict" in failure for failure in failures), failures
+
+
 def test_preflight_release_assignment_selects_the_publication_namespace(tmp_path: Path) -> None:
     config = fe.FactoryConfig(
         kube_context="k8",
