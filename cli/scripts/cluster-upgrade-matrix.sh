@@ -94,6 +94,7 @@ SCENARIOS_ALL=(
     apply-kill-takeover
     rollback-to-serving
     runner-layer-retire
+    hook-fail-not-serving
     terminal-pods
     rollback-uncatalogued
 )
@@ -129,6 +130,7 @@ s14 setup previous-serves
 s15 setup runner-layer-retire
 s16 setup apply-kill-takeover
 s17 setup rollback-to-serving
+s18 setup hook-fail-not-serving
 s19 setup terminal-pods
 s21 setup rollback-uncatalogued"
 SHARDS="${CURIE_E2E_SHARDS_OVERRIDE:-$SHARDS_CANONICAL}"
@@ -142,7 +144,7 @@ die() {
 
 usage() {
     cat <<'EOF' >&2
-usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving|runner-layer-retire|terminal-pods|rollback-uncatalogued] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
+usage: cluster-upgrade-matrix.sh [--scenario all|soak-refusal|fresh-n|n1-to-n-nonempty|same-version|fail-every-phase|interrupt-resume|n-to-n1|guarded-rollback|rollback-published-088|rollback-published-089|migration-crash|converge-negative|previous-serves|apply-kill-takeover|rollback-to-serving|runner-layer-retire|hook-fail-not-serving|terminal-pods|rollback-uncatalogued] [--shard <id>] [--list-shards] [--force] [--keep] [--json] [--self-test]
 EOF
 }
 
@@ -316,7 +318,8 @@ run_self_test() {
         failed=1
     fi
     if valid_scenario "all" && valid_scenario "fresh-n" && valid_scenario "fail-every-phase" \
-        && valid_scenario "runner-layer-retire" && valid_scenario "terminal-pods" && ! valid_scenario "not-a-scenario"; then
+        && valid_scenario "runner-layer-retire" && valid_scenario "hook-fail-not-serving" \
+        && valid_scenario "terminal-pods" && ! valid_scenario "not-a-scenario"; then
         log "unknown scenario refused"
     else
         log "self-test: scenario helper is wrong"
@@ -566,6 +569,13 @@ run_self_test() {
         log "self-test: runner-layer-retire must run in setup shard s15"
         failed=1
     fi
+    if [[ "$(shard_manifest lookup "$SHARDS_CANONICAL" s18)" == $'setup\nhook-fail-not-serving' ]] \
+        && [[ "$(scenario_fn hook-fail-not-serving)" == run_hook_fail_not_serving ]]; then
+        log "hook-fail-not-serving runs in setup shard s18"
+    else
+        log "self-test: hook-fail-not-serving must run in setup shard s18"
+        failed=1
+    fi
     if [[ "$(shard_manifest lookup "$SHARDS_CANONICAL" s19)" == $'setup\nterminal-pods' ]] \
         && [[ "$(scenario_fn terminal-pods)" == run_terminal_pods ]]; then
         log "terminal-pods runs in setup shard s19"
@@ -598,13 +608,14 @@ run_self_test() {
         failed=1
     fi
     local mutated label
-    for label in "dropped scenario" "duplicated scenario" "dropped phase" "duplicated phase" "dropped runner-layer-retire" "dropped terminal-pods"; do
+    for label in "dropped scenario" "duplicated scenario" "dropped phase" "duplicated phase" "dropped runner-layer-retire" "dropped hook-fail-not-serving" "dropped terminal-pods"; do
         case "$label" in
             "dropped scenario") mutated="${SHARDS_CANONICAL/ migration-crash/}" ;;
             "duplicated scenario") mutated="${SHARDS_CANONICAL/s11 nosetup rollback-published-089/s11 nosetup rollback-published-089 fresh-n}" ;;
             "dropped phase") mutated="${SHARDS_CANONICAL/interrupt-resume:checkpoint+migrate/interrupt-resume:checkpoint}" ;;
             "duplicated phase") mutated="${SHARDS_CANONICAL/fail-every-phase:converge/fail-every-phase:converge+plan}" ;;
             "dropped runner-layer-retire") mutated="${SHARDS_CANONICAL/s15 setup runner-layer-retire/}" ;;
+            "dropped hook-fail-not-serving") mutated="${SHARDS_CANONICAL/s18 setup hook-fail-not-serving/}" ;;
             "dropped terminal-pods") mutated="${SHARDS_CANONICAL/s19 setup terminal-pods/}" ;;
         esac
         if [[ "$mutated" == "$SHARDS_CANONICAL" ]]; then
@@ -2662,6 +2673,98 @@ assert (deployment.get("status") or {}).get("readyReplicas", 0) > 0, "API is not
     log "apply-kill-takeover deployed 0.10.1 through the CLI rollback with a Ready API and no holder"
 }
 
+run_hook_fail_not_serving() {
+    local version chart_dir chart hook mode status before_image target_image live_image reason prefix
+    version="$(awk '$1 == "version:" { print $2; exit }' "$REPO_ROOT/charts/curie/Chart.yaml")"
+    [[ -n "$version" && "$version" != 0.10.0 ]] \
+        || die "hook-fail-not-serving needs a target chart version different from 0.10.0"
+    # Use the checkout version's schema window, as in rollback-to-serving.
+    retag_candidate_versions "0.10.0" "$version" required
+    target_image="$(image_for curie-api "$version")"
+    chart_dir="$WORKDIR/hook-fail-not-serving/chart"
+    mkdir -p "$chart_dir" "$WORKDIR/hook-fail-not-serving/packaged"
+    cp -a "$REPO_ROOT/charts/curie" "$chart_dir/curie"
+    # This fault is confined to the private chart copy. Its image is already
+    # loaded for the target release, so failure must be an executed exit 1.
+    cat >"$chart_dir/curie/templates/matrix-hook-fail.yaml" <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "curie.fullname" . }}-matrix-hook-fail
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-weight": "10000"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: hook-fail
+          image: {{ include "curie.image" (dict "repository" .Values.api.image.repository "tag" .Values.api.image.tag "digest" .Values.api.image.digest "defaultTag" .Chart.AppVersion) | quote }}
+          imagePullPolicy: Never
+          command: ["python3", "-c", "raise SystemExit(1)"]
+EOF
+    helm package "$chart_dir/curie" --version "$version" --app-version "$version" \
+        -d "$WORKDIR/hook-fail-not-serving/packaged" >/dev/null
+    chart="$WORKDIR/hook-fail-not-serving/packaged/curie-${version}.tgz"
+    [[ -f "$chart" ]] || die "hook-fail-not-serving target chart package is missing"
+    hook="$(fullname)-matrix-hook-fail"
+    for mode in json human; do
+        # Both output paths must begin with the previous images serving.
+        restore_n
+        wait_rollout
+        before_image="$(kubectl_ns get "deploy/$(fullname)-api" -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].image}')"
+        [[ "$before_image" == "$(image_for curie-api 0.10.0)" ]] \
+            || die "hook-fail-not-serving $mode did not start from the previous API image"
+        exclusive_kind_tag "$version"
+        prefix="hook-fail-not-serving-$mode"
+        status=0
+        if [[ "$mode" == json ]]; then
+            cluster_upgrade "$version" "$chart" || status=$?
+            record_upgrade_json "$prefix"
+            (( status != 0 )) || die "hook-fail-not-serving JSON upgrade unexpectedly succeeded"
+            assert_upgrade_status failed
+            assert_upgrade_phase apply
+            [[ "$(json_field "$EVIDENCE_DIR/last-upgrade.json" previous_serving)" == false ]] \
+                || die "post-upgrade hook failure claimed the previous version is serving"
+            reason="$(json_field "$EVIDENCE_DIR/last-upgrade.json" fail_forward.reason)"
+            [[ "$reason" == *"target manifests are applied"* \
+                && "$reason" == *"upgrade failed after apply"* \
+                && "$reason" == *"post-upgrade hooks failed"* ]] \
+                || die "post-upgrade hook failure omitted the applied-target fail-forward reason"
+        else
+            "$BIN" cluster upgrade --yes --to "$version" \
+                --namespace "$NAMESPACE" --release "$RELEASE" --chart "$chart" \
+                "${KUBECTL_CONTEXT_ARGS[@]}" >"$EVIDENCE_DIR/$prefix.log" 2>&1 || status=$?
+            (( status != 0 )) || die "hook-fail-not-serving human upgrade unexpectedly succeeded"
+            grep -Fq 'previous version is not serving; follow the fail-forward path' \
+                "$EVIDENCE_DIR/$prefix.log" || die "post-upgrade hook failure omitted the operator warning"
+        fi
+        kubectl_ns get job "$hook" -o json >"$EVIDENCE_DIR/$prefix-job.json"
+        kubectl_ns get pods -l "job-name=$hook" -o json >"$EVIDENCE_DIR/$prefix-pods.json"
+        python3 - "$EVIDENCE_DIR/$prefix-job.json" "$EVIDENCE_DIR/$prefix-pods.json" <<'PY'
+import json, sys
+job, pods = (json.load(open(path)) for path in sys.argv[1:])
+if not any(c.get("type") == "Failed" and c.get("status") == "True"
+           for c in job.get("status", {}).get("conditions", [])):
+    raise SystemExit("injected post-upgrade hook Job did not fail")
+if not any(c.get("name") == "hook-fail" and c.get("state", {}).get("terminated", {}).get("exitCode") == 1
+           for pod in pods["items"] for c in pod.get("status", {}).get("containerStatuses", [])):
+    raise SystemExit("injected post-upgrade hook container did not exit 1")
+PY
+        kubectl_ns get "deploy/$(fullname)-api" -o json >"$EVIDENCE_DIR/$prefix-api.json"
+        live_image="$(python3 -c 'import json,sys; print(next(c["image"] for c in json.load(sys.stdin)["spec"]["template"]["spec"]["containers"] if c["name"] == "api"))' \
+            <"$EVIDENCE_DIR/$prefix-api.json")"
+        [[ "$live_image" == "$target_image" && "$live_image" != "$before_image" ]] \
+            || die "post-upgrade hook failure did not apply the target API image"
+        log "hook-fail-not-serving $mode observed exit 1 after target API image $live_image was applied"
+    done
+    assert_sentinel
+}
+
 run_rollback_to_serving() {
     local V CHART_V serving pending="" status=0
     V="$(awk '$1 == "version:" { print $2; exit }' "$REPO_ROOT/charts/curie/Chart.yaml")"
@@ -3344,6 +3447,7 @@ scenario_fn() {
         rollback-to-serving) echo run_rollback_to_serving ;;
         rollback-uncatalogued) echo run_rollback_uncatalogued ;;
         runner-layer-retire) echo run_runner_layer_retire ;;
+        hook-fail-not-serving) echo run_hook_fail_not_serving ;;
         terminal-pods) echo run_terminal_pods ;;
         *) die "no runner for scenario '$1'" ;;
     esac
