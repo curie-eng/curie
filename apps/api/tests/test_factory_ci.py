@@ -852,6 +852,103 @@ def test_metadata_revision_without_a_policy_is_unverified(seconds: float) -> Non
     assert verdict.reason == "metadata_ci_not_configured"
 
 
+@pytest.mark.parametrize("surface", ["check", "status"])
+@pytest.mark.parametrize(
+    ("seconds", "rerun", "expected", "reason"),
+    [
+        (30, "success", "green", None),
+        (30, None, "pending", "checks_awaiting_metadata_rerun"),
+        (1200, None, "unverified", "checks_not_rerun"),
+        (30, "failure", "failing", None),
+    ],
+)
+def test_recorded_metadata_policy_requires_a_fresh_result(
+    surface: str, seconds: float, rerun: str | None, expected: str, reason: str | None
+) -> None:
+    name = "PR body (real newlines)"
+    policy = factory_ci.MetadataCiPolicy(
+        checks=(name,) if surface == "check" else (),
+        statuses=(name,) if surface == "status" else (),
+        recorded=True,
+    )
+    if surface == "check":
+        old = _run(name, conclusion="failure")
+        old["started_at"] = "2026-09-24T11:00:00Z"
+        runs = [old]
+        if rerun is not None:
+            fresh = _run(name, conclusion=rerun, run_id=2)
+            fresh["started_at"] = "2026-09-24T12:00:01Z"
+            runs.append(fresh)
+        detail = _detail(*runs)
+    else:
+        old = _status(name, "failure")
+        old["created_at"] = "2026-09-24T11:00:00Z"
+        statuses = [old]
+        if rerun is not None:
+            fresh = _status(name, rerun)
+            fresh["created_at"] = "2026-09-24T12:00:01Z"
+            statuses.append(fresh)
+        detail = _detail(statuses=tuple(statuses))
+
+    verdict = _decide(detail, seconds, fresh_after=PUBLISHED, metadata_ci=policy)
+
+    assert verdict.kind == expected
+    assert verdict.reason == reason
+    assert _names(verdict.failing) == ({name} if expected == "failing" else set())
+
+
+@pytest.mark.parametrize("stale_surface", ["check", "status"])
+def test_recorded_metadata_policy_keeps_a_partial_reruns_stale_failure_at_the_deadline(
+    stale_surface: str,
+) -> None:
+    fresh = _run("PR body (real newlines)")
+    fresh["started_at"] = "2026-09-24T12:00:01Z"
+    if stale_surface == "check":
+        stale = _run("Conversion suite", conclusion="failure", run_id=2)
+        stale["started_at"] = "2026-09-24T11:00:00Z"
+        detail = _detail(fresh, stale)
+        policy = factory_ci.MetadataCiPolicy(
+            checks=("PR body (real newlines)", "Conversion suite"), statuses=(), recorded=True
+        )
+    else:
+        stale = _status("Conversion suite", "failure")
+        stale["created_at"] = "2026-09-24T11:00:00Z"
+        detail = _detail(fresh, statuses=(stale,))
+        policy = factory_ci.MetadataCiPolicy(
+            checks=("PR body (real newlines)",), statuses=("Conversion suite",), recorded=True
+        )
+
+    pending = _decide(detail, 1199, fresh_after=PUBLISHED, metadata_ci=policy)
+    assert pending.kind == "pending"
+    assert pending.reason == "checks_awaiting_metadata_rerun"
+    assert pending.failing == []
+    failed = _decide(detail, 1200, fresh_after=PUBLISHED, metadata_ci=policy)
+    assert failed.kind == "failing"
+    assert _names(failed.failing) == {"Conversion suite"}
+    early_deadline = _decide(
+        detail, 600, fresh_after=PUBLISHED, metadata_ci=policy,
+        execution_deadline=PUBLISHED + timedelta(seconds=600),
+    )
+    assert early_deadline.kind == "failing"
+    assert _names(early_deadline.failing) == {"Conversion suite"}
+
+
+def test_unrelated_fresh_checks_do_not_prove_a_recorded_metadata_rerun() -> None:
+    stale = _run("PR body (real newlines)", conclusion="failure")
+    stale["started_at"] = "2026-09-24T12:00:00Z"
+    unrelated = _run("unrelated", run_id=2)
+    unrelated["started_at"] = "2026-09-24T12:00:01Z"
+    verdict = _decide(
+        _detail(stale, unrelated), 1200, fresh_after=PUBLISHED,
+        metadata_ci=factory_ci.MetadataCiPolicy(
+            checks=("PR body (real newlines)",), statuses=(), recorded=True
+        ),
+    )
+
+    assert verdict.kind == "unverified"
+    assert verdict.reason == "checks_not_rerun"
+
+
 def test_a_metadata_policy_does_not_change_an_ordinary_commit_verdict() -> None:
     verdict = _decide(
         _detail(_run("Unit conversion suite")),
