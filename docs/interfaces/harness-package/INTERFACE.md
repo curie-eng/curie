@@ -120,9 +120,15 @@ module passes; a new SDK import outside the Claude harness fails and names both
 the probe module and the SDK. Repository scanners retain their normal failure
 behavior and never encounter a disposable probe in the authoritative checkout.
 
-The existing controls were measured with import-linter 2.15 using
-`uv run python -m pytest -q runner/tests/test_harness_boundary.py::test_actual_linter_refuses_a_new_sdk_importer_and_accepts_its_control`:
-the harmless module passed and the forbidden SDK import was rejected. Isolation
+The existing controls in
+[`runner/tests/test_harness_boundary.py`](../../../runner/tests/test_harness_boundary.py)
+were measured with import-linter 2.15 using:
+
+```bash
+uv run python -m pytest -q runner/tests/test_harness_boundary.py::test_actual_linter_refuses_a_new_sdk_importer_and_accepts_its_control
+```
+
+The harmless module passed and the forbidden SDK import was rejected. Isolation
 changes only where these controls place their synthetic module.
 
 ## Known leakage
