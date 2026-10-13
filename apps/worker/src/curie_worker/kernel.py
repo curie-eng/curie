@@ -651,6 +651,7 @@ _ESCALATION_CAUSES = {
     "sandbox-terminated": "sandbox_terminated",
     "workspace-error": "workspace_error",
     "pull-request-not-adopted": "pull_request_not_adopted",
+    "publication-unrecorded": "publication_unrecorded",
     "history-persistence-error": "history_capacity",
     # #3401: max-turns and an unclassified runner failure used to collapse into
     # runner_escalated, so a consumer that only read the terminus cause could

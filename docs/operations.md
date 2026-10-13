@@ -1368,7 +1368,8 @@ A last `Cause:` line names the platform cause code
 (`capacity_wait_expired`, `start_failed`, `execution_deadline`, `issue_cancelled`,
 `owner_lost`, `runner_escalated`, `unclassified`, `max_turns`, `runner_failed`,
 `no_pull_request`,
-`early_stop`, `publication_denied`, `publication_expired`, `publication_failed`, or a
+`early_stop`, `publication_denied`, `publication_expired`, `publication_failed`,
+`publication_unrecorded`, or a
 classified run failure: `model_credit_exhausted`, `model_usage_limited`,
 `model_credential_rejected`, `model_rate_limited`, `model_error`, `model_unreachable`, `budget_exceeded`, `runner_timeout`,
 `sandbox_terminated`, `workspace_error`, or `history_capacity`). A sandbox
@@ -1381,7 +1382,8 @@ Other escalations use that same first line with their own token
 (`delivery-deadline`, `prior-side-effect`, `approval-route-unbound`,
 `approval-approvers-unverifiable`, `approval-no-email-approvers`, `approval-backend-missing`,
 `publication-unavailable`, or `approval-create-failed`). A failed run whose cause is `runner_escalated`,
-`sandbox_terminated`, `unclassified`, `max_turns`, or `ci_failed` still shows as needing a person.
+`sandbox_terminated`, `publication_unrecorded`, `unclassified`, `max_turns`, or `ci_failed`
+still shows as needing a person.
 A history capacity result tells the
 operator to inspect work already done and retry. A model provider that answers
 HTTP 402 or reports exhausted

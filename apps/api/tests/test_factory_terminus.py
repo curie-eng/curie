@@ -100,6 +100,7 @@ def test_failed_comment_leads_with_a_plain_sentence_not_the_cause_code() -> None
         "publication_denied",
         "publication_expired",
         "publication_failed",
+        "publication_unrecorded",
         "ci_failed",
         "ci_timeout",
         "ci_unverified",
@@ -116,6 +117,23 @@ _MODEL_UNREACHABLE_SENTENCE = (
     "the model provider could not be reached. Check the runner's network path to the "
     "model endpoint, then retry."
 )
+
+
+_PUBLICATION_UNRECORDED_SENTENCE = (
+    "the agent tried to publish its change, but no valid publication was recorded. "
+    "The Details line below gives the reason; the pull request, if any, is unchanged."
+)
+
+
+def test_publication_unrecorded_result_section_labels_its_details() -> None:
+    detail = "The publication record did not match the requested repository."
+    body = result_section("publication_unrecorded", pr_url=None, detail=detail)
+
+    assert body.splitlines()[0] == f"Could not complete: {_PUBLICATION_UNRECORDED_SENTENCE}"
+    assert f"Details: {detail}" in body
+    assert "Provider message:" not in body
+    assert "Cause: publication_unrecorded" in body
+    assert "Failure class:" not in body
 
 
 def test_model_unreachable_result_section_names_the_network_path_and_its_class() -> None:
@@ -2676,6 +2694,47 @@ def test_an_issue_originated_notice_still_comments_on_the_issue(admitted: Any) -
     posts = _posts(sink)
     assert [path for path, _ in posts] == [f"/repos/{REPO}/issues/{number}/comments"]
     assert marker_for(row["id"]) in (posts[0][1] or "")
+
+
+def test_factory_notices_publication_unrecorded_finish_comments_its_details_once(
+    admitted: Any,
+) -> None:
+    client, github, sink = admitted
+    number = 9216
+    _label(client, github, number)
+    row = _request(number)
+    epoch = _start_running(row["id"])
+    detail = "The publication record did not match the requested repository."
+    finished = client.post(
+        f"/v1/internal/work-items/requests/{row['id']}/finish",
+        headers={"X-Curie-Worker-Token": "factory-terminus-worker"},
+        json={
+            "runtime_epoch": epoch,
+            "outcome": "failed",
+            "cause": "publication_unrecorded",
+            "detail": detail,
+        },
+    )
+    assert finished.status_code == 200, finished.text
+    terminal = _request(number)
+    assert (terminal["status"], terminal["terminal_cause"]) == (
+        "failed",
+        "publication_unrecorded",
+    )
+    notice = _notices(row["id"])[0]
+    assert notice["terminal_cause"] == "publication_unrecorded"
+    assert notice["detail"] == detail
+
+    _reconcile()
+    _reconcile()
+
+    assert sink.posts == 1
+    body = _assert_one_final_comment([comment["body"] for comment in sink.comments], row["id"])
+    assert body.startswith(f"Could not complete: {_PUBLICATION_UNRECORDED_SENTENCE}\n")
+    assert f"Details: {detail}" in body
+    assert "Provider message:" not in body
+    assert "Cause: publication_unrecorded" in body
+    assert "Failure class:" not in body
 
 
 def test_factory_notices_usage_limited_finish_posts_the_reset_remedy_once(
