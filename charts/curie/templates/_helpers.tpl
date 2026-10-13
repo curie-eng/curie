@@ -1869,6 +1869,13 @@ livenessProbe:
      lookup cannot see the RuntimeClass the same install is about to create (nor
      anything under helm template/--dry-run). Fake-model auto still omits the
      class when that lookup is empty. */}}
+{{/* gVisor's sentry reports LinuxVersion via uname -v, independent of pod names.
+     Source: https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/version/version.go
+     Older releases use the same LinuxVersion in pkg/sentry/syscalls/linux/linux64.go. */}}
+{{- define "curie.gvisor.sentryKernelVersion" -}}
+{{- "#1 SMP Sun Jan 10 15:06:54 PST 2016" -}}
+{{- end -}}
+
 {{- define "curie.gvisor.className" -}}
 {{- $g := .Values.security.gvisor -}}
 {{- if eq ($g.mode | default "auto") "off" -}}
