@@ -64,6 +64,28 @@ _BUILD_DECL_KEYS = {
 # --------------------------------------------------------------------------- #
 # Accepted shapes
 # --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("case", _vector_file("connector-fields.json")["connector_names"])
+def test_connector_name_vectors_match_cli_sealing(case: dict) -> None:
+    assert set(case) == {"name", "allowed"}
+    parsed, errors = validate_connectors(
+        {"connectors": {case["name"]: {"url": "https://example.com/mcp"}}}
+    )
+    assert (not errors) is case["allowed"]
+    if case["allowed"]:
+        assert parsed is not None
+        assert case["name"] in parsed.connectors
+    else:
+        assert "connectors.reserved_name" in [code for code, _ in errors]
+        assert any(case["name"] in message for _, message in errors)
+
+
+def test_connector_name_vectors_cover_platform_reservations() -> None:
+    from plugin_format.connectors import RESERVED_CONNECTOR_NAMES
+
+    cases = _vector_file("connector-fields.json")["connector_names"]
+    assert {case["name"] for case in cases if not case["allowed"]} == RESERVED_CONNECTOR_NAMES
+
+
 def test_hosted_connector_is_accepted() -> None:
     parsed, errors = validate_connectors(
         {
