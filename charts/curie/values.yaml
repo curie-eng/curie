@@ -1324,10 +1324,12 @@ factory:
         services.loadbalancers: "0"
         services.nodeports: "0"
     # One Container LimitRange item in the daemon namespace: per-container
-    # max, default limits and default requests. All three are required when
-    # docker is enabled.
+    # max, min, default limits and default requests. All four are required
+    # when docker is enabled. Admission separately refuses a zero request or
+    # limit.
     limitRange:
       max: { cpu: "4", memory: 8Gi, ephemeral-storage: 40Gi }
+      min: { cpu: 100m, memory: 256Mi, ephemeral-storage: 1Gi }
       default: { cpu: "2", memory: 4Gi, ephemeral-storage: 20Gi }
       defaultRequest: { cpu: 500m, memory: 1Gi, ephemeral-storage: 10Gi }
 # ---------------------------------------------------------------------------

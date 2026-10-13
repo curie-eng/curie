@@ -52,7 +52,7 @@ ADR accepts (decisions 4 and 5). Nothing renders without a Docker repository.
 {{- fail "factory.docker.quota.hard must be set when a repository enables docker: the daemon namespace runs privileged pods and needs a hard ceiling" }}
 {{- end }}
 {{- $limitRange := get $docker "limitRange" | default dict }}
-{{- range $k := list "max" "default" "defaultRequest" }}
+{{- range $k := list "max" "min" "default" "defaultRequest" }}
 {{- if not (get $limitRange $k) }}
 {{- fail (printf "factory.docker.limitRange.%s must be set when a repository enables docker" $k) }}
 {{- end }}
@@ -169,6 +169,8 @@ spec:
     - type: Container
       max:
         {{- toYaml (get $limitRange "max") | nindent 8 }}
+      min:
+        {{- toYaml (get $limitRange "min") | nindent 8 }}
       default:
         {{- toYaml (get $limitRange "default") | nindent 8 }}
       defaultRequest:
@@ -292,7 +294,16 @@ spec:
 {{- /* Decisions 4 and 5: the only privileged pod Curie creates. This policy
        matches every requester in the daemon namespace, so only the worker can
        create a daemon pod and every daemon pod has the accepted shape. */}}
-{{- $resourced := "has(c.resources) && has(c.resources.requests) && has(c.resources.limits) && 'cpu' in c.resources.requests && 'memory' in c.resources.requests && 'ephemeral-storage' in c.resources.requests && 'cpu' in c.resources.limits && 'memory' in c.resources.limits && 'ephemeral-storage' in c.resources.limits && c.resources.requests['cpu'] != '' && c.resources.requests['memory'] != '' && c.resources.requests['ephemeral-storage'] != '' && c.resources.limits['cpu'] != '' && c.resources.limits['memory'] != '' && c.resources.limits['ephemeral-storage'] != ''" }}
+{{- /* Decision 5.4: every cpu, memory and ephemeral-storage request and
+       limit is present and a positive quantity. string() because a Quantity
+       may arrive as an int. */}}
+{{- $positive := list }}
+{{- range $kind := list "requests" "limits" }}
+{{- range $res := list "cpu" "memory" "ephemeral-storage" }}
+{{- $positive = append $positive (printf "'%[2]s' in c.resources.%[1]s && quantity(string(c.resources.%[1]s['%[2]s'])).isGreaterThan(quantity('0'))" $kind $res) }}
+{{- end }}
+{{- end }}
+{{- $resourced := printf "has(c.resources) && has(c.resources.requests) && has(c.resources.limits) && %s" (join " && " $positive) }}
 {{- $noCapAdd := "(!has(c.securityContext) || !has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0)" }}
 {{- $noHostPort := "(!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))" }}
 apiVersion: admissionregistration.k8s.io/v1
@@ -313,6 +324,12 @@ spec:
         apiVersions: ["v1"]
         operations: ["CREATE", "UPDATE"]
         resources: ["pods"]
+      {{- /* Ephemeral containers arrive through this subresource; the
+             ephemeralContainers rule below refuses them. */}}
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["pods/ephemeralcontainers"]
   validations:
     - expression: {{ printf "request.operation != 'CREATE' || request.userInfo.username == '%s'" $workerUser | quote }}
       message: only the Curie worker creates pods in the Docker daemon namespace
@@ -344,9 +361,21 @@ spec:
         size({{ $s }}.containers) == 1 &&
         {{ $s }}.containers[0].name == 'dockerd' &&
         {{ $s }}.containers[0].image == '{{ $image }}' &&
-        (!has({{ $s }}.initContainers) || {{ $s }}.initContainers.all(c, c.image == '{{ $image }}')) &&
         !has({{ $s }}.ephemeralContainers)
-      message: daemon pods run exactly one dockerd container and no ephemeral containers, all on factory.docker.daemonImage
+      message: daemon pods run exactly one dockerd container on factory.docker.daemonImage and no ephemeral containers
+    - expression: {{ printf "!has(%s.initContainers)" $s | quote }}
+      message: daemon pods must not run init containers
+    - expression: >-
+        {{ $s }}.containers.all(c, !has(c.lifecycle) &&
+        (!has(c.livenessProbe) || !has(c.livenessProbe.exec)) &&
+        (!has(c.readinessProbe) || !has(c.readinessProbe.exec)) &&
+        (!has(c.startupProbe) || !has(c.startupProbe.exec)))
+      message: the dockerd container must not set lifecycle hooks or exec probes
+    - expression: >-
+        {{ $s }}.containers.all(c, !has(c.volumeDevices) &&
+        (!has(c.volumeMounts) || c.volumeMounts.all(m, !m.mountPath.contains('..') &&
+        (m.mountPath == '/var/lib/docker' || m.mountPath == '/certs' || m.mountPath.startsWith('/certs/')))))
+      message: the dockerd container mounts volumes only at /var/lib/docker and /certs, with no '..' and no volumeDevices
     - expression: {{ printf "%s.containers.all(c, !has(c.command))" $s | quote }}
       message: the dockerd container must not override the image command
     - expression: >-
@@ -357,10 +386,8 @@ spec:
         c.args.exists(a, a == '--authorization-plugin=curie-authz'))
       message: dockerd must run with --userns-remap=default and --authorization-plugin=curie-authz
     - expression: >-
-        {{ $s }}.containers.all(c, {{ $noCapAdd }}) &&
-        (!has({{ $s }}.initContainers) || {{ $s }}.initContainers.all(c,
-        (!has(c.securityContext) || !has(c.securityContext.privileged) || !c.securityContext.privileged) &&
-        {{ $noCapAdd }}))
+        {{ $s }}.containers.all(c, {{ $noCapAdd }} &&
+        (c.name == 'dockerd' || !has(c.securityContext) || !has(c.securityContext.privileged) || !c.securityContext.privileged))
       message: only the dockerd container may be privileged, and no container may add capabilities
     - expression: >-
         has({{ $s }}.automountServiceAccountToken) && {{ $s }}.automountServiceAccountToken == false &&
@@ -370,19 +397,18 @@ spec:
       message: daemon pods must not mount a ServiceAccount token or run as a non-default ServiceAccount
     - expression: >-
         !has({{ $s }}.volumes) || {{ $s }}.volumes.all(v,
-        (has(v.emptyDir) && has(v.emptyDir.sizeLimit)) || has(v.secret))
-      message: daemon pod volumes must be emptyDir with a sizeLimit or secret
+        (has(v.emptyDir) && has(v.emptyDir.sizeLimit) &&
+        quantity(string(v.emptyDir.sizeLimit)).isGreaterThan(quantity('0'))) || has(v.secret))
+      message: daemon pod volumes must be emptyDir with a positive sizeLimit or secret
     - expression: >-
         (!has({{ $s }}.hostNetwork) || !{{ $s }}.hostNetwork) &&
         (!has({{ $s }}.hostPID) || !{{ $s }}.hostPID) &&
         (!has({{ $s }}.hostIPC) || !{{ $s }}.hostIPC) &&
-        {{ $s }}.containers.all(c, {{ $noHostPort }}) &&
-        (!has({{ $s }}.initContainers) || {{ $s }}.initContainers.all(c, {{ $noHostPort }}))
+        {{ $s }}.containers.all(c, {{ $noHostPort }})
       message: daemon pods must not share the host network, PID, or IPC namespace or bind a host port
     - expression: >-
-        {{ $s }}.containers.all(c, {{ $resourced }}) &&
-        (!has({{ $s }}.initContainers) || {{ $s }}.initContainers.all(c, {{ $resourced }}))
-      message: every daemon container and init container must set cpu, memory, and ephemeral-storage requests and limits
+        {{ $s }}.containers.all(c, {{ $resourced }})
+      message: the dockerd container must set positive cpu, memory, and ephemeral-storage requests and limits
     - expression: {{ printf "has(%[1]s.activeDeadlineSeconds) && %[1]s.activeDeadlineSeconds > 0" $s | quote }}
       message: daemon pods must set activeDeadlineSeconds so a leaked daemon cannot outlive its run
 ---
@@ -444,6 +470,27 @@ spec:
         'curietech.ai/sandbox-claim' in object.spec.podSelector.matchLabels &&
         object.spec.podSelector.matchLabels['curietech.ai/sandbox-claim'] == object.metadata.labels['curietech.ai/sandbox-claim'])
       message: per-run daemon NetworkPolicies are ingress-only and select only their own claim's daemon
+    {{- /* Decision 7.2: every peer is one of this release's runner sandboxes
+           in the release namespace, narrowed by at least one label beyond the
+           release selector, and only on the daemon port. */}}
+    - expression: >-
+        request.resource.resource != 'networkpolicies' ||
+        !has(object.spec.ingress) ||
+        object.spec.ingress.all(r,
+        has(r.from) && size(r.from) > 0 &&
+        r.from.all(p, !has(p.ipBlock) &&
+        has(p.namespaceSelector) && has(p.namespaceSelector.matchLabels) &&
+        'kubernetes.io/metadata.name' in p.namespaceSelector.matchLabels &&
+        p.namespaceSelector.matchLabels['kubernetes.io/metadata.name'] == '{{ .Release.Namespace }}' &&
+        has(p.podSelector) && has(p.podSelector.matchLabels) &&
+        'app.kubernetes.io/component' in p.podSelector.matchLabels &&
+        p.podSelector.matchLabels['app.kubernetes.io/component'] == 'runner-sandbox' &&
+        'app.kubernetes.io/instance' in p.podSelector.matchLabels &&
+        p.podSelector.matchLabels['app.kubernetes.io/instance'] == '{{ .Release.Name }}' &&
+        size(p.podSelector.matchLabels) >= 3) &&
+        has(r.ports) && size(r.ports) > 0 &&
+        r.ports.all(q, has(q.port) && q.port == {{ $port }} && (!has(q.protocol) || q.protocol == 'TCP')))
+      message: per-run daemon NetworkPolicy ingress admits only this release's runner sandbox, selected by more than the release labels, in the release namespace, on TCP factory.docker.port, with no ipBlock
     - expression: >-
         request.resource.resource != 'secrets' ||
         !has(object.type) || object.type == 'Opaque' || object.type == 'kubernetes.io/tls'

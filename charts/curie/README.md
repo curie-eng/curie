@@ -1344,7 +1344,8 @@ and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
    list and delete on pods, services and networkpolicies, get on pods/log,
    create and delete on secrets.
 3. A ResourceQuota from `factory.docker.quota.hard` and a Container LimitRange
-   from `factory.docker.limitRange`. Both are required.
+   from `factory.docker.limitRange` (`max`, `min`, `default`,
+   `defaultRequest`). All are required.
 4. NetworkPolicies in the daemon namespace: default-deny ingress and egress,
    DNS to `security.networkPolicy.dnsNamespace`, and one egress policy per
    class. Pods labelled `curietech.ai/docker-egress: public` reach
@@ -1363,12 +1364,18 @@ and ingress NetworkPolicy inside it. With no Docker repository nothing renders.
    `dockerd` container on `factory.docker.daemonImage` (digest required), the
    `--userns-remap=default` and `--authorization-plugin=curie-authz` flags, the
    claim, managed-by, selector and egress-class labels, privilege only on
-   dockerd, no ServiceAccount token, only `emptyDir` volumes with `sizeLimit`
-   or `secret` volumes, no host namespaces or ports, full cpu, memory and
+   dockerd, no init or ephemeral containers (it also matches
+   `pods/ephemeralcontainers`), no lifecycle hooks or exec probes, mounts only
+   at `/var/lib/docker` and `/certs` with no `volumeDevices`, no
+   ServiceAccount token, only `emptyDir` volumes with a positive `sizeLimit`
+   or `secret` volumes, no host namespaces or ports, positive cpu, memory and
    ephemeral-storage requests and limits, and `activeDeadlineSeconds`.
    `<fullname>-docker-daemon-objects` holds the worker's Services to
    ClusterIP, its Secrets to Opaque or TLS, and its NetworkPolicies to
-   ingress-only policies selecting their own claim.
+   ingress-only policies selecting their own claim, whose every peer is a
+   runner sandbox of this release in the release namespace selected by at
+   least one label beyond the release selector, with no `ipBlock`, on TCP
+   `factory.docker.port`.
    `<fullname>-docker-daemon-cleanup` lets the worker delete only
    NetworkPolicies labelled `curietech.ai/sandbox-claim`, never the chart's.
 
