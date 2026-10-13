@@ -1952,6 +1952,29 @@ fi"""
     assert named_steps["Tear down the disposable upgrade cluster"]["if"] == "always()"
 
 
+
+def test_upgrade_mutants_change_only_their_target_helpers(tmp_path: Path) -> None:
+    """The managed secret mutant must keep every later helper (#4466 added
+    curie.secretChecksum after it), or the candidate fails to render and the
+    negative control passes for the wrong reason."""
+    helpers = REPO_ROOT / CHART_ROOT / "templates" / "_helpers.tpl"
+    placement = tmp_path / "placement.tpl"
+    managed = tmp_path / "managed.tpl"
+    placement.write_text(helpers.read_text())
+    managed.write_text(helpers.read_text())
+    subprocess.run(
+        [sys.executable, str(UPGRADE_MUTANT_BUILDER), str(placement), str(managed)],
+        check=True,
+    )
+    defines = re.compile(r'{{-?\s*define\s+"([^"]+)"')
+    original = defines.findall(helpers.read_text())
+    assert "curie.secretChecksum" in original
+    assert defines.findall(placement.read_text()) == original
+    assert defines.findall(managed.read_text()) == original
+    assert managed.read_text() != helpers.read_text()
+    assert "{{- else if hasKey .existingData .key -}}" in managed.read_text()
+    assert placement.read_text() != helpers.read_text()
+
 def test_released_upgrade_candidate_images_opt_into_forward_only_migrations() -> None:
     workflow = yaml.safe_load(WORKFLOW.read_text())
     steps = workflow["jobs"]["e2e-released-upgrade"]["steps"]
