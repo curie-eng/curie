@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
 import pytest
 from aiohttp import web
@@ -22,6 +23,7 @@ from curie_worker.kernel.core import Kernel
 from curie_worker.kernel.routing import _thread_key_for
 from curie_worker.markers import CompletionRecord
 from curie_worker.protected_completion import ProtectedReplySink, sweep_protected_completions
+from curie_worker.protected_launch_records import canonical_json
 from curie_worker.protected_markers import ProtectedMarkers
 from curie_worker.protected_runner import ProtectedRunnerClient
 from curie_worker.protected_substrate import ProtectedSandboxSubstrate
@@ -216,6 +218,17 @@ def test_actual_kernel_settlement_retains_owed_refunds_before_emit_and_cold_conf
                     )
                     assert status == {"code": 200, "attempts": 2, "confirmed": 1}
                     assert owner.release_accepted(identity) == "already_released"
+                    # Retained proofs support recovery, never another model start
+                    # after real settlement, refund and confirmed cold emission.
+                    replay = next(iter(client._owned.values())).request.as_dict()
+                    replay["request_id"] = str(uuid4())
+                    response = await client._transport.request(
+                        "POST", "/v1/launches", canonical_json(replay), {}, 5
+                    )
+                    try:
+                        assert response.status == 503
+                    finally:
+                        response.close()
                     assert external.events.count(("RUNNER_POST", "/v1/event")) == 1
             finally:
                 await adapter.aclose()

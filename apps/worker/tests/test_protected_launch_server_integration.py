@@ -611,6 +611,10 @@ class ExternalWorkload:
             return web.Response(status=403)
         env = {v["name"]: v.get("value") for v in self.pod["spec"]["containers"][0]["env"]}
         if request.path == "/v1/status":
+            status_hook = getattr(self, "status_hook", None)
+            if status_hook is not None:
+                self.status_hook = None
+                status_hook()
             response = {
                 "status": "idle-awaiting-input",
                 "ready": True,

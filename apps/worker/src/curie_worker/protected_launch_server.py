@@ -29,6 +29,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from curie_protected_hooks.artifact_measurement import ArtifactMeasurementDirectory
 from curie_protected_hooks.authority_records import Manifest, parse_qualification, parse_readiness
+from curie_protected_hooks.execution_namespace import derive_lane_namespace
 from curie_protected_hooks.worker_artifact_selection import SelectedArtifact, select_artifact
 from curie_protected_hooks.worker_transport import AuthenticatedWorkerClient
 from curie_protected_hooks.worker_verification import Dispatchable, verify_delivery
@@ -489,7 +490,24 @@ class ProtectedLaunchServer:
         platform = validate_projection_binding(
             projection, manifest=runtime.manifest, measurement=measurement, execution=execution
         )
+        await self._require_unsettled(runtime, verdict)
         return verdict, selected, projection, platform
+
+    @staticmethod
+    async def _require_unsettled(runtime: ProvisionedRuntime, delivery: Dispatchable) -> None:
+        # Retained admission proves origin, not permission to restart a settled
+        # event. Any terminal key, including malformed or wrong-type evidence,
+        # permanently fences positive execution without revoking recovery reads.
+        key = (
+            derive_lane_namespace(runtime.manifest).prefix + ":settlement:" + delivery.turn.event_id
+        )
+        try:
+            async with asyncio.timeout(2):
+                present_terminal = await runtime.broker.lane().runs.exists(key)
+        except Exception:  # noqa: BLE001 - detach private broker diagnostics at the HTTP boundary
+            raise _Refusal("unavailable", 503) from None
+        if type(present_terminal) is not int or present_terminal != 0:
+            raise _Refusal("unavailable", 503)
 
     async def _create(
         self, worker: ProvisionedWorker, request: LaunchRequest, *, request_digest: str
@@ -939,6 +957,7 @@ class ProtectedLaunchServer:
             row,
             idle=idle,
         )
+        await self._require_unsettled(live.runtime, delivery)
         live.delivery = delivery
         return live
 
@@ -974,6 +993,7 @@ class ProtectedLaunchServer:
                 headers["X-Curie-Capacity-Admission"] = "wait"
             upstream = None
             try:
+                await self._require_unsettled(live.runtime, live.delivery)
                 upstream = await self._runner.send(
                     self._runner.build_request(
                         "POST",
@@ -1112,6 +1132,9 @@ class ProtectedLaunchServer:
                             else None
                         )
                     )
+                    if kind == "admit":
+                        live = self._live[launch_id]
+                        await self._require_unsettled(live.runtime, live.delivery)
                     await self._runner_control(binding, path, value["epoch"], body)
                     current = self._row(worker, launch_id)
                     self._registry.finish_operation(
