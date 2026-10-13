@@ -2152,6 +2152,87 @@ async fn probe_live_schema_revision(common: &CommonOpts, ui: &crate::ui::Ui) -> 
     })
 }
 
+/// Fix a schema-gated dry run carries when no live revision was asserted: the
+/// fail-forward version depends on a revision the dry run never probes.
+const DRY_RUN_FAIL_FORWARD_FIX: &str = "the newest safe fail-forward version depends on the live database revision; pass --live-schema-revision <id> to name it";
+
+/// One shape for every rollback schema-gate refusal. The next step rides in the
+/// message as well as the fix, as in [`RollbackTarget::require_eligible`]: the
+/// human presenter shows only the message, and `--json` keeps `fix`.
+fn schema_gate_refusal(message: &str, fix: &str) -> anyhow::Error {
+    crate::exit::CliError::failure(format!("{message}; {fix}"))
+        .with_fix(fix)
+        .into()
+}
+
+/// The operator-asserted `--live-schema-revision`, or the refusal both the dry
+/// run and the real run return when it names no revision.
+fn parse_asserted_live_schema_revision(raw: &str) -> Result<String> {
+    crate::schema_window::parse_alembic_current_output(raw).ok_or_else(|| {
+        schema_gate_refusal(
+            "refusing rollback: --live-schema-revision did not contain a database revision",
+            "pass a revision id such as 0039",
+        )
+    })
+}
+
+/// The application version the selected target revision installed, or the
+/// refusal both the dry run and the real run return when it has none.
+fn require_target_application_version(
+    history: &[HelmRevision],
+    to_revision: u32,
+) -> Result<String> {
+    history
+        .iter()
+        .find(|row| row.revision == to_revision)
+        .and_then(HelmRevision::application_version)
+        .ok_or_else(|| {
+            schema_gate_refusal(
+                &format!(
+                    "refusing rollback to Helm revision {to_revision}: no application version on that revision"
+                ),
+                "inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued",
+            )
+        })
+}
+
+/// The offline half of the rollback schema gate, run by a dry run: the target
+/// has an application version and the embedded catalog declares its range. The
+/// live window stays real-run only, so a live revision here only names the
+/// fail-forward version in the refusal.
+fn dry_run_schema_catalog_check(
+    history: &[HelmRevision],
+    to_revision: u32,
+    live_schema_revision: Option<&str>,
+) -> Result<()> {
+    let live = live_schema_revision
+        .map(parse_asserted_live_schema_revision)
+        .transpose()?;
+    let target_app = require_target_application_version(history, to_revision)?;
+    if crate::schema_window::window_for(&target_app).is_some() {
+        return Ok(());
+    }
+    let refusal = match live {
+        Some(live) => crate::schema_window::missing_target_window_refusal(
+            &target_app,
+            &live,
+            &history_application_versions(history),
+        ),
+        None => crate::schema_window::SchemaRefusal {
+            message: crate::schema_window::missing_target_window_message(&target_app),
+            fix: DRY_RUN_FAIL_FORWARD_FIX.to_string(),
+        },
+    };
+    Err(schema_gate_refusal(&refusal.message, &refusal.fix))
+}
+
+fn history_application_versions(history: &[HelmRevision]) -> Vec<String> {
+    history
+        .iter()
+        .filter_map(HelmRevision::application_version)
+        .collect()
+}
+
 pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     let ui = crate::ui::ui();
     let history_cmd = helm_history_cmd(&opts.common);
@@ -2188,6 +2269,13 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     };
 
     if opts.common.dry_run {
+        if !opts.disable_schema_gate {
+            dry_run_schema_catalog_check(
+                &history,
+                choice.to_revision,
+                opts.live_schema_revision.as_deref(),
+            )?;
+        }
         let target = history
             .iter()
             .find(|row| row.revision == choice.to_revision)
@@ -2216,42 +2304,19 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
     }
 
     if !opts.disable_schema_gate {
-        let target_row = history
-            .iter()
-            .find(|row| row.revision == choice.to_revision);
-        let target_app = target_row.and_then(HelmRevision::application_version);
-        let history_apps: Vec<String> = history
-            .iter()
-            .filter_map(HelmRevision::application_version)
-            .collect();
+        let history_apps = history_application_versions(&history);
         let live = match opts.live_schema_revision.as_deref() {
-            Some(raw) => {
-                crate::schema_window::parse_alembic_current_output(raw).ok_or_else(|| {
-                    crate::exit::CliError::failure(
-                    "refusing rollback: --live-schema-revision did not contain a database revision",
-                )
-                .with_fix("pass a revision id such as 0039")
-                })?
-            }
+            Some(raw) => parse_asserted_live_schema_revision(raw)?,
             None => probe_live_schema_revision(&opts.common, ui).await?,
         };
-        let Some(target_app) = target_app else {
-            return Err(crate::exit::CliError::failure(format!(
-                "refusing rollback to Helm revision {}: no application version on that revision",
-                choice.to_revision
-            ))
-            .with_fix("inspect `helm history <release> -n <namespace> -o json` and fail forward to a revision whose app_version is catalogued")
-            .into());
-        };
+        let target_app = require_target_application_version(&history, choice.to_revision)?;
         let Some(catalog_window) = crate::schema_window::window_for(&target_app) else {
             let refusal = crate::schema_window::missing_target_window_refusal(
                 &target_app,
                 &live,
                 &history_apps,
             );
-            return Err(crate::exit::CliError::failure(refusal.message)
-                .with_fix(refusal.fix)
-                .into());
+            return Err(schema_gate_refusal(&refusal.message, &refusal.fix));
         };
         let catalog_ambiguous = catalog_window.artifact_identity_ambiguous;
         let catalog_head = catalog_window.schema_head.clone();
@@ -2335,9 +2400,7 @@ pub async fn rollback(opts: RollbackOpts) -> Result<ClusterRollbackOutput> {
                 let fix = published_identity_fix
                     .map(|identity| format!("{}. {identity}", refusal.fix))
                     .unwrap_or(refusal.fix);
-                return Err(crate::exit::CliError::failure(refusal.message)
-                    .with_fix(fix)
-                    .into());
+                return Err(schema_gate_refusal(&refusal.message, &fix));
             }
         }
         if opts.live_schema_revision.is_some() {

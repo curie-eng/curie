@@ -391,6 +391,16 @@ data:
     )
 }
 
+/// PATH for a spawned `curie` whose helm and kubectl are the fakes in `dir`.
+/// The system directories are fixed rather than copied from this process:
+/// `cluster_rollback.rs` narrows the process PATH to one directory while it
+/// holds `ENV_LOCK`, and a spawn reading it then finds no `cat` for the fakes.
+fn fake_tool_path(dir: &Path) -> std::ffi::OsString {
+    let mut paths = vec![dir.to_path_buf()];
+    paths.extend(["/usr/local/bin", "/usr/bin", "/bin"].map(std::path::PathBuf::from));
+    std::env::join_paths(paths).expect("join PATH")
+}
+
 struct RollbackFixture {
     dir: tempfile::TempDir,
 }
@@ -444,15 +454,12 @@ impl RollbackFixture {
     }
 
     fn run(&self, extra: &[&str]) -> Output {
-        let existing = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![self.dir.path().to_path_buf()];
-        paths.extend(std::env::split_paths(&existing));
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_curie"));
         cmd.args(["cluster", "rollback"])
             .args(["--namespace", "agent-ns", "--release", "prod-release"])
             .args(["--yes", "--json"])
             .args(extra)
-            .env("PATH", std::env::join_paths(paths).expect("join PATH"))
+            .env("PATH", fake_tool_path(self.dir.path()))
             .env("NO_COLOR", "1");
         cmd.output().expect("run curie cluster rollback")
     }
@@ -460,15 +467,12 @@ impl RollbackFixture {
     /// Same command as `run` but without `--json`, so the human error
     /// presenter (stderr `Error: <message>`) is what the caller observes.
     fn run_human(&self, extra: &[&str]) -> Output {
-        let existing = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![self.dir.path().to_path_buf()];
-        paths.extend(std::env::split_paths(&existing));
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_curie"));
         cmd.args(["cluster", "rollback"])
             .args(["--namespace", "agent-ns", "--release", "prod-release"])
             .args(["--yes"])
             .args(extra)
-            .env("PATH", std::env::join_paths(paths).expect("join PATH"))
+            .env("PATH", fake_tool_path(self.dir.path()))
             .env("NO_COLOR", "1");
         cmd.output().expect("run curie cluster rollback")
     }
@@ -870,14 +874,11 @@ fn unambiguous_v090_does_not_read_retained_manifest() {
 }
 
 fn run_rollback_json(dir: &Path) -> std::process::Output {
-    let existing = std::env::var_os("PATH").unwrap_or_default();
-    let mut paths = vec![dir.to_path_buf()];
-    paths.extend(std::env::split_paths(&existing));
     std::process::Command::new(env!("CARGO_BIN_EXE_curie"))
         .args(["cluster", "rollback"])
         .args(["--namespace", "agent-ns", "--release", "prod-release"])
         .args(["--yes", "--json"])
-        .env("PATH", std::env::join_paths(paths).expect("join PATH"))
+        .env("PATH", fake_tool_path(dir))
         .env("NO_COLOR", "1")
         .output()
         .expect("run curie cluster rollback --json")
@@ -1133,7 +1134,8 @@ fn main_built_v0101_before_the_next_release_rolls_back_by_declared_window() {
 
 const UNCATALOGUED_REFUSAL: &str =
     "refusing rollback to application sha-9249ff4: no declared schema range for that version";
-const FORWARD_0093: &str = "fail forward to application 0.12.4, which can start against revision 0093";
+const FORWARD_0093: &str =
+    "fail forward to application 0.12.4, which can start against revision 0093";
 const DRY_RUN_FIX: &str = "the newest safe fail-forward version depends on the live database revision; pass --live-schema-revision <id> to name it";
 const NO_APP_VERSION: &str = "no application version on that revision";
 const NO_APP_VERSION_FIX: &str = "fail forward to a revision whose app_version is catalogued";
@@ -1161,11 +1163,7 @@ fn stderr_of(output: &Output) -> String {
 }
 
 fn assert_only_history_reads(fixture: &RollbackFixture) {
-    assert_eq!(
-        fixture.kubectl_log(),
-        "",
-        "dry run must never run kubectl"
-    );
+    assert_eq!(fixture.kubectl_log(), "", "dry run must never run kubectl");
     let helm = fixture.helm_log();
     assert!(
         helm.lines().all(|line| line.starts_with("history ")),
