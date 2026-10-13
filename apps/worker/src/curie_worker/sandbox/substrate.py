@@ -397,6 +397,10 @@ class SandboxSubstrate:
                     if workspace_repo is None
                     else (self._repo_runner(workspace_repo, agent_name=agent_name),)
                 )
+                if preflight is not None:
+                    _refuse_unsecreted_repo_claim(
+                        preflight[0], env, agent_name, self._config.connector_secret_pools
+                    )
                 record = self._affinity.get(thread_key)
                 if record is not None:
                     if record.state is RouteState.SUSPENDED:

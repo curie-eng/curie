@@ -308,6 +308,31 @@ def test_refusal_for_another_repository_leaves_the_live_route_untouched(
     assert stored.state is RouteState.LIVE
 
 
+def test_connector_secret_refusal_for_another_repository_leaves_the_live_route_untouched(
+    probing_k8s: PoolProbingFakeSandboxClient,
+    affinity: AffinityStore,
+    config: SubstrateConfig,
+) -> None:
+    # The target pool exists and its base matches; only the connector secret
+    # guard refuses, and it too is decided before the web route is retired.
+    probing_k8s.warm_pools = frozenset({BASE_POOL, POOL, "acme-web-runner"})
+    pools = {REPO: _entry(), "acme-corp/web": _entry("acme-web-runner")}
+    first = _substrate(probing_k8s, affinity, config, pools).claim(
+        "T-other-secret", workspace_repo="acme-corp/web", agent_name="cli-bot"
+    )
+    with pytest.raises(MissingAgentPoolError):
+        _substrate(probing_k8s, affinity, config, pools).claim(
+            "T-other-secret",
+            env=_secret_env("cli-bot"),
+            workspace_repo=REPO,
+            agent_name="cli-bot",
+        )
+    assert first.claim_name in probing_k8s.claims
+    assert probing_k8s.deleted == []
+    stored = affinity.get("T-other-secret")
+    assert stored is not None and stored.handle == first
+
+
 def test_resume_refusal_leaves_the_suspended_route_untouched(
     probing_k8s: PoolProbingFakeSandboxClient,
     affinity: AffinityStore,
