@@ -87,96 +87,75 @@ jobs:
           title = "Nightly kind CI on next is failing"
           failed_conclusions = {"failure", "timed_out", "cancelled"}
 
+          def gh(*arguments, capture_output=False):
+              return subprocess.run(
+                  ["gh", *arguments], check=True, capture_output=capture_output, text=True)
+
           def read_pages(endpoint):
-              result = subprocess.run(
-                  ["gh", "api", "--paginate", "--slurp", endpoint],
-                  check=True,
-                  capture_output=True,
-                  text=True,
-              )
+              result = gh("api", "--paginate", "--slurp", endpoint, capture_output=True)
               return json.loads(result.stdout)
 
           issue_number = min(
-              (
-                  issue["number"]
+              (issue["number"]
                   for page in read_pages(f"repos/{repo}/issues?state=open&per_page=100")
                   for issue in page
                   if "pull_request" not in issue
                   and issue.get("title") == title
-                  and (issue.get("user") or {}).get("login") == "github-actions[bot]"
-              ),
-              default=None,
-          )
+                  and (issue.get("user") or {}).get("login") == "github-actions[bot]"),
+              default=None)
           nightly_url = os.environ["NIGHTLY_RUN_URL"]
           run_url = os.environ["CI_RUN_URL"]
           dispatch_result = os.environ["DISPATCH_RESULT"]
           verify_result = os.environ["VERIFY_RESULT"]
 
-          if dispatch_result == "success" and verify_result == "success":
-              if issue_number is not None:
-                  body = (
-                      "Nightly kind CI on next passed.\n\n"
-                      f"Nightly workflow: {nightly_url}\n"
-                      f"Dispatched CI run: {run_url}"
-                  )
-                  subprocess.run(
-                      ["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", body],
-                      check=True,
-                  )
-                  subprocess.run(
-                      ["gh", "issue", "close", str(issue_number), "--repo", repo, "--reason", "completed"],
-                      check=True,
-                  )
+          green = dispatch_result == "success" and verify_result == "success"
+          if green:
+              if issue_number is None:
+                  raise SystemExit(0)
+              body = (
+                  "Nightly kind CI on next passed.\n\n"
+                  f"Nightly workflow: {nightly_url}\n"
+                  f"Dispatched CI run: {run_url}")
           else:
               lines = [
                   "Nightly kind CI on next did not succeed.",
                   "",
                   f"Nightly workflow: {nightly_url}",
                   f"Dispatch result: {dispatch_result}",
-                  f"Verification result: {verify_result}",
-                  "",
+                  f"Verification result: {verify_result}", "",
               ]
               if run_url:
                   lines.append(f"Dispatched CI run: {run_url}")
                   try:
                       pages = read_pages(
-                          f"repos/{repo}/actions/runs/{os.environ['CI_RUN_ID']}/jobs?filter=latest&per_page=100"
-                      )
+                          f"repos/{repo}/actions/runs/{os.environ['CI_RUN_ID']}/jobs?filter=latest&per_page=100")
                   except (subprocess.CalledProcessError, json.JSONDecodeError):
                       lines.extend(["", "Failed jobs: could not be listed"])
-                  else:
+                  else:  # The complete job listing supplies failure details.
                       lines.extend(["", "Failed jobs:"])
                       jobs = [
                           job
                           for page in pages
                           for job in page["jobs"]
-                          if job.get("conclusion") in failed_conclusions
-                      ]
+                          if job.get("conclusion") in failed_conclusions]
                       for index, job in enumerate(jobs, 1):
                           steps = [
                               step["name"]
                               for step in job.get("steps", [])
-                              if step.get("conclusion") in failed_conclusions
-                          ]
+                              if step.get("conclusion") in failed_conclusions]
                           detail = ", ".join(steps) if steps else (
-                              f"no failed step recorded ({job['conclusion']})"
-                          )
+                              f"no failed step recorded ({job['conclusion']})")
                           lines.append(f"{index}. {job['name']}: {detail}")
                       if not jobs:
                           lines.append("No failed jobs recorded.")
-              else:
+              else:  # Dispatch did not confirm a CI run.
                   lines.append(
-                      "No CI run was confirmed. Inspect the nightly workflow logs for the dispatch failure."
-                  )
+                      "No CI run was confirmed. Inspect the nightly workflow logs for the dispatch failure.")
               body = "\n".join(lines)
-              if issue_number is None:
-                  subprocess.run(
-                      ["gh", "issue", "create", "--repo", repo, "--title", title, "--body", body],
-                      check=True,
-                  )
-              else:
-                  subprocess.run(
-                      ["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", body],
-                      check=True,
-                  )
+          if issue_number is None:
+              gh("issue", "create", "--repo", repo, "--title", title, "--body", body)
+          else:  # Reuse the existing bot tracking issue.
+              gh("issue", "comment", str(issue_number), "--repo", repo, "--body", body)
+              if green:
+                  gh("issue", "close", str(issue_number), "--repo", repo, "--reason", "completed")
           PY
