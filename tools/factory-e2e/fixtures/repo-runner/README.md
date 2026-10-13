@@ -10,6 +10,11 @@ identities, matching immutable runner images, boot manifest logs, and manifest
 contents. The missing-pool and stale-base cases refuse before sandbox creation
 or a model request.
 
+Each file uses the Preflight evidence envelope: its `scenario` field contains
+the observation passed to the pure judge. Completed turns include explicit CLI,
+runner status, repository, capture, and error evidence. Every turn declares an
+empty error list.
+
 `failing.json` describes the same expectation with an unrelated image identity
 for the second repository. The command
 `curie dev factory-e2e judge-repo-runner --observation <sample>` must return

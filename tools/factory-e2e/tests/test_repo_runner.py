@@ -8,13 +8,16 @@ repository runner routing, a manifest, or a model request.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import subprocess
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import factory_e2e as fe
 import pytest
@@ -27,7 +30,7 @@ REPO_Y = "acme-corp/repo-y"
 
 
 def _passing() -> dict[str, Any]:
-    return json.loads((FIXTURES / "passing.json").read_text())
+    return json.loads((FIXTURES / "passing.json").read_text())["scenario"]
 
 
 def _node(observation: dict[str, Any], path: tuple[Any, ...]) -> Any:
@@ -116,6 +119,418 @@ def _plan_env(tmp_path: Path, plan: Any) -> dict[str, str]:
     path = tmp_path / "repo-runner-plan.json"
     path.write_text(json.dumps(plan))
     return {"CURIE_FACTORY_REPO_RUNNER_PLAN": str(path)}
+
+
+def _config_env(tmp_path: Path) -> dict[str, str]:
+    key = tmp_path / "fixture-private-key.pem"
+    key.write_text("fixture private key; no cryptographic operation in config loading")
+    secret = tmp_path / "fixture-webhook-secret"
+    secret.write_text("fixture-secret")
+    return {
+        **_plan_env(tmp_path, _plan()),
+        "CURIE_FACTORY_KUBE_CONTEXT": "k8",
+        "CURIE_LOCAL_STUB_HOST": "198.51.100.10",
+        "CURIE_FACTORY_APP_ID": "1",
+        "CURIE_FACTORY_INSTALLATION_ID": "1",
+        "CURIE_FACTORY_APP_PRIVATE_KEY_FILE": str(key),
+        "CURIE_FACTORY_WEBHOOK_SECRET_FILE": str(secret),
+        "CURIE_FACTORY_REPO": REPO_X,
+        "CURIE_FACTORY_MENTION": "fixture-factory",
+        "CURIE_FACTORY_ACTOR_TOKEN": "fixture-token",
+        "CURIE_FACTORY_LAYER_REGISTRY": "registry.example.com/acme",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "diagnostic"),
+    [
+        ("CURIE_FACTORY_KUBE_CONTEXT", "production", "repo-runner only uses --context k8"),
+        (
+            "CURIE_LOCAL_STUB_HOST", "127.0.0.1",
+            "CURIE_LOCAL_STUB_HOST must be reachable from the k8 cluster",
+        ),
+        (
+            "CURIE_LOCAL_STUB_HOST", "0.0.0.0",
+            "CURIE_LOCAL_STUB_HOST must be reachable from the k8 cluster",
+        ),
+    ],
+)
+def test_config_refuses_wrong_context_and_unreachable_callback_hosts(
+    field: str, value: str, diagnostic: str, tmp_path: Path
+) -> None:
+    env = _config_env(tmp_path)
+    env[field] = value
+    with pytest.raises(fe.ConfigError) as refused:
+        repo_runner.load_repo_runner_config(env, context=None)
+    assert str(refused.value) == diagnostic
+
+
+def test_config_accepts_its_owned_scripted_model_and_reachable_callback(tmp_path: Path) -> None:
+    config = repo_runner.load_repo_runner_config(_config_env(tmp_path), context=None)
+    assert config.kube_context == "k8"
+    assert config.model_api_key == repo_runner.SCRIPTED_KEY
+    assert config.model_base_url is None
+    assert config.repo == REPO_X
+
+
+@pytest.fixture
+def preflight(tmp_path: Path) -> Iterator[fe.Preflight]:
+    config = fe.FactoryConfig(
+        kube_context="k8",
+        app_id="1",
+        installation_id=1,
+        private_key_file=tmp_path / "fixture.pem",
+        repo=REPO_X,
+        label="fixture",
+        mention="fixture",
+        cloudflared="cloudflared",
+        priority_classes=None,
+        restore_webhook_url=None,
+        webhook_secret="fixture-secret",
+        actor_token="fixture-token",
+        model_api_key=repo_runner.SCRIPTED_KEY,
+    )
+    value = fe.Preflight(
+        config,
+        repo_root=ROOT.parents[1],
+        candidate="c" * 40,
+        namespace="test-factory-tools",
+        evidence_path=tmp_path / "evidence.json",
+        admission_timeout=1,
+        scenario_name="repo-runner",
+    )
+    value.chart_dir = ROOT.parents[1] / "charts" / "curie"
+    value.api_key = "fixture-api-key"
+    try:
+        yield value
+    finally:
+        shutil.rmtree(value.workdir)
+
+
+class _KubernetesCli:
+    """Synthetic external CLI replies; all product collector methods stay real."""
+
+    def __init__(self, p: fe.Preflight) -> None:
+        self.p = p
+        self.calls: list[list[str]] = []
+        self.patches: list[list[dict[str, Any]]] = []
+        self.started = False
+        self.exited = False
+        self.claims_enabled = True
+        self.post_exit_claim: str | None = None
+        self.probes = [{"status": "done", "turn_active": False}]
+        self.probe_calls = 0
+        self.cas_conflict = False
+        self.outcome: dict[str, Any] = {
+            "finalized": True, "failed": False, "reply": "Manifest captured."
+        }
+        pools = copy.deepcopy(_plan()["turns"][2]["worker_pools"])
+        pools[REPO_X]["pool"] = "fixture-x"
+        for pool in pools.values():
+            pool["egress"] = []
+        self.deployment = {
+            "metadata": {"resourceVersion": "1"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "sidecar", "env": [{"name": "UNCHANGED", "value": "sidecar"}]},
+                {"name": "worker", "env": [
+                    {"name": "UNCHANGED", "value": "worker"},
+                    {"name": "CURIE_REPO_RUNNER_POOLS", "value": json.dumps(pools)},
+                ]},
+            ]}}},
+        }
+
+    def pool_value(self) -> str:
+        return str(self.deployment["spec"]["template"]["spec"]["containers"][1]["env"][1]["value"])
+
+    def run(self, argv: list[str], *, check: bool = True, input_text: str | None = None) -> str:
+        self.calls.append(list(argv))
+        assert argv[:3] == ["kubectl", "--context", "k8"]
+        assert self.p.namespace in argv
+        if "get" in argv and "deployment" in argv:
+            return json.dumps(self.deployment)
+        if "patch" in argv:
+            patch = json.loads(argv[argv.index("-p") + 1])
+            self.patches.append(patch)
+            if self.cas_conflict:
+                self.deployment["spec"]["template"]["spec"]["containers"][1]["env"][1][
+                    "name"
+                ] = "UNRELATED_VARIABLE"
+            for operation in patch:
+                node: Any = self.deployment
+                parts = operation["path"].strip("/").split("/")
+                for part in parts[:-1]:
+                    node = node[int(part)] if isinstance(node, list) else node[part]
+                leaf: Any = int(parts[-1]) if isinstance(node, list) else parts[-1]
+                if operation["op"] == "test":
+                    if node[leaf] != operation["value"]:
+                        raise fe.PreflightFailed("external compare-and-swap rejected changed field")
+                else:
+                    assert operation["op"] == "replace"
+                    node[leaf] = operation["value"]
+            return "deployment patched"
+        if "rollout" in argv:
+            return "deployment rolled out"
+        if "sandboxclaims.extensions.agents.x-k8s.io" in argv:
+            claims = []
+            if self.started and self.claims_enabled:
+                name = (
+                    self.post_exit_claim
+                    if self.exited and self.post_exit_claim else "fixture-claim-x"
+                )
+                claims = [{
+                    "metadata": {"name": name},
+                    "spec": {"env": [{"name": "CURIE_REPO_PATH", "value": REPO_X}]},
+                    "status": {"sandbox": {"name": "fixture-sandbox-x"}},
+                }]
+            return json.dumps({"items": claims})
+        if "pod" in argv:
+            turn = _passing()["turns"][0]
+            return json.dumps({
+                "metadata": {"uid": turn["pod_uid"]},
+                "spec": {"containers": [{
+                    "name": "runner", "image": turn["spec_image"],
+                    "ports": [{"name": "aci", "containerPort": 4321}],
+                }]},
+                "status": {"containerStatuses": [{"name": "runner", "imageID": turn["image_id"]}]},
+            })
+        if "logs" in argv:
+            return _passing()["turns"][0]["boot_log"]
+        if "exec" in argv:
+            assert "/status" in argv[-1]
+            status = self.probes[min(self.probe_calls, len(self.probes) - 1)]
+            self.probe_calls += 1
+            return json.dumps(status)
+        if "sandboxwarmpool" in argv:
+            return "" if "absent-fixture-x" in argv else "sandboxwarmpool/fixture-x"
+        raise AssertionError(f"unexpected external kubectl command {argv}")
+
+    def subprocess_run(self, argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        self.calls.append(list(argv))
+        assert argv[:3] == ["kubectl", "config", "view"]
+        assert argv[argv.index("--context") + 1] == "k8"
+        return subprocess.CompletedProcess(argv, 0, "apiVersion: v1\nkind: Config\n", "")
+
+
+@pytest.fixture
+def offline_driver(
+    preflight: fe.Preflight, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[repo_runner.RepoRunnerRun, _KubernetesCli]]:
+    preflight.release = "factory-tools"
+    driver = repo_runner.RepoRunnerRun(preflight, _plan())
+    cli = _KubernetesCli(preflight)
+    driver.baseline_pools = json.loads(cli.pool_value())
+    driver.installed_base = "sha256:" + "e" * 64
+    model = repo_runner.ScriptedManifestModel(host="127.0.0.1", port=0)
+    model.start()
+    driver.model = model
+    class MessageProcess:
+        returncode = 0
+
+        def __init__(self, argv: list[str], **_kwargs: Any) -> None:
+            assert argv[:5] == ["curie", "cluster", "--context", "k8", "message"]
+            assert argv[argv.index("--release") + 1] == "factory-tools"
+            assert argv[argv.index("--namespace") + 1] == preflight.namespace
+            cli.started = True
+            if cli.claims_enabled:
+                first = _first_model_body()
+                status, response = _model_request(model, first)
+                assert status == 200
+                assert _model_request(model, _result_model_body(first, response))[0] == 200
+
+        def poll(self) -> int:
+            cli.exited = True
+            return self.returncode
+
+        def communicate(self, *, timeout: int) -> tuple[str, str]:
+            return json.dumps(cli.outcome), ""
+
+    monkeypatch.setattr(fe, "run", cli.run)
+    monkeypatch.setattr(subprocess, "run", cli.subprocess_run)
+    monkeypatch.setattr(subprocess, "Popen", MessageProcess)
+    monkeypatch.setenv("CURIE_LOCAL_STUB_HOST", "198.51.100.10")
+    try:
+        yield driver, cli
+    finally:
+        assert model.close() == {"stopped": True}
+
+
+def test_scenario_channel_passes_the_actual_api_channel_write_schema(
+    preflight: fe.Preflight,
+) -> None:
+    from curie_api.schemas.channels import ChannelBindingWrite
+
+    driver = repo_runner.RepoRunnerRun(preflight, _plan())
+    accepted = ChannelBindingWrite(kind="slack", address=driver.channel)
+    assert accepted.address == driver.channel
+
+
+def test_namespace_create_payload_already_carries_the_scenario_owner(
+    preflight: fe.Preflight, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    created: list[dict[str, Any]] = []
+
+    def external_run(
+        argv: list[str], *, check: bool = True, input_text: str | None = None
+    ) -> str:
+        assert argv[:3] == ["kubectl", "--context", "k8"]
+        if "create" in argv:
+            assert [name for name, _ in preflight.teardown._steps] == ["delete namespaces"]
+            created.append(json.loads(input_text or "{}"))
+        else:
+            assert "get" in argv and "namespace" in argv
+        return ""
+
+    monkeypatch.setattr(fe, "run", external_run)
+    preflight.create_namespace()
+    assert len(created) == 1
+    labels = created[0]["metadata"]["labels"]
+    owner_name, owner_value = fe.OWNER_LABEL.split("=", 1)
+    assert labels[owner_name] == owner_value
+    assert labels["owner"] == "factory-tools"
+
+
+def test_claim_selection_uses_the_scoped_thread_hash_in_the_actual_kubectl_argv(
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+) -> None:
+    driver, cli = offline_driver
+    thread = "fixture:thread/1"
+    assert driver._claims(thread) == []
+    scoped = ":".join(quote(value, safe="-._~") for value in ("slack", driver.channel, thread))
+    digest = hashlib.sha256(scoped.encode()).hexdigest()[:10]
+    command = cli.calls[-1]
+    assert command[command.index("-l") + 1] == (
+        f"curietech.ai/thread-hash={digest},curietech.ai/agent={fe.FACTORY_AGENT}"
+    )
+
+
+def test_turn_completion_uses_real_claim_pod_probe_and_scripted_http_evidence(
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+) -> None:
+    driver, cli = offline_driver
+    turn = driver._turn(0, _plan()["turns"][0])
+    assert turn["status"] == "completed"
+    assert turn["cli_exit_code"] == 0
+    assert turn["runner_status"] == {"status": "done", "turn_active": False}
+    assert turn["observed_repository"] == REPO_X
+    assert turn["capture_error"] is None
+    assert turn["model_requests"] == 2
+    assert turn["manifest_output"] == _passing()["turns"][0]["manifest_output"]
+    assert turn["errors"] == []
+    assert cli.patches == []
+
+
+def test_turn_reprobes_after_cli_exit_and_includes_claims_first_seen_then(
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+) -> None:
+    driver, cli = offline_driver
+    cli.probes = [
+        {"status": "running", "turn_active": True},
+        {"status": "done", "turn_active": False},
+    ]
+    cli.post_exit_claim = "fixture-claim-after-exit"
+    turn = driver._turn(0, _plan()["turns"][0])
+    assert turn["status"] == "completed"
+    assert cli.probe_calls >= 2
+    assert turn["claim"] == "fixture-claim-after-exit"
+    assert "fixture-claim-after-exit" in turn["new_claims"]
+
+
+@pytest.mark.parametrize("missing_proof", ["finalized", "done-probe"])
+def test_turn_does_not_complete_from_cli_exit_alone(
+    missing_proof: str, offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli]
+) -> None:
+    driver, cli = offline_driver
+    if missing_proof == "finalized":
+        cli.outcome["finalized"] = False
+    else:
+        cli.probes = [{"status": "running", "turn_active": True}]
+    assert driver._turn(0, _plan()["turns"][0])["status"] == "failed"
+
+
+@pytest.mark.parametrize("failure", ["workspace-conflict", "generic-runner-failure"])
+def test_turn_keeps_named_workspace_diagnostics_and_refuses_no_generic_failure(
+    failure: str, offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli]
+) -> None:
+    driver, cli = offline_driver
+    cli.claims_enabled = False
+    cli.outcome = {"failed": True, "failure_class": "runner_failed", "reply": "A runner failed."}
+    if failure == "workspace-conflict":
+        # The worker's workspace.py maps workspace.selection_conflict to this exact reply.
+        cli.outcome["reply"] = "This thread is already bound to a different repository."
+    turn = driver._turn(0, _plan()["turns"][0])
+    if failure == "workspace-conflict":
+        assert turn["reason"] == "workspace.selection_conflict"
+        assert any(
+            "workspace.selection_conflict" in error
+            for error in repo_runner.judge_repo_runner(driver.obs)
+        )
+    else:
+        assert turn["status"] == "failed"
+        assert turn["reason"] == "runner_failed"
+
+
+@pytest.mark.parametrize("index", [2, 3], ids=["missing-pool", "stale-base"])
+def test_fault_turn_changes_only_its_declared_target_and_preserves_named_refusal(
+    index: int, offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli]
+) -> None:
+    driver, cli = offline_driver
+    planned = _plan()["turns"][index]
+    before = copy.deepcopy(driver.baseline_pools)
+    cli.claims_enabled = False
+    cli.outcome = {"failed": True, "failure_class": planned["expect"], "reply": "Refused."}
+    turn = driver._turn(index, planned)
+    assert turn["status"] == "refused"
+    assert turn["reason"] == planned["expect"]
+    after = json.loads(cli.pool_value())
+    field = "pool" if index == 2 else "base"
+    expected = copy.deepcopy(before)
+    expected[REPO_X][field] = planned["worker_pools"][REPO_X][field]
+    assert after == expected
+    assert turn["new_claims"] == []
+    assert turn["model_requests"] == 0
+
+
+@pytest.mark.parametrize("index", [2, 3], ids=["missing-pool", "stale-base"])
+def test_fault_turn_rejects_changes_to_an_unrelated_repository_before_patching(
+    index: int, offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli]
+) -> None:
+    driver, cli = offline_driver
+    planned = _plan()["turns"][index]
+    planned["worker_pools"][REPO_Y]["pool"] = "unrelated-pool"
+    with pytest.raises(fe.ConfigError, match="outside its one target fault"):
+        driver._turn(index, planned)
+    assert cli.patches == []
+
+
+def test_pool_patch_compares_field_name_and_value_then_restores_the_exact_initial_map(
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+) -> None:
+    driver, cli = offline_driver
+    initial = cli.pool_value()
+    fault = copy.deepcopy(driver.baseline_pools)
+    fault[REPO_X]["pool"] = "absent-fixture-x"
+    assert driver._set_pools(fault) == fault
+    patch = cli.patches[0]
+    pointer = "/spec/template/spec/containers/1/env/1"
+    assert {"op": "test", "path": pointer + "/name", "value": "CURIE_REPO_RUNNER_POOLS"} in patch
+    assert {"op": "test", "path": pointer + "/value", "value": initial} in patch
+    assert all(operation["path"] != "/metadata/resourceVersion" for operation in patch)
+    assert driver._set_pools(None) == driver.baseline_pools
+    assert cli.pool_value() == initial
+    assert driver.fault_active is False
+
+
+def test_pool_patch_refuses_a_field_name_changed_after_observation(
+    offline_driver: tuple[repo_runner.RepoRunnerRun, _KubernetesCli],
+) -> None:
+    driver, cli = offline_driver
+    cli.cas_conflict = True
+    fault = copy.deepcopy(driver.baseline_pools)
+    fault[REPO_X]["pool"] = "absent-fixture-x"
+    with pytest.raises(
+        fe.PreflightFailed, match="external compare-and-swap rejected changed field"
+    ):
+        driver._set_pools(fault)
 
 
 def test_plan_loads_full_chart_bindings_and_four_declared_turns(tmp_path: Path) -> None:
@@ -451,7 +866,7 @@ def test_scenario_values_add_factory_to_a_base_without_it() -> None:
 
 @pytest.mark.parametrize(("sample", "passes"), [("passing.json", True), ("failing.json", False)])
 def test_canonical_synthetic_samples(sample: str, passes: bool) -> None:
-    observation = json.loads((FIXTURES / sample).read_text())
+    observation = json.loads((FIXTURES / sample).read_text())["scenario"]
     assert "synthetic" in observation["provenance"]
     assert "not observed live evidence" in observation["provenance"]
     failures = repo_runner.judge_repo_runner(observation)
@@ -603,6 +1018,11 @@ def test_missing_or_non_mapping_observation_fails_closed(observation: Any) -> No
         pytest.param(("turns", 0, "manifest_output"), "[]", id="non-object-manifest"),
         pytest.param(("turns", 0, "status"), "running", id="nonterminal-turn"),
         pytest.param(("turns", 0, "status"), "failed", id="failed-turn"),
+        pytest.param(("turns", 0, "cli_exit_code"), 1, id="failed-cli-exit"),
+        pytest.param(("turns", 0, "runner_status", "status"), "running", id="runner-not-done"),
+        pytest.param(("turns", 0, "runner_status", "turn_active"), True, id="runner-turn-active"),
+        pytest.param(("turns", 0, "observed_repository"), REPO_Y, id="wrong-claim-repository"),
+        pytest.param(("turns", 0, "capture_error"), "ambiguous claim", id="capture-failed"),
         pytest.param(("turns", 0, "model_requests"), 0, id="no-model-requests"),
         pytest.param(("turns", 0, "model_requests"), 1, id="only-one-model-request"),
         pytest.param(("turns", 0, "model_requests"), "2", id="noninteger-model-count"),
@@ -646,6 +1066,10 @@ def test_each_observation_shortfall_fails_closed(path: tuple[Any, ...], value: A
         ("turns", 0, "boot_log"),
         ("turns", 0, "manifest_output"),
         ("turns", 0, "status"),
+        ("turns", 0, "cli_exit_code"),
+        ("turns", 0, "runner_status"),
+        ("turns", 0, "observed_repository"),
+        ("turns", 0, "capture_error"),
         ("turns", 0, "model_requests"),
     ],
 )
@@ -711,6 +1135,17 @@ def test_manifest_cannot_add_an_undeclared_catalog_tool_or_duplicate(extra_tool:
 def test_each_success_and_refusal_case_is_required(turn: int) -> None:
     observation = _passing()
     del observation["turns"][turn]
+    assert repo_runner.judge_repo_runner(observation)
+
+
+@pytest.mark.parametrize("turn", [0, 1, 2, 3])
+@pytest.mark.parametrize("errors", [None, ["unexpected model request"]])
+def test_every_turn_requires_explicit_empty_error_evidence(turn: int, errors: Any) -> None:
+    observation = _passing()
+    if errors is None:
+        del observation["turns"][turn]["errors"]
+    else:
+        observation["turns"][turn]["errors"] = errors
     assert repo_runner.judge_repo_runner(observation)
 
 
@@ -866,6 +1301,23 @@ def test_standalone_judge_fails_closed_on_unreadable_observation(
     observation = tmp_path / "observation.json"
     observation.write_text(contents)
     assert repo_runner.main(["judge", str(observation)]) == 1
+
+
+@pytest.mark.parametrize("scenario", [None, [], "observation"])
+def test_standalone_judge_requires_an_observation_mapping_inside_the_envelope(
+    scenario: Any, tmp_path: Path
+) -> None:
+    path = tmp_path / "evidence.json"
+    path.write_text(json.dumps({"scenario": scenario}))
+    assert repo_runner.main(["judge", str(path)]) == 1
+
+
+def test_standalone_judge_refuses_a_raw_observation_without_the_evidence_envelope(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "raw-observation.json"
+    path.write_text(json.dumps(_passing()))
+    assert repo_runner.main(["judge", str(path)]) == 1
 
 
 @pytest.mark.parametrize(("sample", "code"), [("passing.json", 0), ("failing.json", 1)])
