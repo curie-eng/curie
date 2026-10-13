@@ -15,8 +15,7 @@ worker:
   CURIE_ATTACHMENT_THREAD_MAX_BYTES: worker.attachments.threadMaxBytes
   CURIE_ATTACHMENT_THREAD_MAX_FILES: worker.attachments.threadMaxFiles
   CURIE_CLAIM_TIMEOUT_SECONDS: worker.claimTimeoutSeconds
-  CURIE_CODE_HOST_CA_CONFIGMAP: codeHostTrust.caBundle.configMapRef.name
-  CURIE_CODE_HOST_CA_CONFIGMAP_KEY: codeHostTrust.caBundle.configMapRef.key
+  CURIE_CODE_HOST_CA_BUNDLE: codeHostTrust.caBundle.configMapRef.name
   CURIE_CONNECTOR_APP_NAME: nameOverride
   CURIE_CONNECTOR_CALLER_SIGNING_KEY: connectorCaller.signingKey
   CURIE_CONNECTOR_RECONCILE: worker.connectorReconciler.enabled

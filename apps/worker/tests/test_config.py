@@ -1831,15 +1831,12 @@ def test_the_worker_reads_no_code_host_url(monkeypatch: pytest.MonkeyPatch) -> N
     assert not hasattr(config, "publication_github_html_base")
 
 
-def test_the_publication_job_trust_bundle_comes_from_the_chart_configmap(
+def test_the_publication_job_trust_bundle_comes_from_the_worker_mount(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_all_config_env(monkeypatch)
-    assert WorkerConfig().publication_ca_bundle_config_map == ""
-    assert WorkerConfig().publication_ca_bundle_key == "ca.crt"
+    assert WorkerConfig().publication_ca_bundle_path == ""
 
-    monkeypatch.setenv("CURIE_CODE_HOST_CA_CONFIGMAP", "corp-ca")
-    monkeypatch.setenv("CURIE_CODE_HOST_CA_CONFIGMAP_KEY", "bundle.pem")
+    monkeypatch.setenv("CURIE_CODE_HOST_CA_BUNDLE", "/etc/curie/code-host-trust/ca.crt")
 
-    assert WorkerConfig().publication_ca_bundle_config_map == "corp-ca"
-    assert WorkerConfig().publication_ca_bundle_key == "bundle.pem"
+    assert WorkerConfig().publication_ca_bundle_path == "/etc/curie/code-host-trust/ca.crt"

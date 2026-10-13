@@ -9,6 +9,7 @@ import os
 import ssl
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -637,7 +638,12 @@ async def test_generated_script_only_pushes_the_marked_commit() -> None:
     assert state_response.json()["pull"] is None
 
 
-def _contract_settings() -> PublicationJobSettings:
+CONTRACT_CA_PEM = "-----BEGIN CERTIFICATE-----\nMIIBcontractonly\n-----END CERTIFICATE-----\n"
+
+
+def _contract_settings(directory: Path) -> PublicationJobSettings:
+    bundle = directory / "worker-code-host-trust.crt"
+    bundle.write_text(CONTRACT_CA_PEM, encoding="utf-8")
     return PublicationJobSettings(
         namespace="curie-publication-contract",
         runner_image="curie-runner:contract",
@@ -654,7 +660,7 @@ def _contract_settings() -> PublicationJobSettings:
         memory_limit="512Mi",
         ephemeral_request="128Mi",
         ephemeral_limit="1Gi",
-        ca_bundle_config_map="code-host-trust",
+        ca_bundle_path=str(bundle),
     )
 
 
@@ -682,11 +688,11 @@ CONTRACT_TRANSPORT = PublicationTransport(
 )
 
 
-def test_job_transport_reads_back_what_the_builder_wrote() -> None:
+def test_job_transport_reads_back_what_the_builder_wrote(tmp_path: Path) -> None:
     resources = build_publication_resources(
         _contract_payload(CONTRACT_TRANSPORT),
         credential="fixture-private-token",
-        settings=_contract_settings(),
+        settings=_contract_settings(tmp_path),
     )
     assert job_transport(resources.job) == CONTRACT_TRANSPORT
 
@@ -699,14 +705,14 @@ def test_job_transport_reads_back_what_the_builder_wrote() -> None:
     assert {
         "name": "code-host-trust",
         "configMap": {
-            "name": "code-host-trust",
-            "items": [{"key": "ca.crt", "path": "ca.pem"}],
+            "name": resources.names.config_map,
+            "items": [{"key": "code-host-ca.pem", "path": "ca.pem"}],
         },
     } in pod_spec["volumes"]
 
 
-def test_adoption_refuses_a_job_whose_transport_was_altered() -> None:
-    settings = _contract_settings()
+def test_adoption_refuses_a_job_whose_transport_was_altered(tmp_path: Path) -> None:
+    settings = _contract_settings(tmp_path)
     built = build_publication_resources(
         _contract_payload(CONTRACT_TRANSPORT),
         credential="fixture-private-token",

@@ -1203,16 +1203,14 @@ class WorkerConfig(BaseSettings):
     def _repository_relative_protected_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return normalize_protected_publication_paths(value)
 
-    # The ConfigMap and key holding the operator's code host CA bundle
-    # (codeHostTrust.caBundle.configMapRef, ADR 0197). The publication Job
-    # mounts it at the path the push credential's ``ca_bundle_ref`` names. The
-    # worker itself calls no code host; its workspace clone reads the same
-    # mounted file through the clone credential. Empty means none.
-    publication_ca_bundle_config_map: str = Field(
-        default="", validation_alias="CURIE_CODE_HOST_CA_CONFIGMAP"
-    )
-    publication_ca_bundle_key: str = Field(
-        default="ca.crt", min_length=1, validation_alias="CURIE_CODE_HOST_CA_CONFIGMAP_KEY"
+    # The path of the worker's own mounted copy of the operator's code host CA
+    # bundle (codeHostTrust.caBundle.configMapRef, ADR 0197). The publication
+    # Job runs in another namespace, so the worker copies this PEM into the
+    # Job's own ConfigMap and mounts it at the path the push credential's
+    # ``ca_bundle_ref`` names. The worker itself calls no code host. Empty
+    # means none.
+    publication_ca_bundle_path: str = Field(
+        default="", validation_alias="CURIE_CODE_HOST_CA_BUNDLE"
     )
 
     publication_reconcile_interval_seconds: float = Field(

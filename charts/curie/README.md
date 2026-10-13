@@ -1968,12 +1968,14 @@ codeHostTrust:
 ```
 
 The chart mounts that key read-only at `/etc/curie/code-host-trust/ca.crt` in
-the api, the worker, every sandbox runner and every publication Job. The api
-adds it to the public roots for its code host HTTP clients. git
-(`GIT_SSL_CAINFO`, `http.sslCAInfo`) and the sandbox's `SSL_CERT_FILE` and
-`REQUESTS_CA_BUNDLE` use it as their whole store, so include the public roots
-if the sandbox reaches public HTTPS hosts through them. Create the ConfigMap in
-the publication namespace too when `worker.publication.namespace` differs.
+the api, the worker and every sandbox runner. The api adds it to the public
+roots for its code host HTTP clients. git (`GIT_SSL_CAINFO`, `http.sslCAInfo`)
+and the sandbox's `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` use it as their
+whole store, so include the public roots if the sandbox reaches public HTTPS
+hosts through them. Create the ConfigMap in the release namespace only. A
+publication Job runs in the publication namespace, so the worker copies the PEM
+it has mounted (`CURIE_CODE_HOST_CA_BUNDLE`) into that Job's own ConfigMap and
+mounts it read-only at the path the push credential names.
 
 The worker also refuses new third-party dependency names by default, including
 new transitive lockfile entries. It compares `pyproject.toml`, `uv.lock`,

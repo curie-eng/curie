@@ -3667,7 +3667,7 @@ for component in ("api", "worker"):
     print(f"  ok: missing {component} S3_REGION is rejected")
 PYEOF
 
-echo "=== Assertion 25: worker hands the code-host CA ConfigMap to publication Jobs (#4394) ==="
+echo "=== Assertion 25: worker hands its mounted code-host CA bundle to publication Jobs (#4394) ==="
 python3 - "$CHART" <<'PYEOF'
 import copy
 import subprocess
@@ -3676,8 +3676,8 @@ import sys
 import yaml
 
 chart = sys.argv[1]
-env_name = "CURIE_CODE_HOST_CA_CONFIGMAP"
-ca_path = "github-stub-ca"
+env_name = "CURIE_CODE_HOST_CA_BUNDLE"
+ca_path = "/etc/curie/code-host-trust/ca.crt"
 
 
 def worker_container(documents):
@@ -3705,17 +3705,16 @@ def assert_ca_file(documents):
     assert entries == [{"name": env_name, "value": ca_path}], (
         f"worker {env_name} must equal {ca_path!r} exactly once, found {entries!r}"
     )
-    assert {"name": "CURIE_CODE_HOST_CA_CONFIGMAP_KEY", "value": "ca.pem"} in worker_container(documents)["env"]
     workers = [doc for doc in documents if isinstance(doc, dict) and doc.get("kind") == "Deployment" and doc.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/component") == "worker"]
     volumes = [volume for volume in workers[0]["spec"]["template"]["spec"]["volumes"] if volume["name"] == "code-host-trust"]
     assert len(volumes) == 1
-    assert volumes[0]["configMap"] == {"name": ca_path, "items": [{"key": "ca.pem", "path": "ca.crt"}]}
+    assert volumes[0]["configMap"] == {"name": "github-stub-ca", "items": [{"key": "ca.pem", "path": "ca.crt"}]}
     mounts = [
         mount for mount in worker_container(documents).get("volumeMounts", [])
         if mount["name"] == "code-host-trust"
     ]
     assert len(mounts) == 1, f"expected one worker github-stub-ca mount, found {mounts!r}"
-    assert mounts[0]["mountPath"] == "/etc/curie/code-host-trust", (
+    assert mounts[0]["mountPath"] == ca_path.rsplit("/", 1)[0], (
         f"{env_name} directory must equal the github-stub-ca mountPath {mounts[0]['mountPath']!r}"
     )
 
@@ -3735,7 +3734,7 @@ print(f"  ok: default render gives the worker no {env_name}")
 
 configured = render("--set", "codeHostTrust.caBundle.configMapRef.name=github-stub-ca", "--set", "codeHostTrust.caBundle.configMapRef.key=ca.pem")
 assert_ca_file(configured)
-print(f"  ok: codeHostTrust.caBundle.configMapRef renders {env_name}={ca_path} inside the worker's mounted CA directory")
+print(f"  ok: codeHostTrust.caBundle.configMapRef renders {env_name}={ca_path}, the worker's own mounted copy of the bundle")
 
 mutant = copy.deepcopy(configured)
 container = worker_container(mutant)
@@ -3750,4 +3749,4 @@ print(f"  ok: negative control, a configured render without {env_name} is reject
 PYEOF
 
 echo
-echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate, the API uses RollingUpdate with maxUnavailable 0 and maxSurge 1 plus a preStop sleep 5, proven by both removed-block negative controls, and other workloads keep their strategies; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls; and codeHostTrust.caBundle.configMapRef points the worker publication Jobs at the mounted code-host CA ConfigMap and is absent by default, proven by a failing negative control."
+echo "PASS: sealed render generates strong values for all 12 keys (encryptionKey 64-hex and Langfuse init credentials 32 alphanumeric); dev overlay keeps published defaults; explicit credential and OTel overrides win on the sealed path; default OTel Basic auth uses the resolved Langfuse project secret; every runner boot-env name is a declared contract key (proven by a failing negative control); every long-running platform workload (including langfuse, the OTel collector, the UI, inference and the mail adapter, per #3182), the agent-sandbox controller, and the sandbox render with the expected priorityClassName, including under operator override, with the runner-prewarm DaemonSet pinned classless below curie-sandbox and both negative controls (a classless platform workload, an unclassified new workload) proven to fire; the runner SandboxTemplate opts the controller out of its own permissive NetworkPolicy whenever Rail 1 is on, and leaves it to the controller's default when Rail 1 is off; api.githubToken stays a plain pass-through (empty renders empty, an explicit value renders verbatim, and it is never generated), proven by a failing negative control; every rendered pod surface receives its exact placement class while empty defaults omit placement fields and a platform-only label does not leak across classes; the worker renders exactly one API URL plus exactly one correctly sourced API key in default, connector enabled, release name, configured port, BYO API, and operator override cases; the security probe uses the configured RustFS port in DATATIER_TARGETS; and the API schema-wait init and schema-migrate Job wait with bounded retries that periodically name the probe error class before the upgrade-phase wait, with readiness exhaustion proven to exit nonzero without invoking schema_compat wait; and NOTES prints the same app-service image references the corresponding Deployments render, refusing a bare trailing colon (proven by a failing negative control); the dispatcher rolls out with Recreate, the API uses RollingUpdate with maxUnavailable 0 and maxSurge 1 plus a preStop sleep 5, proven by both removed-block negative controls, and other workloads keep their strategies; chart-managed installs leave pre-install hooks classless and chart-managed upgrades leave pre-upgrade hooks classless, while later hooks and all operator-class hooks use the platform class, including both Grafana hooks, with seven negative controls proven to fail; and rustfs-init expires Langfuse event-upload objects after langfuse.eventUpload.retentionDays; every SandboxTemplate runner takes CURIE_RUNNER_TOKEN from the chart-owned runner token Secret and none renders the tokenless dev flag, proven by three failing negative controls; and codeHostTrust.caBundle.configMapRef hands the worker the path of its own mounted code-host CA bundle for publication Jobs and is absent by default, proven by a failing negative control."

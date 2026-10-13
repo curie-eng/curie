@@ -120,12 +120,15 @@ def _build(module: Any, payload: Any, settings: Any | None = None) -> Any:
     )
 
 
-def _ca_settings(module: Any) -> Any:
-    return replace(
-        _settings(module),
-        ca_bundle_config_map="curie-code-host-trust",
-        ca_bundle_key="corporate-root.pem",
-    )
+CA_PEM = "-----BEGIN CERTIFICATE-----\nMIIBfixtureonly\n-----END CERTIFICATE-----\n"
+
+
+def _ca_settings(module: Any, directory: Path) -> Any:
+    """Settings whose worker-mounted codeHostTrust bundle holds ``CA_PEM``."""
+
+    bundle = directory / "worker-code-host-trust.crt"
+    bundle.write_text(CA_PEM, encoding="utf-8")
+    return replace(_settings(module), ca_bundle_path=str(bundle))
 
 
 def _container(resources: Any) -> dict[str, Any]:
@@ -482,28 +485,43 @@ def test_a_non_github_origin_with_a_nested_repository_path_builds(
     assert "github" not in json.dumps(resources.job).lower()
 
 
-def test_a_ca_bundle_mounts_the_configmap_read_only_and_points_every_client_at_it(
+def test_a_ca_bundle_mounts_from_the_jobs_own_configmap_and_points_every_client_at_it(
     publication_k8s: Any,
+    tmp_path: Path,
 ) -> None:
     payload = replace(
         _payload(publication_k8s),
         transport=_transport(publication_k8s, ca_bundle_ref=CA_REF),
     )
-    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s))
+    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s, tmp_path))
     pod_spec = resources.job["spec"]["template"]["spec"]
     container = _container(resources)
     env = _job_env(resources)
 
+    # The Job runs in the publication namespace, so the PEM travels in the
+    # per-publication ConfigMap the worker creates there, never a reference
+    # to the release namespace's codeHostTrust ConfigMap.
+    assert resources.config_map["data"]["code-host-ca.pem"] == CA_PEM
     trust_volumes = [v for v in pod_spec["volumes"] if v["name"] == "code-host-trust"]
     assert trust_volumes == [
         {
             "name": "code-host-trust",
             "configMap": {
-                "name": "curie-code-host-trust",
-                "items": [{"key": "corporate-root.pem", "path": "ca.crt"}],
+                "name": resources.names.config_map,
+                "items": [{"key": "code-host-ca.pem", "path": "ca.crt"}],
             },
         }
     ]
+    # Every object the pod references is one this publication owns.
+    referenced = {v["configMap"]["name"] for v in pod_spec["volumes"] if "configMap" in v} | {
+        v["secret"]["secretName"] for v in pod_spec["volumes"] if "secret" in v
+    }
+    assert referenced == {resources.names.config_map, resources.names.secret}
+    assert {
+        resources.config_map["metadata"]["namespace"],
+        resources.secret["metadata"]["namespace"],
+        resources.job["metadata"]["namespace"],
+    } == {"curie"}
     trust_mounts = [m for m in container["volumeMounts"] if m["name"] == "code-host-trust"]
     assert trust_mounts == [
         {
@@ -518,9 +536,11 @@ def test_a_ca_bundle_mounts_the_configmap_read_only_and_points_every_client_at_i
     assert "secret" not in trust_volumes[0]
 
 
-def test_no_ca_bundle_adds_no_volume_mount_or_trust_env(publication_k8s: Any) -> None:
-    # A configured ConfigMap alone does not mount anything; the credential's ref does.
-    for settings in (_settings(publication_k8s), _ca_settings(publication_k8s)):
+def test_no_ca_bundle_adds_no_volume_mount_or_trust_env(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    # A mounted worker bundle alone does not mount anything; the credential's ref does.
+    for settings in (_settings(publication_k8s), _ca_settings(publication_k8s, tmp_path)):
         resources = _build(publication_k8s, _payload(publication_k8s), settings)
         pod_spec = resources.job["spec"]["template"]["spec"]
         container = _container(resources)
@@ -545,14 +565,27 @@ def test_no_ca_bundle_adds_no_volume_mount_or_trust_env(publication_k8s: Any) ->
             "REQUESTS_CA_BUNDLE",
         ):
             assert name not in env, name
+        assert "code-host-ca.pem" not in resources.config_map["data"]
     # The two builds are identical, so the operator setting cannot drift a running Job.
-    assert (
-        _build(publication_k8s, _payload(publication_k8s)).job
-        == _build(publication_k8s, _payload(publication_k8s), _ca_settings(publication_k8s)).job
+    plain = _build(publication_k8s, _payload(publication_k8s))
+    with_bundle = _build(
+        publication_k8s, _payload(publication_k8s), _ca_settings(publication_k8s, tmp_path)
     )
+    assert plain.job == with_bundle.job
+    assert plain.config_map == with_bundle.config_map
 
 
-def test_a_ca_bundle_ref_without_a_configmap_is_refused(publication_k8s: Any) -> None:
+def test_a_liveness_publication_with_no_ca_builds_when_the_bundle_path_is_missing(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    # A public-trust credential never reads the worker's bundle, so a stale
+    # or absent path cannot block it.
+    settings = replace(_settings(publication_k8s), ca_bundle_path=str(tmp_path / "absent.crt"))
+    resources = _build(publication_k8s, _payload(publication_k8s), settings)
+    assert "code-host-ca.pem" not in resources.config_map["data"]
+
+
+def test_a_ca_bundle_ref_without_a_worker_bundle_is_refused(publication_k8s: Any) -> None:
     payload = replace(
         _payload(publication_k8s),
         transport=_transport(publication_k8s, ca_bundle_ref=CA_REF),
@@ -560,6 +593,44 @@ def test_a_ca_bundle_ref_without_a_configmap_is_refused(publication_k8s: Any) ->
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="no codeHostTrust"):
         _build(publication_k8s, payload)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [None, b"", b"   \n", b"not a certificate\n", b"\xff\xfe-----BEGIN CERTIFICATE-----"],
+)
+def test_a_ca_bundle_ref_with_an_unusable_worker_bundle_is_refused(
+    publication_k8s: Any, tmp_path: Path, content: bytes | None
+) -> None:
+    bundle = tmp_path / "worker-code-host-trust.crt"
+    if content is not None:
+        bundle.write_bytes(content)
+    payload = replace(
+        _payload(publication_k8s),
+        transport=_transport(publication_k8s, ca_bundle_ref=CA_REF),
+    )
+    settings = replace(_settings(publication_k8s), ca_bundle_path=str(bundle))
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="CA bundle") as raised:
+        _build(publication_k8s, payload, settings)
+    # The refusal names the path, never the bundle's bytes.
+    assert str(bundle) in str(raised.value)
+    assert "not a certificate" not in str(raised.value)
+
+
+def test_a_ca_bundle_that_overflows_the_configmap_is_refused(
+    publication_k8s: Any, tmp_path: Path
+) -> None:
+    bundle = tmp_path / "worker-code-host-trust.crt"
+    bundle.write_text(CA_PEM * 4_000, encoding="utf-8")
+    payload = replace(
+        _payload(publication_k8s, b"x" * publication_k8s.MAX_PATCH_BYTES),
+        transport=_transport(publication_k8s, ca_bundle_ref=CA_REF),
+    )
+    settings = replace(_settings(publication_k8s), ca_bundle_path=str(bundle))
+
+    with pytest.raises(publication_k8s.PublicationResourceError, match="ConfigMap size"):
+        _build(publication_k8s, payload, settings)
 
 
 @pytest.mark.parametrize(
@@ -576,7 +647,7 @@ def test_a_ca_bundle_ref_without_a_configmap_is_refused(publication_k8s: Any) ->
     ],
 )
 def test_a_ca_bundle_ref_that_cannot_be_mounted_safely_is_refused(
-    publication_k8s: Any, ref: str
+    publication_k8s: Any, ref: str, tmp_path: Path
 ) -> None:
     payload = replace(
         _payload(publication_k8s),
@@ -584,7 +655,7 @@ def test_a_ca_bundle_ref_that_cannot_be_mounted_safely_is_refused(
     )
 
     with pytest.raises(publication_k8s.PublicationResourceError, match="CA bundle"):
-        _build(publication_k8s, payload, _ca_settings(publication_k8s))
+        _build(publication_k8s, payload, _ca_settings(publication_k8s, tmp_path))
 
 
 @pytest.mark.parametrize(
@@ -596,7 +667,11 @@ def test_a_ca_bundle_ref_that_cannot_be_mounted_safely_is_refused(
     ],
 )
 def test_job_transport_round_trips_what_the_builder_wrote(
-    publication_k8s: Any, origin: str, header_form: str, ca_bundle_ref: str | None
+    publication_k8s: Any,
+    origin: str,
+    header_form: str,
+    ca_bundle_ref: str | None,
+    tmp_path: Path,
 ) -> None:
     transport = _transport(
         publication_k8s, origin=origin, header_form=header_form, ca_bundle_ref=ca_bundle_ref
@@ -608,7 +683,7 @@ def test_job_transport_round_trips_what_the_builder_wrote(
         clean_clone_url=f"{origin}/{repo}.git",
         transport=transport,
     )
-    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s))
+    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s, tmp_path))
 
     assert publication_k8s.job_transport(resources.job) == transport
     # The real client hands back a V1Job model, not a dict.
@@ -619,7 +694,7 @@ def test_job_transport_round_trips_what_the_builder_wrote(
     rebuilt = _build(
         publication_k8s,
         replace(payload, transport=publication_k8s.job_transport(model)),
-        _ca_settings(publication_k8s),
+        _ca_settings(publication_k8s, tmp_path),
     )
     publication_k8s.validate_adopted_resource("Job", rebuilt.job, model)
 
@@ -1520,6 +1595,7 @@ def test_observe_reads_terminal_status_from_dict_shaped_kubernetes_objects(
 
 def test_observe_reports_the_transport_the_existing_job_was_built_with(
     publication_k8s: Any,
+    tmp_path: Path,
 ) -> None:
     payload = replace(
         _gitlab_payload(publication_k8s, "authorization_bearer"),
@@ -1530,7 +1606,7 @@ def test_observe_reports_the_transport_the_existing_job_was_built_with(
             ca_bundle_ref=CA_REF,
         ),
     )
-    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s))
+    resources = _build(publication_k8s, payload, _ca_settings(publication_k8s, tmp_path))
     live = deepcopy(resources.job)
     live["metadata"]["uid"] = "job-uid-live"
     live["status"] = {"active": 1}

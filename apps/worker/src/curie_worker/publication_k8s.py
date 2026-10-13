@@ -54,6 +54,12 @@ _HEADER_FORM_ENV = "CODE_HOST_HEADER_FORM"
 # The same boot contract key the sandbox reads, named from its one declaration.
 _CA_BUNDLE_ENV = BootEnv.env_key("repo_ca_bundle")
 _CA_VOLUME = "code-host-trust"
+# The per-publication ConfigMap key carrying the CA PEM. The Job lives in the
+# publication namespace, so it must not reference the release namespace's
+# codeHostTrust ConfigMap; the worker copies the PEM in instead.
+_CA_CONFIG_MAP_KEY = "code-host-ca.pem"
+# The apiserver's cap on a ConfigMap's data plus decoded binaryData.
+_CONFIG_MAP_MAX_BYTES = 1_048_576
 
 
 def _redact(text: str) -> str:
@@ -135,11 +141,11 @@ class PublicationJobSettings:
     owner_uid: str | None = None
     active_deadline_seconds: int = 300
     git_timeout_seconds: int = 60
-    # The ConfigMap holding the operator's code host CA bundle
-    # (codeHostTrust.caBundle.configMapRef), mounted read-only at the path the
+    # The worker's own mounted copy of the operator's code host CA bundle
+    # (codeHostTrust.caBundle.configMapRef). Its PEM is copied into the
+    # per-publication ConfigMap and mounted read-only at the path the
     # credential's ``ca_bundle_ref`` names. Empty means none is configured.
-    ca_bundle_config_map: str = ""
-    ca_bundle_key: str = "ca.crt"
+    ca_bundle_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -406,12 +412,33 @@ def _check_transport(
         or directory.startswith(("/publication", "/credentials", "/work", "/tmp"))
     ):
         raise PublicationResourceError("publication CA bundle reference is not a mountable path")
-    if not settings.ca_bundle_config_map:
-        raise PublicationResourceError(
-            "the credential names a code host CA bundle but no codeHostTrust "
-            "ConfigMap is configured for the publication Job"
-        )
     return directory, filename
+
+
+def _read_ca_bundle(settings: PublicationJobSettings) -> str:
+    """The PEM the worker mounted from codeHostTrust, for the Job's own ConfigMap.
+
+    Errors name the path only; the bundle's content is never logged.
+    """
+
+    if not settings.ca_bundle_path:
+        raise PublicationResourceError(
+            "the credential names a code host CA bundle but the worker has no "
+            "codeHostTrust bundle mounted to hand the publication Job"
+        )
+    try:
+        with open(settings.ca_bundle_path, encoding="utf-8") as handle:
+            pem = handle.read(_CONFIG_MAP_MAX_BYTES + 1)
+    except (OSError, UnicodeDecodeError) as exc:
+        raise PublicationResourceError(
+            f"the worker's code host CA bundle at {settings.ca_bundle_path} is unreadable"
+        ) from exc
+    if "-----BEGIN CERTIFICATE-----" not in pem:
+        raise PublicationResourceError(
+            f"the worker's code host CA bundle at {settings.ca_bundle_path} holds no "
+            "PEM certificate"
+        )
+    return pem
 
 
 def build_publication_resources(
@@ -449,6 +476,14 @@ def build_publication_resources(
     if payload.revision_number <= 0:
         raise PublicationResourceError("publication revision number must be positive")
     ca_mount = _check_transport(payload, settings)
+    ca_pem = _read_ca_bundle(settings) if ca_mount is not None else None
+    config_map_bytes = len(payload.patch) + len(_PUBLISH_SCRIPT.encode())
+    if ca_pem is not None:
+        config_map_bytes += len(ca_pem.encode())
+    if config_map_bytes > _CONFIG_MAP_MAX_BYTES:
+        raise PublicationResourceError(
+            "publication patch and code host CA bundle exceed the ConfigMap size limit"
+        )
     if not credential.strip():
         raise PublicationResourceError("publication credential is empty")
     if min(settings.active_deadline_seconds, settings.git_timeout_seconds) <= 0:
@@ -471,8 +506,9 @@ def build_publication_resources(
         "origin": payload.transport.origin,
         "header_form": payload.transport.header_form,
         "ca_bundle_ref": payload.transport.ca_bundle_ref,
-        "ca_bundle_config_map": settings.ca_bundle_config_map if ca_mount else None,
-        "ca_bundle_key": settings.ca_bundle_key if ca_mount else None,
+        "ca_bundle_sha256": (
+            hashlib.sha256(ca_pem.encode()).hexdigest() if ca_pem is not None else None
+        ),
         "base_sha": payload.base_sha,
         "expected_prior_head": payload.expected_prior_head,
         "expected_remote_head": payload.expected_remote_head,
@@ -496,7 +532,7 @@ def build_publication_resources(
         "annotations": annotations,
         "ownerReferences": _owner_reference(settings, owner_uid),
     }
-    config_map = {
+    config_map: dict[str, Any] = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": {**metadata, "name": names.config_map},
@@ -506,6 +542,8 @@ def build_publication_resources(
         },
         "data": {"publish.sh": _PUBLISH_SCRIPT},
     }
+    if ca_pem is not None:
+        config_map["data"][_CA_CONFIG_MAP_KEY] = ca_pem
     secret = {
         "apiVersion": "v1",
         "kind": "Secret",
@@ -557,8 +595,8 @@ def build_publication_resources(
             {
                 "name": _CA_VOLUME,
                 "configMap": {
-                    "name": settings.ca_bundle_config_map,
-                    "items": [{"key": settings.ca_bundle_key, "path": ca_file}],
+                    "name": names.config_map,
+                    "items": [{"key": _CA_CONFIG_MAP_KEY, "path": ca_file}],
                 },
             }
         )
