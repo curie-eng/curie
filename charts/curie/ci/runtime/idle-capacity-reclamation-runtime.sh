@@ -214,12 +214,12 @@ trap 'exit 143' TERM
 # Keep normal route retention and claim deadlines; only sandbox pod quota is reduced.
 sets=(
     --set "fullnameOverride=$FULLNAME"
-    --set-string "api.image.repository=${CURIE_SCENARIO_API_IMAGE%:*}" \
-    --set-string "api.image.tag=${CURIE_SCENARIO_API_IMAGE##*:}" --set api.image.pullPolicy=Never
-    --set-string "worker.image.repository=${CURIE_SCENARIO_WORKER_IMAGE%:*}" \
-    --set-string "worker.image.tag=${CURIE_SCENARIO_WORKER_IMAGE##*:}" --set worker.image.pullPolicy=Never
-    --set-string "agentSandbox.runner.image=${CURIE_SCENARIO_RUNNER_IMAGE%:*}" \
-    --set-string "agentSandbox.runner.tag=${CURIE_SCENARIO_RUNNER_IMAGE##*:}"
+    --set "api.image.repository=${CURIE_SCENARIO_API_IMAGE%:*}" \
+    --set "api.image.tag=${CURIE_SCENARIO_API_IMAGE##*:}" --set api.image.pullPolicy=Never
+    --set "worker.image.repository=${CURIE_SCENARIO_WORKER_IMAGE%:*}" \
+    --set "worker.image.tag=${CURIE_SCENARIO_WORKER_IMAGE##*:}" --set worker.image.pullPolicy=Never
+    --set "agentSandbox.runner.image=${CURIE_SCENARIO_RUNNER_IMAGE%:*}" \
+    --set "agentSandbox.runner.tag=${CURIE_SCENARIO_RUNNER_IMAGE##*:}"
     --set agentSandbox.runner.imagePullPolicy=Never --set agentSandbox.runner.prewarm.imagePullPolicy=Never
     --set agentSandbox.deploy=true --set agentSandbox.controller.deploy=true
     --set agentSandbox.platformPool.replicas=0 --set agentSandbox.runner.fakeModel=true

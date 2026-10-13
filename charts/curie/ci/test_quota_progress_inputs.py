@@ -60,6 +60,9 @@ if tool == "kubectl":
     if any(command in args for command in ("delete", "wait", "logs")):
         raise SystemExit(0)
 if tool == "curie":
+    assert not any(
+        argument.split("=", 1)[0] == "--set-string" for argument in args
+    )
     raise SystemExit(93)
 if tool == "helm" and any(command in args for command in ("uninstall", "list")):
     raise SystemExit(0)
@@ -254,10 +257,24 @@ def test_occupied_shared_or_private_object_refuses_before_install_or_cleanup(
     ), calls
 
 
+@pytest.mark.parametrize(
+    "images",
+    [
+        ("curie-api:wsdiag-acme", "curie-worker:wsdiag-acme", "curie-runner:wsdiag-acme"),
+        (
+            "registry.example.com:5000/acme-corp/curie-api:12345",
+            "registry.example.com:5000/acme-corp/curie-worker:23456",
+            "registry.example.com:5000/acme-corp/curie-runner:34567",
+        ),
+    ],
+    ids=["ordinary-tags", "numeric-tags-and-registry-ports"],
+)
 def test_empty_inventory_advances_to_install_and_cleans_up_failed_install(
-    scenario: Scenario,
+    scenario: Scenario, images: tuple[str, str, str]
 ) -> None:
     scenario.environment["QUOTA_INVENTORY_MODE"] = "1"
+    for variable, image in zip(IMAGE_INPUTS, images, strict=True):
+        scenario.environment[variable] = image
     completed = scenario.run()
     output = completed.stdout + completed.stderr
     assert completed.returncode != 0, "the failed candidate install must remain a failed scenario"
@@ -270,18 +287,76 @@ def test_empty_inventory_advances_to_install_and_cleans_up_failed_install(
     assert "kind-acme-test" in install, install
     assert "test-4368-idle-capacity-12345-1" in install, install
     assert "idlecap-12345-1" in install, install
+    assert not any(
+        argument.split("=", 1)[0] == "--set-string" for argument in install
+    ), install
+    # This pins CLI argv preservation, including numeric tags and registry
+    # ports. It does not assert how Helm later interprets those tag strings.
+    sets = [
+        install[index + 1] for index, argument in enumerate(install) if argument == "--set"
+    ]
+    for image, repository_key, tag_key in zip(
+        images,
+        ("api.image.repository", "worker.image.repository", "agentSandbox.runner.image"),
+        ("api.image.tag", "worker.image.tag", "agentSandbox.runner.tag"),
+        strict=True,
+    ):
+        repository, tag = image.rsplit(":", 1)
+        for key, value in ((repository_key, repository), (tag_key, tag)):
+            assert [setting for setting in sets if setting.startswith(key + "=")] == [
+                f"{key}={value}"
+            ], install
     install_index = calls.index(install)
     assert all(
         call[0] == "kubectl" and "get" in call for call in calls[:install_index]
     ), calls
     cleanup = calls[install_index + 1 :]
-    assert any(call[0] == "helm" and "uninstall" in call for call in cleanup), cleanup
+    claims = [
+        call
+        for call in cleanup
+        if call[0] == "kubectl" and "delete" in call
+        and "sandboxclaims" in call
+    ]
+    sandboxes = [
+        call
+        for call in cleanup
+        if call[0] == "kubectl" and "delete" in call
+        and "sandboxes" in call
+    ]
+    uninstalls = [call for call in cleanup if call[0] == "helm" and "uninstall" in call]
+    assert len(claims) == len(sandboxes) == len(uninstalls) == 1, cleanup
+    assert cleanup.index(claims[0]) < cleanup.index(sandboxes[0]), cleanup
+    assert cleanup.index(sandboxes[0]) < cleanup.index(uninstalls[0]), cleanup
+    for deletion in (claims[0], sandboxes[0]):
+        assert "--all" in deletion and "--wait=true" in deletion, deletion
+        assert "--timeout=90s" in deletion, deletion
+        assert "-n" in deletion, deletion
+        assert "test-4368-idle-capacity-12345-1" in deletion, deletion
     assert any(
         call[0] == "kubectl"
         and "delete" in call
         and any(argument.endswith("test-4368-idle-capacity-12345-1") for argument in call)
         for call in cleanup
     ), cleanup
+    namespace = "test-4368-idle-capacity-12345-1"
+    fullname = "idlecap-12345-1-curie"
+    publication_namespace = f"{namespace}-{fullname}-publication"[:63].rstrip("-")
+    for deleted_namespace in (namespace, "agent-sandbox-system", publication_namespace):
+        waits = [
+            call
+            for call in cleanup
+            if call[0] == "kubectl" and "wait" in call
+            and f"namespace/{deleted_namespace}" in call
+        ]
+        assert len(waits) == 1, (deleted_namespace, cleanup)
+        assert "--for=delete" in waits[0] and "--timeout=180s" in waits[0], waits[0]
+    for kind in ("validatingadmissionpolicy", "validatingadmissionpolicybinding"):
+        assert any(
+            call[0] == "kubectl"
+            and "get" in call
+            and f"{kind}/{fullname}-runner-resources" in call
+            for call in cleanup
+        ), (kind, cleanup)
     assert all(call[0] not in {"kind", "docker", "cargo"} for call in calls), calls
 
 
