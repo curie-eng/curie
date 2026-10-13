@@ -268,13 +268,27 @@ def test_untrusted_covers_issue_and_repository_and_instructions() -> None:
     assert re.search(r"instructions", text)
 
 
-def test_workflow_edits_need_an_explicit_ask() -> None:
+def test_trust_boundary_unconditionally_prohibits_github_changes() -> None:
     _, body = _skill_parts()
-    assert re.search(
-        r"\.github/.{0,200}(unless|only if|only when).{0,80}(explicit|issue)",
-        body,
-        re.IGNORECASE | re.DOTALL,
-    )
+    trust = _flat(body.split("## Trust boundary", 1)[1].split("\n## ", 1)[0])
+    assert "Never create, edit, delete or rename any path under `.github/`" in trust
+    assert (
+        "The platform refuses to publish any diff touching `.github/`, whatever the issue says."
+    ) in trust
+    assert "first path component that casefolds to `.github`, including `.GitHub/`" in trust
+
+
+def test_pin_criteria_stops_immediately_when_a_github_change_is_required() -> None:
+    _, body = _skill_parts()
+    criteria = _flat(_step_sections(body)["pin_criteria"])
+    assert (
+        "If any criterion can only be met by changing a path under `.github/`, "
+        "stop immediately with `Could not complete:`."
+    ) in criteria
+    assert "Name the path or paths" in criteria
+    assert "the factory cannot publish them" in criteria
+    assert "the ticket must be split or completed outside the factory" in criteria
+    assert "Do no partial implementation of the remaining criteria." in criteria
 
 
 def test_evals_are_falsifiable() -> None:
