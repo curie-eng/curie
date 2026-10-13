@@ -3431,7 +3431,20 @@ async fn runtime_class_selector_matches_no_node(selector: &str) -> bool {
     );
     // Only a readable, empty node list authorizes the reduced isolation posture.
     // Taints, tolerations and cordons are outside this node pool selector check.
-    matches!(run_capture(&cmd).await, Ok((true, out, _)) if out.trim().is_empty())
+    match run_capture(&cmd).await {
+        Ok((true, out, _)) => out.trim().is_empty(),
+        Ok((false, _, err)) => {
+            crate::ui::ui().plumbing(&format!(
+                "gVisor node selector lookup unavailable: {}",
+                failure_reason(&err)
+            ));
+            false
+        }
+        Err(error) => {
+            crate::ui::ui().plumbing(&format!("gVisor node selector lookup unavailable: {error}"));
+            false
+        }
+    }
 }
 
 async fn gvisor_preflight_scheduling_failure(
@@ -5817,12 +5830,33 @@ async fn run_prepared_up(
     // runtimeClassName default is not `gvisor`.
     let mut gvisor_preflight =
         rendered_gvisor_preflight_job(&opts.chart, &opts.common, &value_plan).await?;
+    // A fake-model auto install omits the Job but can still use the class on
+    // runner pods. Let the chart identify that path with one real-model render.
+    let fake_model_preflight = if detect_facts && gvisor_preflight.is_none() {
+        let mut real_model_plan = value_plan.clone();
+        real_model_plan.set(FAKE_MODEL_KEY, "false");
+        rendered_gvisor_preflight_job(&opts.chart, &opts.common, &real_model_plan)
+            .await?
+            .filter(|preflight| !preflight.creates_runtime_class)
+    } else {
+        None
+    };
     if detect_facts {
-        if let Some(preflight) = gvisor_preflight.as_ref() {
+        if let Some(preflight) = gvisor_preflight.as_ref().or(fake_model_preflight.as_ref()) {
             let name = preflight.runtime_class_name.clone();
             let creates_runtime_class = preflight.creates_runtime_class;
-            match lookup_runtime_class(&name).await? {
+            let fake_model_auto = fake_model_preflight.is_some();
+            let lookup = match lookup_runtime_class(&name).await {
+                Ok(lookup) => lookup,
+                Err(error) if fake_model_auto => {
+                    ui.plumbing(&format!("gVisor RuntimeClass lookup unavailable: {error}"));
+                    RuntimeClassLookup::Present
+                }
+                Err(error) => return Err(error),
+            };
+            match lookup {
                 RuntimeClassLookup::Present => {}
+                RuntimeClassLookup::Forbidden | RuntimeClassLookup::Absent if fake_model_auto => {}
                 RuntimeClassLookup::Forbidden => {
                     runtime_class_lookup_forbidden = true;
                 }
