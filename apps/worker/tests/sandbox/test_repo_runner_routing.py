@@ -237,9 +237,11 @@ def test_refusal_on_a_retained_route_leaves_the_route_untouched(
     assert stored is not None and stored.handle.claim_name == first.claim_name
 
 
-def _secret_env(agent: str) -> dict[str, str]:
+def _connector_marked_env(agent: str) -> dict[str, str]:
     env: dict[str, str] = {"CURIE_BUDGET": "{}"}
-    inject_connector_secrets(env, {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_secret"}, agent_label=agent)
+    inject_connector_secrets(
+        env, {"GITHUB_PERSONAL_ACCESS_TOKEN": "fixture-value"}, agent_label=agent
+    )
     assert CONNECTOR_SECRET_KEYS_ENV in env
     return env
 
@@ -256,7 +258,7 @@ def test_connector_secrets_without_a_secret_pool_are_refused_even_with_a_repo_en
     with pytest.raises(MissingAgentPoolError):
         substrate.claim(
             "T-secret-refused",
-            env=_secret_env("cli-bot"),
+            env=_connector_marked_env("cli-bot"),
             workspace_repo=REPO,
             agent_name="cli-bot",
         )
@@ -277,7 +279,10 @@ def test_connector_secrets_with_a_secret_pool_claim_the_repo_entry(
         connector_secret_pools=frozenset({"factory"}),
     )
     handle = substrate.claim(
-        "T-secret-ok", env=_secret_env("factory"), workspace_repo=REPO, agent_name="factory"
+        "T-secret-ok",
+        env=_connector_marked_env("factory"),
+        workspace_repo=REPO,
+        agent_name="factory",
     )
     assert probing_k8s.claims[handle.claim_name].pool == POOL
     assert handle.runner_digests == DIGESTS
@@ -323,7 +328,7 @@ def test_connector_secret_refusal_for_another_repository_leaves_the_live_route_u
     with pytest.raises(MissingAgentPoolError):
         _substrate(probing_k8s, affinity, config, pools).claim(
             "T-other-secret",
-            env=_secret_env("cli-bot"),
+            env=_connector_marked_env("cli-bot"),
             workspace_repo=REPO,
             agent_name="cli-bot",
         )
